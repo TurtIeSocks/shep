@@ -60,7 +60,7 @@ use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasRegistry};
 use crate::kill::kill_process;
-use crate::privilege::{self, Credentials};
+use crate::privilege::{self, Credentials, PrivilegeError, SpawnIdentity};
 use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
@@ -224,14 +224,61 @@ pub(crate) enum BatchPolicy {
     /// a dog start is always one app, and a roll restore is a recovery
     /// rather than a request.
     ///
-    /// What a failure leaves behind differs by cause, and the difference is
-    /// not cosmetic. A failed SPAWN leaves an `Errored` row, because
-    /// [`Actor::spawn_fresh`] registers the entry before it reports. An
-    /// unresolvable `user`/`group` leaves nothing, because there is no
-    /// identity to assemble a spawn for and running that app under the
-    /// daemon's own identity instead is the one outcome that must never
-    /// happen. Both are reported in the error either way.
+    /// Every failure leaves an `Errored` row, whatever its cause. A failed
+    /// SPAWN gets one from [`Actor::spawn_fresh`], which registers the entry
+    /// before it reports; an unresolvable `user`/`group` gets one from
+    /// [`Actor::do_start`] directly, since there is no identity to assemble a
+    /// spawn for and so no spawn to register it. Both are reported in the
+    /// error as well.
+    ///
+    /// The second used to leave nothing, on the reasoning that an app with
+    /// no resolvable identity must never run under the daemon's own. That
+    /// outcome is still ruled out, but by the row's
+    /// [`SpawnIdentity::Unresolved`] rather than by its absence, and absence
+    /// was costing the operator the one trace they had: under this policy
+    /// nobody is holding a terminal, so an app missing from `shep flock`
+    /// reads as one nobody ever configured.
+    ///
+    /// [`AllOrNothing`](Self::AllOrNothing) leaves no row for either cause,
+    /// and that is not an inconsistency: it registers nothing at all.
     PerApp,
+}
+
+/// Whether a registration call created the row it hands back, or found one
+/// already there.
+///
+/// [`Actor::register_without_spawning`] is idempotent by name, so its return
+/// answers "what is registered under this name now" and cannot on its own
+/// answer "did this call put it there". Those are different questions, and an
+/// event is owed to the second: [`ProcessEventKind::Errored`] says a sheep
+/// TRANSITIONED, and a second muster restore finding the row the first one
+/// left has transitioned nothing.
+///
+/// Which is why the emit keys on this and not on the row's status. A status is
+/// true both when something just happened and when it was already true, so the
+/// row found and the row created are alike in it -- both `Errored` -- and a
+/// status test announces both. Bark's `Trigger::GaveUp` fires on `Errored`
+/// for any sheep and reads the repeat as fresh. NOT `dogs::spawn_dog_watch`,
+/// which filters on `info.dog.is_some()` and can never see a restored row,
+/// since the restore registers with `dog: None`.
+#[derive(Debug)]
+enum Registration {
+    /// This call registered the row. A transition happened, and whatever an
+    /// event is owed for it is owed now.
+    Fresh(ProcessInfo),
+    /// An app of this name was already registered. The row is untouched and
+    /// reported exactly as it stood, including its status.
+    AlreadyKnown(ProcessInfo),
+}
+
+impl Registration {
+    /// The row, whichever of the two it is, for a caller that only has to
+    /// report what is registered under the name.
+    fn into_info(self) -> ProcessInfo {
+        match self {
+            Self::Fresh(info) | Self::AlreadyKnown(info) => info,
+        }
+    }
 }
 
 /// Commands the supervisor actor accepts (wrapped in [`Msg::Command`]).
@@ -585,10 +632,15 @@ pub enum SupervisorError {
     NotFound,
     /// Spawn failed (carries the runner's message).
     SpawnFailed(String),
-    /// A `Start` batch was refused before anything was registered, because
-    /// at least one app in it provably could not run. Carries one
-    /// `"<name>: <reason>"` entry per such app, joined by `"; "`, behind a
-    /// count and the fact that nothing was registered.
+    /// A command that would have started processes was refused before any of
+    /// them was registered, because what it was asked to start provably could
+    /// not run. Carries `"<name>: <reason>"` per app that could not.
+    ///
+    /// Two callers. A `Start` batch refused in its checking pass, which
+    /// prefixes the list with a count and the fact that nothing was
+    /// registered; and a `Scale` whose app has a `user`/`group` that will not
+    /// resolve, which is one app and carries just the pair. What unites them
+    /// is not the verb but the guarantee below.
     ///
     /// Separate from [`Self::SpawnFailed`] because NOTHING WAS SPAWNED, and
     /// an operator reading "spawn failed" about a spawn that never happened
@@ -745,10 +797,9 @@ impl SupervisorHandle {
     /// - [`SupervisorError::SpawnFailed`]: at least one app could not be
     ///   started, carrying one `"<name>: <reason>"` entry per such app joined
     ///   by `"; "`. Every app in the batch was attempted regardless, and
-    ///   every app that could start is running. An app whose SPAWN failed is
-    ///   registered `Errored` and visible; an app whose `user`/`group` could
-    ///   not be resolved leaves no row at all, since nothing can be
-    ///   assembled without an identity to assemble it for.
+    ///   every app that could start is running. Every app that could not is
+    ///   registered `Errored` and visible, whether its spawn failed or its
+    ///   `user`/`group` could not be resolved.
     /// - [`SupervisorError::EngineStopped`]: the actor is gone.
     pub(crate) async fn start_restored(
         &self,
@@ -972,7 +1023,9 @@ impl SupervisorHandle {
     /// bus. A matched sheep that is not `Online` has nothing to replace and
     /// is a no-op success in that answer. Nothing here re-reads config: the
     /// replacement is spawned from the stored `ResolvedApp` and the
-    /// credentials resolved at the first `Start`.
+    /// credentials the instance resolved at its own first spawn, which for a
+    /// sheep restored from the muster roll is its first restart rather than a
+    /// `Start`.
     ///
     /// # Errors
     ///
@@ -1019,8 +1072,38 @@ impl SupervisorHandle {
     /// - [`SupervisorError::NotFound`] — no app of that name is registered.
     /// - [`SupervisorError::InvalidScale`] — a count of `0`, or a target that
     ///   is a dog.
+    /// - [`SupervisorError::CannotStart`] — a scale-UP whose app has a
+    ///   `user`/`group` that will not resolve, so no new instance could be
+    ///   assembled. Nothing was spawned, nothing was removed, and the stored
+    ///   instance count is unchanged: the flock is exactly as it was.
     /// - [`SupervisorError::ReloadInFlight`] — the app is mid-reload.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    ///
+    /// `CannotStart`'s reachable set is narrow, and worth stating rather than
+    /// guessing at. It needs all three of `count > current`, an app whose
+    /// identity has never been resolved, and a resolution that then fails.
+    /// Only the growing arm resolves anything, so scaling DOWN and scaling to
+    /// the count an app already has never ask the passwd database and never
+    /// reach this variant, however unresolvable the app's `user` is. And only
+    /// two things carry an unresolved identity, both of them registered
+    /// without ever spawning:
+    ///
+    /// - a sheep the muster roll restored because it was saved while stopped;
+    /// - a row left `Errored` by a `Start` under [`BatchPolicy::PerApp`] whose
+    ///   credentials failed. Its `user` is already known not to resolve —
+    ///   that is why the row is there — so scaling it up meets the same
+    ///   refusal the start did, worded the same way.
+    ///
+    /// Both register `instance: 0` and nothing else, so their `current` is 1
+    /// and any `count` of 2 or more is the scale-up that reaches the lookup.
+    /// A count of 0 is refused as `InvalidScale` before any of this, which is
+    /// what leaves scaling down unreachable for them rather than merely
+    /// harmless.
+    ///
+    /// A scale-up that resolves successfully settles the identity for good,
+    /// including for the instance that was already registered: the lookup
+    /// runs once and is stored, so the app's next restart reuses it rather
+    /// than asking again.
     ///
     /// A scale-up that ran out of instances part-way is NOT an error here: it
     /// answers `Ok` with [`Scaled::shortfall`] set, the achieved count on
@@ -2358,20 +2441,56 @@ impl<R: ProcessRunner> Actor<R> {
                     // The reasons were each true; the count was not.
                     //
                     // Asks the policy, like every other stopping point in
-                    // this function. Under `PerApp` this app is skipped and
-                    // the rest of the batch goes on: an unresolvable `user`
-                    // on one saved app must not cost a muster restore the
-                    // whole flock.
-                    //
-                    // Skipped rather than registered `Errored`, unlike a
-                    // failed spawn. Nothing can be assembled without an
-                    // identity to assemble it for, and running it under the
-                    // daemon's own identity instead is the one outcome that
-                    // must never happen here. The failure is reported either
-                    // way; what differs is that this app leaves no row.
+                    // this function, and the policy decides what this app
+                    // leaves behind as well as whether the batch goes on.
+                    // This match is the ONE place that decision is made;
+                    // `register_without_spawning` performs it and holds no
+                    // opinion about it.
                     match policy {
+                        // Nothing is registered, this app included. The
+                        // whole batch is about to be refused with every
+                        // failing app named, and the operator who typed
+                        // `shep start` is holding a terminal to read it. One
+                        // `Errored` row and no others would leave exactly
+                        // the flock-matching-neither-state this policy
+                        // exists to prevent.
                         BatchPolicy::AllOrNothing => refusals.push(format!("{name}: {err}")),
-                        BatchPolicy::PerApp => failures.push(format!("{name}: {err}")),
+                        // A row, and this is the case that needs one. The
+                        // rest of the batch goes on, so there IS a flock to
+                        // be missing from -- and the two callers here are a
+                        // muster restore at boot and a dog, where nobody is
+                        // holding a terminal and the shepherd's log is the
+                        // only trace. An app absent from `shep flock` looks
+                        // like one nobody ever configured.
+                        //
+                        // Safe to register only because the row carries
+                        // `SpawnIdentity::Unresolved`: a later `shep
+                        // restart` resolves it through
+                        // `credentials_for_spawn` and meets this same
+                        // refusal, rather than reusing a settled `None` and
+                        // bringing the sheep up as the shepherd. That is the
+                        // outcome being ruled out, and it is ruled out by
+                        // the identity the row holds rather than by the row
+                        // not existing.
+                        //
+                        // Idempotent by name, so a failed start never
+                        // overwrites the state of something already running.
+                        BatchPolicy::PerApp => {
+                            failures.push(format!("{name}: {err}"));
+                            // `Fresh` only: the emit announces a TRANSITION,
+                            // and a second restore finding the row a first one
+                            // left has transitioned nothing. Keying this on
+                            // the row's status instead sent a duplicate, since
+                            // the row found and the row created are both
+                            // `Errored`.
+                            if let Registration::Fresh(info) = self.register_without_spawning(
+                                &app,
+                                ProcStatus::Errored,
+                                dog.clone(),
+                            ) {
+                                self.emit(ProcessEventKind::Errored, info, true);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -2457,8 +2576,10 @@ impl<R: ProcessRunner> Actor<R> {
                             //
                             // `spawn_fresh` has already registered this one
                             // `Errored` before returning, which is the row
-                            // the muster's own comment promises and the
-                            // event `dogs::spawn_dog_watch` subscribes to.
+                            // the muster's own comment promises. Bark's
+                            // `Trigger::GaveUp` is what sees that event; a
+                            // restored row carries `dog: None`, so the dog
+                            // watcher never does.
                             BatchPolicy::PerApp => {
                                 failures.push(failure);
                                 // This app's remaining instances are skipped
@@ -2492,6 +2613,53 @@ impl<R: ProcessRunner> Actor<R> {
         Ok(results)
     }
 
+    /// The credentials `id`'s next spawn must apply, resolved once if this
+    /// entry has never had them resolved.
+    ///
+    /// The ONE seam through which a stored [`SpawnIdentity`] becomes the
+    /// settled `Option<Credentials>` [`assemble`] takes, which is what keeps
+    /// the two meanings of "no credentials" from being confused at a spawn
+    /// site:
+    ///
+    /// - An entry resolved at its `Start` answers from that stored value and
+    ///   never touches the passwd database again. A running app's identity
+    ///   therefore cannot change underneath it, and a restart cannot fail on
+    ///   a passwd database that has changed since.
+    /// - An entry that has never been resolved -- registered at rest from
+    ///   the muster roll, or registered `Errored` because this very
+    ///   resolution failed -- resolves here, and stores the answer so the
+    ///   guarantee above holds from its first spawn onward. Falling back to
+    ///   the shepherd's own identity instead would start the child as the
+    ///   daemon with nothing said about it.
+    ///
+    /// A failed resolution stores nothing: the entry stays
+    /// [`SpawnIdentity::Unresolved`], so a later restart asks again rather
+    /// than inheriting a refusal from a passwd database that has since been
+    /// fixed.
+    ///
+    /// # Errors
+    /// - Whatever [`privilege::resolve`] refused this app's `user`/`group`
+    ///   for: no such user, no such group, an unreadable database, or a
+    ///   non-root daemon asked to change identity.
+    fn credentials_for_spawn(&mut self, id: u32) -> Result<Option<Credentials>, PrivilegeError> {
+        let slot = self
+            .sheep
+            .get(&id)
+            .expect("credentials_for_spawn: unknown id");
+        match slot.entry.credentials {
+            SpawnIdentity::Resolved(credentials) => Ok(credentials),
+            SpawnIdentity::Unresolved => {
+                let credentials = privilege::resolve(slot.entry.spec.config())?;
+                self.sheep
+                    .get_mut(&id)
+                    .expect("credentials_for_spawn: the entry was read a moment ago")
+                    .entry
+                    .credentials = SpawnIdentity::Resolved(credentials);
+                Ok(credentials)
+            }
+        }
+    }
+
     /// Registers one app as a member of the flock without spawning anything.
     ///
     /// The flock is a membership list, not a list of live processes. `stop`
@@ -2510,35 +2678,76 @@ impl<R: ProcessRunner> Actor<R> {
     /// is left exactly as it is, so restoring a roll over a live flock never
     /// disturbs what is already running.
     fn register_at_rest(&mut self, app: &ResolvedApp) -> ProcessInfo {
+        self.register_without_spawning(app, ProcStatus::Stopped, None)
+            .into_info()
+    }
+
+    /// Registers one app as a flock member in `status`, spawning nothing.
+    ///
+    /// Mechanism, not policy: it registers the status it is handed and has
+    /// no opinion about which one an app deserves. Two callers hold that
+    /// opinion, and each states it where the decision is made -- a muster
+    /// roll restoring a sheep that was saved while stopped
+    /// ([`Self::register_at_rest`], `Stopped`), and [`Self::do_start`]'s
+    /// credential-resolution failure under [`BatchPolicy::PerApp`]
+    /// (`Errored`). Adding a third means deciding there, not here.
+    ///
+    /// What this function DOES fix is the entry's identity, which is
+    /// [`SpawnIdentity::Unresolved`] whatever the status: nothing has been
+    /// spawned, so nothing has been resolved. That is what makes an
+    /// `Errored` row safe to leave behind -- a later `restart` resolves it
+    /// through [`Self::credentials_for_spawn`] rather than reusing a settled
+    /// `None` and starting the sheep as the shepherd.
+    ///
+    /// Idempotent by name, like [`Self::do_start_dog`]: an app already known
+    /// is left exactly as it is.
+    ///
+    /// Which of the two happened is the return value's whole job, and it is
+    /// not something the caller can read off the row: see [`Registration`] for
+    /// why the status cannot answer it and what went out twice when a caller
+    /// tried.
+    fn register_without_spawning(
+        &mut self,
+        app: &ResolvedApp,
+        status: ProcStatus,
+        dog: Option<DogSource>,
+    ) -> Registration {
         let name = &app.config().name;
         if let Some(slot) = self
             .sheep
             .values()
             .find(|slot| &slot.entry.spec.config().name == name)
         {
-            return to_info(&slot.entry, &self.smits);
+            return Registration::AlreadyKnown(to_info(&slot.entry, &self.smits));
         }
 
         let id = self.next_id;
         self.next_id += 1;
         // Assembled for its log paths only: nothing is spawned here, but the
         // entry has to name the files a later `restart` will append to, the
-        // same way the failure arm of `spawn_fresh` does.
+        // same way the failure arm of `spawn_fresh` does. `None` credentials
+        // here are inert for the same reason -- this spec never reaches a
+        // runner, and the entry below records that the real question has not
+        // been asked yet.
         let spec = assemble(app, 0, &self.paths, None);
         let entry = ProcessEntry {
             id,
             spec: app.clone(),
             instance: 0,
-            status: ProcStatus::Stopped,
+            status,
             pid: None,
             restarts: 0,
             started_at: None,
             budget: RestartBudget::default(),
             reload: ReloadState::None,
-            credentials: None,
+            // Never looked up: this is a membership record, not a `Start`.
+            // The first spawn of this entry resolves it (`respawn`), so a
+            // restored app comes up under its configured `user` rather than
+            // under the shepherd's own identity.
+            credentials: SpawnIdentity::Unresolved,
             out_file: spec.out_file.clone(),
             err_file: spec.err_file.clone(),
-            dog: None,
+            dog,
             // A fresh registration, never spawned: nothing has exited yet.
             last_exit: None,
         };
@@ -2559,7 +2768,7 @@ impl<R: ProcessRunner> Actor<R> {
                 actions: ActionWaits::default(),
             },
         );
-        info
+        Registration::Fresh(info)
     }
 
     /// Names the fields in which each app differs from the registered sheep
@@ -2648,7 +2857,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: Some(tokio::time::Instant::now()),
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
-                    credentials,
+                    credentials: SpawnIdentity::Resolved(credentials),
                     out_file,
                     err_file,
                     dog,
@@ -2722,7 +2931,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: None,
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
-                    credentials,
+                    credentials: SpawnIdentity::Resolved(credentials),
                     out_file,
                     err_file,
                     dog,
@@ -2805,13 +3014,20 @@ impl<R: ProcessRunner> Actor<R> {
     /// failure. Callers pass `origin == CommandOrigin::Operator`, never a
     /// literal, wherever a command is what got them here.
     fn respawn(&mut self, id: u32, manually: bool) -> ProcessInfo {
+        // Reused as-is once resolved (never re-resolved): a restart must
+        // never re-touch the passwd database, and must never silently change
+        // identity out from under an already-running app. An entry that has
+        // never been resolved -- restored from the muster roll, or left
+        // `Errored` by a refused start -- resolves HERE, because coming up
+        // as the shepherd instead would be a privilege downgrade nothing
+        // reports.
+        let credentials = match self.credentials_for_spawn(id) {
+            Ok(credentials) => credentials,
+            Err(err) => return self.respawn_failed(id, manually, &err),
+        };
         let slot = self.sheep.get(&id).expect("respawn: unknown id");
         let app = slot.entry.spec.clone();
         let instance = slot.entry.instance;
-        // Reused as-is from the initial Start (never re-resolved): a
-        // restart must never re-touch the passwd database, and must never
-        // silently change identity out from under an already-running app.
-        let credentials = slot.entry.credentials;
         // Computed ahead of the mutable borrow below (IMPORTANT-3): this
         // respawn's new epoch, one past the slot's current one.
         let next_epoch = slot.epoch + 1;
@@ -2890,47 +3106,76 @@ impl<R: ProcessRunner> Actor<R> {
                 }
                 info
             }
-            Err(_error) => {
-                // The deferred aggregation reply has no per-id error slot
-                // (locked model): a failed respawn simply lands the entry in
-                // Errored, same as a budget-exhausted crash loop.
-                let slot = self
-                    .sheep
-                    .get_mut(&id)
-                    .expect("respawn: entry vanished mid-respawn");
-                slot.entry.status = ProcStatus::Errored;
-                slot.entry.pid = None;
-                slot.entry.started_at = None;
-                // Cleared, because nothing exited here: the spawn itself
-                // failed, so there is no exit to report. Leaving the
-                // previous process's code in place would show a sheep that
-                // once crashed with 1 as still crashing with 1 while it is
-                // in fact failing to start at all -- and telling those two
-                // apart is the whole reason this field exists.
-                slot.entry.last_exit = None;
-                slot.ctl = None;
-                // Already `None` on every route into a respawn: all three
-                // callers reach it only for an id whose `ctl` is clear, and
-                // the two are cleared in the same breath. Written anyway, so
-                // that "these two go together" is something a reader can see
-                // at each site rather than infer from the callers.
-                slot.to_child = None;
-                slot.signals = None;
-                slot.to_stdin = None;
-                slot.ready_tx = None;
-                let info = to_info(&slot.entry, &self.smits);
-                self.emit(ProcessEventKind::Errored, info.clone(), manually);
-                // The same terminal status `Decision::Errored` reaches, and it
-                // needs the same disarm: a respawn that fails to spawn (the
-                // binary replaced mid-deploy, `EAGAIN`, a cwd that is gone)
-                // would otherwise leave the name-group's cron worker and watch
-                // live, and the enforcer armed against a pid that no longer
-                // exists. Re-disarming an already-disarmed id is a no-op by
-                // construction, so this is safe from every caller.
-                self.disarm_extras(id, &info.name);
-                info
-            }
+            Err(error) => self.respawn_failed(id, manually, &error),
         }
+    }
+
+    /// Lands `id` in the terminal state a respawn that could not start
+    /// reaches: `Errored`, every handle cleared, its lifecycle extras
+    /// disarmed.
+    ///
+    /// Two callers, failing for different reasons at different moments -- a
+    /// runner that refused the spawn, and a `user` that could not be
+    /// resolved before a spawn could be attempted -- and the state they
+    /// leave behind has to be identical, because it is the same state: a
+    /// sheep that is not running, and whose watch, cron and memory
+    /// enforcement are not armed against a pid that does not exist.
+    ///
+    /// `reason` is logged here rather than by the caller, and that is the
+    /// point of it being a parameter. The `Errored` event this emits carries
+    /// no reason, and the deferred aggregation reply has no per-id error
+    /// slot, so this log line is the ONLY place an operator can learn why a
+    /// restart did not produce a process: a binary replaced mid-deploy, an
+    /// `EAGAIN`, a `cwd` that is gone, a `user` that no longer resolves. One
+    /// of the two callers used to bind the runner's error as `_error` and
+    /// drop it, which left exactly those cases with an `errored` row and
+    /// nothing to read. Taking it as an argument is what stops a third
+    /// caller repeating that: there is no way in without one.
+    fn respawn_failed(
+        &mut self,
+        id: u32,
+        manually: bool,
+        reason: &dyn fmt::Display,
+    ) -> ProcessInfo {
+        tracing::warn!(id, %reason, "restart did not start a process");
+        // The deferred aggregation reply has no per-id error slot
+        // (locked model): a failed respawn simply lands the entry in
+        // Errored, same as a budget-exhausted crash loop.
+        let slot = self
+            .sheep
+            .get_mut(&id)
+            .expect("respawn: entry vanished mid-respawn");
+        slot.entry.status = ProcStatus::Errored;
+        slot.entry.pid = None;
+        slot.entry.started_at = None;
+        // Cleared, because nothing exited here: the spawn itself
+        // failed, so there is no exit to report. Leaving the
+        // previous process's code in place would show a sheep that
+        // once crashed with 1 as still crashing with 1 while it is
+        // in fact failing to start at all -- and telling those two
+        // apart is the whole reason this field exists.
+        slot.entry.last_exit = None;
+        slot.ctl = None;
+        // Already `None` on every route into a respawn: all three
+        // callers reach it only for an id whose `ctl` is clear, and
+        // the two are cleared in the same breath. Written anyway, so
+        // that "these two go together" is something a reader can see
+        // at each site rather than infer from the callers.
+        slot.to_child = None;
+        slot.signals = None;
+        slot.to_stdin = None;
+        slot.ready_tx = None;
+        let info = to_info(&slot.entry, &self.smits);
+        self.emit(ProcessEventKind::Errored, info.clone(), manually);
+        // The same terminal status `Decision::Errored` reaches, and it
+        // needs the same disarm: a respawn that fails to spawn (the
+        // binary replaced mid-deploy, `EAGAIN`, a cwd that is gone)
+        // would otherwise leave the name-group's cron worker and watch
+        // live, and the enforcer armed against a pid that no longer
+        // exists. Re-disarming an already-disarmed id is a no-op by
+        // construction, so this is safe from every caller.
+        self.disarm_extras(id, &info.name);
+        info
     }
 
     /// Offers `manual` the `manual` marker on a RUNNING sheep, starting its
@@ -3368,13 +3613,6 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         let current = u32::try_from(slots.len()).unwrap_or(u32::MAX);
-        let credentials = self
-            .sheep
-            .get(&slots[0].1)
-            .expect("handle_scale: id read off this map a moment ago")
-            .entry
-            .credentials;
-
         // The spawn/remove pass runs FIRST and the config write-back second,
         // which is the opposite of the obvious order and is the whole of this
         // function's care about a partial scale. Writing `rescaled` onto every
@@ -3396,6 +3634,49 @@ impl<R: ProcessRunner> Actor<R> {
         let survivors: Vec<u32> = match count.cmp(&current) {
             Ordering::Equal => slots.iter().map(|(_, id)| *id).collect(),
             Ordering::Greater => {
+                // INSIDE this arm, not above the match, because this is the
+                // only arm that spawns. `Equal` is a genuine no-op and `Less`
+                // only removes, so neither needs an identity -- and resolving
+                // one anyway meant a lookup that could REFUSE the call. `shep
+                // stock <name> 1` on an app restored from the muster roll was
+                // exactly that: `register_without_spawning` registers
+                // `instance: 0` whatever `instances` says, so `current` is 1,
+                // `count == 0` is refused earlier, and `Equal` is the only
+                // arm such a call can reach. It failed with `CannotStart`
+                // over credentials it was never going to use.
+                //
+                // Read off an instance that already exists, so for a RUNNING
+                // app this is the identity that instance is already under and
+                // the resolve inside never happens. The failure arm is not
+                // dead code all the same: an entry that has never spawned has
+                // never resolved anything, and scaling one up is a real route
+                // to a passwd lookup that can fail.
+                //
+                // `CannotStart`, not `SpawnFailed`, and not `InvalidScale`.
+                // Nothing has been spawned, nothing removed, and the config
+                // write-back is still ahead, so the flock this returns on is
+                // untouched -- exactly the promise `CannotStart` documents.
+                // `SpawnFailed` would name a spawn that never happened, and
+                // `InvalidScale` maps to `InvalidConfig` and means "ask for a
+                // different count", which is not something the caller can do
+                // about a `user` that will not resolve.
+                //
+                // Measured, because the obvious claim for that choice is
+                // wrong: both `CannotStart` and `SpawnFailed` map to
+                // `RpcErrorCode::SpawnFailed`, and the CLI frames a reply by
+                // its CODE, so `shep stock` prints "error[spawn_failed]: the
+                // daemon reported SpawnFailed: <message>" either way. The
+                // operator's sentence does not change at all. What changes is
+                // what a caller matching `SupervisorError` sees, and what this
+                // daemon's own log says through the variant's `Display`.
+                let credentials = match self.credentials_for_spawn(slots[0].1) {
+                    Ok(credentials) => credentials,
+                    Err(err) => {
+                        let _ =
+                            reply.send(Err(SupervisorError::CannotStart(format!("{name}: {err}"))));
+                        return;
+                    }
+                };
                 let existing: Vec<u32> = slots.iter().map(|(instance, _)| *instance).collect();
                 let mut ids: Vec<u32> = slots.iter().map(|(_, id)| *id).collect();
                 for instance in instance_slots(&existing, count - current) {
@@ -3516,9 +3797,9 @@ impl<R: ProcessRunner> Actor<R> {
     /// live process in its slot buys the overlap nobody can use yet.
     ///
     /// Nothing here re-reads configuration. The replacement is assembled from
-    /// the drainee's stored [`ResolvedApp`] and the credentials resolved at
-    /// the first `Start`, which is what [`ProcessEntry::credentials`]' own
-    /// once-only rule requires; a config-rereading verb would be a different
+    /// the drainee's stored [`ResolvedApp`] and the credentials that instance
+    /// resolved at its own first spawn, which is what
+    /// [`ProcessEntry::credentials`]' own once-only rule requires; a config-rereading verb would be a different
     /// feature with a different argument shape.
     fn handle_reload(
         &mut self,
@@ -3756,13 +4037,20 @@ impl<R: ProcessRunner> Actor<R> {
     ///   function's own carve-out on the swap's phase instead.
     ///
     /// The mark is undone if the spawn fails, and nothing can observe it in
-    /// between — the actor is synchronous here and emits no event.
+    /// between — the actor is synchronous here and emits no event. An
+    /// identity that will not resolve returns before the mark is made at all,
+    /// which leaves the drainee where it stood by never moving it.
     fn spawn_replacement(&mut self, old_id: u32) -> Result<u32, String> {
+        // `Credentials` is `Copy`; reused, never re-resolved. A drainee is
+        // by definition running, so the seam finds a resolved identity and
+        // touches nothing -- but a reload must not be the one path that
+        // would fall back to the shepherd if that ever stopped holding.
+        let credentials = self
+            .credentials_for_spawn(old_id)
+            .map_err(|err| err.to_string())?;
         let drainee = &self.sheep[&old_id].entry;
         let app = drainee.spec.clone();
         let instance = drainee.instance;
-        // `Credentials` is `Copy`; reused, never re-resolved.
-        let credentials = drainee.credentials;
         let restarts = drainee.restarts;
         // Carried across the swap for the same reason `restarts` is: the
         // replacement is the same instance continuing, not a new one, and
@@ -3807,7 +4095,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: Some(tokio::time::Instant::now()),
                     budget: RestartBudget::default(),
                     reload: ReloadState::Replacement,
-                    credentials,
+                    credentials: SpawnIdentity::Resolved(credentials),
                     out_file,
                     err_file,
                     dog,
@@ -5552,12 +5840,20 @@ impl<R: ProcessRunner> Actor<R> {
         let supervisor = SupervisorHandle {
             tx: self.tx.clone(),
         };
-        // `Credentials` is `Copy`, which is why this needs no clone.
+        // `Credentials` is `Copy`, which is why this needs no clone. This
+        // spec is assembled for `spec_prober` alone and is never spawned, so
+        // the unresolved arm costs nothing: extras are armed only for a
+        // process that is already running, which resolved its identity
+        // before it could start.
+        let credentials = match slot.entry.credentials {
+            SpawnIdentity::Resolved(creds) => creds,
+            SpawnIdentity::Unresolved => None,
+        };
         let spec = assemble(
             &slot.entry.spec,
             slot.entry.instance,
             &self.paths,
-            slot.entry.credentials,
+            credentials,
         );
         self.registry
             .arm(&slot.entry, spec_prober(&spec), extras, &supervisor);
@@ -5570,8 +5866,11 @@ impl<R: ProcessRunner> Actor<R> {
     /// through more than one door. Adding a transition means adding a call
     /// here; the list is the checklist:
     ///
-    /// 1. `respawn`'s `Err` arm — a restart that could not spawn lands in
-    ///    `Errored` without ever going through `handle_exited`.
+    /// 1. `respawn_failed` — a restart that could not spawn, or one whose
+    ///    `user` could not be resolved, lands in `Errored` without ever
+    ///    going through `handle_exited`. Both of `respawn`'s failure routes
+    ///    reach it, which is why this entry names the function rather than
+    ///    one arm of its caller.
     /// 2. `apply_immediate`'s Stop arm — a `WaitingRestart` or `Errored`
     ///    sheep has no live task, so its stop resolves synchronously.
     /// 3. `apply_immediate`'s Delete arm — ditto, deregistered on the spot.
@@ -6504,8 +6803,8 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
     use crate::testing::{
-        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, harness, idle_stats,
-        probe_config, test_paths,
+        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, capture_logs, harness,
+        idle_stats, probe_config, test_paths,
     };
     // Test-only: the one case that drives a real `liveness_probe` has to
     // build the lifecycle extras the production wiring builds at boot, and
@@ -9231,6 +9530,13 @@ mod tests {
     /// all, `b-mine` running as the daemon rather than as the user it asked
     /// for, and `c-plain` absent.
     ///
+    /// `a-bad` IS registered under `PerApp`, deliberately, and holds
+    /// [`SpawnIdentity::Unresolved`] -- which is what this case reads. The
+    /// distinction matters here more than anywhere: absence used to be the
+    /// proof it had not inherited a neighbour's identity, and now the stored
+    /// identity is the proof directly, which is the stronger claim of the
+    /// two.
+    ///
     /// `#[cfg(unix)]`: `nix` is a unix-only dependency of this crate, and
     /// `privilege::resolve` refuses any user request off-platform anyway.
     #[cfg(unix)]
@@ -9283,23 +9589,27 @@ mod tests {
         };
         assert_eq!(
             identity("a-bad"),
-            None,
-            "an app with no resolvable user must not be registered at all, \
-             and must never inherit another app's identity"
+            Some(SpawnIdentity::Unresolved),
+            "an app with no resolvable user is registered `Errored` so it is \
+             visible, and must hold NO identity: `Unresolved` is what stops a \
+             later restart reusing one, and it is also the proof this app did \
+             not inherit b-mine's"
         );
         assert_eq!(
             identity("b-mine"),
-            Some(Some(Credentials {
+            Some(SpawnIdentity::Resolved(Some(Credentials {
                 uid: own_uid.as_raw(),
                 gid: None
-            })),
+            }))),
             "the app that asked for a user must run as that user"
         );
         assert_eq!(
             identity("c-plain"),
-            Some(None),
+            Some(SpawnIdentity::Resolved(None)),
             "the app that asked for no user must be registered, and must run \
-             as the daemon rather than as somebody else's uid"
+             as the daemon rather than as somebody else's uid. `Resolved(None)` \
+             rather than a bare `None`: this app was ASKED, and answered \
+             nobody, which is not the same fact as never having been asked"
         );
     }
 
@@ -14052,6 +14362,490 @@ mod tests {
             stdin: false,
             credentials: None,
         }
+    }
+
+    // --- Identity: which user a spawn actually runs as ----------------
+    //
+    // `ProcessEntry::credentials` decides the uid a child comes up under,
+    // and nothing on the wire reports it: `ProcessInfo` carries no identity
+    // field, and `shep describe` shows an app running as the shepherd
+    // exactly as it shows one running as the user it asked for. So every
+    // case below asserts the identity a spawn CARRIED -- read off the
+    // `SpawnSpec` the runner was handed, through `ScriptedRunner::spawned_as`
+    // -- or the identity the entry stored. A case that asserted a row exists,
+    // or that a restart succeeded, would pass just as happily on the silent
+    // downgrade these exist to catch.
+
+    /// A bare actor holding nothing at all, for the cases that drive
+    /// registration and respawn directly.
+    ///
+    /// Direct because neither of the things they assert on is reachable from
+    /// outside: [`ProcessEntry::credentials`] is crate-internal by design,
+    /// and the identity a spawn carried lives on the `SpawnSpec` the runner
+    /// received rather than on any reply.
+    fn actor_with_an_empty_flock(
+        dir: &tempfile::TempDir,
+        scripts: Vec<ProcScript>,
+    ) -> Actor<ScriptedRunner> {
+        let (events, _events_rx) = broadcast::channel(64);
+        let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
+        Actor {
+            runner: ScriptedRunner::new(scripts),
+            paths: test_paths(dir),
+            events,
+            tx,
+            sheep: HashMap::new(),
+            next_id: 0,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+            smits: Smits::new(),
+        }
+    }
+
+    /// The name this test process is already running under.
+    ///
+    /// The only user a non-root test can ask for and get a real, permitted
+    /// passwd lookup out of: `privilege::resolve` refuses any request that
+    /// would CHANGE identity unless the daemon is root, and becoming
+    /// ourselves changes nothing.
+    #[cfg(unix)]
+    fn own_user_name() -> String {
+        nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .unwrap()
+            .expect("this process has a passwd entry")
+            .name
+    }
+
+    /// A user name no passwd database has an entry for, so `resolve` fails
+    /// the same way whether or not the test runs as root.
+    const NO_SUCH_USER: &str = "definitely-not-a-real-shep-user";
+
+    // fails if an app restored from the muster roll comes back running as
+    // the shepherd. `register_at_rest` records membership and never resolves
+    // anything, so the entry's identity is unresolved until its first spawn;
+    // a respawn that read that as "this app asked for nobody" would hand the
+    // child the daemon's own identity instead of the configured one, with no
+    // error anywhere.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_app_restarts_under_its_configured_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+        let app = app_with("web", |app| app.user = Some(own_user_name()));
+
+        let info = actor.register_at_rest(&app);
+        assert_eq!(
+            actor.sheep[&info.id].entry.credentials,
+            SpawnIdentity::Unresolved,
+            "a membership record is not a `Start`: nothing has looked this app's user up yet"
+        );
+
+        actor.respawn(info.id, true);
+
+        let wanted = Credentials {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: None,
+        };
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(wanted),
+            "the restarted child must carry the identity its `user` resolves to; `None` here is \
+             the child running as the shepherd, which is the downgrade"
+        );
+        assert_eq!(
+            actor.sheep[&info.id].entry.credentials,
+            SpawnIdentity::Resolved(Some(wanted)),
+            "resolved once at the first spawn and stored, so no later restart looks it up again"
+        );
+    }
+
+    // fails if a restored app whose `user` cannot be resolved is started as
+    // the shepherd instead of refused. A `Start` refuses this config
+    // outright; reaching a spawn through the roll must not be a way around
+    // that.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_app_whose_user_cannot_be_resolved_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+
+        let info = actor.register_at_rest(&app);
+        let after = actor.respawn(info.id, true);
+
+        assert_eq!(
+            actor.runner.spawn_count(),
+            0,
+            "nothing may be spawned for an app whose identity could not be resolved"
+        );
+        assert_eq!(after.status, ProcStatus::Errored);
+        assert_eq!(
+            actor.sheep[&info.id].entry.credentials,
+            SpawnIdentity::Unresolved,
+            "a failed resolution settles nothing: the next restart must ask again"
+        );
+    }
+
+    // fails if a restart re-resolves an identity the entry already holds.
+    // The pinned uid below is one no lookup of this app's `user` could
+    // produce, so a respawn that touched the passwd database again would
+    // come back with this machine's own uid and be seen doing it.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_reuses_a_resolved_identity_rather_than_looking_it_up_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _rx) = actor_with_one_online_sheep(&dir, vec![ProcScript::never_exits()]);
+        let pinned = Credentials {
+            uid: 4242,
+            gid: Some(4243),
+        };
+        let entry = &mut actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registers id 0")
+            .entry;
+        entry.spec = app_with("web", |app| app.user = Some(own_user_name()));
+        entry.credentials = SpawnIdentity::Resolved(Some(pinned));
+
+        actor.respawn(0, true);
+
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(pinned),
+            "a running app's identity must survive its restart untouched"
+        );
+    }
+
+    // fails if a `PerApp` start refused over credentials leaves nothing
+    // behind. The refusal is one line in the shepherd's log, and `PerApp` is
+    // the muster restore and the dog, where nobody is reading those -- so
+    // the app has to be visible as `Errored` instead of missing.
+    //
+    // `#[cfg(unix)]` for the same reason as its neighbours: the refusal it
+    // asserts comes from resolving a user against the passwd database, and
+    // Windows has none, so there is nothing for `NO_SUCH_USER` to fail
+    // against. Without the gate the test compiles there and fails on
+    // `expect_err`, which is what CI's three Windows legs reported.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_start_refused_over_credentials_leaves_an_errored_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+
+        let err = actor
+            .do_start(vec![app], None, BatchPolicy::PerApp)
+            .expect_err("an unresolvable user must refuse the start");
+        assert!(
+            err.to_string().contains(NO_SUCH_USER),
+            "the refusal must name the user it could not resolve: {err}"
+        );
+
+        assert_eq!(actor.runner.spawn_count(), 0);
+        let slot = actor
+            .sheep
+            .values()
+            .next()
+            .expect("the refusal must leave a row rather than vanishing");
+        assert_eq!(slot.entry.status, ProcStatus::Errored);
+        assert_eq!(
+            slot.entry.credentials,
+            SpawnIdentity::Unresolved,
+            "the row must not claim a settled identity: a `restart` would reuse it and bring the \
+             sheep up as the shepherd, which is the bug the row was added to make visible"
+        );
+
+        // And the row is inert rather than dangerous: restarting it meets
+        // the same refusal instead of starting anything.
+        let id = slot.entry.id;
+        let after = actor.respawn(id, true);
+        assert_eq!(after.status, ProcStatus::Errored);
+        assert_eq!(actor.runner.spawn_count(), 0);
+    }
+
+    // fails if the row above leaks into `AllOrNothing`, whose whole contract
+    // is that a refused batch registers nothing. One `Errored` row and no
+    // others is the flock-matching-neither-state that policy exists to
+    // prevent, and the operator who typed `shep start` is holding a terminal
+    // to read the refusal instead.
+    //
+    // `#[cfg(unix)]` for the reason its neighbour above gives.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_all_or_nothing_start_refused_over_credentials_registers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+
+        let err = actor
+            .do_start(vec![app], None, BatchPolicy::AllOrNothing)
+            .expect_err("an unresolvable user must refuse the start");
+        assert!(
+            err.to_string().contains(NO_SUCH_USER),
+            "the refusal must name the user it could not resolve: {err}"
+        );
+        assert!(
+            actor.sheep.is_empty(),
+            "`AllOrNothing` registers nothing at all, this app included"
+        );
+        assert_eq!(actor.runner.spawn_count(), 0);
+    }
+
+    // fails if scaling up an app whose `user` will not resolve spawns
+    // anything, changes the stored count, or reports the refusal as a spawn
+    // that failed. Reachable because an app registered at rest has never
+    // resolved its identity: it is the muster roll's own entry, one `shep
+    // stock` away from a passwd lookup.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn scaling_an_app_whose_user_will_not_resolve_leaves_the_flock_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 4]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+        let registered = actor.register_at_rest(&app);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_scale("web", 3, reply);
+        let err = answer
+            .await
+            .expect("handle_scale answers every call")
+            .expect_err("an unresolvable user must refuse the scale");
+
+        // `CannotStart` rather than `SpawnFailed`: no spawn was attempted, and
+        // the flock is exactly as it was.
+        let SupervisorError::CannotStart(message) = &err else {
+            panic!("expected CannotStart, got {err:?}");
+        };
+        assert!(
+            message.contains("web") && message.contains(NO_SUCH_USER),
+            "the refusal must name the app and the user it could not resolve: {message}"
+        );
+        assert_eq!(actor.runner.spawn_count(), 0);
+        assert_eq!(
+            actor.sheep.len(),
+            1,
+            "no instance may be registered by a scale that could not resolve an identity"
+        );
+        assert_eq!(
+            actor.sheep[&registered.id].entry.spec.config().instances,
+            1,
+            "the stored count must not be written back for a scale that did not happen"
+        );
+        assert_eq!(
+            actor.sheep[&registered.id].entry.credentials,
+            SpawnIdentity::Unresolved,
+            "a failed resolution settles nothing: the next attempt must ask again"
+        );
+    }
+
+    // fails if a SECOND restore over an existing errored row announces it
+    // again. `register_without_spawning` is idempotent by name, so the second
+    // call finds the row rather than making one, and nothing transitioned --
+    // but an emit keyed on the row's STATUS cannot tell the row it found from
+    // the row it created, because both are `Errored`.
+    //
+    // Reachable: `start_restored` uses `PerApp`, so any second muster restore
+    // over a flock already holding the row hits it whenever the app's `user`
+    // still does not resolve. Bark's `Trigger::GaveUp` would read the repeat
+    // as a fresh transition and page a second time, once the two restores are
+    // further apart than its five-minute per-subject debounce.
+    //
+    // Counts events rather than checking the row still exists, which is what
+    // the row-shaped assertions in the cases above already do and what would
+    // pass either way.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_second_restore_does_not_re_announce_an_errored_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 2]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+        let mut events = actor.events.subscribe();
+
+        for attempt in 1..=2 {
+            assert!(
+                actor
+                    .do_start(vec![app.clone()], None, BatchPolicy::PerApp)
+                    .is_err(),
+                "restore {attempt} must refuse the app"
+            );
+        }
+
+        assert_eq!(
+            actor.sheep.len(),
+            1,
+            "the second restore must find the row, not add a second one"
+        );
+
+        let mut errored = 0;
+        while let Ok(event) = events.try_recv() {
+            if let BusEvent::Process {
+                event: ProcessEventKind::Errored,
+                info,
+                ..
+            } = event
+                && info.name == "web"
+            {
+                errored += 1;
+            }
+        }
+        assert_eq!(
+            errored, 1,
+            "one Errored event, for the restore that actually registered the row: a second is a \
+             transition that did not happen"
+        );
+    }
+
+    // fails if the `Errored` row a refused start leaves behind can be scaled
+    // up into running processes. It is the second of the two things that
+    // carry an unresolved identity, and the one `scale`'s own `# Errors`
+    // names without anything else covering it: its `user` is already known
+    // not to resolve, which is why the row is there at all, so the scale must
+    // meet the same refusal the start did.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn scaling_up_the_row_a_refused_start_left_meets_the_same_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 4]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+
+        // The row, made the way an unattended boot makes it.
+        actor
+            .do_start(vec![app], None, BatchPolicy::PerApp)
+            .expect_err("an unresolvable user must refuse the start");
+        let id = actor
+            .sheep
+            .values()
+            .next()
+            .expect("the refused start leaves a row")
+            .entry
+            .id;
+        assert_eq!(actor.sheep[&id].entry.status, ProcStatus::Errored);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_scale("web", 3, reply);
+        let err = answer
+            .await
+            .expect("handle_scale answers every call")
+            .expect_err("the row's user still will not resolve");
+
+        assert!(
+            matches!(err, SupervisorError::CannotStart(_)),
+            "expected CannotStart, got {err:?}"
+        );
+        assert_eq!(actor.runner.spawn_count(), 0);
+        assert_eq!(
+            actor.sheep.len(),
+            1,
+            "no instance may be registered by a scale that could not resolve an identity"
+        );
+    }
+
+    // fails if a scale that needs no spawn asks the passwd database anything.
+    // A resolvable user, so the question WOULD be answered if it were asked:
+    // what this reads is that the entry's identity is still unresolved
+    // afterwards, which it could not be if a lookup had run and stored its
+    // answer. `count == current` spawns nothing, so there is nothing for an
+    // identity to be resolved FOR.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_no_op_scale_asks_no_passwd_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 2]);
+        let app = app_with("web", |app| app.user = Some(own_user_name()));
+        let registered = actor.register_at_rest(&app);
+
+        // `register_at_rest` always registers `instance: 0` whatever
+        // `instances` says, so a restored app's `current` is 1 and this is the
+        // `Ordering::Equal` arm.
+        let (reply, answer) = oneshot::channel();
+        actor.handle_scale("web", 1, reply);
+        answer
+            .await
+            .expect("handle_scale answers every call")
+            .expect("scaling to the count an app already has is a no-op");
+
+        assert_eq!(
+            actor.sheep[&registered.id].entry.credentials,
+            SpawnIdentity::Unresolved,
+            "a scale that spawns nothing must not resolve an identity: nothing would use it, \
+             and asking is what lets the answer refuse the call"
+        );
+        assert_eq!(actor.runner.spawn_count(), 0);
+    }
+
+    // fails if a genuine no-op is refused over credentials it never needed.
+    // The user here cannot be resolved, so a scale that asks is a scale that
+    // fails -- and `shep stock <name> 1` on a restored app is exactly the
+    // call an operator re-running a provisioning script makes.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_no_op_scale_survives_a_user_that_will_not_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 2]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+        let registered = actor.register_at_rest(&app);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_scale("web", 1, reply);
+        let scaled = answer
+            .await
+            .expect("handle_scale answers every call")
+            .expect("a no-op scale must not be refused over an identity it never needed");
+
+        assert_eq!(scaled.instances.len(), 1);
+        assert_eq!(actor.runner.spawn_count(), 0);
+        assert_eq!(
+            actor.sheep[&registered.id].entry.status,
+            ProcStatus::Stopped,
+            "a no-op must leave the sheep exactly as it found it"
+        );
+    }
+
+    // fails if either route into `respawn_failed` lands a sheep in `Errored`
+    // without saying why. The event it emits carries no reason and the
+    // deferred reply has no per-id error slot, so this log line is all an
+    // operator has: the spawn-failure route used to bind the runner's error
+    // as `_error` and drop it, leaving a binary replaced mid-deploy or an
+    // `EAGAIN` with an `errored` row and nothing to read.
+    //
+    // `#[test]` with a `block_on` inside, not `#[tokio::test]`:
+    // `capture_logs` scopes its subscriber to one thread and needs a
+    // synchronous closure, the same pattern `boot.rs` established.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_that_starts_nothing_says_why_in_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Route one: no script to pop, so the runner refuses the spawn.
+        let refused = capture_logs(|| {
+            let mut actor = actor_with_an_empty_flock(&dir, Vec::new());
+            let info = actor.register_at_rest(&app_with("web", |_| {}));
+            rt.block_on(async { actor.respawn(info.id, true) });
+        });
+        assert!(
+            refused.contains("script exhausted"),
+            "the runner's own reason must reach the log: {refused}"
+        );
+
+        // Route two: the identity cannot be resolved, so no spawn is
+        // attempted at all.
+        let unresolved = capture_logs(|| {
+            let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+            let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+            let info = actor.register_at_rest(&app);
+            rt.block_on(async { actor.respawn(info.id, true) });
+        });
+        assert!(
+            unresolved.contains(NO_SUCH_USER),
+            "the unresolvable user must reach the log by name: {unresolved}"
+        );
     }
 
     // ---------------------------------------------------------------

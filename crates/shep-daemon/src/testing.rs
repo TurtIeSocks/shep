@@ -26,6 +26,7 @@ use crate::fake::{FIRST_SCRIPTED_PID, ProcScript, ScriptedRunner};
 use crate::limits::sample::{MemorySampler, ProcessIdentity, ProcessRss};
 use crate::limits::stats::StatsState;
 use crate::limits::{LimitBreach, LimitEnforcer};
+use crate::privilege::SpawnIdentity;
 use crate::probes::{LivenessFailure, ProbeFailure, Prober};
 use crate::rpc::RpcContext;
 use crate::runner::{ProcIo, ProcessRunner, RunnerError, SpawnSpec};
@@ -580,7 +581,9 @@ pub(crate) fn armed_entry(
         started_at: None,
         budget: RestartBudget::default(),
         reload: ReloadState::None,
-        credentials: None,
+        // Online, so its identity is settled: this entry stands in for one
+        // the actor really registered through a `Start`.
+        credentials: SpawnIdentity::Resolved(None),
         out_file: spec.out_file,
         err_file: spec.err_file,
         dog: None,

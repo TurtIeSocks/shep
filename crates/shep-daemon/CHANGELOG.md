@@ -82,10 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own credentials from the point of resolution, so there is no second
   sequence to keep in step.
 
-  An app whose credentials fail is skipped rather than registered `Errored`,
-  unlike an app whose spawn fails. Nothing can be assembled without an
-  identity to assemble it for, and running it under the daemon's own identity
-  instead is the outcome being ruled out. Both are named in the error.
+  Under `PerApp`, an app whose credentials fail is registered `Errored` like
+  an app whose spawn fails, so it is visible in `shep flock` rather than
+  missing from it. It carries no identity, which is what still rules out the
+  outcome that matters: a later `shep restart` resolves it afresh and meets
+  the same refusal instead of coming up as the daemon. `AllOrNothing`
+  registers nothing at all, as it always has. Both causes are named in the
+  error either way.
 
   The policy governs the SPAWN loop as well as the pre-registration check.
   That loop returned on the first failure whatever the policy said, so a bad
@@ -127,10 +130,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inconsistency this change exists to end, one layer down. It now calls
   `sort_flock`, so the two cannot drift.
 
+- A sheep restored from the muster roll comes back under its configured
+  `user`/`group` rather than under the shepherd. `register_at_rest` records
+  membership without resolving anything, and `ProcessEntry::credentials`
+  spelled "nobody has looked this app up yet" and "this app asked for nobody"
+  the same way, as `None`. A later `shep restart` read the second meaning and
+  started the child as the daemon: no error, no warning, and nothing in `shep
+  describe` to see it by. The field is now a `SpawnIdentity`, which tells the
+  two apart, and every spawn path reaches a usable `Option<Credentials>`
+  through one seam that resolves an unresolved entry instead of falling back.
+  An app that resolved once is still settled for good, so a restart neither
+  re-reads the passwd database nor changes a running app's identity underneath
+  it.
+
+- Announce a credential-refused row once, not on every restore. The
+  `Errored` row a `PerApp` start leaves is registered idempotently by name, so
+  a second muster restore over a flock already holding it finds the row rather
+  than making one. The `ProcessEventKind::Errored` emit keyed on the row's
+  STATUS, which is `Errored` whether the call created it or found it, so the
+  repeat went out as a fresh transition and bark's `Trigger::GaveUp` read it as
+  one, paging twice for a row that had not changed whenever the two restores
+  sat further apart than its five-minute debounce. It keys on the registration now: `register_without_spawning` returns
+  whether it made the row, which is a question the row itself cannot answer.
+
+- Say why a restart produced no process. The event a failed restart emits
+  carries no reason and the reply has no per-id error slot, so the shepherd's
+  log was the only place to learn that a binary had been replaced mid-deploy
+  or that `fork` returned `EAGAIN` -- and that path discarded the runner's
+  error, leaving an `errored` row and nothing to read. The reason is now an
+  argument to the one function both failure routes go through, so there is no
+  way into that state without one.
+
 ### Additions
 
-- Add `SupervisorError::CannotStart`, a `Start` batch refused before anything
-  was registered. Separate from `SpawnFailed` because nothing was spawned,
+- Add `SupervisorError::CannotStart`, a command refused before it registered
+  or spawned anything: a `Start` batch whose checking pass rejected an app, or
+  a `shep stock` scale-UP of an app whose `user` will not resolve. A scale
+  that removes instances, or that asks for the count an app already has,
+  resolves nothing and cannot reach it. Separate from `SpawnFailed` because nothing was spawned,
   and an operator told "spawn failed" about a spawn that never happened is
   being pointed at the wrong place; the two also differ in what they leave
   behind, which is the part that matters operationally. It maps to the
@@ -160,6 +197,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule `Start` follows plus one of its own: an unnormalized config would
   report every default it did not spell out as a difference from the
   normalized copy the flock stores.
+
+- `privilege::SpawnIdentity` — an entry's identity and whether it has been
+  resolved yet, which tells "this app asked for nobody" apart from "nobody
+  has asked yet". Both credential fixes above turn on that distinction.
+- `fake::ScriptedRunner::spawned_as` and `spawn_count`, behind `test-fakes`.
+  The fake starts no process, so it drops no privilege and changes no identity
+  at all. Recording what a spawn was ASKED for is therefore the only way a test
+  can assert the identity it carried rather than merely that it happened.
 
 ## [0.1.0] - 2026-08-26
 

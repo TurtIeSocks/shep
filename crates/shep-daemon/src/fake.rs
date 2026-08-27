@@ -14,6 +14,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::channel::{ChildMessage, ShepherdMessage};
+use crate::privilege::Credentials;
 use crate::runner::{
     ExitOutcome, LogCtl, LogLine, Preflight, ProcIo, ProcessRunner, RunnerError, RunningProcess,
     SpawnSpec, StdinWrite, StopSignal,
@@ -370,6 +371,15 @@ struct SpawnedProc {
     /// Every line written to this spawn's stdin, in write order — read back
     /// via [`ScriptedRunner::stdin_lines`].
     stdin_lines: Arc<Mutex<Vec<String>>>,
+    /// The identity this spawn was asked to run under, copied off
+    /// [`SpawnSpec::credentials`] — read back via
+    /// [`ScriptedRunner::spawned_as`].
+    ///
+    /// The fake runs no program, so it cannot BECOME anyone; recording what
+    /// it was asked for is the only way a supervisor-tier test can assert
+    /// the identity a spawn actually carried rather than merely that a
+    /// spawn happened.
+    credentials: Option<Credentials>,
 }
 
 /// The pid [`ScriptedRunner`] gives the first proc it spawns; each later
@@ -462,6 +472,34 @@ impl ScriptedRunner {
             .iter()
             .map(|p| p.state.kill_count.load(Ordering::SeqCst))
             .collect()
+    }
+
+    /// The credentials the spawn at `spawn_index` was asked to apply, as
+    /// they stood on its [`SpawnSpec`].
+    ///
+    /// `None` means the spawn carried no credentials at all, which is the
+    /// child running as the shepherd. A test about a privilege drop must
+    /// assert on THIS rather than on the spawn's existence: a downgraded
+    /// spawn and a correct one are alike in every other way the fake can
+    /// report.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    #[track_caller]
+    pub fn spawned_as(&self, spawn_index: usize) -> Option<Credentials> {
+        self.spawned.lock().unwrap()[spawn_index].credentials
+    }
+
+    /// How many spawns this runner has been asked for.
+    ///
+    /// A refused spawn that never reached the runner does not appear here,
+    /// which is what lets a test say "nothing was started" rather than
+    /// "nothing came up".
+    #[must_use]
+    pub fn spawn_count(&self) -> usize {
+        self.spawned.lock().unwrap().len()
     }
 
     /// Every raw signal number an explicit `signal()` call has recorded for
@@ -624,15 +662,28 @@ impl ProcessRunner for ScriptedRunner {
         Preflight::Unknown
     }
 
-    /// Every field of `spec` besides `spec.channel` is still read by nothing
-    /// here: the fake writes no files (`spec.out_file`/`err_file`) and runs
-    /// no program (`spec.program`/`args`/`env`/`cwd`/`credentials`), which is
-    /// what keeps it deterministic and instant under the paused clock — see
-    /// this module's own top-level `WHY`. `spec.channel` is the one exception,
-    /// because `begin_action` (`supervisor.rs`) now treats "does this sheep
-    /// have a channel" as load-bearing, and a fake that answered that
-    /// question wrong for every spawn would be worse than one that could not
-    /// answer it at all. What that one flag changes is below, gated on it.
+    /// Six fields of `spec` are read by nothing here: `program`, `args`,
+    /// `env` and `cwd`, because the fake runs no program, and `out_file` and
+    /// `err_file`, because it writes no files. That is what keeps it
+    /// deterministic and instant under the paused clock — see this module's
+    /// own top-level `WHY`.
+    ///
+    /// The other four are read, and this list is the whole of it rather than
+    /// a blanket claim with exceptions hung off it. That shape is what let
+    /// the paragraph go stale twice:
+    ///
+    /// - `name`, to match against [`ScriptedRunner::failing_to_spawn`], so a
+    ///   case can pick WHICH app's spawn refuses.
+    /// - `channel`, because `begin_action` (`supervisor.rs`) treats "does
+    ///   this sheep have a channel" as load-bearing, and a fake that
+    ///   answered that wrong for every spawn would be worse than one that
+    ///   could not answer at all. What it changes is below, gated on it.
+    /// - `stdin`, gated the same way and for the same reason.
+    /// - `credentials`, recorded rather than applied. The fake starts no
+    ///   process, so it drops no privilege and changes no identity at all,
+    ///   which is exactly why recording what it was ASKED for is the only way
+    ///   a test can assert the identity a spawn carried, through
+    ///   [`ScriptedRunner::spawned_as`].
     ///
     /// Real fd-3 delivery, refusal, and timeout — the facts this flag alone
     /// cannot reach, since nothing here is a real socketpair to a real child
@@ -835,6 +886,7 @@ impl ProcessRunner for ScriptedRunner {
             reopens,
             flushes,
             stdin_lines,
+            credentials: spec.credentials,
         });
         drop(spawned);
 
