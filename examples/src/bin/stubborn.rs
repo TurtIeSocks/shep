@@ -1,10 +1,13 @@
-//! Traps `SIGTERM` and refuses to die, so `graceful_timeout` elapses and shep
-//! escalates to `SIGKILL`.
+//! Traps `SIGTERM` and refuses to die, so `kill_timeout` elapses and shep
+//! escalates to `SIGKILL`. (`kill_timeout`, not `graceful_timeout` --
+//! that field only governs a *reload*'s drain window for the old instance;
+//! the grace period between a plain stop signal and SIGKILL is
+//! `kill_timeout`, and that's what `examples/Flockfile.toml` sets below.)
 //!
 //! A survey of 131 real repositories behind this example found nothing that
 //! does this on purpose, which is exactly why the escalation path has never
 //! been watched by a person: every real app dies on the first signal, so
-//! `graceful_timeout`'s expiry and shep's follow-up `SIGKILL` only ever fire
+//! `kill_timeout`'s expiry and shep's follow-up `SIGKILL` only ever fire
 //! in a test. Stop this one with `shep stop` and watch both happen for real.
 //!
 //! # Usage
