@@ -662,19 +662,26 @@ impl ProcessRunner for ScriptedRunner {
         Preflight::Unknown
     }
 
-    /// Every field of `spec` besides `spec.channel` is still read by nothing
-    /// here: the fake writes no files (`spec.out_file`/`err_file`) and runs
-    /// no program (`spec.program`/`args`/`env`/`cwd`), which is
-    /// what keeps it deterministic and instant under the paused clock — see
-    /// this module's own top-level `WHY`. `spec.channel` is the one exception,
-    /// because `begin_action` (`supervisor.rs`) now treats "does this sheep
-    /// have a channel" as load-bearing, and a fake that answered that
-    /// question wrong for every spawn would be worse than one that could not
-    /// answer it at all. What that one flag changes is below, gated on it.
+    /// Six fields of `spec` are read by nothing here: `program`, `args`,
+    /// `env` and `cwd`, because the fake runs no program, and `out_file` and
+    /// `err_file`, because it writes no files. That is what keeps it
+    /// deterministic and instant under the paused clock — see this module's
+    /// own top-level `WHY`.
     ///
-    /// `spec.credentials` is recorded rather than applied — the fake becomes
-    /// nobody — so a test can assert the identity a spawn carried through
-    /// [`ScriptedRunner::spawned_as`].
+    /// The other four are read, and this list is the whole of it rather than
+    /// a blanket claim with exceptions hung off it. That shape is what let
+    /// the paragraph go stale twice:
+    ///
+    /// - `name`, to match against [`ScriptedRunner::failing_to_spawn`], so a
+    ///   case can pick WHICH app's spawn refuses.
+    /// - `channel`, because `begin_action` (`supervisor.rs`) treats "does
+    ///   this sheep have a channel" as load-bearing, and a fake that
+    ///   answered that wrong for every spawn would be worse than one that
+    ///   could not answer at all. What it changes is below, gated on it.
+    /// - `stdin`, gated the same way and for the same reason.
+    /// - `credentials`, recorded rather than applied — the fake becomes
+    ///   nobody — so a test can assert the identity a spawn carried, through
+    ///   [`ScriptedRunner::spawned_as`].
     ///
     /// Real fd-3 delivery, refusal, and timeout — the facts this flag alone
     /// cannot reach, since nothing here is a real socketpair to a real child
