@@ -102,18 +102,60 @@ pub async fn kill_with_wait(client: Client, streams: &mut Streams<'_>, wait: Dur
     }
 }
 
-/// Polls for `socket` to disappear, checking every [`KILL_POLL_INTERVAL`],
-/// up to `wait`. Returns whether it actually disappeared within budget.
+/// Polls for the control address to stop answering, checking every
+/// [`KILL_POLL_INTERVAL`], up to `wait`. Returns whether it actually went
+/// away within budget.
+///
+/// **The two platforms ask a different question here, because the address is
+/// a different kind of thing.** On unix it is a socket FILE, and the daemon
+/// unlinks it on its way out, so its absence is the proof that the shutdown
+/// finished. On Windows it is a named pipe: there is no directory entry to
+/// watch, and `Path::exists` on `\\.\pipe\...` answers about a filesystem
+/// that has no such path — it would return `false` immediately and report a
+/// shutdown as complete the instant it was requested, which is exactly the
+/// false success `shep kill`'s own contract exists to prevent.
+///
+/// So the Windows arm probes the pipe instead. A pipe stops existing when
+/// its last handle closes, which happens when the daemon exits, so a connect
+/// that fails with `ERROR_FILE_NOT_FOUND` is the same evidence the missing
+/// socket file gives on unix. `ERROR_PIPE_BUSY` is deliberately treated as
+/// STILL ALIVE rather than gone: it means the pipe is there and every
+/// instance is in use, which is a daemon that has not finished.
 async fn wait_for_socket_to_disappear(socket: &Path, wait: Duration) -> bool {
     let start = Instant::now();
     loop {
-        if !socket.exists() {
+        if !control_address_answers(socket) {
             return true;
         }
         if start.elapsed() >= wait {
             return false;
         }
         tokio::time::sleep(KILL_POLL_INTERVAL).await;
+    }
+}
+
+/// Whether the control address is still there — see
+/// [`wait_for_socket_to_disappear`] for why this is a file check on one
+/// platform and a connect probe on the other.
+fn control_address_answers(socket: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        socket.exists()
+    }
+    #[cfg(windows)]
+    {
+        /// `ERROR_FILE_NOT_FOUND` — the pipe name no longer exists, which is
+        /// what a departed daemon leaves behind.
+        const ERROR_FILE_NOT_FOUND: i32 = 2;
+        match std::fs::OpenOptions::new().read(true).open(socket) {
+            // Connected: something is still serving.
+            Ok(_) => true,
+            Err(err) if err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => false,
+            // Anything else (busy, access denied) means the pipe is still
+            // present. Fail towards "still alive" so `shep kill` reports a
+            // timeout rather than a shutdown that did not happen.
+            Err(_) => true,
+        }
     }
 }
 
@@ -131,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn kill_waits_for_the_socket_to_disappear_before_reporting_success() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         // A fake daemon that replies ShuttingDown, waits, THEN unlinks.
         let (client, daemon) = fake_client_on(&path).await;
         daemon.reply_shutting_down_then_unlink_after(Duration::from_millis(120));
@@ -155,13 +197,29 @@ mod tests {
         );
     }
 
+    /// `cfg(unix)` because the FAKE's mechanism is unix-only, not because
+    /// the behaviour is. `reply_shutting_down_and_never_unlink` simulates a
+    /// wedged teardown by declining to unlink a socket FILE — and a named
+    /// pipe has no file to decline to unlink. The pipe stops existing when
+    /// its owner's last handle closes, so a fake that is still running
+    /// cannot represent "the shepherd said it was going and then did not
+    /// go".
+    ///
+    /// The production code this guards DOES have a Windows arm:
+    /// `control_address_answers` probes the pipe rather than stat-ing a
+    /// path, and deliberately reads `ERROR_PIPE_BUSY` as still-alive so a
+    /// wedged daemon times out instead of reporting success. That arm was
+    /// exercised against a real Windows shepherd (`shep kill` reported
+    /// `SOCKET_REMOVED true` only once the daemon had actually exited);
+    /// what is missing here is a fake that can reproduce it, not the code.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_teardown_that_never_finishes_reports_in_progress_not_success() {
         // Fake daemon replies ShuttingDown and never unlinks. Uses an injected
         // short wait, not KILL_TEARDOWN_WAIT — the test proves the branch, not
         // that ten seconds elapse.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_on(&path).await;
         daemon.reply_shutting_down_and_never_unlink();
 
