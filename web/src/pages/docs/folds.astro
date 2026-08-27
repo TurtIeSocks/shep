@@ -87,12 +87,12 @@ error[not_found]: the daemon reported NotFound: selector matched no registered s
 
     <h2>Selecting one from any verb</h2>
     <p>
-      Every verb that takes a selector (<code>stop</code>,
-      <code>restart</code>, <code>delete</code>, <code>bleats</code>,
-      <code>trigger</code>, and the rest) accepts
-      <code>fold:&lt;name&gt;</code> in place of a name, an id, a
-      <code>/regex/</code>, or <code>all</code>. It reaches every sheep
-      carrying that fold in one call:
+      Every verb accepts <code>fold:&lt;name&gt;</code> in place of a name,
+      an id, a <code>/regex/</code>, a glob, or <code>all</code>. That is
+      <code>stop</code>, <code>restart</code>, <code>reload</code>,
+      <code>delete</code>, <code>bleats</code>, <code>trigger</code>,
+      <code>start</code>, and the rest. It reaches every sheep carrying that
+      fold in one call:
     </p>
     <CodeBlock>{`$ shep stop fold:backend
 ID  NAME    STATUS   PID    RESTARTS  EXIT     CPU  MEM    UPTIME  FOLD     SMIT
@@ -103,6 +103,47 @@ ID  NAME    STATUS   PID    RESTARTS  EXIT     CPU  MEM    UPTIME  FOLD     SMIT
       The listing is the whole flock, not just the fold. Every lifecycle verb
       prints it that way, so <code>cron</code> is there and still online. See
       <a href="/docs/output#after-a-lifecycle-command">terminal output</a>.
+    </p>
+
+    <h2>Folds on <code>start</code></h2>
+    <p>
+      <code>shep start</code> takes selectors like every other verb, and it
+      also takes the things only it can take: a script path, a Flockfile, or
+      <code>-</code> for Flockfile JSON on stdin. That makes some targets
+      ambiguous, so it resolves one in a fixed order and the first tier that
+      matches wins.
+    </p>
+    <div class="rows">
+      <div class="row"><span>1. a sheep</span><span>by id or by name</span></div>
+      <div class="row"><span>2. a fold</span><span><code>fold:backed</code>, or just <code>backed</code></span></div>
+      <div class="row"><span>3. a Flockfile</span><span>by its extension</span></div>
+      <div class="row"><span>4. a path</span><span>started as a script</span></div>
+    </div>
+    <p>
+      So <code>shep start backed</code> starts the fold even when a file
+      called <code>backed</code> is sitting right there in the current
+      directory. Write <code>./backed</code> when you mean the file. That
+      works whatever your sheep are called: a sheep name may never contain a
+      path separator, so a target carrying one is always a path.
+    </p>
+    <p>
+      Only sheep the flock already has can be reached this way. A fold is a
+      field on a registered sheep, so there is nothing for a fold to
+      register. A sheep that is already running is reported and left alone;
+      <code>restart</code> is the verb that replaces one.
+    </p>
+    <CodeBlock>{`$ shep start fold:backed
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM    UPTIME  FOLD    SMIT
+0   golbat  online  19303  1         -     -    32.0K  0s      backed  -
+1   koji    online  19304  1         -     -    32.0K  0s      backed  -
+2   rotom   online  19260  0         -     -    32.0K  0s      front   -
+
+$ shep start fold:typo
+error[not_found]: no sheep is in a fold called typo`}</CodeBlock>
+    <p>
+      A selector that matched nothing is <code>not_found</code>, exit 3, the
+      same as everywhere else. It does not fall back to looking for a file
+      called <code>fold:typo</code>.
     </p>
 
     <Callout variant="note">

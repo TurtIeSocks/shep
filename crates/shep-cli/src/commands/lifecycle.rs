@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
-use shep_core::protocol::{Request, Response, SelectorSpec};
+use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec};
+use shep_core::selector::ProcessSelector;
 
 use crate::cli::Format;
 use crate::cli::{SelectorArgs, StartArgs, StockArgs};
@@ -45,8 +46,8 @@ pub enum TargetError {
     },
     /// The source read fine but failed Flockfile validation.
     Flockfile(FlockfileError),
-    /// `target` was not `-`, had no recognised Flockfile extension, and did
-    /// not name an existing path.
+    /// `target` named nothing at any tier of `start`'s precedence: no sheep
+    /// by id or name, no fold, no Flockfile, and no path on disk.
     Unresolvable {
         /// The raw target string, verbatim, so the reported message names
         /// exactly what was tried.
@@ -85,7 +86,8 @@ impl std::fmt::Display for TargetError {
             Self::Flockfile(err) => write!(f, "{err}"),
             Self::Unresolvable { target } => write!(
                 f,
-                "{target} is not `-`, a recognised Flockfile, or an existing path"
+                "{target} is not a sheep, a fold, `-`, a recognised Flockfile, or an \
+                 existing path"
             ),
             Self::UnknownFlockfileFormat { path } => write!(
                 f,
@@ -475,6 +477,94 @@ where
     (collected, failure)
 }
 
+/// Which sheep in `flock` a `start` target names, under the precedence
+/// [`start_one`] documents.
+///
+/// # The two tiers this function is
+///
+/// A `Name` token is tried as an exact sheep name first and as a FOLD name
+/// second, which is what makes `shep start backed` reach a fold called
+/// `backed` without the `fold:` prefix. Every other selector form means one
+/// thing already and is matched as itself.
+///
+/// # Dogs
+///
+/// A wildcard passes a dog by; an exact name or id reaches it. The same rule
+/// [`ProcessSelector::is_exact`] states for the daemon's own matching, and for
+/// the same reason: a dog is a process an operator installed, not a member of
+/// the flock `all` means. The fold fallback counts as a wildcard even though
+/// it came from a `Name` token, because the operator named a group rather than
+/// a process.
+fn flock_matches(selector: &ProcessSelector, flock: &[ProcessInfo]) -> Vec<ProcessInfo> {
+    let sheep_only = |flock: &[ProcessInfo], keep: &dyn Fn(&ProcessInfo) -> bool| {
+        flock
+            .iter()
+            .filter(|info| info.dog.is_none())
+            .filter(|info| keep(info))
+            .cloned()
+            .collect::<Vec<ProcessInfo>>()
+    };
+    match selector {
+        ProcessSelector::Name(wanted) => {
+            let named: Vec<ProcessInfo> = flock
+                .iter()
+                .filter(|info| &info.name == wanted)
+                .cloned()
+                .collect();
+            if !named.is_empty() {
+                return named;
+            }
+            sheep_only(flock, &|info| info.fold.as_deref() == Some(wanted.as_str()))
+        }
+        ProcessSelector::Id(wanted) => flock
+            .iter()
+            .filter(|info| info.id == *wanted)
+            .cloned()
+            .collect(),
+        other => sheep_only(flock, &|info| {
+            other.matches(&info.name, info.id, info.fold.as_deref())
+        }),
+    }
+}
+
+/// Whether `target` carries a marker that makes it unmistakably a selector,
+/// and so what to say when it matched nothing.
+///
+/// Only the message differs. `start` still falls through to the Flockfile and
+/// path tiers for every token, because a marker being present does not make a
+/// file of that name stop existing -- `/srv/app/` parses as a `/regex/` and is
+/// also a real directory somebody might type. What this decides is whether
+/// `shep start fold:typo` reports "no sheep is in a fold called typo" or the
+/// baffling "fold:typo is not a sheep, a fold, `-`, a recognised Flockfile, or
+/// an existing path" that sent an operator looking for a file by that name.
+fn selector_miss(target: &str, selector: &ProcessSelector) -> Option<String> {
+    match selector {
+        ProcessSelector::All => Some("the flock is empty; there is nothing to start".to_string()),
+        ProcessSelector::Fold(fold) => Some(format!("no sheep is in a fold called {fold}")),
+        ProcessSelector::Regex(_) => Some(format!("no sheep matched {target}")),
+        // A bare name or id carries no marker, so it may equally have been
+        // meant as a filename. The unresolvable message names every tier.
+        ProcessSelector::Name(_) | ProcessSelector::Id(_) => None,
+    }
+}
+
+/// Whether `target` could name a sheep or a fold at all.
+///
+/// A sheep name may not contain a path separator and may not be `.` or `..`
+/// (`shep_core::config::normalize`), so a token carrying one cannot be a
+/// sheep however the flock is configured. Making that a rule rather than a
+/// coincidence is what gives an operator whose fold shares a name with a file
+/// a way to say which they meant: `./backed` is the file, always.
+///
+/// Applied to the `Name` form only. `/regex/`, `fold:`, `all` and a glob are
+/// markers rather than names, and `/web/` legitimately contains slashes.
+fn is_reachable_as_a_name(selector: &ProcessSelector) -> bool {
+    match selector {
+        ProcessSelector::Name(name) => !name.contains(['/', '\\']) && name != "." && name != "..",
+        _ => true,
+    }
+}
+
 /// Renders what a lifecycle verb should leave on the operator's screen: the
 /// rows it touched under `--format json`, and the WHOLE flock as a table
 /// otherwise.
@@ -584,29 +674,95 @@ fn fail_target(streams: &mut Streams<'_>, err: &TargetError) -> ExitCode {
 /// the identical broken script reported `error[spawn_failed]` -- reproduced
 /// live and fixed here, since this is the one place that turns a `Restart`
 /// answer into `start`'s own exit code.
+fn is_live(info: &ProcessInfo) -> bool {
+    use shep_core::status::ProcStatus;
+    matches!(
+        info.status,
+        ProcStatus::Online | ProcStatus::Starting | ProcStatus::Stopping
+    )
+}
+
+/// Brings every sheep in `matched` up, and reports the ones that were already
+/// up rather than replacing them.
+///
+/// `selector` is the operator's own token when the match came from the
+/// selector tier, and `None` when it came from a path or Flockfile that
+/// resolved to apps the flock already has. The distinction is the difference
+/// between a suggestion that works and one that does not: `shep restart
+/// fold:backed` is a command, and `shep restart ./rotom.sh` is not, because
+/// `restart` takes selectors and a path is not one. So a single sheep is
+/// always named by its own name, and a group falls back to listing the names
+/// when there is no selector to quote.
+///
+/// The already-up set gets ONE notice however large it is. `shep start all`
+/// against a healthy thirteen-app flock would otherwise print thirteen
+/// notices saying the same thing.
+///
+/// Respawns are issued per NAME, not per row: `Request::Restart` with a name
+/// selector reaches every instance of a clustered app, so a fold holding a
+/// four-instance app would otherwise send the same request four times.
+async fn resume_all(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    selector: Option<&str>,
+    matched: &[ProcessInfo],
+    started: &mut Vec<ProcessInfo>,
+) -> ExitCode {
+    let (live, asleep): (Vec<&ProcessInfo>, Vec<&ProcessInfo>) =
+        matched.iter().partition(|info| is_live(info));
+
+    match live.as_slice() {
+        [] => {}
+        [one] => {
+            let message = format!(
+                "{} is already {}; `shep restart {}` replaces it.",
+                one.name, one.status, one.name
+            );
+            streams.aside("start", &message);
+        }
+        several => {
+            let names: Vec<&str> = unique_names(several);
+            let retype = selector.map_or_else(|| names.join(" "), str::to_string);
+            let message = format!(
+                "{} are already running; `shep restart {retype}` replaces them.",
+                names.join(", ")
+            );
+            streams.aside("start", &message);
+        }
+    }
+
+    for name in unique_names(&asleep) {
+        let code = resume(client, streams, name, started).await;
+        if code != ExitCode::Success {
+            return code;
+        }
+    }
+    ExitCode::Success
+}
+
+/// Every distinct name in `infos`, in the order they appear.
+///
+/// The listing is already sorted by name, so this is a scan rather than a set.
+fn unique_names<'a>(infos: &[&'a ProcessInfo]) -> Vec<&'a str> {
+    let mut names: Vec<&str> = Vec::with_capacity(infos.len());
+    for info in infos {
+        if names.last() != Some(&info.name.as_str()) {
+            names.push(&info.name);
+        }
+    }
+    names
+}
+
 async fn resume(
     client: &Client,
     streams: &mut Streams<'_>,
-    existing: &shep_core::protocol::ProcessInfo,
+    name: &str,
     started: &mut Vec<shep_core::protocol::ProcessInfo>,
 ) -> ExitCode {
-    use shep_core::status::ProcStatus;
-
-    if matches!(
-        existing.status,
-        ProcStatus::Online | ProcStatus::Starting | ProcStatus::Stopping
-    ) {
-        let message = format!(
-            "{} is already {}; `shep restart {}` replaces it.",
-            existing.name, existing.status, existing.name
-        );
-        streams.aside("start", &message);
-        return ExitCode::Success;
-    }
     let (procs, failure) = request_each(
         client,
         streams,
-        &[SelectorSpec::Name(existing.name.clone())],
+        &[SelectorSpec::Name(name.to_string())],
         None,
         |selector| Request::Restart { selector },
         |response| match response {
@@ -626,8 +782,7 @@ async fn resume(
     // does: an error on stderr and nothing on stdout.
     if any_restart_failed(&procs) {
         let message = format!(
-            "{} could not be started; see `shep bleats {}` or its log files for why",
-            existing.name, existing.name
+            "{name} could not be started; see `shep bleats {name}` or its log files for why"
         );
         return streams.fail(ExitCode::SpawnFailed, &message);
     }
@@ -899,23 +1054,47 @@ async fn start_one(
     // directory's Flockfile". The caller does the discovery, because the
     // no-target-and-no-Flockfile case never reaches here: it brings a
     // shepherd up and stops.
-    // A target naming a sheep the flock already has is that sheep, not a new
-    // one. Checked before the path arms below, or `shep start zeus-auth` on a
-    // registered-but-stopped sheep is read as a filename, fails to resolve,
-    // and reports that nothing by that name is on disk -- while the sheep sits
-    // in the listing.
     //
-    // Only when the target is not itself a readable target: an explicit path
-    // or Flockfile still means what it says, so `shep start ./server.js` is
-    // never diverted by a coincidence of names.
-    let mut listing: Option<Vec<shep_core::protocol::ProcessInfo>> = None;
-    if let Some(name) = target {
-        let is_path_like = name == "-" || args.flockfile || Path::new(name).exists();
-        if !is_path_like {
+    // Everything from here to `resolve_target` is the precedence in
+    // `StartArgs::targets`' own help: a sheep by id or name, then a fold, then
+    // a Flockfile, then a path. Each tier claims the token only if the token
+    // actually resolves there, so a name the flock does not have still reaches
+    // the file of that name.
+    //
+    // `-` and `--flockfile` skip the flock entirely. Both say outright that
+    // the token is a source to read, and neither has ever meant anything else.
+    let mut listing: Option<Vec<ProcessInfo>> = None;
+    let mut missed: Option<String> = None;
+    if let Some(token) = target
+        && token != "-"
+        && !args.flockfile
+    {
+        // Parsed client-side, exactly as every selector-taking verb does, so a
+        // malformed one is a local usage error rather than a round trip. This
+        // is also what makes `shep start fold:backed` and `shep start all`
+        // work at all: `start` used to take a different argument grammar from
+        // every other lifecycle verb, so folds were actionable everywhere
+        // except the verb that creates things.
+        let selector = match parse_selector(streams, token) {
+            Ok(selector) => selector,
+            Err(code) => return code,
+        };
+        if is_reachable_as_a_name(&selector) {
             let flock = flock_now(client).await;
-            if let Some(existing) = flock.iter().find(|info| info.name == name) {
-                return resume(client, streams, existing, started).await;
+            let matched = flock_matches(&selector, &flock);
+            if !matched.is_empty() {
+                // No `report_config_drift` on this path, and that is not an
+                // omission: drift is a comparison between a config the
+                // operator just supplied and the one the flock stores. A
+                // selector supplies no config -- `shep start fold:backed`
+                // names sheep, not a Flockfile -- so there is nothing to
+                // compare and nothing that could have been silently ignored.
+                return resume_all(client, streams, Some(token), &matched, started).await;
             }
+            // Held for the failure path below rather than reported here: the
+            // token may still name a Flockfile or a path, and only if it names
+            // neither does the shape it was written in decide the message.
+            missed = selector_miss(token, &selector);
             listing = Some(flock);
         }
     }
@@ -942,6 +1121,16 @@ async fn start_one(
 
     let mut apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
         Ok(apps) => apps,
+        // The last tier refused too, so the token named nothing anywhere. A
+        // token written unmistakably as a selector is reported as one -- `shep
+        // start fold:typo` says no sheep is in a fold called typo, rather than
+        // reporting that no file called `fold:typo` is on disk, which is the
+        // answer to a question nobody asked. Exit 3, matching what every other
+        // verb returns for a selector that matched nothing.
+        Err(TargetError::Unresolvable { .. }) if missed.is_some() => {
+            let message = missed.unwrap_or_default();
+            return streams.fail(ExitCode::NotFound, &message);
+        }
         Err(err) => return fail_target(streams, &err),
     };
 
@@ -981,8 +1170,13 @@ async fn start_one(
     // and gets a wall of restart output should read why none of it applied
     // at the top of the run rather than under it.
     report_config_drift(client, streams, &resumed).await;
-    for (_, existing) in &resumed {
-        let code = resume(client, streams, existing, started).await;
+    if !resumed.is_empty() {
+        // `None`, not the operator's token: this arm reached the flock through
+        // a Flockfile or a path, so there is no selector to quote back in the
+        // "already running" notice. `shep restart ./rotom.sh` is not a
+        // command. See `resume_all`'s own doc.
+        let existing: Vec<ProcessInfo> = resumed.iter().map(|(_, info)| info.clone()).collect();
+        let code = resume_all(client, streams, None, &existing, started).await;
         if code != ExitCode::Success {
             return code;
         }
@@ -1760,6 +1954,224 @@ mod tests {
         );
     }
 
+    /// A flock in which every tier of `start`'s precedence has something to
+    /// find, and each tier's answer is distinguishable from the others'.
+    ///
+    /// `golbat` and `koji` are in the fold `backed`; `rotom` is not in any
+    /// fold; `log-rotate` is a dog. The name `backed` is a fold and NOT a
+    /// sheep, which is the whole point: a build that only ever matched names
+    /// finds nothing for it.
+    fn a_foldable_flock() -> Vec<shep_core::protocol::ProcessInfo> {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+        vec![
+            ProcessInfo::builder(0, "golbat", ProcStatus::Stopped)
+                .fold(Some("backed".to_string()))
+                .build(),
+            ProcessInfo::builder(1, "koji", ProcStatus::Stopped)
+                .fold(Some("backed".to_string()))
+                .build(),
+            ProcessInfo::builder(2, "rotom", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(3, "log-rotate", ProcStatus::Online)
+                .dog(Some(DogSource::BuiltIn))
+                .build(),
+        ]
+    }
+
+    /// The names `flock_matches` picks, so a case below reads as the rule it
+    /// is about rather than as a fold of `ProcessInfo` fields.
+    fn matched_names(target: &str) -> Vec<String> {
+        let selector = ProcessSelector::parse(target).expect("the fixture uses valid selectors");
+        flock_matches(&selector, &a_foldable_flock())
+            .into_iter()
+            .map(|info| info.name)
+            .collect()
+    }
+
+    /// The precedence `StartArgs::targets`' own help states, one case per
+    /// tier, driven through the function that decides it.
+    ///
+    /// `shep stop fold:backed` already worked and `shep start fold:backed`
+    /// refused with "backed is not `-`, a recognised Flockfile, or an existing
+    /// path", because `start` took a different argument grammar from every
+    /// other lifecycle verb. Folds were actionable everywhere except the verb
+    /// that creates things.
+    #[test]
+    fn a_start_target_walks_the_precedence() {
+        assert_eq!(
+            matched_names("koji"),
+            vec!["koji"],
+            "tier 1: a sheep by name"
+        );
+        assert_eq!(matched_names("1"), vec!["koji"], "tier 1: a sheep by id");
+        assert_eq!(
+            matched_names("fold:backed"),
+            vec!["golbat", "koji"],
+            "tier 2: a fold, named as one"
+        );
+        assert_eq!(
+            matched_names("backed"),
+            vec!["golbat", "koji"],
+            "tier 2: the same fold, named bare"
+        );
+        assert!(
+            matched_names("nosuchthing").is_empty(),
+            "and a token that is none of those falls through to the file tiers"
+        );
+    }
+
+    /// fails if a name that is BOTH a sheep and a fold resolves to the fold.
+    ///
+    /// The order is name before fold, and this is the only fixture that can
+    /// tell the two apart: `a_start_target_walks_the_precedence`'s `backed` is
+    /// a fold and not a sheep, so it would pass under either order.
+    #[test]
+    fn a_sheep_outranks_a_fold_of_the_same_name() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let flock = vec![
+            ProcessInfo::builder(0, "backed", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(1, "koji", ProcStatus::Stopped)
+                .fold(Some("backed".to_string()))
+                .build(),
+        ];
+        let selector = ProcessSelector::parse("backed").unwrap();
+        let names: Vec<String> = flock_matches(&selector, &flock)
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        assert_eq!(names, vec!["backed"], "the sheep, not the fold it names");
+    }
+
+    /// fails if a wildcard sweeps up a dog.
+    ///
+    /// The same rule `ProcessSelector::is_exact` states for the daemon's own
+    /// matching: a dog is a process an operator installed, not a member of the
+    /// flock `all` means, so `shep start all` must pass it by while
+    /// `shep start log-rotate` still reaches it. The fold fallback counts as a
+    /// wildcard even though the token was a bare name, because the operator
+    /// named a group.
+    #[test]
+    fn a_wildcard_passes_a_dog_by_and_an_exact_name_reaches_it() {
+        assert_eq!(
+            matched_names("all"),
+            vec!["golbat", "koji", "rotom"],
+            "no dog in the sweep"
+        );
+        assert_eq!(
+            matched_names("log-rotate"),
+            vec!["log-rotate"],
+            "but naming it outright reaches it"
+        );
+    }
+
+    /// fails if a token carrying a path separator is tried as a sheep or a
+    /// fold.
+    ///
+    /// This is the escape hatch, and it has to be a rule rather than a
+    /// coincidence: somebody whose fold shares a name with a file in the
+    /// current directory needs a way to say which they meant, and the
+    /// precedence alone gives them none. A sheep name may never contain a path
+    /// separator (`shep_core::config::normalize`), so `./backed` is always the
+    /// file.
+    ///
+    /// `/web/` is in the same case for the opposite reason: it is full of
+    /// slashes and is a regex, not a name, so the rule is on the PARSED form
+    /// rather than on the raw token.
+    #[test]
+    fn a_token_with_a_path_separator_is_never_a_name() {
+        let path = ProcessSelector::parse("./backed").unwrap();
+        assert!(
+            !is_reachable_as_a_name(&path),
+            "./backed can only be a file"
+        );
+        let bare = ProcessSelector::parse("backed").unwrap();
+        assert!(is_reachable_as_a_name(&bare), "backed may be either");
+        let regex = ProcessSelector::parse("/web/").unwrap();
+        assert!(
+            is_reachable_as_a_name(&regex),
+            "a regex is not a name, so the separator rule does not apply to it"
+        );
+    }
+
+    /// fails if `shep start fold:typo` reports that no FILE called `fold:typo`
+    /// is on disk.
+    ///
+    /// That was the error Rin actually hit, and it sent her looking for a file
+    /// she had never asked about. A token written unmistakably as a selector
+    /// is reported as one; a bare name or id carries no marker and may equally
+    /// have been meant as a filename, so it keeps the message that names every
+    /// tier.
+    #[test]
+    fn a_selector_that_matched_nothing_is_reported_as_a_selector() {
+        let miss = |target: &str| selector_miss(target, &ProcessSelector::parse(target).unwrap());
+
+        assert_eq!(
+            miss("fold:typo").as_deref(),
+            Some("no sheep is in a fold called typo")
+        );
+        assert_eq!(miss("zz-*").as_deref(), Some("no sheep matched zz-*"));
+        assert_eq!(
+            miss("all").as_deref(),
+            Some("the flock is empty; there is nothing to start")
+        );
+        assert_eq!(
+            miss("koji"),
+            None,
+            "a bare name may still be a file, so the unresolvable message stands"
+        );
+        assert_eq!(miss("11"), None, "and so may a bare id");
+    }
+
+    /// fails if `shep start fold:typo` exits anything but 3, or if it reaches
+    /// the daemon with a `Start`.
+    ///
+    /// Driven through the VERB rather than through `selector_miss`, because
+    /// the mapping from "matched nothing" to an exit code lives in `start_one`
+    /// and a unit test of the message alone cannot see it. Exit 3 is what
+    /// `shep stop fold:typo` already returns, which is the consistency this
+    /// whole change is about.
+    #[tokio::test]
+    async fn a_start_on_an_empty_fold_exits_not_found_without_a_start_request() {
+        use shep_client::testing::fake_client_on;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        daemon.reply_to_list(a_foldable_flock());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            start(
+                &client,
+                &mut streams,
+                &start_args("fold:typo"),
+                None,
+                &BTreeMap::new(),
+            )
+            .await
+        };
+
+        assert_eq!(code, ExitCode::NotFound);
+        let said = String::from_utf8(err).unwrap();
+        assert!(
+            said.contains("no sheep is in a fold called typo"),
+            "the refusal names the fold, not a file: {said}"
+        );
+        assert!(
+            !said.contains("existing path"),
+            "and never mentions a path nobody asked about: {said}"
+        );
+        assert!(out.is_empty(), "stdout stays empty on a failure");
+    }
+
     /// A sheep that is already up is reported, never restarted. Someone who
     /// typed `start` did not ask for their live service to be replaced, and
     /// `restart` is right there.
@@ -1827,17 +2239,20 @@ mod tests {
             .await
         };
         assert_eq!(code, ExitCode::Usage);
-        // One request, and it is the flock lookup: a target is a sheep's name
-        // before it is a filename, so `start` has to ask before it can say
-        // the target resolves to nothing. What must never reach the daemon is
-        // a `Start` carrying an app built from an unresolvable target.
-        let asked = envelopes
-            .try_recv()
-            .expect("the flock is consulted before the target is read as a path");
-        assert_eq!(asked.body, Request::ListFlock);
+        // NOTHING reaches the daemon. `./does-not-exist` carries a path
+        // separator, and a sheep name may never contain one
+        // (`shep_core::config::normalize`), so the token cannot be a sheep or
+        // a fold and `start` skips the flock lookup rather than asking a
+        // question whose answer it already knows. A target with no separator
+        // does ask -- `a_target_naming_a_stopped_sheep_is_acted_on_not_
+        // resolved_as_a_path` is the case that proves it.
+        //
+        // What must never reach the daemon either way is a `Start` carrying an
+        // app built from an unresolvable target.
         assert!(
             envelopes.try_recv().is_err(),
-            "and nothing else: an unresolvable target must not become a Start"
+            "a target that can only be a path costs no round trip, and an \
+             unresolvable one must never become a Start"
         );
         assert!(String::from_utf8(err).unwrap().contains("./does-not-exist"));
     }

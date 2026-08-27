@@ -13,6 +13,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Additions
+
+- `shep start` takes the selector grammar every other lifecycle verb takes:
+  `all`, `fold:<name>`, `/regex/`, globs, and a bare id. `shep stop
+  fold:backed` worked and `shep start fold:backed` refused with "backed is not
+  `-`, a recognised Flockfile, or an existing path", because `start` alone
+  took a different argument grammar. Folds were actionable everywhere except
+  the verb that creates things.
+
+- A bare token is also tried as a fold name, so `shep start backed` reaches
+  the fold `backed`. The full order, first tier that matches wins: a sheep by
+  id or name, then a fold, then a Flockfile, then a path on disk. Written down
+  in `shep start --help` and on the folds page, since a precedence rule is
+  only reasonable if the person it surprises can find out why.
+
+- `./backed` always means the file. A sheep name may never contain a path
+  separator, so a target carrying one skips the flock entirely. That is what
+  gives somebody whose fold shares a name with a file a way to say which they
+  meant.
+
 ### Fixes
 
 - Say so when a Flockfile app names a sheep the flock already has under a
@@ -28,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separate decision, and changing a running flock's `cwd` or argv underneath
   an operator would be a worse surprise than the bug being fixed. Field names
   only, never values, since `env` carries secrets.
+
+- A selector that matched nothing is reported as a selector. `shep start
+  fold:typo` said `fold:typo is not ... an existing path` and sent an operator
+  looking for a file they had never asked about; it now says no sheep is in a
+  fold called typo, and exits 3 like every other verb does.
 
 - Every lifecycle verb prints the whole flock afterwards, not only the rows it
   touched. `shep start koji` printed a one-row table containing koji; the
