@@ -265,8 +265,8 @@ async fn a_child_reaches_the_shepherd_channel_by_pipe_name() {
     let dir = tempfile::tempdir().unwrap();
     let seen = dir.path().join("seen.txt");
     let script = dir.path().join("channel.cmd");
-    // Built line by line rather than as one multi-line literal: a `.cmd`
-    // wants CRLF, and a Rust string literal cannot carry a bare CR.
+    // Joined with escaped CRLF: a `.cmd` wants it, and the .rs file itself
+    // is pinned to LF, so a literal CR here would not survive.
     let body = [
         "@echo off".to_string(),
         format!("(echo %SHEP_CHANNEL_PIPE%) > \"{}\"", seen.display()),
@@ -274,10 +274,7 @@ async fn a_child_reaches_the_shepherd_channel_by_pipe_name() {
         "ping -n 30 127.0.0.1 >nul".to_string(),
         String::new(),
     ]
-    .join(
-        "
-",
-    );
+    .join("\r\n");
     std::fs::write(&script, body).unwrap();
 
     let mut spec = cmd_spec(&dir, &["echo", "placeholder"]);
