@@ -72,6 +72,7 @@ command-fds.workspace = true
 # exactly as `sys.rs` is on unix.
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+getrandom.workspace = true
 
 # `cfg(any())` never matches any target, so nothing here is ever compiled into any real
 # build — but Cargo's resolver still walks these entries when computing the dependency

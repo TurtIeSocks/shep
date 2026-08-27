@@ -2149,6 +2149,7 @@ dependencies = [
  "command-fds",
  "fsevent-sys",
  "futures-util",
+ "getrandom 0.4.3",
  "globset",
  "nix 0.29.0",
  "notify",

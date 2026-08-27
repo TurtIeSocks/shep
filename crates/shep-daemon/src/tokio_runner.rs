@@ -498,10 +498,25 @@ impl ProcessRunner for TokioRunner {
             // Unique per spawn, not per home: two instances of one app must
             // not share a channel, and a restarted sheep must not inherit a
             // name a dying predecessor still holds.
+            //
+            // The nonce is a separate job from that uniqueness: the pipe is
+            // created before the child exists, with the default security
+            // descriptor (readable by every local account), and the single
+            // `accept` below authenticates nobody. A guessable name is
+            // therefore pre-openable by a hostile local account, which would
+            // starve a `wait_ready` sheep and read daemon-to-child frames.
+            // 128 bits of name is what closes that; a restrictive descriptor
+            // would need `create_with_security_attributes_raw`, and shep-core
+            // is `#![forbid(unsafe_code)]`.
+            let mut nonce = [0_u8; 16];
+            getrandom::fill(&mut nonce).map_err(|error| {
+                RunnerError::SpawnFailed(format!("shepherd channel pipe name: {error}"))
+            })?;
             let pipe = std::path::PathBuf::from(format!(
-                r"\\.\pipe\shep-channel-{}-{}",
+                r"\\.\pipe\shep-channel-{}-{}-{:032x}",
                 std::process::id(),
-                NEXT_CHANNEL_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                NEXT_CHANNEL_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                u128::from_ne_bytes(nonce)
             ));
             let mut listener = transport::Listener::bind(&pipe).map_err(|error| {
                 RunnerError::SpawnFailed(format!("shepherd channel pipe: {error}"))
@@ -511,19 +526,30 @@ impl ProcessRunner for TokioRunner {
 
             // Accepted on a task rather than awaited here, because `spawn` is
             // synchronous and the child cannot connect until it has been
-            // started — which happens below. An app that never opens the pipe
-            // simply leaves this task parked until the pumps are dropped,
-            // which is the same outcome a unix app that never reads fd 3
-            // produces.
+            // started, which happens below.
+            //
+            // The `closed()` arm is what bounds that task. An app that never
+            // opens the pipe would otherwise park it forever, holding the
+            // listener, `to_child_rx` and a sender clone for the daemon's
+            // life, once per spawn and so again on every autorestart. Unix
+            // has no equivalent leak to match: there `spawn_channel_pumps`
+            // runs unconditionally and its reader ends at EOF when the
+            // child's fd 3 closes. `Sender::closed` resolves when `run_sheep`
+            // drops the receiver, which is that same lifetime, and
+            // `Listener::accept` is cancel-safe, so racing the two is sound.
             let from_child_tx = from_child_tx.clone();
             tokio::spawn(async move {
-                match listener.accept().await {
-                    Ok(daemon_end) => {
-                        spawn_channel_pumps(daemon_end, from_child_tx, to_child_rx);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "shepherd channel accept failed");
-                    }
+                let watcher = from_child_tx.clone();
+                tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok(daemon_end) => {
+                            spawn_channel_pumps(daemon_end, from_child_tx, to_child_rx);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "shepherd channel accept failed");
+                        }
+                    },
+                    () = watcher.closed() => {}
                 }
             });
         } else {
