@@ -108,4 +108,28 @@ mod tests {
         assert_eq!(restart_delay(&app, 1), None);
         assert_eq!(restart_delay(&app, 5), None);
     }
+
+    /// The only opt-out an operator can actually write is the string `"0"`:
+    /// `AppConfig`'s struct-level `#[serde(default)]` means an omitted key
+    /// deserializes to `Some(100ms)`, not `None` -- TOML has no way to write
+    /// a bare null. Parses a real Flockfile end to end, rather than poking
+    /// the struct field directly, so a Deserialize regression in the
+    /// grammar or the default would show up here too.
+    #[test]
+    fn the_toml_escape_hatch_is_the_string_zero_not_a_missing_key() {
+        let src = r#"
+[[app]]
+name = "p"
+script = "./p"
+exp_backoff_restart_delay = "0"
+"#;
+        let flock =
+            shep_core::config::Flockfile::parse(src, shep_core::config::FlockFormat::Toml).unwrap();
+        let app = &flock.apps[0];
+        assert_eq!(
+            app.exp_backoff_restart_delay,
+            Some(shep_core::values::UpDuration::from_millis(0))
+        );
+        assert_eq!(restart_delay(app, 1), Some(Duration::from_millis(0)));
+    }
 }

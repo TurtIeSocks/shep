@@ -568,7 +568,7 @@ and was not expanded should say so.
 
 Found 2026-08-20 while building `shep-log-rotate`. Its `max_age` setting is a
 log-retention window, so the natural spelling is `7d`. The grammar is
-`^\d+(h|m|s)?$` (`crates/shep-core/src/values.rs`), so `7d` is refused and a
+`^\d+(ms|h|m|s)?$` (`crates/shep-core/src/values.rs`), so `7d` is refused and a
 week has to be written `168h`. A month is `720h`.
 
 **For shep itself the grammar is right and should not change on this

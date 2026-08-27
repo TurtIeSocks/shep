@@ -308,6 +308,18 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
       ))
     }
 
+    <Callout variant="note">
+      A permanently broken app (bad config, missing dependency: it exits
+      before <code>min_uptime</code> every time) still errors out once it
+      hits <code>max_restarts</code>, but the default
+      <code>exp_backoff_restart_delay</code> of 100ms, growing ×1.5 each
+      attempt, changes how long that takes. At the default
+      <code>max_restarts = 16</code>, reaching <code>Errored</code> now
+      takes roughly 50-70s instead of well under a second. Set
+      <code>exp_backoff_restart_delay = "0"</code> to go back to failing
+      fast.
+    </Callout>
+
     <h2>Get the schema directly</h2>
     <p>
       Everything above is generated from the same source the parser uses,

@@ -6846,14 +6846,23 @@ mod tests {
         app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
-        // mean restarts==2 once the never_exits proc is up.
-        loop {
-            let info = handle.list().await.remove(0);
+        // mean restarts==2 once the never_exits proc is up. Bounded (IR-46):
+        // an unbounded wait for this state would hang the test instead of
+        // failing it if a future change reintroduces a delay for this
+        // config shape.
+        let mut info = handle.list().await.remove(0);
+        for _ in 0..200 {
             if info.restarts == 2 && info.status == ProcStatus::Online {
                 break;
             }
             tokio::task::yield_now().await;
+            info = handle.list().await.remove(0);
         }
+        assert_eq!(
+            (info.status, info.restarts),
+            (ProcStatus::Online, 2),
+            "never reached the never_exits proc -- got {info:?}"
+        );
         let restarted = handle
             .restart(ProcessSelector::Name("svc".to_string()))
             .await
@@ -6937,14 +6946,23 @@ mod tests {
         app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
-        // mean restarts==2 once the never_exits proc is up.
-        loop {
-            let info = handle.list().await.remove(0);
+        // mean restarts==2 once the never_exits proc is up. Bounded (IR-46):
+        // an unbounded wait for this state would hang the test instead of
+        // failing it if a future change reintroduces a delay for this
+        // config shape.
+        let mut info = handle.list().await.remove(0);
+        for _ in 0..200 {
             if info.restarts == 2 && info.status == ProcStatus::Online {
                 break;
             }
             tokio::task::yield_now().await;
+            info = handle.list().await.remove(0);
         }
+        assert_eq!(
+            (info.status, info.restarts),
+            (ProcStatus::Online, 2),
+            "never reached the never_exits proc -- got {info:?}"
+        );
 
         handle
             .restart_automatic(ProcessSelector::Name("svc".to_string()))
@@ -7029,14 +7047,23 @@ mod tests {
         app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
-        // mean restarts==2 once the never_exits proc is up.
-        loop {
-            let info = handle.list().await.remove(0);
+        // mean restarts==2 once the never_exits proc is up. Bounded (IR-46):
+        // an unbounded wait for this state would hang the test instead of
+        // failing it if a future change reintroduces a delay for this
+        // config shape.
+        let mut info = handle.list().await.remove(0);
+        for _ in 0..200 {
             if info.restarts == 2 && info.status == ProcStatus::Online {
                 break;
             }
             tokio::task::yield_now().await;
+            info = handle.list().await.remove(0);
         }
+        assert_eq!(
+            (info.status, info.restarts),
+            (ProcStatus::Online, 2),
+            "never reached the never_exits proc -- got {info:?}"
+        );
 
         // `stop` is what takes the sheep off its live task without touching
         // the budget: `decide_on_exit` short-circuits to CleanStop on
