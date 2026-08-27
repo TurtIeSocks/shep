@@ -1293,7 +1293,7 @@ mod tests {
             narrow.rendered
         );
         assert!(narrow.rendered.contains("FOLD"), "{}", narrow.rendered);
-        assert!(narrow.rendered.contains("(o~o)"), "{}", narrow.rendered);
+        assert!(narrow.rendered.contains("(>_<)"), "{}", narrow.rendered);
         assert!(
             !narrow.rendered.contains("waiting-restart"),
             "{}",

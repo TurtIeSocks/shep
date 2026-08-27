@@ -24,16 +24,31 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <ReferencePills slug="output" />
     <p class="lede">
       At a terminal, shep draws a box-drawn table that fits your window,
-      colours each sheep's status, and shows it as a face. Piped into
-      anything else, it prints the same plain columns it always has. You do
-      not have to configure that; it is the default both ways.
+      colours a sheep's status, restart count, exit code, CPU and memory, and
+      shows status as a face too. Piped into anything else, it prints the
+      same plain columns it always has. You do not have to configure that; it
+      is the default both ways.
     </p>
 
     <h2>What a terminal shows</h2>
     <p>
-      <code>shep flock</code> in a 120-column window. The status column
-      carries a face and the word, and each row's status is the one coloured
-      cell:
+      <code>shep flock</code> in a 120-column window. Every colour here says
+      something a number alone would take a second glance to notice: STATUS
+      carries a face and the word; RESTARTS and EXIT turn a colour once a
+      sheep has actually restarted or crashed; CPU and MEM ramp with how much
+      of each a sheep is using; ID and FOLD are muted throughout, since they
+      never change; and every <code>-</code> is muted too, so an absent value
+      does not compete with a real one:
+    </p>
+    <p>
+      CPU and MEM have two tiers each, not a gradient. The question they
+      answer is whether one sheep is unusual for this flock, not how much it
+      is using: 160M and 4G both land in the same tier, and on a flock where
+      everything is large the whole column is one colour and tells you
+      nothing. A third tier would have to be the fault colour, which would
+      paint a healthy 4G service as though it had broken. Use
+      <code>--format json</code> when the exact number is the thing you
+      need.
     </p>
     <CodeBlock label="shep flock">{`┌────┬──────┬───────────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┬──────┐
 │ ID │ NAME │ STATUS        │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ FOLD    │ SMIT │
@@ -49,12 +64,13 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 
     <h3>The faces</h3>
     <p>
-      Four faces across six statuses, because some of them mean the same
+      Five faces across six statuses, because two of them mean the same
       thing to someone glancing at a table:
     </p>
     <div class="rows">
       <div class="row"><span><code>(o.o)</code> grazing</span><span>online</span></div>
-      <div class="row"><span><code>(o~o)</code> waking</span><span>starting, waiting to restart</span></div>
+      <div class="row"><span><code>(o~o)</code> waking</span><span>starting</span></div>
+      <div class="row"><span><code>(&gt;_&lt;)</code> flinching</span><span>waiting to restart</span></div>
       <div class="row"><span><code>(-.-)</code> asleep</span><span>stopping, stopped</span></div>
       <div class="row"><span><code>(x.x)</code> startled</span><span>errored</span></div>
     </div>
