@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::UnixListener;
+use shep_core::transport::{Listener, ServerStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
@@ -37,7 +37,62 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 
 use crate::Client;
-use crate::connection::Frames;
+
+/// A control address valid on the platform running the test, unique to
+/// `dir`.
+///
+/// Every fake in this module takes an address as `&Path`, and until the
+/// Windows tier existed a caller could simply write `dir.path().join(
+/// "s.sock")`. That still works on unix and cannot work on Windows, where
+/// the control transport is a named pipe: `\\.\pipe\...` is a name in a
+/// machine-global kernel namespace, not a path under a directory, so a
+/// tempdir path names nothing a pipe can be created on.
+///
+/// The uniqueness argument is the reason this takes a `dir` it does not
+/// otherwise need on Windows. The pipe namespace is shared by every process
+/// on the machine, so two tests that picked one fixed name would contend for
+/// real — passing individually and failing under `cargo test`'s default
+/// parallelism, which is the worst way for this to show up. A `TempDir`'s
+/// path is already unique per test, so folding it into the pipe name inherits
+/// that uniqueness instead of inventing a second scheme. This is the same
+/// derivation [`ShepPaths::pipe_name`](shep_core::paths::ShepPaths::pipe_name)
+/// performs for a real `$SHEP_HOME`, which is why the two agree by
+/// construction rather than by being kept in step.
+///
+/// The process id is folded in as well, because `cargo test` runs each
+/// integration binary as its own process and two of them can hold
+/// same-named tempdirs on some platforms.
+#[must_use]
+pub fn control_address(dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        dir.join("s.sock")
+    }
+    #[cfg(windows)]
+    {
+        let sanitized: String = dir
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        PathBuf::from(format!(
+            r"\\.\pipe\shep-test-{}-{}",
+            std::process::id(),
+            sanitized.trim_matches('-')
+        ))
+    }
+}
+
+/// The framed transport a fake daemon holds for one accepted client.
+///
+/// Deliberately NOT [`crate::connection::Frames`], which is the *client's*
+/// side. The two are the same type on unix, where a socket's two ends are
+/// indistinguishable, and different types on Windows, where a named pipe's
+/// server end is its own type. Every fake in this module is a server, so it
+/// frames a [`ServerStream`]; reusing the client alias compiled on unix and
+/// would not on Windows, which is precisely the bug this separate name
+/// exists to make impossible.
+type Frames = Framed<ServerStream, tokio_util::codec::LengthDelimitedCodec>;
 use crate::spawn::SpawnOptions;
 
 /// Serves exactly one connection, replying to the `Hello` with `reply`,
@@ -53,9 +108,9 @@ use crate::spawn::SpawnOptions;
 /// is test scaffolding, meant to fail the test loudly rather than surface
 /// a `Result` nobody would check.
 pub async fn fake_daemon(path: &Path, reply: HelloReply) -> JoinHandle<Hello> {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         let first = frames.next().await.unwrap().unwrap();
         let hello: Hello = decode_frame(&first).unwrap();
@@ -84,9 +139,9 @@ pub async fn serve_one_request(
     ack: HelloAck,
     response: Response,
 ) -> JoinHandle<Envelope> {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         handshake(&mut frames, ack).await;
         let envelope = read_envelope(&mut frames).await;
@@ -118,11 +173,11 @@ pub fn fake_daemon_accepting_repeatedly(
     path: &Path,
     reply: Response,
 ) -> (JoinHandle<()>, Arc<AtomicU32>) {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     let served = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&served);
     let handle = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
+        while let Ok(stream) = listener.accept().await {
             let mut frames = Framed::new(stream, codec());
             handshake(&mut frames, sample_ack()).await;
             let envelope = read_envelope(&mut frames).await;
@@ -532,7 +587,7 @@ impl FakeDaemon {
 /// it, for this private, one-caller function.
 #[allow(clippy::too_many_arguments)]
 async fn serve_scripted(
-    listener: UnixListener,
+    mut listener: Listener,
     socket_path: PathBuf,
     ack: HelloAck,
     mut script: mpsc::Receiver<ScriptCommand>,
@@ -544,7 +599,7 @@ async fn serve_scripted(
     armed_shutdown_never_unlink: Arc<Mutex<Option<()>>>,
     list_flock_count: Arc<AtomicU64>,
 ) {
-    let (stream, _) = listener.accept().await.unwrap();
+    let stream = listener.accept().await.unwrap();
     let mut frames = Framed::new(stream, codec());
     handshake(&mut frames, ack).await;
 
@@ -693,7 +748,7 @@ pub async fn fake_client_on(path: &Path) -> (Client, FakeDaemon) {
 /// As [`fake_client_on`], but with a caller-chosen [`HelloAck`] — for a
 /// test asserting on the ack a `Client` receives.
 pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDaemon) {
-    let listener = UnixListener::bind(path).unwrap();
+    let listener = Listener::bind(path).unwrap();
     let (script_tx, script_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
     let armed_list = Arc::new(Mutex::new(None));
     let armed_list_sequence = Arc::new(Mutex::new(VecDeque::new()));
@@ -749,10 +804,10 @@ pub async fn fake_client_with_push(path: &Path) -> (Client, FakeDaemon) {
 /// puts on the wire (its deadline, in particular) rather than on how the
 /// daemon answers.
 pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Receiver<Envelope>) {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     let (tx, rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         handshake(&mut frames, sample_ack()).await;
         loop {
@@ -835,9 +890,9 @@ pub async fn fake_client_event_then_reply(path: &Path) -> (Client, FakeDaemon) {
 /// connection — for testing that a `Client` fails every pending request
 /// with `RequestError::Closed` rather than hanging.
 pub async fn fake_client_that_closes_after_handshake(path: &Path) -> (Client, JoinHandle<()>) {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         handshake(&mut frames, sample_ack()).await;
         // Dropping `frames` (and the `UnixStream` it owns) here closes the
@@ -855,9 +910,9 @@ pub async fn fake_client_that_closes_after_handshake(path: &Path) -> (Client, Jo
 /// connection was already gone before the request was ever sent (that's
 /// [`fake_client_that_closes_after_handshake`]).
 pub async fn fake_client_that_dies_mid_request(path: &Path) -> (Client, JoinHandle<()>) {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         handshake(&mut frames, sample_ack()).await;
         let _envelope = read_envelope(&mut frames).await;
@@ -883,9 +938,9 @@ pub async fn fake_client_that_dies_mid_request(path: &Path) -> (Client, JoinHand
 /// `FakeDaemon`-backed version of this helper could not do what its name
 /// promises. Deliberate divergence from the roster, not an oversight.
 pub async fn fake_client_that_never_replies(path: &Path) -> (Client, JoinHandle<()>) {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     let task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         handshake(&mut frames, sample_ack()).await;
         core::future::pending::<()>().await;
@@ -934,9 +989,9 @@ pub fn fast_opts() -> SpawnOptions {
 /// Panics if `path` cannot be bound — test scaffolding, see [`fake_daemon`]'s
 /// own doc for why that is the right failure mode here.
 pub fn start_fake_daemon_answering_on(path: &Path) {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         handshake(&mut frames, sample_ack()).await;
         core::future::pending::<()>().await;

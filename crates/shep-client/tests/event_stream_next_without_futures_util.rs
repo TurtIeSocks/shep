@@ -7,8 +7,6 @@
 //! not found) rather than silently keep passing, since nothing here has a
 //! trait in scope to fall back to.
 
-#![cfg(unix)]
-
 use std::time::Duration;
 
 use shep_client::testing::fake_client_with_push;
@@ -21,7 +19,7 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
 #[tokio::test]
 async fn next_resolves_with_no_futures_util_import_in_scope() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, daemon) = fake_client_with_push(&path).await;
     let mut stream = client.subscribe(vec!["log.*".into()]).await.unwrap();
 

@@ -5,8 +5,6 @@
 //! An integration test rather than a `#[cfg(test)] mod tests` block inside
 //! `events.rs`, for the reason spelled out at the top of `request_reply.rs`.
 
-#![cfg(unix)]
-
 use std::time::Duration;
 
 use shep_client::Lagged;
@@ -21,7 +19,7 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
 #[tokio::test]
 async fn subscribe_yields_events_the_daemon_pushes() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, daemon) = fake_client_with_push(&path).await;
     let mut stream = client.subscribe(vec!["log.*".into()]).await.unwrap();
 
@@ -64,7 +62,7 @@ async fn subscribe_yields_events_the_daemon_pushes() {
 #[tokio::test]
 async fn subscribing_installs_the_receiver_before_the_request_is_sent() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, daemon) = fake_client_with_push(&path).await;
     daemon.queue_reply_then_event(
         Response::Subscribed,
@@ -107,7 +105,7 @@ async fn subscribing_installs_the_receiver_before_the_request_is_sent() {
 #[tokio::test]
 async fn a_daemon_shutdown_event_ends_the_stream_cleanly() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, daemon) = fake_client_with_push(&path).await;
     let mut stream = client.subscribe(vec!["daemon.*".into()]).await.unwrap();
 
@@ -141,7 +139,7 @@ async fn a_daemon_shutdown_event_ends_the_stream_cleanly() {
 #[tokio::test]
 async fn a_lagging_consumer_reports_the_lag_rather_than_silently_skipping() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, daemon) = fake_client_with_push(&path).await;
     let mut stream = client.subscribe(vec!["log.*".into()]).await.unwrap();
 
