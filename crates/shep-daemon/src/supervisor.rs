@@ -257,8 +257,10 @@ pub(crate) enum BatchPolicy {
 /// Which is why the emit keys on this and not on the row's status. A status is
 /// true both when something just happened and when it was already true, so the
 /// row found and the row created are alike in it -- both `Errored` -- and a
-/// status test announces both. `dogs::spawn_dog_watch` subscribes to that
-/// event and reads the repeat as fresh.
+/// status test announces both. Bark's `Trigger::GaveUp` fires on `Errored`
+/// for any sheep and reads the repeat as fresh. NOT `dogs::spawn_dog_watch`,
+/// which filters on `info.dog.is_some()` and can never see a restored row,
+/// since the restore registers with `dog: None`.
 #[derive(Debug)]
 enum Registration {
     /// This call registered the row. A transition happened, and whatever an
@@ -2574,8 +2576,10 @@ impl<R: ProcessRunner> Actor<R> {
                             //
                             // `spawn_fresh` has already registered this one
                             // `Errored` before returning, which is the row
-                            // the muster's own comment promises and the
-                            // event `dogs::spawn_dog_watch` subscribes to.
+                            // the muster's own comment promises. Bark's
+                            // `Trigger::GaveUp` is what sees that event; a
+                            // restored row carries `dog: None`, so the dog
+                            // watcher never does.
                             BatchPolicy::PerApp => {
                                 failures.push(failure);
                                 // This app's remaining instances are skipped
@@ -14645,8 +14649,9 @@ mod tests {
     //
     // Reachable: `start_restored` uses `PerApp`, so any second muster restore
     // over a flock already holding the row hits it whenever the app's `user`
-    // still does not resolve. `dogs::spawn_dog_watch` subscribes and would
-    // read the repeat as a fresh transition.
+    // still does not resolve. Bark's `Trigger::GaveUp` would read the repeat
+    // as a fresh transition and page a second time, once the two restores are
+    // further apart than its five-minute per-subject debounce.
     //
     // Counts events rather than checking the row still exists, which is what
     // the row-shaped assertions in the cases above already do and what would

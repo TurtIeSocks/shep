@@ -148,8 +148,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a second muster restore over a flock already holding it finds the row rather
   than making one. The `ProcessEventKind::Errored` emit keyed on the row's
   STATUS, which is `Errored` whether the call created it or found it, so the
-  repeat went out as a fresh transition and `dogs::spawn_dog_watch` read it as
-  one. It keys on the registration now: `register_without_spawning` returns
+  repeat went out as a fresh transition and bark's `Trigger::GaveUp` read it as
+  one, paging twice for a row that had not changed whenever the two restores
+  sat further apart than its five-minute debounce. It keys on the registration now: `register_without_spawning` returns
   whether it made the row, which is a question the row itself cannot answer.
 
 - Say why a restart produced no process. The event a failed restart emits
