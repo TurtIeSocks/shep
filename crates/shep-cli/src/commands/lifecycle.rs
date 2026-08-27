@@ -139,16 +139,50 @@ pub(crate) fn target_exit_code(err: &TargetError) -> ExitCode {
 /// The script handed to `node -e`. Wraps the `require` in its own
 /// `try`/`catch` rather than letting an uncaught exception crash node and
 /// relying on node's own crash-dump formatting — see this function's doc for
-/// why. `process.argv[1]` is the absolute path, per `-e`'s argv layout
-/// (identical to `-p`'s).
+/// why.
+/// The filename [`evaluate_js_flockfile`] writes [`JS_BRIDGE_SCRIPT`] to.
+///
+/// Deliberately plain ASCII with no spaces: it is passed to node as a bare
+/// relative argument, and the whole point of the file is that nothing
+/// needing quoting ever reaches a command line.
+const JS_BRIDGE_FILE: &str = "shep-flockfile-bridge.js";
+
+/// The bridge run by [`evaluate_js_flockfile`], written to a file rather
+/// than passed to `node -e`.
+///
+/// **It was `node -e <script>` and that did not survive Windows CI.** The
+/// symptom was node failing with `EISDIR: illegal operation on a directory,
+/// lstat 'C:'`, unchanged across two different ways of handing it the path,
+/// which is what ruled the path out as the cause: an identical message after
+/// changing the mechanism means the mechanism was not what broke.
+///
+/// The remaining suspect is this script itself crossing a command line. It
+/// contains `&&`, which is a `cmd.exe` operator, so a `node` that resolves
+/// to a `.cmd` shim rather than a real `node.exe` would have cmd re-parse
+/// and truncate it. That was never confirmed, because a machine with a real
+/// `node.exe` does not reproduce it.
+///
+/// Writing the script to a file removes the question rather than answering
+/// it. A file's contents cross no parser: not the MSVC C runtime's argument
+/// escaping, not `cmd.exe`'s, not any shim's. The only argument left is
+/// [`JS_BRIDGE_FILE`], a bare relative name with nothing in it to quote.
+///
+/// The path is still read from the environment and still never interpolated
+/// into the source, so the injection argument holds: a Flockfile path
+/// containing `'`, `\` or a newline cannot escape a string literal here,
+/// because there is no string literal for it to escape.
 const JS_BRIDGE_SCRIPT: &str = "try { \
      process.stdout.write(JSON.stringify(require(process.env.SHEP_FLOCKFILE_PATH))); \
  } catch (err) { \
-     process.stderr.write(err && err.message ? String(err.message) : String(err)); \
+     process.stderr.write('[bridge saw ' + String(process.env.SHEP_FLOCKFILE_PATH) + '] ' + (err && err.message ? String(err.message) : String(err))); \
      process.exitCode = 1; \
  }";
 
 /// Evaluates a `.js` Flockfile through node and returns its JSON.
+///
+/// The script is written to a file and run as `node <file>` from that
+/// file's own directory; see [`JS_BRIDGE_SCRIPT`] for why it is not
+/// `node -e`.
 ///
 /// The path is passed in the **environment**, as `SHEP_FLOCKFILE_PATH`, and
 /// never interpolated into the JavaScript source: a path containing `'`,
@@ -183,7 +217,7 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 /// never the message. `err.message` is written to stderr ourselves instead,
 /// which is what makes the sentence below actually name the failure. This
 /// stays inside the same mechanic the design calls for (`-p` / `-e` both put
-/// the path at `process.argv[1]`, never in the source), so it is a narrower
+/// the path in the environment, never in the source), so it is a narrower
 /// implementation choice, not a different design.
 ///
 /// **There is no timeout.** A module that never returns — one that starts a
@@ -213,9 +247,25 @@ fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
         path: path.to_path_buf(),
         source,
     })?;
+    // The bridge is written to a file and run as `node loader.js` from that
+    // file's own directory, so the only argument node ever receives is a
+    // bare relative filename: no path, no quotes, no shell metacharacters.
+    // See [`JS_BRIDGE_SCRIPT`] for what this is defending against.
+    let scratch = tempfile::Builder::new()
+        .prefix("shep-js-bridge")
+        .tempdir()
+        .map_err(|source| TargetError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let loader = scratch.path().join(JS_BRIDGE_FILE);
+    std::fs::write(&loader, JS_BRIDGE_SCRIPT).map_err(|source| TargetError::Read {
+        path: loader.clone(),
+        source,
+    })?;
     let output = std::process::Command::new("node")
-        .arg("-e")
-        .arg(JS_BRIDGE_SCRIPT)
+        .arg(JS_BRIDGE_FILE)
+        .current_dir(scratch.path())
         .env("SHEP_FLOCKFILE_PATH", &absolute)
         .stdin(std::process::Stdio::null())
         .output();
