@@ -1038,12 +1038,12 @@ impl SupervisorHandle {
     /// - [`SupervisorError::CannotStart`] — a scale-UP whose app has a
     ///   `user`/`group` that will not resolve, so no new instance could be
     ///   assembled. Nothing was spawned, nothing was removed, and the stored
-    ///   instance count is unchanged: the flock is exactly as it was. The
-    ///   reachable set is narrow, and worth stating rather than guessing at:
+    ///   instance count is unchanged: the flock is exactly as it was.
     /// - [`SupervisorError::ReloadInFlight`] — the app is mid-reload.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
     ///
-    /// `CannotStart` needs all three of `count > current`, an app whose
+    /// `CannotStart`'s reachable set is narrow, and worth stating rather than
+    /// guessing at. It needs all three of `count > current`, an app whose
     /// identity has never been resolved, and a resolution that then fails.
     /// Only the growing arm resolves anything, so scaling DOWN and scaling to
     /// the count an app already has never ask the passwd database and never
