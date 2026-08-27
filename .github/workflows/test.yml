@@ -355,3 +355,18 @@ jobs:
           -- --ignored --nocapture --exact
           reopen_moves_a_running_sheeps_log_onto_the_recreated_path
         continue-on-error: true
+      # The whole daemon_e2e suite, ignored cases included, one thread at a
+      # time. This is the experiment the other steps set up: the reopen case
+      # passes alone and hangs when the suite runs together, so the question
+      # is whether the fault is concurrency or the case itself. Serial green
+      # here means concurrency, and points at the fixture's boot path, where
+      # seven cases race seven daemons for a `share_mode(0)` lock on a
+      # two-core box. Serial hanging means the opposite and this line of
+      # enquiry is dead.
+      #
+      # `timeout-minutes` on the job caps it either way, so a hang costs
+      # twelve minutes and still prints which case it stopped on.
+      - run: >
+          cargo test -p shep-daemon --test daemon_e2e --locked --all-features
+          -- --include-ignored --test-threads=1 --nocapture
+        continue-on-error: true
