@@ -65,6 +65,7 @@ mod tests {
                 dog: None,
                 lambs: None,
                 last_exit: None,
+                smit: None,
             },
             manually: false,
             at_ms: 1_700_000_000_000,

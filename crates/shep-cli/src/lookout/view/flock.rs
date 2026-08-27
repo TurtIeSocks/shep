@@ -83,6 +83,11 @@ pub enum Column {
     Uptime,
     /// Fold membership.
     Fold,
+    /// A short marker a dog attaches to a sheep over the client protocol's
+    /// `SetSmit` request -- task 7's own column, last in the header order to
+    /// match `output::rows::FlockRows`'s. shep paints what a dog wrote and
+    /// never parses it.
+    Smit,
 }
 
 impl Column {
@@ -105,6 +110,7 @@ impl Column {
             Self::Mem => "MEM",
             Self::Uptime => "UPTIME",
             Self::Fold => "FOLD",
+            Self::Smit => "SMIT",
         }
     }
 
@@ -130,11 +136,32 @@ impl Column {
             Self::Mem => 8,
             Self::Uptime => 8,
             Self::Fold => 10,
+            // 13: `visible_width("▲ main@a1b2c3")` -- the measured width of
+            // the real strings a deploy dog paints, pinned by
+            // `output::table`'s own `how_wide_the_real_smits_actually_are`.
+            // A smit's own cap is 48 characters (`Smit::MAX_CHARS`), but the
+            // pane is fixed-width like every other column here, not
+            // variable like NAME, so a longer one truncates via [`fit`]
+            // rather than growing the column.
+            Self::Smit => 13,
         }
     }
 }
 
 const ALL: &[Column] = &[
+    Column::Id,
+    Column::Name,
+    Column::Status,
+    Column::Pid,
+    Column::Restarts,
+    Column::Exit,
+    Column::Cpu,
+    Column::Mem,
+    Column::Uptime,
+    Column::Fold,
+    Column::Smit,
+];
+const NO_SMIT: &[Column] = &[
     Column::Id,
     Column::Name,
     Column::Status,
@@ -218,8 +245,14 @@ const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 /// the exact same tension in its own comment and reaches the same answer --
 /// so an operator who has learned one table's drop order is not surprised
 /// by the other's.
+///
+/// SMIT (task 7) sits above FOLD, at the very top: it is by far the widest
+/// column, so it is the first one to go. That is the same reasoning
+/// `output::rows::FlockRows::PRIORITIES` gives for its own priority 8, the
+/// highest number in that table.
 const TIERS: &[(u16, &[Column])] = &[
-    (101, ALL),
+    (116, ALL),
+    (101, NO_SMIT),
     (89, NO_FOLD),
     (78, NO_EXIT),
     (68, NO_RESTARTS),
@@ -391,6 +424,7 @@ fn cell(app: &App, row: &Row, column: Column) -> String {
             .uptime_ms(info.id)
             .map_or_else(|| "-".to_string(), human_duration),
         Column::Fold => info.fold.clone().unwrap_or_else(|| "-".to_string()),
+        Column::Smit => info.smit.clone().unwrap_or_else(|| "-".to_string()),
     }
 }
 
@@ -426,7 +460,10 @@ mod tests {
     /// those three are the pane.
     #[test]
     fn columns_drop_in_a_fixed_order_as_the_terminal_narrows() {
-        assert_eq!(columns_for(300).len(), 10);
+        assert_eq!(columns_for(300).len(), 11);
+        assert_eq!(columns_for(116).len(), 11);
+        assert!(!columns_for(115).contains(&Column::Smit));
+        assert!(columns_for(115).contains(&Column::Fold));
         assert_eq!(columns_for(101).len(), 10);
         assert!(!columns_for(100).contains(&Column::Fold));
         assert!(columns_for(100).contains(&Column::Exit));

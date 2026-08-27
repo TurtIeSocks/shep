@@ -43,6 +43,7 @@ impl Render for FlockRows {
     fn headers() -> &'static [&'static str] {
         &[
             "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD",
+            "SMIT",
         ]
     }
 
@@ -70,6 +71,7 @@ impl Render for FlockRows {
                         .map_or_else(|| "-".to_string(), super::human_bytes),
                     super::human_duration(p.uptime_ms),
                     p.fold.clone().unwrap_or_else(|| "-".to_string()),
+                    p.smit.clone().unwrap_or_else(|| "-".to_owned()),
                 ]
             })
             .collect()
@@ -112,6 +114,7 @@ impl Render for FlockRows {
             "MEM" => "memory_bytes",
             "UPTIME" => "uptime_ms",
             "FOLD" => "fold",
+            "SMIT" => "smit",
             other => panic!("FlockRows::headers() does not include {other:?}"),
         }
     }
@@ -135,14 +138,17 @@ impl Render for FlockRows {
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
-    // "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD"]`. `flock` is the
-    // table this whole feature is drawn of, so it is the one payload type
-    // the design spec gives an explicit priority table: ID/NAME/STATUS never
-    // drop (`0`), then UPTIME, PID, MEM, RESTARTS, CPU, EXIT, FOLD, in that
-    // dropping order. `flock_priorities_line_up_with_flock_headers` (below)
-    // pins both the length and which three columns sit at `0`, because
-    // these two arrays drift silently -- a header inserted without its
-    // priority shifts every priority after it onto the wrong column.
+    // "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD", "SMIT"]`. `flock`
+    // is the table this whole feature is drawn of, so it is the one payload
+    // type the design spec gives an explicit priority table: ID/NAME/STATUS
+    // never drop (`0`), then, in the order they survive as the terminal
+    // narrows (ascending priority), UPTIME, PID, MEM, RESTARTS, CPU, EXIT,
+    // FOLD, SMIT -- so the real give-up order, highest priority first, is
+    // SMIT, FOLD, EXIT, CPU, RESTARTS, MEM, PID, UPTIME.
+    // `flock_priorities_line_up_with_flock_headers` (below) pins both the
+    // length and which three columns sit at `0`, because these two arrays
+    // drift silently -- a header inserted without its priority shifts every
+    // priority after it onto the wrong column.
     //
     // EXIT and FOLD are the only two columns sharing the "6 and up" tier,
     // and deliberately not tied at the same number (task 49): EXIT is
@@ -151,10 +157,15 @@ impl Render for FlockRows {
     // says why" -- and least when everything is healthy, where it renders
     // `-` for every row. FOLD, an organizational label rather than a
     // diagnostic, keeps its long-standing spot as the single most droppable
-    // column; EXIT sits one tier below it, so a narrowing terminal loses
-    // FOLD before it loses the one column that answers "why is this row
-    // even here".
-    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7];
+    // column below SMIT; EXIT sits one tier below FOLD, so a narrowing
+    // terminal loses FOLD before it loses the one column that answers "why
+    // is this row even here".
+    //
+    // SMIT sits above FOLD, at the very top: it is by far the widest
+    // column, so dropping it recovers the most space for one column lost.
+    // Rin's ruling is that it belongs among the first columns to yield, and
+    // 8 is the literal reading of that.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
 }
 
 /// One sheep's STATUS cell, per spec §2 -- the only place in this module a
@@ -368,6 +379,10 @@ impl Render for DogRows {
         // Rides the JSON anyway, same as every other field on this wire, so
         // a consumer switching on `ProcessInfo` shape alone still sees it.
         "last_exit",
+        // A dog paints smits; nothing paints one on a dog. Always `null`
+        // here, and in the JSON for the same shape-consistency reason as the
+        // rest of this list.
+        "smit",
     ];
 
     // Parallel to `headers()` above: `["NAME", "SOURCE", "STATUS", "PID",
@@ -783,6 +798,9 @@ impl Render for FlushedRows {
         // a terminal. Stays in the JSON for shape consistency with every
         // other verb answering `ProcessInfo`.
         "last_exit",
+        // And the same again for the mark a dog painted: a flush neither
+        // reads nor changes it.
+        "smit",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "OUT_FILE",
@@ -1826,6 +1844,16 @@ pub(crate) mod tests {
                 code: Some(1),
                 signal: None,
             }))
+            // Fixed rather than id-derived, like `fold` and `cpu_percent`
+            // above. The literal a real dog paints, taken from shep-deploy's
+            // own renderer, so the drift check compares the cell against a
+            // string shep will actually be handed rather than a placeholder.
+            // Left `None` it would serialize as `null`, which
+            // `assert_no_drift`'s cell check skips rather than compares, and
+            // SMIT would quietly stop being watched: swapping the cell for a
+            // bogus string still passed the drift test until this line
+            // existed.
+            .smit(Some("\u{25b2} main@a1b2c3".to_string()))
             .build()
     }
 
@@ -2866,10 +2894,11 @@ pub(crate) mod tests {
             vec![
                 // The three that identify a sheep, and so never drop.
                 "ID", "NAME", "STATUS", //
-                // Then, in the order they are given up as the terminal
-                // narrows: the ones answering "is it healthy" outlast the
-                // ones answering "which one is it".
-                "UPTIME", "PID", "MEM", "RESTARTS", "CPU", "EXIT", "FOLD",
+                // Then, in the order they SURVIVE as the terminal narrows
+                // (ascending priority; the real give-up order is the
+                // reverse of this): the ones answering "is it healthy"
+                // outlast the ones answering "which one is it".
+                "UPTIME", "PID", "MEM", "RESTARTS", "CPU", "EXIT", "FOLD", "SMIT",
             ],
             "the flock listing's drop order changed; if that is deliberate, \
              change this test and say why in the commit"

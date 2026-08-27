@@ -35,6 +35,7 @@
 
 use core::cmp::Ordering;
 use core::fmt;
+use core::sync::atomic::{self, AtomicU64};
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
@@ -47,7 +48,7 @@ use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
-    ProcessEventKind, ProcessInfo, SignalOutcome, SignalReply,
+    ProcessEventKind, ProcessInfo, SignalOutcome, SignalReply, Smit,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -141,6 +142,43 @@ const MAX_ABANDONED_ACTION_REPLIES: usize = 64;
 // ---------------------------------------------------------------------
 // Public command / handle surface
 // ---------------------------------------------------------------------
+
+/// Distinguishes one client connection from another, for the lifetime of that
+/// connection and no longer.
+///
+/// Minted per accepted connection by the server layer and never reused within
+/// a daemon's life. The only thing scoped by it today is smits, whose whole
+/// lifecycle rule is "they belong to the connection that painted them" — which
+/// is what makes them ephemeral without cleanup logic on every path that can
+/// stop a dog.
+///
+/// It lives here rather than in `server`, which is where it is minted and
+/// where its doc would otherwise sit: that module is `#[cfg(unix)]`, and this
+/// one is not. A `ConnId` named from here on a Windows build would not
+/// resolve, and the workspace's own windows-gnu cross-check is a gate that
+/// would catch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ConnId(u64);
+
+impl ConnId {
+    /// Mints the next id. Monotonic, and wide enough that a daemon cannot
+    /// reach the wrap.
+    pub(crate) fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, atomic::Ordering::Relaxed))
+    }
+}
+
+/// Every sheep name that currently carries a smit, and which connection
+/// painted it.
+///
+/// Keyed by NAME, not by instance id. A sheep can run several instances, and
+/// one smit per entry would mean fanning out at publish time and then keeping
+/// it in step as instances come and go — an instance spawned five seconds
+/// after a publish would show nothing until the publisher's next tick. Every
+/// instance of a named sheep reads the same mark, including one spawned a
+/// moment ago.
+type Smits = HashMap<String, (ConnId, String)>;
 
 /// Commands the supervisor actor accepts (wrapped in [`Msg::Command`]).
 ///
@@ -248,6 +286,44 @@ pub(crate) enum Command {
         count: u32,
         /// Answers with the app's surviving instances and its new config.
         reply: oneshot::Sender<Result<Scaled, SupervisorError>>,
+    },
+    /// Attaches a marker to one sheep by name, or clears it.
+    ///
+    /// # Last writer wins
+    ///
+    /// `Some` overwrites whatever is already there, including a mark another
+    /// connection painted. That is deliberate rather than an oversight: there
+    /// is one column and one string, and shep is not going to arbitrate
+    /// between dogs. A `None`, by contrast, only takes effect when the stored
+    /// [`ConnId`] matches, so one dog cannot wipe another's mark — clearing
+    /// somebody else's would be a silent removal nobody could attribute,
+    /// where an overwrite at least leaves a mark on screen.
+    SetSmit {
+        /// The connection painting it — the scope the mark lives in.
+        conn: ConnId,
+        /// The sheep's name, exactly as its config spells it. Not a selector,
+        /// for [`Self::Scale`]'s reason.
+        sheep: String,
+        /// The marker, or `None` to clear this connection's own.
+        smit: Option<Smit>,
+        /// Answers with the named sheep's instances, or
+        /// [`SupervisorError::NotFound`] when no sheep holds that name.
+        reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
+    /// Forgets every smit `conn` painted, leaving every other connection's
+    /// alone.
+    ///
+    /// Sent from the server layer's per-connection tail, which is the one
+    /// block that runs on every path out of a connection. That is the whole
+    /// of a smit's cleanup: `shep disable`, `shep rehome`, a dog crashing, a
+    /// daemon restart and a deliberate reconnect all end a socket, so all
+    /// five drop the marks without anyone editing five code paths.
+    ForgetSmits {
+        /// The connection that has ended.
+        conn: ConnId,
+        /// Answers once the actor has processed the removal, so the caller
+        /// knows the marks are gone rather than merely queued.
+        reply: oneshot::Sender<()>,
     },
     /// Full flock listing, name-grouped (see [`Actor::snapshot_all`]).
     List {
@@ -804,6 +880,62 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
+    /// Attaches `smit` to the sheep called `sheep`, scoped to `conn`, or
+    /// clears this connection's own mark with `None`.
+    ///
+    /// `smit` arrives as a [`Smit`](shep_core::protocol::Smit) and stays one
+    /// the whole way down. The type did its real work at the wire's edge,
+    /// which is where a third party's text has to be refused, but carrying
+    /// it further costs nothing and means the compiler rather than a comment
+    /// is what stops a later caller inside this crate from handing over a
+    /// string nothing checked. It becomes a `String` only at the map insert,
+    /// where `Smits` stores the rendered text against the name.
+    ///
+    /// A clear from a connection that did not paint the mark is a no-op that
+    /// still answers `Ok` — see [`Command::SetSmit`] for why one dog may
+    /// overwrite another's mark but not remove it.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::NotFound`] — no sheep of that name is registered.
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    pub(crate) async fn set_smit(
+        &self,
+        conn: ConnId,
+        sheep: &str,
+        smit: Option<Smit>,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::SetSmit {
+                conn,
+                sheep: sheep.to_string(),
+                smit,
+                reply,
+            }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Forgets every smit `conn` painted.
+    ///
+    /// Answers `Ok(())` on an engine that has already stopped: a daemon on
+    /// its way down has dropped every smit it held by definition, and the
+    /// caller is a connection tail that has nothing useful to do with a
+    /// failure.
+    pub(crate) async fn forget_smits(&self, conn: ConnId) {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Msg::Command(Command::ForgetSmits { conn, reply }))
+            .await
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+    }
+
     /// Reopens the log files of every sheep matching `selector` — and of
     /// every other sheep writing to one of their paths — for an external
     /// rotator that has renamed them.
@@ -1080,6 +1212,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
             extras: self.extras,
             registry: ExtrasRegistry::default(),
             reloads: HashMap::new(),
+            smits: Smits::new(),
         };
         tokio::spawn(actor.run(rx));
         SupervisorHandle { tx }
@@ -1704,6 +1837,10 @@ struct Actor<R: ProcessRunner> {
     /// What is armed right now, per sheep and per name. Stays empty while
     /// `extras` is `None`: there are no seams to arm anything on.
     registry: ExtrasRegistry,
+    /// Every sheep name currently carrying a smit — see [`Smits`]. Empty is
+    /// the ordinary state; a dog painting one is what puts an entry here, and
+    /// that dog's connection closing is what takes it away again.
+    smits: Smits,
     /// Every app currently mid-reload, keyed by app name. Empty is the
     /// ordinary state; an entry is what makes a second reload of the same
     /// app refusable and what tells a sheep's exit whether it is a swap's
@@ -1799,6 +1936,23 @@ impl<R: ProcessRunner> Actor<R> {
             }
             Command::Scale { name, count, reply } => {
                 self.handle_scale(&name, count, reply);
+                false
+            }
+            // Neither is rejected while `shutting_down`: a smit registers
+            // nothing and spawns nothing, and a daemon on its way down is
+            // about to drop the whole map anyway.
+            Command::SetSmit {
+                conn,
+                sheep,
+                smit,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_set_smit(conn, &sheep, smit));
+                false
+            }
+            Command::ForgetSmits { conn, reply } => {
+                self.smits.retain(|_, (painter, _)| *painter != conn);
+                let _ = reply.send(());
                 false
             }
             Command::List { reply } => {
@@ -1930,7 +2084,7 @@ impl<R: ProcessRunner> Actor<R> {
             .values()
             .find(|slot| slot.entry.spec.config().name == app.config().name)
         {
-            return Ok(to_info(&slot.entry));
+            return Ok(to_info(&slot.entry, &self.smits));
         }
         let started = self.do_start(vec![app], Some(source))?;
         started
@@ -2004,7 +2158,7 @@ impl<R: ProcessRunner> Actor<R> {
             .values()
             .find(|slot| &slot.entry.spec.config().name == name)
         {
-            return to_info(&slot.entry);
+            return to_info(&slot.entry, &self.smits);
         }
 
         let id = self.next_id;
@@ -2030,7 +2184,7 @@ impl<R: ProcessRunner> Actor<R> {
             // A fresh registration, never spawned: nothing has exited yet.
             last_exit: None,
         };
-        let info = to_info(&entry);
+        let info = to_info(&entry, &self.smits);
         self.sheep.insert(
             id,
             SheepSlot {
@@ -2115,7 +2269,7 @@ impl<R: ProcessRunner> Actor<R> {
                     // exited yet under it.
                     last_exit: None,
                 };
-                let info = to_info(&entry);
+                let info = to_info(&entry, &self.smits);
                 let log_ctl = io.log_ctl.clone();
                 let to_child = io.to_child.clone();
                 let to_stdin = io.to_stdin.clone();
@@ -2188,7 +2342,7 @@ impl<R: ProcessRunner> Actor<R> {
                     // Spawn itself failed: no process ever existed to exit.
                     last_exit: None,
                 };
-                let info = to_info(&entry);
+                let info = to_info(&entry, &self.smits);
                 self.sheep.insert(
                     id,
                     SheepSlot {
@@ -2300,7 +2454,7 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.epoch += 1;
                 debug_assert_eq!(slot.epoch, next_epoch);
                 slot.ready_tx = ready_tx;
-                let info = to_info(&slot.entry);
+                let info = to_info(&slot.entry, &self.smits);
                 self.emit(ProcessEventKind::Restart, info.clone(), manually);
                 // Same gap as `spawn_fresh`'s Ok arm (see its own comment):
                 // for a gated app `Online` fires later, from
@@ -2338,7 +2492,7 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.signals = None;
                 slot.to_stdin = None;
                 slot.ready_tx = None;
-                let info = to_info(&slot.entry);
+                let info = to_info(&slot.entry, &self.smits);
                 self.emit(ProcessEventKind::Errored, info.clone(), manually);
                 // The same terminal status `Decision::Errored` reaches, and it
                 // needs the same disarm: a respawn that fails to spawn (the
@@ -2626,17 +2780,17 @@ impl<R: ProcessRunner> Actor<R> {
                     // the sheep in limbo.
                     ProcStatus::WaitingRestart | ProcStatus::Errored => {
                         slot.entry.status = ProcStatus::Stopped;
-                        let info = to_info(&slot.entry);
+                        let info = to_info(&slot.entry, &self.smits);
                         self.emit(ProcessEventKind::Stop, info.clone(), manually);
                         self.disarm_extras(id, &info.name);
                         Some(info)
                     }
-                    _ => Some(to_info(&slot.entry)),
+                    _ => Some(to_info(&slot.entry, &self.smits)),
                 }
             }
             ManualKind::Delete => {
                 let slot = self.sheep.remove(&id)?;
-                let info = to_info(&slot.entry);
+                let info = to_info(&slot.entry, &self.smits);
                 self.emit(ProcessEventKind::Delete, info.clone(), manually);
                 self.disarm_extras(id, &info.name);
                 Some(info)
@@ -2890,7 +3044,11 @@ impl<R: ProcessRunner> Actor<R> {
 
         let mut instances: Vec<ProcessInfo> = survivors
             .iter()
-            .filter_map(|id| self.sheep.get(id).map(|slot| to_info(&slot.entry)))
+            .filter_map(|id| {
+                self.sheep
+                    .get(id)
+                    .map(|slot| to_info(&slot.entry, &self.smits))
+            })
             .collect();
         instances.sort_unstable_by_key(|info| info.id);
         // `Ok` even when `failure` is set, and that is deliberate: see
@@ -2971,7 +3129,7 @@ impl<R: ProcessRunner> Actor<R> {
                     .sheep
                     .get(id)
                     .expect("handle_reload: `matched` holds ids read off this map a moment ago");
-                to_info(&slot.entry)
+                to_info(&slot.entry, &self.smits)
             })
             .collect();
 
@@ -3098,7 +3256,7 @@ impl<R: ProcessRunner> Actor<R> {
                     // put the drainee back to `Online`, which is what the
                     // event carries.
                     if let Some(slot) = self.sheep.get(&old_id) {
-                        let info = to_info(&slot.entry);
+                        let info = to_info(&slot.entry, &self.smits);
                         self.emit(ProcessEventKind::ReloadAbandoned, info, true);
                     }
                     return;
@@ -3225,7 +3383,7 @@ impl<R: ProcessRunner> Actor<R> {
                     dog,
                     last_exit,
                 };
-                let info = to_info(&entry);
+                let info = to_info(&entry, &self.smits);
                 let log_ctl = io.log_ctl.clone();
                 let to_child = io.to_child.clone();
                 let to_stdin = io.to_stdin.clone();
@@ -3273,7 +3431,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // from the drainee's own entry, which is `Stopping` by now,
                 // so a reader following one id sees it change hands rather
                 // than having to pair two events by slot.
-                let drainee = to_info(&self.sheep[&old_id].entry);
+                let drainee = to_info(&self.sheep[&old_id].entry, &self.smits);
                 self.emit(ProcessEventKind::Reload, drainee, true);
                 self.emit(ProcessEventKind::Start, info, true);
                 Ok(new_id)
@@ -3430,7 +3588,7 @@ impl<R: ProcessRunner> Actor<R> {
             .get(&new_id)
             .is_some_and(|slot| slot.entry.status == ProcStatus::Online);
         if serving {
-            let info = to_info(&self.sheep[&new_id].entry);
+            let info = to_info(&self.sheep[&new_id].entry, &self.smits);
             self.emit(ProcessEventKind::Reloaded, info, true);
             self.advance_reload(name, job.queue);
             return;
@@ -3443,7 +3601,7 @@ impl<R: ProcessRunner> Actor<R> {
              replaced went"
         );
         if let Some(slot) = self.sheep.get(&new_id) {
-            let info = to_info(&slot.entry);
+            let info = to_info(&slot.entry, &self.smits);
             self.emit(ProcessEventKind::ReloadAbandoned, info, true);
         }
     }
@@ -3506,7 +3664,7 @@ impl<R: ProcessRunner> Actor<R> {
             if drainee.ctl.is_some() && drainee.manual.is_none() {
                 drainee.entry.status = ProcStatus::Online;
             }
-            to_info(&drainee.entry)
+            to_info(&drainee.entry, &self.smits)
         });
         if let Some(info) = kept {
             self.emit(ProcessEventKind::ReloadAbandoned, info, true);
@@ -3640,7 +3798,7 @@ impl<R: ProcessRunner> Actor<R> {
                 self.reloads.remove(name);
                 self.clear_reload(new_id);
                 if let Some(slot) = self.sheep.get(&new_id) {
-                    let info = to_info(&slot.entry);
+                    let info = to_info(&slot.entry, &self.smits);
                     self.emit(ProcessEventKind::ReloadAbandoned, info, true);
                 }
             }
@@ -3687,7 +3845,7 @@ impl<R: ProcessRunner> Actor<R> {
             .expect("deregister_on_exit: unknown id");
         removed.entry.status = ProcStatus::Stopped;
         removed.entry.reload = ReloadState::None;
-        let info = to_info(&removed.entry);
+        let info = to_info(&removed.entry, &self.smits);
         self.emit(ProcessEventKind::Delete, info.clone(), true);
         self.disarm_extras(id, &info.name);
         self.resolve_pending(id, info)
@@ -3820,7 +3978,7 @@ impl<R: ProcessRunner> Actor<R> {
                 .expect("`matching_ids` answers with ids read off this map a moment ago");
             paths.insert(slot.entry.out_file.clone());
             paths.insert(slot.entry.err_file.clone());
-            matched.push(to_info(&slot.entry));
+            matched.push(to_info(&slot.entry, &self.smits));
         }
 
         if matched.is_empty() {
@@ -3837,7 +3995,7 @@ impl<R: ProcessRunner> Actor<R> {
             .filter_map(|slot| {
                 slot.log_ctl
                     .clone()
-                    .map(|log_ctl| (to_info(&slot.entry), log_ctl))
+                    .map(|log_ctl| (to_info(&slot.entry, &self.smits), log_ctl))
             })
             .collect();
 
@@ -3919,7 +4077,7 @@ impl<R: ProcessRunner> Actor<R> {
                 .expect("`matching_ids` answers with ids read off this map a moment ago");
             paths.insert(slot.entry.out_file.clone());
             paths.insert(slot.entry.err_file.clone());
-            matched.push(to_info(&slot.entry));
+            matched.push(to_info(&slot.entry, &self.smits));
         }
 
         if matched.is_empty() {
@@ -4181,7 +4339,7 @@ impl<R: ProcessRunner> Actor<R> {
                         );
                         self.reloads.remove(&name);
                         if let Some(slot) = self.sheep.get(&id) {
-                            let info = to_info(&slot.entry);
+                            let info = to_info(&slot.entry, &self.smits);
                             self.emit(ProcessEventKind::ReloadAbandoned, info, true);
                         }
                     }
@@ -4218,12 +4376,15 @@ impl<R: ProcessRunner> Actor<R> {
             if kind == Some(ManualKind::Delete) || pending_delete {
                 let mut removed = self.sheep.remove(&id).expect("checked above");
                 removed.entry.status = ProcStatus::Stopped;
-                let info = to_info(&removed.entry);
+                let info = to_info(&removed.entry, &self.smits);
                 self.emit(ProcessEventKind::Delete, info.clone(), true);
                 self.disarm_extras(id, &info.name);
                 return self.resolve_pending(id, info);
             }
-            let info = to_info(&self.sheep.get(&id).expect("checked above").entry);
+            let info = to_info(
+                &self.sheep.get(&id).expect("checked above").entry,
+                &self.smits,
+            );
             return self.resolve_pending(id, info);
         };
         let uptime = tokio::time::Instant::now().saturating_duration_since(started_at);
@@ -4310,7 +4471,7 @@ impl<R: ProcessRunner> Actor<R> {
             Decision::CleanStop if kind == Some(ManualKind::Delete) || pending_delete => {
                 let mut removed = self.sheep.remove(&id).expect("checked above");
                 removed.entry.status = ProcStatus::Stopped;
-                let info = to_info(&removed.entry);
+                let info = to_info(&removed.entry, &self.smits);
                 self.emit(ProcessEventKind::Delete, info.clone(), true);
                 self.disarm_extras(id, &info.name);
                 info
@@ -5007,7 +5168,52 @@ impl<R: ProcessRunner> Actor<R> {
     fn set_status(&mut self, id: u32, status: ProcStatus) -> ProcessInfo {
         let slot = self.sheep.get_mut(&id).expect("set_status: unknown id");
         slot.entry.status = status;
-        to_info(&slot.entry)
+        to_info(&slot.entry, &self.smits)
+    }
+
+    /// Paints or clears one sheep's smit and answers with that sheep's
+    /// instances as they now stand.
+    ///
+    /// Every instance of the name, not one row: the map is keyed by name, so
+    /// every instance carries the mark and the reply says so rather than
+    /// leaving the caller to guess how far it reached.
+    fn handle_set_smit(
+        &mut self,
+        conn: ConnId,
+        sheep: &str,
+        smit: Option<Smit>,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        if !self
+            .sheep
+            .values()
+            .any(|slot| slot.entry.spec.config().name == sheep)
+        {
+            // Refused rather than stored against a name nothing holds: a dog
+            // painting a mark on a sheep somebody deleted gets a clean answer
+            // instead of an orphan entry no listing would ever show it.
+            return Err(SupervisorError::NotFound);
+        }
+        match smit {
+            Some(smit) => {
+                self.smits
+                    .insert(sheep.to_string(), (conn, smit.to_string()));
+            }
+            // Only this connection's own — see `Command::SetSmit`'s doc.
+            None => {
+                if self
+                    .smits
+                    .get(sheep)
+                    .is_some_and(|(painter, _)| *painter == conn)
+                {
+                    self.smits.remove(sheep);
+                }
+            }
+        }
+        Ok(self
+            .snapshot_all()
+            .into_iter()
+            .filter(|info| info.name == sheep)
+            .collect())
     }
 
     /// Full flock listing, grouped by app name.
@@ -5033,7 +5239,10 @@ impl<R: ProcessRunner> Actor<R> {
                 b.id,
             ))
         });
-        entries.into_iter().map(to_info).collect()
+        entries
+            .into_iter()
+            .map(|entry| to_info(entry, &self.smits))
+            .collect()
     }
 
     /// Broadcasts one lifecycle transition. Send failures (no receivers)
@@ -5066,7 +5275,13 @@ fn send_reply(reply: ReplyKind, outcome: Result<Vec<ProcessInfo>, SupervisorErro
 }
 
 /// Snapshots one entry into the wire-facing [`ProcessInfo`] shape.
-fn to_info(entry: &ProcessEntry) -> ProcessInfo {
+///
+/// Takes the smit map rather than hanging off `&self`, and that is not a
+/// stylistic preference: several call sites hold a `&mut` borrow of
+/// `self.sheep` when they reach this, so a method on `Actor` would borrow the
+/// whole actor and refuse to compile. A free function taking one field lets
+/// the borrow checker see the two fields as disjoint, which they are.
+fn to_info(entry: &ProcessEntry, smits: &Smits) -> ProcessInfo {
     let uptime_ms = entry.started_at.map_or(0, |started_at| {
         tokio::time::Instant::now()
             .saturating_duration_since(started_at)
@@ -5092,6 +5307,13 @@ fn to_info(entry: &ProcessEntry) -> ProcessInfo {
         .memory_bytes(None)
         .dog(entry.dog.clone())
         .last_exit(entry.last_exit)
+        // By NAME: every instance of a sheep shows the same mark, including
+        // one spawned after it was painted.
+        .smit(
+            smits
+                .get(&entry.spec.config().name)
+                .map(|(_, smit)| smit.clone()),
+        )
         .build()
 }
 
@@ -7542,6 +7764,7 @@ mod tests {
             extras: None,
             registry: ExtrasRegistry::default(),
             reloads: HashMap::new(),
+            smits: Smits::new(),
         };
         (actor, ctl_rx)
     }
@@ -7713,6 +7936,7 @@ mod tests {
             extras: None,
             registry: ExtrasRegistry::default(),
             reloads: HashMap::new(),
+            smits: Smits::new(),
         };
         (actor, rx)
     }
@@ -7773,6 +7997,7 @@ mod tests {
             extras: None,
             registry: ExtrasRegistry::default(),
             reloads: HashMap::new(),
+            smits: Smits::new(),
         };
         (actor, rx)
     }
@@ -7820,10 +8045,13 @@ mod tests {
         let (actor, _mailbox) = actor_with_a_sheep_and_a_dog(&dir);
 
         assert_eq!(
-            to_info(&actor.sheep[&DOG_ID].entry).dog,
+            to_info(&actor.sheep[&DOG_ID].entry, &actor.smits).dog,
             Some(DogSource::BuiltIn)
         );
-        assert_eq!(to_info(&actor.sheep[&SHEEP_ID].entry).dog, None);
+        assert_eq!(
+            to_info(&actor.sheep[&SHEEP_ID].entry, &actor.smits).dog,
+            None
+        );
     }
 
     /// Starts `app` (normalized) through `h`'s supervisor and hands back the
@@ -7963,6 +8191,7 @@ mod tests {
             extras: None,
             registry: ExtrasRegistry::default(),
             reloads: HashMap::new(),
+            smits: Smits::new(),
         }
     }
 

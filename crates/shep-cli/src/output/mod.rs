@@ -1249,30 +1249,35 @@ mod tests {
     /// Spec §2: the STATUS word is the first thing dropped from that
     /// column, before any whole column is. `waiting-restart` (15
     /// characters) is the longest status word, chosen so face-plus-word
-    /// alone forces `FOLD` past a width face-alone comfortably fits —
+    /// alone forces a column past a width face-alone comfortably fits —
     /// exercising `Render::rows_for` and `table::render_boxed_ex` directly,
     /// the same two calls `table_of`'s own two-pass retry makes -- `table_of`
     /// could be driven at this same chosen width too now that width is an
     /// injected `Presentation` field rather than a real-terminal read, but
     /// this test stays at the lower level anyway, to pin the exact retry
     /// mechanics rather than `table_of`'s outer wrapping around them.
+    ///
+    /// Width 84, not this module's usual 80: task 7's `SMIT` column, empty
+    /// here and the highest priority number, is what face-alone now needs
+    /// dropped at 80 -- the same seven-column cost `output/table.rs`'s own
+    /// tests record for adding a column nobody's row fills.
     #[test]
     fn the_word_drops_before_a_whole_column_does() {
         let flock = FlockRows(vec![
             ProcessInfo::builder(1, "a", ProcStatus::WaitingRestart).build(),
         ]);
-        let presentation = Presentation::new(StyleLevel::Full, None, None, None, 80);
+        let presentation = Presentation::new(StyleLevel::Full, None, None, None, 84);
         let headers = FlockRows::headers();
 
         let wide = table::render_boxed_ex(
             headers,
             &flock.rows_for(presentation, true),
             FlockRows::PRIORITIES,
-            80,
+            84,
         );
         assert!(
             !wide.dropped.is_empty(),
-            "face-plus-word should already force a drop at 80: {}",
+            "face-plus-word should already force a drop at 84: {}",
             wide.rendered
         );
 
@@ -1280,11 +1285,11 @@ mod tests {
             headers,
             &flock.rows_for(presentation, false),
             FlockRows::PRIORITIES,
-            80,
+            84,
         );
         assert!(
             narrow.dropped.is_empty(),
-            "face-alone should fit every column at 80: {}",
+            "face-alone should fit every column at 84: {}",
             narrow.rendered
         );
         assert!(narrow.rendered.contains("FOLD"), "{}", narrow.rendered);
