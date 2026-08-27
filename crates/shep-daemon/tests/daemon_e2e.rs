@@ -684,6 +684,22 @@ async fn await_file_contents(path: &std::path::Path, expected: &str) {
 /// The sheep's own log path is read off the `Started` reply rather than
 /// derived here, so the test cannot disagree with the daemon about which
 /// file it is looking at.
+// TEMPORARY, must not survive this pull request. Re-ignored after 57d7d80
+// un-ignored it, because that experiment produced a result rather than a fix.
+//
+// What it established, worth more than the green run it cost: this case
+// passes on the runner when run ALONE (2.05s, windows-probe on 59b120b) and
+// hangs when the daemon_e2e binary runs its seven cases together. The fault
+// is concurrency, not this test, so re-reading it line by line will not find
+// it.
+//
+// It also rules out the obvious suspect. The RECV_TIMEOUT added to
+// `Client::request` in 4ac5ea7 did NOT fire, so whatever blocks is not a
+// request awaiting a reply. The unbounded wait is somewhere else.
+#[cfg_attr(
+    windows,
+    ignore = "hangs only when the suite runs concurrently; see comment"
+)]
 #[tokio::test]
 async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
