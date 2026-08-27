@@ -39,12 +39,12 @@
 //! same way on both platforms if it fixes it at all.
 
 #![allow(unsafe_code)] // IR-24 exception — the Windows twin of `sys.rs`'s, and
-// the only one on this platform. Eight sites, all in this file: six FFI calls
+// the only one on this platform. Ten sites, all in this file: eight FFI calls
 // (`CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`,
-// `TerminateJobObject`, `CloseHandle`, and one `mem::zeroed` for a Win32
-// limit struct) plus the two `unsafe impl`s that make a kernel handle `Send`
-// and `Sync`. Nothing outside this module writes `unsafe` on Windows, and
-// nothing outside this crate can: `sys_windows` is `pub(crate)`.
+// `TerminateJobObject`, `CloseHandle`, `GetStdHandle`, `SetHandleInformation`,
+// and one `mem::zeroed` for a Win32 limit struct) plus the two `unsafe impl`s
+// that make a kernel handle `Send` and `Sync`. Nothing outside this module
+// writes `unsafe` on Windows.
 
 use std::io;
 use std::os::windows::io::RawHandle;
@@ -292,10 +292,12 @@ mod tests {
     #[tokio::test]
     async fn a_child_assigned_to_a_job_is_killed_by_terminate() {
         let job = Job::create().unwrap();
-        // `timeout` is a Windows built-in that sleeps; `/t 30` far outlives
-        // this test, and `/nobreak` keeps it from returning on a keypress.
+        // `ping`, not `timeout /t`: `timeout.exe` refuses a non-console stdin
+        // and exits in milliseconds, so it would assert nothing here. Same
+        // choice, same measurement, as `real_runner_windows.rs`'s
+        // `LONG_RUNNING`.
         let mut child = tokio::process::Command::new("cmd")
-            .args(["/C", "timeout", "/t", "30", "/nobreak"])
+            .args(["/C", "ping", "-n", "600", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())

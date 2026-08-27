@@ -311,11 +311,10 @@ pub mod sys;
 // `process_group(0)`. Doc lives inside the module's own `//!` header, same
 // reasoning as `server`'s note below.
 //
-// `pub(crate)` rather than `pub`, unlike `sys`: `sys` is public because its
-// documented caller lives in shep-cli and cannot be written any other way,
-// whereas nothing outside this crate ever needs to name a job object —
-// `tokio_runner` owns one per sheep and exposes only the `RunningProcess`
-// trait over it.
+// `pub` for the same reason `sys` is: `seal_std_handles`' documented caller
+// lives in shep-cli and cannot be written any other way. `Job` itself stays
+// `pub(crate)`, `tokio_runner` its only consumer, so nothing outside this
+// crate can name a job object.
 #[cfg(windows)]
 pub mod sys_windows;
 
