@@ -600,7 +600,27 @@ So parse-only is available cheaply and asymmetrically, if it is wanted. Not
 picked here: the grammar is Rin's, it is a wire decision, and the exercise's
 job was to find the friction rather than resolve it.
 
-### `shep adopt`'s vetting runs the candidate against the WRONG `$SHEP_HOME`
+### `shep adopt`'s vetting runs the candidate against the WRONG `$SHEP_HOME` -- FIXED, 2026-08-25
+
+**Fixed in `8a8056b`, by (1) and (3) below.** `vet_binary` now takes the
+home this invocation resolved and passes it to the probe, so `shep adopt
+--home /tmp/scratch ./my-dog` vets the candidate against `/tmp/scratch` and
+not against whatever the shell happened to have. The probe's stdin, stdout
+and stderr all go to `Stdio::null()`, so a candidate can no longer write on
+the operator's terminal during the command that is deciding whether to trust
+it.
+
+**(2) was considered and deliberately not taken.** A real adopted dog runs
+with the daemon's own filtered environment, so `env_clear()` would vet under
+stricter conditions than the dog will ever meet, and a binary needing
+`DYLD_LIBRARY_PATH` or its like would be refused despite working perfectly
+once adopted. Vetting has to model the real thing rather than an idealised
+one. `vet_binary`'s own comment carries that reasoning.
+
+The probe also carries `SHEP_DOG_NAME` now, for the same reason it carries
+`SHEP_HOME`: see the dog-name entry below.
+
+The original entry follows.
 
 Found 2026-08-20, the hard way, while building `shep-log-rotate`. It came
 within a `max_size` default of rotating the live `~/.shep` that supervises
