@@ -13,7 +13,12 @@ use std::time::Duration;
 
 fn main() {
     let rate = parse_rate(std::env::args().nth(1).as_deref());
-    let interval = Duration::from_millis(1000 / u64::from(rate));
+    // `Duration::from_secs_f64`, not integer millisecond division: at any
+    // rate above 1000/s, `1000 / rate` floors to zero and the loop busy-spins
+    // instead of honouring the rate it was given. This stays honest at any
+    // rate a `u32` can hold, including one high enough to be its own kind of
+    // demonstration.
+    let interval = Duration::from_secs_f64(1.0 / f64::from(rate));
 
     println!(
         "noisy pid={} writing {rate} lines/s to stdout and stderr",
