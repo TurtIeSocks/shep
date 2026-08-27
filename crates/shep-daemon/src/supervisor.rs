@@ -244,6 +244,41 @@ pub(crate) enum BatchPolicy {
     PerApp,
 }
 
+/// Whether a registration call created the row it hands back, or found one
+/// already there.
+///
+/// [`Actor::register_without_spawning`] is idempotent by name, so its return
+/// answers "what is registered under this name now" and cannot on its own
+/// answer "did this call put it there". Those are different questions, and an
+/// event is owed to the second: [`ProcessEventKind::Errored`] says a sheep
+/// TRANSITIONED, and a second muster restore finding the row the first one
+/// left has transitioned nothing.
+///
+/// Which is why the emit keys on this and not on the row's status. A status is
+/// true both when something just happened and when it was already true, so the
+/// row found and the row created are alike in it -- both `Errored` -- and a
+/// status test announces both. `dogs::spawn_dog_watch` subscribes to that
+/// event and reads the repeat as fresh.
+#[derive(Debug)]
+enum Registration {
+    /// This call registered the row. A transition happened, and whatever an
+    /// event is owed for it is owed now.
+    Fresh(ProcessInfo),
+    /// An app of this name was already registered. The row is untouched and
+    /// reported exactly as it stood, including its status.
+    AlreadyKnown(ProcessInfo),
+}
+
+impl Registration {
+    /// The row, whichever of the two it is, for a caller that only has to
+    /// report what is registered under the name.
+    fn into_info(self) -> ProcessInfo {
+        match self {
+            Self::Fresh(info) | Self::AlreadyKnown(info) => info,
+        }
+    }
+}
+
 /// Commands the supervisor actor accepts (wrapped in [`Msg::Command`]).
 ///
 /// `pub(crate)` like [`Msg`], and for the same reason: [`SupervisorHandle`] is
@@ -2440,12 +2475,17 @@ impl<R: ProcessRunner> Actor<R> {
                         // overwrites the state of something already running.
                         BatchPolicy::PerApp => {
                             failures.push(format!("{name}: {err}"));
-                            let info = self.register_without_spawning(
+                            // `Fresh` only: the emit announces a TRANSITION,
+                            // and a second restore finding the row a first one
+                            // left has transitioned nothing. Keying this on
+                            // the row's status instead sent a duplicate, since
+                            // the row found and the row created are both
+                            // `Errored`.
+                            if let Registration::Fresh(info) = self.register_without_spawning(
                                 &app,
                                 ProcStatus::Errored,
                                 dog.clone(),
-                            );
-                            if info.status == ProcStatus::Errored {
+                            ) {
                                 self.emit(ProcessEventKind::Errored, info, true);
                             }
                         }
@@ -2635,6 +2675,7 @@ impl<R: ProcessRunner> Actor<R> {
     /// disturbs what is already running.
     fn register_at_rest(&mut self, app: &ResolvedApp) -> ProcessInfo {
         self.register_without_spawning(app, ProcStatus::Stopped, None)
+            .into_info()
     }
 
     /// Registers one app as a flock member in `status`, spawning nothing.
@@ -2655,21 +2696,25 @@ impl<R: ProcessRunner> Actor<R> {
     /// `None` and starting the sheep as the shepherd.
     ///
     /// Idempotent by name, like [`Self::do_start_dog`]: an app already known
-    /// is left exactly as it is, and the caller can tell by the status on
-    /// the returned [`ProcessInfo`].
+    /// is left exactly as it is.
+    ///
+    /// Which of the two happened is the return value's whole job, and it is
+    /// not something the caller can read off the row: see [`Registration`] for
+    /// why the status cannot answer it and what went out twice when a caller
+    /// tried.
     fn register_without_spawning(
         &mut self,
         app: &ResolvedApp,
         status: ProcStatus,
         dog: Option<DogSource>,
-    ) -> ProcessInfo {
+    ) -> Registration {
         let name = &app.config().name;
         if let Some(slot) = self
             .sheep
             .values()
             .find(|slot| &slot.entry.spec.config().name == name)
         {
-            return to_info(&slot.entry, &self.smits);
+            return Registration::AlreadyKnown(to_info(&slot.entry, &self.smits));
         }
 
         let id = self.next_id;
@@ -2719,7 +2764,7 @@ impl<R: ProcessRunner> Actor<R> {
                 actions: ActionWaits::default(),
             },
         );
-        info
+        Registration::Fresh(info)
     }
 
     /// Names the fields in which each app differs from the registered sheep
@@ -14589,6 +14634,62 @@ mod tests {
             actor.sheep[&registered.id].entry.credentials,
             SpawnIdentity::Unresolved,
             "a failed resolution settles nothing: the next attempt must ask again"
+        );
+    }
+
+    // fails if a SECOND restore over an existing errored row announces it
+    // again. `register_without_spawning` is idempotent by name, so the second
+    // call finds the row rather than making one, and nothing transitioned --
+    // but an emit keyed on the row's STATUS cannot tell the row it found from
+    // the row it created, because both are `Errored`.
+    //
+    // Reachable: `start_restored` uses `PerApp`, so any second muster restore
+    // over a flock already holding the row hits it whenever the app's `user`
+    // still does not resolve. `dogs::spawn_dog_watch` subscribes and would
+    // read the repeat as a fresh transition.
+    //
+    // Counts events rather than checking the row still exists, which is what
+    // the row-shaped assertions in the cases above already do and what would
+    // pass either way.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_second_restore_does_not_re_announce_an_errored_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 2]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+        let mut events = actor.events.subscribe();
+
+        for attempt in 1..=2 {
+            assert!(
+                actor
+                    .do_start(vec![app.clone()], None, BatchPolicy::PerApp)
+                    .is_err(),
+                "restore {attempt} must refuse the app"
+            );
+        }
+
+        assert_eq!(
+            actor.sheep.len(),
+            1,
+            "the second restore must find the row, not add a second one"
+        );
+
+        let mut errored = 0;
+        while let Ok(event) = events.try_recv() {
+            if let BusEvent::Process {
+                event: ProcessEventKind::Errored,
+                info,
+                ..
+            } = event
+                && info.name == "web"
+            {
+                errored += 1;
+            }
+        }
+        assert_eq!(
+            errored, 1,
+            "one Errored event, for the restore that actually registered the row: a second is a \
+             transition that did not happen"
         );
     }
 

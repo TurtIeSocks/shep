@@ -143,6 +143,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-reads the passwd database nor changes a running app's identity underneath
   it.
 
+- Announce a credential-refused row once, not on every restore. The
+  `Errored` row a `PerApp` start leaves is registered idempotently by name, so
+  a second muster restore over a flock already holding it finds the row rather
+  than making one. The `ProcessEventKind::Errored` emit keyed on the row's
+  STATUS, which is `Errored` whether the call created it or found it, so the
+  repeat went out as a fresh transition and `dogs::spawn_dog_watch` read it as
+  one. It keys on the registration now: `register_without_spawning` returns
+  whether it made the row, which is a question the row itself cannot answer.
+
 - Say why a restart produced no process. The event a failed restart emits
   carries no reason and the reply has no per-id error slot, so the shepherd's
   log was the only place to learn that a binary had been replaced mid-deploy
