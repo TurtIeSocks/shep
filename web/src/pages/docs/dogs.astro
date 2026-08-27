@@ -267,10 +267,12 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       git and cargo's own precedent (<code>git foo</code> runs{" "}
       <code>git-foo</code>), resolved against adopted dogs only, never a{" "}
       <code>$PATH</code> scan. It's a second invocation mode, distinct from
-      the shepherd's own: a supervised dog gets no argv and one environment
-      variable; a dog you name on the command line gets whatever you typed
-      after it, plus that same <code>$SHEP_HOME</code>. A built-in verb
-      or alias always wins over a same-named dog.
+      the shepherd's own: an adopted dog the shepherd starts gets no argv
+      and two environment variables; a dog you name on the command line
+      gets whatever you typed after it, plus those same two. A built-in dog
+      is the exception, and not one you can write: the shepherd starts it
+      as <code>shep dog &lt;name&gt;</code>. A built-in verb or alias always
+      wins over a same-named dog.
     </p>
     <p>
       What gets recorded in <code>shep.toml</code> is the canonicalized,
@@ -284,22 +286,36 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       <code>$SHEP_HOME/run/shep.sock</code>, send <code>Hello</code>, wait
       for <code>HelloAck</code>, then send{" "}
       <code>Request::DogConfig {"{"} name {"}"}</code> to fetch your own
-      section as opaque text. The one variable an adopted dog inherits from
-      the shepherd's environment is <code>$SHEP_HOME</code>, which is how it
-      finds that socket in the first place: no <code>[dog.&lt;name&gt;]</code>{" "}
-      value rides along beside it.
+      section as opaque text. Shep sets two variables of its own on a dog:{" "}
+      <code>$SHEP_HOME</code>, which is how it finds that socket in the first
+      place, and <code>$SHEP_DOG_NAME</code>, which is the name to put in
+      that request. No <code>[dog.&lt;name&gt;]</code> value rides along
+      beside them.
+    </p>
+    <p>
+      Those two are what shep adds, not the whole environment. A dog is a
+      supervised process like any other, so it also starts from the small
+      base every sheep gets: <code>PATH</code>, plus whichever of{" "}
+      <code>HOME</code>, <code>USER</code>, <code>LANG</code> and{" "}
+      <code>TZ</code> the shepherd itself has, plus{" "}
+      <code>SHEP_INSTANCE</code>. Nothing from{" "}
+      <code>[dog.&lt;name&gt;]</code> is in there.
     </p>
     <Callout variant="careful">
-      Knowing which name to ask for is your problem, and getting it wrong
-      is silent. Nothing tells a dog what the operator typed at{" "}
-      <code>shep adopt</code>, and a <code>DogConfig</code> for a name
-      nobody adopted comes back empty, which is exactly what a registered
-      dog with no section gets. So a one-character mismatch discards the
-      operator's whole section for you, uses every default instead, and
-      prints nothing on either side. Hardcode a name and say so loudly, or
-      work it out: your process knows its own pid, <code>ListFlock</code>{" "}
-      reports one per entry, and the entry marked as a dog carrying your
-      pid is you.
+      Read <code>$SHEP_DOG_NAME</code> rather than hardcoding a name. It
+      holds the name you are registered under, which is the operator's{" "}
+      <code>--name</code> if they gave one and otherwise your own file stem
+      with a leading <code>shep-</code> stripped. Shep sets it every way it
+      runs you: supervised, <code>shep &lt;name&gt;</code>, and the exec
+      probe during <code>adopt</code> itself. Getting the name wrong is silent, which is the whole reason
+      the variable exists: a <code>DogConfig</code> for a name nobody
+      adopted comes back empty, exactly what a registered dog with no
+      section gets, so a one-character mismatch discards the operator's
+      whole section, uses every default instead, and prints nothing on
+      either side. If the variable is absent you are not being run by a
+      shep that sets it, and the fallback is the pid: your process knows
+      its own, <code>ListFlock</code> reports one per entry, and the entry
+      marked as a dog carrying your pid is you.
     </Callout>
     <Callout variant="careful">
       Never send <code>Request::Flush</code> as part of rotating anything.

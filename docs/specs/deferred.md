@@ -600,7 +600,27 @@ So parse-only is available cheaply and asymmetrically, if it is wanted. Not
 picked here: the grammar is Rin's, it is a wire decision, and the exercise's
 job was to find the friction rather than resolve it.
 
-### `shep adopt`'s vetting runs the candidate against the WRONG `$SHEP_HOME`
+### `shep adopt`'s vetting runs the candidate against the WRONG `$SHEP_HOME` -- FIXED, 2026-08-25
+
+**Fixed in `8a8056b`, by (1) and (3) below.** `vet_binary` now takes the
+home this invocation resolved and passes it to the probe, so `shep adopt
+--home /tmp/scratch ./my-dog` vets the candidate against `/tmp/scratch` and
+not against whatever the shell happened to have. The probe's stdin, stdout
+and stderr all go to `Stdio::null()`, so a candidate can no longer write on
+the operator's terminal during the command that is deciding whether to trust
+it.
+
+**(2) was considered and deliberately not taken.** A real adopted dog runs
+with the daemon's own filtered environment, so `env_clear()` would vet under
+stricter conditions than the dog will ever meet, and a binary needing
+`DYLD_LIBRARY_PATH` or its like would be refused despite working perfectly
+once adopted. Vetting has to model the real thing rather than an idealised
+one. `vet_binary`'s own comment carries that reasoning.
+
+The probe also carries `SHEP_DOG_NAME` now, for the same reason it carries
+`SHEP_HOME`: see the dog-name entry below.
+
+The original entry follows.
 
 Found 2026-08-20, the hard way, while building `shep-log-rotate`. It came
 within a `max_size` default of rotating the live `~/.shep` that supervises
@@ -649,7 +669,33 @@ Three fixes, cheap, and they compose:
 Deferred only because it is Rin's call how far to take it. (1) alone is a
 two-line change and fixes the case that was actually hit.
 
-### `emit_error`'s table arm prints whatever it is handed, unsanitised
+### `emit_error`'s table arm prints whatever it is handed, unsanitised -- FIXED, 2026-08-25
+
+**Fixed in `f34d88b`, by (1) below**, and wider than (1) as written.
+`emit_error` runs its message through `terminal_safe::sanitise` before
+either arm sees it, so the class is closed at the one place every caller
+passes through rather than in each error type.
+
+Two things the entry did not anticipate, both in the fix:
+
+- **`emit_notice` gets the same treatment.** It is a sibling emitter with
+  its own envelope, and leaving it out would have left the hole open on
+  every `bleats` notice.
+- **The JSON arm is sanitised too, not only the table arm.** `serde_json`
+  escapes a control byte to `\u001b`, so a terminal never renders it
+  directly, but `shep ... --format json | jq -r .error.message` unescapes
+  it straight back onto a terminal.
+
+`code` is deliberately left alone: every one is a `&'static str` from
+`ExitCode::code_str` or a literal at the call site, so none is ever
+attacker-supplied.
+
+**(2), the `TerminalSafe` newtype, was not built.** It pushes the
+obligation to where the string is built, which is where it belongs, and it
+is still the better answer if shep grows much more error text off the wire.
+`shep install` remains the case that would force it.
+
+The original entry follows.
 
 Found 2026-08-23 by the adversarial review of `shep dogs --available`, and
 recorded because the instance was fixed while the class was not.
@@ -682,9 +728,25 @@ Deferred rather than picked, because the live hole is closed and the right
 answer depends on whether shep expects more error text to come off the wire.
 `shep install`, if it is ever built, would be exactly that.
 
-### A dog cannot learn the name it was adopted under, and getting it wrong is silent
+### A dog cannot learn the name it was adopted under, and getting it wrong is silent -- FIXED, 2026-08-27
 
-Found 2026-08-20 while building `shep-log-rotate`, the first fully external dog.
+**Fixed by option 1 below**, the environment variable: every way shep runs a
+dog now sets `SHEP_DOG_NAME` to the name it was registered under, beside the
+`SHEP_HOME` it already set. Three seams, so a dog is never run under a
+contract it will not meet again: `shep_daemon::dogs::dog_app` (supervised),
+`run_adopted_dog` (`shep <name>`), and `vet_binary`'s exec probe during
+`adopt` itself. The last of the three carries no test of its own, and its
+comment says why rather than leaving the gap to be found: the probe child is
+killed on sight, immediately on every kernel but macOS, so anything it wrote
+to prove what it received would race its own teardown.
+
+Options 2 and 3 were not taken and did not need to be. Option 2 (letting
+`DogConfig` tell an absent section from an unadopted name) is a wire change,
+and handing the dog the key removes the guess that made the ambiguity
+reachable. Option 3 (documenting the pid trick) is in `docs/dogs.md`
+anyway, now as the fallback for an older shep rather than as the answer.
+
+The original entry follows.
 
 An adopted dog is spawned with **no argv at all** and **one** environment
 entry. `dogs.rs`'s `dog_app` maps `DogSource::Adopted { path }` to

@@ -837,8 +837,8 @@ src/
              (below), plus `mod.rs` at this level for `run_dog`'s own dispatch — refuse a
              name that is not one of the two built-ins before the socket is ever touched,
              then hand off to `metrics::run` or `run_bark`. `DogRuntime` is a dog's own
-             connection and config: `$SHEP_HOME` is the one variable it inherits, everything
-             else is asked for over the wire via `Request::DogConfig`.
+             connection and config: `$SHEP_HOME` and `$SHEP_DOG_NAME` are the two variables
+             it inherits, everything else is asked for over the wire via `Request::DogConfig`.
     http.rs
       Notes: the metrics dog's own tiny hand-rolled HTTP/1.1 request reader (request line +
              headers, no body) — no axum/hyper pulled in to serve one route.
