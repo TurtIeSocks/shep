@@ -143,6 +143,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-reads the passwd database nor changes a running app's identity underneath
   it.
 
+- Say why a restart produced no process. The event a failed restart emits
+  carries no reason and the reply has no per-id error slot, so the shepherd's
+  log was the only place to learn that a binary had been replaced mid-deploy
+  or that `fork` returned `EAGAIN` -- and that path discarded the runner's
+  error, leaving an `errored` row and nothing to read. The reason is now an
+  argument to the one function both failure routes go through, so there is no
+  way into that state without one.
+
 ### Additions
 
 - Add `SupervisorError::CannotStart`, a `Start` batch refused before anything

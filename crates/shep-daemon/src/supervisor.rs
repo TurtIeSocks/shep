@@ -2937,14 +2937,7 @@ impl<R: ProcessRunner> Actor<R> {
         // reports.
         let credentials = match self.credentials_for_spawn(id) {
             Ok(credentials) => credentials,
-            Err(err) => {
-                tracing::warn!(
-                    id,
-                    %err,
-                    "restart refused: this app's user could not be resolved"
-                );
-                return self.respawn_failed(id, manually);
-            }
+            Err(err) => return self.respawn_failed(id, manually, &err),
         };
         let slot = self.sheep.get(&id).expect("respawn: unknown id");
         let app = slot.entry.spec.clone();
@@ -3027,7 +3020,7 @@ impl<R: ProcessRunner> Actor<R> {
                 }
                 info
             }
-            Err(_error) => self.respawn_failed(id, manually),
+            Err(error) => self.respawn_failed(id, manually, &error),
         }
     }
 
@@ -3041,7 +3034,24 @@ impl<R: ProcessRunner> Actor<R> {
     /// leave behind has to be identical, because it is the same state: a
     /// sheep that is not running, and whose watch, cron and memory
     /// enforcement are not armed against a pid that does not exist.
-    fn respawn_failed(&mut self, id: u32, manually: bool) -> ProcessInfo {
+    ///
+    /// `reason` is logged here rather than by the caller, and that is the
+    /// point of it being a parameter. The `Errored` event this emits carries
+    /// no reason, and the deferred aggregation reply has no per-id error
+    /// slot, so this log line is the ONLY place an operator can learn why a
+    /// restart did not produce a process: a binary replaced mid-deploy, an
+    /// `EAGAIN`, a `cwd` that is gone, a `user` that no longer resolves. One
+    /// of the two callers used to bind the runner's error as `_error` and
+    /// drop it, which left exactly those cases with an `errored` row and
+    /// nothing to read. Taking it as an argument is what stops a third
+    /// caller repeating that: there is no way in without one.
+    fn respawn_failed(
+        &mut self,
+        id: u32,
+        manually: bool,
+        reason: &dyn fmt::Display,
+    ) -> ProcessInfo {
+        tracing::warn!(id, %reason, "restart did not start a process");
         // The deferred aggregation reply has no per-id error slot
         // (locked model): a failed respawn simply lands the entry in
         // Errored, same as a budget-exhausted crash loop.
@@ -6675,8 +6685,8 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
     use crate::testing::{
-        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, harness, idle_stats,
-        probe_config, test_paths,
+        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, capture_logs, harness,
+        idle_stats, probe_config, test_paths,
     };
     // Test-only: the one case that drives a real `liveness_probe` has to
     // build the lifecycle extras the production wiring builds at boot, and
@@ -14464,6 +14474,50 @@ mod tests {
             "`AllOrNothing` registers nothing at all, this app included"
         );
         assert_eq!(actor.runner.spawn_count(), 0);
+    }
+
+    // fails if either route into `respawn_failed` lands a sheep in `Errored`
+    // without saying why. The event it emits carries no reason and the
+    // deferred reply has no per-id error slot, so this log line is all an
+    // operator has: the spawn-failure route used to bind the runner's error
+    // as `_error` and drop it, leaving a binary replaced mid-deploy or an
+    // `EAGAIN` with an `errored` row and nothing to read.
+    //
+    // `#[test]` with a `block_on` inside, not `#[tokio::test]`:
+    // `capture_logs` scopes its subscriber to one thread and needs a
+    // synchronous closure, the same pattern `boot.rs` established.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_that_starts_nothing_says_why_in_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Route one: no script to pop, so the runner refuses the spawn.
+        let refused = capture_logs(|| {
+            let mut actor = actor_with_an_empty_flock(&dir, Vec::new());
+            let info = actor.register_at_rest(&app_with("web", |_| {}));
+            rt.block_on(async { actor.respawn(info.id, true) });
+        });
+        assert!(
+            refused.contains("script exhausted"),
+            "the runner's own reason must reach the log: {refused}"
+        );
+
+        // Route two: the identity cannot be resolved, so no spawn is
+        // attempted at all.
+        let unresolved = capture_logs(|| {
+            let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+            let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+            let info = actor.register_at_rest(&app);
+            rt.block_on(async { actor.respawn(info.id, true) });
+        });
+        assert!(
+            unresolved.contains(NO_SUCH_USER),
+            "the unresolvable user must reach the log by name: {unresolved}"
+        );
     }
 
     // ---------------------------------------------------------------
