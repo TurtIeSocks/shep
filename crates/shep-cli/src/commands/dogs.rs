@@ -398,12 +398,23 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
     // default size threshold happened to be larger than the logs it found.
     //
     // NOT `env_clear()`, though an earlier note of mine suggested it. A real
-    // adopted dog runs with the daemon's own filtered environment merged
-    // under its `[dog.<name>]` env (`AppConfig::env`'s doc), so clearing
-    // here would vet under stricter conditions than the dog will ever run
-    // under, and a binary needing `DYLD_LIBRARY_PATH` or its like would be
-    // refused despite working perfectly once adopted. Vetting has to model
-    // the real thing, not an idealised one.
+    // adopted dog runs with a filtered environment the daemon builds
+    // (`assemble::base_env`: `PATH`, plus whichever of `HOME`/`USER`/`LANG`/
+    // `TZ` the daemon itself has), so clearing here would vet under stricter
+    // conditions than the dog will ever run under, and a binary needing
+    // `DYLD_LIBRARY_PATH` or its like would be refused despite working
+    // perfectly once adopted. Vetting has to model the real thing, not an
+    // idealised one.
+    //
+    // An earlier revision of this comment said that filtered environment has
+    // the dog's `[dog.<name>]` env merged over it, citing `AppConfig::env`'s
+    // doc. That is true of a sheep and false of a dog: `dog_app` builds an
+    // `AppConfig::minimal` and inserts only the two variables below, and the
+    // `[dog.<name>]` section never becomes an `AppConfig` at all -- it is
+    // served as opaque text over the socket, which is the whole point of
+    // keeping it off the environment. `shep-daemon`'s
+    // `a_dogs_child_environment_carries_shep_home_and_its_name_and_no_configuration`
+    // is what pins it.
     //
     // `SHEP_DOG_NAME` rides along for the same reason, and it is `name`
     // rather than the binary's file stem because the operator's `--name` is

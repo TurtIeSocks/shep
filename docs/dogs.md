@@ -235,16 +235,23 @@ The wire a third-party dog speaks is the same client protocol
 every other client of this daemon: connect to the Unix socket at
 `$SHEP_HOME/run/shep.sock`, send `Hello`, wait for `HelloAck`, then send
 `Request::DogConfig { name }` to fetch your own `[dog.<name>]` section as
-opaque text — parse it however your own config shape wants. An adopted dog
-inherits two variables from the shepherd's environment: `$SHEP_HOME`, which
-is how it finds that socket in the first place, and `$SHEP_DOG_NAME`, which
-is the `name` to put in that request. No `[dog.<name>]` value ever rides
-along beside them, for the reason given above. A section's key is not one of
-its values.
+opaque text — parse it however your own config shape wants. Shep sets two
+variables of its own on a dog: `$SHEP_HOME`, which is how it finds that
+socket in the first place, and `$SHEP_DOG_NAME`, which is the `name` to put
+in that request. No `[dog.<name>]` value ever rides along beside them, for
+the reason given above. A section's key is not one of its values.
 
-**Read `$SHEP_DOG_NAME` rather than hardcoding a name.** It holds whatever
-the operator typed at `shep adopt`, and shep sets it every way it runs you:
-supervised, `shep <name>`, and the exec probe during `adopt` itself.
+Those two are what shep ADDS, not the whole environment. A dog is a
+supervised process like any other, so it also starts from the small base
+every sheep gets: `PATH`, plus whichever of `HOME`, `USER`, `LANG` and `TZ`
+the shepherd itself has, plus `SHEP_INSTANCE`. Nothing from `[dog.<name>]`
+is in there.
+
+**Read `$SHEP_DOG_NAME` rather than hardcoding a name.** It holds the name
+you are registered under, which is the operator's `--name` if they gave one
+and otherwise your own file stem with a leading `shep-` stripped. Shep sets
+it every way it runs you: supervised, `shep <name>`, and the exec probe
+during `adopt` itself.
 
 Getting the name wrong is silent, which is the whole reason the variable
 exists. A `DogConfig` for a name nobody adopted comes back as the empty

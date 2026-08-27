@@ -284,18 +284,28 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       <code>$SHEP_HOME/run/shep.sock</code>, send <code>Hello</code>, wait
       for <code>HelloAck</code>, then send{" "}
       <code>Request::DogConfig {"{"} name {"}"}</code> to fetch your own
-      section as opaque text. An adopted dog inherits two variables from the
-      shepherd's environment: <code>$SHEP_HOME</code>, which is how it finds
-      that socket in the first place, and <code>$SHEP_DOG_NAME</code>, which
-      is the name to put in that request. No <code>[dog.&lt;name&gt;]</code>{" "}
-      value rides along beside them.
+      section as opaque text. Shep sets two variables of its own on a dog:{" "}
+      <code>$SHEP_HOME</code>, which is how it finds that socket in the first
+      place, and <code>$SHEP_DOG_NAME</code>, which is the name to put in
+      that request. No <code>[dog.&lt;name&gt;]</code> value rides along
+      beside them.
+    </p>
+    <p>
+      Those two are what shep adds, not the whole environment. A dog is a
+      supervised process like any other, so it also starts from the small
+      base every sheep gets: <code>PATH</code>, plus whichever of{" "}
+      <code>HOME</code>, <code>USER</code>, <code>LANG</code> and{" "}
+      <code>TZ</code> the shepherd itself has, plus{" "}
+      <code>SHEP_INSTANCE</code>. Nothing from{" "}
+      <code>[dog.&lt;name&gt;]</code> is in there.
     </p>
     <Callout variant="careful">
       Read <code>$SHEP_DOG_NAME</code> rather than hardcoding a name. It
-      holds whatever the operator typed at <code>shep adopt</code>, and
-      shep sets it every way it runs you: supervised, <code>shep
-      &lt;name&gt;</code>, and the exec probe during <code>adopt</code>{" "}
-      itself. Getting the name wrong is silent, which is the whole reason
+      holds the name you are registered under, which is the operator's{" "}
+      <code>--name</code> if they gave one and otherwise your own file stem
+      with a leading <code>shep-</code> stripped. Shep sets it every way it
+      runs you: supervised, <code>shep &lt;name&gt;</code>, and the exec
+      probe during <code>adopt</code> itself. Getting the name wrong is silent, which is the whole reason
       the variable exists: a <code>DogConfig</code> for a name nobody
       adopted comes back empty, exactly what a registered dog with no
       section gets, so a one-character mismatch discards the operator's
