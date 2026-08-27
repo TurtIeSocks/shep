@@ -40,6 +40,16 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       never change; and every <code>-</code> is muted too, so an absent value
       does not compete with a real one:
     </p>
+    <p>
+      CPU and MEM have two tiers each, not a gradient. The question they
+      answer is whether one sheep is unusual for this flock, not how much it
+      is using: 160M and 4G both land in the same tier, and on a flock where
+      everything is large the whole column is one colour and tells you
+      nothing. A third tier would have to be the fault colour, which would
+      paint a healthy 4G service as though it had broken. Use
+      <code>--format json</code> when the exact number is the thing you
+      need.
+    </p>
     <CodeBlock label="shep flock">{`┌────┬──────┬───────────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┬──────┐
 │ ID │ NAME │ STATUS        │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ FOLD    │ SMIT │
 ├────┼──────┼───────────────┼───────┼──────────┼──────┼──────┼──────┼────────┼─────────┼──────┤
