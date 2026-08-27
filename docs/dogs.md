@@ -220,11 +220,15 @@ again after a reboot from a different working directory than the one
 Once adopted, `shep <name> [args...]` runs the dog directly — the same
 `git foo` runs `git-foo` precedent, resolved against adopted dogs only
 (never a `$PATH` scan). It's a second invocation mode, distinct from the
-one the shepherd itself uses: a dog the shepherd starts gets no argv and
-two environment variables (`$SHEP_HOME` and `$SHEP_DOG_NAME`, below); a
-dog you name on the command line gets whatever you typed after it, passed
-straight through, plus those same two. A built-in verb or alias always
-wins over a same-named dog.
+one the shepherd itself uses: an adopted dog the shepherd starts gets no
+argv and two environment variables (`$SHEP_HOME` and `$SHEP_DOG_NAME`,
+below); a dog you name on the command line gets whatever you typed after
+it, passed straight through, plus those same two. A built-in verb or alias
+always wins over a same-named dog.
+
+No argv is the adopted case specifically. The two built-in dogs are
+started as `shep dog <name>` and read their own name from that argv, but
+neither is a dog anybody writes: they ship inside the binary.
 
 `rehome <name>` is `disable`'s counterpart for a third-party dog: it stops
 it if running and forgets the registration in `shep.toml` entirely, rather
