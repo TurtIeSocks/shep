@@ -537,8 +537,23 @@ fn flock_matches(selector: &ProcessSelector, flock: &[ProcessInfo]) -> Vec<Proce
 /// `shep start fold:typo` reports "no sheep is in a fold called typo" or the
 /// baffling "fold:typo is not a sheep, a fold, `-`, a recognised Flockfile, or
 /// an existing path" that sent an operator looking for a file by that name.
-fn selector_miss(target: &str, selector: &ProcessSelector) -> Option<String> {
+fn selector_miss(
+    target: &str,
+    selector: &ProcessSelector,
+    flock: &[ProcessInfo],
+) -> Option<String> {
     match selector {
+        // Phrased off the SHEEP count, never off `flock.is_empty()`.
+        // `flock_matches` passes a dog by for every wildcard, so `all`
+        // matching nothing means there are no sheep -- which is not the same
+        // as an empty flock, and saying "the flock is empty" while
+        // `shep flock` prints dog rows on the same machine is a plain
+        // contradiction an operator would have to reconcile themselves.
+        ProcessSelector::All if flock.iter().any(|info| info.dog.is_some()) => Some(
+            "no sheep in the flock; there is nothing to start. The dogs listed \
+             by `shep dogs` are not sheep and `all` never reaches them"
+                .to_string(),
+        ),
         ProcessSelector::All => Some("the flock is empty; there is nothing to start".to_string()),
         ProcessSelector::Fold(fold) => Some(format!("no sheep is in a fold called {fold}")),
         ProcessSelector::Regex(_) => Some(format!("no sheep matched {target}")),
@@ -1094,7 +1109,7 @@ async fn start_one(
             // Held for the failure path below rather than reported here: the
             // token may still name a Flockfile or a path, and only if it names
             // neither does the shape it was written in decide the message.
-            missed = selector_miss(token, &selector);
+            missed = selector_miss(token, &selector, &flock);
             listing = Some(flock);
         }
     }
@@ -2107,23 +2122,67 @@ mod tests {
     /// tier.
     #[test]
     fn a_selector_that_matched_nothing_is_reported_as_a_selector() {
-        let miss = |target: &str| selector_miss(target, &ProcessSelector::parse(target).unwrap());
+        let miss = |target: &str, flock: &[shep_core::protocol::ProcessInfo]| {
+            selector_miss(target, &ProcessSelector::parse(target).unwrap(), flock)
+        };
+        let empty: [shep_core::protocol::ProcessInfo; 0] = [];
 
         assert_eq!(
-            miss("fold:typo").as_deref(),
+            miss("fold:typo", &empty).as_deref(),
             Some("no sheep is in a fold called typo")
         );
-        assert_eq!(miss("zz-*").as_deref(), Some("no sheep matched zz-*"));
         assert_eq!(
-            miss("all").as_deref(),
+            miss("zz-*", &empty).as_deref(),
+            Some("no sheep matched zz-*")
+        );
+        assert_eq!(
+            miss("all", &empty).as_deref(),
             Some("the flock is empty; there is nothing to start")
         );
         assert_eq!(
-            miss("koji"),
+            miss("koji", &empty),
             None,
             "a bare name may still be a file, so the unresolvable message stands"
         );
-        assert_eq!(miss("11"), None, "and so may a bare id");
+        assert_eq!(miss("11", &empty), None, "and so may a bare id");
+    }
+
+    /// fails if `shep start all` calls a flock empty while it holds dogs.
+    ///
+    /// `flock_matches` passes a dog by for every wildcard, so `all` matching
+    /// nothing means there are no SHEEP. Reading that as an empty flock made
+    /// `shep start all` print "the flock is empty" on a machine where
+    /// `shep flock` was printing dog rows at the same moment, which is a
+    /// contradiction an operator has to reconcile on their own.
+    ///
+    /// Both halves in one case, because a build that always says "no sheep"
+    /// and a build that always says "empty" each pass one of them.
+    #[test]
+    fn an_all_that_matched_nothing_counts_sheep_and_not_dogs() {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+
+        let all = ProcessSelector::parse("all").unwrap();
+        let dogs_only = [ProcessInfo::builder(0, "log-rotate", ProcStatus::Online)
+            .dog(Some(DogSource::BuiltIn))
+            .build()];
+
+        let said = selector_miss("all", &all, &dogs_only).expect("a miss is reported");
+        assert!(
+            said.starts_with("no sheep in the flock"),
+            "a flock holding only dogs is not empty: {said}"
+        );
+        assert!(
+            said.contains("`shep dogs`"),
+            "and it says where the rows an operator can see came from: {said}"
+        );
+
+        let empty: [ProcessInfo; 0] = [];
+        assert_eq!(
+            selector_miss("all", &all, &empty).as_deref(),
+            Some("the flock is empty; there is nothing to start"),
+            "with nothing registered at all, empty is the honest word"
+        );
     }
 
     /// fails if `shep start fold:typo` exits anything but 3, or if it reaches
