@@ -6417,11 +6417,12 @@ mod tests {
         assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
 
         // The exit at 500ms is unstable (< the 1000ms min_uptime default)
-        // and triggers an immediate automatic respawn (no
-        // exp_backoff_restart_delay configured, so `restart_delay` is
-        // `None`): status goes straight back to `Starting` for the NEW
-        // process, epoch bumped. `Restart` fires here; `Online` does not —
-        // proving the two emits stay separate on the respawn path too.
+        // and triggers an automatic respawn after the default 100ms
+        // `exp_backoff_restart_delay`, well inside the seconds-wide margins
+        // this test asserts on: status goes straight back to `Starting` for
+        // the NEW process, epoch bumped. `Restart` fires here; `Online`
+        // does not, proving the two emits stay separate on the respawn
+        // path too.
         tokio::time::timeout(
             Duration::from_secs(1),
             await_event(&mut rx, 0, ProcessEventKind::Restart),
@@ -6803,6 +6804,26 @@ mod tests {
         assert_eq!(handle.list().await.len(), 1);
     }
 
+    /// Waits until the flock's single process reads `restarts` restarts and
+    /// `Online`, bounded rather than an unbounded `loop` (IR-46): the three
+    /// budget-reset tests below all set `exp_backoff_restart_delay = None`
+    /// so this state is ready work under their paused clock, but a future
+    /// change that reintroduced a delay for that config shape would spin an
+    /// unbounded wait for minutes at ~95% CPU with no failing assertion to
+    /// notice. One bound here instead of three copies means one place to
+    /// change it, and one place to get it wrong.
+    async fn wait_for_restarts_online(handle: &SupervisorHandle, restarts: u32) -> ProcessInfo {
+        let mut info = handle.list().await.remove(0);
+        for _ in 0..200 {
+            if info.restarts == restarts && info.status == ProcStatus::Online {
+                break;
+            }
+            tokio::task::yield_now().await;
+            info = handle.list().await.remove(0);
+        }
+        info
+    }
+
     // An operator's `shep restart` aimed at a RUNNING sheep resets the restart
     // budget (spec §4) and respawns, and the operator gets the respawned sheep
     // back as its reply. The not-running half of that claim is a third test,
@@ -6837,16 +6858,21 @@ mod tests {
         // leave the budget one short of exhausted and a single further crash
         // decides the test.
         app.max_restarts = 3;
+        // This test is about the budget, not the backoff: the sync loop
+        // below is a busy `yield_now` poll under a paused clock, which never
+        // lets the clock auto-advance, so a non-zero
+        // `exp_backoff_restart_delay` (the default since defect 2's fix)
+        // would spin it forever instead of failing.
+        app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
         // mean restarts==2 once the never_exits proc is up.
-        loop {
-            let info = handle.list().await.remove(0);
-            if info.restarts == 2 && info.status == ProcStatus::Online {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let info = wait_for_restarts_online(&handle, 2).await;
+        assert_eq!(
+            (info.status, info.restarts),
+            (ProcStatus::Online, 2),
+            "never reached the never_exits proc -- got {info:?}"
+        );
         let restarted = handle
             .restart(ProcessSelector::Name("svc".to_string()))
             .await
@@ -6922,16 +6948,21 @@ mod tests {
         // leave the budget one short of exhausted and a single further crash
         // decides the test.
         app.max_restarts = 3;
+        // This test is about the budget, not the backoff: the sync loop
+        // below is a busy `yield_now` poll under a paused clock, which never
+        // lets the clock auto-advance, so a non-zero
+        // `exp_backoff_restart_delay` (the default since defect 2's fix)
+        // would spin it forever instead of failing.
+        app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
         // mean restarts==2 once the never_exits proc is up.
-        loop {
-            let info = handle.list().await.remove(0);
-            if info.restarts == 2 && info.status == ProcStatus::Online {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let info = wait_for_restarts_online(&handle, 2).await;
+        assert_eq!(
+            (info.status, info.restarts),
+            (ProcStatus::Online, 2),
+            "never reached the never_exits proc -- got {info:?}"
+        );
 
         handle
             .restart_automatic(ProcessSelector::Name("svc".to_string()))
@@ -7008,16 +7039,21 @@ mod tests {
         // leave the budget one short of exhausted and a single further crash
         // decides the test.
         app.max_restarts = 3;
+        // This test is about the budget, not the backoff: the sync loop
+        // below is a busy `yield_now` poll under a paused clock, which never
+        // lets the clock auto-advance, so a non-zero
+        // `exp_backoff_restart_delay` (the default since defect 2's fix)
+        // would spin it forever instead of failing.
+        app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
         // mean restarts==2 once the never_exits proc is up.
-        loop {
-            let info = handle.list().await.remove(0);
-            if info.restarts == 2 && info.status == ProcStatus::Online {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let info = wait_for_restarts_online(&handle, 2).await;
+        assert_eq!(
+            (info.status, info.restarts),
+            (ProcStatus::Online, 2),
+            "never reached the never_exits proc -- got {info:?}"
+        );
 
         // `stop` is what takes the sheep off its live task without touching
         // the budget: `decide_on_exit` short-circuits to CleanStop on

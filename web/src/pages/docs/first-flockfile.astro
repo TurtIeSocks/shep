@@ -47,7 +47,7 @@ const fieldGroups: FieldGroup[] = [
       { name: "min_uptime", type: "duration", default: "1s", does: "Below this, an exit counts as unstable." },
       { name: "max_restarts", type: "integer", default: "16", does: "Consecutive unstable exits before errored." },
       { name: "restart_delay", type: "duration?", default: "none", does: "Fixed delay before every restart (alternative to backoff)." },
-      { name: "exp_backoff_restart_delay", type: "duration?", default: "none", does: "Initial backoff; grows ×1.5, capped at 15s." },
+      { name: "exp_backoff_restart_delay", type: "duration?", default: "100ms", does: "Initial backoff; grows ×1.5, capped at 15s. Only applies to unstable exits, and only while restart_delay is unset -- a configured restart_delay wins even over \"0\" here." },
     ],
   },
   {
@@ -189,15 +189,18 @@ flockfile.json5`}</CodeBlock>
       Two field types are small parsers of their own rather than bare
       numbers, so a typo in either fails at parse time instead of silently
       meaning something else. Both accept plain digits with one optional
-      trailing letter, nothing more:
+      trailing unit, nothing more:
     </p>
     <div class="grammar-grid">
       <div class="grammar-card">
         <div class="grammar-name">Durations</div>
-        <div class="grammar-pattern"><code>^\d+(h|m|s)?$</code></div>
+        <div class="grammar-pattern"><code>^\d+(ms|h|m|s)?$</code></div>
         <p>
-          Plain digits are milliseconds; <code>h</code>/<code>m</code>/<code
-          >s</code> are hours/minutes/seconds. Lowercase only.
+          Plain digits are milliseconds; <code>ms</code>/<code>h</code>/<code
+          >m</code>/<code>s</code> are milliseconds/hours/minutes/seconds.
+          Lowercase only, and <code>ms</code> is checked before <code
+          >m</code> so a trailing <code>m</code> on its own still means
+          minutes.
         </p>
       </div>
       <div class="grammar-card">
@@ -304,6 +307,20 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
         </div>
       ))
     }
+
+    <Callout variant="note">
+      A permanently broken app (bad config, missing dependency: it exits
+      before <code>min_uptime</code> every time) still errors out once it
+      hits <code>max_restarts</code>, but the default
+      <code>exp_backoff_restart_delay</code> of 100ms, growing ×1.5 each
+      attempt, changes how long that takes. At the default
+      <code>max_restarts = 16</code>, reaching <code>Errored</code> now
+      takes roughly 50-70s instead of well under a second. Set
+      <code>exp_backoff_restart_delay = "0"</code> to go back to failing
+      fast, provided <code>restart_delay</code> is unset -- a fixed
+      <code>restart_delay</code> takes precedence and still applies its
+      own wait on every restart, even with the backoff disabled.
+    </Callout>
 
     <h2>Get the schema directly</h2>
     <p>
