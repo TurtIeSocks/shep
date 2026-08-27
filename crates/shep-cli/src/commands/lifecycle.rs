@@ -1883,9 +1883,11 @@ mod tests {
             "every sheep, not only the one that was stopped, and no dog among \
              them: {printed}"
         );
+        // Column 1, not 0: the dogs table leads with ID now, exactly as the
+        // sheep table does.
         let dog_names: Vec<&str> = dogs
             .lines()
-            .filter_map(|line| line.split_whitespace().next())
+            .filter_map(|line| line.split_whitespace().nth(1))
             .filter(|word| *word != "NAME")
             .collect();
         assert_eq!(

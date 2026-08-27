@@ -97,39 +97,77 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <h2>The dogs table</h2>
     <p>
       Dogs get their own table, under a <code>Dogs</code> caption, wherever
-      one appears beside a flock listing. It carries the columns a dog can
-      actually fill: no <code>ID</code> and no <code>FOLD</code>, since a dog
-      is supervised rather than grouped, and a <code>SOURCE</code> column the
-      sheep table has no use for.
+      one appears beside a flock listing. Every column the two tables share
+      sits in the same place, and each table's own columns come last:
     </p>
-    <CodeBlock label="shep dogs">{`┌────────────┬─────────┬──────────────┬──────┬──────────┬─────┬──────┬────────┐
-│ NAME       │ SOURCE  │ STATUS       │ PID  │ RESTARTS │ CPU │ MEM  │ UPTIME │
-├────────────┼─────────┼──────────────┼──────┼──────────┼─────┼──────┼────────┤
-│ log-rotate │ adopted │ (o.o) online │ 7868 │ 0        │ -   │ 6.6M │ 2s     │
-└────────────┴─────────┴──────────────┴──────┴──────────┴─────┴──────┴────────┘`}</CodeBlock>
+    <div class="rows">
+      <div class="row"><span>both</span><span><code>ID NAME STATUS PID RESTARTS EXIT CPU MEM UPTIME</code></span></div>
+      <div class="row"><span>sheep only</span><span><code>FOLD SMIT</code></span></div>
+      <div class="row"><span>dogs only</span><span><code>SOURCE</code></span></div>
+    </div>
+    <CodeBlock label="shep flock">{`┌────┬────────┬──────────────┬───────┬──────────┬──────┬─────┬──────┬────────┬────────┬──────┐
+│ ID │ NAME   │ STATUS       │ PID   │ RESTARTS │ EXIT │ CPU │ MEM  │ UPTIME │ FOLD   │ SMIT │
+├────┼────────┼──────────────┼───────┼──────────┼──────┼─────┼──────┼────────┼────────┼──────┤
+│ 0  │ golbat │ (o.o) online │ 48182 │ 0        │ -    │ -   │ 3.0M │ 2s     │ backed │ -    │
+└────┴────────┴──────────────┴───────┴──────────┴──────┴─────┴──────┴────────┴────────┴──────┘
+
+Dogs
+┌────┬────────────┬──────────────┬───────┬──────────┬──────┬─────┬──────┬────────┬─────────┐
+│ ID │ NAME       │ STATUS       │ PID   │ RESTARTS │ EXIT │ CPU │ MEM  │ UPTIME │ SOURCE  │
+├────┼────────────┼──────────────┼───────┼──────────┼──────┼─────┼──────┼────────┼─────────┤
+│ 1  │ log-rotate │ (o.o) online │ 48207 │ 0        │ -    │ -   │ 6.6M │ 2s     │ adopted │
+└────┴────────────┴──────────────┴───────┴──────────┴──────┴─────┴──────┴────────┴─────────┘`}</CodeBlock>
     <p>
-      The colours are the flock table's, on the five columns the two share:
-      the same face and status colour, the same restart colour above zero,
-      the same two-tier ramps for CPU and MEM. <code>SOURCE</code> is muted
-      like <code>FOLD</code> is, because it says where a binary came from and
-      never whether the dog is healthy. So the same dog reads the same way
-      under <code>shep dogs</code>, under <code>shep flock</code>, and after
+      <code>FOLD</code> and <code>SMIT</code> are missing from the dogs table
+      because they are impossible for a dog rather than merely empty: a dog
+      belongs to no fold, and a smit is a mark a dog paints <em>on</em> a
+      sheep. A column that reads <code>-</code> on every row teaches nothing.
+    </p>
+    <p>
+      Colours match too, column for column. Same face and status colour, same
+      restart colour above zero, same ramps for CPU and MEM, same
+      <code>EXIT</code>. So the same dog reads the same way under
+      <code>shep dogs</code>, under <code>shep flock</code>, and after
       <code>shep restart log-rotate</code>.
+    </p>
+
+    <h3>SOURCE says whose code is running</h3>
+    <p>
+      It is the only column in shep carrying a trust distinction, so the two
+      values do not look alike. <code>built-in</code> is shep running its own
+      code, and is muted like any other label you read past.
+      <code>adopted</code> is a third-party binary running at the shepherd's
+      own trust level, from a path you supplied, with no sandbox around it.
+      That gets the same colour a restart count above zero gets: worth a
+      glance, not a fault, because you chose it.
     </p>
     <p>
       <code>enable</code>, <code>disable</code>, <code>adopt</code> and
       <code>rehome</code> print a one-row confirmation with the same
       treatment. Their <code>STATUS</code> holds either a status or a
       sentence saying why no shepherd answered, and only a status is
-      coloured; a sentence is left plain, because a colour that repeats the
+      coloured; a sentence is left plain, because a colour repeating the
       words beside it is decoration rather than information.
     </p>
+
+    <h3>Where else colour appears</h3>
+    <p>
+      Every table shep prints follows one rule: a colour carries information,
+      or the column does not get one. Beyond the flock and the dogs:
+    </p>
+    <div class="rows">
+      <div class="row"><span><code>trigger</code>, <code>signal</code>, <code>whisper</code></span><span>OUTCOME by what happened: it worked, nothing to report, a config gap you can close, or it failed</span></div>
+      <div class="row"><span><code>flush</code>, <code>startup</code></span><span>RESULT the same way. <code>absent</code> is muted, not marked: it is the state the verb was asked to produce</span></div>
+      <div class="row"><span><code>barks</code></span><span>SINKS, so an alert that failed to deliver does not read like one that arrived</span></div>
+      <div class="row"><span><code>kill</code></span><span>SOCKET_REMOVED, because a <code>false</code> is what the next boot has to contend with</span></div>
+      <div class="row"><span><code>import</code></span><span>REUSE_PORT when it is <code>true</code>, which is work you have to do</span></div>
+    </div>
     <Callout variant="note">
-      Two tables carry no colour on purpose. <code>describe</code>'s lamb
-      table is two identity columns with no state to report, and
-      <code>shep empty</code>'s table is mostly file paths, which are the
-      subject of that table rather than a reading about it. Every colour
-      shep prints carries information; none is decoration.
+      Five tables carry no colour at all, deliberately: <code>describe</code>'s
+      lamb tree, <code>delete</code>'s id list, the saved-roll summary, the KV
+      store, and <code>shep dogs --available</code>. Each is either pure data
+      shep has no opinion about, or a single column that is also the whole
+      content, where muting would fade the table and distinguish nothing.
     </Callout>
 
     <h2>After a lifecycle command</h2>
@@ -148,17 +186,16 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 └────┴────────┴─────────┴───────┴──────────┴─────────┴─────┴────────┴────────┴────────┴──────┘
 
 Dogs
-┌────────────┬─────────┬────────┬───────┬──────────┬──────┬──────┬────────┐
-│ NAME       │ SOURCE  │ STATUS │ PID   │ RESTARTS │ CPU  │ MEM  │ UPTIME │
-├────────────┼─────────┼────────┼───────┼──────────┼──────┼──────┼────────┤
-│ log-rotate │ adopted │ online │ 14110 │ 1        │ 0.0% │ 6.6M │ 41s    │
-└────────────┴─────────┴────────┴───────┴──────────┴──────┴──────┴────────┘`}</CodeBlock>
+┌────┬────────────┬────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┐
+│ ID │ NAME       │ STATUS │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ SOURCE  │
+├────┼────────────┼────────┼───────┼──────────┼──────┼──────┼──────┼────────┼─────────┤
+│ 6  │ log-rotate │ online │ 14110 │ 1        │ -    │ 0.0% │ 6.6M │ 41s    │ adopted │
+└────┴────────────┴────────┴───────┴──────────┴──────┴──────┴──────┴────────┴─────────┘`}</CodeBlock>
     <p>
       That is the same output <code>shep flock</code> gives, dogs table and
-      all. A dog has no fold and no id you would ever type, so it gets the
-      dogs table with its own <code>SOURCE</code> column rather than a row in
-      the sheep table. <code>shep restart log-rotate</code> and
-      <code>shep flock</code> draw it the same way.
+      all, so <code>shep restart log-rotate</code> and <code>shep flock</code>
+      draw the same dog the same way. See <a href="#the-dogs-table">the dogs
+      table</a> for why it is a second table rather than another row.
     </p>
     <p>
       <code>delete</code> is the one verb whose listing cannot show what it

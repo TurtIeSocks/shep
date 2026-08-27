@@ -15,6 +15,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- The dogs table's columns line up with the sheep table's. Every column the
+  two share sits in the same order and each table's own columns come last, so
+  the dogs table gains `ID` and `EXIT` and moves `SOURCE` from second to last.
+  Both fields were already on the `ProcessInfo` it builds from, so this is no
+  wire change. `FOLD` and `SMIT` stay off it because they are impossible for a
+  dog rather than empty.
+
+- `SOURCE` carries the one trust distinction shep draws. `adopted` is a
+  third-party binary running at the shepherd's own trust level from an
+  operator-supplied path; `built-in` is shep running its own code. They no
+  longer look identical.
+
+- Colour reaches every table that has something to say with one, which is
+  seventeen of the twenty-two. The nine newly covered are the three per-sheep
+  reply tables (`trigger`, `signal`, `whisper`), `flush`'s two, `startup`'s,
+  `barks`, `kill` and `import`. Five stay plain on purpose, each with the
+  reason recorded on the impl.
+
+### Fixes
+
+- Cell colour is keyed on a column's NAME rather than its index. The old
+  `rows_for` painted `row[0]`, `row[4]`, `row[9]` and `row[10]`, which are
+  facts about one table's column order: reordering columns repointed every one
+  of them with nothing failing to compile and no test able to notice.
+
 - Colour reaches the seven `Render` impls that are not the flock table.
   `colour_cell` had only ever appeared inside `FlockRows`, so one of eight
   tables was coloured and the same dog read one way under `shep dogs` and
