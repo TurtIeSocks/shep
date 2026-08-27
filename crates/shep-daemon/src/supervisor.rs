@@ -6804,6 +6804,26 @@ mod tests {
         assert_eq!(handle.list().await.len(), 1);
     }
 
+    /// Waits until the flock's single process reads `restarts` restarts and
+    /// `Online`, bounded rather than an unbounded `loop` (IR-46): the three
+    /// budget-reset tests below all set `exp_backoff_restart_delay = None`
+    /// so this state is ready work under their paused clock, but a future
+    /// change that reintroduced a delay for that config shape would spin an
+    /// unbounded wait for minutes at ~95% CPU with no failing assertion to
+    /// notice. One bound here instead of three copies means one place to
+    /// change it, and one place to get it wrong.
+    async fn wait_for_restarts_online(handle: &SupervisorHandle, restarts: u32) -> ProcessInfo {
+        let mut info = handle.list().await.remove(0);
+        for _ in 0..200 {
+            if info.restarts == restarts && info.status == ProcStatus::Online {
+                break;
+            }
+            tokio::task::yield_now().await;
+            info = handle.list().await.remove(0);
+        }
+        info
+    }
+
     // An operator's `shep restart` aimed at a RUNNING sheep resets the restart
     // budget (spec §4) and respawns, and the operator gets the respawned sheep
     // back as its reply. The not-running half of that claim is a third test,
@@ -6846,18 +6866,8 @@ mod tests {
         app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
-        // mean restarts==2 once the never_exits proc is up. Bounded (IR-46):
-        // an unbounded wait for this state would hang the test instead of
-        // failing it if a future change reintroduces a delay for this
-        // config shape.
-        let mut info = handle.list().await.remove(0);
-        for _ in 0..200 {
-            if info.restarts == 2 && info.status == ProcStatus::Online {
-                break;
-            }
-            tokio::task::yield_now().await;
-            info = handle.list().await.remove(0);
-        }
+        // mean restarts==2 once the never_exits proc is up.
+        let info = wait_for_restarts_online(&handle, 2).await;
         assert_eq!(
             (info.status, info.restarts),
             (ProcStatus::Online, 2),
@@ -6946,18 +6956,8 @@ mod tests {
         app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
-        // mean restarts==2 once the never_exits proc is up. Bounded (IR-46):
-        // an unbounded wait for this state would hang the test instead of
-        // failing it if a future change reintroduces a delay for this
-        // config shape.
-        let mut info = handle.list().await.remove(0);
-        for _ in 0..200 {
-            if info.restarts == 2 && info.status == ProcStatus::Online {
-                break;
-            }
-            tokio::task::yield_now().await;
-            info = handle.list().await.remove(0);
-        }
+        // mean restarts==2 once the never_exits proc is up.
+        let info = wait_for_restarts_online(&handle, 2).await;
         assert_eq!(
             (info.status, info.restarts),
             (ProcStatus::Online, 2),
@@ -7047,18 +7047,8 @@ mod tests {
         app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
-        // mean restarts==2 once the never_exits proc is up. Bounded (IR-46):
-        // an unbounded wait for this state would hang the test instead of
-        // failing it if a future change reintroduces a delay for this
-        // config shape.
-        let mut info = handle.list().await.remove(0);
-        for _ in 0..200 {
-            if info.restarts == 2 && info.status == ProcStatus::Online {
-                break;
-            }
-            tokio::task::yield_now().await;
-            info = handle.list().await.remove(0);
-        }
+        // mean restarts==2 once the never_exits proc is up.
+        let info = wait_for_restarts_online(&handle, 2).await;
         assert_eq!(
             (info.status, info.restarts),
             (ProcStatus::Online, 2),

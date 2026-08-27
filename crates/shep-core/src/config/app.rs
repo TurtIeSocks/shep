@@ -164,11 +164,14 @@ pub struct AppConfig {
     /// (a missing dependency, a bad config) burned its whole `max_restarts`
     /// budget inside a second, logging the same failure dozens of times.
     /// `min_uptime` already existed to name that case as unstable; only the
-    /// default that should have throttled it was missing. A stable exit
-    /// (`uptime >= min_uptime`) is unaffected either way: it still restarts
-    /// immediately, so a healthy app's restart-during-deploy stays instant.
-    /// Set this field to `"0"` (or set `restart_delay = "0"`, which takes
-    /// precedence) to opt back into unthrottled unstable restarts.
+    /// default that should have throttled it was missing.
+    ///
+    /// All of the above assumes `restart_delay` is unset. A fixed
+    /// `restart_delay` takes precedence over this field on every exit,
+    /// stable or not, so a stable exit restarts immediately only while
+    /// `restart_delay` stays unset, and setting this field to `"0"`
+    /// disables the backoff without producing an immediate restart if a
+    /// nonzero `restart_delay` is also configured.
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "5s",
         "group": "control",
