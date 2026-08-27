@@ -606,6 +606,20 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             code: RpcErrorCode::SpawnFailed,
             message: msg.clone(),
         },
+        // The same code as `SpawnFailed` above, on the rule this function
+        // already applies twice below: `RpcErrorCode` is versioned, a client
+        // predating a new code cannot decode the reply at all, and that costs
+        // the operator the message as well as the code. "Could not start it",
+        // and exit 7, is true of a batch refused before it was registered.
+        //
+        // The bare payload rather than `err.to_string()`, unlike the two
+        // `Internal` groups below: those share a code with something else and
+        // need `Display` to tell them apart, while this message already opens
+        // with "nothing was registered" and says everything the prefix would.
+        SupervisorError::CannotStart(msg) => RpcError {
+            code: RpcErrorCode::SpawnFailed,
+            message: msg.clone(),
+        },
         // `Internal` — an "unexpected daemon-side failure", which a log path
         // the daemon can no longer open, or can no longer empty, both are.
         // No code of its own: the wire enum is versioned, and a client that

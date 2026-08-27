@@ -45,8 +45,9 @@ use tokio::sync::mpsc;
 use crate::boot::DIR_MODE;
 use crate::channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 use crate::runner::{
-    ExitOutcome, FlushError, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError,
-    RunningProcess, SpawnSpec, StdinWrite, StopSignal, check_log_ancestry, open_log_path,
+    ExitOutcome, FlushError, LogCtl, LogLine, Preflight, ProcIo, ProcessRunner, ReopenError,
+    RunnerError, RunningProcess, SpawnSpec, StdinWrite, StopSignal, check_log_ancestry,
+    open_log_path,
 };
 
 /// Capacity of every channel a spawn wires up — generous enough that a
@@ -229,49 +230,76 @@ fn to_nix_operator_signal(sig: OperatorSignal) -> Signal {
     }
 }
 
-/// Why exec will not find `spec.program`, when that is a question with one
-/// answer.
+/// What exec will make of `spec.program`, before anything is spawned.
 ///
-/// A `Some` is a certainty, never a suspicion. Every form this cannot decide
-/// cheaply and safely returns `None` and is left to fail at the spawn as it
-/// always did, because refusing a Flockfile that would have run is far worse
-/// than the partial-registration bug the caller is fixing
-/// ([`ProcessRunner::preflight`]). Two such forms:
+/// Two arms, and which one a program takes is decided by a single `/`:
 ///
+/// - **With a `/`** the program is a path, and a path is a claim about the
+///   filesystem this can settle. Absolute, or relative to `spec.cwd`, and
+///   either way the file is either there or it is not.
+///   [`Preflight::Impossible`], which its caller refuses a whole batch over.
+/// - **Without one** it is a bare command exec resolves through `PATH`, and
+///   that is a claim about an environment rather than about a path. At most
+///   [`Preflight::Doubtful`], never `Impossible`. See [`Preflight`] for the
+///   argument; the short version is that a `shep startup` unit's `PATH` is
+///   not the operator's shell's, so refusing a batch here would keep a whole
+///   flock down over one app's interpreter.
+///
+/// The PATH searched is `spec.env`'s own, not the daemon's ambient one: that
+/// map IS the child's whole environment (`spawn` calls `env_clear` then
+/// `envs`), so it is the exact list exec is about to walk, and naming it in
+/// the message is what tells an operator which `PATH` was actually looked in.
+///
+/// [`Preflight::Unknown`] for everything else, which is anything that would
+/// have to be guessed at:
+///
+/// - a program that resolves, whether by path or on `PATH`. Reported as
+///   "nothing knowable", not as "this will work": the executable bit, the
+///   shebang and the `user`/`group` drop are all still ahead of it.
 /// - a relative path with no `cwd`. The child would resolve it against the
 ///   DAEMON's working directory, whatever the shepherd happened to be
-///   autostarted from, and a refusal is not worth betting on that.
+///   autostarted from.
 /// - a bare command with no usable `PATH` in `spec.env`. `assemble`'s
 ///   `base_env` always seeds one, so only a spec built some other way gets
 ///   here.
-///
-/// The bare-command arm searches `spec.env`'s own `PATH`, not the daemon's
-/// ambient one: that map IS the child's whole environment (`spawn` calls
-/// `env_clear` then `envs`), so it is the exact list exec is about to walk.
-/// `node` and `npx` in a real Flockfile take this arm.
+/// - an empty program, which `normalize` refuses upstream.
 ///
 /// Existence only, never the executable bit: a file that is there and cannot
 /// be exec'd is the spawn's business, and mode bits under a `user`/`group`
 /// drop are not a thing to be confident about from here.
-fn program_not_found(spec: &SpawnSpec) -> Option<String> {
+fn what_exec_will_find(spec: &SpawnSpec) -> Preflight {
     if spec.program.is_empty() {
-        return None;
+        return Preflight::Unknown;
     }
     let program = Path::new(&spec.program);
     if spec.program.contains('/') {
         let full = if program.is_absolute() {
             program.to_path_buf()
         } else {
-            spec.cwd.as_ref()?.join(program)
+            match &spec.cwd {
+                Some(cwd) => cwd.join(program),
+                None => return Preflight::Unknown,
+            }
         };
-        return (!full.exists()).then(|| format!("no such file: {}", full.display()));
+        if full.exists() {
+            return Preflight::Unknown;
+        }
+        return Preflight::Impossible(format!("no such file: {}", full.display()));
     }
-    let path = spec.env.get("PATH").filter(|value| !value.is_empty())?;
+    let Some(path) = spec.env.get("PATH").filter(|value| !value.is_empty()) else {
+        return Preflight::Unknown;
+    };
     let found = path
         .split(':')
         .filter(|dir| !dir.is_empty())
         .any(|dir| Path::new(dir).join(program).exists());
-    (!found).then(|| format!("`{}` is not on the shepherd's PATH ({path})", spec.program))
+    if found {
+        return Preflight::Unknown;
+    }
+    Preflight::Doubtful(format!(
+        "`{}` is not on the shepherd's PATH ({path})",
+        spec.program
+    ))
 }
 
 impl ProcessRunner for TokioRunner {
@@ -285,11 +313,11 @@ impl ProcessRunner for TokioRunner {
     /// app running `npx next start` is checked at `npx`, and `next` is
     /// npx's business.
     ///
-    /// Deliberately under-tightened: see this module's `program_not_found`
-    /// for every form it declines to decide and why each one is left to the
-    /// spawn.
-    fn preflight(&self, spec: &SpawnSpec) -> Option<String> {
-        program_not_found(spec)
+    /// Deliberately under-tightened: see this module's `what_exec_will_find`
+    /// for every form it declines to decide, and for why a bare command is
+    /// only ever doubted while a path can be refused.
+    fn preflight(&self, spec: &SpawnSpec) -> Preflight {
+        what_exec_will_find(spec)
     }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
@@ -1810,7 +1838,7 @@ mod tests {
     /// produced the defect: absolute (`heatrotom`), relative to a `cwd`
     /// (`obscura`), a bare command on PATH (`node`, `npx`).
     #[test]
-    fn a_program_that_is_really_there_is_never_refused() {
+    fn a_program_that_is_really_there_is_nothing_to_report() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("srv");
         fs::write(&bin, "#!/bin/sh\n").unwrap();
@@ -1833,9 +1861,9 @@ mod tests {
             preflight_spec("", None, None),
         ] {
             assert_eq!(
-                program_not_found(&spec),
-                None,
-                "refused a spec it cannot be certain about: {spec:?}"
+                what_exec_will_find(&spec),
+                Preflight::Unknown,
+                "reported something about a spec it cannot be certain about: {spec:?}"
             );
         }
     }
@@ -1844,32 +1872,61 @@ mod tests {
     /// eleven-app Flockfile pointing at an unbuilt binary, which registered
     /// two apps, failed, and never reached the other eight.
     ///
-    /// The reason string is asserted to carry the resolved PATH, not the
+    /// `Impossible`, which its caller refuses the whole batch over, and only
+    /// ever for a program with a `/` in it. A path is a claim about the
+    /// filesystem, and this is what makes it a claim the daemon can settle.
+    ///
+    /// The reason string is asserted to carry the RESOLVED path, not the
     /// `./proto-enum-api` the operator wrote, because "no such file:
     /// ./proto-enum-api" is exactly the message that left them guessing
     /// which directory it was looked for in.
     #[test]
-    fn a_program_that_is_provably_absent_is_named_with_the_path_that_was_tried() {
+    fn an_absent_path_is_impossible_and_names_the_path_that_was_tried() {
         let dir = tempfile::tempdir().unwrap();
 
-        let relative = program_not_found(&preflight_spec(
-            "./proto-enum-api",
-            Some(dir.path().to_path_buf()),
-            None,
-        ))
-        .expect("a relative script under a real cwd is decidable");
         assert_eq!(
-            relative,
-            format!("no such file: {}/./proto-enum-api", dir.path().display())
+            what_exec_will_find(&preflight_spec(
+                "./proto-enum-api",
+                Some(dir.path().to_path_buf()),
+                None,
+            )),
+            Preflight::Impossible(format!(
+                "no such file: {}/./proto-enum-api",
+                dir.path().display()
+            )),
         );
+        assert_eq!(
+            what_exec_will_find(&preflight_spec("/nonexistent/srv", None, None)),
+            Preflight::Impossible("no such file: /nonexistent/srv".to_string()),
+        );
+    }
 
-        let absolute = program_not_found(&preflight_spec("/nonexistent/srv", None, None))
-            .expect("an absolute script is decidable");
-        assert_eq!(absolute, "no such file: /nonexistent/srv");
+    /// fails if a bare command off the PATH ever becomes `Impossible`, which
+    /// is the assertion this case exists for.
+    ///
+    /// `Doubtful` is reported and carried on with, never refused. The
+    /// daemon's own PATH under the unit `shep startup` installs is not the
+    /// shell an operator tested in: homebrew's `node` on Apple Silicon is in
+    /// `/opt/homebrew/bin` and nvm's is under `$HOME`, so a `shep startup`
+    /// flock whose one Node app cannot resolve `node` must still bring up
+    /// every other app. Refusing here would keep the whole flock down.
+    ///
+    /// The PATH that was searched is in the message on purpose. "`node` is
+    /// not on the shepherd's PATH" without saying WHICH path sends an
+    /// operator to check the one in their terminal, which is the one that
+    /// works.
+    #[test]
+    fn a_bare_command_off_the_path_is_only_ever_doubtful() {
+        let found = what_exec_will_find(&preflight_spec("node", None, Some("/nonexistent")));
 
-        let bare = program_not_found(&preflight_spec("node", None, Some("/nonexistent")))
-            .expect("a bare command against a real PATH is decidable");
-        assert_eq!(bare, "`node` is not on the shepherd's PATH (/nonexistent)");
+        assert_eq!(
+            found,
+            Preflight::Doubtful("`node` is not on the shepherd's PATH (/nonexistent)".to_string()),
+        );
+        assert!(
+            !matches!(found, Preflight::Impossible(_)),
+            "a claim about an environment must never refuse a batch"
+        );
     }
 
     // Everything else in this module needs a real OS child and lives in

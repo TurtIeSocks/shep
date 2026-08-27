@@ -6305,3 +6305,88 @@ fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() 
 
     graceful_kill(home);
 }
+
+/// A bare command that is not on the shepherd's PATH does NOT take the rest
+/// of the flock down with it. It is reported, its own app fails to spawn as
+/// it always did, and every other app in the Flockfile comes up.
+///
+/// The asymmetry against
+/// [`one_absent_script_refuses_the_whole_flockfile_and_registers_nothing`] is
+/// the whole point, and it is a line between two kinds of claim. A `script`
+/// with a `/` in it is a claim about the filesystem, which the daemon can
+/// settle and an operator can fix with a typo correction, so the batch is
+/// refused. A bare command is a claim about an ENVIRONMENT, and the one that
+/// decides is the daemon's, not the shell an operator tested in: a `shep
+/// startup` unit gets whatever `PATH` launchd or systemd hands it, and
+/// `assemble`'s fallback is `/usr/local/bin:/usr/bin:/bin`. Node from
+/// homebrew on Apple Silicon lives in `/opt/homebrew/bin` and nvm's under
+/// `$HOME`, so a real Flockfile's `script = "node"` resolves in a terminal
+/// and not under the unit. Refusing the batch there would keep twelve
+/// working apps down over one app's interpreter.
+///
+/// What a broken implementation this catches: the bare-command case
+/// promoted back to a batch refusal (`resolvable` is missing from the
+/// listing, which is the assertion that matters); the report dropped
+/// altogether, so an operator whose interpreter vanished gets no clue in the
+/// shepherd's log (the log assertion).
+#[test]
+fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    // `resolvable` FIRST: it is the app that must survive, and a refusal of
+    // the whole batch would leave it unregistered rather than online.
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"resolvable\"\nscript = \"{}\"\n\n\
+             [[app]]\nname = \"no-interpreter\"\nscript = \"shep-no-such-interpreter-xyz\"\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+
+    // Exit 7 all the same: one app really did fail. What changed is what it
+    // took with it.
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the one app that cannot run still fails the command: {output:?}"
+    );
+
+    let data = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["name"] == "resolvable" && row["status"] == "online")
+        })
+    });
+    // Found by hand rather than through `sheep_named`, which panics with its
+    // own message: the regression this case exists for makes the row ABSENT,
+    // and a red run has to say that rather than report a lookup failure deep
+    // in a helper.
+    let survivor = data
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["name"] == "resolvable"));
+    assert_eq!(
+        survivor.map(|row| &row["status"]).map(ToString::to_string),
+        Some("\"online\"".to_string()),
+        "an app whose own script resolves must come up regardless of a \
+         sibling's unresolvable interpreter, and must not be refused \
+         registration over it: {data}"
+    );
+
+    let log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
+    assert!(
+        log.contains("shep-no-such-interpreter-xyz") && log.contains("PATH"),
+        "the shepherd must still say which program it could not find: {log}"
+    );
+    assert!(
+        log.contains("no-interpreter"),
+        "and which sheep wanted it: {log}"
+    );
+
+    graceful_kill(home);
+}

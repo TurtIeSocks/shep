@@ -65,7 +65,7 @@ use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
 use crate::runner::{
-    ExitOutcome, FlushError, LogCtl, ProcIo, ProcessRunner, ReopenError, RunnerError,
+    ExitOutcome, FlushError, LogCtl, Preflight, ProcIo, ProcessRunner, ReopenError, RunnerError,
     RunningProcess, SpawnSpec, StdinWrite, check_log_ancestry, open_log_path,
 };
 
@@ -513,8 +513,9 @@ pub(crate) enum Msg {
 
 /// Error type returned from supervisor commands.
 ///
-/// `#[non_exhaustive]`: seven variants today cover lookup, spawn, reload
-/// overlap, an invalid scale, and the two log-maintenance failure classes.
+/// `#[non_exhaustive]`: eight variants today cover lookup, spawn, a batch
+/// refused before it was registered, reload overlap, an invalid scale, and
+/// the two log-maintenance failure classes.
 /// The doc here used to forecast "a scale or pause verb" adding its own
 /// failure variant; the scale half of that has now landed as
 /// [`Self::InvalidScale`], and a pause verb, if one is ever built, is the
@@ -528,6 +529,26 @@ pub enum SupervisorError {
     NotFound,
     /// Spawn failed (carries the runner's message).
     SpawnFailed(String),
+    /// A `Start` batch was refused before anything was registered, because
+    /// at least one app in it provably could not run. Carries one
+    /// `"<name>: <reason>"` entry per such app, joined by `"; "`, behind a
+    /// count and the fact that nothing was registered.
+    ///
+    /// Separate from [`Self::SpawnFailed`] because NOTHING WAS SPAWNED, and
+    /// an operator reading "spawn failed" about a spawn that never happened
+    /// is being told something untrue about where to look. The two also
+    /// differ in what they leave behind, which is the part that matters
+    /// operationally: a `SpawnFailed` can leave earlier apps in the batch
+    /// registered and running, while this one guarantees an untouched flock.
+    ///
+    /// Maps to
+    /// [`RpcErrorCode::SpawnFailed`](shep_core::protocol::RpcErrorCode::SpawnFailed)
+    /// all the same, on the rule this file already applies to
+    /// [`Self::ReloadInFlight`]: `RpcErrorCode` is versioned, a client that
+    /// predates a new code cannot decode the reply at all, and that would
+    /// cost the operator the message as well as the code. "Could not start
+    /// it", and the exit code that goes with it, is true of both.
+    CannotStart(String),
     /// The selector reached an app that is already being reloaded; carries
     /// that app's name.
     ///
@@ -611,6 +632,7 @@ impl fmt::Display for SupervisorError {
         match self {
             Self::NotFound => f.write_str("selector matched no registered sheep"),
             Self::SpawnFailed(msg) => write!(f, "spawn failed: {msg}"),
+            Self::CannotStart(msg) => write!(f, "start refused: {msg}"),
             Self::ReloadInFlight(name) => write!(f, "{name} is already being reloaded"),
             Self::InvalidScale(msg) => write!(f, "cannot scale: {msg}"),
             Self::ReopenFailed(msg) => write!(f, "log reopen failed: {msg}"),
@@ -2183,12 +2205,28 @@ impl<R: ProcessRunner> Actor<R> {
                 Ok(resolved) => credentials.push(resolved),
                 Err(err) => refusals.push(format!("{name}: {err}")),
             }
-            if let Some(reason) = self.runner.preflight(&assemble(app, 0, &self.paths, None)) {
-                refusals.push(format!("{name}: {reason}"));
+            match self.runner.preflight(&assemble(app, 0, &self.paths, None)) {
+                Preflight::Unknown => {}
+                Preflight::Impossible(reason) => refusals.push(format!("{name}: {reason}")),
+                // Reported, never refused. A `Doubtful` is a claim about the
+                // daemon's environment rather than about a path, and the
+                // daemon's environment under the unit `shep startup`
+                // installs is not the shell an operator tested in: refusing
+                // here would keep a whole flock down at boot because one
+                // app's `node` is in `/opt/homebrew/bin`. That app's spawn
+                // fails on its own in a moment, naming the same program.
+                //
+                // The log rather than the reply: the reply is for the batch,
+                // and this is not a batch failure. At boot there is no
+                // operator holding a terminal to send it to either, and the
+                // shepherd's log is where they look.
+                Preflight::Doubtful(reason) => {
+                    tracing::warn!(sheep = %name, "{reason}");
+                }
             }
         }
         if !refusals.is_empty() {
-            return Err(SupervisorError::SpawnFailed(format!(
+            return Err(SupervisorError::CannotStart(format!(
                 "nothing was registered; {} of {} apps cannot start: {}",
                 refusals.len(),
                 apps.len(),
@@ -6908,7 +6946,15 @@ mod tests {
             .start(vec![normalize(app).unwrap()])
             .await
             .unwrap_err();
-        assert!(matches!(err, SupervisorError::SpawnFailed(_)));
+        // `CannotStart`, not `SpawnFailed`: passwd resolution happens in the
+        // pass that runs BEFORE anything is registered, so nothing was
+        // spawned and nothing was left behind. Saying "spawn failed" here
+        // would point an operator at a spawn that never happened.
+        assert!(matches!(err, SupervisorError::CannotStart(_)), "{err:?}");
+        assert!(
+            handle.list().await.is_empty(),
+            "a refusal before the registering pass must leave nothing registered"
+        );
     }
 
     #[tokio::test(start_paused = true)]

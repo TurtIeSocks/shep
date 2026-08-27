@@ -740,8 +740,7 @@ pub trait ProcessRunner: Send + Sync + 'static {
     /// - [`RunnerError::SpawnFailed`] — exec failure, permissions, missing binary.
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError>;
 
-    /// The reason `spec` cannot be spawned, if that is knowable without
-    /// trying
+    /// What is knowable about `spec` before anything is spawned
     ///
     /// Lets a caller refuse a whole batch before registering any of it. The
     /// defect this exists for: an eleven-app Flockfile whose third app
@@ -749,33 +748,77 @@ pub trait ProcessRunner: Send + Sync + 'static {
     /// failed on three, and never reached four through eleven, leaving a
     /// flock that matched neither the file nor its previous state.
     ///
-    /// `Option<String>` rather than `Result<(), RunnerError>`: nothing has
-    /// been attempted here, so there is no OS refusal to report, and
-    /// [`RunnerError::SpawnFailed`]'s own `Display` would say "process spawn
-    /// failed" about a process that was never spawned. The string is one
-    /// reason, no trailing punctuation, ready to be printed after a sheep's
-    /// name.
-    ///
-    /// `None` means "nothing knowable in advance", NOT "this will work".
-    /// A `Some` must therefore be a certainty rather than a suspicion:
-    /// refusing a Flockfile that would have run is far worse than the bug
-    /// this addresses, so anything an implementation cannot decide cheaply
-    /// and safely belongs in the `None` arm, where the spawn reports it as
-    /// it always did.
+    /// See [`Preflight`] for what separates a verdict a caller may refuse a
+    /// batch over from one it may only report. That split is the whole
+    /// design: a check that refuses too much is worse than the bug it
+    /// addresses, because it takes a flock down that would have come up.
     ///
     /// # Default implementation
     ///
-    /// `None`, always. A defaulted method rather than a required one for the
-    /// reason [`RunningProcess::signal_process`] gives: this is a `pub`
-    /// trait in a published library, and adding a required method to one is
-    /// a break for an out-of-tree implementor (IR-20). The default is also
-    /// the honest answer for a runner that never touches the filesystem,
-    /// which is what the crate's own fakes are.
+    /// [`Preflight::Unknown`], always. A defaulted method rather than a
+    /// required one for the reason [`RunningProcess::signal_process`] gives:
+    /// this is a `pub` trait in a published library, and adding a required
+    /// method to one is a break for an out-of-tree implementor (IR-20). The
+    /// default is also the honest answer for a runner that never touches the
+    /// filesystem, which is what the crate's own fakes are.
     #[must_use]
-    fn preflight(&self, spec: &SpawnSpec) -> Option<String> {
+    fn preflight(&self, spec: &SpawnSpec) -> Preflight {
         let _ = spec;
-        None
+        Preflight::Unknown
     }
+}
+
+/// What a [`ProcessRunner`] can tell about a [`SpawnSpec`] before anything is
+/// spawned
+///
+/// Three variants because a caller registering a BATCH has three different
+/// things to do with the answer, and collapsing any two of them costs a
+/// flock. The line that matters runs between [`Self::Impossible`] and
+/// [`Self::Doubtful`], and it is a line between two kinds of claim rather
+/// than between two confidence levels:
+///
+/// - a path with a `/` in it is a claim about the FILESYSTEM, which the
+///   daemon can check with certainty and an operator can fix with a typo
+///   correction.
+/// - a bare command is a claim about an ENVIRONMENT, and the environment
+///   that matters is the daemon's, not the shell the operator tested in. A
+///   `shep startup` unit gives the shepherd whatever `PATH` launchd or
+///   systemd hands it, so `node` from homebrew on Apple Silicon
+///   (`/opt/homebrew/bin`) and `node` from nvm (under `$HOME`) both resolve
+///   in a terminal and neither resolves under the unit.
+///
+/// Refusing a batch on the second kind would mean one app's interpreter
+/// keeping the other twelve down at boot, which is strictly worse than the
+/// partial registration the check exists to prevent.
+// `#[non_exhaustive]`: shep-daemon is a published library, an out-of-tree
+// consumer can match this exhaustively today, and a fourth verdict would
+// break them with no version bump to say so (IR-20).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preflight {
+    /// Nothing is knowable in advance.
+    ///
+    /// NOT "this will work". Every form an implementation declines to decide
+    /// arrives here, alongside every form it decided is fine, and the two are
+    /// deliberately not distinguished: a caller may only ever act on the
+    /// other two variants.
+    Unknown,
+    /// The spawn cannot succeed, and that is a certainty rather than a
+    /// suspicion. Carries one reason, no trailing punctuation, ready to be
+    /// printed after a sheep's name.
+    ///
+    /// A caller registering a batch should refuse the WHOLE batch on this and
+    /// register none of it.
+    Impossible(String),
+    /// The spawn looks like it will fail, and a caller must not refuse a
+    /// batch over it. Carries a reason on the same terms as
+    /// [`Self::Impossible`].
+    ///
+    /// Report it and carry on: the spawn then fails for that one sheep
+    /// exactly as it would have anyway, and every other app in the batch
+    /// comes up. See this enum's own doc for why the two are not the same
+    /// question.
+    Doubtful(String),
 }
 
 /// Everything a spawn needs, pre-assembled by the assembler (a later task)

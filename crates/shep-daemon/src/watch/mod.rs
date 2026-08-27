@@ -467,10 +467,12 @@ async fn run_group(
                 err @ (SupervisorError::ReopenFailed(_)
                 | SupervisorError::FlushFailed(_)
                 | SupervisorError::ReloadInFlight(_)
-                | SupervisorError::InvalidScale(_)),
+                | SupervisorError::InvalidScale(_)
+                | SupervisorError::CannotStart(_)),
             ) => {
-                // A restart touches no log files, starts no reload and scales
-                // nothing, so none of the four can arrive. Named rather than
+                // A restart touches no log files, starts no reload, scales
+                // nothing and registers no batch, so none of the five can
+                // arrive. Named rather than
                 // swept into a catch-all, so a variant this path CAN produce
                 // still fails to compile here.
                 tracing::warn!(name, %err, "watch-triggered restart reported an unrelated failure");

@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already opens with.
 
 - Check every app in a `Start` batch before registering any of it, and
-  register nothing if any of them fails. One app pointing at a script that
+  register nothing if any of them fails. One app pointing at a `script` that
   does not exist used to register and start the apps ahead of it, fail on
   that one, and never reach the apps behind it, leaving a flock that matched
   neither the Flockfile nor its previous state. The error now names every app
@@ -32,18 +32,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure alone. Passwd resolution for `user`/`group` is hoisted into the
   same pass for the same reason.
 
+  The refusal reaches only a `script` or `interpreter` containing a `/`. A
+  path is a claim about the filesystem, which the daemon can settle and an
+  operator can fix with a typo correction. A BARE command is a claim about an
+  environment, and the environment that decides is the daemon's rather than
+  the shell an operator tested in: a `shep startup` unit gives the shepherd
+  whatever `PATH` launchd or systemd hands it, and shep's own fallback is
+  `/usr/local/bin:/usr/bin:/bin`, so homebrew's `node` on Apple Silicon
+  (`/opt/homebrew/bin`) and nvm's (under `$HOME`) both resolve in a terminal
+  and neither resolves under the unit. A bare command that does not resolve
+  is reported in the shepherd's log, naming the sheep and the program, and
+  the batch goes ahead; that one app's spawn then fails exactly as it did
+  before. Refusing there would keep a whole flock down at boot over one app's
+  interpreter, which is worse than the partial registration being fixed.
+
 ### Additions
 
-- Add `ProcessRunner::preflight`, the reason a `SpawnSpec` cannot be spawned
-  when that is knowable without trying. Defaulted to `None` ("nothing
-  knowable in advance", never "this will work"), so an out-of-tree
-  implementor is unaffected and a runner that never touches the filesystem
-  gives the honest answer. `TokioRunner` reports a program that provably is
-  not there: an absolute path, a path relative to a `cwd`, or a bare command
-  against the PATH the child will actually be given. Deliberately narrow.
-  Existence only, never the executable bit; a relative path with no `cwd` and
-  a bare command with no PATH are both left to the spawn, because refusing a
-  Flockfile that would have run is worse than the bug it addresses.
+- Add `SupervisorError::CannotStart`, a `Start` batch refused before anything
+  was registered. Separate from `SpawnFailed` because nothing was spawned,
+  and an operator told "spawn failed" about a spawn that never happened is
+  being pointed at the wrong place; the two also differ in what they leave
+  behind, which is the part that matters operationally. It maps to the
+  existing `RpcErrorCode::SpawnFailed` all the same, so exit 7 and every
+  older client are unchanged: `RpcErrorCode` is versioned and a client
+  predating a new code could not decode the reply at all.
+
+- Add `ProcessRunner::preflight` and `Preflight`, what a runner can tell
+  about a `SpawnSpec` before anything is spawned. Three verdicts, because a
+  caller registering a batch has three different things to do with the
+  answer: `Unknown` ("nothing knowable in advance", never "this will work"),
+  `Impossible` (a certainty, and the only one a caller may refuse a whole
+  batch over), and `Doubtful` (report it and carry on). `preflight` is
+  defaulted to `Unknown`, so an out-of-tree implementor is unaffected and a
+  runner that never touches the filesystem gives the honest answer.
+  `TokioRunner` answers `Impossible` for a `/`-containing path that is not on
+  the filesystem, `Doubtful` for a bare command missing from the `PATH` the
+  child will actually be given, and `Unknown` for everything else, including
+  a relative path with no `cwd`. Existence only, never the executable bit.
 
 - Answer `Request::ConfigDrift`: report which of a set of apps name a
   registered sheep whose stored config differs, and in which fields. Reads
