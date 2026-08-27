@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Additions
+
+- Add `Request::ConfigDrift`, `Response::Drifted`, `SheepDrift`, and
+  `AppConfig::drifted_fields`. `ConfigDrift` asks which of a set of apps name
+  a sheep the flock already has under a DIFFERENT config, and changes
+  nothing. `Start` on an already-registered name adds instances rather than
+  reconciling config, which `shep stock` depends on, so an operator who
+  edited a Flockfile and re-ran `shep start` had the edit ignored with no
+  error and no warning; this is what a caller asks in order to say so.
+  `SheepDrift` carries the sheep's name and the names of the differing
+  fields, never their values, because `AppConfig::env` holds secrets and the
+  answer is printed at an operator (IR-41). `drifted_fields` compares through
+  serde rather than field by field, so a field added to `AppConfig` is
+  compared without a second edit, and sorts the result explicitly rather than
+  leaning on `serde_json::Map` being a `BTreeMap`, which holds only while the
+  additive `preserve_order` feature is off anywhere in the graph. Additive: `PROTOCOL_VERSION` stays **1**, a
+  daemon that predates the request answers its existing "does not implement
+  that request" error, and every previously pinned wire fixture is unchanged.
+
 ## [0.1.1] - 2026-08-26
 
 ### Additions

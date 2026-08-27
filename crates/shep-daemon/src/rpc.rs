@@ -271,6 +271,25 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 }
             }
         },
+        // Re-normalized for the reason `Start` is, plus one of its own: an
+        // unnormalized config would report every default it did not spell
+        // out as a difference from the normalized copy the flock stores, so
+        // a Flockfile that changed nothing would be reported as drifting in
+        // a dozen fields.
+        //
+        // Nothing is recorded in the registry: this answers a question and
+        // registers nothing, so a `ConfigDrift` must not be able to change
+        // what the next `shep save` writes.
+        Request::ConfigDrift { apps } => match normalize_all(apps) {
+            Err(err) => reply(Err(RpcError {
+                code: RpcErrorCode::InvalidConfig,
+                message: err.to_string(),
+            })),
+            Ok(resolved) => match ctx.supervisor.config_drift(resolved).await {
+                Ok(drifted) => reply(Ok(Response::Drifted(drifted))),
+                Err(err) => reply(Err(rpc_error(&err))),
+            },
+        },
         Request::Stop { selector } => {
             selector_call(id, selector, |s| ctx.supervisor.stop(s), Response::Stopped).await
         }
@@ -584,6 +603,20 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
     match err {
         SupervisorError::NotFound => not_found(),
         SupervisorError::SpawnFailed(msg) => RpcError {
+            code: RpcErrorCode::SpawnFailed,
+            message: msg.clone(),
+        },
+        // The same code as `SpawnFailed` above, on the rule this function
+        // already applies twice below: `RpcErrorCode` is versioned, a client
+        // predating a new code cannot decode the reply at all, and that costs
+        // the operator the message as well as the code. "Could not start it",
+        // and exit 7, is true of a batch refused before it was registered.
+        //
+        // The bare payload rather than `err.to_string()`, unlike the two
+        // `Internal` groups below: those share a code with something else and
+        // need `Display` to tell them apart, while this message already opens
+        // with "nothing was registered" and says everything the prefix would.
+        SupervisorError::CannotStart(msg) => RpcError {
             code: RpcErrorCode::SpawnFailed,
             message: msg.clone(),
         },

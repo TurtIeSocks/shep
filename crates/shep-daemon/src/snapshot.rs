@@ -457,7 +457,14 @@ pub(crate) async fn muster(
     // config it is actually running under, rather than having the roll's
     // copy written over it for the next save to persist.
     registry.record(&to_start);
-    if let Err(err) = supervisor.start(to_start).await {
+    // `start_restored`, not `start`: the difference is whether one saved app
+    // that cannot run keeps the rest of the flock down, and the comment below
+    // has always said it must not. `start` refuses a whole batch over an app
+    // whose script provably is not there, which is right for an operator
+    // typing `shep start` against a Flockfile and wrong here -- this runs at
+    // boot with nobody watching, and a binary missing after a rebuild would
+    // silently cost the machine its entire flock.
+    if let Err(err) = supervisor.start_restored(to_start).await {
         // One bad entry does not sink the muster — the same policy
         // `restorable` already applies at validation time. The sheep that
         // failed to spawn is already recorded `Errored` by the supervisor.
@@ -871,6 +878,156 @@ mod tests {
             seen,
             vec![("down", ProcStatus::Stopped), ("up", ProcStatus::Online)],
             "the sheep that was down is listed and stopped, not missing"
+        );
+        handle.shutdown().await;
+    }
+
+    /// fails if a bad entry that is not LAST takes every app after it down.
+    ///
+    /// The sibling case below has the broken app last in roll order, which is
+    /// exactly why it did not catch this: `do_start`'s spawn loop returned on
+    /// the first failure regardless of policy, so `BatchPolicy::PerApp`
+    /// bought nothing for anything sorted after the wreck. `a-good` came up,
+    /// `b-bad` failed, and `c-good` was never registered at all -- not
+    /// `Errored`, absent, with no log line.
+    ///
+    /// Not a race that might not bite. `FlockRegistry` is a `BTreeMap`, so
+    /// `roll` writes the saved apps alphabetically and `restorable` preserves
+    /// that order, which makes this a certainty whenever the broken name
+    /// sorts before a working one. The names here are `a-`/`b-`/`c-` so the
+    /// roll order below IS the production order.
+    ///
+    /// ONE `muster` call, deliberately. `shep muster`'s CLI path calls twice
+    /// -- an autostart boot restore, then an explicit `Request::Muster` --
+    /// and the second call re-registers what the first lost, which is what
+    /// hid this through three rounds of review. The single unattended
+    /// restore a real `shep startup` unit performs is the only path where it
+    /// matters and the only one with nobody watching, and it is the one this
+    /// exercises.
+    ///
+    /// `failing_to_spawn` is load-bearing: scripts are consumed in spawn
+    /// order, so no arrangement of the script list can make the MIDDLE app
+    /// fail while its neighbours come up.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_saved_app_does_not_take_the_apps_after_it_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
+        let saved = |name: &str| SavedApp {
+            app: AppConfig::minimal(name, "./srv"),
+            instances_running: 1,
+        };
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![saved("a-good"), saved("b-bad"), saved("c-good")],
+        };
+        write_atomic(&paths.snapshot, &roll).unwrap();
+
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            // Two scripts for the two that must come up. `b-bad` consumes
+            // none, so a run that let it take one would starve `c-good` and
+            // fail here for a reason of its own.
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 2]).failing_to_spawn(&["b-bad"]),
+            paths.clone(),
+            events,
+        );
+        let registry = FlockRegistry::new();
+
+        let restored = muster(&paths.snapshot, &registry, &handle).await.unwrap();
+        assert_eq!(
+            restored,
+            vec![
+                "a-good".to_string(),
+                "b-bad".to_string(),
+                "c-good".to_string()
+            ]
+        );
+
+        let mut listed = handle.list().await;
+        listed.sort_by(|a, b| a.name.cmp(&b.name));
+        let seen: Vec<(&str, ProcStatus)> =
+            listed.iter().map(|i| (i.name.as_str(), i.status)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("a-good", ProcStatus::Online),
+                ("b-bad", ProcStatus::Errored),
+                ("c-good", ProcStatus::Online),
+            ],
+            "every app after the broken one must still get its turn, and the \
+             broken one must be visible rather than absent"
+        );
+        handle.shutdown().await;
+    }
+
+    /// fails if ONE saved app that cannot start keeps the rest of the flock
+    /// down at the next boot.
+    ///
+    /// The restore shares `do_start` with `Request::Start`, so the
+    /// pre-registration check written for an operator typing `shep start`
+    /// against a Flockfile reached this path too. Under it, a machine whose
+    /// saved `gone` had lost its binary to a rebuild came back with NOTHING
+    /// running -- not the twelve apps that were fine -- and did so at boot
+    /// with nobody watching. That is a strictly worse version of the
+    /// half-registered Flockfile the check exists to prevent, which is why
+    /// `muster` calls `start_restored` rather than `start`.
+    ///
+    /// The comment at that call site has always claimed "one bad entry does
+    /// not sink the muster". This is the case that makes the claim true
+    /// rather than aspirational.
+    ///
+    /// `refusing` is load-bearing and this case cannot fail without it:
+    /// `ScriptedRunner` reads nothing from a spec, so its `preflight`
+    /// answers `Unknown` for everything and the validating pass never
+    /// refuses anything at all.
+    ///
+    /// One script for two apps, so `gone` fails at its spawn as well. Both
+    /// halves matter: it must be REACHED (the regression refused it before
+    /// any spawn) and it must land as a visible `Errored` row rather than
+    /// vanishing.
+    #[tokio::test(start_paused = true)]
+    async fn one_unstartable_saved_app_does_not_keep_the_rest_of_the_flock_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![
+                SavedApp {
+                    app: AppConfig::minimal("good", "./srv"),
+                    instances_running: 1,
+                },
+                SavedApp {
+                    app: AppConfig::minimal("gone", "./deleted-by-a-rebuild"),
+                    instances_running: 1,
+                },
+            ],
+        };
+        write_atomic(&paths.snapshot, &roll).unwrap();
+
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]).refusing(&["gone"]),
+            paths.clone(),
+            events,
+        );
+        let registry = FlockRegistry::new();
+
+        let restored = muster(&paths.snapshot, &registry, &handle).await.unwrap();
+        assert_eq!(restored, vec!["good".to_string(), "gone".to_string()]);
+
+        let mut listed = handle.list().await;
+        listed.sort_by(|a, b| a.name.cmp(&b.name));
+        let seen: Vec<(&str, ProcStatus)> =
+            listed.iter().map(|i| (i.name.as_str(), i.status)).collect();
+        assert_eq!(
+            seen,
+            vec![("gone", ProcStatus::Errored), ("good", ProcStatus::Online)],
+            "the app that could still run must come up, and the one that \
+             could not must be visible rather than absent"
         );
         handle.shutdown().await;
     }

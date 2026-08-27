@@ -48,7 +48,7 @@ use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
-    ProcessEventKind, ProcessInfo, SignalOutcome, SignalReply, Smit,
+    ProcessEventKind, ProcessInfo, SheepDrift, SignalOutcome, SignalReply, Smit,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -65,7 +65,7 @@ use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
 use crate::runner::{
-    ExitOutcome, FlushError, LogCtl, ProcIo, ProcessRunner, ReopenError, RunnerError,
+    ExitOutcome, FlushError, LogCtl, Preflight, ProcIo, ProcessRunner, ReopenError, RunnerError,
     RunningProcess, SpawnSpec, StdinWrite, check_log_ancestry, open_log_path,
 };
 
@@ -180,6 +180,60 @@ impl ConnId {
 /// moment ago.
 type Smits = HashMap<String, (ConnId, String)>;
 
+/// Whether a [`Command::Start`] is all-or-nothing.
+///
+/// The pre-registration check in [`Actor::do_start`] exists for ONE caller's
+/// problem, and three others share that function. Making the policy a
+/// parameter is what stops the check reaching callers it was never meant for
+/// -- twice already it has, and both times the symptom was a flock that
+/// stayed down rather than a flock that came up half-registered.
+///
+/// `pub(crate)` like [`Command`] itself, and for the same reason: nothing
+/// outside this crate names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchPolicy {
+    /// Refuse the whole batch if any app in it provably cannot run, and
+    /// register none of it.
+    ///
+    /// What an operator typing `shep start` against a Flockfile asked for,
+    /// and the only caller this is right for. The defect it exists for: the
+    /// third app of eleven pointed at an unbuilt binary, so two registered
+    /// and started, one failed, and eight were never reached, leaving a
+    /// flock that matched neither the file nor its previous state. The
+    /// operator is holding a terminal, gets told, and can fix the file and
+    /// run it again.
+    AllOrNothing,
+    /// Register and spawn each app on its own merits, so one app that cannot
+    /// run costs only itself.
+    ///
+    /// What every other caller needs, and for two different reasons that
+    /// point the same way:
+    ///
+    /// - **Nobody is watching.** The muster roll restore runs at boot, and
+    ///   its own comment has always said "one bad entry does not sink the
+    ///   muster". A saved app whose binary is missing after a rebuild must
+    ///   not keep the other twelve down until somebody notices.
+    /// - **The failure IS the product.** A dog that cannot start belongs in
+    ///   the dogs table as `Errored`, which is what the operator who enabled
+    ///   it needs to see. [`Actor::spawn_fresh`] registers that row on
+    ///   purpose and says so, and `dogs::spawn_dog_watch` is a subscriber
+    ///   whose whole business is a dog reaching `Errored`. A refusal leaves
+    ///   no trace for either.
+    ///
+    /// Note that neither is a batch in the sense the check was written for:
+    /// a dog start is always one app, and a roll restore is a recovery
+    /// rather than a request.
+    ///
+    /// What a failure leaves behind differs by cause, and the difference is
+    /// not cosmetic. A failed SPAWN leaves an `Errored` row, because
+    /// [`Actor::spawn_fresh`] registers the entry before it reports. An
+    /// unresolvable `user`/`group` leaves nothing, because there is no
+    /// identity to assemble a spawn for and running that app under the
+    /// daemon's own identity instead is the one outcome that must never
+    /// happen. Both are reported in the error either way.
+    PerApp,
+}
+
 /// Commands the supervisor actor accepts (wrapped in [`Msg::Command`]).
 ///
 /// `pub(crate)` like [`Msg`], and for the same reason: [`SupervisorHandle`] is
@@ -192,6 +246,8 @@ pub(crate) enum Command {
     Start {
         /// Already-validated app specs to expand into instances.
         apps: Vec<ResolvedApp>,
+        /// Whether one app that provably cannot run refuses the whole batch.
+        policy: BatchPolicy,
         /// Answers with every spawned instance, or the first spawn failure.
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
@@ -206,6 +262,21 @@ pub(crate) enum Command {
         apps: Vec<ResolvedApp>,
         /// Answers with every entry now registered, in the order given.
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
+    /// Reports which of `apps` name a sheep registered under a different
+    /// config.
+    ///
+    /// Read-only, so it is answered during a shutdown like
+    /// [`Self::RegisterAtRest`] rather than refused like [`Self::Start`]:
+    /// nothing is registered, spawned or changed, so there is no child it
+    /// could leave outside the shutdown aggregation.
+    ConfigDrift {
+        /// Already-validated app specs to compare against the flock, exactly
+        /// as [`Self::Start`] would carry them.
+        apps: Vec<ResolvedApp>,
+        /// Answers with one entry per app that is both registered and
+        /// different, and no entry for anything else.
+        reply: oneshot::Sender<Result<Vec<SheepDrift>, SupervisorError>>,
     },
     /// Registers + spawns one dog, marked with where it came from.
     ///
@@ -498,8 +569,9 @@ pub(crate) enum Msg {
 
 /// Error type returned from supervisor commands.
 ///
-/// `#[non_exhaustive]`: seven variants today cover lookup, spawn, reload
-/// overlap, an invalid scale, and the two log-maintenance failure classes.
+/// `#[non_exhaustive]`: eight variants today cover lookup, spawn, a batch
+/// refused before it was registered, reload overlap, an invalid scale, and
+/// the two log-maintenance failure classes.
 /// The doc here used to forecast "a scale or pause verb" adding its own
 /// failure variant; the scale half of that has now landed as
 /// [`Self::InvalidScale`], and a pause verb, if one is ever built, is the
@@ -513,6 +585,26 @@ pub enum SupervisorError {
     NotFound,
     /// Spawn failed (carries the runner's message).
     SpawnFailed(String),
+    /// A `Start` batch was refused before anything was registered, because
+    /// at least one app in it provably could not run. Carries one
+    /// `"<name>: <reason>"` entry per such app, joined by `"; "`, behind a
+    /// count and the fact that nothing was registered.
+    ///
+    /// Separate from [`Self::SpawnFailed`] because NOTHING WAS SPAWNED, and
+    /// an operator reading "spawn failed" about a spawn that never happened
+    /// is being told something untrue about where to look. The two also
+    /// differ in what they leave behind, which is the part that matters
+    /// operationally: a `SpawnFailed` can leave earlier apps in the batch
+    /// registered and running, while this one guarantees an untouched flock.
+    ///
+    /// Maps to
+    /// [`RpcErrorCode::SpawnFailed`](shep_core::protocol::RpcErrorCode::SpawnFailed)
+    /// all the same, on the rule this file already applies to
+    /// [`Self::ReloadInFlight`]: `RpcErrorCode` is versioned, a client that
+    /// predates a new code cannot decode the reply at all, and that would
+    /// cost the operator the message as well as the code. "Could not start
+    /// it", and the exit code that goes with it, is true of both.
+    CannotStart(String),
     /// The selector reached an app that is already being reloaded; carries
     /// that app's name.
     ///
@@ -596,6 +688,7 @@ impl fmt::Display for SupervisorError {
         match self {
             Self::NotFound => f.write_str("selector matched no registered sheep"),
             Self::SpawnFailed(msg) => write!(f, "spawn failed: {msg}"),
+            Self::CannotStart(msg) => write!(f, "start refused: {msg}"),
             Self::ReloadInFlight(name) => write!(f, "{name} is already being reloaded"),
             Self::InvalidScale(msg) => write!(f, "cannot scale: {msg}"),
             Self::ReopenFailed(msg) => write!(f, "log reopen failed: {msg}"),
@@ -626,13 +719,56 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
+    /// - [`SupervisorError::CannotStart`] — at least one app provably could
+    ///   not run, so NOTHING was registered and the flock is exactly as it
+    ///   was. Carries one `"<name>: <reason>"` per refused app, never one
+    ///   per failed check. All or nothing, which is what an operator typing
+    ///   `shep start` against a Flockfile wants: a typo in the third app of
+    ///   eleven leaves nothing half-registered rather than a flock matching
+    ///   neither the file nor what was there before.
     /// - [`SupervisorError::SpawnFailed`] — the first instance that failed
     ///   to spawn (already-registered instances persist regardless).
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
     pub async fn start(&self, apps: Vec<ResolvedApp>) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        self.start_with(apps, BatchPolicy::AllOrNothing).await
+    }
+
+    /// [`Self::start`], but one app that cannot run costs only itself.
+    ///
+    /// For restoring a muster roll, which is the caller
+    /// [`BatchPolicy::PerApp`]'s doc opens with: it runs at boot with nobody
+    /// watching, and a saved app whose binary went missing must not keep the
+    /// rest of the flock down.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::SpawnFailed`]: at least one app could not be
+    ///   started, carrying one `"<name>: <reason>"` entry per such app joined
+    ///   by `"; "`. Every app in the batch was attempted regardless, and
+    ///   every app that could start is running. An app whose SPAWN failed is
+    ///   registered `Errored` and visible; an app whose `user`/`group` could
+    ///   not be resolved leaves no row at all, since nothing can be
+    ///   assembled without an identity to assemble it for.
+    /// - [`SupervisorError::EngineStopped`]: the actor is gone.
+    pub(crate) async fn start_restored(
+        &self,
+        apps: Vec<ResolvedApp>,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        self.start_with(apps, BatchPolicy::PerApp).await
+    }
+
+    async fn start_with(
+        &self,
+        apps: Vec<ResolvedApp>,
+        policy: BatchPolicy,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Msg::Command(Command::Start { apps, reply }))
+            .send(Msg::Command(Command::Start {
+                apps,
+                policy,
+                reply,
+            }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -653,6 +789,30 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::RegisterAtRest { apps, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Names the fields in which each app differs from the flock's own copy
+    /// of the sheep of the same name.
+    ///
+    /// Reads the flock and changes nothing. [`Self::start`] on a name the
+    /// flock already has adds instances rather than reconciling config,
+    /// which is what `shep stock` depends on; this is how a caller finds out
+    /// that an edit it just read from a Flockfile is one `start` will not
+    /// apply, rather than the edit vanishing without a word.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`] - the actor is gone.
+    pub(crate) async fn config_drift(
+        &self,
+        apps: Vec<ResolvedApp>,
+    ) -> Result<Vec<SheepDrift>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::ConfigDrift { apps, reply }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -1908,11 +2068,15 @@ impl<R: ProcessRunner> Actor<R> {
             // begun — it would register + spawn a child the shutdown
             // aggregation (computed from `online` ids at the moment it ran)
             // can never know to kill, orphaning it after the actor exits.
-            Command::Start { apps, reply } => {
+            Command::Start {
+                apps,
+                policy,
+                reply,
+            } => {
                 let result = if self.shutting_down {
                     Err(SupervisorError::EngineStopped)
                 } else {
-                    self.do_start(apps, None)
+                    self.do_start(apps, None, policy)
                 };
                 let _ = reply.send(result);
                 false
@@ -1924,6 +2088,13 @@ impl<R: ProcessRunner> Actor<R> {
             Command::RegisterAtRest { apps, reply } => {
                 let registered = apps.iter().map(|app| self.register_at_rest(app)).collect();
                 let _ = reply.send(Ok(registered));
+                false
+            }
+            // Answered during a shutdown, unlike Start and for the mirror of
+            // CRITICAL-1's reason: it registers and spawns nothing, so there
+            // is no child it could leave outside the shutdown aggregation.
+            Command::ConfigDrift { apps, reply } => {
+                let _ = reply.send(Ok(self.config_drift(&apps)));
                 false
             }
             // Rejected while `shutting_down` under CRITICAL-1's rule, the one
@@ -2086,7 +2257,13 @@ impl<R: ProcessRunner> Actor<R> {
         {
             return Ok(to_info(&slot.entry, &self.smits));
         }
-        let started = self.do_start(vec![app], Some(source))?;
+        // `PerApp`, and this is the whole reason the policy is a parameter.
+        // A dog that cannot start must land in the dogs table as `Errored`,
+        // which `spawn_fresh`'s failure arm registers on purpose and
+        // `dogs::spawn_dog_watch` subscribes to. A refusal would leave the
+        // operator who enabled it no trace at all. There is no half-batch to
+        // prevent here either: a dog start is always exactly one app.
+        let started = self.do_start(vec![app], Some(source), BatchPolicy::PerApp)?;
         started
             .into_iter()
             .next()
@@ -2094,8 +2271,22 @@ impl<R: ProcessRunner> Actor<R> {
     }
 
     /// Expands each app through `instance_slots` + `assemble`, spawning one
-    /// instance per slot. Already-registered entries persist even when a
-    /// later spawn in the batch fails.
+    /// instance per slot, after checking every app in the batch.
+    ///
+    /// Nothing at all is registered if any app fails that check, and the
+    /// error names every one that did rather than the first. The defect
+    /// this exists for: the third app of an eleven-app Flockfile pointed at
+    /// an unbuilt binary, so apps one and two registered and started, app
+    /// three failed to spawn, and apps four through eleven were never
+    /// reached. The flock then matched neither the file nor its previous
+    /// state.
+    ///
+    /// A spawn that fails ANYWAY still leaves the batch part-registered, and
+    /// that is not a case this can close: exec is the only thing that knows
+    /// for certain, and the first instance is already running by the time
+    /// the second one is attempted. What it closes is the knowable half, and
+    /// [`ProcessRunner::preflight`] is deliberately narrow about what counts
+    /// as knowable.
     ///
     /// `dog` is written onto every entry this registers, and is `None` for
     /// every caller but [`Self::do_start_dog`] — see [`ProcessEntry::dog`]
@@ -2104,17 +2295,116 @@ impl<R: ProcessRunner> Actor<R> {
         &mut self,
         apps: Vec<ResolvedApp>,
         dog: Option<DogSource>,
+        policy: BatchPolicy,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
-        let mut results = Vec::new();
+        // Every app that survives this pass carries its OWN credentials, in
+        // one sequence rather than two.
+        //
+        // The shape this replaces was a `Vec<Option<Credentials>>` zipped
+        // against `apps`, and it was sound only while a credential failure
+        // returned early: the two vectors could differ in length, and a
+        // comment asserted they did not. The moment a failure is SKIPPED
+        // instead -- which is exactly what `PerApp` needs -- `credentials`
+        // grows shorter than `apps` while staying in order, and `zip` pairs
+        // app 2 with app 3's credentials and silently drops the last app.
+        // That is a privilege misassignment rather than a scheduling bug: a
+        // flock comes up looking correct with processes running under
+        // identities nobody chose, and nothing announces it. Pairing at the
+        // point of resolution removes the second sequence, so there is
+        // nothing left to keep in step and no invariant left to assert.
+        let mut ready: Vec<(ResolvedApp, Option<Credentials>)> = Vec::with_capacity(apps.len());
+        // `AllOrNothing` only, by construction: every push below is guarded
+        // on the policy, and a non-empty `refusals` returns before anything
+        // is registered.
+        let mut refusals = Vec::new();
+        // `PerApp` only, by the same construction. Joined into one error
+        // after every app has had its turn.
+        let mut failures = Vec::new();
+        let total = apps.len();
         for app in apps {
             let name = app.config().name.clone();
             // Resolved once per app in this Start batch, not once per
             // instance: every instance of the same app shares one identity,
             // and respawn() reuses this same value from ProcessEntry for
             // every future restart instead of re-touching the passwd
-            // database (crate::privilege's module doc).
-            let credentials = privilege::resolve(app.config())
-                .map_err(|err| SupervisorError::SpawnFailed(err.to_string()))?;
+            // database (crate::privilege's module doc). Ahead of the
+            // registering loop for this function's own reason too: a passwd
+            // lookup that fails on the fourth app must not leave three
+            // registered.
+            let credentials = match privilege::resolve(app.config()) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    // One refusal per app, not one per failed check. Both
+                    // arms used to run, so an app failing credentials AND
+                    // carrying an unresolvable path pushed twice and the
+                    // summary below could say "4 of 2 apps cannot start".
+                    // The reasons were each true; the count was not.
+                    //
+                    // Asks the policy, like every other stopping point in
+                    // this function. Under `PerApp` this app is skipped and
+                    // the rest of the batch goes on: an unresolvable `user`
+                    // on one saved app must not cost a muster restore the
+                    // whole flock.
+                    //
+                    // Skipped rather than registered `Errored`, unlike a
+                    // failed spawn. Nothing can be assembled without an
+                    // identity to assemble it for, and running it under the
+                    // daemon's own identity instead is the one outcome that
+                    // must never happen here. The failure is reported either
+                    // way; what differs is that this app leaves no row.
+                    match policy {
+                        BatchPolicy::AllOrNothing => refusals.push(format!("{name}: {err}")),
+                        BatchPolicy::PerApp => failures.push(format!("{name}: {err}")),
+                    }
+                    continue;
+                }
+            };
+            // Assembled at instance 0 and with no credentials: neither
+            // changes which file exec names, which is all `preflight` reads.
+            // The real per-instance spec is built again below.
+            match self.runner.preflight(&assemble(&app, 0, &self.paths, None)) {
+                Preflight::Unknown => {}
+                // Only ever a refusal under `AllOrNothing`. Under `PerApp`
+                // it is logged like a `Doubtful` and the app goes on to
+                // register: see `BatchPolicy::PerApp` for the two callers
+                // and why each needs the row rather than the refusal.
+                Preflight::Impossible(reason) if policy == BatchPolicy::AllOrNothing => {
+                    refusals.push(format!("{name}: {reason}"));
+                    continue;
+                }
+                // Reported, never refused. A `Doubtful` is a claim about the
+                // daemon's environment rather than about a path, and the
+                // daemon's environment under the unit `shep startup`
+                // installs is not the shell an operator tested in: refusing
+                // here would keep a whole flock down at boot because one
+                // app's `node` is in `/opt/homebrew/bin`. That app's spawn
+                // fails on its own in a moment, naming the same program.
+                //
+                // The log rather than the reply: the reply is for the batch,
+                // and this is not a batch failure. At boot there is no
+                // operator holding a terminal to send it to either, and the
+                // shepherd's log is where they look. An `Impossible` under
+                // `PerApp` arrives here for the same reason.
+                Preflight::Impossible(reason) | Preflight::Doubtful(reason) => {
+                    tracing::warn!(sheep = %name, "{reason}");
+                }
+            }
+            ready.push((app, credentials));
+        }
+        if !refusals.is_empty() {
+            return Err(SupervisorError::CannotStart(format!(
+                "nothing was registered; {} of {} apps cannot start: {}",
+                refusals.len(),
+                total,
+                refusals.join("; "),
+            )));
+        }
+
+        let mut results = Vec::new();
+        // Each pair came out of the pass above together and has travelled
+        // together since. No zip, no second sequence, no alignment to hold.
+        'apps: for (app, credentials) in ready {
+            let name = app.config().name.clone();
             let mut existing: Vec<u32> = self
                 .sheep
                 .values()
@@ -2127,9 +2417,55 @@ impl<R: ProcessRunner> Actor<R> {
             for instance in slots {
                 match self.spawn_fresh(&app, instance, credentials, dog.clone()) {
                     Ok(info) => results.push(info),
-                    Err(message) => return Err(SupervisorError::SpawnFailed(message)),
+                    Err(message) => {
+                        // The sheep's name, which `spawn_fresh`'s message
+                        // deliberately leaves to its caller: one app of
+                        // eleven failing must say WHICH one.
+                        let failure = format!("{name}: {message}");
+                        match policy {
+                            // The operator is holding a terminal and asked
+                            // for all-or-nothing. Stopping here is what
+                            // keeps the batch from getting any further than
+                            // it already has.
+                            BatchPolicy::AllOrNothing => {
+                                return Err(SupervisorError::SpawnFailed(failure));
+                            }
+                            // The half `BatchPolicy` gated the pass above
+                            // for and did not reach: a bad entry that is not
+                            // LAST used to take every app after it with it,
+                            // and a muster roll restores in alphabetical
+                            // order, so that is not a race but a certainty
+                            // whenever the broken name sorts first. Every
+                            // remaining app still gets its turn.
+                            //
+                            // `spawn_fresh` has already registered this one
+                            // `Errored` before returning, which is the row
+                            // the muster's own comment promises and the
+                            // event `dogs::spawn_dog_watch` subscribes to.
+                            BatchPolicy::PerApp => {
+                                failures.push(failure);
+                                // This app's remaining instances are skipped
+                                // rather than attempted. They share a binary
+                                // and a cwd with the one that just failed,
+                                // so they would fail identically and turn
+                                // one broken app into `instances` identical
+                                // wrecks in the listing. One row per broken
+                                // app, which is also what `AllOrNothing`
+                                // leaves behind.
+                                continue 'apps;
+                            }
+                        }
+                    }
                 }
             }
+        }
+        // Every app was attempted, and at least one could not start. An
+        // `Err` rather than a partial `Ok`, so the caller's existing
+        // reporting still fires: `snapshot::muster` logs "failed to spawn one
+        // or more apps" off exactly this, and `do_start_dog` turns it into
+        // the dog's own refusal.
+        if !failures.is_empty() {
+            return Err(SupervisorError::SpawnFailed(failures.join("; ")));
         }
         Ok(results)
     }
@@ -2202,6 +2538,35 @@ impl<R: ProcessRunner> Actor<R> {
             },
         );
         info
+    }
+
+    /// Names the fields in which each app differs from the registered sheep
+    /// of the same name, skipping every app that matches and every app the
+    /// flock does not have.
+    ///
+    /// `&self`: this reads the flock and changes nothing, which is the whole
+    /// point of it being a separate command rather than something `do_start`
+    /// reports on its way past. Applying an edit under a running sheep is
+    /// the outcome being ruled out, not the one being built.
+    ///
+    /// Several instances of one app share one config, so the first slot
+    /// found under a name answers for all of them. Instance count is not
+    /// what makes them differ; the stored config is.
+    fn config_drift(&self, apps: &[ResolvedApp]) -> Vec<SheepDrift> {
+        apps.iter()
+            .filter_map(|app| {
+                let incoming = app.config();
+                let stored = self
+                    .sheep
+                    .values()
+                    .find(|slot| slot.entry.spec.config().name == incoming.name)?
+                    .entry
+                    .spec
+                    .config();
+                let fields = stored.drifted_fields(incoming);
+                (!fields.is_empty()).then(|| SheepDrift::new(&incoming.name, fields))
+            })
+            .collect()
     }
 
     /// Registers + spawns one brand-new instance (a fresh id, `restarts: 0`).
@@ -2360,7 +2725,46 @@ impl<R: ProcessRunner> Actor<R> {
                     },
                 );
                 self.emit(ProcessEventKind::Errored, info, true);
-                Err(error.to_string())
+                // Names the file exec was pointed at. `error` on its own was
+                // the whole message an operator got: "process spawn failed:
+                // No such file or directory (os error 2)", which told
+                // somebody starting an eleven-app Flockfile neither which
+                // app nor which path. The app's NAME is added by the caller
+                // rather than here, so `scale`'s own reply -- which already
+                // opens with the sheep's name -- does not say it twice.
+                //
+                // `spec.program` and `spec.cwd` verbatim, not a resolution of
+                // the two: they are what the Flockfile said, which is where
+                // the operator has to make the edit.
+                //
+                // A `Doubtful` verdict REPLACES that clause rather than
+                // joining it. This is the one channel the "not on the
+                // shepherd's PATH" sentence has to an operator holding a
+                // terminal: the batch check only ever logs it, because a
+                // doubt must not fail a batch and the `Start` reply is about
+                // the batch. Once THIS app's own spawn has failed, the reply
+                // is about this app, and the sentence belongs in it. It
+                // needs no protocol change: `SpawnFailed` already carries
+                // free-form text.
+                //
+                // Re-asking the runner rather than reading `error`'s kind:
+                // `RunnerError` carries the OS message already stringified,
+                // and widening it to carry an `ErrorKind` would be a public
+                // change to say something the runner can already answer. A
+                // second PATH walk, on a path that has already failed.
+                //
+                // Only `Doubtful`. An `Impossible` here means the file went
+                // away between the check and the spawn, and "tried `./srv`
+                // in /srv" names the literal the operator wrote plus the
+                // directory, which is what they need in order to edit it.
+                let attempted = match self.runner.preflight(&spec) {
+                    Preflight::Doubtful(reason) => reason,
+                    _ => match &spec.cwd {
+                        Some(cwd) => format!("tried `{}` in {}", spec.program, cwd.display()),
+                        None => format!("tried `{}`", spec.program),
+                    },
+                };
+                Err(format!("{error}; {attempted}"))
             }
         }
     }
@@ -6773,7 +7177,58 @@ mod tests {
             .start(vec![normalize(app).unwrap()])
             .await
             .unwrap_err();
-        assert!(matches!(err, SupervisorError::SpawnFailed(_)));
+        // `CannotStart`, not `SpawnFailed`: passwd resolution happens in the
+        // pass that runs BEFORE anything is registered, so nothing was
+        // spawned and nothing was left behind. Saying "spawn failed" here
+        // would point an operator at a spawn that never happened.
+        assert!(matches!(err, SupervisorError::CannotStart(_)), "{err:?}");
+        assert!(
+            handle.list().await.is_empty(),
+            "a refusal before the registering pass must leave nothing registered"
+        );
+    }
+
+    /// fails if one app can contribute more than one refusal. Both checks in
+    /// the validating pass used to run unconditionally, so an app with an
+    /// unresolvable user AND an unresolvable path pushed twice, and a
+    /// two-app batch could tell an operator that "4 of 2 apps cannot start".
+    ///
+    /// Every reason in that message was true. Only the arithmetic was wrong,
+    /// which is why this asserts the COUNT rather than the reasons: the
+    /// reasons were never the broken part and a test pinning them would have
+    /// passed throughout.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_counted_once_per_app_not_once_per_failed_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            // `refusing` is what makes this test able to fail. Without it
+            // the fake answers `Preflight::Unknown` for everything, only the
+            // credentials check can refuse, and no app can push twice no
+            // matter what the counting code does.
+            ScriptedRunner::new(vec![ProcScript::never_exits()]).refusing(&["one", "two"]),
+            test_paths(&dir),
+            events,
+        );
+        // Two apps, each failing both checks it can fail: an unresolvable
+        // user, and a script preflight refuses.
+        let both_bad = |name: &str| {
+            let mut app = AppConfig::minimal(name, "./definitely-not-here");
+            app.cwd = Some(dir.path().display().to_string());
+            app.user = Some("definitely-not-a-real-shep-user".to_string());
+            normalize(app).unwrap()
+        };
+        let err = handle
+            .start(vec![both_bad("one"), both_bad("two")])
+            .await
+            .unwrap_err();
+        let SupervisorError::CannotStart(msg) = &err else {
+            panic!("expected CannotStart, got {err:?}");
+        };
+        assert!(
+            msg.contains("2 of 2 apps cannot start"),
+            "one refusal per app, never one per failed check: {msg}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -8693,6 +9148,206 @@ mod tests {
         assert_eq!(errored.dog, Some(DogSource::BuiltIn));
     }
 
+    /// fails if an app's credentials can be paired with a DIFFERENT app.
+    ///
+    /// The hazard this exists for is not a scheduling bug, and it would not
+    /// announce itself. `do_start` used to resolve credentials into a
+    /// `Vec<Option<Credentials>>` and `zip` it against `apps`, sound only
+    /// while a credential failure returned early. Teaching that failure to
+    /// skip instead -- which is exactly what `PerApp` needs, so that one
+    /// unresolvable `user` cannot cost a muster restore its whole flock --
+    /// leaves `credentials` shorter than `apps` while still in order. `zip`
+    /// then pairs app 2 with app 3's credentials and drops the last app
+    /// silently, so the flock comes up looking correct with processes
+    /// running under identities nobody chose.
+    ///
+    /// The FIRST of three fails, because that is the ordering where the
+    /// drift starts at the very next app rather than somewhere behind it.
+    ///
+    /// Asserts the identity each app ACTUALLY got, not merely that it is
+    /// registered: `b-mine` and `c-plain` are both present under the broken
+    /// pairing too, holding each other's credentials. `b-mine` asks for this
+    /// process's own user, which resolves to a real uid without needing root
+    /// (`privilege::resolve` only refuses a CHANGE of identity), and
+    /// `c-plain` asks for none, so the two are distinguishable.
+    ///
+    /// What the broken pairing produces, for comparison: `a-bad` registered
+    /// and running as `b-mine`'s user despite having no resolvable user at
+    /// all, `b-mine` running as the daemon rather than as the user it asked
+    /// for, and `c-plain` absent.
+    ///
+    /// `#[cfg(unix)]`: `nix` is a unix-only dependency of this crate, and
+    /// `privilege::resolve` refuses any user request off-platform anyway.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_credential_failure_never_shifts_another_apps_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two scripts, for the two apps that must survive the first one's
+        // failure.
+        let (mut actor, _mailbox) =
+            actor_with_one_online_sheep(&dir, vec![ProcScript::never_exits(); 2]);
+
+        let own_uid = nix::unistd::geteuid();
+        let own_user = nix::unistd::User::from_uid(own_uid)
+            .expect("the passwd database is readable")
+            .expect("this process's own uid has a passwd entry")
+            .name;
+
+        let mut bad = AppConfig::minimal("a-bad", "./a");
+        bad.user = Some("definitely-not-a-real-shep-user".to_string());
+        let mut mine = AppConfig::minimal("b-mine", "./b");
+        mine.user = Some(own_user);
+        let plain = AppConfig::minimal("c-plain", "./c");
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Start {
+            apps: vec![
+                normalize(bad).unwrap(),
+                normalize(mine).unwrap(),
+                normalize(plain).unwrap(),
+            ],
+            policy: BatchPolicy::PerApp,
+            reply,
+        });
+
+        let err = answer
+            .await
+            .expect("the actor answers every Start")
+            .expect_err("one app has no resolvable user");
+        assert!(
+            err.to_string().contains("a-bad"),
+            "the failure must name the app whose user could not be resolved: {err}"
+        );
+
+        let identity = |name: &str| {
+            actor
+                .sheep
+                .values()
+                .find(|slot| slot.entry.spec.config().name == name)
+                .map(|slot| slot.entry.credentials)
+        };
+        assert_eq!(
+            identity("a-bad"),
+            None,
+            "an app with no resolvable user must not be registered at all, \
+             and must never inherit another app's identity"
+        );
+        assert_eq!(
+            identity("b-mine"),
+            Some(Some(Credentials {
+                uid: own_uid.as_raw(),
+                gid: None
+            })),
+            "the app that asked for a user must run as that user"
+        );
+        assert_eq!(
+            identity("c-plain"),
+            Some(None),
+            "the app that asked for no user must be registered, and must run \
+             as the daemon rather than as somebody else's uid"
+        );
+    }
+
+    /// fails if `AllOrNothing` stops stopping at the first failed spawn.
+    ///
+    /// The mirror of `snapshot::tests::a_bad_saved_app_does_not_take_the_apps
+    /// _after_it_down`, and the reason the policy is a parameter rather than
+    /// a blanket change: teaching the spawn loop to carry on past a failure
+    /// is right for a muster restore and wrong for an operator's `shep
+    /// start`, who asked for all-or-nothing and is holding a terminal to read
+    /// the refusal. Without this case, "carry on" could quietly become the
+    /// behaviour for both.
+    ///
+    /// `failing_to_spawn` on the FIRST app, so what the assertion reads is
+    /// the second app's absence rather than its failure.
+    #[tokio::test(start_paused = true)]
+    async fn an_all_or_nothing_start_stops_at_the_first_failed_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = broadcast::channel(64);
+        let handle = spawn_supervisor(
+            // A script for the second app, which must NOT get as far as
+            // using it: an exhausted pool would fail it for a reason of its
+            // own and make the assertion below say nothing.
+            ScriptedRunner::new(vec![ProcScript::never_exits()]).failing_to_spawn(&["first"]),
+            test_paths(&dir),
+            events,
+        );
+
+        let err = handle
+            .start(vec![
+                normalize(AppConfig::minimal("first", "./first")).unwrap(),
+                normalize(AppConfig::minimal("second", "./second")).unwrap(),
+            ])
+            .await
+            .expect_err("the first app cannot spawn");
+
+        assert!(matches!(err, SupervisorError::SpawnFailed(_)), "{err:?}");
+        let listed = handle.list().await;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|i| (i.name.as_str(), i.status))
+                .collect::<Vec<_>>(),
+            vec![("first", ProcStatus::Errored)],
+            "an operator's `shep start` must not go on past a failure: the \
+             second app is never reached: {listed:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    /// fails if a dog whose binary is missing is refused instead of being
+    /// registered `Errored`.
+    ///
+    /// `do_start_dog` shares `do_start` with `Request::Start`, so the
+    /// pre-registration check written for a Flockfile batch reached dogs too
+    /// and turned a visible wreck into no trace at all. Three things depend
+    /// on the row: [`Actor::spawn_fresh`]'s failure arm registers it on
+    /// purpose and says so in its own doc, `shep dogs` renders it, and
+    /// `dogs::spawn_dog_watch` is a subscriber whose entire business is a
+    /// dog reaching `Errored`. An operator who enabled a dog wants to be
+    /// told it is broken, not to find nothing there.
+    ///
+    /// `refusing` is load-bearing and this case cannot fail without it.
+    /// `ScriptedRunner` reads nothing from a spec, so its `preflight`
+    /// answers `Unknown` like the trait default, the validating pass never
+    /// refuses anything, and the assertions below would hold whichever way
+    /// `do_start_dog` passed its policy.
+    ///
+    /// The error is asserted too, not only the row. `SpawnFailed` is a spawn
+    /// that was really attempted and really failed; `CannotStart` would mean
+    /// the batch was refused, which is the regression, and the two are
+    /// otherwise indistinguishable from the caller.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_cannot_spawn_is_registered_errored_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = broadcast::channel(64);
+        // Empty scripts, so the spawn this now reaches fails on its own too:
+        // the point is that it is REACHED, and that the wreck is registered.
+        let runner = ScriptedRunner::new(Vec::new()).refusing(&["bark"]);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+
+        let err = handle
+            .start_dog(dog_app("bark"), DogSource::BuiltIn)
+            .await
+            .expect_err("nothing can spawn against an empty script pool");
+
+        assert!(
+            matches!(err, SupervisorError::SpawnFailed(_)),
+            "a dog must reach its spawn and fail there, not be refused \
+             before it registers: {err:?}"
+        );
+        let listed = handle.list().await;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|i| (i.name.as_str(), i.status, i.dog.clone()))
+                .collect::<Vec<_>>(),
+            vec![("bark", ProcStatus::Errored, Some(DogSource::BuiltIn))],
+            "the dogs table must still show the dog, and show it broken"
+        );
+        handle.shutdown().await;
+    }
+
     /// fails if a reload's replacement is built without the marker.
     /// `shep reload bark` names the dog exactly, so it reaches it (a
     /// wildcard would not), and an unmarked replacement turns the dog into a
@@ -10608,6 +11263,94 @@ mod tests {
         );
     }
 
+    /// Fails if a spawn failure goes back to naming neither the sheep nor
+    /// the path.
+    ///
+    /// The whole error an operator got was `error[spawn_failed]: the daemon
+    /// reported SpawnFailed: process spawn failed: No such file or directory
+    /// (os error 2)`. Starting an eleven-app Flockfile, that named neither
+    /// which app had failed nor which path had been tried.
+    ///
+    /// An exact string rather than two `contains`: the message is the whole
+    /// product here, and its shape is what a reader of a red run has to be
+    /// able to compare against.
+    ///
+    /// The `cwd` half is left to the end-to-end tier, which has a real one.
+    /// `AppConfig::minimal` sets none, and inventing one for this case would
+    /// pin a branch against a fixture rather than against a spawn.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_spawn_names_the_sheep_and_the_path_it_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        // An EMPTY script pool, so `ScriptedRunner` refuses the first spawn
+        // it is asked for. What matters is that the refusal reaches the
+        // reply unchanged apart from the two things being added to it.
+        let (mut actor, _mailbox) = actor_with_one_online_sheep(&dir, Vec::new());
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Start {
+            apps: vec![normalize(AppConfig::minimal("api", "./api")).unwrap()],
+            policy: BatchPolicy::AllOrNothing,
+            reply,
+        });
+
+        let err = answer
+            .await
+            .expect("the actor answers every Start")
+            .expect_err("an empty script pool cannot spawn");
+        assert_eq!(
+            err.to_string(),
+            "spawn failed: api: process spawn failed: script exhausted; tried `./api`"
+        );
+    }
+
+    /// Fails if `config_drift` stops naming an edited field, starts naming a
+    /// field nobody edited, starts reporting an app the flock has never
+    /// heard of, or lets a VALUE out.
+    ///
+    /// The defect in miniature: an operator edits `cwd` in a Flockfile and
+    /// re-runs `shep start`, which adds instances rather than reconciling,
+    /// so the edit is not applied. It was also not reported, and that is
+    /// what this pins. The last assertion is the other half of the contract:
+    /// asking must not APPLY the edit either, or the report would be a
+    /// silent reconciliation with a message attached.
+    #[tokio::test(start_paused = true)]
+    async fn config_drift_names_an_edited_sheeps_fields_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _mailbox) = actor_with_one_online_sheep(&dir, vec![ProcScript::never_exits()]);
+
+        // The fixture registered `AppConfig::minimal("web", "./srv")`. Two
+        // fields edited, not one, so a comparator that stopped at the first
+        // difference fails here; and `env` is one of them because reporting
+        // it by NAME alone is the security half of this (IR-41).
+        let mut edited = AppConfig::minimal("web", "./srv");
+        edited.cwd = Some("/srv/new".to_string());
+        edited
+            .env
+            .insert("DATABASE_URL".to_string(), "postgres://hunter2".to_string());
+        // A name the flock does not have. `start` will register it, so there
+        // is nothing to warn about and it must not appear in the answer.
+        let unknown = AppConfig::minimal("api", "./api");
+
+        let drift = actor.config_drift(&[normalize(edited).unwrap(), normalize(unknown).unwrap()]);
+
+        assert_eq!(
+            drift,
+            vec![SheepDrift::new(
+                "web",
+                vec!["cwd".to_string(), "env".to_string()]
+            )]
+        );
+        assert!(
+            !format!("{drift:?}").contains("hunter2"),
+            "a value must never travel with the field name that changed: {drift:?}"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().cwd,
+            None,
+            "asking which fields differ must not apply them"
+        );
+    }
+
     /// Fails if any of the three spawns stops putting its
     /// [`ProcIo::to_child`] clone on the slot — the handle the actor reaches a
     /// live child through, and the thing the case above would pass vacuously
@@ -10649,6 +11392,7 @@ mod tests {
         let (reply, _answer) = oneshot::channel();
         actor.handle_command(Command::Start {
             apps: vec![normalize(app).unwrap()],
+            policy: BatchPolicy::AllOrNothing,
             reply,
         });
         assert!(
