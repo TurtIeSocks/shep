@@ -28,10 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer look identical.
 
 - Colour reaches every table that has something to say with one, which is
-  seventeen of the twenty-two. The nine newly covered are the three per-sheep
-  reply tables (`trigger`, `signal`, `whisper`), `flush`'s two, `startup`'s,
-  `barks`, `kill` and `import`. Five stay plain on purpose, each with the
-  reason recorded on the impl.
+  fifteen of the twenty-two in `output::rows`. The eight newly covered are the
+  three per-sheep reply tables (`trigger`, `signal`, `whisper`), `flush`'s
+  two, `startup`'s, `barks` and `kill`, plus `import`'s `REUSE_PORT`. Seven
+  stay plain on purpose, each with the reason recorded on its impl.
 
 ### Fixes
 

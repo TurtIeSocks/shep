@@ -163,12 +163,19 @@ Dogs
       <div class="row"><span><code>import</code></span><span>REUSE_PORT when it is <code>true</code>, which is work you have to do</span></div>
     </div>
     <Callout variant="note">
-      Five tables carry no colour at all, deliberately: <code>describe</code>'s
-      lamb tree, <code>delete</code>'s id list, the saved-roll summary, the KV
-      store, and <code>shep dogs --available</code>. Each is either pure data
-      shep has no opinion about, or a single column that is also the whole
-      content, where muting would fade the table and distinguish nothing.
+      Seven tables carry no colour at all, deliberately: <code>describe</code>'s
+      lamb tree, <code>delete</code>'s id list, <code>unset</code>'s count, the
+      two saved-roll tables, the KV store, and
+      <code>shep dogs --available</code>. Each is either pure data shep has no
+      opinion about, or a single column that is also the whole content, where
+      muting would fade the table and distinguish nothing.
     </Callout>
+    <p class="fine">
+      The roll listing is the one table with a <code>STATUS</code> column and
+      no colour on it. Everything in a saved roll is stopped by definition, so
+      the cell reads <code>stopped</code> on every row of every rendering, and
+      a colour that never varies distinguishes nothing.
+    </p>
 
     <h2>After a lifecycle command</h2>
     <p>

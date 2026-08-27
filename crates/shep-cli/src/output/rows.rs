@@ -1522,6 +1522,21 @@ pub struct RolledSheep {
 #[derive(Debug, Serialize)]
 pub struct RolledSheepRows(pub Vec<RolledSheep>);
 
+/// No colour, including on STATUS, which is the one place in this module a
+/// STATUS column goes unpainted.
+///
+/// It was painted first, on the reasoning that keying treatments by column
+/// NAME is exactly so the same header means the same thing everywhere. That
+/// reasoning is right in general and wrong here, because this column is a
+/// CONSTANT: `commands::query`'s `flock_from_roll` writes the literal
+/// `stopped` on every row, since nothing in a saved roll is running by
+/// definition. A colour identical on every row of every rendering of this
+/// table distinguishes nothing, and the rule the colour work runs on is that
+/// a colour carries information or the column does not get one. Rin's call,
+/// and it is the same call `AvailableDogRows` gets for CATEGORY.
+///
+/// INSTANCES is a count with no threshold anyone agreed on, and NAME is
+/// identity.
 impl Render for RolledSheepRows {
     fn headers() -> &'static [&'static str] {
         &["NAME", "INSTANCES", "STATUS"]
@@ -1532,29 +1547,6 @@ impl Render for RolledSheepRows {
             .iter()
             .map(|s| vec![s.name.clone(), s.instances.to_string(), s.status.to_owned()])
             .collect()
-    }
-
-    /// STATUS gets the face and the role every other STATUS column in this
-    /// module gets, which is the whole point of keying the treatment on the
-    /// column NAME: the same header means the same thing everywhere.
-    ///
-    /// It is a constant here -- `query.rs` writes the literal `stopped` on
-    /// every row, because nothing in a saved roll is running -- so the colour
-    /// draws no comparison BETWEEN rows. It still carries the fact, and a
-    /// reader who has learned `(-.-)` elsewhere reads this table without
-    /// being told. INSTANCES is a count with no threshold anyone agreed on.
-    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let rows = self.rows();
-        paint(
-            rows.clone(),
-            Self::headers(),
-            presentation,
-            status_word,
-            |header, index| match header {
-                "STATUS" => status_named_by(&rows[index][2]).map_or(Paint::Default, Paint::Status),
-                _ => Paint::Default,
-            },
-        )
     }
 
     /// # Panics
