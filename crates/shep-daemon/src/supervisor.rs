@@ -2467,6 +2467,11 @@ impl<R: ProcessRunner> Actor<R> {
         if !failures.is_empty() {
             return Err(SupervisorError::SpawnFailed(failures.join("; ")));
         }
+        // The table `shep start` prints. `results` is built in the order the
+        // caller supplied its apps and then instance by instance within each,
+        // which is the Flockfile's order rather than the one every other
+        // listing takes.
+        sort_flock(&mut results);
         Ok(results)
     }
 
@@ -3526,7 +3531,7 @@ impl<R: ProcessRunner> Actor<R> {
             return;
         }
 
-        let accepted: Vec<ProcessInfo> = matched
+        let mut accepted: Vec<ProcessInfo> = matched
             .iter()
             .map(|id| {
                 let slot = self
@@ -3536,6 +3541,10 @@ impl<R: ProcessRunner> Actor<R> {
                 to_info(&slot.entry, &self.smits)
             })
             .collect();
+        // The table `shep reload` prints, so it takes the one order every
+        // operator-facing listing takes. It arrives in the id order
+        // `matching_ids` answers in, which is not that order.
+        sort_flock(&mut accepted);
 
         // Grouped by app because a reload runs one instance of an app at a
         // time, and ordered by instance slot because that is the order an
@@ -5631,12 +5640,29 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Full flock listing, grouped by app name.
     ///
-    /// Sorted on `(name, instance, id)`, not id: sorting by id scatters a
-    /// clustered app's instances across the table, and grouping by name is
-    /// what makes a four-instance app read as one thing at a glance.
-    /// `instance` keeps a clustered app's slots in their own order once
-    /// grouped, and `id` breaks the tie a reload creates, where a
-    /// replacement takes the drainee's slot number with a fresh id.
+    /// Sorted by [`sort_flock`], the one rule every operator-facing listing
+    /// in shep takes: name, then id. Sorting by id alone scatters a clustered
+    /// app's instances across the table, and grouping by name is what makes a
+    /// four-instance app read as one thing at a glance.
+    ///
+    /// # Why not `(name, instance, id)`
+    ///
+    /// It used to sort on that, and the extra key was a real refinement:
+    /// `instance` keeps a clustered app's slots in their own order, where
+    /// `id` breaks the tie a reload creates by giving a replacement a fresh
+    /// id at the drainee's slot number.
+    ///
+    /// It was also a SECOND rule. `ProcessInfo` carries no instance number,
+    /// so no listing that has crossed the wire can reproduce it, and
+    /// `sort_flock` -- which every lifecycle reply now takes -- cannot. The
+    /// two agree on any flock whose ids were handed out in instance order and
+    /// diverge exactly once a reload has churned one, so `ListFlock` could
+    /// order a reloaded app differently from the `Restart` reply printed a
+    /// second earlier. That is the inconsistency this whole change exists to
+    /// end, reintroduced one layer down.
+    ///
+    /// So the finer key goes and the shared one stays, by calling the shared
+    /// function rather than restating it: the two cannot drift.
     ///
     /// Applied here once rather than once per verb: this is the single
     /// function every listing reply is built from — `ListFlock`, `Describe`,
@@ -5644,18 +5670,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// anywhere else would leave the metrics dog and bark reading a
     /// different order from the operator, or duplicate the rule per verb.
     fn snapshot_all(&self) -> Vec<ProcessInfo> {
-        let mut entries: Vec<&ProcessEntry> = self.sheep.values().map(|slot| &slot.entry).collect();
-        entries.sort_unstable_by(|a, b| {
-            (a.spec.config().name.as_str(), a.instance, a.id).cmp(&(
-                b.spec.config().name.as_str(),
-                b.instance,
-                b.id,
-            ))
-        });
-        entries
-            .into_iter()
-            .map(|entry| to_info(entry, &self.smits))
-            .collect()
+        let mut listing: Vec<ProcessInfo> = self
+            .sheep
+            .values()
+            .map(|slot| to_info(&slot.entry, &self.smits))
+            .collect();
+        sort_flock(&mut listing);
+        listing
     }
 
     /// Broadcasts one lifecycle transition. Send failures (no receivers)

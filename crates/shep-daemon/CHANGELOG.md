@@ -111,10 +111,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Every reply carrying a listing now comes back in the same order the flock
   listing does: by name, then by id. `ListFlock`, `Describe` and `Mustered`
-  already grouped by name; `Stop`, `Restart`, `Delete`, `Scale`, `Reopen`,
-  `Flush`, `Trigger`, `Signal` and `SendLine` came back by id, so one session
-  against one flock printed two different orders. Wire-observable, and so
-  visible under `--format json` as well as in a table.
+  already grouped by name; `Start`, `Stop`, `Restart`, `Reload`, `Scale`,
+  `Reopen`, `Flush`, `Trigger`, `Signal` and `SendLine` came back in whatever
+  order they were assembled, so one session against one flock printed two
+  different orders. Wire-observable, and so visible under `--format json` as
+  well as in a table. `Delete` is not in that list and never was: it answers
+  with ids alone, which the daemon already sorts.
+
+- `snapshot_all` takes the shared rule rather than a finer one of its own. It
+  sorted `(name, instance, id)`, which is more stable across a reload and
+  which no listing that has crossed the wire can reproduce, since
+  `ProcessInfo` carries no instance number. The two agreed until a reload
+  churned an id and then diverged, so `ListFlock` could order a reloaded app
+  differently from the `Restart` reply printed a second earlier -- the very
+  inconsistency this change exists to end, one layer down. It now calls
+  `sort_flock`, so the two cannot drift.
 
 ### Additions
 

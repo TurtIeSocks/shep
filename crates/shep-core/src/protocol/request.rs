@@ -710,12 +710,15 @@ pub struct ProcessInfo {
 /// still how an operator addresses one instance at `shep stop 11`. It stops
 /// being a sort key and stays an addressing key.
 ///
-/// The daemon's own `snapshot_all` sorts the richer `(name, instance, id)`,
-/// which agrees with this one on every listing where the ids were handed out
-/// in instance order and is strictly more stable where a reload has given a
-/// slot a fresh id. [`ProcessInfo`] carries no instance number, so this is
-/// the finest key expressible over a listing that has already crossed the
-/// wire.
+/// This is the ONLY ordering rule in shep, and the daemon's own
+/// `snapshot_all` calls this function rather than restating it. It used to
+/// sort the richer `(name, instance, id)`, which is strictly more stable
+/// where a reload has given a slot a fresh id -- and which was a second rule
+/// no listing that has crossed the wire could reproduce, since
+/// [`ProcessInfo`] carries no instance number. The two agreed until a reload
+/// churned an id and then disagreed, so `ListFlock` could order a reloaded
+/// app differently from the `Restart` reply printed a second earlier. One
+/// rule everywhere is worth more than a finer one in half the places.
 pub fn sort_flock(listing: &mut [ProcessInfo]) {
     listing.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
 }
