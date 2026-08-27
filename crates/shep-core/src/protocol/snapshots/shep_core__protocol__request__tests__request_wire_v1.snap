@@ -246,5 +246,13 @@ expression: requests
       "sheep": "web",
       "smit": null
     }
+  },
+  {
+    "id": 22,
+    "deadline_ms": null,
+    "body": {
+      "kind": "config_drift",
+      "apps": []
+    }
   }
 ]

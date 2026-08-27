@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- Say so when a Flockfile app names a sheep the flock already has under a
+  different config, instead of ignoring the edit in silence. `shep start` on
+  a registered name adds instances rather than reconciling config, so
+  changing an app's `cwd` and re-running `shep start` left it running the old
+  one with nothing printed; the apps then crash-looped against a path that no
+  longer applied and only a `shep delete` plus a fresh start recovered them.
+  `start` now asks the daemon (`Request::ConfigDrift`) before resuming
+  anything and names the sheep and every field that differs, on stderr, so
+  `--format json` piping is unaffected. Reported, never applied: whether
+  `start` should reconcile by default or grow an `--update` flag is a
+  separate decision, and changing a running flock's `cwd` or argv underneath
+  an operator would be a worse surprise than the bug being fixed. Field names
+  only, never values, since `env` carries secrets.
+
 - Table columns are padded by the columns a name draws in, not by its
   character count. A CJK or emoji glyph counts as one character and draws as
   two, so a name built from them hung over its own column and pushed every

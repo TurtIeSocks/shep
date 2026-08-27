@@ -484,6 +484,58 @@ impl AppConfig {
             ..Self::default()
         }
     }
+
+    /// The names of the fields whose values differ between `self` and
+    /// `other`, in field-name order.
+    ///
+    /// Names only, never values. The one caller sends this list across the
+    /// wire to be printed at an operator, and [`AppConfig::env`] carries
+    /// secrets, so a differing `env` reports `"env"` and stops there (IR-41).
+    ///
+    /// Compare configs that have both been through
+    /// [`normalize`](crate::config::normalize). Two configs differing only
+    /// in what normalization would have filled in are not a difference an
+    /// operator can act on, and reporting them would make the caller noisy
+    /// about nothing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use shep_core::config::AppConfig;
+    ///
+    /// let stored = AppConfig::minimal("web", "./srv");
+    /// let mut edited = stored.clone();
+    /// edited.cwd = Some("/srv".to_string());
+    ///
+    /// assert_eq!(stored.drifted_fields(&edited), vec!["cwd".to_string()]);
+    /// assert!(stored.drifted_fields(&stored).is_empty());
+    /// ```
+    #[must_use]
+    pub fn drifted_fields(&self, other: &Self) -> Vec<String> {
+        if self == other {
+            return Vec::new();
+        }
+        // Through serde rather than field by field, so a field added to this
+        // struct is compared without a second edit here. 44 hand-written
+        // comparisons is exactly the list that goes stale. `#[serde(default)]`
+        // with no `skip_serializing_if` means both sides serialize every
+        // field, so the two key sets are identical and iterating one is
+        // enough. `serde_json::Map` is a `BTreeMap`, which is where the
+        // field-name ordering comes from.
+        //
+        // An empty vector when either side fails to serialize as an object:
+        // there is no honest field list to report, and the caller must not
+        // fail over a warning it could not compute.
+        let (Ok(serde_json::Value::Object(mine)), Ok(serde_json::Value::Object(theirs))) =
+            (serde_json::to_value(self), serde_json::to_value(other))
+        else {
+            return Vec::new();
+        };
+        mine.iter()
+            .filter(|(key, value)| theirs.get(key.as_str()) != Some(value))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -608,6 +660,61 @@ target = "http://127.0.0.1:8080/healthz"
         assert_eq!(
             format!("{app:?}"),
             "AppConfig { name: \"web\", script: \"./srv\", env: <2 vars>, .. }"
+        );
+    }
+
+    #[test]
+    fn an_unedited_config_has_drifted_in_no_field() {
+        let app = AppConfig::minimal("web", "./srv");
+
+        assert!(app.drifted_fields(&app.clone()).is_empty());
+    }
+
+    #[test]
+    fn drift_names_every_edited_field_and_no_other() {
+        // The defect this exists for: an operator edits `cwd` in a Flockfile
+        // and re-runs `shep start`. Two fields, not one, so a comparator
+        // that stopped at the first difference fails here.
+        let stored = AppConfig::minimal("proto-api", "./proto-enum-api");
+        let mut edited = stored.clone();
+        edited.cwd = Some("/Users/rin/GitHub/pogo-proto-api".to_string());
+        edited.args = vec!["-config".to_string(), "config.toml".to_string()];
+
+        assert_eq!(
+            stored.drifted_fields(&edited),
+            vec!["args".to_string(), "cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn drift_reports_env_by_name_and_never_by_value() {
+        let stored = AppConfig::minimal("web", "./srv");
+        let mut edited = stored.clone();
+        edited
+            .env
+            .insert("DATABASE_URL".to_string(), "postgres://hunter2".to_string());
+
+        let fields = edited.drifted_fields(&stored);
+
+        assert_eq!(fields, vec!["env".to_string()]);
+        // The whole point of returning names: this list is printed at an
+        // operator, so nothing from a value may reach it (IR-41).
+        assert!(!fields.concat().contains("hunter2"));
+    }
+
+    #[test]
+    fn drift_is_symmetric() {
+        let stored = AppConfig::minimal("web", "./srv");
+        let mut edited = stored.clone();
+        edited.instances = 4;
+
+        assert_eq!(
+            stored.drifted_fields(&edited),
+            edited.drifted_fields(&stored)
+        );
+        assert_eq!(
+            stored.drifted_fields(&edited),
+            vec!["instances".to_string()]
         );
     }
 }

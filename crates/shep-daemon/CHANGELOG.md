@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Additions
+
+- Answer `Request::ConfigDrift`: report which of a set of apps name a
+  registered sheep whose stored config differs, and in which fields. Reads
+  the flock and changes nothing -- it registers, spawns and records nothing,
+  so it is answered during a shutdown rather than refused the way `Start` is.
+  The incoming configs are re-normalized first, on the same untrusted-peer
+  rule `Start` follows plus one of its own: an unnormalized config would
+  report every default it did not spell out as a difference from the
+  normalized copy the flock stores.
+
 ## [0.1.0] - 2026-08-26
 
 ### Additions

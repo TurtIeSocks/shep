@@ -48,7 +48,7 @@ use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
-    ProcessEventKind, ProcessInfo, SignalOutcome, SignalReply, Smit,
+    ProcessEventKind, ProcessInfo, SheepDrift, SignalOutcome, SignalReply, Smit,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -206,6 +206,21 @@ pub(crate) enum Command {
         apps: Vec<ResolvedApp>,
         /// Answers with every entry now registered, in the order given.
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
+    /// Reports which of `apps` name a sheep registered under a different
+    /// config.
+    ///
+    /// Read-only, so it is answered during a shutdown like
+    /// [`Self::RegisterAtRest`] rather than refused like [`Self::Start`]:
+    /// nothing is registered, spawned or changed, so there is no child it
+    /// could leave outside the shutdown aggregation.
+    ConfigDrift {
+        /// Already-validated app specs to compare against the flock, exactly
+        /// as [`Self::Start`] would carry them.
+        apps: Vec<ResolvedApp>,
+        /// Answers with one entry per app that is both registered and
+        /// different, and no entry for anything else.
+        reply: oneshot::Sender<Result<Vec<SheepDrift>, SupervisorError>>,
     },
     /// Registers + spawns one dog, marked with where it came from.
     ///
@@ -653,6 +668,30 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::RegisterAtRest { apps, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Names the fields in which each app differs from the flock's own copy
+    /// of the sheep of the same name.
+    ///
+    /// Reads the flock and changes nothing. [`Self::start`] on a name the
+    /// flock already has adds instances rather than reconciling config,
+    /// which is what `shep stock` depends on; this is how a caller finds out
+    /// that an edit it just read from a Flockfile is one `start` will not
+    /// apply, rather than the edit vanishing without a word.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`] - the actor is gone.
+    pub(crate) async fn config_drift(
+        &self,
+        apps: Vec<ResolvedApp>,
+    ) -> Result<Vec<SheepDrift>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::ConfigDrift { apps, reply }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -1926,6 +1965,13 @@ impl<R: ProcessRunner> Actor<R> {
                 let _ = reply.send(Ok(registered));
                 false
             }
+            // Answered during a shutdown, unlike Start and for the mirror of
+            // CRITICAL-1's reason: it registers and spawns nothing, so there
+            // is no child it could leave outside the shutdown aggregation.
+            Command::ConfigDrift { apps, reply } => {
+                let _ = reply.send(Ok(self.config_drift(&apps)));
+                false
+            }
             // Rejected while `shutting_down` under CRITICAL-1's rule, the one
             // Start follows and for the same reason: a dog spawned after the
             // shutdown aggregation was computed is a child nothing will kill.
@@ -2202,6 +2248,35 @@ impl<R: ProcessRunner> Actor<R> {
             },
         );
         info
+    }
+
+    /// Names the fields in which each app differs from the registered sheep
+    /// of the same name, skipping every app that matches and every app the
+    /// flock does not have.
+    ///
+    /// `&self`: this reads the flock and changes nothing, which is the whole
+    /// point of it being a separate command rather than something `do_start`
+    /// reports on its way past. Applying an edit under a running sheep is
+    /// the outcome being ruled out, not the one being built.
+    ///
+    /// Several instances of one app share one config, so the first slot
+    /// found under a name answers for all of them. Instance count is not
+    /// what makes them differ; the stored config is.
+    fn config_drift(&self, apps: &[ResolvedApp]) -> Vec<SheepDrift> {
+        apps.iter()
+            .filter_map(|app| {
+                let incoming = app.config();
+                let stored = self
+                    .sheep
+                    .values()
+                    .find(|slot| slot.entry.spec.config().name == incoming.name)?
+                    .entry
+                    .spec
+                    .config();
+                let fields = stored.drifted_fields(incoming);
+                (!fields.is_empty()).then(|| SheepDrift::new(&incoming.name, fields))
+            })
+            .collect()
     }
 
     /// Registers + spawns one brand-new instance (a fresh id, `restarts: 0`).
@@ -10605,6 +10680,54 @@ mod tests {
             Some(None),
             "the writer task outlived its sheep, parked on `recv()` and \
              holding the daemon's end of the shepherd channel"
+        );
+    }
+
+    /// Fails if `config_drift` stops naming an edited field, starts naming a
+    /// field nobody edited, starts reporting an app the flock has never
+    /// heard of, or lets a VALUE out.
+    ///
+    /// The defect in miniature: an operator edits `cwd` in a Flockfile and
+    /// re-runs `shep start`, which adds instances rather than reconciling,
+    /// so the edit is not applied. It was also not reported, and that is
+    /// what this pins. The last assertion is the other half of the contract:
+    /// asking must not APPLY the edit either, or the report would be a
+    /// silent reconciliation with a message attached.
+    #[tokio::test(start_paused = true)]
+    async fn config_drift_names_an_edited_sheeps_fields_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _mailbox) = actor_with_one_online_sheep(&dir, vec![ProcScript::never_exits()]);
+
+        // The fixture registered `AppConfig::minimal("web", "./srv")`. Two
+        // fields edited, not one, so a comparator that stopped at the first
+        // difference fails here; and `env` is one of them because reporting
+        // it by NAME alone is the security half of this (IR-41).
+        let mut edited = AppConfig::minimal("web", "./srv");
+        edited.cwd = Some("/srv/new".to_string());
+        edited
+            .env
+            .insert("DATABASE_URL".to_string(), "postgres://hunter2".to_string());
+        // A name the flock does not have. `start` will register it, so there
+        // is nothing to warn about and it must not appear in the answer.
+        let unknown = AppConfig::minimal("api", "./api");
+
+        let drift = actor.config_drift(&[normalize(edited).unwrap(), normalize(unknown).unwrap()]);
+
+        assert_eq!(
+            drift,
+            vec![SheepDrift::new(
+                "web",
+                vec!["cwd".to_string(), "env".to_string()]
+            )]
+        );
+        assert!(
+            !format!("{drift:?}").contains("hunter2"),
+            "a value must never travel with the field name that changed: {drift:?}"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().cwd,
+            None,
+            "asking which fields differ must not apply them"
         );
     }
 

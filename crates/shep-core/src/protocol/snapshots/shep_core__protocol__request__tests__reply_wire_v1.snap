@@ -440,5 +440,29 @@ expression: replies
         ]
       }
     }
+  },
+  {
+    "id": 26,
+    "result": {
+      "Ok": {
+        "kind": "drifted",
+        "data": [
+          {
+            "name": "web",
+            "fields": [
+              "cwd"
+            ]
+          },
+          {
+            "name": "api",
+            "fields": [
+              "args",
+              "env",
+              "script"
+            ]
+          }
+        ]
+      }
+    }
   }
 ]

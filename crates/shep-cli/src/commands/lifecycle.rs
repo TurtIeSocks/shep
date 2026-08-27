@@ -626,6 +626,57 @@ async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
     }
 }
 
+/// Says so when a Flockfile app the flock already has is registered under a
+/// different config, naming the sheep and the fields that differ.
+///
+/// The defect this exists for: an operator edits `cwd` on two apps, re-runs
+/// `shep start`, and both keep running the old one. `Request::Start` on a
+/// name the flock already has adds instances rather than reconciling config,
+/// which is what `shep stock` depends on, so the edit is simply not applied.
+/// It was also not reported, which is the half being fixed: the edit
+/// vanished without a word and the apps crash-looped against a path that no
+/// longer applied.
+///
+/// Reports rather than applies. Whether `start` should reconcile by default,
+/// or grow an `--update` flag, is Rin's call and neither is taken here; a
+/// running flock changing its cwd or argv underneath an operator would be a
+/// worse surprise than the one being fixed.
+///
+/// Field NAMES only, never values: this reaches an operator's terminal and
+/// `env` carries secrets, so a differing `env` says `env` and stops (IR-41).
+/// [`AppConfig::drifted_fields`] is where that rule is enforced.
+///
+/// Silent on an unreachable daemon, an unexpected answer, or a daemon too
+/// old to know the request, the same call [`flock_now`] makes: failing a
+/// `start` over a warning it could not compute would trade a working command
+/// for a defensive one.
+///
+/// One request for the whole invocation, not one per app.
+async fn report_config_drift(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    resumed: &[(AppConfig, shep_core::protocol::ProcessInfo)],
+) {
+    if resumed.is_empty() {
+        return;
+    }
+    let apps = resumed.iter().map(|(app, _)| app.clone()).collect();
+    let Ok(Response::Drifted(drifted)) = client.request(Request::ConfigDrift { apps }).await else {
+        return;
+    };
+    for drift in drifted {
+        let name = &drift.name;
+        let fields = drift.fields.join(", ");
+        let message = format!(
+            "{name} is registered with a different config ({fields}). `shep start` \
+             adds instances to a sheep the flock already has; it does not apply \
+             config edits, so the edit is not in effect. To apply it: `shep \
+             delete {name}`, then start again."
+        );
+        streams.aside("start", &message);
+    }
+}
+
 /// `shep.toml`'s `[interpreters]` entry for `script`'s own extension, if it
 /// has one and the map names it.
 ///
@@ -816,10 +867,24 @@ async fn start_one(
         Vec::new()
     };
 
-    let apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
+    let mut apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
         Ok(apps) => apps,
         Err(err) => return fail_target(streams, &err),
     };
+
+    if let Some(fold) = &args.fold {
+        for app in &mut apps {
+            app.fold = Some(fold.clone());
+        }
+    }
+    // After the per-app defaults above, so an explicit flag wins over both
+    // the script form's "where you are" default and a Flockfile's own value.
+    if let Some(cwd) = &args.cwd {
+        for app in &mut apps {
+            app.cwd = Some(cwd.clone());
+        }
+    }
+    apply_interpreters(&mut apps, interpreters, args.interpreter.as_deref());
     // The same rule the bare-name lookup above applies, now that the target
     // has become a set of named apps: a name the flock already has is that
     // sheep. Without this, `shep start ./thing` against a running `thing`
@@ -835,11 +900,15 @@ async fn start_one(
     let mut fresh = Vec::new();
     for app in apps {
         match flock.iter().find(|info| info.name == app.name) {
-            Some(existing) => resumed.push(existing.clone()),
+            Some(existing) => resumed.push((app, existing.clone())),
             None => fresh.push(app),
         }
     }
-    for existing in &resumed {
+    // Before the resumes below, not after: an operator who edited the file
+    // and gets a wall of restart output should read why none of it applied
+    // at the top of the run rather than under it.
+    report_config_drift(client, streams, &resumed).await;
+    for (_, existing) in &resumed {
         let code = resume(client, streams, existing, started).await;
         if code != ExitCode::Success {
             return code;
@@ -848,21 +917,7 @@ async fn start_one(
     if fresh.is_empty() {
         return ExitCode::Success;
     }
-    let mut apps = fresh;
-
-    if let Some(fold) = &args.fold {
-        for app in &mut apps {
-            app.fold = Some(fold.clone());
-        }
-    }
-    // After the per-app defaults above, so an explicit flag wins over both
-    // the script form's "where you are" default and a Flockfile's own value.
-    if let Some(cwd) = &args.cwd {
-        for app in &mut apps {
-            app.cwd = Some(cwd.clone());
-        }
-    }
-    apply_interpreters(&mut apps, interpreters, args.interpreter.as_deref());
+    let apps = fresh;
 
     let (procs, failure) = request_each(
         client,

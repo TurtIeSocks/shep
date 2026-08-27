@@ -221,6 +221,27 @@ pub enum Request {
         /// untrusted); failures return [`RpcErrorCode::InvalidConfig`]
         apps: Vec<AppConfig>,
     },
+    /// Ask which of `apps` name a sheep the flock already has under a
+    /// different config
+    ///
+    /// Read-only: nothing is registered, started, or changed. [`Self::Start`]
+    /// on an already-registered name adds instances rather than reconciling
+    /// config, which is what `shep stock` relies on; this is how a caller
+    /// finds out that an edit it just read from a Flockfile is one `Start`
+    /// will not apply, instead of the edit vanishing without a word.
+    ///
+    /// Answers [`Response::Drifted`] with one [`SheepDrift`] per app that is
+    /// both registered and different. An app the flock does not have is
+    /// absent from the answer, not reported as unchanged: `Start` will
+    /// register it, so there is nothing to warn about.
+    ConfigDrift {
+        /// The configs to compare against, exactly as [`Self::Start`] would
+        /// carry them. The daemon MUST re-normalize (peer input is
+        /// untrusted, and an unnormalized config would report every default
+        /// it has not spelled out as a difference); failures return
+        /// [`RpcErrorCode::InvalidConfig`].
+        apps: Vec<AppConfig>,
+    },
     /// Stop matching sheep (stay registered)
     Stop {
         /// Which sheep
@@ -1020,6 +1041,46 @@ impl fmt::Debug for DogSectionToml {
     }
 }
 
+/// One registered sheep whose stored config differs from a caller's copy:
+/// the answer [`Request::ConfigDrift`] is asking for
+///
+/// Field NAMES only, never their values. This is built to be printed at an
+/// operator, and [`AppConfig::env`](crate::config::AppConfig::env) carries
+/// secrets, so a differing `env` reports `"env"` and nothing more (IR-41).
+/// `Debug` is derived for that reason: there is nothing here to redact.
+// wire format: changing field names is a breaking change
+//
+// `#[non_exhaustive]`: shep-core is a published library, an out-of-tree
+// consumer can match or construct this exhaustively today, and a third field
+// (which side is newer, say) would break them with no version bump to say
+// so (IR-20). [`SheepDrift::new`] is how the daemon builds one.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheepDrift {
+    /// The sheep's name. Both configs share it by construction: it is what
+    /// matched them to each other.
+    pub name: String,
+    /// The [`AppConfig`](crate::config::AppConfig) fields that differ, in
+    /// field-name order. Never empty: a sheep with nothing to report is left
+    /// out of the answer entirely.
+    pub fields: Vec<String>,
+}
+
+impl SheepDrift {
+    /// Builds one sheep's report.
+    ///
+    /// No builder, unlike [`ProcessInfo`]: both fields are required and
+    /// neither can be defaulted, so there is no optional surface for one to
+    /// spare a caller.
+    #[must_use]
+    pub fn new(name: impl Into<String>, fields: Vec<String>) -> Self {
+        Self {
+            name: name.into(),
+            fields,
+        }
+    }
+}
+
 /// One RPC response (pairs with [`Request`] variants)
 ///
 /// Ten variants carry a bare `Vec<ProcessInfo>` (`Flock`, `Described`,
@@ -1055,6 +1116,11 @@ pub enum Response {
     Described(Vec<ProcessInfo>),
     /// Answer to `Start`
     Started(Vec<ProcessInfo>),
+    /// Answer to `ConfigDrift`: one entry per app that is registered under a
+    /// config different from the one asked about, and no entry for anything
+    /// else. An empty vector means every app asked about either matches or
+    /// is not registered at all.
+    Drifted(Vec<SheepDrift>),
     /// Answer to `Stop`
     Stopped(Vec<ProcessInfo>),
     /// Answer to `Restart`
@@ -1848,6 +1914,16 @@ mod tests {
                     smit: None,
                 },
             },
+            // An EMPTY `apps`, unlike `start`'s row above. The two carry the
+            // identical payload type, so a second `AppConfig` blob here would
+            // pin nothing `start`'s blob does not already pin, at fifty lines
+            // of snapshot. What is genuinely this row's own is the tag and
+            // the key the list travels under, and an empty list shows both.
+            Envelope {
+                id: 22,
+                deadline_ms: None,
+                body: Request::ConfigDrift { apps: Vec::new() },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -2090,6 +2166,22 @@ mod tests {
                         .pid(Some(4242))
                         .smit(Some("\u{25b2} main@a1b2c3".to_string()))
                         .build(),
+                ])),
+            },
+            // Two entries in one reply, and each is the shape the other is
+            // not: a sheep drifting in one field and a sheep drifting in
+            // several. `env` is deliberately one of them, because reporting
+            // it as a bare NAME is the whole security property of this row
+            // (IR-41) and a fixture is where an out-of-tree reader learns
+            // that no value ever travels with it.
+            Reply {
+                id: 26,
+                result: Ok(Response::Drifted(vec![
+                    SheepDrift::new("web", vec!["cwd".to_string()]),
+                    SheepDrift::new(
+                        "api",
+                        vec!["args".to_string(), "env".to_string(), "script".to_string()],
+                    ),
                 ])),
             },
         ];

@@ -6103,3 +6103,73 @@ fn an_unknown_verb_with_no_matching_dog_keeps_claps_own_suggestion() {
         "clap's own did-you-mean must still suggest the real verb: {stderr}"
     );
 }
+
+/// A Flockfile edit to a sheep the flock already has is reported, naming the
+/// sheep and every field that changed, and naming no VALUE.
+///
+/// The defect: changing `cwd` on two apps and re-running `shep start` left
+/// both running the old one, with no error and no warning. `Request::Start`
+/// on an existing name adds instances rather than reconciling config, which
+/// is deliberate and is what `shep stock` depends on, so the edit was simply
+/// not applied. The silence was the bug, and the apps then crash-looped
+/// against a path that no longer applied.
+///
+/// What a broken implementation this catches: the drift check dropped
+/// entirely (no `cwd` in stderr); the drift computed against an
+/// unnormalized config (every default the file did not spell out reported
+/// as changed, and the `env`/`cwd` assertions drown in noise); the report
+/// carrying values rather than names, which is what the `hunter2` assertion
+/// is for (IR-41). Asserting only that the config was NOT silently replaced
+/// would pass on the broken code, since not replacing it is exactly what
+/// the broken code did.
+///
+/// A one-app Flockfile where the real report had two: one sheep is enough to
+/// prove the message exists, and the daemon-side unit tier
+/// (`supervisor.rs::config_drift_names_an_edited_sheeps_fields_and_changes_nothing`)
+/// is where multiple fields and an unregistered app are pinned, at no
+/// process-spawning cost.
+#[test]
+fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    // `env` carries a value that must never be printed, and `cwd` a second
+    // changed field, so a report that stopped at the first difference fails
+    // here too.
+    let body = |cwd: &Path, token: &str| {
+        format!(
+            "[[app]]\nname = \"edited\"\nscript = \"{}\"\ncwd = \"{}\"\n\
+             env = {{ API_TOKEN = \"{token}\" }}\n",
+            script.display(),
+            cwd.display(),
+        )
+    };
+    let flockfile = write_flockfile(&dir, &body(home, "hunter2-before"));
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+    poll_flock(home, |info| info["status"] == "online");
+
+    // The edit, over the same path the daemon was told about.
+    write_flockfile(&dir, &body(elsewhere.path(), "hunter2-after"));
+    let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        stderr.contains("edited"),
+        "the report must name the sheep: {stderr}"
+    );
+    assert!(
+        stderr.contains("cwd") && stderr.contains("env"),
+        "the report must name every field that changed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("hunter2"),
+        "a field's VALUE must never reach an operator's terminal (IR-41): {stderr}"
+    );
+
+    graceful_kill(home);
+}

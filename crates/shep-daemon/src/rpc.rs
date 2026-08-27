@@ -271,6 +271,25 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 }
             }
         },
+        // Re-normalized for the reason `Start` is, plus one of its own: an
+        // unnormalized config would report every default it did not spell
+        // out as a difference from the normalized copy the flock stores, so
+        // a Flockfile that changed nothing would be reported as drifting in
+        // a dozen fields.
+        //
+        // Nothing is recorded in the registry: this answers a question and
+        // registers nothing, so a `ConfigDrift` must not be able to change
+        // what the next `shep save` writes.
+        Request::ConfigDrift { apps } => match normalize_all(apps) {
+            Err(err) => reply(Err(RpcError {
+                code: RpcErrorCode::InvalidConfig,
+                message: err.to_string(),
+            })),
+            Ok(resolved) => match ctx.supervisor.config_drift(resolved).await {
+                Ok(drifted) => reply(Ok(Response::Drifted(drifted))),
+                Err(err) => reply(Err(rpc_error(&err))),
+            },
+        },
         Request::Stop { selector } => {
             selector_call(id, selector, |s| ctx.supervisor.stop(s), Response::Stopped).await
         }
