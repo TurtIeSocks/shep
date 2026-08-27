@@ -107,3 +107,11 @@ version_group = "shep"
 [[package]]
 name = "shep-cli"
 release = false
+
+# Runnable demos for docs/humans, not a crate anyone installs. `publish =
+# false` in its own manifest already stops `cargo publish` from ever
+# reaching it; this entry says the same thing to release-plz explicitly,
+# the same defense-in-depth `shep-cli`'s entry above uses.
+[[package]]
+name = "shep-examples"
+release = false
