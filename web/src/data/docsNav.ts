@@ -75,6 +75,13 @@ export const docsNav: DocsNavGroup[] = [
         source: "docs/migration.md",
         spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
       },
+      {
+        slug: "examples",
+        label: "Examples",
+        built: true,
+        source: "examples/",
+        spec: { anchor: "7-readiness--health", label: "§7 Readiness & health" },
+      },
     ],
   },
   {

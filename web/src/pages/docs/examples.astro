@@ -1,0 +1,345 @@
+---
+/*
+ * Examples (examples/Flockfile.toml, examples/src/bin/*.rs). Every command
+ * and behaviour on this page was run against a real `shep start
+ * examples/Flockfile.toml`, under its own $SHEP_HOME, before this page was
+ * written.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+
+interface ExampleRow {
+  program: string;
+  demonstrates: string;
+  watch: string;
+}
+
+const rows: ExampleRow[] = [
+  {
+    program: "http_server",
+    demonstrates: "The baseline every probe example needs.",
+    watch: "curl 127.0.0.1:8081/ and get 200 OK.",
+  },
+  {
+    program: "slow_boot",
+    demonstrates: "A readiness probe waiting, and listen_timeout expiring.",
+    watch: "shep flock shows starting, then online anyway once listen_timeout elapses, before the port is even bound.",
+  },
+  {
+    program: "ready_when_told",
+    demonstrates: "An exec probe — the one kind with no everyday real-world example.",
+    watch: "touch the sentinel file and watch the next poll flip the sheep to online.",
+  },
+  {
+    program: "stubborn",
+    demonstrates: "Escalation past a stop signal.",
+    watch: "shep stop stubborn takes exactly kill_timeout, then SIGKILL ends it.",
+  },
+  {
+    program: "leaky",
+    demonstrates: "max_memory firing.",
+    watch: "shep flock's MEM column climbs past the ceiling, then RESTARTS increments and it climbs again.",
+  },
+  {
+    program: "crasher",
+    demonstrates: "Restart policy, growing backoff, and max_restarts.",
+    watch: "shep logs -f shows the gap between restarts widen until the sheep reaches errored.",
+  },
+  {
+    program: "noisy",
+    demonstrates: "The log plane.",
+    watch: "shep bleats noisy -f, alternating stdout and stderr lines.",
+  },
+];
+---
+
+<DocsLayout
+  title="Examples"
+  description="Seven small programs and one Flockfile — build them, start them, and watch shep's supervision behaviours happen instead of reading about them."
+  crumb="Start here / Examples"
+  activeSlug="examples"
+>
+  <article>
+    <h1>Examples</h1>
+    <ReferencePills slug="examples" />
+    <p class="lede">
+      Every page in this section describes what shep does. This one is seven
+      tiny programs and a Flockfile that make it happen where you can watch:
+      a probe waiting, a stop signal being ignored, a memory ceiling firing,
+      a crash loop backing off. Everything lives under
+      <code>examples/</code> — a workspace member of its own, built by
+      <code>cargo build --release</code> but never on the path a plain
+      <code>cargo install shep</code> walks.
+    </p>
+
+    <Callout variant="careful">
+      No config edits needed. Every path in <code>examples/Flockfile.toml</code>
+      is relative to <code>examples/</code> itself — a Flockfile app with no
+      <code>cwd</code> runs where its Flockfile lives — so cloning the repo
+      and running the two commands below just works.
+    </Callout>
+
+    <h2>Run it</h2>
+    <div class="terminal">
+      <div><span class="prompt">$</span> cargo build --release --workspace</div>
+      <div><span class="prompt">$</span> shep start examples/Flockfile.toml</div>
+      <div><span class="prompt">$</span> shep flock</div>
+    </div>
+    <p class="fine">
+      Two of the seven — <code>leaky</code> and <code>crasher</code> — restart
+      on purpose and by design. Run this against a throwaway
+      <code>$SHEP_HOME</code>, not the daemon supervising anything you care
+      about.
+    </p>
+
+    <h2>What each one demonstrates</h2>
+    <div class="field-table">
+      <div class="row header">
+        <span class="col-name">Program</span>
+        <span class="col-does">Demonstrates</span>
+        <span class="col-does">Watch for</span>
+      </div>
+      {
+        rows.map((r) => (
+          <div class="row">
+            <span class="col-name">
+              <code>{r.program}</code>
+            </span>
+            <span class="col-does">{r.demonstrates}</span>
+            <span class="col-does">{r.watch}</span>
+          </div>
+        ))
+      }
+    </div>
+
+    <h2>The exec probe, in full</h2>
+    <p>
+      <code>readiness_probe</code> with <code>kind = "exec"</code> has no
+      everyday real-world stand-in the way an HTTP or TCP probe does —
+      <code>ready_when_told</code> is the minimal program that makes one
+      demonstrable. It exits <code>0</code> once a file exists on disk and
+      non-zero otherwise; the Flockfile points a probe at it, gated on a
+      sentinel path this page and the file both agree on:
+    </p>
+    <CodeBlock label="examples/Flockfile.toml">{`[app.readiness_probe]
+kind     = "exec"
+target   = "../target/release/ready_when_told /tmp/shep-examples-sentinel"
+interval = "3s"`}</CodeBlock>
+    <div class="terminal">
+      <div><span class="prompt">$</span> touch /tmp/shep-examples-sentinel</div>
+    </div>
+    <p class="fine">
+      The next poll — within <code>interval</code> — flips
+      <code>http-server-gated-by-sentinel</code> from <code>starting</code> to
+      <code>online</code>.
+    </p>
+
+    <h2>kill_timeout, not graceful_timeout</h2>
+    <p>
+      <code>stubborn</code> blocks <code>SIGTERM</code> and never acts on it,
+      so shep's kill ladder has to escalate to <code>SIGKILL</code> — a
+      signal nothing can trap. The field that governs how long shep waits
+      before that escalation on a plain <code>shep stop</code>/
+      <code>restart</code>/<code>delete</code> is <code>kill_timeout</code>,
+      not <code>graceful_timeout</code>: the latter only governs a
+      <em>reload</em>'s drain window for the old instance. This example sets
+      <code>kill_timeout</code> to 3 seconds, short enough to watch land:
+    </p>
+    <div class="terminal">
+      <div><span class="prompt">$</span> shep stop stubborn</div>
+    </div>
+    <p class="fine">
+      Roughly three seconds pass — one <code>"caught SIGTERM, still not
+      dying"</code> line in its log, then silence — before
+      <code>shep flock</code> reports it stopped by <code>SIGKILL</code>.
+    </p>
+
+    <h2>Where to go next</h2>
+    <div class="next-grid">
+      <a href="/docs/first-flockfile" class="next-card">
+        <div class="next-title">Your first Flockfile →</div>
+        <div class="next-body">
+          Every field <code>examples/Flockfile.toml</code> uses, and every one
+          it doesn't.
+        </div>
+      </a>
+      <a href="/docs/output" class="next-card">
+        <div class="next-title">Terminal output →</div>
+        <div class="next-body">
+          What the columns in <code>shep flock</code>'s table above actually
+          mean.
+        </div>
+      </a>
+    </div>
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(36px, 4.6vw, 56px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 27px;
+    letter-spacing: -0.03em;
+    margin: 44px 0 12px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 14.5px;
+    color: var(--ink-3);
+  }
+
+  code {
+    font-family: "Space Mono", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+
+  .terminal {
+    background: var(--illus-terminal-bg, #1b1b1b);
+    color: var(--illus-terminal-fg, #eee);
+    border-radius: 14px;
+    padding: 18px 20px;
+    font-family: "Space Mono", monospace;
+    font-size: 14px;
+    line-height: 1.9;
+    margin: 0 0 18px;
+  }
+
+  .prompt {
+    color: var(--butter, #e8b64a);
+    margin-right: 8px;
+  }
+
+  .field-table {
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    overflow: hidden;
+    margin: 0 0 26px;
+  }
+
+  .field-table .row {
+    display: grid;
+    grid-template-columns: minmax(0, 190px) minmax(0, 1fr) minmax(0, 1fr);
+    gap: 14px;
+    padding: 11px 18px;
+    align-items: start;
+  }
+
+  .field-table .row.header {
+    background: var(--ink);
+    padding: 10px 18px;
+  }
+
+  .field-table .row:not(.header) {
+    border-bottom: 2px solid var(--hair);
+    background: var(--paper-2);
+  }
+
+  .field-table .row:last-child {
+    border-bottom: none;
+  }
+
+  .field-table .row.header span {
+    font-family: "Space Mono", monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .field-table .row.header .col-name {
+    color: var(--butter);
+  }
+
+  .col-name code {
+    font-size: 12.5px;
+    padding: 1px 5px;
+  }
+
+  .col-does {
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--ink);
+  }
+
+  @media (max-width: 640px) {
+    .field-table .row {
+      grid-template-columns: 1fr;
+      gap: 5px;
+    }
+
+    .field-table .row.header {
+      display: none;
+    }
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+
+  .next-body code {
+    font-size: 0.85em;
+  }
+</style>
