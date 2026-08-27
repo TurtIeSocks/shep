@@ -224,13 +224,23 @@ pub(crate) enum BatchPolicy {
     /// a dog start is always one app, and a roll restore is a recovery
     /// rather than a request.
     ///
-    /// What a failure leaves behind differs by cause, and the difference is
-    /// not cosmetic. A failed SPAWN leaves an `Errored` row, because
-    /// [`Actor::spawn_fresh`] registers the entry before it reports. An
-    /// unresolvable `user`/`group` leaves nothing, because there is no
-    /// identity to assemble a spawn for and running that app under the
-    /// daemon's own identity instead is the one outcome that must never
-    /// happen. Both are reported in the error either way.
+    /// Every failure leaves an `Errored` row, whatever its cause. A failed
+    /// SPAWN gets one from [`Actor::spawn_fresh`], which registers the entry
+    /// before it reports; an unresolvable `user`/`group` gets one from
+    /// [`Actor::do_start`] directly, since there is no identity to assemble a
+    /// spawn for and so no spawn to register it. Both are reported in the
+    /// error as well.
+    ///
+    /// The second used to leave nothing, on the reasoning that an app with
+    /// no resolvable identity must never run under the daemon's own. That
+    /// outcome is still ruled out, but by the row's
+    /// [`SpawnIdentity::Unresolved`] rather than by its absence, and absence
+    /// was costing the operator the one trace they had: under this policy
+    /// nobody is holding a terminal, so an app missing from `shep flock`
+    /// reads as one nobody ever configured.
+    ///
+    /// [`AllOrNothing`](Self::AllOrNothing) leaves no row for either cause,
+    /// and that is not an inconsistency: it registers nothing at all.
     PerApp,
 }
 
@@ -745,10 +755,9 @@ impl SupervisorHandle {
     /// - [`SupervisorError::SpawnFailed`]: at least one app could not be
     ///   started, carrying one `"<name>: <reason>"` entry per such app joined
     ///   by `"; "`. Every app in the batch was attempted regardless, and
-    ///   every app that could start is running. An app whose SPAWN failed is
-    ///   registered `Errored` and visible; an app whose `user`/`group` could
-    ///   not be resolved leaves no row at all, since nothing can be
-    ///   assembled without an identity to assemble it for.
+    ///   every app that could start is running. Every app that could not is
+    ///   registered `Errored` and visible, whether its spawn failed or its
+    ///   `user`/`group` could not be resolved.
     /// - [`SupervisorError::EngineStopped`]: the actor is gone.
     pub(crate) async fn start_restored(
         &self,
@@ -2358,20 +2367,51 @@ impl<R: ProcessRunner> Actor<R> {
                     // The reasons were each true; the count was not.
                     //
                     // Asks the policy, like every other stopping point in
-                    // this function. Under `PerApp` this app is skipped and
-                    // the rest of the batch goes on: an unresolvable `user`
-                    // on one saved app must not cost a muster restore the
-                    // whole flock.
-                    //
-                    // Skipped rather than registered `Errored`, unlike a
-                    // failed spawn. Nothing can be assembled without an
-                    // identity to assemble it for, and running it under the
-                    // daemon's own identity instead is the one outcome that
-                    // must never happen here. The failure is reported either
-                    // way; what differs is that this app leaves no row.
+                    // this function, and the policy decides what this app
+                    // leaves behind as well as whether the batch goes on.
+                    // This match is the ONE place that decision is made;
+                    // `register_without_spawning` performs it and holds no
+                    // opinion about it.
                     match policy {
+                        // Nothing is registered, this app included. The
+                        // whole batch is about to be refused with every
+                        // failing app named, and the operator who typed
+                        // `shep start` is holding a terminal to read it. One
+                        // `Errored` row and no others would leave exactly
+                        // the flock-matching-neither-state this policy
+                        // exists to prevent.
                         BatchPolicy::AllOrNothing => refusals.push(format!("{name}: {err}")),
-                        BatchPolicy::PerApp => failures.push(format!("{name}: {err}")),
+                        // A row, and this is the case that needs one. The
+                        // rest of the batch goes on, so there IS a flock to
+                        // be missing from -- and the two callers here are a
+                        // muster restore at boot and a dog, where nobody is
+                        // holding a terminal and the shepherd's log is the
+                        // only trace. An app absent from `shep flock` looks
+                        // like one nobody ever configured.
+                        //
+                        // Safe to register only because the row carries
+                        // `SpawnIdentity::Unresolved`: a later `shep
+                        // restart` resolves it through
+                        // `credentials_for_spawn` and meets this same
+                        // refusal, rather than reusing a settled `None` and
+                        // bringing the sheep up as the shepherd. That is the
+                        // outcome being ruled out, and it is ruled out by
+                        // the identity the row holds rather than by the row
+                        // not existing.
+                        //
+                        // Idempotent by name, so a failed start never
+                        // overwrites the state of something already running.
+                        BatchPolicy::PerApp => {
+                            failures.push(format!("{name}: {err}"));
+                            let info = self.register_without_spawning(
+                                &app,
+                                ProcStatus::Errored,
+                                dog.clone(),
+                            );
+                            if info.status == ProcStatus::Errored {
+                                self.emit(ProcessEventKind::Errored, info, true);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -2557,6 +2597,35 @@ impl<R: ProcessRunner> Actor<R> {
     /// is left exactly as it is, so restoring a roll over a live flock never
     /// disturbs what is already running.
     fn register_at_rest(&mut self, app: &ResolvedApp) -> ProcessInfo {
+        self.register_without_spawning(app, ProcStatus::Stopped, None)
+    }
+
+    /// Registers one app as a flock member in `status`, spawning nothing.
+    ///
+    /// Mechanism, not policy: it registers the status it is handed and has
+    /// no opinion about which one an app deserves. Two callers hold that
+    /// opinion, and each states it where the decision is made -- a muster
+    /// roll restoring a sheep that was saved while stopped
+    /// ([`Self::register_at_rest`], `Stopped`), and [`Self::do_start`]'s
+    /// credential-resolution failure under [`BatchPolicy::PerApp`]
+    /// (`Errored`). Adding a third means deciding there, not here.
+    ///
+    /// What this function DOES fix is the entry's identity, which is
+    /// [`SpawnIdentity::Unresolved`] whatever the status: nothing has been
+    /// spawned, so nothing has been resolved. That is what makes an
+    /// `Errored` row safe to leave behind -- a later `restart` resolves it
+    /// through [`Self::credentials_for_spawn`] rather than reusing a settled
+    /// `None` and starting the sheep as the shepherd.
+    ///
+    /// Idempotent by name, like [`Self::do_start_dog`]: an app already known
+    /// is left exactly as it is, and the caller can tell by the status on
+    /// the returned [`ProcessInfo`].
+    fn register_without_spawning(
+        &mut self,
+        app: &ResolvedApp,
+        status: ProcStatus,
+        dog: Option<DogSource>,
+    ) -> ProcessInfo {
         let name = &app.config().name;
         if let Some(slot) = self
             .sheep
@@ -2579,7 +2648,7 @@ impl<R: ProcessRunner> Actor<R> {
             id,
             spec: app.clone(),
             instance: 0,
-            status: ProcStatus::Stopped,
+            status,
             pid: None,
             restarts: 0,
             started_at: None,
@@ -2592,7 +2661,7 @@ impl<R: ProcessRunner> Actor<R> {
             credentials: SpawnIdentity::Unresolved,
             out_file: spec.out_file.clone(),
             err_file: spec.err_file.clone(),
-            dog: None,
+            dog,
             // A fresh registration, never spawned: nothing has exited yet.
             last_exit: None,
         };
@@ -9330,6 +9399,13 @@ mod tests {
     /// all, `b-mine` running as the daemon rather than as the user it asked
     /// for, and `c-plain` absent.
     ///
+    /// `a-bad` IS registered under `PerApp`, deliberately, and holds
+    /// [`SpawnIdentity::Unresolved`] -- which is what this case reads. The
+    /// distinction matters here more than anywhere: absence used to be the
+    /// proof it had not inherited a neighbour's identity, and now the stored
+    /// identity is the proof directly, which is the stronger claim of the
+    /// two.
+    ///
     /// `#[cfg(unix)]`: `nix` is a unix-only dependency of this crate, and
     /// `privilege::resolve` refuses any user request off-platform anyway.
     #[cfg(unix)]
@@ -9382,9 +9458,11 @@ mod tests {
         };
         assert_eq!(
             identity("a-bad"),
-            None,
-            "an app with no resolvable user must not be registered at all, \
-             and must never inherit another app's identity"
+            Some(SpawnIdentity::Unresolved),
+            "an app with no resolvable user is registered `Errored` so it is \
+             visible, and must hold NO identity: `Unresolved` is what stops a \
+             later restart reusing one, and it is also the proof this app did \
+             not inherit b-mine's"
         );
         assert_eq!(
             identity("b-mine"),
@@ -14308,6 +14386,71 @@ mod tests {
             Some(pinned),
             "a running app's identity must survive its restart untouched"
         );
+    }
+
+    // fails if a `PerApp` start refused over credentials leaves nothing
+    // behind. The refusal is one line in the shepherd's log, and `PerApp` is
+    // the muster restore and the dog, where nobody is reading those -- so
+    // the app has to be visible as `Errored` instead of missing.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_refused_over_credentials_leaves_an_errored_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+
+        let err = actor
+            .do_start(vec![app], None, BatchPolicy::PerApp)
+            .expect_err("an unresolvable user must refuse the start");
+        assert!(
+            err.to_string().contains(NO_SUCH_USER),
+            "the refusal must name the user it could not resolve: {err}"
+        );
+
+        assert_eq!(actor.runner.spawn_count(), 0);
+        let slot = actor
+            .sheep
+            .values()
+            .next()
+            .expect("the refusal must leave a row rather than vanishing");
+        assert_eq!(slot.entry.status, ProcStatus::Errored);
+        assert_eq!(
+            slot.entry.credentials,
+            SpawnIdentity::Unresolved,
+            "the row must not claim a settled identity: a `restart` would reuse it and bring the \
+             sheep up as the shepherd, which is the bug the row was added to make visible"
+        );
+
+        // And the row is inert rather than dangerous: restarting it meets
+        // the same refusal instead of starting anything.
+        let id = slot.entry.id;
+        let after = actor.respawn(id, true);
+        assert_eq!(after.status, ProcStatus::Errored);
+        assert_eq!(actor.runner.spawn_count(), 0);
+    }
+
+    // fails if the row above leaks into `AllOrNothing`, whose whole contract
+    // is that a refused batch registers nothing. One `Errored` row and no
+    // others is the flock-matching-neither-state that policy exists to
+    // prevent, and the operator who typed `shep start` is holding a terminal
+    // to read the refusal instead.
+    #[tokio::test(start_paused = true)]
+    async fn an_all_or_nothing_start_refused_over_credentials_registers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+
+        let err = actor
+            .do_start(vec![app], None, BatchPolicy::AllOrNothing)
+            .expect_err("an unresolvable user must refuse the start");
+        assert!(
+            err.to_string().contains(NO_SUCH_USER),
+            "the refusal must name the user it could not resolve: {err}"
+        );
+        assert!(
+            actor.sheep.is_empty(),
+            "`AllOrNothing` registers nothing at all, this app included"
+        );
+        assert_eq!(actor.runner.spawn_count(), 0);
     }
 
     // ---------------------------------------------------------------

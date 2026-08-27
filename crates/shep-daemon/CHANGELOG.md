@@ -82,10 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own credentials from the point of resolution, so there is no second
   sequence to keep in step.
 
-  An app whose credentials fail is skipped rather than registered `Errored`,
-  unlike an app whose spawn fails. Nothing can be assembled without an
-  identity to assemble it for, and running it under the daemon's own identity
-  instead is the outcome being ruled out. Both are named in the error.
+  Under `PerApp`, an app whose credentials fail is registered `Errored` like
+  an app whose spawn fails, so it is visible in `shep flock` rather than
+  missing from it. It carries no identity, which is what still rules out the
+  outcome that matters: a later `shep restart` resolves it afresh and meets
+  the same refusal instead of coming up as the daemon. `AllOrNothing`
+  registers nothing at all, as it always has. Both causes are named in the
+  error either way.
 
   The policy governs the SPAWN loop as well as the pre-registration check.
   That loop returned on the first failure whatever the policy said, so a bad
@@ -174,7 +177,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report every default it did not spell out as a difference from the
   normalized copy the flock stores.
 
-- `privilege::SpawnIdentity` — the type behind the fix above.
+- `privilege::SpawnIdentity` — an entry's identity and whether it has been
+  resolved yet, which tells "this app asked for nobody" apart from "nobody
+  has asked yet". Both credential fixes above turn on that distinction.
 - `fake::ScriptedRunner::spawned_as` and `spawn_count`, behind `test-fakes`.
   The fake becomes nobody, so recording the credentials a spawn was asked for
   is the only way a test can assert the identity it carried rather than merely
