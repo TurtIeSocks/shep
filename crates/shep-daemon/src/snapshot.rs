@@ -882,6 +882,86 @@ mod tests {
         handle.shutdown().await;
     }
 
+    /// fails if a bad entry that is not LAST takes every app after it down.
+    ///
+    /// The sibling case below has the broken app last in roll order, which is
+    /// exactly why it did not catch this: `do_start`'s spawn loop returned on
+    /// the first failure regardless of policy, so `BatchPolicy::PerApp`
+    /// bought nothing for anything sorted after the wreck. `a-good` came up,
+    /// `b-bad` failed, and `c-good` was never registered at all -- not
+    /// `Errored`, absent, with no log line.
+    ///
+    /// Not a race that might not bite. `FlockRegistry` is a `BTreeMap`, so
+    /// `roll` writes the saved apps alphabetically and `restorable` preserves
+    /// that order, which makes this a certainty whenever the broken name
+    /// sorts before a working one. The names here are `a-`/`b-`/`c-` so the
+    /// roll order below IS the production order.
+    ///
+    /// ONE `muster` call, deliberately. `shep muster`'s CLI path calls twice
+    /// -- an autostart boot restore, then an explicit `Request::Muster` --
+    /// and the second call re-registers what the first lost, which is what
+    /// hid this through three rounds of review. The single unattended
+    /// restore a real `shep startup` unit performs is the only path where it
+    /// matters and the only one with nobody watching, and it is the one this
+    /// exercises.
+    ///
+    /// `failing_to_spawn` is load-bearing: scripts are consumed in spawn
+    /// order, so no arrangement of the script list can make the MIDDLE app
+    /// fail while its neighbours come up.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_saved_app_does_not_take_the_apps_after_it_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
+        let saved = |name: &str| SavedApp {
+            app: AppConfig::minimal(name, "./srv"),
+            instances_running: 1,
+        };
+        let roll = FlockSnapshot {
+            version: SNAPSHOT_VERSION,
+            saved_at_ms: 0,
+            apps: vec![saved("a-good"), saved("b-bad"), saved("c-good")],
+        };
+        write_atomic(&paths.snapshot, &roll).unwrap();
+
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            // Two scripts for the two that must come up. `b-bad` consumes
+            // none, so a run that let it take one would starve `c-good` and
+            // fail here for a reason of its own.
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 2]).failing_to_spawn(&["b-bad"]),
+            paths.clone(),
+            events,
+        );
+        let registry = FlockRegistry::new();
+
+        let restored = muster(&paths.snapshot, &registry, &handle).await.unwrap();
+        assert_eq!(
+            restored,
+            vec![
+                "a-good".to_string(),
+                "b-bad".to_string(),
+                "c-good".to_string()
+            ]
+        );
+
+        let mut listed = handle.list().await;
+        listed.sort_by(|a, b| a.name.cmp(&b.name));
+        let seen: Vec<(&str, ProcStatus)> =
+            listed.iter().map(|i| (i.name.as_str(), i.status)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("a-good", ProcStatus::Online),
+                ("b-bad", ProcStatus::Errored),
+                ("c-good", ProcStatus::Online),
+            ],
+            "every app after the broken one must still get its turn, and the \
+             broken one must be visible rather than absent"
+        );
+        handle.shutdown().await;
+    }
+
     /// fails if ONE saved app that cannot start keeps the rest of the flock
     /// down at the next boot.
     ///

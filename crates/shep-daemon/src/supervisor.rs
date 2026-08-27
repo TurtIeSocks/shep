@@ -727,8 +727,11 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// - [`SupervisorError::SpawnFailed`]: the first instance that failed to
-    ///   spawn (already-registered instances persist regardless).
+    /// - [`SupervisorError::SpawnFailed`]: at least one app could not be
+    ///   spawned, carrying one `"<name>: <reason>"` entry per such app joined
+    ///   by `"; "`. Every app in the batch was attempted regardless, each one
+    ///   that failed is registered `Errored` rather than left absent, and
+    ///   every app that could start is running.
     /// - [`SupervisorError::EngineStopped`]: the actor is gone.
     pub(crate) async fn start_restored(
         &self,
@@ -2342,9 +2345,10 @@ impl<R: ProcessRunner> Actor<R> {
         }
 
         let mut results = Vec::new();
+        let mut failures = Vec::new();
         // Lengths agree exactly here: every app above pushed onto one of the
         // two vectors, and a non-empty `refusals` has already returned.
-        for (app, credentials) in apps.into_iter().zip(credentials) {
+        'apps: for (app, credentials) in apps.into_iter().zip(credentials) {
             let name = app.config().name.clone();
             let mut existing: Vec<u32> = self
                 .sheep
@@ -2358,14 +2362,55 @@ impl<R: ProcessRunner> Actor<R> {
             for instance in slots {
                 match self.spawn_fresh(&app, instance, credentials, dog.clone()) {
                     Ok(info) => results.push(info),
-                    // The sheep's name, which `spawn_fresh`'s message
-                    // deliberately leaves to its caller: one app of eleven
-                    // failing must say WHICH one.
                     Err(message) => {
-                        return Err(SupervisorError::SpawnFailed(format!("{name}: {message}")));
+                        // The sheep's name, which `spawn_fresh`'s message
+                        // deliberately leaves to its caller: one app of
+                        // eleven failing must say WHICH one.
+                        let failure = format!("{name}: {message}");
+                        match policy {
+                            // The operator is holding a terminal and asked
+                            // for all-or-nothing. Stopping here is what
+                            // keeps the batch from getting any further than
+                            // it already has.
+                            BatchPolicy::AllOrNothing => {
+                                return Err(SupervisorError::SpawnFailed(failure));
+                            }
+                            // The half `BatchPolicy` gated the pass above
+                            // for and did not reach: a bad entry that is not
+                            // LAST used to take every app after it with it,
+                            // and a muster roll restores in alphabetical
+                            // order, so that is not a race but a certainty
+                            // whenever the broken name sorts first. Every
+                            // remaining app still gets its turn.
+                            //
+                            // `spawn_fresh` has already registered this one
+                            // `Errored` before returning, which is the row
+                            // the muster's own comment promises and the
+                            // event `dogs::spawn_dog_watch` subscribes to.
+                            BatchPolicy::PerApp => {
+                                failures.push(failure);
+                                // This app's remaining instances are skipped
+                                // rather than attempted. They share a binary
+                                // and a cwd with the one that just failed,
+                                // so they would fail identically and turn
+                                // one broken app into `instances` identical
+                                // wrecks in the listing. One row per broken
+                                // app, which is also what `AllOrNothing`
+                                // leaves behind.
+                                continue 'apps;
+                            }
+                        }
                     }
                 }
             }
+        }
+        // Every app was attempted, and at least one could not start. An
+        // `Err` rather than a partial `Ok`, so the caller's existing
+        // reporting still fires: `snapshot::muster` logs "failed to spawn one
+        // or more apps" off exactly this, and `do_start_dog` turns it into
+        // the dog's own refusal.
+        if !failures.is_empty() {
+            return Err(SupervisorError::SpawnFailed(failures.join("; ")));
         }
         Ok(results)
     }
@@ -9046,6 +9091,53 @@ mod tests {
         let errored = dog_row(&listed, 0);
         assert_eq!(errored.status, ProcStatus::Errored);
         assert_eq!(errored.dog, Some(DogSource::BuiltIn));
+    }
+
+    /// fails if `AllOrNothing` stops stopping at the first failed spawn.
+    ///
+    /// The mirror of `snapshot::tests::a_bad_saved_app_does_not_take_the_apps
+    /// _after_it_down`, and the reason the policy is a parameter rather than
+    /// a blanket change: teaching the spawn loop to carry on past a failure
+    /// is right for a muster restore and wrong for an operator's `shep
+    /// start`, who asked for all-or-nothing and is holding a terminal to read
+    /// the refusal. Without this case, "carry on" could quietly become the
+    /// behaviour for both.
+    ///
+    /// `failing_to_spawn` on the FIRST app, so what the assertion reads is
+    /// the second app's absence rather than its failure.
+    #[tokio::test(start_paused = true)]
+    async fn an_all_or_nothing_start_stops_at_the_first_failed_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = broadcast::channel(64);
+        let handle = spawn_supervisor(
+            // A script for the second app, which must NOT get as far as
+            // using it: an exhausted pool would fail it for a reason of its
+            // own and make the assertion below say nothing.
+            ScriptedRunner::new(vec![ProcScript::never_exits()]).failing_to_spawn(&["first"]),
+            test_paths(&dir),
+            events,
+        );
+
+        let err = handle
+            .start(vec![
+                normalize(AppConfig::minimal("first", "./first")).unwrap(),
+                normalize(AppConfig::minimal("second", "./second")).unwrap(),
+            ])
+            .await
+            .expect_err("the first app cannot spawn");
+
+        assert!(matches!(err, SupervisorError::SpawnFailed(_)), "{err:?}");
+        let listed = handle.list().await;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|i| (i.name.as_str(), i.status))
+                .collect::<Vec<_>>(),
+            vec![("first", ProcStatus::Errored)],
+            "an operator's `shep start` must not go on past a failure: the \
+             second app is never reached: {listed:?}"
+        );
+        handle.shutdown().await;
     }
 
     /// fails if a dog whose binary is missing is refused instead of being

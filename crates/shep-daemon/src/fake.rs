@@ -383,6 +383,19 @@ pub const FIRST_SCRIPTED_PID: u32 = 1000;
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
 pub struct ScriptedRunner {
     scripts: Mutex<VecDeque<ProcScript>>,
+    /// Sheep names whose [`ProcessRunner::spawn`] fails, by name because
+    /// that is what a caller has.
+    ///
+    /// Sibling to [`Self::refuse`] and needed for the same class of reason:
+    /// scripts are consumed in spawn ORDER, so a test cannot make one
+    /// PARTICULAR app of several fail by arranging the script list. Reaching
+    /// `do_start`'s per-app failure handling needs a failure that lands on a
+    /// named app while its neighbours succeed.
+    ///
+    /// Checked before a script is popped, so a sheep named here consumes
+    /// nothing and the apps around it still get the scripts they were meant
+    /// to have.
+    fail_spawn: Mutex<Vec<String>>,
     /// Sheep names whose [`ProcessRunner::preflight`] answers
     /// [`Preflight::Impossible`], by name because that is what a caller has.
     ///
@@ -414,7 +427,19 @@ impl ScriptedRunner {
             scripts: Mutex::new(scripts.into_iter().collect()),
             spawned: Mutex::new(Vec::new()),
             refuse: Mutex::new(Vec::new()),
+            fail_spawn: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Makes `spawn` fail for these sheep, without consuming a script.
+    ///
+    /// For reaching `do_start`'s per-app failure handling, which needs one
+    /// named app of several to fail while the others come up. Script order
+    /// alone cannot express that.
+    #[must_use]
+    pub fn failing_to_spawn(self, names: &[&str]) -> Self {
+        *self.fail_spawn.lock().unwrap() = names.iter().map(|n| (*n).to_string()).collect();
+        self
     }
 
     /// Makes `preflight` answer [`Preflight::Impossible`] for these sheep.
@@ -614,6 +639,13 @@ impl ProcessRunner for ScriptedRunner {
     /// — are proven against [`crate::tokio_runner::TokioRunner`] instead, in
     /// `tests/daemon_e2e.rs`.
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+        // Before the script is popped, so a sheep named to `failing_to_spawn`
+        // leaves the list alone for the apps around it.
+        if self.fail_spawn.lock().unwrap().contains(&spec.name) {
+            return Err(RunnerError::SpawnFailed(
+                "No such file or directory (os error 2)".to_string(),
+            ));
+        }
         let script = self
             .scripts
             .lock()

@@ -67,6 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the case the check exists for and the only one where an operator is holding
   a terminal.
 
+  The policy governs the SPAWN loop as well as the pre-registration check.
+  That loop returned on the first failure whatever the policy said, so a bad
+  entry that was not last still took every app after it down: `a-good` came
+  up, `b-bad` failed, and `c-good` was never registered at all. A muster roll
+  is written from a `BTreeMap` and restored in that order, so this was a
+  certainty whenever the broken name sorted first rather than a race. Under
+  `PerApp` a failed spawn now records that app, leaves it `Errored` and
+  visible, and moves to the next; the app's own remaining instances are
+  skipped, since they share a binary and would only add identical wrecks to
+  the listing. The error still names every app that failed, so the muster's
+  existing "failed to spawn one or more apps" log keeps its meaning.
+
 - Explain a bare program's spawn failure in the reply, not only in the log.
   When a `script` or `interpreter` with no `/` in it fails to spawn, the
   `SpawnFailed` message now carries "`node` is not on the shepherd's PATH
