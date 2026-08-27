@@ -69,15 +69,76 @@ fn base_env() -> BTreeMap<String, String> {
     let path = std::env::var("PATH")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
+        .unwrap_or_else(|| DEFAULT_PATH.to_string());
     env.insert("PATH".to_string(), path);
-    for key in ["HOME", "USER", "LANG", "TZ"] {
+    for key in INHERITED {
         if let Ok(value) = std::env::var(key) {
             env.insert(key.to_string(), value);
         }
     }
     env
 }
+
+/// The `PATH` a child gets when the daemon itself has none.
+#[cfg(unix)]
+const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+/// The `PATH` a child gets when the daemon itself has none.
+///
+/// `%SystemRoot%` is not expanded here because this value is only ever
+/// reached when the environment is already broken enough to have no `PATH`;
+/// the literal paths below are correct on every standard Windows install and
+/// need no variable to resolve.
+#[cfg(windows)]
+const DEFAULT_PATH: &str = r"C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem";
+
+/// Variables inherited from the daemon's own environment, on top of `PATH`.
+#[cfg(unix)]
+const INHERITED: &[&str] = &["HOME", "USER", "LANG", "TZ"];
+
+/// Variables inherited from the daemon's own environment, on top of `PATH`.
+///
+/// **Much longer than the unix list, and it has to be.** `env_clear()` is a
+/// far blunter instrument on Windows: a great many Win32 APIs read
+/// `%SystemRoot%` directly, so a child started without it fails in ways that
+/// name nothing — winsock initialisation, temp-file creation and the CRT's
+/// own startup can all break before an app's `main` runs. Measured while
+/// porting: `powershell` launched with a genuinely empty environment
+/// produces no output and no error, which is exactly the kind of silent
+/// failure an operator cannot debug.
+///
+/// So this list is not a convenience allowlist like the unix one; it is the
+/// minimum a Windows process needs to behave like a process. `PATHEXT` and
+/// `COMSPEC` are what let a child resolve `foo` to `foo.cmd` and run a batch
+/// file at all; `TEMP`/`TMP` are where nearly every runtime writes; the
+/// `USERPROFILE`/`APPDATA`/`LOCALAPPDATA` trio is where language runtimes
+/// keep per-user state (a Node or Python sheep misbehaves without them);
+/// `PROCESSOR_ARCHITECTURE` and `NUMBER_OF_PROCESSORS` are read by thread-pool
+/// sizing in several runtimes.
+///
+/// The daemon-env-leakage contract in [`SpawnSpec`](crate::runner::SpawnSpec)
+/// is unchanged in kind — this is still a closed allowlist read once from the
+/// daemon's own environment, not an inherit-everything — it is simply a
+/// longer one, because the floor is higher here.
+#[cfg(windows)]
+const INHERITED: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "LANG",
+    "TZ",
+];
 
 /// Assembles a [`SpawnSpec`] from a validated app config and instance slot.
 ///

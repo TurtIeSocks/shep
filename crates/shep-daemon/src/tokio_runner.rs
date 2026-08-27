@@ -26,22 +26,29 @@
 //! rather than being kept artificially open by our own leftover reference.
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+#[cfg(unix)]
 use command_fds::{CommandFdExt, FdMapping};
+#[cfg(unix)]
 use nix::sys::signal::{self, Signal};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use shep_core::signals::OperatorSignal;
 use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, Lines,
 };
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+#[cfg(unix)]
 use crate::boot::DIR_MODE;
 use crate::channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 use crate::runner::{
@@ -57,6 +64,28 @@ const CHANNEL_CAPACITY: usize = 32;
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
 #[derive(Debug, Default)]
 pub struct TokioRunner;
+
+/// The exit code [`TokioProc::kill_tree`] terminates a job with.
+///
+/// Windows exits carry no signal number, so this value is all a reader of
+/// `ProcessInfo::last_exit` or the `EXIT` column ever sees for a sheep the
+/// daemon killed. `137` is chosen rather than std's own `TerminateProcess(h, 1)`
+/// because it is `128 + 9` — the shell convention for "killed by SIGKILL"
+/// that `commands::reap::classify` already reads on unix — so the same number
+/// means the same thing in a listing on either platform.
+#[cfg(windows)]
+const KILL_TREE_EXIT_CODE: u32 = 137;
+
+/// Distinguishes one spawn's shepherd-channel pipe from every other's.
+///
+/// The pipe namespace is machine-global, so a name has to be unique across
+/// every sheep this daemon runs AND across any other daemon on the host —
+/// hence process id plus this counter rather than the sheep's name, which
+/// two `$SHEP_HOME`s could both be using. Monotonic rather than reused, so a
+/// restarted sheep never inherits a name its dying predecessor still holds a
+/// handle on.
+#[cfg(windows)]
+static NEXT_CHANNEL_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 impl TokioRunner {
     /// Builds a runner that spawns real OS child processes.
@@ -78,6 +107,15 @@ pub struct TokioProc {
     /// (e.g. a kill ladder) may still need the pid after that point.
     pid: u32,
     child: Child,
+    /// The job object this sheep and every process it spawns belong to —
+    /// Windows' stand-in for the unix process group `process_group(0)`
+    /// establishes, and what [`RunningProcess::kill_tree`] terminates.
+    ///
+    /// Held for the proc's whole life because the handle IS the group: drop
+    /// it and there is nothing left to address the tree by. See
+    /// [`crate::sys_windows`] for what it does and does not guarantee.
+    #[cfg(windows)]
+    job: crate::sys_windows::Job,
 }
 
 impl RunningProcess for TokioProc {
@@ -95,6 +133,15 @@ impl RunningProcess for TokioProc {
         match self.child.wait().await {
             Ok(status) => ExitOutcome {
                 code: status.code(),
+                // Always `None` on Windows, and that is the truth rather
+                // than a stub: nothing kills a Windows process by signal, so
+                // there is no signal number for an exit to carry. Every
+                // Windows exit has a code — including one this daemon caused
+                // itself, which is why `kill_tree` picks its termination code
+                // deliberately (see `KILL_TREE_EXIT_CODE`).
+                #[cfg(windows)]
+                signal: None,
+                #[cfg(unix)]
                 signal: status.signal(),
             },
             Err(error) => {
@@ -111,14 +158,110 @@ impl RunningProcess for TokioProc {
         }
     }
 
+    #[cfg(unix)]
     fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError> {
         signal_group(self.pid, to_nix_signal(sig))
     }
 
+    /// Refuses, on every platform-supported signal, and the refusal is the
+    /// design rather than a gap left open.
+    ///
+    /// **Windows has no way to deliver anything SIGTERM-shaped to an
+    /// arbitrary process.** The nearest mechanism,
+    /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group)`, reaches only
+    /// console-subsystem processes that share a console with the caller and
+    /// that installed their own `SetConsoleCtrlHandler`; a detached shepherd
+    /// shares a console with nothing, and a GUI app or a runtime that never
+    /// registered a handler would ignore it regardless. Pretending otherwise
+    /// — returning `Ok(())` having done nothing — would make the ladder
+    /// believe a polite stop was delivered and silently convert every
+    /// `shep stop` into a hang followed by a kill, with no line anywhere
+    /// saying why.
+    ///
+    /// So what actually happens on `shep stop`, spelled out because it is an
+    /// operator-visible behaviour difference and belongs in the release
+    /// notes as much as here:
+    ///
+    /// - An app that opts into the shepherd channel (`shutdown_with_message`)
+    ///   is unaffected. `kill::kill_process` sends
+    ///   `ShepherdMessage::Shutdown` and never reaches this method at all.
+    ///   **That is the supported graceful path on Windows.**
+    /// - Any other app gets this refusal, which the ladder logs; then the
+    ///   ladder waits out its full `grace` and escalates to
+    ///   [`Self::kill_tree`]. So `shep stop` costs `kill_timeout` and ends in
+    ///   a termination, which is `shep kill` with a delay in front of it.
+    ///
+    /// The wait is kept rather than short-circuited deliberately. Skipping
+    /// straight to `kill_tree` would be faster and would be wrong: a
+    /// channel-using app whose `Shutdown` crossed with this call still
+    /// deserves the grace period it was promised, and `kill.rs` is one
+    /// shared ladder whose timing contract should not fork per platform.
+    #[cfg(windows)]
+    fn signal(&mut self, sig: StopSignal) -> Result<(), RunnerError> {
+        Err(RunnerError::SignalFailed(format!(
+            "Windows cannot deliver {sig:?} to another process; \
+             an app that needs a graceful stop must opt into the shepherd \
+             channel (shutdown_with_message), otherwise the stop escalates \
+             to a forced termination after kill_timeout"
+        )))
+    }
+
+    #[cfg(unix)]
     fn kill_tree(&mut self) -> Result<(), RunnerError> {
         signal_group(self.pid, Signal::SIGKILL)
     }
 
+    /// Terminates the sheep's whole job — every process it spawned, however
+    /// deeply nested.
+    ///
+    /// Strictly more complete than the unix rung it mirrors. `kill.rs`'s
+    /// module comment records that a grandchild which calls `setsid` escapes
+    /// its process group and survives `SIGKILL`; a job member cannot leave
+    /// its job, and cannot spawn outside it, because
+    /// `sys_windows::Job::create` does not grant breakaway. The
+    /// escaped-`setsid` hole simply does not exist on this platform.
+    #[cfg(windows)]
+    fn kill_tree(&mut self) -> Result<(), RunnerError> {
+        self.job
+            .terminate(KILL_TREE_EXIT_CODE)
+            .map_err(|error| RunnerError::SignalFailed(error.to_string()))
+    }
+
+    /// `SIGKILL` is delivered; the other eight names are refused by name.
+    ///
+    /// A per-signal refusal rather than a whole-verb one, which is what
+    /// keeps `shep signal <sheep> SIGKILL` working while
+    /// `shep signal <sheep> SIGHUP` says precisely what it cannot do. Seven
+    /// of the nine (`Hup`, `Quit`, `Usr1`, `Usr2`, `Winch`, `Cont`, `Term`)
+    /// have no delivery mechanism to a foreign Windows process at all.
+    ///
+    /// `Int` is refused too, and that one is a judgement rather than an
+    /// absence: `GenerateConsoleCtrlEvent(CTRL_C_EVENT, ..)` exists, but
+    /// Ctrl+C is *disabled by default* in a process group created with
+    /// `CREATE_NEW_PROCESS_GROUP` — which is exactly how [`TokioRunner`]
+    /// spawns every sheep — so it would arrive nowhere while reading as
+    /// success. A refusal that names the reason beats a delivery that
+    /// silently is not one.
+    ///
+    /// Deliberately per-PROCESS, matching the unix arm's positive-pid
+    /// `kill`: `start_kill` terminates this sheep alone and leaves its lambs
+    /// running, which is the documented difference between this method and
+    /// [`Self::kill_tree`].
+    #[cfg(windows)]
+    fn signal_process(&mut self, sig: OperatorSignal) -> Result<(), RunnerError> {
+        match sig {
+            OperatorSignal::Kill => self
+                .child
+                .start_kill()
+                .map_err(|error| RunnerError::SignalFailed(error.to_string())),
+            other => Err(RunnerError::SignalFailed(format!(
+                "Windows has no way to deliver {other:?} to another process; \
+                 only SIGKILL is available here"
+            ))),
+        }
+    }
+
+    #[cfg(unix)]
     fn signal_process(&mut self, sig: OperatorSignal) -> Result<(), RunnerError> {
         // POSITIVE pid, unlike `signal_group`'s negative one. That single
         // character is the difference between the two contracts, so it gets
@@ -178,6 +321,7 @@ impl RunningProcess for TokioProc {
 ///
 /// [`RunnerError::SignalFailed`] — `pid` is not a signallable process id, or
 /// the `kill(2)` itself failed (typically `ESRCH`: no group led by `pid`).
+#[cfg(unix)]
 pub(crate) fn signal_group(pid: u32, sig: Signal) -> Result<(), RunnerError> {
     // Rejecting 0 is not a range formality: `kill(0, ...)` means "every
     // process in the CALLER's group" — the daemon itself — and `-0` is `0`,
@@ -198,6 +342,7 @@ pub(crate) fn signal_group(pid: u32, sig: Signal) -> Result<(), RunnerError> {
 ///
 /// Kept as an explicit match (rather than `Signal::try_from(sig.as_raw())`)
 /// so an unsupported raw number is a compile error, not a runtime one.
+#[cfg(unix)]
 fn to_nix_signal(sig: StopSignal) -> Signal {
     match sig {
         StopSignal::Term => Signal::SIGTERM,
@@ -215,6 +360,7 @@ fn to_nix_signal(sig: StopSignal) -> Signal {
 /// by platform — `SIGUSR1` is 10 on Linux and 30 on macOS), so this is the one
 /// place in the workspace where the two vocabularies meet, and an unmapped
 /// variant must be a compile error rather than a runtime one.
+#[cfg(unix)]
 fn to_nix_operator_signal(sig: OperatorSignal) -> Signal {
     match sig {
         OperatorSignal::Hup => Signal::SIGHUP,
@@ -258,8 +404,32 @@ impl ProcessRunner for TokioRunner {
         // New process group rooted at the child itself, so kill_tree's
         // negative-pid SIGKILL reaches it and its descendants without also
         // reaching the daemon's own group.
+        #[cfg(unix)]
         command.process_group(0);
 
+        // The Windows equivalent is a job object, which cannot be asked for
+        // at spawn time — a process is ASSIGNED to one after it exists — so
+        // the containment half happens below, immediately after `spawn()`.
+        // What is set here are the two creation flags that make that
+        // assignment meaningful and keep the child from stealing a console:
+        //
+        // - `CREATE_NEW_PROCESS_GROUP` roots a console process group at the
+        //   child, so a Ctrl+C in whatever console launched the shepherd is
+        //   not broadcast to every sheep in the flock. Exactly the isolation
+        //   `process_group(0)` buys on unix.
+        // - `CREATE_NO_WINDOW` keeps a console child from flashing up a
+        //   window. A supervised service has nowhere to draw one, and its
+        //   stdout and stderr are already piped to log files.
+        #[cfg(windows)]
+        {
+            /// Roots a new console process group at the child.
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            /// Runs a console application without allocating a console window.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
+
+        #[cfg(unix)]
         if let Some(creds) = spec.credentials {
             // std sets the gid before the uid in the child (setgid must
             // happen while still privileged), which is the order privilege
@@ -285,9 +455,82 @@ impl ProcessRunner for TokioRunner {
             command.uid(creds.uid);
         }
 
+        // No Windows arm, and none is possible without becoming a different
+        // feature. Dropping privilege there means `CreateProcessWithLogonW`
+        // or `CreateProcessAsUser` against a real token, which needs either a
+        // plaintext password at spawn time or `SeAssignPrimaryTokenPrivilege`
+        // and a full LSA logon session. A partial version would be worse than
+        // the refusal, so `user`/`group` in a Flockfile are refused outright:
+        // `privilege::resolve`'s non-unix arm is what performs that refusal,
+        // and it runs long before a spawn, which is why this assertion can be
+        // a `debug_assert` rather than an error path — reaching here with
+        // credentials set would mean that refusal had been bypassed.
+        #[cfg(windows)]
+        debug_assert!(
+            spec.credentials.is_none(),
+            "privilege::resolve must refuse user/group on Windows before a spawn is reached"
+        );
+
         let (from_child_tx, from_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (to_child_tx, to_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
+        // The Windows shepherd channel: a named pipe the child opens by
+        // name, rather than a descriptor it inherits.
+        //
+        // The fd-3 contract cannot hold here and the reason is not fixable
+        // by cleverness: `command-fds` is a `pre_exec`-based unix-only crate,
+        // and `cmd.exe` has no fd-3 redirection, so
+        // `docs/shepherd-channel.md`'s decisive promise — "a shell script
+        // doing `read -r line <&3` works" — has no Windows reading.
+        //
+        // **The wire format is untouched.** Newline-delimited JSON, the same
+        // `ready`/`metric`/`action-reply` outbound and `shutdown`/`action`
+        // inbound shapes, so `shep trigger`'s request/reply flow and its
+        // correlation id survive unchanged. Only "how do I obtain the
+        // handle" moves: the daemon exports `SHEP_CHANNEL_PIPE`, and an app
+        // opens that path like any other file. `SHEP_CHANNEL_FD` is
+        // deliberately NOT set, so an app can branch on which variable is
+        // present rather than guessing from the platform.
+        #[cfg(windows)]
+        if spec.channel {
+            use shep_core::transport;
+
+            // Unique per spawn, not per home: two instances of one app must
+            // not share a channel, and a restarted sheep must not inherit a
+            // name a dying predecessor still holds.
+            let pipe = std::path::PathBuf::from(format!(
+                r"\\.\pipe\shep-channel-{}-{}",
+                std::process::id(),
+                NEXT_CHANNEL_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            ));
+            let mut listener = transport::Listener::bind(&pipe).map_err(|error| {
+                RunnerError::SpawnFailed(format!("shepherd channel pipe: {error}"))
+            })?;
+            command.env("SHEP_CHANNEL_PIPE", &pipe);
+            command.env("SHEP_CHANNEL_VERSION", CHANNEL_VERSION);
+
+            // Accepted on a task rather than awaited here, because `spawn` is
+            // synchronous and the child cannot connect until it has been
+            // started — which happens below. An app that never opens the pipe
+            // simply leaves this task parked until the pumps are dropped,
+            // which is the same outcome a unix app that never reads fd 3
+            // produces.
+            let from_child_tx = from_child_tx.clone();
+            tokio::spawn(async move {
+                match listener.accept().await {
+                    Ok(daemon_end) => {
+                        spawn_channel_pumps(daemon_end, from_child_tx, to_child_rx);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "shepherd channel accept failed");
+                    }
+                }
+            });
+        } else {
+            drop(to_child_rx);
+        }
+
+        #[cfg(unix)]
         if spec.channel {
             command.env("SHEP_CHANNEL_FD", "3");
             // Not negotiation — the shepherd still cannot ask an app what it
@@ -352,6 +595,36 @@ impl ProcessRunner for TokioRunner {
             RunnerError::SpawnFailed("child exited before its pid could be read".to_string())
         })?;
 
+        // Containment, as early as it can possibly happen: the child exists
+        // now and everything it spawns from here inherits the job. See
+        // `sys_windows::Job::assign` for the residual race this cannot close
+        // and why closing it would mean re-implementing `CreateProcessW`.
+        //
+        // A failure here is fatal to the spawn rather than a warning. A sheep
+        // outside its job is one `kill_tree` cannot reach, so `shep stop`
+        // would report success and leave the process running — the single
+        // worst failure mode a supervisor has. Better to refuse the start.
+        #[cfg(windows)]
+        let job = {
+            let job = crate::sys_windows::Job::create().map_err(|error| {
+                RunnerError::SpawnFailed(format!("job object for {}: {error}", spec.name))
+            })?;
+            let handle = child.raw_handle().ok_or_else(|| {
+                RunnerError::SpawnFailed("child exited before it could be contained".to_string())
+            })?;
+            if let Err(error) = job.assign(handle) {
+                // The child is already running and is NOT in a job, so it
+                // must not be left behind: nothing would be able to stop its
+                // descendants afterwards.
+                let _ = child.start_kill();
+                return Err(RunnerError::SpawnFailed(format!(
+                    "could not contain {} in a job object: {error}",
+                    spec.name
+                )));
+            }
+            job
+        };
+
         let (logs_tx, logs_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (log_ctl_tx, log_ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
         spawn_log_pump(
@@ -381,7 +654,15 @@ impl ProcessRunner for TokioRunner {
             log_ctl: log_ctl_tx,
             to_stdin: to_stdin_tx,
         };
-        Ok((TokioProc { pid, child }, io))
+        Ok((
+            TokioProc {
+                pid,
+                child,
+                #[cfg(windows)]
+                job,
+            },
+            io,
+        ))
     }
 }
 
@@ -868,14 +1149,18 @@ async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
-        && let Err(error) = tokio::fs::DirBuilder::new()
-            .mode(DIR_MODE)
-            .recursive(true)
-            .create(parent)
-            .await
     {
-        tracing::error!(?path, %error, "log directory create failed");
-        return Err(error);
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true);
+        // No `DIR_MODE` on Windows — see `boot::create_dir_at_dir_mode`'s
+        // Windows arm for why there is no scalar mode to set, and what is
+        // guarding the control plane there instead.
+        #[cfg(unix)]
+        builder.mode(DIR_MODE);
+        if let Err(error) = builder.create(parent).await {
+            tracing::error!(?path, %error, "log directory create failed");
+            return Err(error);
+        }
     }
 
     let mut options = tokio::fs::OpenOptions::new();
@@ -959,12 +1244,21 @@ where
 /// Wires the daemon side of the shepherd channel: a reader task decodes
 /// newline-JSON [`ChildMessage`]s onto `from_child_tx`; a writer task encodes
 /// [`ShepherdMessage`]s taken from `to_child_rx` back onto the socket.
-fn spawn_channel_pumps(
-    daemon_end: UnixStream,
+///
+/// Generic over the transport rather than naming one: the daemon's end is a
+/// `UnixStream` half of a socketpair on unix and an accepted named-pipe
+/// server instance on Windows, and the pumps care about neither — only that
+/// it carries bytes both ways. `tokio::io::split` in place of
+/// `UnixStream::into_split` is what makes that true, since `NamedPipeServer`
+/// has no `into_split` of its own.
+fn spawn_channel_pumps<S>(
+    daemon_end: S,
     from_child_tx: mpsc::Sender<ChildMessage>,
     mut to_child_rx: mpsc::Receiver<ShepherdMessage>,
-) {
-    let (read_half, mut write_half) = daemon_end.into_split();
+) where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (read_half, mut write_half) = tokio::io::split(daemon_end);
 
     tokio::spawn(async move {
         let mut lines = BufReader::new(read_half).lines();
@@ -1257,6 +1551,14 @@ mod tests {
     ///
     /// `#[cfg(unix)]`: this whole module is, and so are `O_NOFOLLOW` and
     /// `std::os::unix::fs::symlink`.
+    /// `cfg(unix)` because it needs `std::os::unix::fs::symlink` to build
+    /// the hazard. The refusal it exercises is `open_log_path`'s
+    /// `O_NOFOLLOW`, which has no Windows counterpart wired up yet — a
+    /// Windows reparse-point refusal would be
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` plus a `symlink_metadata` check, both
+    /// safe std, and it is named in the operator docs as a gap rather than
+    /// silently assumed to hold.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opening_a_symlinked_log_path_is_refused_rather_than_followed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1722,6 +2024,11 @@ mod tests {
     // Everything else in this module needs a real OS child and lives in
     // `tests/real_runner.rs`; this one case is reachable with no process at
     // all, so it belongs here (IR-38).
+    /// `cfg(unix)` alongside `signal_group`, the function it guards. There
+    /// is no negative-pid primitive on Windows and so no zero-pid hazard:
+    /// `kill_tree` addresses a job HANDLE, which cannot accidentally name
+    /// the daemon's own group the way `kill(0, ..)` can.
+    #[cfg(unix)]
     #[test]
     fn a_zero_pid_is_refused_before_it_can_reach_the_daemons_own_group() {
         // `SIGCONT`, not a lethal signal, deliberately: if `signal_group`'s
