@@ -121,9 +121,10 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 1   api   errored  -      15        1     -     -     0s      -        -
 0   web   online   68630  0         -     0.0%  3.0M  5m 10s  backend  -`}</CodeBlock>
     <p>
-      Those are the same bytes shep printed before any of this existed, which
-      is the point: a script that parsed shep's output last year still parses
-      it today.
+      None of the pretty rendering survives a pipe, which is the point. The
+      columns themselves do move between releases though. <code>EXIT</code>
+      and <code>SMIT</code> are both recent, so parse
+      <code>--format json</code> instead if a script depends on the shape.
     </p>
 
     <h2>Choosing how much</h2>
