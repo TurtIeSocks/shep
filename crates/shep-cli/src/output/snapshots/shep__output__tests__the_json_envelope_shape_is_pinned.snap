@@ -24,7 +24,7 @@ expression: out
         "code": 1,
         "signal": null
       },
-      "smit": null
+      "smit": "▲ main@a1b2c3"
     },
     {
       "id": 2,
@@ -44,7 +44,7 @@ expression: out
         "code": 1,
         "signal": null
       },
-      "smit": null
+      "smit": "▲ main@a1b2c3"
     },
     {
       "id": 3,
@@ -64,7 +64,7 @@ expression: out
         "code": 1,
         "signal": null
       },
-      "smit": null
+      "smit": "▲ main@a1b2c3"
     }
   ]
 }

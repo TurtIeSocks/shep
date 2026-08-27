@@ -1845,6 +1845,16 @@ pub(crate) mod tests {
                 code: Some(1),
                 signal: None,
             }))
+            // Fixed rather than id-derived, like `fold` and `cpu_percent`
+            // above. The literal a real dog paints, taken from shep-deploy's
+            // own renderer, so the drift check compares the cell against a
+            // string shep will actually be handed rather than a placeholder.
+            // Left `None` it would serialize as `null`, which
+            // `assert_no_drift`'s cell check skips rather than compares, and
+            // SMIT would quietly stop being watched: swapping the cell for a
+            // bogus string still passed the drift test until this line
+            // existed.
+            .smit(Some("\u{25b2} main@a1b2c3".to_string()))
             .build()
     }
 
