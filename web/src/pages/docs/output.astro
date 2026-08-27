@@ -35,12 +35,17 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       carries a face and the word, and each row's status is the one coloured
       cell:
     </p>
-    <CodeBlock label="shep flock">{`┌────┬──────┬───────────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┐
-│ ID │ NAME │ STATUS        │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ FOLD    │
-├────┼──────┼───────────────┼───────┼──────────┼──────┼──────┼──────┼────────┼─────────┤
-│ 1  │ api  │ (x.x) errored │ -     │ 15       │ 1    │ -    │ -    │ 0s     │ -       │
-│ 0  │ web  │ (o.o) online  │ 68630 │ 0        │ -    │ 0.0% │ 3.0M │ 18s    │ backend │
-└────┴──────┴───────────────┴───────┴──────────┴──────┴──────┴──────┴────────┴─────────┘`}</CodeBlock>
+    <CodeBlock label="shep flock">{`┌────┬──────┬───────────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┬──────┐
+│ ID │ NAME │ STATUS        │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ FOLD    │ SMIT │
+├────┼──────┼───────────────┼───────┼──────────┼──────┼──────┼──────┼────────┼─────────┼──────┤
+│ 1  │ api  │ (x.x) errored │ -     │ 15       │ 1    │ -    │ -    │ 0s     │ -       │ -    │
+│ 0  │ web  │ (o.o) online  │ 68630 │ 0        │ -    │ 0.0% │ 3.0M │ 18s    │ backend │ -    │
+└────┴──────┴───────────────┴───────┴──────────┴──────┴──────┴──────┴────────┴─────────┴──────┘`}</CodeBlock>
+    <p>
+      <code>SMIT</code> is a marker a dog attaches to a sheep over the client
+      protocol — <code>-</code> for every sheep here because none carries
+      one. See <a href="/docs/terminology">terminology</a>.
+    </p>
 
     <h3>The faces</h3>
     <p>
@@ -85,12 +90,14 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 │ 1  │ api  │ (x.x)  │ -     │ 15       │ -    │ 0s     │
 │ 0  │ web  │ (o.o)  │ 68630 │ 0        │ 3.0M │ 18s    │
 └────┴──────┴────────┴───────┴──────────┴──────┴────────┘
-  CPU, EXIT, FOLD hidden. Widen the window, or use --format json.`}</CodeBlock>
+  CPU, EXIT, FOLD, SMIT hidden. Widen the window, or use --format json.`}</CodeBlock>
     <p>
       Two things narrowed there. The status word went before any whole
       column did, leaving the face, which is five columns rather than
-      fifteen. Then <code>CPU</code>, <code>EXIT</code> and <code>FOLD</code>
-      dropped, and the footer says so.
+      fifteen. Then <code>SMIT</code>, <code>FOLD</code>, <code>EXIT</code>
+      and <code>CPU</code> dropped, in that order, and the footer says so.
+      <code>SMIT</code> goes first: it is by far the widest column, and the
+      only one whose content another command can recover.
     </p>
     <Callout variant="note">
       Nothing is ever hidden silently, and <code>--format json</code> always
@@ -110,9 +117,9 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       setting; a non-terminal stdout forces it, and so does
       <code>--format json</code>:
     </p>
-    <CodeBlock label="shep flock | cat">{`ID  NAME  STATUS   PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD
-1   api   errored  -      15        1     -     -     0s      -
-0   web   online   68630  0         -     0.0%  3.0M  5m 10s  backend`}</CodeBlock>
+    <CodeBlock label="shep flock | cat">{`ID  NAME  STATUS   PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD     SMIT
+1   api   errored  -      15        1     -     -     0s      -        -
+0   web   online   68630  0         -     0.0%  3.0M  5m 10s  backend  -`}</CodeBlock>
     <p>
       Those are the same bytes shep printed before any of this existed, which
       is the point: a script that parsed shep's output last year still parses

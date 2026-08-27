@@ -83,9 +83,10 @@ pub enum Column {
     Uptime,
     /// Fold membership.
     Fold,
-    /// A dog's marker, painted over `shep whisper` -- task 7's own column,
-    /// last in the header order to match `output::rows::FlockRows`'s. shep
-    /// paints what a dog wrote and never parses it.
+    /// A short marker a dog attaches to a sheep over the client protocol's
+    /// `SetSmit` request -- task 7's own column, last in the header order to
+    /// match `output::rows::FlockRows`'s. shep paints what a dog wrote and
+    /// never parses it.
     Smit,
 }
 
