@@ -669,7 +669,33 @@ Three fixes, cheap, and they compose:
 Deferred only because it is Rin's call how far to take it. (1) alone is a
 two-line change and fixes the case that was actually hit.
 
-### `emit_error`'s table arm prints whatever it is handed, unsanitised
+### `emit_error`'s table arm prints whatever it is handed, unsanitised -- FIXED, 2026-08-25
+
+**Fixed in `f34d88b`, by (1) below**, and wider than (1) as written.
+`emit_error` runs its message through `terminal_safe::sanitise` before
+either arm sees it, so the class is closed at the one place every caller
+passes through rather than in each error type.
+
+Two things the entry did not anticipate, both in the fix:
+
+- **`emit_notice` gets the same treatment.** It is a sibling emitter with
+  its own envelope, and leaving it out would have left the hole open on
+  every `bleats` notice.
+- **The JSON arm is sanitised too, not only the table arm.** `serde_json`
+  escapes a control byte to `\u001b`, so a terminal never renders it
+  directly, but `shep ... --format json | jq -r .error.message` unescapes
+  it straight back onto a terminal.
+
+`code` is deliberately left alone: every one is a `&'static str` from
+`ExitCode::code_str` or a literal at the call site, so none is ever
+attacker-supplied.
+
+**(2), the `TerminalSafe` newtype, was not built.** It pushes the
+obligation to where the string is built, which is where it belongs, and it
+is still the better answer if shep grows much more error text off the wire.
+`shep install` remains the case that would force it.
+
+The original entry follows.
 
 Found 2026-08-23 by the adversarial review of `shep dogs --available`, and
 recorded because the instance was fixed while the class was not.
