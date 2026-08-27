@@ -108,21 +108,51 @@ pub struct ShepPaths {
     pub kv: PathBuf,
 }
 
+/// FNV-1a, 64-bit, over `bytes`
+///
+/// Hand-rolled rather than reached for from `std`: [`std::hash::DefaultHasher`]
+/// does not promise a stable value across toolchains, and the daemon and a
+/// client built separately have to derive one pipe name and agree on it.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 impl ShepPaths {
-    /// Windows named-pipe identity for this home: `\\.\pipe\shep-<sanitized>`
+    /// Windows named-pipe identity for this home:
+    /// `\\.\pipe\shep-<sanitized>-<digest>`
     ///
-    /// Derived from the home path (non-alphanumerics become `-`) so distinct
-    /// `$SHEP_HOME`s never collide on the global pipe namespace.
+    /// The readable half is the home path with every non-alphanumeric
+    /// character collapsed to `-`, capped, so an operator reading a pipe name
+    /// can tell which home it belongs to. **That half alone does not identify
+    /// a home**: `\`, `:`, `.`, `_` and a literal `-` all become `-`, so
+    /// `C:\a\b` and `C:\a-b` sanitize to one string. The pipe namespace is
+    /// machine-global and [`crate::transport::Listener::bind`] asks for
+    /// `first_pipe_instance`, so a collision does not surface as an error: the
+    /// second home's daemon is refused as already running, and that home's CLI
+    /// then drives the first home's flock. No handshake field carries a home,
+    /// so nothing downstream would catch it.
+    ///
+    /// The appended digest of the full home path is what makes the name
+    /// distinct, and it is why the name is not stable across this change: a
+    /// daemon already bound under the old form is unreachable to a client
+    /// built after it.
     #[must_use]
     pub fn pipe_name(&self) -> String {
-        let sanitized: String = self
-            .home
-            .to_string_lossy()
+        // Bounds the readable half; a pipe name may be 256 characters.
+        const MAX_STEM: usize = 64;
+
+        let home = self.home.to_string_lossy();
+        let sanitized: String = home
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect();
         let trimmed = sanitized.trim_matches('-');
-        format!(r"\\.\pipe\shep-{trimmed}")
+        // Every character above is ASCII, so this cut cannot split one.
+        let stem = trimmed[..trimmed.len().min(MAX_STEM)].trim_end_matches('-');
+        let digest = fnv1a64(home.as_bytes());
+        format!(r"\\.\pipe\shep-{stem}-{digest:016x}")
     }
 
     /// Resolves the layout from an environment lookup and the user's home dir
@@ -259,7 +289,10 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(p.socket, Path::new("/home/rin/.shep/run/shep.sock"));
         #[cfg(windows)]
-        assert_eq!(p.socket, Path::new(r"\\.\pipe\shep-home-rin--shep"));
+        assert_eq!(
+            p.socket,
+            Path::new(r"\\.\pipe\shep-home-rin--shep-3bf53a2f040b1dfb")
+        );
         #[cfg(windows)]
         assert_eq!(
             p.socket,
@@ -276,17 +309,51 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(p.socket, Path::new("/srv/shep/run/shep.sock"));
         #[cfg(windows)]
-        assert_eq!(p.socket, Path::new(r"\\.\pipe\shep-srv-shep"));
+        assert_eq!(
+            p.socket,
+            Path::new(r"\\.\pipe\shep-srv-shep-23b467803966a71a")
+        );
     }
 
     #[test]
     fn pipe_name_is_per_home_and_sanitized() {
         // Windows transport identity (spec §6): derived from SHEP_HOME so
-        // two homes never share a pipe; non-alphanumerics collapse to '-'.
-        let p = ShepPaths::resolve(&no_env, Path::new("/home/rin"));
-        assert_eq!(p.pipe_name(), r"\\.\pipe\shep-home-rin--shep");
+        // two homes never share a pipe; non-alphanumerics collapse to '-',
+        // then a digest of the whole home path. Both homes come from the env
+        // rather than the default join, whose separator is the host's and
+        // would give the digest a different value per platform.
+        let env = |key: &str| (key == "SHEP_HOME").then(|| "/home/rin/.shep".to_string());
+        let p = ShepPaths::resolve(&env, Path::new("/home/rin"));
+        assert_eq!(
+            p.pipe_name(),
+            r"\\.\pipe\shep-home-rin--shep-580896cf7a454a74"
+        );
         let env = |key: &str| (key == "SHEP_HOME").then(|| "/srv/shep".to_string());
         let q = ShepPaths::resolve(&env, Path::new("/home/rin"));
-        assert_eq!(q.pipe_name(), r"\\.\pipe\shep-srv-shep");
+        assert_eq!(q.pipe_name(), r"\\.\pipe\shep-srv-shep-23b467803966a71a");
+    }
+
+    /// The sanitizer is not injective (`\`, `:` and a literal `-` all become
+    /// `-`), and a shared name is the one failure that reaches nobody: the
+    /// second daemon is refused as already running and its CLI then drives the
+    /// first home's flock in silence.
+    #[test]
+    fn two_homes_that_sanitize_alike_get_distinct_pipe_names() {
+        let nested = |key: &str| (key == "SHEP_HOME").then(|| r"C:\a\b".to_string());
+        let dashed = |key: &str| (key == "SHEP_HOME").then(|| r"C:\a-b".to_string());
+        let n = ShepPaths::resolve(&nested, Path::new("/home/rin"));
+        let d = ShepPaths::resolve(&dashed, Path::new("/home/rin"));
+        assert!(
+            n.pipe_name().starts_with(r"\\.\pipe\shep-C--a-b-")
+                && d.pipe_name().starts_with(r"\\.\pipe\shep-C--a-b-"),
+            "the readable stem is what collides, and it stays readable: {} vs {}",
+            n.pipe_name(),
+            d.pipe_name()
+        );
+        assert_ne!(
+            n.pipe_name(),
+            d.pipe_name(),
+            "only the digest keeps two homes that sanitize alike off one pipe"
+        );
     }
 }
