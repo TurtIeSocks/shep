@@ -4,7 +4,7 @@
 //! bark dog and the metrics dog — each installed a `SIGTERM` listener of
 //! their own and selected on it. That is exactly right on unix and does not
 //! compile on Windows, where there are no signals and the equivalent request
-//! arrives as one of four distinct console control events.
+//! arrives as one of five distinct console control events.
 //!
 //! [`Terminate`] is the one place that difference is spent, so the three
 //! call sites keep the shape they had: install once, `recv().await` in a
@@ -16,7 +16,7 @@
 //! own Ctrl-C and these three already handle a key press or a closed stdin
 //! separately.
 //!
-//! Windows merges all four console control events, and that is a wider net
+//! Windows merges all five console control events, and that is a wider net
 //! than `SIGTERM` on purpose: `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` are what
 //! an operator sends by hand, while `CTRL_CLOSE_EVENT`,
 //! `CTRL_SHUTDOWN_EVENT` and `CTRL_LOGOFF_EVENT` are what arrive when the
@@ -44,6 +44,8 @@ pub(crate) struct Terminate {
     ctrl_close: tokio::signal::windows::CtrlClose,
     #[cfg(windows)]
     ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
+    #[cfg(windows)]
+    ctrl_logoff: tokio::signal::windows::CtrlLogoff,
 }
 
 impl core::fmt::Debug for Terminate {
@@ -74,6 +76,7 @@ impl Terminate {
                 ctrl_break: windows::ctrl_break()?,
                 ctrl_close: windows::ctrl_close()?,
                 ctrl_shutdown: windows::ctrl_shutdown()?,
+                ctrl_logoff: windows::ctrl_logoff()?,
             })
         }
     }
@@ -90,7 +93,7 @@ impl Terminate {
     /// Safe on both platforms, which every call site depends on — all three
     /// poll this inside a `select!` against other work, so a cancelled
     /// branch must not drop a pending signal. Each underlying stream is
-    /// documented cancel-safe, and the Windows arm's `select!` over four of
+    /// documented cancel-safe, and the Windows arm's `select!` over five of
     /// them inherits that: a cancellation drops the outer future without
     /// consuming any inner one's notification.
     pub(crate) async fn recv(&mut self) -> Option<()> {
@@ -105,6 +108,7 @@ impl Terminate {
                 received = self.ctrl_break.recv() => received,
                 received = self.ctrl_close.recv() => received,
                 received = self.ctrl_shutdown.recv() => received,
+                received = self.ctrl_logoff.recv() => received,
             }
         }
     }
@@ -132,7 +136,7 @@ mod tests {
 
     /// fails if the listener resolves without anything having been sent.
     ///
-    /// The Windows arm is a `select!` over four streams, and a `select!`
+    /// The Windows arm is a `select!` over five streams, and a `select!`
     /// whose branches were mis-wired (a `recv()` that returns immediately,
     /// say) would make every long-running verb exit the instant it started.
     /// That is a silent, total failure, so it earns a test.
