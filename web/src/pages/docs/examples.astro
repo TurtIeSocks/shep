@@ -188,7 +188,8 @@ const polyglotRows: ExampleRow[] = [
     <CodeBlock label="examples/Flockfile.toml">{`[app.readiness_probe]
 kind     = "exec"
 target   = "../target/release/ready_when_told /tmp/shep-examples-sentinel"
-interval = "3s"`}</CodeBlock>
+interval = "3s"
+timeout  = "1s"`}</CodeBlock>
     <div class="terminal">
       <div><span class="prompt">$</span> touch /tmp/shep-examples-sentinel</div>
     </div>
@@ -295,8 +296,9 @@ js = "node"
 py = "python3"`}</CodeBlock>
     <p class="fine">
       An app's own <code>interpreter</code> field, when it sets one — as
-      every app in <code>examples/Flockfile.polyglot.toml</code> does —
-      always wins over the extension map. The map exists for a flock of
+      every interpreted app in <code>examples/Flockfile.polyglot.toml</code>
+      does, though <code>go-http</code> sets none because a compiled binary
+      runs directly — always wins over the extension map. The map exists for a flock of
       apps that all use the same handful of extensions and would rather
       not repeat <code>interpreter = "node"</code> five times.
     </p>
