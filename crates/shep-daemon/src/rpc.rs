@@ -386,7 +386,6 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         // `Deserialize` refused a control character before this arm was
         // reached — so the only refusal left here is a name nothing holds.
         Request::SetSmit { sheep, smit } => {
-            let smit = smit.map(|smit| smit.to_string());
             match ctx.supervisor.set_smit(conn, &sheep, smit).await {
                 Ok(infos) => reply(Ok(Response::SmitPainted(infos))),
                 Err(err) => reply(Err(rpc_error(&err))),

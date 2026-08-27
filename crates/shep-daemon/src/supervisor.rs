@@ -48,7 +48,7 @@ use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
-    ProcessEventKind, ProcessInfo, SignalOutcome, SignalReply,
+    ProcessEventKind, ProcessInfo, SignalOutcome, SignalReply, Smit,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -305,7 +305,7 @@ pub(crate) enum Command {
         /// for [`Self::Scale`]'s reason.
         sheep: String,
         /// The marker, or `None` to clear this connection's own.
-        smit: Option<String>,
+        smit: Option<Smit>,
         /// Answers with the named sheep's instances, or
         /// [`SupervisorError::NotFound`] when no sheep holds that name.
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
@@ -886,9 +886,10 @@ impl SupervisorHandle {
     /// `smit` arrives as a `String` rather than a
     /// [`Smit`](shep_core::protocol::Smit) because the type has already done
     /// its job by the time this is called: it validated at the wire's edge,
-    /// which is where a third party's text has to be refused. Carrying the
-    /// newtype further would only invite a second parse of something already
-    /// known good.
+    /// which is where a third party's text has to be refused. The newtype
+    /// rides the whole way down anyway, so the compiler and not a comment is
+    /// what stops a later caller inside this crate from handing over a string
+    /// nothing checked. It becomes a `String` only at the map insert.
     ///
     /// A clear from a connection that did not paint the mark is a no-op that
     /// still answers `Ok` — see [`Command::SetSmit`] for why one dog may
@@ -902,7 +903,7 @@ impl SupervisorHandle {
         &self,
         conn: ConnId,
         sheep: &str,
-        smit: Option<String>,
+        smit: Option<Smit>,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -5180,7 +5181,7 @@ impl<R: ProcessRunner> Actor<R> {
         &mut self,
         conn: ConnId,
         sheep: &str,
-        smit: Option<String>,
+        smit: Option<Smit>,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
         if !self
             .sheep
@@ -5194,7 +5195,8 @@ impl<R: ProcessRunner> Actor<R> {
         }
         match smit {
             Some(smit) => {
-                self.smits.insert(sheep.to_string(), (conn, smit));
+                self.smits
+                    .insert(sheep.to_string(), (conn, smit.to_string()));
             }
             // Only this connection's own — see `Command::SetSmit`'s doc.
             None => {
