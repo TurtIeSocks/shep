@@ -2203,7 +2203,15 @@ impl<R: ProcessRunner> Actor<R> {
             let name = &app.config().name;
             match privilege::resolve(app.config()) {
                 Ok(resolved) => credentials.push(resolved),
-                Err(err) => refusals.push(format!("{name}: {err}")),
+                Err(err) => {
+                    // One refusal per app, not one per failed check. Both
+                    // arms used to run, so an app failing credentials AND
+                    // carrying an unresolvable path pushed twice and the
+                    // summary below could say "4 of 2 apps cannot start".
+                    // The reasons were each true; the count was not.
+                    refusals.push(format!("{name}: {err}"));
+                    continue;
+                }
             }
             match self.runner.preflight(&assemble(app, 0, &self.paths, None)) {
                 Preflight::Unknown => {}
@@ -6978,6 +6986,49 @@ mod tests {
         assert!(
             handle.list().await.is_empty(),
             "a refusal before the registering pass must leave nothing registered"
+        );
+    }
+
+    /// fails if one app can contribute more than one refusal. Both checks in
+    /// the validating pass used to run unconditionally, so an app with an
+    /// unresolvable user AND an unresolvable path pushed twice, and a
+    /// two-app batch could tell an operator that "4 of 2 apps cannot start".
+    ///
+    /// Every reason in that message was true. Only the arithmetic was wrong,
+    /// which is why this asserts the COUNT rather than the reasons: the
+    /// reasons were never the broken part and a test pinning them would have
+    /// passed throughout.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_counted_once_per_app_not_once_per_failed_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let handle = spawn_supervisor(
+            // `refusing` is what makes this test able to fail. Without it
+            // the fake answers `Preflight::Unknown` for everything, only the
+            // credentials check can refuse, and no app can push twice no
+            // matter what the counting code does.
+            ScriptedRunner::new(vec![ProcScript::never_exits()]).refusing(&["one", "two"]),
+            test_paths(&dir),
+            events,
+        );
+        // Two apps, each failing both checks it can fail: an unresolvable
+        // user, and a script preflight refuses.
+        let both_bad = |name: &str| {
+            let mut app = AppConfig::minimal(name, "./definitely-not-here");
+            app.cwd = Some(dir.path().display().to_string());
+            app.user = Some("definitely-not-a-real-shep-user".to_string());
+            normalize(app).unwrap()
+        };
+        let err = handle
+            .start(vec![both_bad("one"), both_bad("two")])
+            .await
+            .unwrap_err();
+        let SupervisorError::CannotStart(msg) = &err else {
+            panic!("expected CannotStart, got {err:?}");
+        };
+        assert!(
+            msg.contains("2 of 2 apps cannot start"),
+            "one refusal per app, never one per failed check: {msg}"
         );
     }
 

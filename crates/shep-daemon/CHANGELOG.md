@@ -15,9 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Name the sheep and the path in a failed spawn's message. The whole error
   an operator got was `process spawn failed: No such file or directory (os
   error 2)`, which on an eleven-app Flockfile said neither which app had
-  failed nor which path had been tried. It now reads `<name>: process spawn
-  failed: <os error>; tried \`<script>\` in <cwd>`, with the `cwd` clause
-  present only when the app sets one. The path is the `script`/`interpreter`
+  failed nor which path had been tried. It now reads
+  ``<name>: process spawn failed: <os error>; tried `<script>` in <cwd>``,
+  with the `cwd` clause present only when the app sets one. The path is the `script`/`interpreter`
   and `cwd` as the Flockfile spells them rather than a resolution of the two,
   because that is where the edit has to be made. `shep stock`'s own partial-
   scale reply gains the path too and does not repeat the name, which it

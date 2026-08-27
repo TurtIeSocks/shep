@@ -15,8 +15,8 @@ use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::runner::{
-    ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec,
-    StdinWrite, StopSignal,
+    ExitOutcome, LogCtl, LogLine, Preflight, ProcIo, ProcessRunner, RunnerError, RunningProcess,
+    SpawnSpec, StdinWrite, StopSignal,
 };
 
 /// Capacity of every channel the fake wires up — generous enough that no
@@ -383,6 +383,15 @@ pub const FIRST_SCRIPTED_PID: u32 = 1000;
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
 pub struct ScriptedRunner {
     scripts: Mutex<VecDeque<ProcScript>>,
+    /// Sheep names whose [`ProcessRunner::preflight`] answers
+    /// [`Preflight::Impossible`], by name because that is what a caller has.
+    ///
+    /// Empty by default, which is this fake's whole point: it reads nothing
+    /// from a spec and so answers [`Preflight::Unknown`] for everything, the
+    /// same as the trait's own default. The supervisor's validating pass is
+    /// otherwise unreachable from a unit test, and a test written against
+    /// the default cannot fail no matter what that pass does.
+    refuse: Mutex<Vec<String>>,
     /// State + IO for every spawn, indexed by spawn order, behind ONE lock.
     /// Two separate `Mutex`es here (one for state, one for IO) would let
     /// concurrent spawns interleave their critical sections and desync a
@@ -404,7 +413,18 @@ impl ScriptedRunner {
         Self {
             scripts: Mutex::new(scripts.into_iter().collect()),
             spawned: Mutex::new(Vec::new()),
+            refuse: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Makes `preflight` answer [`Preflight::Impossible`] for these sheep.
+    ///
+    /// For reaching the supervisor's pre-registration validating pass, which
+    /// no other fake behaviour can enter.
+    #[must_use]
+    pub fn refusing(self, names: &[&str]) -> Self {
+        *self.refuse.lock().unwrap() = names.iter().map(|n| (*n).to_string()).collect();
+        self
     }
 
     /// `kill_tree()` call count per proc, indexed by spawn order — the only
@@ -569,6 +589,15 @@ impl ScriptedRunner {
 
 impl ProcessRunner for ScriptedRunner {
     type Proc = FakeProc;
+
+    /// [`Preflight::Impossible`] for a name given to [`Self::refusing`],
+    /// [`Preflight::Unknown`] for everything else.
+    fn preflight(&self, spec: &SpawnSpec) -> Preflight {
+        if self.refuse.lock().unwrap().contains(&spec.name) {
+            return Preflight::Impossible(format!("no such file: {}", spec.program));
+        }
+        Preflight::Unknown
+    }
 
     /// Every field of `spec` besides `spec.channel` is still read by nothing
     /// here: the fake writes no files (`spec.out_file`/`err_file`) and runs
