@@ -139,7 +139,7 @@
           }
         },
         "exp_backoff_restart_delay": {
-          "description": "Initial backoff delay; grows ×1.5 capped at 15s (spec §4)",
+          "description": "Initial backoff delay; grows ×1.5 capped at 15s (spec §4)\n\nDefaults to 100ms, not unset. An unstable exit (sooner than\n`min_uptime`) with neither this nor `restart_delay` configured used\nto restart with no delay at all, so an app that could never start\n(a missing dependency, a bad config) burned its whole `max_restarts`\nbudget inside a second, logging the same failure dozens of times.\n`min_uptime` already existed to name that case as unstable; only the\ndefault that should have throttled it was missing. A stable exit\n(`uptime >= min_uptime`) is unaffected either way: it still restarts\nimmediately, so a healthy app's restart-during-deploy stays instant.\nSet this field to `\"0\"` (or set `restart_delay = \"0\"`, which takes\nprecedence) to opt back into unthrottled unstable restarts.",
           "anyOf": [
             {
               "$ref": "#/$defs/UpDuration"
@@ -148,7 +148,7 @@
               "type": "null"
             }
           ],
-          "default": null,
+          "default": "100",
           "init": {
             "blurb": "Starting delay between restarts, growing each time it fails again",
             "example": "5s",

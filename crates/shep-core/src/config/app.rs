@@ -157,6 +157,18 @@ pub struct AppConfig {
     })))]
     pub restart_delay: Option<UpDuration>,
     /// Initial backoff delay; grows ×1.5 capped at 15s (spec §4)
+    ///
+    /// Defaults to 100ms, not unset. An unstable exit (sooner than
+    /// `min_uptime`) with neither this nor `restart_delay` configured used
+    /// to restart with no delay at all, so an app that could never start
+    /// (a missing dependency, a bad config) burned its whole `max_restarts`
+    /// budget inside a second, logging the same failure dozens of times.
+    /// `min_uptime` already existed to name that case as unstable; only the
+    /// default that should have throttled it was missing. A stable exit
+    /// (`uptime >= min_uptime`) is unaffected either way: it still restarts
+    /// immediately, so a healthy app's restart-during-deploy stays instant.
+    /// Set this field to `"0"` (or set `restart_delay = "0"`, which takes
+    /// precedence) to opt back into unthrottled unstable restarts.
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "5s",
         "group": "control",
@@ -426,7 +438,9 @@ impl Default for AppConfig {
             min_uptime: UpDuration::from_millis(1000),
             max_restarts: 16,
             restart_delay: None,
-            exp_backoff_restart_delay: None,
+            // Not None: see the field's doc comment. An unstable exit with
+            // no restart policy configured must not restart instantly.
+            exp_backoff_restart_delay: Some(UpDuration::from_millis(100)),
             kill_signal: None,
             kill_timeout: UpDuration::from_millis(1600),
             shutdown_with_message: false,
@@ -491,6 +505,21 @@ mod tests {
         assert!(app.max_memory.is_none());
         assert!(app.fold.is_none());
         assert!(!app.channel);
+    }
+
+    /// fails if `exp_backoff_restart_delay` reverts to `None`. Defect 2:
+    /// with no restart policy configured, a crash-looping app used to
+    /// restart with no delay at all, burning `max_restarts` in well under a
+    /// second. `restart_delay` (the daemon-side function that reads this
+    /// field) is what actually applies the throttle; this test only pins
+    /// that the default an unconfigured app gets is "on".
+    #[test]
+    fn unstable_restarts_are_throttled_by_default() {
+        let app = AppConfig::minimal("web", "./srv");
+        assert_eq!(
+            app.exp_backoff_restart_delay,
+            Some(UpDuration::from_millis(100))
+        );
     }
 
     /// fails if `stdin` defaults to anything but false. The default is the

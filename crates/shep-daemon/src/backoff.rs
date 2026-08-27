@@ -6,12 +6,14 @@ use shep_core::config::AppConfig;
 
 /// Compute restart delay based on app config and consecutive unstable exits.
 ///
-/// - Fixed `restart_delay` field takes precedence if set
+/// - Fixed `restart_delay` field takes precedence if set (even over a stable exit)
+/// - Else `consecutive_unstable == 0` (stable exit) → `None` (immediate restart)
 /// - Else if `exp_backoff_restart_delay = Some(initial)`: uses iterative integer rule
 ///   `d = min(d * 3 / 2, 15000)` starting at `initial` for `consecutive_unstable = 1`,
-///   applied `consecutive_unstable - 1` times
-/// - `consecutive_unstable == 0` (stable exit) → `None` (immediate restart)
-/// - Else None
+///   applied `consecutive_unstable - 1` times. `AppConfig::default()` sets this to
+///   `Some(100ms)`, so an unstable exit is throttled unless an operator opts out by
+///   setting the field to `None` explicitly.
+/// - Else (both unset) → `None` (immediate restart)
 pub fn restart_delay(app: &AppConfig, consecutive_unstable: u32) -> Option<Duration> {
     // Fixed delay takes precedence
     if let Some(fixed) = app.restart_delay {
@@ -75,9 +77,34 @@ mod tests {
         assert_eq!(restart_delay(&app, 1).unwrap().as_millis(), 500);
     }
 
+    /// Defect 2 fix: an app with neither `restart_delay` nor
+    /// `exp_backoff_restart_delay` set is not "no delay" any more:
+    /// `AppConfig::default()` now carries a 100ms `exp_backoff_restart_delay`
+    /// (see its doc comment), so an unconfigured app still backs off on
+    /// unstable exits.
     #[test]
-    fn neither_set_returns_none() {
+    fn default_config_backs_off_unstable_exits() {
         let app = shep_core::config::AppConfig::minimal("p", "./p");
+        assert_eq!(restart_delay(&app, 1).unwrap().as_millis(), 100);
+        assert_eq!(restart_delay(&app, 2).unwrap().as_millis(), 150);
+    }
+
+    /// A stable exit (`consecutive_unstable == 0`) is unaffected by the
+    /// default above: it stays `None` regardless of what's configured, so a
+    /// healthy app restarting during a deploy is never throttled.
+    #[test]
+    fn stable_exit_is_never_delayed_even_with_a_configured_backoff() {
+        let app = shep_core::config::AppConfig::minimal("p", "./p");
+        assert_eq!(restart_delay(&app, 0), None);
+    }
+
+    /// Explicitly turning the backoff off (`exp_backoff_restart_delay =
+    /// None`) is still honoured: this is the escape hatch documented on the
+    /// field for an operator who wants the old unthrottled behaviour back.
+    #[test]
+    fn an_explicit_none_still_means_no_backoff() {
+        let mut app = shep_core::config::AppConfig::minimal("p", "./p");
+        app.exp_backoff_restart_delay = None;
         assert_eq!(restart_delay(&app, 1), None);
         assert_eq!(restart_delay(&app, 5), None);
     }

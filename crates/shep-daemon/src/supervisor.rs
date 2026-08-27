@@ -6417,11 +6417,12 @@ mod tests {
         assert_eq!(handle.list().await[0].status, ProcStatus::Starting);
 
         // The exit at 500ms is unstable (< the 1000ms min_uptime default)
-        // and triggers an immediate automatic respawn (no
-        // exp_backoff_restart_delay configured, so `restart_delay` is
-        // `None`): status goes straight back to `Starting` for the NEW
-        // process, epoch bumped. `Restart` fires here; `Online` does not —
-        // proving the two emits stay separate on the respawn path too.
+        // and triggers an automatic respawn after the default 100ms
+        // `exp_backoff_restart_delay`, well inside the seconds-wide margins
+        // this test asserts on: status goes straight back to `Starting` for
+        // the NEW process, epoch bumped. `Restart` fires here; `Online`
+        // does not, proving the two emits stay separate on the respawn
+        // path too.
         tokio::time::timeout(
             Duration::from_secs(1),
             await_event(&mut rx, 0, ProcessEventKind::Restart),
@@ -6837,6 +6838,12 @@ mod tests {
         // leave the budget one short of exhausted and a single further crash
         // decides the test.
         app.max_restarts = 3;
+        // This test is about the budget, not the backoff: the sync loop
+        // below is a busy `yield_now` poll under a paused clock, which never
+        // lets the clock auto-advance, so a non-zero
+        // `exp_backoff_restart_delay` (the default since defect 2's fix)
+        // would spin it forever instead of failing.
+        app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
         // mean restarts==2 once the never_exits proc is up.
@@ -6922,6 +6929,12 @@ mod tests {
         // leave the budget one short of exhausted and a single further crash
         // decides the test.
         app.max_restarts = 3;
+        // This test is about the budget, not the backoff: the sync loop
+        // below is a busy `yield_now` poll under a paused clock, which never
+        // lets the clock auto-advance, so a non-zero
+        // `exp_backoff_restart_delay` (the default since defect 2's fix)
+        // would spin it forever instead of failing.
+        app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
         // mean restarts==2 once the never_exits proc is up.
@@ -7008,6 +7021,12 @@ mod tests {
         // leave the budget one short of exhausted and a single further crash
         // decides the test.
         app.max_restarts = 3;
+        // This test is about the budget, not the backoff: the sync loop
+        // below is a busy `yield_now` poll under a paused clock, which never
+        // lets the clock auto-advance, so a non-zero
+        // `exp_backoff_restart_delay` (the default since defect 2's fix)
+        // would spin it forever instead of failing.
+        app.exp_backoff_restart_delay = None;
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
         // Sync on state, not on the repeated Online event: immediate restarts
         // mean restarts==2 once the never_exits proc is up.

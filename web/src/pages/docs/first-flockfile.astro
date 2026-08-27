@@ -47,7 +47,7 @@ const fieldGroups: FieldGroup[] = [
       { name: "min_uptime", type: "duration", default: "1s", does: "Below this, an exit counts as unstable." },
       { name: "max_restarts", type: "integer", default: "16", does: "Consecutive unstable exits before errored." },
       { name: "restart_delay", type: "duration?", default: "none", does: "Fixed delay before every restart (alternative to backoff)." },
-      { name: "exp_backoff_restart_delay", type: "duration?", default: "none", does: "Initial backoff; grows ×1.5, capped at 15s." },
+      { name: "exp_backoff_restart_delay", type: "duration?", default: "100ms", does: "Initial backoff; grows ×1.5, capped at 15s. Only applies to unstable exits; set to \"0\" to opt out." },
     ],
   },
   {
