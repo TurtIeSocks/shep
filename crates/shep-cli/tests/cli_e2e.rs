@@ -1510,6 +1510,79 @@ fn a_second_command_reuses_the_daemon_rather_than_spawning_a_second() {
     graceful_kill(home);
 }
 
+/// A lifecycle verb prints the whole flock, not only the sheep it touched.
+///
+/// `shep start koji` used to print a one-row table containing koji, which
+/// cannot answer the question an operator actually has after a lifecycle
+/// command: what does the flock look like now.
+///
+/// Driven over the real binary against a real daemon, because the unit tests
+/// for this behaviour drive `render_outcome` directly and so cannot say
+/// whether any verb is wired to it. The mutation they cannot catch is the one
+/// that matters most: a `stop` still calling `emit` with its own rows.
+///
+/// Three sheep and a stop of ONE, so the narrow answer and the full one differ
+/// by row count as well as by content. The name assertion is on the exact set
+/// -- a `contains("alpha")` would pass on the one-row table this replaces,
+/// since the row it prints is alpha's.
+///
+/// The `--format json` half is asserted in the same case, and it is not
+/// padding: the two surfaces answer different questions on purpose, so a
+/// change that widened both would fix the complaint and silently break every
+/// script reading `data[0]`.
+#[test]
+fn a_lifecycle_verb_prints_the_whole_flock_and_json_still_prints_what_it_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    for name in ["alpha", "gamma", "beta"] {
+        let started = shep(home)
+            .arg("start")
+            .arg(&script)
+            .arg("--name")
+            .arg(name)
+            .output()
+            .unwrap();
+        guard.adopt_home(home);
+        assert_success(&started);
+    }
+
+    let stopped = shep(home).arg("stop").arg("alpha").output().unwrap();
+    assert_success(&stopped);
+    let printed = String::from_utf8(stopped.stdout).unwrap();
+    let named: Vec<&str> = printed
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter(|word| *word != "NAME")
+        .collect();
+    assert_eq!(
+        named,
+        ["alpha", "beta", "gamma"],
+        "stopping one sheep prints the whole flock, in name order: {printed}"
+    );
+
+    let json = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("stop")
+        .arg("beta")
+        .output()
+        .unwrap();
+    assert_success(&json);
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let rows = envelope["data"].as_array().unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        ["beta"],
+        "the machine surface still answers what it touched: {envelope}"
+    );
+
+    graceful_kill(home);
+}
+
 // --- Case 3 --------------------------------------------------------------
 
 /// Two concurrent `shep start` invocations against a cold `$SHEP_HOME`

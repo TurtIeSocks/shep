@@ -95,9 +95,15 @@ error[not_found]: the daemon reported NotFound: selector matched no registered s
       carrying that fold in one call:
     </p>
     <CodeBlock>{`$ shep stop fold:backend
-ID  NAME    STATUS   PID  RESTARTS  CPU  MEM  UPTIME  FOLD
-0   web     stopped  -    0         -    -    0s      backend
-1   worker  stopped  -    0         -    -    0s      backend`}</CodeBlock>
+ID  NAME    STATUS   PID    RESTARTS  EXIT     CPU  MEM    UPTIME  FOLD     SMIT
+2   cron    online   16564  0         -        -    32.0K  0s      -        -
+0   web     stopped  -      0         SIGTERM  -    -      0s      backend  -
+1   worker  stopped  -      0         SIGTERM  -    -      0s      backend  -`}</CodeBlock>
+    <p>
+      The listing is the whole flock, not just the fold. Every lifecycle verb
+      prints it that way, so <code>cron</code> is there and still online. See
+      <a href="/docs/output#after-a-lifecycle-command">terminal output</a>.
+    </p>
 
     <Callout variant="note">
       Selector parsing checks shapes in a fixed order, and it matters if a

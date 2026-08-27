@@ -94,6 +94,66 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       on that same row says it never started at all.
     </p>
 
+    <h2>After a lifecycle command</h2>
+    <p>
+      <code>start</code>, <code>stop</code>, <code>restart</code>,
+      <code>reload</code>, <code>delete</code> and <code>stock</code> all
+      print the whole flock afterwards, not only the sheep they touched. The
+      question after starting one app is usually what everything else is
+      doing, and the exit code already said whether the one you named worked.
+    </p>
+    <CodeBlock label="shep restart golbat">{`┌────┬────────┬─────────┬───────┬──────────┬─────────┬─────┬────────┬────────┬────────┬──────┐
+│ ID │ NAME   │ STATUS  │ PID   │ RESTARTS │ EXIT    │ CPU │ MEM    │ UPTIME │ FOLD   │ SMIT │
+├────┼────────┼─────────┼───────┼──────────┼─────────┼─────┼────────┼────────┼────────┼──────┤
+│ 4  │ golbat │ online  │ 14459 │ 5        │ -       │ -   │ 416.0K │ 0s     │ backed │ -    │
+│ 5  │ koji   │ stopped │ -     │ 2        │ SIGTERM │ -   │ -      │ 0s     │ backed │ -    │
+└────┴────────┴─────────┴───────┴──────────┴─────────┴─────┴────────┴────────┴────────┴──────┘
+
+Dogs
+┌────────────┬─────────┬────────┬───────┬──────────┬──────┬──────┬────────┐
+│ NAME       │ SOURCE  │ STATUS │ PID   │ RESTARTS │ CPU  │ MEM  │ UPTIME │
+├────────────┼─────────┼────────┼───────┼──────────┼──────┼──────┼────────┤
+│ log-rotate │ adopted │ online │ 14110 │ 1        │ 0.0% │ 6.6M │ 41s    │
+└────────────┴─────────┴────────┴───────┴──────────┴──────┴──────┴────────┘`}</CodeBlock>
+    <p>
+      That is the same output <code>shep flock</code> gives, dogs table and
+      all. A dog has no fold and no id you would ever type, so it gets the
+      dogs table with its own <code>SOURCE</code> column rather than a row in
+      the sheep table. <code>shep restart log-rotate</code> and
+      <code>shep flock</code> draw it the same way.
+    </p>
+    <p>
+      <code>delete</code> is the one verb whose listing cannot show what it
+      did, since the rows are gone. It names the ids it removed on stderr and
+      prints what is left on stdout.
+    </p>
+    <CodeBlock label="shep delete rotom">{`notice[delete]: deleted 1 sheep, id 6`}</CodeBlock>
+    <Callout variant="note">
+      <code>--format json</code> is not widened. A script that runs
+      <code>shep stop web --format json</code> asked about
+      <code>web</code>, so <code>data</code> holds the rows for
+      <code>web</code>. Use <code>shep flock --format json</code> when you
+      want the flock.
+    </Callout>
+
+    <h2>Row order</h2>
+    <p>
+      Every listing shep prints is sorted by name, then by id. That covers
+      <code>shep flock</code>, every lifecycle verb above,
+      <code>shep lookout</code>, and the tables
+      <code>signal</code>, <code>whisper</code> and <code>trigger</code>
+      print.
+    </p>
+    <p>
+      Ids are handed out in registration order, which is a fact about your
+      shell history rather than about the flock, and they move: a
+      <code>delete all</code> followed by a fresh start renumbers everything.
+      Names do not. The id breaks ties, so the four instances of an app
+      stocked to four stay in a fixed order instead of shuffling between
+      refreshes, and it is still what you type at
+      <code>shep stop 11</code>.
+    </p>
+
     <h2>Narrow windows</h2>
     <p>
       The table measures your terminal and drops columns until it fits,

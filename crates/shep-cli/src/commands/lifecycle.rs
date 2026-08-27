@@ -17,10 +17,11 @@ use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
 use shep_core::protocol::{Request, Response, SelectorSpec};
 
+use crate::cli::Format;
 use crate::cli::{SelectorArgs, StartArgs, StockArgs};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, write_outcome};
+use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_flock, write_outcome};
 
 /// What [`resolve_target`] can fail with. Module-scoped per IR-18, and named
 /// for the function rather than the verb on purpose: `start`'s own
@@ -369,8 +370,13 @@ pub fn resolve_target(
 }
 
 /// Sends `body` with `deadline` (`None` defers to the client's own default),
-/// renders whatever the daemon answers through [`emit`], and maps every way
-/// that can go wrong to its exit code.
+/// renders whatever the daemon answers through [`render_outcome`], and maps
+/// every way that can go wrong to its exit code.
+///
+/// `stock` is the only caller. It renders the flock afterwards for the same
+/// reason every other verb in this file does -- see [`render_outcome`] -- and
+/// its `extract` still names the narrow payload, because that is what
+/// `--format json` gets.
 ///
 /// `extract` pulls the verb's own payload out of `Response`; `Response` is
 /// `#[non_exhaustive]` (Global Constraints), so an answer `extract` does not
@@ -390,13 +396,7 @@ where
 {
     match client.request_with_deadline(body, deadline).await {
         Ok(response) => match extract(response) {
-            Some(payload) => write_outcome(emit(
-                &mut *streams.out,
-                streams.fmt,
-                command,
-                payload,
-                streams.style,
-            )),
+            Some(payload) => render_outcome(client, streams, command, payload).await,
             None => {
                 let message = "the daemon answered with a response this client does not understand";
                 streams.fail(ExitCode::Internal, message)
@@ -473,6 +473,79 @@ where
         }
     }
     (collected, failure)
+}
+
+/// Renders what a lifecycle verb should leave on the operator's screen: the
+/// rows it touched under `--format json`, and the WHOLE flock as a table
+/// otherwise.
+///
+/// # Why the whole flock, and why only in a table
+///
+/// `shep start koji` used to print a one-row table containing koji. The
+/// question an operator has after starting one app is almost never "did that
+/// one app start" -- the exit code already answered that -- it is "what does
+/// the flock look like now", which is the question `shep flock` exists for
+/// and which a one-row table cannot answer. Every lifecycle verb here now
+/// prints exactly what `shep flock` would print, so the answer is the same
+/// shape whichever verb asked it.
+///
+/// `--format json` keeps the narrow payload, deliberately, and this is the
+/// one place the two surfaces diverge on purpose. A script that runs
+/// `shep stop web --format json` asked about `web` and wants the rows for
+/// `web`; widening its `data` to the whole flock would break every consumer
+/// reading `data[0]` to learn what it just stopped, for no gain -- a script
+/// that wants the flock has `shep flock --format json`. So the rule is: the
+/// human surface answers "what now", the machine surface answers "what did I
+/// just touch".
+///
+/// # The cost
+///
+/// One extra `ListFlock` round trip per lifecycle verb in table form. The
+/// reply a lifecycle verb gets back carries only the rows it touched, and
+/// widening those responses would be a wire change -- a bigger decision than
+/// this behaviour needs, and one that would still leave `delete` unable to
+/// describe a flock it had just removed rows from. A fresh listing needs no
+/// protocol change and is the same request `shep flock` already makes.
+///
+/// # Dogs
+///
+/// Routed through [`emit_flock`], not [`emit`], so a dog renders through the
+/// dogs table with its `SOURCE` column rather than through the sheep table
+/// with an ID, a face, and a `FOLD` and `SMIT` it can never fill.
+/// `shep restart log-rotate` used to draw the same dog in two shapes
+/// depending on which verb asked.
+///
+/// # Errors
+///
+/// Never returns a listing failure as this verb's failure. The verb already
+/// did its work and already reported its own outcome; failing the command
+/// because the receipt could not be fetched would turn a successful restart
+/// into a non-zero exit. An unreachable or unrecognised listing prints
+/// nothing extra and reports success, the same call [`flock_now`] makes for
+/// its own reasons.
+async fn render_outcome<T: Render>(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    command: &str,
+    narrow: T,
+) -> ExitCode {
+    if streams.fmt == Format::Json {
+        return write_outcome(emit(
+            &mut *streams.out,
+            streams.fmt,
+            command,
+            narrow,
+            streams.style,
+        ));
+    }
+    let listing = flock_now(client).await;
+    write_outcome(emit_flock(
+        &mut *streams.out,
+        streams.fmt,
+        command,
+        listing,
+        streams.style,
+    ))
 }
 
 /// Renders `err` and returns the exit code `start` reports it as.
@@ -748,14 +821,14 @@ pub async fn start(
             &mut started,
         )
         .await;
-        if !started.is_empty() {
-            let wrote = write_outcome(emit(
-                &mut *streams.out,
-                streams.fmt,
-                "start",
-                FlockRows(started),
-                streams.style,
-            ));
+        // Printed whenever the verb did its work, not only when it touched a row.
+        // `shep start koji` against a koji that is already online starts nothing
+        // and succeeds, and the flock is still the answer to what happens next --
+        // before this it printed the notice and no table at all. A verb that
+        // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
+        // `assert_json_error` pins crate-wide.
+        if !started.is_empty() || code == ExitCode::Success {
+            let wrote = render_outcome(client, streams, "start", FlockRows(started)).await;
             if wrote != ExitCode::Success {
                 return wrote;
             }
@@ -785,14 +858,14 @@ pub async fn start(
     // One table for the whole invocation, matching `stop` and `restart`. A
     // header per target would be the only place in the CLI where asking for
     // three things prints three tables.
-    if !started.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "start",
-            FlockRows(started),
-            streams.style,
-        ));
+    // Printed whenever the verb did its work, not only when it touched a row.
+    // `shep start koji` against a koji that is already online starts nothing
+    // and succeeds, and the flock is still the answer to what happens next --
+    // before this it printed the notice and no table at all. A verb that
+    // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
+    // `assert_json_error` pins crate-wide.
+    if !started.is_empty() || failure.is_none() {
+        let wrote = render_outcome(client, streams, "start", FlockRows(started)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -955,14 +1028,9 @@ pub async fn stop(client: &Client, streams: &mut Streams<'_>, args: &SelectorArg
         },
     )
     .await;
-    if !procs.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "stop",
-            FlockRows(procs),
-            streams.style,
-        ));
+    // See `start`'s own note: printed whenever the verb did its work.
+    if !procs.is_empty() || failure.is_none() {
+        let wrote = render_outcome(client, streams, "stop", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1008,14 +1076,8 @@ pub async fn restart(client: &Client, streams: &mut Streams<'_>, args: &Selector
     // the operator reads them from `shep flock`. Consistency across verbs is
     // worth more here than this verb keeping its table on the one path where
     // it has bad news to deliver.
-    if !procs.is_empty() && failed.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "restart",
-            FlockRows(procs),
-            streams.style,
-        ));
+    if (!procs.is_empty() || failure.is_none()) && failed.is_empty() {
+        let wrote = render_outcome(client, streams, "restart", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1060,14 +1122,9 @@ pub async fn reload(client: &Client, streams: &mut Streams<'_>, args: &SelectorA
         },
     )
     .await;
-    if !procs.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "reload",
-            FlockRows(procs),
-            streams.style,
-        ));
+    // See `start`'s own note: printed whenever the verb did its work.
+    if !procs.is_empty() || failure.is_none() {
+        let wrote = render_outcome(client, streams, "reload", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1093,14 +1150,28 @@ pub async fn delete(client: &Client, streams: &mut Streams<'_>, args: &SelectorA
         },
     )
     .await;
-    if !ids.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "delete",
-            DeletedIds(ids),
-            streams.style,
-        ));
+    // See `start`'s own note: printed whenever the verb did its work. The
+    // aside below is guarded separately -- there is nothing to name when
+    // nothing was deleted.
+    if !ids.is_empty() || failure.is_none() {
+        // The listing this prints no longer holds what was deleted, so the
+        // ids go to stderr rather than being lost. Named as ids and not as
+        // names because ids are all `Response::Deleted` carries, and inventing
+        // the names would need a second listing taken before the delete.
+        let count = ids.len();
+        let listed = ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<String>>()
+            .join(", ");
+        if count > 0 && streams.fmt != Format::Json {
+            let message = match count {
+                1 => format!("deleted 1 sheep, id {listed}"),
+                n => format!("deleted {n} sheep, ids {listed}"),
+            };
+            streams.aside("delete", &message);
+        }
+        let wrote = render_outcome(client, streams, "delete", DeletedIds(ids)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1539,6 +1610,153 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&err).contains("zeus-auth\" does not"),
             "and must not be reported as an unresolvable target"
+        );
+    }
+
+    /// The flock a `render_outcome` test hands the fake: two sheep the verb
+    /// did not touch, one it did, and a dog.
+    ///
+    /// The names are chosen so the narrow payload and the full listing cannot
+    /// be confused for one another: a test that asserted "the output mentions
+    /// koji" would pass on the one-row table this change replaces, so every
+    /// assertion below is on the exact SET of rows.
+    fn a_flock_with_a_dog() -> Vec<shep_core::protocol::ProcessInfo> {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+        vec![
+            ProcessInfo::builder(0, "golbat", ProcStatus::Online).build(),
+            ProcessInfo::builder(1, "koji", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(2, "rotom", ProcStatus::Online).build(),
+            ProcessInfo::builder(3, "log-rotate", ProcStatus::Online)
+                .dog(Some(DogSource::Adopted {
+                    path: "/usr/local/bin/shep-log-rotate".to_string(),
+                }))
+                .build(),
+        ]
+    }
+
+    /// fails if a lifecycle verb prints only the rows it touched.
+    ///
+    /// `shep start koji` printed a one-row table containing koji. The question
+    /// after starting one app is "what does the flock look like now", which a
+    /// one-row table cannot answer.
+    ///
+    /// The narrow payload handed in is koji ALONE, and the armed listing has
+    /// four entries, so the two are distinguishable by row count as well as by
+    /// content -- a build that kept rendering the narrow payload prints one
+    /// row and fails on the first assertion rather than passing on a
+    /// coincidence of names.
+    #[tokio::test]
+    async fn a_lifecycle_verb_renders_the_whole_flock_as_a_table() {
+        use shep_client::testing::fake_client_on;
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        daemon.reply_to_list(a_flock_with_a_dog());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let touched = vec![ProcessInfo::builder(1, "koji", ProcStatus::Stopped).build()];
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            render_outcome(&client, &mut streams, "stop", FlockRows(touched)).await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        let printed = String::from_utf8(out).unwrap();
+        // Split at the caption rather than filtering the whole output: the two
+        // tables have different columns, so a NAME read from the wrong one is
+        // a different field. This is also what proves the dog is in the SECOND
+        // table and not merely somewhere on the page.
+        let (sheep, dogs) = printed
+            .split_once("\nDogs\n")
+            .unwrap_or_else(|| panic!("the dogs table needs its own caption: {printed}"));
+        let sheep_names: Vec<&str> = sheep
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .filter(|word| *word != "NAME")
+            .collect();
+        assert_eq!(
+            sheep_names,
+            vec!["golbat", "koji", "rotom"],
+            "every sheep, not only the one that was stopped, and no dog among \
+             them: {printed}"
+        );
+        let dog_names: Vec<&str> = dogs
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|word| *word != "NAME")
+            .collect();
+        assert_eq!(
+            dog_names,
+            vec!["log-rotate"],
+            "the dog renders through the dogs table: {printed}"
+        );
+        assert!(
+            dogs.contains("SOURCE") && dogs.contains("adopted"),
+            "with the SOURCE column the sheep table has not: {printed}"
+        );
+    }
+
+    /// fails if `--format json` is widened to the whole flock, or if it pays
+    /// for a listing it does not render.
+    ///
+    /// The machine surface answers a different question from the human one. A
+    /// script that runs `shep stop koji --format json` asked about koji and
+    /// reads `data[0]` to learn what it stopped; handing it four rows, three
+    /// of which it never asked about, breaks it silently.
+    ///
+    /// `list_flock_count` is the second half and is not decoration: it is what
+    /// proves the JSON path SKIPS the listing rather than fetching one and
+    /// discarding it. Without it a build that always asked and then chose what
+    /// to print would pass.
+    #[tokio::test]
+    async fn the_json_surface_keeps_the_rows_the_verb_touched() {
+        use shep_client::testing::fake_client_on;
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        daemon.reply_to_list(a_flock_with_a_dog());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let touched = vec![ProcessInfo::builder(1, "koji", ProcStatus::Stopped).build()];
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Json,
+            };
+            render_outcome(&client, &mut streams, "stop", FlockRows(touched)).await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        let envelope: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = envelope["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["koji"],
+            "only what the verb touched: {envelope}"
+        );
+        assert_eq!(
+            daemon.list_flock_count(),
+            0,
+            "and no listing was fetched to build it"
         );
     }
 

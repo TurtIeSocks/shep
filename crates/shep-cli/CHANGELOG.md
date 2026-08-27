@@ -29,6 +29,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an operator would be a worse surprise than the bug being fixed. Field names
   only, never values, since `env` carries secrets.
 
+- Every lifecycle verb prints the whole flock afterwards, not only the rows it
+  touched. `shep start koji` printed a one-row table containing koji; the
+  question an operator has after a lifecycle command is what the flock looks
+  like now, which a one-row table cannot answer and which the exit code
+  already covered for the sheep they named. Applies to `start`, `stop`,
+  `restart`, `reload`, `delete` and `stock`. `describe` stays narrow, because
+  answering about one sheep is what it is for.
+
+- A lifecycle verb acting on a dog renders it through the dogs table rather
+  than the sheep table. `shep restart log-rotate` gave it an id, a face, and a
+  `FOLD` and `SMIT` a dog can never fill, while dropping the `SOURCE` column
+  that says whether it was adopted or is built in. Falls out of the change
+  above: the listing goes through the same renderer `shep flock` uses.
+
+- `--format json` is deliberately NOT widened by either of those. A script
+  running `shep stop web --format json` asked about `web`, so `data` still
+  holds `web`'s rows; widening it would break every consumer reading
+  `data[0]`. `shep flock --format json` is the way to ask for the flock.
+
 - `shep lookout`'s flock table draws by name, then by id, rather than by id.
   It repolls every two seconds, so the tiebreak is what stops two instances of
   one app swapping places under the cursor between refreshes.
