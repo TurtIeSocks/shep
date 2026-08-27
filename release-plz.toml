@@ -109,9 +109,19 @@ name = "shep-cli"
 release = false
 
 # Runnable demos for docs/humans, not a crate anyone installs. `publish =
-# false` in its own manifest already stops `cargo publish` from ever
-# reaching it; this entry says the same thing to release-plz explicitly,
-# the same defense-in-depth `shep-cli`'s entry above uses.
+# false` in its own manifest already stops `cargo publish` from ever reaching
+# it, and both keys below say so to release-plz as well.
+#
+# BOTH keys are required, and that is not belt and braces. release-plz
+# validates its own `publish` against the manifest's and refuses the whole
+# run when they disagree, so `release = false` alone left it believing this
+# crate was publishable and it failed the release for v0.1.7 with "has
+# `publish = false` ... but it has `publish = true` in the release-plz
+# configuration". `release` governs whether a crate is released; `publish` is
+# what gets checked against the manifest. `shep-cli`'s entry above needs only
+# `release = false` because its manifest sets no `publish` key at all, so
+# there is nothing for that check to disagree with.
 [[package]]
 name = "shep-examples"
 release = false
+publish = false
