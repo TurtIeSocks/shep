@@ -158,7 +158,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
-      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots'
+      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots signal_ignored_then_kill_tree_reaps'
   # `cargo llvm-cov` on its own runs `cargo test --tests`, and `--tests` does
   # not build a package's examples. `daemon_e2e`'s two reload tests exec
   # `examples/reuse_port_sheep`, the SO_REUSEPORT fixture the whole reload
