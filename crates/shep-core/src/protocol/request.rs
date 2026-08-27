@@ -1060,7 +1060,7 @@ pub struct SheepDrift {
     /// The sheep's name. Both configs share it by construction: it is what
     /// matched them to each other.
     pub name: String,
-    /// The [`AppConfig`](crate::config::AppConfig) fields that differ, in
+    /// The [`AppConfig`] fields that differ, in
     /// field-name order. Never empty: a sheep with nothing to report is left
     /// out of the answer entirely.
     pub fields: Vec<String>,

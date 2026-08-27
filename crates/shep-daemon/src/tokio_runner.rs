@@ -283,8 +283,11 @@ impl ProcessRunner for TokioRunner {
     /// `interpreter` down to, so this checks the one file exec will name and
     /// never a script that an interpreter takes as its first ARGUMENT: an
     /// app running `npx next start` is checked at `npx`, and `next` is
-    /// npx's business. Deliberately under-tightened, per
-    /// [`program_not_found`].
+    /// npx's business.
+    ///
+    /// Deliberately under-tightened: see this module's `program_not_found`
+    /// for every form it declines to decide and why each one is left to the
+    /// spawn.
     fn preflight(&self, spec: &SpawnSpec) -> Option<String> {
         program_not_found(spec)
     }

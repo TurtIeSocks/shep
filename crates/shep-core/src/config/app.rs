@@ -493,7 +493,7 @@ impl AppConfig {
     /// secrets, so a differing `env` reports `"env"` and stops there (IR-41).
     ///
     /// Compare configs that have both been through
-    /// [`normalize`](crate::config::normalize). Two configs differing only
+    /// [`normalize`](fn@crate::config::normalize). Two configs differing only
     /// in what normalization would have filled in are not a difference an
     /// operator can act on, and reporting them would make the caller noisy
     /// about nothing.
