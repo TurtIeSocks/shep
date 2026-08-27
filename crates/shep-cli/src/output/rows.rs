@@ -255,6 +255,25 @@ const MEM_ELEVATED_BYTES: u64 = 128 * 1024 * 1024;
 /// [`Role::Ink3`], the same "no honest value" colour every dash in this
 /// table gets; otherwise the cell is coloured by [`MEM_ELEVATED_BYTES`]'s
 /// two-tier ramp.
+///
+/// # What this deliberately cannot show
+///
+/// Two tiers saturate. A flock of several large but healthy services
+/// renders its whole MEM column one uniform [`Role::Butter`], unable to
+/// separate 160M from 4G, and on such a flock the colour carries no
+/// information at all.
+///
+/// A third tier is the obvious answer and is worse. The only role left is
+/// [`Role::Bark`], which is reserved for faults everywhere else in this
+/// table and in the lookout both, so a healthy 4G service would render as
+/// though it had broken. Adding a fifth role instead would mean adding it
+/// to `vocabulary.rs`, which is deliberately the single source both
+/// renderers read, and paying for it in the lookout's theme as well, for a
+/// distinction only some flocks need.
+///
+/// So the ramp answers "is this one unusual for this flock" and not "how
+/// much memory is this". `--format json` carries the exact number for any
+/// reader who needs the second question answered.
 fn mem_role(memory_bytes: Option<u64>) -> Role {
     match memory_bytes {
         None => Role::Ink3,
