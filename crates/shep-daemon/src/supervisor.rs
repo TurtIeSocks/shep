@@ -5738,8 +5738,11 @@ impl<R: ProcessRunner> Actor<R> {
     /// through more than one door. Adding a transition means adding a call
     /// here; the list is the checklist:
     ///
-    /// 1. `respawn`'s `Err` arm — a restart that could not spawn lands in
-    ///    `Errored` without ever going through `handle_exited`.
+    /// 1. `respawn_failed` — a restart that could not spawn, or one whose
+    ///    `user` could not be resolved, lands in `Errored` without ever
+    ///    going through `handle_exited`. Both of `respawn`'s failure routes
+    ///    reach it, which is why this entry names the function rather than
+    ///    one arm of its caller.
     /// 2. `apply_immediate`'s Stop arm — a `WaitingRestart` or `Errored`
     ///    sheep has no live task, so its stop resolves synchronously.
     /// 3. `apply_immediate`'s Delete arm — ditto, deregistered on the spot.
@@ -14392,6 +14395,13 @@ mod tests {
     // behind. The refusal is one line in the shepherd's log, and `PerApp` is
     // the muster restore and the dog, where nobody is reading those -- so
     // the app has to be visible as `Errored` instead of missing.
+    //
+    // `#[cfg(unix)]` for the same reason as its neighbours: the refusal it
+    // asserts comes from resolving a user against the passwd database, and
+    // Windows has none, so there is nothing for `NO_SUCH_USER` to fail
+    // against. Without the gate the test compiles there and fails on
+    // `expect_err`, which is what CI's three Windows legs reported.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn a_start_refused_over_credentials_leaves_an_errored_row() {
         let dir = tempfile::tempdir().unwrap();
@@ -14433,6 +14443,9 @@ mod tests {
     // others is the flock-matching-neither-state that policy exists to
     // prevent, and the operator who typed `shep start` is holding a terminal
     // to read the refusal instead.
+    //
+    // `#[cfg(unix)]` for the reason its neighbour above gives.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn an_all_or_nothing_start_refused_over_credentials_registers_nothing() {
         let dir = tempfile::tempdir().unwrap();
