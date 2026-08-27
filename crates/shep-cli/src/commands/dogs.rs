@@ -478,7 +478,10 @@ fn writability(canonical: &Path) -> Result<Vec<PathBuf>, AdoptRefusal> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    let group_writable = Vec::new();
+    // `mut` is read only by the `cfg(unix)` push below, so Windows sees an
+    // unused `mut` and unix sees an immutable binding it needs to mutate.
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut group_writable = Vec::new();
     for candidate in [Some(canonical), canonical.parent()].into_iter().flatten() {
         // Unreadable metadata is not a refusal: the binary itself was
         // stat'ed successfully by the caller, and a directory whose mode

@@ -153,7 +153,6 @@ pub async fn open_regular(path: &Path) -> Option<(tokio::fs::File, u64)> {
     options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(OFlag::O_NOFOLLOW.bits() | OFlag::O_NONBLOCK.bits());
     }
     // `FILE_FLAG_OPEN_REPARSE_POINT` is the Windows analogue of

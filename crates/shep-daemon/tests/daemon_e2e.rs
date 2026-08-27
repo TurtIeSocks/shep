@@ -1551,7 +1551,7 @@ async fn muster_restores_the_flock_across_a_daemon_lifetime() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    let mut alpha = forever_app("alpha");
+    let alpha = forever_app("alpha");
     let mut beta = forever_app("beta");
     beta.instances = 2;
     let started = client
