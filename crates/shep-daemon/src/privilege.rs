@@ -42,6 +42,7 @@ pub struct Credentials {
 }
 
 /// Error resolving an app's `user`/`group` config to numeric ids
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrivilegeError {
     /// No passwd entry for this user name

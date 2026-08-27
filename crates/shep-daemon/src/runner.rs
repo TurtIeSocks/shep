@@ -251,6 +251,7 @@ impl core::error::Error for FlushError {}
 /// already prefixes one (`"<path>: <what the open reported>"`, see
 /// [`ReopenError::message`] and [`FlushError::message`]), and repeating it
 /// would print it twice.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) const SYMLINK_REFUSED: &str = "refusing to follow a symlink at this log path; shep \
      opens log files with O_NOFOLLOW, so point out_file/err_file at the real file";
 

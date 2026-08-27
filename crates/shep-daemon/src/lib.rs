@@ -70,7 +70,7 @@
 //! Unix-specific glue underneath both tiers above; nothing here is reachable
 //! from a portable (non-unix) build except [`privilege`]'s refuse-outright stub.
 //!
-//! - [`sys`]: adopting an inherited descriptor — this crate's only `unsafe fn`, and its
+//! - `sys`: adopting an inherited descriptor — this crate's only `unsafe fn`, and its
 //!   only unsafe surface, full stop (IR-22): [`boot`] receives an already-adopted
 //!   [`std::fs::File`] and calls it not at all (`sys`'s own doc has the full
 //!   test-call-site accounting) (unix-only)
@@ -278,7 +278,12 @@ pub(crate) mod testing;
 //
 // Reachable tier: `shep-cli`'s hidden `daemon` subcommand calls `boot` and
 // `RunningDaemon::run`, and `launch.rs` reads `DIR_MODE`.
-#[cfg(unix)]
+//
+// Portable on both tiers as of the Windows port: the control transport moved
+// to `shep_core::transport`, the pidfile lock and the directory modes carry
+// per-platform arms next to their own docs, and the console-control events
+// stand in for the unix signals. `DIR_MODE` remains a unix-only constant and
+// is gated as one.
 pub mod boot;
 
 // Unix-only: `std::os::unix::io::{FromRawFd, RawFd}` and this crate's whole
@@ -299,6 +304,20 @@ pub mod boot;
 // its documented caller.
 #[cfg(unix)]
 pub mod sys;
+
+// The Windows counterpart to `sys` above, and this crate's only unsafe
+// surface on that platform: a job object per sheep, standing in for the
+// unix process group that `tokio_runner` establishes with
+// `process_group(0)`. Doc lives inside the module's own `//!` header, same
+// reasoning as `server`'s note below.
+//
+// `pub(crate)` rather than `pub`, unlike `sys`: `sys` is public because its
+// documented caller lives in shep-cli and cannot be written any other way,
+// whereas nothing outside this crate ever needs to name a job object —
+// `tokio_runner` owns one per sheep and exposes only the `RunningProcess`
+// trait over it.
+#[cfg(windows)]
+pub mod sys_windows;
 
 // Unix-only: `std::os::unix::net::UnixDatagram`, plus (on Linux) the
 // abstract-namespace address it can be handed. Doc lives inside notify.rs's
@@ -322,22 +341,25 @@ pub mod notify;
 ///
 /// Public because `shep-cli` hands [`TokioRunner`](tokio_runner::TokioRunner)
 /// to [`boot`], and `tests/real_runner.rs` drives it against real children.
-#[cfg(unix)]
 pub mod tokio_runner;
 
-// Unix-only for the same reason as `tokio_runner` above: it is built on
-// `tokio::net`'s unix-socket types. Task 4's `rpc` dispatcher (and
-// everything it calls) stays portable; this module is the thing that
-// actually opens a socket. Doc lives inside server.rs's own `//!` header
-// (not here) — an outer `///` doc on this declaration would merge with
-// that inner doc and rustdoc would resolve the WHOLE merged block's
-// intra-doc links against this file's scope, breaking every bare
-// same-module link inside server.rs's own header (confirmed by a minimal
-// repro during Task 5's docs gate).
+// Portable on both tiers as of the Windows port. This was `#[cfg(unix)]`
+// while it named `tokio::net`'s unix-socket types directly; it names
+// `shep_core::transport` now, so the OS choice is made one crate down and
+// the accept loop, the handshake and the connection state machine are one
+// implementation on both platforms. The one thing that genuinely does not
+// port — the same-uid `peer_cred` check — is `#[cfg(unix)]` *inside* the
+// module, next to a comment explaining what answers the same question on
+// Windows and why it is answered earlier there.
+//
+// Doc lives inside server.rs's own `//!` header (not here) — an outer `///`
+// doc on this declaration would merge with that inner doc and rustdoc would
+// resolve the WHOLE merged block's intra-doc links against this file's
+// scope, breaking every bare same-module link inside server.rs's own header
+// (confirmed by a minimal repro during Task 5's docs gate).
 //
 // Internal tier: `boot` constructs and runs the server; nothing outside this
 // crate names it.
-#[cfg(unix)]
 pub(crate) mod server;
 
 /// Deterministic scripted [`ProcessRunner`](runner::ProcessRunner), reused by

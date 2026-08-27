@@ -539,9 +539,17 @@ mod tests {
     /// The inner loop skips this module with `--skip ::slow::`; the full
     /// suite still runs them because nothing here is `#[ignore]`d.
     mod slow {
+        // All three are read only by the `cfg(unix)` cases below, which
+        // drive a real `/bin/sh` child. There is no Windows twin of those
+        // yet: `tests/real_runner_windows.rs` covers real-child behaviour on
+        // that platform instead, at the runner tier rather than the
+        // sampler's.
+        #[cfg(unix)]
         use std::process::Command;
+        #[cfg(unix)]
         use std::time::Duration;
 
+        #[cfg(unix)]
         use super::*;
 
         /// The name `sampler` reports for `pid`, or `None` if the walk did
