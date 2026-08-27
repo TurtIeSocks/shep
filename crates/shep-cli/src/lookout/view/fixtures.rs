@@ -133,24 +133,41 @@ pub fn with_no_selection() -> App {
     app_with(Vec::new(), plain())
 }
 
-/// A TWO-sheep dashboard with the selection on `info`, which sorts second.
+/// A TWO-sheep dashboard with the selection walked onto `info`.
 ///
 /// Two, and the selection not on row 0, on purpose: Task 7's first mutation
 /// replaces `selected_row()` with `rows().first()`, and a one-sheep fixture
-/// would make that mutation invisible.
+/// would make that mutation invisible. Both properties are ASSERTED below
+/// rather than assumed, which is the whole reason this walks the cursor
+/// instead of pressing `j` once.
 pub fn with_selection(info: ProcessInfo) -> App {
     with_selection_and_palette(info, plain())
 }
 
 /// The same, at a given palette.
+///
+/// The decoy is `!decoy` rather than `decoy` because the table reads by NAME:
+/// with an ordinary name the decoy sorts wherever the alphabet puts it, and
+/// this fixture is used with sheep called `api`, `cron` and `gateway`. It used
+/// to press `j` once and trust `info` to be row 1, which was true only while
+/// the table read by id and the decoy held id 0. `!` sorts below every ASCII
+/// letter and digit, so the decoy is row 0 whatever the sheep under test is
+/// called.
 pub fn with_selection_and_palette(info: ProcessInfo, palette: Palette) -> App {
     assert!(
         info.id > 0,
         "the decoy takes id 0, so the sheep under test cannot"
     );
-    let decoy = ProcessInfo::builder(0, "decoy", ProcStatus::Online).build();
+    let wanted = info.id;
+    let decoy = ProcessInfo::builder(0, "!decoy", ProcStatus::Online).build();
     let mut app = app_with(vec![decoy, info], palette);
     app.update(Msg::Key(KeyPress::SelectDown));
+    assert_eq!(
+        app.selected(),
+        Some(wanted),
+        "the sheep under test must end up selected, and on row 1: the mutation \
+         this fixture exists to catch reads row 0 instead"
+    );
     app
 }
 
@@ -328,10 +345,23 @@ fn named_flock() -> Vec<ProcessInfo> {
 
 /// [`filtered_app`]'s four sheep with the gate open and the cursor on `api`
 /// at id 2, which is the sheep every action assertion in this file names.
+///
+/// The cursor is WALKED to `api` rather than moved a fixed number of rows.
+/// The table reads by name, so which row `api` occupies is decided by what
+/// the other three sheep happen to be called; this used to press `j` once and
+/// land on `api` only because the table read by id and `api` held id 2. A
+/// fixture that silently selects a different sheep than its doc claims is
+/// worse than one that fails, so the walk asserts it arrived.
 pub fn allowed_app() -> App {
     let mut app = app_with(named_flock(), plain());
     app.set_control_for_tests(Control::Allowed);
-    app.update(Msg::Key(KeyPress::SelectDown));
+    for _ in 0..named_flock().len() {
+        if app.selected() == Some(2) {
+            break;
+        }
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+    assert_eq!(app.selected(), Some(2), "the cursor must end up on api");
     app
 }
 

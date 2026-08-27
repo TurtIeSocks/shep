@@ -204,9 +204,34 @@ pub trait Render: Serialize {
     fn rows(&self) -> Vec<Vec<String>>;
     /// The rows as this presentation wants them rendered.
     ///
-    /// Defaults to [`Self::rows`]: most payloads have nothing to dress up.
-    /// [`rows::FlockRows`] overrides it because its STATUS cell is the one
-    /// place a face and a colour belong. Only ever called from `table_of`'s
+    /// Defaults to [`Self::rows`]: a table with nothing to dress up says so
+    /// by not implementing this. An impl that wants colour overrides it and
+    /// calls [`rows::paint`], which keys each cell's treatment on the
+    /// column's NAME.
+    ///
+    /// The default deliberately does NOT apply the `-` placeholder rule, even
+    /// though that rule holds for every table that has a placeholder. It was
+    /// written that way first, and the mutation that deleted it killed no
+    /// test: every table in the crate that can actually render a `-` already
+    /// overrides this and reaches the rule through [`rows::Paint::Default`],
+    /// and the seven that do not override it cannot produce a dash at all. A
+    /// default nothing reaches is a path that rots unwatched, so the rule
+    /// lives in `paint` alone, where it is exercised.
+    ///
+    /// # Why by name, and never by index
+    ///
+    /// This used to be `FlockRows`' own method, painting `row[0]`, `row[4]`,
+    /// `row[9]` and `row[10]` by hardcoded index. An index is a fact about
+    /// one table's column ORDER, so reordering its columns silently
+    /// repoints every one of them: the wrong cells get painted, nothing
+    /// fails to compile, and no test catches it -- a snapshot pins whatever
+    /// was accepted into it, and only a human looking at a rendered table
+    /// would notice RESTARTS had started wearing the memory ramp. Reordering
+    /// the dogs table is what made that concrete. Keyed on the name, one
+    /// place says RESTARTS is coloured by `restarts_role`, and every table
+    /// carrying a RESTARTS column gets it wherever the column sits.
+    ///
+    /// Only ever called from `table_of`'s
     /// boxed path — the plain path keeps calling [`render_table`], which
     /// keeps calling [`Self::rows`], and that is what makes `bare` provably
     /// byte-identical rather than merely intended to be.
@@ -214,9 +239,9 @@ pub trait Render: Serialize {
     /// `status_word` is a plain parameter rather than a field on
     /// `Presentation`: it is `table_of`'s own per-attempt retry knob (spec
     /// §2's word-drops-before-a-column rule), never a fact resolved once at
-    /// the seam the way every `Presentation` field is. Only
-    /// [`rows::FlockRows`] reads it; every other default impl ignores it,
-    /// so the retry `table_of` makes is a harmless no-op for anything else.
+    /// the seam the way every `Presentation` field is. Only a STATUS column
+    /// reads it, so the retry `table_of` makes is a harmless no-op for a
+    /// table that has none.
     fn rows_for(&self, _presentation: Presentation, _status_word: bool) -> Vec<Vec<String>> {
         self.rows()
     }
@@ -830,9 +855,37 @@ mod tests {
         assert!(!sheep_table.contains("bark"), "a dog is not a sheep");
         assert!(dogs_table.contains("bark"));
         assert!(!dogs_table.contains("web"));
+        // The dogs table DOES carry an ID column, and its columns line up
+        // with the sheep table's for every header the two share. It used to
+        // lead with NAME and put SOURCE second, so the two tables printed one
+        // under the other disagreed on the position of every column after the
+        // first. `DogRows`' own doc carries the ruling.
         assert!(
-            !dogs_table.starts_with("ID"),
-            "the dogs table has no ID column"
+            dogs_table.starts_with("ID"),
+            "the dogs table leads with ID, as the sheep table does: {dogs_table}"
+        );
+        let shared: Vec<&str> = dogs_table
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .take(9)
+            .collect();
+        assert_eq!(
+            shared,
+            [
+                "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME"
+            ],
+            "the nine shared columns, in the sheep table's own order"
+        );
+        assert!(
+            dogs_table
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end()
+                .ends_with("SOURCE"),
+            "and this table's own column last"
         );
     }
 

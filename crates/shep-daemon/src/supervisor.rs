@@ -48,7 +48,7 @@ use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
-    ProcessEventKind, ProcessInfo, SheepDrift, SignalOutcome, SignalReply, Smit,
+    ProcessEventKind, ProcessInfo, SheepDrift, SignalOutcome, SignalReply, Smit, sort_flock,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -1161,8 +1161,14 @@ impl SupervisorHandle {
     }
 
     /// Sends `action` over the shepherd channel of every sheep matching
-    /// `selector` and answers with one id-sorted row per match, carrying what
-    /// each app said back or why nothing came.
+    /// `selector` and answers with one row per match, carrying what each app
+    /// said back or why nothing came.
+    ///
+    /// Rows come back in the one order every operator-facing listing takes: by name, then
+    /// by id (`shep_core::protocol::sort_flock`). They were id-sorted until
+    /// that rule was made the only one; this table carries an ID and a NAME
+    /// column exactly as a flock listing does, so an operator reading both in
+    /// one session should not have to read two orders.
     ///
     /// Answers on completion rather than on acceptance: an action has no
     /// floor on how long it takes, so an acceptance would tell a caller
@@ -1216,8 +1222,8 @@ impl SupervisorHandle {
     }
 
     /// Delivers `sig` to the OWN process of every sheep matching `selector` —
-    /// never its process group — and answers with one id-sorted row per
-    /// match.
+    /// never its process group — and answers with one row per match, in the one order every operator-facing listing takes: by name, then
+    /// by id (`shep_core::protocol::sort_flock`).
     ///
     /// Unlike [`Self::trigger`], there is nothing to wait out: a `kill(2)`
     /// either returns or does not, so this answers as soon as every matched
@@ -1245,8 +1251,9 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
-    /// Writes `line` to every matched sheep's stdin, and answers with one
-    /// id-sorted row per match.
+    /// Writes `line` to every matched sheep's stdin, and answers with one row
+    /// per match, in the one order every operator-facing listing takes: by name, then
+    /// by id (`shep_core::protocol::sort_flock`).
     ///
     /// Unlike [`Self::signal`], each write can genuinely wait — a pipe write
     /// blocks until the app reads — so the reply is bounded per sheep at
@@ -1288,8 +1295,14 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)
     }
 
-    /// Full flock listing, grouped by app name (each app's instances kept
-    /// in their own instance-slot order, ties from a reload broken by id).
+    /// Full flock listing, by name and then by id
+    /// (`shep_core::protocol::sort_flock`, which `snapshot_all` calls).
+    ///
+    /// It used to keep each app's instances in their own instance-slot order
+    /// with reload ties broken by id. That is a finer key and no listing that
+    /// has crossed the wire can reproduce it, since `ProcessInfo` carries no
+    /// instance number, so it was dropped for the one rule every reply now
+    /// shares. See `snapshot_all` for the whole of that reasoning.
     ///
     /// Convenience over `Self::list_checked` for callers that don't need
     /// to distinguish "actor gone" from "empty flock" — mainly tests.
@@ -1925,8 +1938,12 @@ enum ReplyKind {
 /// turns on whether the request was fully satisfied.
 #[derive(Debug)]
 pub(crate) struct Scaled {
-    /// The app's surviving instances, in instance-slot order. On a partial
-    /// scale-up this is what came up, never the count asked for.
+    /// The app's surviving instances, by name and then by id
+    /// (`shep_core::protocol::sort_flock`). Every row here shares one name,
+    /// so in practice that is id order -- but it is the shared rule that says
+    /// so, not a rule of this reply's own, which is what stops the two
+    /// drifting. On a partial scale-up this is what came up, never the count
+    /// asked for.
     pub(crate) instances: Vec<ProcessInfo>,
     /// The app's config as it now stands, with the ACHIEVED `instances` count.
     pub(crate) app: ResolvedApp,
@@ -2467,6 +2484,11 @@ impl<R: ProcessRunner> Actor<R> {
         if !failures.is_empty() {
             return Err(SupervisorError::SpawnFailed(failures.join("; ")));
         }
+        // The table `shep start` prints. `results` is built in the order the
+        // caller supplied its apps and then instance by instance within each,
+        // which is the Flockfile's order rather than the one every other
+        // listing takes.
+        sort_flock(&mut results);
         Ok(results)
     }
 
@@ -3130,7 +3152,7 @@ impl<R: ProcessRunner> Actor<R> {
         }
 
         if remaining.is_empty() {
-            results.sort_unstable_by_key(|info| info.id);
+            sort_flock(&mut results);
             send_reply(reply, Ok(results));
             return;
         }
@@ -3454,7 +3476,7 @@ impl<R: ProcessRunner> Actor<R> {
                     .map(|slot| to_info(&slot.entry, &self.smits))
             })
             .collect();
-        instances.sort_unstable_by_key(|info| info.id);
+        sort_flock(&mut instances);
         // `Ok` even when `failure` is set, and that is deliberate: see
         // `Scaled`'s own doc. The caller records `app` unconditionally and
         // turns `shortfall` into the operator's error; an `Err` here would
@@ -3526,7 +3548,7 @@ impl<R: ProcessRunner> Actor<R> {
             return;
         }
 
-        let accepted: Vec<ProcessInfo> = matched
+        let mut accepted: Vec<ProcessInfo> = matched
             .iter()
             .map(|id| {
                 let slot = self
@@ -3536,6 +3558,10 @@ impl<R: ProcessRunner> Actor<R> {
                 to_info(&slot.entry, &self.smits)
             })
             .collect();
+        // The table `shep reload` prints, so it takes the one order every
+        // operator-facing listing takes. It arrives in the id order
+        // `matching_ids` answers in, which is not that order.
+        sort_flock(&mut accepted);
 
         // Grouped by app because a reload runs one instance of an app at a
         // time, and ordered by instance slot because that is the order an
@@ -4407,10 +4433,17 @@ impl<R: ProcessRunner> Actor<R> {
         // reopens: `HashMap` iteration order is arbitrary, and pump failures
         // are reported in the order they are collected, so an unsorted pump
         // set would make a multi-pump failure message read differently run to
-        // run. `matched` needs no such step — it is built in the id order
-        // `matching_ids` answers in, and a caller reading the reply as a
-        // table wants a stable order over `list`'s own (name-grouped) one.
+        // run. Id order, deliberately, unlike `matched` below: this sequence
+        // is never rendered, it only fixes the order failures are collected
+        // in, and any total order does that job.
         pumps.sort_unstable_by_key(|(info, _)| info.id);
+        // `matched` IS rendered -- it is the table `shep reopen` prints -- so
+        // it takes the one order every operator-facing listing takes. It
+        // arrives here in the id order `matching_ids` answers in; an earlier
+        // version of this comment claimed that was already `list`'s order,
+        // which was never true (`snapshot_all` groups by name) and is what
+        // let two orders ship side by side.
+        sort_flock(&mut matched);
         spawn_reopen_task(matched, pumps, reply);
     }
 
@@ -4501,12 +4534,14 @@ impl<R: ProcessRunner> Actor<R> {
         // Sorted for the reason `handle_reopen` sorts: `HashMap` iteration
         // order is arbitrary, and pump failures are reported in the order
         // they are collected, so an unsorted flush set would make a
-        // multi-pump failure message read differently run to run. Neither
-        // `matched` nor `paths` needs the step — the first is built in the id
-        // order `matching_ids` answers in, which is `list`'s and so the one a
-        // caller rendering the reply as a table wants, and the second is a
-        // `BTreeSet` already.
+        // multi-pump failure message read differently run to run. `paths`
+        // needs no such step, being a `BTreeSet` already.
         pumps.sort_unstable_by_key(|&(id, _)| id);
+        // `matched` is the table `shep empty` prints, so it takes the
+        // operator-facing order rather than the id order `matching_ids`
+        // hands it over in. See `handle_reopen` for the stale claim this
+        // replaces.
+        sort_flock(&mut matched);
         let pumps = pumps.into_iter().map(|(_, log_ctl)| log_ctl).collect();
         spawn_flush_task(matched, pumps, paths, reply);
     }
@@ -5474,7 +5509,7 @@ impl<R: ProcessRunner> Actor<R> {
             }
             if self.pending[i].remaining.is_empty() {
                 let mut pending = self.pending.remove(i);
-                pending.results.sort_unstable_by_key(|info| info.id);
+                sort_flock(&mut pending.results);
                 if matches!(pending.reply, ReplyKind::Shutdown(_)) {
                     shutdown_completed = true;
                 }
@@ -5622,12 +5657,29 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// Full flock listing, grouped by app name.
     ///
-    /// Sorted on `(name, instance, id)`, not id: sorting by id scatters a
-    /// clustered app's instances across the table, and grouping by name is
-    /// what makes a four-instance app read as one thing at a glance.
-    /// `instance` keeps a clustered app's slots in their own order once
-    /// grouped, and `id` breaks the tie a reload creates, where a
-    /// replacement takes the drainee's slot number with a fresh id.
+    /// Sorted by [`sort_flock`], the one rule every operator-facing listing
+    /// in shep takes: name, then id. Sorting by id alone scatters a clustered
+    /// app's instances across the table, and grouping by name is what makes a
+    /// four-instance app read as one thing at a glance.
+    ///
+    /// # Why not `(name, instance, id)`
+    ///
+    /// It used to sort on that, and the extra key was a real refinement:
+    /// `instance` keeps a clustered app's slots in their own order, where
+    /// `id` breaks the tie a reload creates by giving a replacement a fresh
+    /// id at the drainee's slot number.
+    ///
+    /// It was also a SECOND rule. `ProcessInfo` carries no instance number,
+    /// so no listing that has crossed the wire can reproduce it, and
+    /// `sort_flock` -- which every lifecycle reply now takes -- cannot. The
+    /// two agree on any flock whose ids were handed out in instance order and
+    /// diverge exactly once a reload has churned one, so `ListFlock` could
+    /// order a reloaded app differently from the `Restart` reply printed a
+    /// second earlier. That is the inconsistency this whole change exists to
+    /// end, reintroduced one layer down.
+    ///
+    /// So the finer key goes and the shared one stays, by calling the shared
+    /// function rather than restating it: the two cannot drift.
     ///
     /// Applied here once rather than once per verb: this is the single
     /// function every listing reply is built from — `ListFlock`, `Describe`,
@@ -5635,18 +5687,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// anywhere else would leave the metrics dog and bark reading a
     /// different order from the operator, or duplicate the rule per verb.
     fn snapshot_all(&self) -> Vec<ProcessInfo> {
-        let mut entries: Vec<&ProcessEntry> = self.sheep.values().map(|slot| &slot.entry).collect();
-        entries.sort_unstable_by(|a, b| {
-            (a.spec.config().name.as_str(), a.instance, a.id).cmp(&(
-                b.spec.config().name.as_str(),
-                b.instance,
-                b.id,
-            ))
-        });
-        entries
-            .into_iter()
-            .map(|entry| to_info(entry, &self.smits))
-            .collect()
+        let mut listing: Vec<ProcessInfo> = self
+            .sheep
+            .values()
+            .map(|slot| to_info(&slot.entry, &self.smits))
+            .collect();
+        sort_flock(&mut listing);
+        listing
     }
 
     /// Broadcasts one lifecycle transition. Send failures (no receivers)
@@ -5900,7 +5947,13 @@ fn spawn_trigger_task(
         // The refusals were collected in id order and the waits were armed in
         // it, but a wait's row is appended when it settles, so this is what
         // the answer's order actually rests on.
-        rows.sort_unstable_by_key(|row| row.id);
+        // Keyed the way every operator-facing table shep prints is keyed
+        // (`sort_flock`'s own doc): by name, with the id breaking the tie
+        // between two instances of one app. This table carries an ID and a
+        // NAME column just as a flock listing does, so an operator who runs
+        // `shep flock` and then `shep trigger` should not have to read two
+        // orders.
+        rows.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
         let _ = reply.send(Ok(rows));
     });
 }
@@ -5937,7 +5990,8 @@ fn spawn_signal_task(
             };
             rows.push(SignalReply { id, name, outcome });
         }
-        rows.sort_unstable_by_key(|row| row.id);
+        // Name then id, per `spawn_trigger_task`'s own note.
+        rows.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
         let _ = reply.send(Ok(rows));
     });
 }
@@ -5948,7 +6002,7 @@ type LineWait = (u32, String, oneshot::Receiver<Result<(), RunnerError>>);
 
 /// Awaits every write's acknowledgement, each under its own
 /// [`STDIN_WRITE_TIMEOUT`], and answers `reply` with `settled` and the results
-/// in id order.
+/// by name and then by id, the order `spawn_trigger_task`'s own note gives.
 ///
 /// The waits run CONCURRENTLY — `join_all`, not a `for` loop. Unlike
 /// `spawn_trigger_task`, whose per-row waits carry no shared bound, every wait
@@ -5995,7 +6049,8 @@ fn spawn_send_line_task(
             ))
             .await,
         );
-        rows.sort_unstable_by_key(|row| row.id);
+        // Name then id, per `spawn_trigger_task`'s own note.
+        rows.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
         let _ = reply.send(Ok(rows));
     });
 }
@@ -12150,16 +12205,25 @@ mod tests {
     /// every row assertion below — which is what the `try_recv` between the
     /// two settlements is for.
     ///
-    /// The id order and the order the rows are produced in genuinely differ,
-    /// so the final sort is load-bearing rather than incidental: the refused
-    /// sheep is collected before either wait is even armed, and the two waits
-    /// settle in the order the app and the clock decide. Delete the sort and
-    /// the rows come back `[1, 0, 2]`.
+    /// The three sheep are named so that NO two of the candidate orders
+    /// agree, which is what makes the final sort load-bearing rather than
+    /// incidental. Ids are `web` 0, `zeus` 1, `worker` 2. The rows are
+    /// PRODUCED as `[1, 0, 2]` -- the refused sheep is collected before
+    /// either wait is armed, and the two waits settle in the order the app
+    /// and the clock decide. Sorted by id they would be `[0, 1, 2]`. Sorted
+    /// the way shep actually sorts a listing, by name then id, they are
+    /// `[0, 2, 1]`: web, worker, zeus. Delete the sort and this fails; key it
+    /// on the id instead and it fails differently.
+    ///
+    /// The sheep was called `api` until the ordering rule changed, and that
+    /// name made the fixture unable to fail: `api, web, worker` is what the
+    /// rows settle in AND what name order asks for, so a build with no sort
+    /// at all would have passed.
     #[tokio::test(start_paused = true)]
     async fn a_trigger_answers_every_sheep_it_matched_before_it_answers_at_all() {
         let dir = tempfile::tempdir().unwrap();
         let (mut actor, mut mailbox, mut child_rx) = actor_with_an_open_channel(&dir);
-        register_sheep(&mut actor, &dir, "api", None);
+        register_sheep(&mut actor, &dir, "zeus", None);
         let (silent_tx, mut silent_rx) = mpsc::channel(16);
         register_sheep(&mut actor, &dir, "worker", Some(silent_tx));
 
@@ -12199,8 +12263,8 @@ mod tests {
                         body: "swept 3".to_string()
                     }
                 ),
-                row(1, "api", ActionOutcome::NoChannel),
                 row(2, "worker", ActionOutcome::TimedOut),
+                row(1, "zeus", ActionOutcome::NoChannel),
             ])
         );
     }
@@ -12231,6 +12295,7 @@ mod tests {
         assert_eq!(
             triggered(answer).await,
             Ok(vec![
+                row(1, "api", ActionOutcome::NoChannel),
                 row(
                     0,
                     "web",
@@ -12238,7 +12303,6 @@ mod tests {
                         body: "swept 3".to_string()
                     }
                 ),
-                row(1, "api", ActionOutcome::NoChannel),
             ])
         );
         assert!(

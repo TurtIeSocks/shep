@@ -94,6 +94,148 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       on that same row says it never started at all.
     </p>
 
+    <h2 id="the-dogs-table">The dogs table</h2>
+    <p>
+      Dogs get their own table, under a <code>Dogs</code> caption, wherever
+      one appears beside a flock listing. Every column the two tables share
+      sits in the same place, and each table's own columns come last:
+    </p>
+    <div class="rows">
+      <div class="row"><span>both</span><span><code>ID NAME STATUS PID RESTARTS EXIT CPU MEM UPTIME</code></span></div>
+      <div class="row"><span>sheep only</span><span><code>FOLD SMIT</code></span></div>
+      <div class="row"><span>dogs only</span><span><code>SOURCE</code></span></div>
+    </div>
+    <CodeBlock label="shep flock">{`┌────┬────────┬──────────────┬───────┬──────────┬──────┬─────┬──────┬────────┬────────┬──────┐
+│ ID │ NAME   │ STATUS       │ PID   │ RESTARTS │ EXIT │ CPU │ MEM  │ UPTIME │ FOLD   │ SMIT │
+├────┼────────┼──────────────┼───────┼──────────┼──────┼─────┼──────┼────────┼────────┼──────┤
+│ 0  │ golbat │ (o.o) online │ 48182 │ 0        │ -    │ -   │ 3.0M │ 2s     │ backed │ -    │
+└────┴────────┴──────────────┴───────┴──────────┴──────┴─────┴──────┴────────┴────────┴──────┘
+
+Dogs
+┌────┬────────────┬──────────────┬───────┬──────────┬──────┬─────┬──────┬────────┬─────────┐
+│ ID │ NAME       │ STATUS       │ PID   │ RESTARTS │ EXIT │ CPU │ MEM  │ UPTIME │ SOURCE  │
+├────┼────────────┼──────────────┼───────┼──────────┼──────┼─────┼──────┼────────┼─────────┤
+│ 1  │ log-rotate │ (o.o) online │ 48207 │ 0        │ -    │ -   │ 6.6M │ 2s     │ adopted │
+└────┴────────────┴──────────────┴───────┴──────────┴──────┴─────┴──────┴────────┴─────────┘`}</CodeBlock>
+    <p>
+      <code>FOLD</code> and <code>SMIT</code> are missing from the dogs table
+      because they are impossible for a dog rather than merely empty: a dog
+      belongs to no fold, and a smit is a mark a dog paints <em>on</em> a
+      sheep. A column that reads <code>-</code> on every row teaches nothing.
+    </p>
+    <p>
+      Colours match too, column for column. Same face and status colour, same
+      restart colour above zero, same ramps for CPU and MEM, same
+      <code>EXIT</code>. So the same dog reads the same way under
+      <code>shep dogs</code>, under <code>shep flock</code>, and after
+      <code>shep restart log-rotate</code>.
+    </p>
+
+    <h3 id="source-says-whose-code-is-running">SOURCE says whose code is running</h3>
+    <p>
+      It is the only column in shep carrying a trust distinction, so the two
+      values do not look alike. <code>built-in</code> is shep running its own
+      code, and is muted like any other label you read past.
+      <code>adopted</code> is a third-party binary running at the shepherd's
+      own trust level, from a path you supplied, with no sandbox around it.
+      That gets the same colour a restart count above zero gets: worth a
+      glance, not a fault, because you chose it.
+    </p>
+    <p>
+      <code>enable</code>, <code>disable</code>, <code>adopt</code> and
+      <code>rehome</code> print a one-row confirmation with the same
+      treatment. Their <code>STATUS</code> holds either a status or a
+      sentence saying why no shepherd answered, and only a status is
+      coloured; a sentence is left plain, because a colour repeating the
+      words beside it is decoration rather than information.
+    </p>
+
+    <h3 id="where-else-colour-appears">Where else colour appears</h3>
+    <p>
+      Every table shep prints follows one rule: a colour carries information,
+      or the column does not get one. Beyond the flock and the dogs:
+    </p>
+    <div class="rows">
+      <div class="row"><span><code>trigger</code>, <code>signal</code>, <code>whisper</code></span><span>OUTCOME by what happened: it worked, nothing to report, a config gap you can close, or it failed</span></div>
+      <div class="row"><span><code>flush</code>, <code>startup</code></span><span>RESULT the same way. <code>absent</code> is muted, not marked: it is the state the verb was asked to produce</span></div>
+      <div class="row"><span><code>barks</code></span><span>SINKS, so an alert that failed to deliver does not read like one that arrived</span></div>
+      <div class="row"><span><code>kill</code></span><span>SOCKET_REMOVED, because a <code>false</code> is what the next boot has to contend with</span></div>
+      <div class="row"><span><code>import</code></span><span>REUSE_PORT when it is <code>true</code>, which is work you have to do</span></div>
+    </div>
+    <Callout variant="note">
+      Seven tables carry no colour at all, deliberately: <code>describe</code>'s
+      lamb tree, <code>delete</code>'s id list, <code>unset</code>'s count, the
+      two saved-roll tables, the KV store, and
+      <code>shep dogs --available</code>. Each is either pure data shep has no
+      opinion about, or a single column that is also the whole content, where
+      muting would fade the table and distinguish nothing.
+    </Callout>
+    <p class="fine">
+      The roll listing is the one table with a <code>STATUS</code> column and
+      no colour on it. Everything in a saved roll is stopped by definition, so
+      the cell reads <code>stopped</code> on every row of every rendering, and
+      a colour that never varies distinguishes nothing.
+    </p>
+
+    <h2 id="after-a-lifecycle-command">After a lifecycle command</h2>
+    <p>
+      <code>start</code>, <code>stop</code>, <code>restart</code>,
+      <code>reload</code>, <code>delete</code> and <code>stock</code> all
+      print the whole flock afterwards, not only the sheep they touched. The
+      question after starting one app is usually what everything else is
+      doing, and the exit code already said whether the one you named worked.
+    </p>
+    <CodeBlock label="shep restart golbat">{`┌────┬────────┬─────────┬───────┬──────────┬─────────┬─────┬────────┬────────┬────────┬──────┐
+│ ID │ NAME   │ STATUS  │ PID   │ RESTARTS │ EXIT    │ CPU │ MEM    │ UPTIME │ FOLD   │ SMIT │
+├────┼────────┼─────────┼───────┼──────────┼─────────┼─────┼────────┼────────┼────────┼──────┤
+│ 4  │ golbat │ online  │ 14459 │ 5        │ -       │ -   │ 416.0K │ 0s     │ backed │ -    │
+│ 5  │ koji   │ stopped │ -     │ 2        │ SIGTERM │ -   │ -      │ 0s     │ backed │ -    │
+└────┴────────┴─────────┴───────┴──────────┴─────────┴─────┴────────┴────────┴────────┴──────┘
+
+Dogs
+┌────┬────────────┬────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┐
+│ ID │ NAME       │ STATUS │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ SOURCE  │
+├────┼────────────┼────────┼───────┼──────────┼──────┼──────┼──────┼────────┼─────────┤
+│ 6  │ log-rotate │ online │ 14110 │ 1        │ -    │ 0.0% │ 6.6M │ 41s    │ adopted │
+└────┴────────────┴────────┴───────┴──────────┴──────┴──────┴──────┴────────┴─────────┘`}</CodeBlock>
+    <p>
+      That is the same output <code>shep flock</code> gives, dogs table and
+      all, so <code>shep restart log-rotate</code> and <code>shep flock</code>
+      draw the same dog the same way. See <a href="#the-dogs-table">the dogs
+      table</a> for why it is a second table rather than another row.
+    </p>
+    <p>
+      <code>delete</code> is the one verb whose listing cannot show what it
+      did, since the rows are gone. It names the ids it removed on stderr and
+      prints what is left on stdout.
+    </p>
+    <CodeBlock label="shep delete koji">{`notice[delete]: deleted 1 sheep, id 5`}</CodeBlock>
+    <Callout variant="note">
+      <code>--format json</code> is not widened. A script that runs
+      <code>shep stop web --format json</code> asked about
+      <code>web</code>, so <code>data</code> holds the rows for
+      <code>web</code>. Use <code>shep flock --format json</code> when you
+      want the flock.
+    </Callout>
+
+    <h2 id="row-order">Row order</h2>
+    <p>
+      Every listing shep prints is sorted by name, then by id. That covers
+      <code>shep flock</code>, every lifecycle verb above,
+      <code>shep lookout</code>, and the tables
+      <code>signal</code>, <code>whisper</code> and <code>trigger</code>
+      print.
+    </p>
+    <p>
+      Ids are handed out in registration order, which is a fact about your
+      shell history rather than about the flock, and they move: a
+      <code>delete all</code> followed by a fresh start renumbers everything.
+      Names do not. The id breaks ties, so the four instances of an app
+      stocked to four stay in a fixed order instead of shuffling between
+      refreshes, and it is still what you type at
+      <code>shep stop 11</code>.
+    </p>
+
     <h2>Narrow windows</h2>
     <p>
       The table measures your terminal and drops columns until it fits,

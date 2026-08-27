@@ -81,18 +81,25 @@ NAME     SOURCE    SHEPHERD  STATUS
 metrics  built-in  true      online
 
 $ shep dogs
-NAME     SOURCE    STATUS  PID    RESTARTS  CPU  MEM   UPTIME
-metrics  built-in  online  39950  0         -    9.8M  1s
+ID  NAME     STATUS  PID    RESTARTS  EXIT  CPU  MEM    UPTIME  SOURCE
+1   metrics  online  49313  0         -     -    10.9M  2s      built-in
 
 $ shep flock
-ID  NAME  STATUS  PID    RESTARTS  CPU  MEM   UPTIME  FOLD
-0   web   online  39899  0         -    3.0M  5s      -
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
+0   web   online  49290  0         -     -    3.0M  2s      -     -
 
 Dogs
-NAME     SOURCE    STATUS  PID    RESTARTS  CPU  MEM   UPTIME
-metrics  built-in  online  39950  0         -    9.8M  1s
+ID  NAME     STATUS  PID    RESTARTS  EXIT  CPU  MEM    UPTIME  SOURCE
+1   metrics  online  49313  0         -     -    10.9M  2s      built-in
 
 $ shep disable metrics`}</CodeBlock>
+    <p class="fine">
+      The dogs table shares its column order with the sheep table above it,
+      so a dog and a sheep read the same way. <code>SOURCE</code> is the one
+      column only dogs have, and <code>FOLD</code>/<code>SMIT</code> the two
+      only sheep have. See <a href="/docs/output#the-dogs-table">terminal
+      output</a>.
+    </p>
     <p class="fine">
       Running <code>enable</code> and <code>adopt</code> at once from a
       provisioning script is safe: each takes an exclusive lock on{" "}

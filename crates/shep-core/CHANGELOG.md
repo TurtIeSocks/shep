@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daemon that predates the request answers its existing "does not implement
   that request" error, and every previously pinned wire fixture is unchanged.
 
+- Add `protocol::sort_flock`, the one ordering rule every operator-facing
+  listing takes: by name, then by id. An id is assigned at registration, so
+  ordering by it sorts the flock by an accident of history rather than by
+  anything an operator is looking for, and it is not stable -- a `delete all`
+  followed by a fresh start moved a real thirteen-app flock from ids 0-10 to
+  11-21 with nothing about the apps having changed. The id keeps its other
+  job: it is still how one instance of a clustered app is addressed. It stops
+  being a sort key and stays an addressing key.
+
 ## [0.1.1] - 2026-08-26
 
 ### Additions

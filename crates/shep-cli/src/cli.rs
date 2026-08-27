@@ -566,11 +566,28 @@ pub enum Commands {
 /// Arguments to `shep start`.
 #[derive(Debug, clap::Args)]
 pub struct StartArgs {
-    /// Script paths, Flockfiles, names the flock already has, or `-` to read
-    /// Flockfile JSON from stdin
+    /// Selectors, script paths, Flockfiles, or `-` to read Flockfile JSON
+    /// from stdin
     ///
-    /// Omit them to start the Flockfile in the current directory, or, when
-    /// there is none, to bring a shepherd up with nothing running yet.
+    /// A target is resolved in four tiers and the first one that matches
+    /// wins: a sheep the flock already has, by id or by name; then a fold,
+    /// written either as `fold:<name>` or as the bare fold name; then a
+    /// Flockfile, by its extension; then a path on disk, started as a
+    /// script.
+    ///
+    /// So `shep start backed` starts the fold `backed` even when a file
+    /// called `backed` is sitting in the current directory. Write `./backed`
+    /// to mean the file: a sheep name may never contain a path separator, so
+    /// a target carrying one is always a path.
+    ///
+    /// The wildcard selectors work here too, and mean what they mean
+    /// everywhere else: `all`, `/regex/`, and glob patterns such as
+    /// `web-*`. They reach only sheep the flock already has, since there is
+    /// nothing to register. A sheep already running is reported and left
+    /// alone; `restart` is the verb that replaces one.
+    ///
+    /// Omit the targets to start the Flockfile in the current directory, or,
+    /// when there is none, to bring a shepherd up with nothing running yet.
     ///
     /// Several are started in turn, not atomically: if the second fails the
     /// first is already up, and the exit code is the first failure. `--name`

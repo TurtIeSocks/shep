@@ -386,6 +386,29 @@ pub fn scene(which: Scene) -> (&'static str, Buffer) {
     (which.label(), scene_with(which, Duration::from_secs(600)))
 }
 
+/// Parks the gallery's cursor on the sheep with id `id`.
+///
+/// `SelectDown` moves one VISIBLE row, and the table reads by name, so the
+/// number of presses a given sheep needs is a fact about the fixture's names
+/// rather than about its ids. Walking until the id matches keeps a scene
+/// describing the sheep its assertions name, whatever the ordering rule is.
+///
+/// # Panics
+///
+/// If `id` is not in the flock, or is hidden by a filter. Gallery scaffolding:
+/// a scene that silently described a different sheep than the one its own
+/// assertions name is the failure this exists to make loud.
+#[track_caller]
+fn select_id(app: &mut App, id: u32) {
+    for _ in 0..=app.flock_len() {
+        if app.selected() == Some(id) {
+            return;
+        }
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+    panic!("the gallery cannot park its cursor on id {id}");
+}
+
 /// One scene, `age` after its opening snapshot.
 ///
 /// The parameter exists for one test:
@@ -534,10 +557,16 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         now: t0 + Duration::from_secs(7),
     });
 
-    // Onto `api`, id 2, in both flocks — the third row of each. A fresh
-    // snapshot selects the FIRST id, so without this every "sheep 2  api"
-    // and "bleats  api" assertion below is asserting about `web` at id 0 and
-    // failing for a reason that has nothing to do with the pane.
+    // Onto `api`, id 2, in both flocks. A fresh snapshot selects the first
+    // VISIBLE row, so without this every "sheep 2  api" and "bleats  api"
+    // assertion below is asserting about whichever sheep the table happens to
+    // draw first, and failing for a reason that has nothing to do with the
+    // pane.
+    //
+    // Walked by id rather than by a fixed number of `j`s. The table reads by
+    // name, so which row `api` occupies is decided by what the other five
+    // sheep are called; two `SelectDown`s used to land on it only because the
+    // table read by id and `api` held id 2.
     //
     // The four excluded scenes have either no flock (`Empty`) or no pane
     // below the table to describe (`Narrow`, `TooNarrow`, `TableOnly`), so
@@ -546,15 +575,12 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         which,
         Scene::Empty | Scene::Narrow | Scene::TooNarrow | Scene::TableOnly
     ) {
-        app.update(Msg::Key(KeyPress::SelectDown));
-        app.update(Msg::Key(KeyPress::SelectDown));
+        select_id(&mut app, 2);
     }
 
-    // `LambsUnknown` wants `cron`, id 4 — two rows further down than `api`,
-    // where the block above already parked the cursor.
+    // `LambsUnknown` wants `cron`, id 4, instead.
     if which == Scene::LambsUnknown {
-        app.update(Msg::Key(KeyPress::SelectDown));
-        app.update(Msg::Key(KeyPress::SelectDown));
+        select_id(&mut app, 4);
     }
 
     match which {

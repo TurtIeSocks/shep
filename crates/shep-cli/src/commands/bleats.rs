@@ -294,9 +294,11 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
 ///
 /// Within one sheep, `out_file` (unless `--err`) prints before `err_file`
 /// (unless `--out`) — this module's own doc states the ordering limitation
-/// that follows from it. Ids are sorted before anything is read: `cache` is
-/// a `HashMap`, whose iteration order is not the id order this command's
-/// `--format json` output is pinned against.
+/// that follows from it. The matched sheep are sorted before anything is
+/// read -- `cache` is a `HashMap` and its iteration order is arbitrary -- by
+/// name and then by id, the one order every operator-facing listing takes
+/// (`shep_core::protocol::sort_flock`). It was id order until that rule was
+/// made the only one.
 ///
 /// A `None` path means the shepherd predates the field (module doc,
 /// [`shep_core::protocol::ProcessInfo::out_file`]) — one `log_path_unknown`
@@ -318,7 +320,11 @@ fn tail_log_files(
         .values()
         .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref()))
         .collect();
-    matched.sort_unstable_by_key(|info| info.id);
+    // Name then id, the one order every operator-facing shep listing takes
+    // (`shep_core::protocol::sort_flock`'s own doc). Not `sort_flock` itself:
+    // this is a `Vec<&ProcessInfo>` borrowed out of the cache, and copying the
+    // rows to reach the helper would buy nothing but a clone per sheep.
+    matched.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
 
     let mut failure = false;
 
@@ -1608,20 +1614,32 @@ mod tests {
         );
     }
 
-    /// Scripts the listing in DESCENDING id order, so the cache's `HashMap`
-    /// iteration order cannot be what makes ascending output pass.
+    /// fails if the sheep are tailed in the order the cache happens to hold
+    /// them, or in id order.
+    ///
+    /// The fixture is built so those two answers and the right one are all
+    /// different. `b` holds id 1 and `a` holds id 2, so id order is `b, a`
+    /// while name order is `a, b`; the listing is scripted `b, a` so the
+    /// cache's arbitrary `HashMap` order cannot be what makes the assertion
+    /// pass either.
+    ///
+    /// It read `a` 1, `b` 2 until this change, which made name order and id
+    /// order the same sequence -- so once `bleats` moved to name order the
+    /// test went on passing while no longer able to tell the two apart, and
+    /// its name still said `id`.
     #[tokio::test]
-    async fn files_are_printed_in_ascending_id_order() {
+    async fn files_are_printed_in_name_order() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("s.sock");
         let a_path = write_log(dir.path(), "a-out.log", "line-from-a\n");
         let b_path = write_log(dir.path(), "b-out.log", "line-from-b\n");
 
         let (client, daemon) = fake_client_with_push(&sock).await;
-        let mut sheep_a = info(1, "a");
-        sheep_a.out_file = Some(a_path);
-        let mut sheep_b = info(2, "b");
+        // `b` takes the LOWER id, so id order and name order disagree.
+        let mut sheep_b = info(1, "b");
         sheep_b.out_file = Some(b_path);
+        let mut sheep_a = info(2, "a");
+        sheep_a.out_file = Some(a_path);
         daemon.reply_to_list(vec![sheep_b, sheep_a]);
 
         let mut out = Vec::new();
@@ -1642,15 +1660,11 @@ mod tests {
         }
         let rendered = String::from_utf8(out).unwrap();
 
-        let a_pos = rendered
-            .find("line-from-a")
-            .expect("id 1's line is present");
-        let b_pos = rendered
-            .find("line-from-b")
-            .expect("id 2's line is present");
+        let a_pos = rendered.find("line-from-a").expect("a's line is present");
+        let b_pos = rendered.find("line-from-b").expect("b's line is present");
         assert!(
             a_pos < b_pos,
-            "ascending id order means id 1 before id 2: {rendered}"
+            "name order puts `a` (id 2) before `b` (id 1): {rendered}"
         );
     }
 

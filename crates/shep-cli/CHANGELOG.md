@@ -13,7 +13,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Additions
+
+- The dogs table's columns line up with the sheep table's. Every column the
+  two share sits in the same order and each table's own columns come last, so
+  the dogs table gains `ID` and `EXIT` and moves `SOURCE` from second to last.
+  Both fields were already on the `ProcessInfo` it builds from, so this is no
+  wire change. `FOLD` and `SMIT` stay off it because they are impossible for a
+  dog rather than empty.
+
+- `SOURCE` carries the one trust distinction shep draws. `adopted` is a
+  third-party binary running at the shepherd's own trust level from an
+  operator-supplied path; `built-in` is shep running its own code. They no
+  longer look identical.
+
+- Colour reaches every table that has something to say with one, which is
+  fifteen of the twenty-two in `output::rows`. The eight newly covered are the
+  three per-sheep reply tables (`trigger`, `signal`, `whisper`), `flush`'s
+  two, `startup`'s, `barks` and `kill`, plus `import`'s `REUSE_PORT`. Seven
+  stay plain on purpose, each with the reason recorded on its impl.
+
+- Colour reaches the seven `Render` impls that are not the flock table.
+  `colour_cell` had only ever appeared inside `FlockRows`, so one of eight
+  tables was coloured and the same dog read one way under `shep dogs` and
+  another under `shep flock`. The dogs table and the `enable`/`disable`/
+  `adopt`/`rehome` confirmations now take the flock table's own rules, and
+  `shep empty`'s table mutes its id and its placeholders. `describe`'s lamb
+  table stays plain: two identity columns with no state, no reading and no
+  placeholder, so there is nothing for a colour to carry.
+
+- `shep start` takes the selector grammar every other lifecycle verb takes:
+  `all`, `fold:<name>`, `/regex/`, globs, and a bare id. `shep stop
+  fold:backed` worked and `shep start fold:backed` refused with "backed is not
+  `-`, a recognised Flockfile, or an existing path", because `start` alone
+  took a different argument grammar. Folds were actionable everywhere except
+  the verb that creates things.
+
+- A bare token is also tried as a fold name, so `shep start backed` reaches
+  the fold `backed`. The full order, first tier that matches wins: a sheep by
+  id or name, then a fold, then a Flockfile, then a path on disk. Written down
+  in `shep start --help` and on the folds page, since a precedence rule is
+  only reasonable if the person it surprises can find out why.
+
+- `./backed` always means the file. A sheep name may never contain a path
+  separator, so a target carrying one skips the flock entirely. That is what
+  gives somebody whose fold shares a name with a file a way to say which they
+  meant.
+
 ### Fixes
+
+- Cell colour is keyed on a column's NAME rather than its index. The old
+  `rows_for` painted `row[0]`, `row[4]`, `row[9]` and `row[10]`, which are
+  facts about one table's column order: reordering columns repointed every one
+  of them with nothing failing to compile and no test able to notice.
 
 - Say so when a Flockfile app names a sheep the flock already has under a
   different config, instead of ignoring the edit in silence. `shep start` on
@@ -28,6 +80,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separate decision, and changing a running flock's `cwd` or argv underneath
   an operator would be a worse surprise than the bug being fixed. Field names
   only, never values, since `env` carries secrets.
+
+- A selector that matched nothing is reported as a selector. `shep start
+  fold:typo` said `fold:typo is not ... an existing path` and sent an operator
+  looking for a file they had never asked about; it now says no sheep is in a
+  fold called typo, and exits 3 like every other verb does.
+
+- Every lifecycle verb prints the whole flock afterwards, not only the rows it
+  touched. `shep start koji` printed a one-row table containing koji; the
+  question an operator has after a lifecycle command is what the flock looks
+  like now, which a one-row table cannot answer and which the exit code
+  already covered for the sheep they named. Applies to `start`, `stop`,
+  `restart`, `reload`, `delete` and `stock`. `describe` stays narrow, because
+  answering about one sheep is what it is for.
+
+- A lifecycle verb acting on a dog renders it through the dogs table rather
+  than the sheep table. `shep restart log-rotate` gave it an id, a face, and a
+  `FOLD` and `SMIT` a dog can never fill, while dropping the `SOURCE` column
+  that says whether it was adopted or is built in. Falls out of the change
+  above: the listing goes through the same renderer `shep flock` uses.
+
+- `--format json` is deliberately NOT widened by either of those. A script
+  running `shep stop web --format json` asked about `web`, so `data` still
+  holds `web`'s rows; widening it would break every consumer reading
+  `data[0]`. `shep flock --format json` is the way to ask for the flock.
+
+- `shep lookout`'s flock table draws by name, then by id, rather than by id.
+  It repolls every two seconds, so the tiebreak is what stops two instances of
+  one app swapping places under the cursor between refreshes.
+
+- `shep bleats` tails a flock's log files in name order, and `shep flock`
+  against a stopped shepherd lists the saved roll in name order. Both used
+  the order they happened to be handed.
 
 - Table columns are padded by the columns a name draws in, not by its
   character count. A CJK or emoji glyph counts as one character and draws as
