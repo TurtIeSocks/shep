@@ -235,7 +235,7 @@ ID  NAME  OUTCOME     DETAIL
     <h2>Summary for the impatient</h2>
     <ul>
       <li>Ask for a channel with <code>channel = true</code> (or get one free from <code>wait_ready</code> / <code>shutdown_with_message</code>).</li>
-      <li>Read <code>SHEP_CHANNEL_FD</code>, open that fd, read/write newline-delimited JSON.</li>
+      <li>Read <code>SHEP_CHANNEL_FD</code> on unix, or <code>SHEP_CHANNEL_PIPE</code> on Windows, where the channel is a named pipe your app opens by path rather than an inherited fd. Exactly one is ever set, so branch on which one is present, not on the platform. Then read/write newline-delimited JSON.</li>
       <li>A plain blocking read works: no event loop required.</li>
       <li>Reply to every <code>action</code> message you receive, even ones you don't recognize, exactly once, promptly.</li>
       <li>Echo the <code>id</code>: one field, and it's what makes a slow action's answer land on the right trigger.</li>

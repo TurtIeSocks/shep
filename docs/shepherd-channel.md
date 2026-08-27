@@ -52,9 +52,12 @@ not exist there. So the descriptor half of the contract is replaced, and
 only that half:
 
 - The daemon exports **`SHEP_CHANNEL_PIPE`**, whose value is a named-pipe
-  path like `\\.\pipe\shep-channel-1234-0`. **Your app opens it itself**,
-  for reading and writing, exactly as it would open any file. That open is
-  the whole difference.
+  path like `\\.\pipe\shep-channel-1234-0-9f3c1a2b4d5e6f708192a3b4c5d6e7f8`.
+  **Your app opens it itself**, for reading and writing, exactly as it would
+  open any file. That open is the whole difference. Read the name out of the
+  environment and do not try to reconstruct it: the trailing hex is random
+  per spawn, deliberately, because a named pipe is readable by every local
+  account and a guessable name is one a hostile account could open first.
 - `SHEP_CHANNEL_VERSION` is exported as before.
 - **`SHEP_CHANNEL_FD` is deliberately NOT set on Windows.** Branch on which
   variable is present rather than on the platform: an app that finds
@@ -193,7 +196,8 @@ with any subscriber seeing, not just the one who asked.
 
 - Ask for a channel with `channel = true` (or get one for free from
   `wait_ready` / `shutdown_with_message`).
-- Read `SHEP_CHANNEL_FD`, open that fd, read/write newline-delimited JSON.
+- Read `SHEP_CHANNEL_FD` on unix or `SHEP_CHANNEL_PIPE` on Windows (exactly
+  one is ever set), open it, read/write newline-delimited JSON.
 - A plain blocking read works — no event loop required.
 - Reply to every `action` message you receive, even ones you don't
   recognize, and reply exactly once, promptly.

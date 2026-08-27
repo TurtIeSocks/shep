@@ -21,14 +21,16 @@ import Callout from "../../components/docs/Callout.astro";
     <h1>What's not built yet</h1>
     <ReferencePills slug="not-built" />
     <p class="lede">
-      shep is feature-complete for v1 on macOS, Linux and Windows: every verb
-      in the CLI reference, the whistle MCP server, all four lookout panes,
-      dogs, serve/dev/runtime, and config and packaging. This page is the
-      honest remainder: what the newest platform does not do, and a short
-      list of smaller cuts, each with the reason it isn't here yet.
+      shep is feature-complete for v1 on macOS and Linux: every verb in the
+      CLI reference, the whistle MCP server, all four lookout panes, dogs,
+      serve/dev/runtime, and config and packaging. Windows runs the same
+      build and the same day-to-day loop, minus a named handful of refusals
+      it makes out loud. This page is the honest remainder: what the newest
+      platform does not do, and a short list of smaller cuts, each with the
+      reason it isn't here yet.
     </p>
 
-    <h2>Windows: built, with two named limits</h2>
+    <h2>Windows: built, with named limits</h2>
     <p>
       <strong>This section used to say the opposite.</strong> Until
       2026-08-26 every command on Windows printed <code>shep does not yet
@@ -48,7 +50,7 @@ import Callout from "../../components/docs/Callout.astro";
       group.
     </p>
     <Callout variant="careful">
-      <strong>Two limits are real and are not going to be papered over.</strong>
+      <strong>These limits are real and are not going to be papered over.</strong>
       Windows has nothing SIGTERM-shaped that can be delivered to an
       arbitrary process, so <code>shep stop</code> waits out the app's whole
       <code>kill_timeout</code> and then terminates it — unless the app opts
