@@ -132,6 +132,12 @@ impl Render for FlockRows {
         // in a later task; this list just keeps the shape consistent with
         // every other verb answering `ProcessInfo`.
         "lambs",
+        // Here only until the SMIT column lands. The task that put `smit` on
+        // the wire deliberately stopped at the wire: a column is a rendering
+        // decision with a drop order and two width tiers behind it, and
+        // bolting one on here would have made a protocol change into a table
+        // change nobody reviewed as one.
+        "smit",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
@@ -368,6 +374,10 @@ impl Render for DogRows {
         // Rides the JSON anyway, same as every other field on this wire, so
         // a consumer switching on `ProcessInfo` shape alone still sees it.
         "last_exit",
+        // A dog paints smits; nothing paints one on a dog. Always `null`
+        // here, and in the JSON for the same shape-consistency reason as the
+        // rest of this list.
+        "smit",
     ];
 
     // Parallel to `headers()` above: `["NAME", "SOURCE", "STATUS", "PID",
@@ -783,6 +793,9 @@ impl Render for FlushedRows {
         // a terminal. Stays in the JSON for shape consistency with every
         // other verb answering `ProcessInfo`.
         "last_exit",
+        // And the same again for the mark a dog painted: a flush neither
+        // reads nor changes it.
+        "smit",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "OUT_FILE",

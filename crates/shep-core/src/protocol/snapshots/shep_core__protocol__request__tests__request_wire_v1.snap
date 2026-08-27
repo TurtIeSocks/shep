@@ -228,5 +228,23 @@ expression: requests
       },
       "line": "reload-config"
     }
+  },
+  {
+    "id": 20,
+    "deadline_ms": null,
+    "body": {
+      "kind": "set_smit",
+      "sheep": "web",
+      "smit": "▲ main@a1b2c3"
+    }
+  },
+  {
+    "id": 21,
+    "deadline_ms": null,
+    "body": {
+      "kind": "set_smit",
+      "sheep": "web",
+      "smit": null
+    }
   }
 ]
