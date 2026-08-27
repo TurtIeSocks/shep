@@ -78,21 +78,24 @@ const rows: ExampleRow[] = [
       No config edits needed. Every path in <code>examples/Flockfile.toml</code>
       is relative to <code>examples/</code> itself — a Flockfile app with no
       <code>cwd</code> runs where its Flockfile lives — so cloning the repo
-      and running the two commands below just works.
+      and running the commands below just works.
     </Callout>
 
     <h2>Run it</h2>
+    <p>
+      Two of the seven — <code>leaky</code> and <code>crasher</code> — restart
+      on purpose and by design, and <code>shep start</code> registers into
+      whatever <code>$SHEP_HOME</code> is already pointed at. The
+      <code>export</code> below is not optional: skip it and this starts
+      inside your own real daemon, alongside whatever it's already
+      supervising.
+    </p>
     <div class="terminal">
       <div><span class="prompt">$</span> cargo build --release --workspace</div>
+      <div><span class="prompt">$</span> export SHEP_HOME="$(mktemp -d)"</div>
       <div><span class="prompt">$</span> shep start examples/Flockfile.toml</div>
       <div><span class="prompt">$</span> shep flock</div>
     </div>
-    <p class="fine">
-      Two of the seven — <code>leaky</code> and <code>crasher</code> — restart
-      on purpose and by design. Run this against a throwaway
-      <code>$SHEP_HOME</code>, not the daemon supervising anything you care
-      about.
-    </p>
 
     <h2>What each one demonstrates</h2>
     <div class="field-table">
