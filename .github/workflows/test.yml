@@ -26,6 +26,19 @@ name: test
 # Cache scope is per-branch, so the first run on a new PR is still cold. The
 # win is the second and every push after it, which is the shape of most work
 # here.
+#
+# Every job also carries `timeout-minutes`. These are ceilings against a hang,
+# NOT performance budgets: each is roughly three times the job's runtime on
+# the last green run, rounded up, with a floor of ten minutes so a cold cache
+# on a fresh branch cannot trip one. A job that gets slower is not what this
+# file is trying to catch; a job that stops making progress is.
+#
+# GitHub's default when the key is absent is 360 minutes, which is why the
+# omission was expensive rather than merely untidy. Three runs on 2026-08-27
+# were cancelled by hand at 40-plus minutes each because a Windows test hung
+# and nothing here bounded it -- left alone, the first would have held a
+# runner for six hours before Actions said a word. Add a job below and give it
+# a timeout, whatever else you do.
 on:
   push:
     branches: [main]
@@ -36,6 +49,7 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93 --profile minimal --component clippy,rustfmt
@@ -48,6 +62,7 @@ jobs:
       - run: cargo +1.93 clippy --workspace --all-targets --all-features -- -D warnings
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal
@@ -55,6 +70,8 @@ jobs:
       - run: cargo +nightly doc --workspace --all-features --no-deps
         env: { RUSTDOCFLAGS: "-Dwarnings --cfg docsrs" }
   typos:
+    # Compiles nothing, so the floor is the whole value here.
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +88,9 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
         toolchain: [stable, "1.88"]
     runs-on: ${{ matrix.os }}
+    # `timeout-minutes` applies per matrix leg, so it is sized from the
+    # slowest one: `windows-latest` / stable, 355s on the last green run.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
@@ -79,6 +99,9 @@ jobs:
       - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots'
   minimal-versions:
     runs-on: ubuntu-latest
+    # Resolves a whole second lockfile before it builds anything, so it never
+    # gets the cache hit the other Linux jobs do.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly stable --profile minimal
@@ -87,6 +110,9 @@ jobs:
       - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots'
   musl:
     runs-on: ubuntu-latest
+    # Builds the whole tree for a second target, from cold, on the first run
+    # of a branch.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
@@ -118,6 +144,8 @@ jobs:
   # target's compile-time coverage.
   windows-gnu:
     runs-on: ubuntu-latest
+    # 39s on the last green run; the floor is doing all the work.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
@@ -130,6 +158,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # The slowest job in the file: two full test runs back to back, 414s on
+    # `windows-latest` last time it was green.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
@@ -169,6 +200,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # 143s on `windows-latest`, but every test here waits on a real clock and
+    # runs single-threaded, so this one gets more headroom than 3x.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
@@ -190,6 +224,9 @@ jobs:
   # first, so this job never reached `daemon_e2e`.
   coverage:
     runs-on: ubuntu-latest
+    # Instrumented builds are the slowest thing on Linux here, and this job
+    # also installs a tool before it starts.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component llvm-tools
@@ -214,6 +251,7 @@ jobs:
       matrix:
         toolchain: [stable, "1.88"]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
@@ -235,6 +273,9 @@ jobs:
     # on the way, so it has to actually START as root. A throwaway container
     # filesystem is the cheap way to have that.
     runs-on: ubuntu-latest
+    # One test, but the container has to build shep-daemon's test tier to get
+    # to it.
+    timeout-minutes: 20
     container:
       image: rust:1.88
     steps:
@@ -248,3 +289,69 @@ jobs:
       - run: >
           cargo test -p shep-daemon --test real_runner --locked --all-features
           -- --ignored --exact a_dropped_child_runs_as_the_requested_user
+  # Evidence, gathered on every push, at zero risk to the pull request
+  # carrying it.
+  #
+  # Two Windows tests are `#[cfg_attr(windows, ignore)]` right now:
+  # `real_runner_windows.rs`'s
+  # `kill_tree_reaches_a_grandchild_and_not_just_the_sheep` and
+  # `daemon_e2e.rs`'s `reopen_moves_a_running_sheeps_log_onto_the_recreated_path`.
+  # Both pass on a developer's Windows box; on `windows-latest` one of them
+  # hangs, which is what cost three runs 40-plus minutes each on 2026-08-27.
+  # Ignoring them unblocks the branch but also stops anyone learning anything,
+  # and neither reproduces off this runner -- so the only machine that can
+  # answer the question is the one that asks it.
+  #
+  # This job asks it. It runs the diagnostic test that prints the runner's
+  # job-object environment, then each ignored test explicitly, each as its own
+  # step so the log says plainly which one hung and which one merely failed.
+  #
+  # `continue-on-error: true` is what makes running known-bad tests safe: the
+  # job is reported neutral however its steps end, so it can never block a
+  # merge or turn the check suite red. It sits on the individual steps as well
+  # as the job, because the job-level flag only decides how the result is
+  # reported -- a failing step still ends the job, and the first test failing
+  # must not stop the second from running. `timeout-minutes: 12` is the other
+  # half: a hang here ends in twelve minutes with the log already written.
+  #
+  # This job is temporary. It exists to produce output, not to protect
+  # anything. Delete it in the same commit that deletes the two
+  # `cfg_attr(windows, ignore)` attributes, once the cause is understood.
+  windows-probe:
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 12
+    # Job-level rather than per-step: every step here exists to produce a
+    # readable log, and a backtrace is part of that for all three.
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # `--nocapture` is the entire point of this step: the diagnostic test
+      # asserts nothing and is meant to PASS, and libtest replays captured
+      # output only for tests that fail.
+      - run: >
+          cargo test -p shep-daemon --test real_runner_windows --locked --all-features
+          -- --nocapture --exact job_object_environment_reports_itself
+        continue-on-error: true
+      # Bounded on its own, and only this one is: hanging is this test's known
+      # failure mode, and a hang caught by the JOB timeout would cancel the
+      # job and take the next step down with it. Three minutes is many times
+      # what a real run needs -- the test's own longest wait is 15s -- and the
+      # step above has already built this binary, so nothing here is paying
+      # for a compile. The last step needs no such bound: it builds a second
+      # test binary, so a fixed budget would be guessing at compile time, and
+      # with nothing after it the job timeout is the right net.
+      - run: >
+          cargo test -p shep-daemon --test real_runner_windows --locked --all-features
+          -- --ignored --nocapture --exact
+          kill_tree_reaches_a_grandchild_and_not_just_the_sheep
+        continue-on-error: true
+        timeout-minutes: 3
+      - run: >
+          cargo test -p shep-daemon --test daemon_e2e --locked --all-features
+          -- --ignored --nocapture --exact
+          reopen_moves_a_running_sheeps_log_onto_the_recreated_path
+        continue-on-error: true
