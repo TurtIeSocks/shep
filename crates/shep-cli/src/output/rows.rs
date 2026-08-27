@@ -111,7 +111,7 @@ impl Render for FlockRows {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| process_info_paint(header, &self.0[index]),
+            |header, _cell, index| process_info_paint(header, &self.0[index]),
         )
     }
 
@@ -250,6 +250,21 @@ pub(super) enum Paint {
 /// row longer than its header list is malformed, `render_table` has its own
 /// guard for that, and painting past the last header would be inventing a
 /// column name to key on.
+///
+/// # Why `paint_of` is handed the cell and not the row
+///
+/// Every rule in this module decides a column from its OWN value: SOURCE from
+/// the source text, OUTCOME from the outcome kind, RESULT from the result
+/// word. Handing the closure the whole row let those rules reach the deciding
+/// value by index -- `row[1]`, `row[2]`, `row[3]` -- which is the exact
+/// coupling keying on the header name exists to remove, just moved one level
+/// in. Reordering `DogEnabledRow::headers` would have repointed them with
+/// nothing failing to compile.
+///
+/// So the closure gets `(header, cell, index)` and there is no row to index
+/// into. `index` remains only for the rules keyed off the SOURCE STRUCT
+/// rather than the rendered text ([`process_info_paint`] reads a
+/// `ProcessInfo`), and it addresses the payload, never a sibling cell.
 pub(super) fn paint<F>(
     mut rows: Vec<Vec<String>>,
     headers: &[&'static str],
@@ -258,11 +273,11 @@ pub(super) fn paint<F>(
     paint_of: F,
 ) -> Vec<Vec<String>>
 where
-    F: Fn(&str, usize) -> Paint,
+    F: Fn(&str, &str, usize) -> Paint,
 {
     for (index, row) in rows.iter_mut().enumerate() {
         for (cell, header) in row.iter_mut().zip(headers) {
-            match paint_of(header, index) {
+            match paint_of(header, cell, index) {
                 Paint::Status(status) => *cell = status_cell(status, presentation, status_word),
                 Paint::Role(role) => colour_cell(cell, role, presentation),
                 Paint::Default => mute_a_dash(cell, presentation),
@@ -336,11 +351,14 @@ fn source_role(source: &DogSource) -> Role {
 /// The treatment the four dog-action rows wear: `enable`, `disable`, `adopt`
 /// and `rehome`, which share the columns `NAME SOURCE SHEPHERD STATUS`.
 ///
-/// Keyed off the RENDERED row rather than off the struct, unlike
+/// Keyed off the RENDERED cell rather than off the struct, unlike
 /// [`process_info_paint`]. The four types carry `source` as a `DogSource`, an
-/// `Option<DogSource>` and a `status` as free text, so reading the cells back
-/// is what lets one function serve all four instead of four near-identical
-/// ones differing only in how they reach the same two facts.
+/// `Option<DogSource>` and a `status` as free text, so reading the rendered
+/// text back is what lets one function serve all four instead of four
+/// near-identical ones differing only in how they reach the same two facts.
+///
+/// `cell` is the cell of the column named by `header`, never a sibling: see
+/// [`paint`]'s own doc for why this takes a cell rather than a row.
 ///
 /// SOURCE takes [`source_role`], the same trust distinction the dogs table
 /// draws. `rehome`'s can be absent, which renders `-` and reaches the dash
@@ -356,14 +374,14 @@ fn source_role(source: &DogSource) -> Role {
 /// would be a second decoration repeating its neighbour. That is the same
 /// reasoning `lookout/theme.rs` gives for keeping a face out of its own flock
 /// pane.
-fn dog_action_paint(header: &str, row: &[String]) -> Paint {
+fn dog_action_paint(header: &str, cell: &str) -> Paint {
     match header {
-        "SOURCE" => match row[1].as_str() {
+        "SOURCE" => match cell {
             "built-in" => Paint::Role(Role::Ink3),
             "-" => Paint::Default,
             _ => Paint::Role(Role::Butter),
         },
-        "STATUS" => status_named_by(&row[3]).map_or(Paint::Default, Paint::Status),
+        "STATUS" => status_named_by(cell).map_or(Paint::Default, Paint::Status),
         _ => Paint::Default,
     }
 }
@@ -404,10 +422,13 @@ fn outcome_role(kind: &str) -> Role {
 /// is free-form explanatory text of unbounded length, it is only ever present
 /// when OUTCOME has already said what happened, and colouring a whole
 /// sentence the colour of the word beside it is decoration.
-fn reply_paint(header: &str, row: &[String]) -> Paint {
+///
+/// `cell` is the cell of the column named by `header`, never a sibling: see
+/// [`paint`]'s own doc for why this takes a cell rather than a row.
+fn reply_paint(header: &str, cell: &str) -> Paint {
     match header {
         "ID" => Paint::Role(Role::Ink3),
-        "OUTCOME" => Paint::Role(outcome_role(&row[2])),
+        "OUTCOME" => Paint::Role(outcome_role(cell)),
         _ => Paint::Default,
     }
 }
@@ -731,7 +752,7 @@ impl Render for DogRows {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| process_info_paint(header, &self.0[index]),
+            |header, _cell, index| process_info_paint(header, &self.0[index]),
         )
     }
 
@@ -918,7 +939,7 @@ impl Render for DogEnabledRow {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| dog_action_paint(header, &rows[index]),
+            |header, cell, _index| dog_action_paint(header, cell),
         )
     }
 
@@ -996,7 +1017,7 @@ impl Render for DogDisabledRow {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| dog_action_paint(header, &rows[index]),
+            |header, cell, _index| dog_action_paint(header, cell),
         )
     }
 
@@ -1066,7 +1087,7 @@ impl Render for DogAdoptedRow {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| dog_action_paint(header, &rows[index]),
+            |header, cell, _index| dog_action_paint(header, cell),
         )
     }
 
@@ -1144,7 +1165,7 @@ impl Render for DogRehomedRow {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| dog_action_paint(header, &rows[index]),
+            |header, cell, _index| dog_action_paint(header, cell),
         )
     }
 
@@ -1237,7 +1258,7 @@ impl Render for FlushedRows {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| process_info_paint(header, &self.0[index]),
+            |header, _cell, index| process_info_paint(header, &self.0[index]),
         )
     }
 
@@ -1357,7 +1378,7 @@ impl Render for EmptiedFiles {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| match (header, rows[index][2].as_str()) {
+            |header, cell, _index| match (header, cell) {
                 ("RESULT", "emptied") => Paint::Role(Role::Meadow),
                 ("RESULT", _) => Paint::Role(Role::Ink3),
                 _ => Paint::Default,
@@ -1472,7 +1493,7 @@ impl Render for KillRow {
             Self::headers(),
             presentation,
             status_word,
-            |header, _index| match header {
+            |header, _cell, _index| match header {
                 "SOCKET_REMOVED" if removed => Paint::Role(Role::Meadow),
                 "SOCKET_REMOVED" => Paint::Role(Role::Butter),
                 _ => Paint::Default,
@@ -1682,7 +1703,7 @@ impl Render for ImportRows {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| match (header, rows[index][3].as_str()) {
+            |header, cell, _index| match (header, cell) {
                 ("REUSE_PORT", "true") => Paint::Role(Role::Butter),
                 _ => Paint::Default,
             },
@@ -1781,7 +1802,7 @@ impl Render for StartupSteps {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| match (header, rows[index][2].as_str()) {
+            |header, cell, _index| match (header, cell) {
                 ("RESULT", "ok") => Paint::Role(Role::Meadow),
                 ("RESULT", "absent") => Paint::Role(Role::Ink3),
                 ("RESULT", _) => Paint::Role(Role::Bark),
@@ -1896,7 +1917,7 @@ impl Render for TriggeredRows {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| reply_paint(header, &rows[index]),
+            |header, cell, _index| reply_paint(header, cell),
         )
     }
 
@@ -2034,7 +2055,7 @@ impl Render for SignalledRows {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| reply_paint(header, &rows[index]),
+            |header, cell, _index| reply_paint(header, cell),
         )
     }
 
@@ -2118,7 +2139,7 @@ impl Render for SentLineRows {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| reply_paint(header, &rows[index]),
+            |header, cell, _index| reply_paint(header, cell),
         )
     }
 
@@ -2216,10 +2237,10 @@ impl Render for BarkRows {
             Self::headers(),
             presentation,
             status_word,
-            |header, index| match header {
-                "SINKS" if rows[index][4] == "-" => Paint::Default,
-                "SINKS" if rows[index][4].contains("(failed)") => Paint::Role(Role::Bark),
-                "SINKS" => Paint::Role(Role::Meadow),
+            |header, cell, _index| match (header, cell) {
+                ("SINKS", "-") => Paint::Default,
+                ("SINKS", sinks) if sinks.contains("(failed)") => Paint::Role(Role::Bark),
+                ("SINKS", _) => Paint::Role(Role::Meadow),
                 _ => Paint::Default,
             },
         )
@@ -3848,7 +3869,7 @@ pub(crate) mod tests {
 
         let mut cells: Vec<String> = DogRows(vec![dog.clone()]).rows().remove(0);
         cells.reverse();
-        let painted_rows = paint(vec![cells], &backwards, coloured(), true, |header, _| {
+        let painted_rows = paint(vec![cells], &backwards, coloured(), true, |header, _, _| {
             process_info_paint(header, &dog)
         });
 
@@ -3869,6 +3890,113 @@ pub(crate) mod tests {
         );
         assert_eq!(painted_rows[0][at("NAME")], "log-rotate", "still plain");
         assert_eq!(painted_rows[0][at("UPTIME")], "41s", "still plain");
+    }
+
+    /// The same reversed-header proof, pointed at every painter that is NOT
+    /// [`process_info_paint`].
+    ///
+    /// The sibling of `a_columns_colour_follows_its_name_and_not_its_position`
+    /// and the reason it needed one. That test covered `process_info_paint`
+    /// alone, while `dog_action_paint`, `reply_paint` and the four inline
+    /// closures each dispatched on the header NAME and then read the deciding
+    /// value at a fixed index -- `row[1]`, `row[3]`, `row[2]`, `rows[i][4]`.
+    /// Reordering `DogEnabledRow::headers` would have repointed all of them
+    /// with nothing failing to compile and nothing here to notice, which is
+    /// the exact defect the by-name rule exists to remove, moved one level
+    /// in.
+    ///
+    /// `paint` now hands each rule its OWN cell, so there is no row to index
+    /// into and the class of bug is gone by construction rather than by
+    /// inspection. This is what says so: every table below is painted through
+    /// a REVERSED header list, so every column sits somewhere it never sits
+    /// in life, and each still wears its own rule.
+    #[test]
+    fn every_painter_follows_the_column_name_and_not_the_position() {
+        /// Paints `rows` through `T`'s headers in reverse, and hands back a
+        /// lookup from column name to painted cell.
+        fn reversed<T: Render>(row: Vec<String>, paint_of: fn(&str, &str) -> Paint) -> Vec<String> {
+            let backwards: Vec<&'static str> = T::headers().iter().copied().rev().collect();
+            let mut cells = row;
+            cells.reverse();
+            let mut painted = paint(
+                vec![cells],
+                &backwards,
+                coloured(),
+                true,
+                |header, cell, _index| paint_of(header, cell),
+            )
+            .remove(0);
+            painted.reverse();
+            painted
+        }
+        let at =
+            |headers: &[&'static str], name: &str| headers.iter().position(|h| *h == name).unwrap();
+
+        // --- the four dog-action rows, through `dog_action_paint` ---------
+        let adopted = DogAdoptedRow {
+            name: "log-rotate".to_string(),
+            source: DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            },
+            shepherd_acted: true,
+            status: "online".to_string(),
+        };
+        let cells = reversed::<DogAdoptedRow>(adopted.rows().remove(0), dog_action_paint);
+        let h = DogAdoptedRow::headers();
+        assert_eq!(
+            cells[at(h, "SOURCE")],
+            painted("adopted", Role::Butter),
+            "SOURCE decided from SOURCE, wherever it sits"
+        );
+        assert_eq!(
+            cells[at(h, "STATUS")],
+            painted("(o.o) online", Role::Meadow),
+            "STATUS decided from STATUS"
+        );
+        assert_eq!(cells[at(h, "NAME")], "log-rotate", "NAME untouched");
+        assert_eq!(cells[at(h, "SHEPHERD")], "true", "SHEPHERD untouched");
+
+        // --- the three reply tables, through `reply_paint` ----------------
+        let reply = TriggeredRows(vec![ActionReply {
+            id: 0,
+            name: "web".to_string(),
+            outcome: ActionOutcome::TimedOut,
+        }]);
+        let cells = reversed::<TriggeredRows>(reply.rows().remove(0), reply_paint);
+        let h = TriggeredRows::headers();
+        assert_eq!(cells[at(h, "ID")], painted("0", Role::Ink3));
+        assert_eq!(cells[at(h, "OUTCOME")], painted("timed_out", Role::Bark));
+        assert_eq!(
+            cells[at(h, "DETAIL")],
+            "no reply within the app's own action_timeout",
+            "DETAIL untouched, and never mistaken for the OUTCOME beside it"
+        );
+
+        // --- the inline closures, which now share the same shape ----------
+        // Each of these decides its own column from its own cell, so driving
+        // them reversed proves the same property the two above do.
+        let emptied = EmptiedFiles(vec![EmptiedFile {
+            stream: "stdout",
+            file: "/logs/shepd.out.log".to_string(),
+            result: "emptied",
+        }])
+        .rows_for(coloured(), true);
+        assert_eq!(
+            emptied[0][at(EmptiedFiles::headers(), "RESULT")],
+            painted("emptied", Role::Meadow)
+        );
+
+        let steps = StartupSteps(vec![StartupStep {
+            action: "ran",
+            target: "launchctl load".to_string(),
+            result: "permission denied".to_string(),
+        }])
+        .rows_for(coloured(), true);
+        assert_eq!(
+            steps[0][at(StartupSteps::headers(), "RESULT")],
+            painted("permission denied", Role::Bark),
+            "an unrecognised RESULT is the failure line"
+        );
     }
 
     /// fails if SOURCE stops drawing the one trust distinction in the crate.
