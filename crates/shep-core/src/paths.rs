@@ -26,7 +26,27 @@ pub struct ShepPaths {
     pub pids: PathBuf,
     /// Runtime dir (sockets; created 0700)
     pub run: PathBuf,
-    /// Control socket: `run/shep.sock`
+    /// The control address the client dials and the daemon answers on.
+    ///
+    /// **Two different kinds of thing behind one field, on purpose.** On
+    /// unix it is a filesystem path, `run/shep.sock`, and a real AF_UNIX
+    /// socket file lives there. On Windows it is [`Self::pipe_name`] — a
+    /// named pipe's `\\.\pipe\...` name, which is path-*shaped* but names an
+    /// object in the kernel's pipe namespace rather than a file on any
+    /// volume.
+    ///
+    /// One field rather than two because every consumer in the workspace
+    /// treats this as an opaque address it hands to `Client::connect`, and a
+    /// second field would make all of them choose. The one place the
+    /// difference is load-bearing is a caller that treats this as a *file* —
+    /// `shep-cli`'s `wait_for_socket_to_disappear` is the only one, and it
+    /// carries its own Windows arm because a pipe has no directory entry to
+    /// watch: it stops existing when its last handle closes, so "has the
+    /// daemon gone" is a connect attempt there, not a `Path::exists`.
+    ///
+    /// A corollary worth stating because it silently breaks otherwise:
+    /// `socket.parent()` is `$SHEP_HOME/run` on unix and the meaningless
+    /// `\\.\pipe` on Windows. Nothing may derive a directory from this field.
     pub socket: PathBuf,
     /// Bark history ring: `barks.jsonl`
     pub barks: PathBuf,
@@ -52,13 +72,20 @@ impl ShepPaths {
     }
 
     /// Resolves the layout from an environment lookup and the user's home dir
+    ///
+    /// [`Self::socket`] resolves per-platform — a socket file under `run/` on
+    /// unix, a `\\.\pipe\...` name on Windows — for the reason that field's
+    /// own doc gives. Everything else is identical on both.
     #[must_use]
     pub fn resolve(env: &dyn Fn(&str) -> Option<String>, home_dir: &Path) -> Self {
         let home = env("SHEP_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir.join(".shep"));
         let run = home.join("run");
-        Self {
+        // `mut` is read only by the `cfg(windows)` block below; on unix the
+        // value is returned exactly as built.
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut paths = Self {
             daemon_config: home.join("shep.toml"),
             snapshot: home.join("flock.json"),
             logs: home.join("logs"),
@@ -68,7 +95,16 @@ impl ShepPaths {
             kv: home.join("kv.json"),
             run,
             home,
+        };
+        // Computed from the already-built value rather than inline above,
+        // because `pipe_name` reads `self.home` and the struct is what owns
+        // that derivation — duplicating the sanitizer here is exactly how
+        // the two would drift.
+        #[cfg(windows)]
+        {
+            paths.socket = PathBuf::from(paths.pipe_name());
         }
+        paths
     }
 }
 
@@ -90,9 +126,29 @@ mod tests {
         assert_eq!(p.logs, Path::new("/home/rin/.shep/logs"));
         assert_eq!(p.pids, Path::new("/home/rin/.shep/pids"));
         assert_eq!(p.run, Path::new("/home/rin/.shep/run"));
-        assert_eq!(p.socket, Path::new("/home/rin/.shep/run/shep.sock"));
         assert_eq!(p.barks, Path::new("/home/rin/.shep/barks.jsonl"));
         assert_eq!(p.kv, Path::new("/home/rin/.shep/kv.json"));
+    }
+
+    /// The one field that is not the same kind of thing on both platforms —
+    /// see [`ShepPaths::socket`]'s own doc. Asserted per-platform rather
+    /// than skipped on Windows, because "the socket resolves to the pipe
+    /// name" IS the Windows transport's identity and a silent fallback to
+    /// `run/shep.sock` there would produce a daemon that binds a pipe and a
+    /// client that dials a file that does not exist.
+    #[test]
+    fn the_control_address_is_a_socket_file_on_unix_and_a_pipe_name_on_windows() {
+        let p = ShepPaths::resolve(&no_env, Path::new("/home/rin"));
+        #[cfg(unix)]
+        assert_eq!(p.socket, Path::new("/home/rin/.shep/run/shep.sock"));
+        #[cfg(windows)]
+        assert_eq!(p.socket, Path::new(r"\\.\pipe\shep-home-rin--shep"));
+        #[cfg(windows)]
+        assert_eq!(
+            p.socket,
+            Path::new(&p.pipe_name()),
+            "the resolved address and `pipe_name` must not drift"
+        );
     }
 
     #[test]
@@ -100,7 +156,10 @@ mod tests {
         let env = |key: &str| (key == "SHEP_HOME").then(|| "/srv/shep".to_string());
         let p = ShepPaths::resolve(&env, Path::new("/home/rin"));
         assert_eq!(p.home, Path::new("/srv/shep"));
+        #[cfg(unix)]
         assert_eq!(p.socket, Path::new("/srv/shep/run/shep.sock"));
+        #[cfg(windows)]
+        assert_eq!(p.socket, Path::new(r"\\.\pipe\shep-srv-shep"));
     }
 
     #[test]
