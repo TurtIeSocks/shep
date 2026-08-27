@@ -6244,3 +6244,64 @@ fn one_absent_script_refuses_the_whole_flockfile_and_registers_nothing() {
 
     graceful_kill(home);
 }
+
+/// A spawn that fails for a reason no preflight could see still names the
+/// sheep and the path it tried, and the `cwd` it tried it in.
+///
+/// The whole error an operator got was `error[spawn_failed]: the daemon
+/// reported SpawnFailed: process spawn failed: No such file or directory
+/// (os error 2)`. On an eleven-app Flockfile that named neither which app
+/// had failed nor which path had been tried.
+///
+/// A script that EXISTS and cannot be exec'd, deliberately: the batch check
+/// (`one_absent_script_refuses_the_whole_flockfile_and_registers_nothing`)
+/// tests existence only, so this reaches the real `spawn` and its real
+/// `EACCES` rather than being refused before it. That is also the honest
+/// residue of that check: something can always still fail at exec, and this
+/// is what an operator reads when it does.
+#[test]
+fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let unrunnable = dir.path().join("unrunnable.sh");
+    std::fs::write(&unrunnable, "#!/bin/sh\nsleep 60\n").unwrap();
+    // Present, so the batch check passes it; no execute bit anywhere, which
+    // even a root-owned run cannot exec.
+    std::fs::set_permissions(&unrunnable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"locked-out\"\nscript = \"{}\"\n",
+            unrunnable.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the spawn-failed exit code: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("locked-out"),
+        "the error must name the sheep: {stderr}"
+    );
+    assert!(
+        stderr.contains("unrunnable.sh"),
+        "the error must name the script it tried: {stderr}"
+    );
+    // Canonicalized: `start` fills an app's absent `cwd` from the
+    // Flockfile's own directory through `canonicalize`, and on macOS a
+    // tempdir's `/var/...` resolves to `/private/var/...`.
+    let flockfile_dir = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(
+        stderr.contains(&format!("in {}", flockfile_dir.display())),
+        "the error must name the cwd it tried it in: {stderr}"
+    );
+
+    graceful_kill(home);
+}

@@ -2213,7 +2213,12 @@ impl<R: ProcessRunner> Actor<R> {
             for instance in slots {
                 match self.spawn_fresh(&app, instance, credentials, dog.clone()) {
                     Ok(info) => results.push(info),
-                    Err(message) => return Err(SupervisorError::SpawnFailed(message)),
+                    // The sheep's name, which `spawn_fresh`'s message
+                    // deliberately leaves to its caller: one app of eleven
+                    // failing must say WHICH one.
+                    Err(message) => {
+                        return Err(SupervisorError::SpawnFailed(format!("{name}: {message}")));
+                    }
                 }
             }
         }
@@ -2475,7 +2480,22 @@ impl<R: ProcessRunner> Actor<R> {
                     },
                 );
                 self.emit(ProcessEventKind::Errored, info, true);
-                Err(error.to_string())
+                // Names the file exec was pointed at. `error` on its own was
+                // the whole message an operator got: "process spawn failed:
+                // No such file or directory (os error 2)", which told
+                // somebody starting an eleven-app Flockfile neither which
+                // app nor which path. The app's NAME is added by the caller
+                // rather than here, so `scale`'s own reply -- which already
+                // opens with the sheep's name -- does not say it twice.
+                //
+                // `spec.program` and `spec.cwd` verbatim, not a resolution of
+                // the two: they are what the Flockfile said, which is where
+                // the operator has to make the edit.
+                let attempted = match &spec.cwd {
+                    Some(cwd) => format!("`{}` in {}", spec.program, cwd.display()),
+                    None => format!("`{}`", spec.program),
+                };
+                Err(format!("{error}; tried {attempted}"))
             }
         }
     }
@@ -10720,6 +10740,45 @@ mod tests {
             Some(None),
             "the writer task outlived its sheep, parked on `recv()` and \
              holding the daemon's end of the shepherd channel"
+        );
+    }
+
+    /// Fails if a spawn failure goes back to naming neither the sheep nor
+    /// the path.
+    ///
+    /// The whole error an operator got was `error[spawn_failed]: the daemon
+    /// reported SpawnFailed: process spawn failed: No such file or directory
+    /// (os error 2)`. Starting an eleven-app Flockfile, that named neither
+    /// which app had failed nor which path had been tried.
+    ///
+    /// An exact string rather than two `contains`: the message is the whole
+    /// product here, and its shape is what a reader of a red run has to be
+    /// able to compare against.
+    ///
+    /// The `cwd` half is left to the end-to-end tier, which has a real one.
+    /// `AppConfig::minimal` sets none, and inventing one for this case would
+    /// pin a branch against a fixture rather than against a spawn.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_spawn_names_the_sheep_and_the_path_it_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        // An EMPTY script pool, so `ScriptedRunner` refuses the first spawn
+        // it is asked for. What matters is that the refusal reaches the
+        // reply unchanged apart from the two things being added to it.
+        let (mut actor, _mailbox) = actor_with_one_online_sheep(&dir, Vec::new());
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Start {
+            apps: vec![normalize(AppConfig::minimal("api", "./api")).unwrap()],
+            reply,
+        });
+
+        let err = answer
+            .await
+            .expect("the actor answers every Start")
+            .expect_err("an empty script pool cannot spawn");
+        assert_eq!(
+            err.to_string(),
+            "spawn failed: api: process spawn failed: script exhausted; tried `./api`"
         );
     }
 
