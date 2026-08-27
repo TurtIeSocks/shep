@@ -189,15 +189,18 @@ flockfile.json5`}</CodeBlock>
       Two field types are small parsers of their own rather than bare
       numbers, so a typo in either fails at parse time instead of silently
       meaning something else. Both accept plain digits with one optional
-      trailing letter, nothing more:
+      trailing unit, nothing more:
     </p>
     <div class="grammar-grid">
       <div class="grammar-card">
         <div class="grammar-name">Durations</div>
-        <div class="grammar-pattern"><code>^\d+(h|m|s)?$</code></div>
+        <div class="grammar-pattern"><code>^\d+(ms|h|m|s)?$</code></div>
         <p>
-          Plain digits are milliseconds; <code>h</code>/<code>m</code>/<code
-          >s</code> are hours/minutes/seconds. Lowercase only.
+          Plain digits are milliseconds; <code>ms</code>/<code>h</code>/<code
+          >m</code>/<code>s</code> are milliseconds/hours/minutes/seconds.
+          Lowercase only, and <code>ms</code> is checked before <code
+          >m</code> so a trailing <code>m</code> on its own still means
+          minutes.
         </p>
       </div>
       <div class="grammar-card">

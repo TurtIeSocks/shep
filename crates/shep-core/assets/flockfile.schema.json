@@ -571,9 +571,9 @@
       ]
     },
     "UpDuration": {
-      "description": "A duration: digits, optionally suffixed h, m or s. Plain digits are milliseconds.",
+      "description": "A duration: digits, optionally suffixed ms, h, m or s. Plain digits are milliseconds.",
       "type": "string",
-      "pattern": "^\\d+(h|m|s)?$"
+      "pattern": "^\\d+(ms|h|m|s)?$"
     }
   }
 }
