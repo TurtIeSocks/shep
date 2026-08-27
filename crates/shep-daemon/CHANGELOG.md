@@ -67,6 +67,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the case the check exists for and the only one where an operator is holding
   a terminal.
 
+  The policy governs every point `do_start` can stop at, which took three
+  passes to get right: the pre-registration check, the spawn loop, and
+  `user`/`group` resolution. A `PerApp` batch now survives an app whose user
+  cannot be resolved, where one unresolvable name used to refuse an entire
+  muster restore.
+
+  Resolving credentials no longer builds a vector to zip against the apps.
+  That pairing was safe only while a failure returned early; once a failure
+  is SKIPPED, the two sequences drift, `zip` hands app 2 app 3's credentials,
+  and the last app is dropped without a word. That is a privilege
+  misassignment rather than a scheduling bug: the flock comes up looking
+  correct with processes under identities nobody chose. Each app now carries
+  its own credentials from the point of resolution, so there is no second
+  sequence to keep in step.
+
+  An app whose credentials fail is skipped rather than registered `Errored`,
+  unlike an app whose spawn fails. Nothing can be assembled without an
+  identity to assemble it for, and running it under the daemon's own identity
+  instead is the outcome being ruled out. Both are named in the error.
+
   The policy governs the SPAWN loop as well as the pre-registration check.
   That loop returned on the first failure whatever the policy said, so a bad
   entry that was not last still took every app after it down: `a-good` came

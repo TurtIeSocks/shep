@@ -223,6 +223,14 @@ pub(crate) enum BatchPolicy {
     /// Note that neither is a batch in the sense the check was written for:
     /// a dog start is always one app, and a roll restore is a recovery
     /// rather than a request.
+    ///
+    /// What a failure leaves behind differs by cause, and the difference is
+    /// not cosmetic. A failed SPAWN leaves an `Errored` row, because
+    /// [`Actor::spawn_fresh`] registers the entry before it reports. An
+    /// unresolvable `user`/`group` leaves nothing, because there is no
+    /// identity to assemble a spawn for and running that app under the
+    /// daemon's own identity instead is the one outcome that must never
+    /// happen. Both are reported in the error either way.
     PerApp,
 }
 
@@ -728,10 +736,12 @@ impl SupervisorHandle {
     /// # Errors
     ///
     /// - [`SupervisorError::SpawnFailed`]: at least one app could not be
-    ///   spawned, carrying one `"<name>: <reason>"` entry per such app joined
-    ///   by `"; "`. Every app in the batch was attempted regardless, each one
-    ///   that failed is registered `Errored` rather than left absent, and
-    ///   every app that could start is running.
+    ///   started, carrying one `"<name>: <reason>"` entry per such app joined
+    ///   by `"; "`. Every app in the batch was attempted regardless, and
+    ///   every app that could start is running. An app whose SPAWN failed is
+    ///   registered `Errored` and visible; an app whose `user`/`group` could
+    ///   not be resolved leaves no row at all, since nothing can be
+    ///   assembled without an identity to assemble it for.
     /// - [`SupervisorError::EngineStopped`]: the actor is gone.
     pub(crate) async fn start_restored(
         &self,
@@ -2280,33 +2290,72 @@ impl<R: ProcessRunner> Actor<R> {
         dog: Option<DogSource>,
         policy: BatchPolicy,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
-        // Assembled at instance 0 and with no credentials: neither changes
-        // which file exec names, which is all `preflight` reads. The real
-        // per-instance spec is built again below.
+        // Every app that survives this pass carries its OWN credentials, in
+        // one sequence rather than two.
+        //
+        // The shape this replaces was a `Vec<Option<Credentials>>` zipped
+        // against `apps`, and it was sound only while a credential failure
+        // returned early: the two vectors could differ in length, and a
+        // comment asserted they did not. The moment a failure is SKIPPED
+        // instead -- which is exactly what `PerApp` needs -- `credentials`
+        // grows shorter than `apps` while staying in order, and `zip` pairs
+        // app 2 with app 3's credentials and silently drops the last app.
+        // That is a privilege misassignment rather than a scheduling bug: a
+        // flock comes up looking correct with processes running under
+        // identities nobody chose, and nothing announces it. Pairing at the
+        // point of resolution removes the second sequence, so there is
+        // nothing left to keep in step and no invariant left to assert.
+        let mut ready: Vec<(ResolvedApp, Option<Credentials>)> = Vec::with_capacity(apps.len());
+        // `AllOrNothing` only, by construction: every push below is guarded
+        // on the policy, and a non-empty `refusals` returns before anything
+        // is registered.
         let mut refusals = Vec::new();
-        // Resolved once per app in this Start batch, not once per instance:
-        // every instance of the same app shares one identity, and respawn()
-        // reuses this same value from ProcessEntry for every future restart
-        // instead of re-touching the passwd database (crate::privilege's
-        // module doc). Hoisted above the registering loop for this
-        // function's own reason: a passwd lookup that fails on the fourth
-        // app must not leave three registered either.
-        let mut credentials = Vec::with_capacity(apps.len());
-        for app in &apps {
-            let name = &app.config().name;
-            match privilege::resolve(app.config()) {
-                Ok(resolved) => credentials.push(resolved),
+        // `PerApp` only, by the same construction. Joined into one error
+        // after every app has had its turn.
+        let mut failures = Vec::new();
+        let total = apps.len();
+        for app in apps {
+            let name = app.config().name.clone();
+            // Resolved once per app in this Start batch, not once per
+            // instance: every instance of the same app shares one identity,
+            // and respawn() reuses this same value from ProcessEntry for
+            // every future restart instead of re-touching the passwd
+            // database (crate::privilege's module doc). Ahead of the
+            // registering loop for this function's own reason too: a passwd
+            // lookup that fails on the fourth app must not leave three
+            // registered.
+            let credentials = match privilege::resolve(app.config()) {
+                Ok(resolved) => resolved,
                 Err(err) => {
                     // One refusal per app, not one per failed check. Both
                     // arms used to run, so an app failing credentials AND
                     // carrying an unresolvable path pushed twice and the
                     // summary below could say "4 of 2 apps cannot start".
                     // The reasons were each true; the count was not.
-                    refusals.push(format!("{name}: {err}"));
+                    //
+                    // Asks the policy, like every other stopping point in
+                    // this function. Under `PerApp` this app is skipped and
+                    // the rest of the batch goes on: an unresolvable `user`
+                    // on one saved app must not cost a muster restore the
+                    // whole flock.
+                    //
+                    // Skipped rather than registered `Errored`, unlike a
+                    // failed spawn. Nothing can be assembled without an
+                    // identity to assemble it for, and running it under the
+                    // daemon's own identity instead is the one outcome that
+                    // must never happen here. The failure is reported either
+                    // way; what differs is that this app leaves no row.
+                    match policy {
+                        BatchPolicy::AllOrNothing => refusals.push(format!("{name}: {err}")),
+                        BatchPolicy::PerApp => failures.push(format!("{name}: {err}")),
+                    }
                     continue;
                 }
-            }
-            match self.runner.preflight(&assemble(app, 0, &self.paths, None)) {
+            };
+            // Assembled at instance 0 and with no credentials: neither
+            // changes which file exec names, which is all `preflight` reads.
+            // The real per-instance spec is built again below.
+            match self.runner.preflight(&assemble(&app, 0, &self.paths, None)) {
                 Preflight::Unknown => {}
                 // Only ever a refusal under `AllOrNothing`. Under `PerApp`
                 // it is logged like a `Doubtful` and the app goes on to
@@ -2314,9 +2363,7 @@ impl<R: ProcessRunner> Actor<R> {
                 // and why each needs the row rather than the refusal.
                 Preflight::Impossible(reason) if policy == BatchPolicy::AllOrNothing => {
                     refusals.push(format!("{name}: {reason}"));
-                }
-                Preflight::Impossible(reason) => {
-                    tracing::warn!(sheep = %name, "{reason}");
+                    continue;
                 }
                 // Reported, never refused. A `Doubtful` is a claim about the
                 // daemon's environment rather than about a path, and the
@@ -2329,26 +2376,27 @@ impl<R: ProcessRunner> Actor<R> {
                 // The log rather than the reply: the reply is for the batch,
                 // and this is not a batch failure. At boot there is no
                 // operator holding a terminal to send it to either, and the
-                // shepherd's log is where they look.
-                Preflight::Doubtful(reason) => {
+                // shepherd's log is where they look. An `Impossible` under
+                // `PerApp` arrives here for the same reason.
+                Preflight::Impossible(reason) | Preflight::Doubtful(reason) => {
                     tracing::warn!(sheep = %name, "{reason}");
                 }
             }
+            ready.push((app, credentials));
         }
         if !refusals.is_empty() {
             return Err(SupervisorError::CannotStart(format!(
                 "nothing was registered; {} of {} apps cannot start: {}",
                 refusals.len(),
-                apps.len(),
+                total,
                 refusals.join("; "),
             )));
         }
 
         let mut results = Vec::new();
-        let mut failures = Vec::new();
-        // Lengths agree exactly here: every app above pushed onto one of the
-        // two vectors, and a non-empty `refusals` has already returned.
-        'apps: for (app, credentials) in apps.into_iter().zip(credentials) {
+        // Each pair came out of the pass above together and has travelled
+        // together since. No zip, no second sequence, no alignment to hold.
+        'apps: for (app, credentials) in ready {
             let name = app.config().name.clone();
             let mut existing: Vec<u32> = self
                 .sheep
@@ -9091,6 +9139,106 @@ mod tests {
         let errored = dog_row(&listed, 0);
         assert_eq!(errored.status, ProcStatus::Errored);
         assert_eq!(errored.dog, Some(DogSource::BuiltIn));
+    }
+
+    /// fails if an app's credentials can be paired with a DIFFERENT app.
+    ///
+    /// The hazard this exists for is not a scheduling bug, and it would not
+    /// announce itself. `do_start` used to resolve credentials into a
+    /// `Vec<Option<Credentials>>` and `zip` it against `apps`, sound only
+    /// while a credential failure returned early. Teaching that failure to
+    /// skip instead -- which is exactly what `PerApp` needs, so that one
+    /// unresolvable `user` cannot cost a muster restore its whole flock --
+    /// leaves `credentials` shorter than `apps` while still in order. `zip`
+    /// then pairs app 2 with app 3's credentials and drops the last app
+    /// silently, so the flock comes up looking correct with processes
+    /// running under identities nobody chose.
+    ///
+    /// The FIRST of three fails, because that is the ordering where the
+    /// drift starts at the very next app rather than somewhere behind it.
+    ///
+    /// Asserts the identity each app ACTUALLY got, not merely that it is
+    /// registered: `b-mine` and `c-plain` are both present under the broken
+    /// pairing too, holding each other's credentials. `b-mine` asks for this
+    /// process's own user, which resolves to a real uid without needing root
+    /// (`privilege::resolve` only refuses a CHANGE of identity), and
+    /// `c-plain` asks for none, so the two are distinguishable.
+    ///
+    /// What the broken pairing produces, for comparison: `a-bad` registered
+    /// and running as `b-mine`'s user despite having no resolvable user at
+    /// all, `b-mine` running as the daemon rather than as the user it asked
+    /// for, and `c-plain` absent.
+    ///
+    /// `#[cfg(unix)]`: `nix` is a unix-only dependency of this crate, and
+    /// `privilege::resolve` refuses any user request off-platform anyway.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_credential_failure_never_shifts_another_apps_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two scripts, for the two apps that must survive the first one's
+        // failure.
+        let (mut actor, _mailbox) =
+            actor_with_one_online_sheep(&dir, vec![ProcScript::never_exits(); 2]);
+
+        let own_uid = nix::unistd::geteuid();
+        let own_user = nix::unistd::User::from_uid(own_uid)
+            .expect("the passwd database is readable")
+            .expect("this process's own uid has a passwd entry")
+            .name;
+
+        let mut bad = AppConfig::minimal("a-bad", "./a");
+        bad.user = Some("definitely-not-a-real-shep-user".to_string());
+        let mut mine = AppConfig::minimal("b-mine", "./b");
+        mine.user = Some(own_user);
+        let plain = AppConfig::minimal("c-plain", "./c");
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::Start {
+            apps: vec![
+                normalize(bad).unwrap(),
+                normalize(mine).unwrap(),
+                normalize(plain).unwrap(),
+            ],
+            policy: BatchPolicy::PerApp,
+            reply,
+        });
+
+        let err = answer
+            .await
+            .expect("the actor answers every Start")
+            .expect_err("one app has no resolvable user");
+        assert!(
+            err.to_string().contains("a-bad"),
+            "the failure must name the app whose user could not be resolved: {err}"
+        );
+
+        let identity = |name: &str| {
+            actor
+                .sheep
+                .values()
+                .find(|slot| slot.entry.spec.config().name == name)
+                .map(|slot| slot.entry.credentials)
+        };
+        assert_eq!(
+            identity("a-bad"),
+            None,
+            "an app with no resolvable user must not be registered at all, \
+             and must never inherit another app's identity"
+        );
+        assert_eq!(
+            identity("b-mine"),
+            Some(Some(Credentials {
+                uid: own_uid.as_raw(),
+                gid: None
+            })),
+            "the app that asked for a user must run as that user"
+        );
+        assert_eq!(
+            identity("c-plain"),
+            Some(None),
+            "the app that asked for no user must be registered, and must run \
+             as the daemon rather than as somebody else's uid"
+        );
     }
 
     /// fails if `AllOrNothing` stops stopping at the first failed spawn.
