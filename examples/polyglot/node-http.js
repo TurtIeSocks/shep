@@ -2,7 +2,7 @@
 // One file, two runtimes: `examples/Flockfile.polyglot.toml` runs this same
 // script three times -- once with `interpreter = "node"`, once with
 // `interpreter = "bun"`, and once with `interpreter = "node"` again but
-// `instances = 3` -- to show that `interpreter` in a Flockfile is a plain
+// `instances = 4` -- to show that `interpreter` in a Flockfile is a plain
 // program name, not a language shep has special-cased anywhere.
 //
 // Usage: node-http.js <base-port>
