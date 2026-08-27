@@ -520,8 +520,15 @@ impl AppConfig {
         // comparisons is exactly the list that goes stale. `#[serde(default)]`
         // with no `skip_serializing_if` means both sides serialize every
         // field, so the two key sets are identical and iterating one is
-        // enough. `serde_json::Map` is a `BTreeMap`, which is where the
-        // field-name ordering comes from.
+        // enough.
+        //
+        // Sorted explicitly rather than relying on `serde_json::Map` being a
+        // `BTreeMap`: it is one only while `serde_json`'s `preserve_order`
+        // feature is off, and that feature is additive, so ANY crate in the
+        // graph turning it on would make this an `IndexMap` and silently
+        // switch the order to serialization order. Nothing enables it today.
+        // The sort costs a few field names and makes the doc above true by
+        // construction instead of by a dependency's default feature set.
         //
         // An empty vector when either side fails to serialize as an object:
         // there is no honest field list to report, and the caller must not
@@ -531,10 +538,13 @@ impl AppConfig {
         else {
             return Vec::new();
         };
-        mine.iter()
+        let mut fields: Vec<String> = mine
+            .iter()
             .filter(|(key, value)| theirs.get(key.as_str()) != Some(value))
             .map(|(key, _)| key.clone())
-            .collect()
+            .collect();
+        fields.sort_unstable();
+        fields
     }
 }
 

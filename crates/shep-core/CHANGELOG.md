@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fields, never their values, because `AppConfig::env` holds secrets and the
   answer is printed at an operator (IR-41). `drifted_fields` compares through
   serde rather than field by field, so a field added to `AppConfig` is
-  compared without a second edit. Additive: `PROTOCOL_VERSION` stays **1**, a
+  compared without a second edit, and sorts the result explicitly rather than
+  leaning on `serde_json::Map` being a `BTreeMap`, which holds only while the
+  additive `preserve_order` feature is off anywhere in the graph. Additive: `PROTOCOL_VERSION` stays **1**, a
   daemon that predates the request answers its existing "does not implement
   that request" error, and every previously pinned wire fixture is unchanged.
 

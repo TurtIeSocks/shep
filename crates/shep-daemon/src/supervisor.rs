@@ -180,6 +180,52 @@ impl ConnId {
 /// moment ago.
 type Smits = HashMap<String, (ConnId, String)>;
 
+/// Whether a [`Command::Start`] is all-or-nothing.
+///
+/// The pre-registration check in [`Actor::do_start`] exists for ONE caller's
+/// problem, and three others share that function. Making the policy a
+/// parameter is what stops the check reaching callers it was never meant for
+/// -- twice already it has, and both times the symptom was a flock that
+/// stayed down rather than a flock that came up half-registered.
+///
+/// `pub(crate)` like [`Command`] itself, and for the same reason: nothing
+/// outside this crate names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchPolicy {
+    /// Refuse the whole batch if any app in it provably cannot run, and
+    /// register none of it.
+    ///
+    /// What an operator typing `shep start` against a Flockfile asked for,
+    /// and the only caller this is right for. The defect it exists for: the
+    /// third app of eleven pointed at an unbuilt binary, so two registered
+    /// and started, one failed, and eight were never reached, leaving a
+    /// flock that matched neither the file nor its previous state. The
+    /// operator is holding a terminal, gets told, and can fix the file and
+    /// run it again.
+    AllOrNothing,
+    /// Register and spawn each app on its own merits, so one app that cannot
+    /// run costs only itself.
+    ///
+    /// What every other caller needs, and for two different reasons that
+    /// point the same way:
+    ///
+    /// - **Nobody is watching.** The muster roll restore runs at boot, and
+    ///   its own comment has always said "one bad entry does not sink the
+    ///   muster". A saved app whose binary is missing after a rebuild must
+    ///   not keep the other twelve down until somebody notices.
+    /// - **The failure IS the product.** A dog that cannot start belongs in
+    ///   the dogs table as `Errored`, which is what the operator who enabled
+    ///   it needs to see. [`Actor::spawn_fresh`] registers that row on
+    ///   purpose and says so, and `dogs::spawn_dog_watch` is a subscriber
+    ///   whose whole business is a dog reaching `Errored`. A refusal leaves
+    ///   no trace for either.
+    ///
+    /// Note that neither is a batch in the sense the check was written for:
+    /// a dog start is always one app, and a roll restore is a recovery
+    /// rather than a request.
+    PerApp,
+}
+
 /// Commands the supervisor actor accepts (wrapped in [`Msg::Command`]).
 ///
 /// `pub(crate)` like [`Msg`], and for the same reason: [`SupervisorHandle`] is
@@ -192,6 +238,8 @@ pub(crate) enum Command {
     Start {
         /// Already-validated app specs to expand into instances.
         apps: Vec<ResolvedApp>,
+        /// Whether one app that provably cannot run refuses the whole batch.
+        policy: BatchPolicy,
         /// Answers with every spawned instance, or the first spawn failure.
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
     },
@@ -667,9 +715,40 @@ impl SupervisorHandle {
     ///   to spawn (already-registered instances persist regardless).
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
     pub async fn start(&self, apps: Vec<ResolvedApp>) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        self.start_with(apps, BatchPolicy::AllOrNothing).await
+    }
+
+    /// [`Self::start`], but one app that cannot run costs only itself.
+    ///
+    /// For restoring a muster roll, which is the caller
+    /// [`BatchPolicy::PerApp`]'s doc opens with: it runs at boot with nobody
+    /// watching, and a saved app whose binary went missing must not keep the
+    /// rest of the flock down.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::SpawnFailed`]: the first instance that failed to
+    ///   spawn (already-registered instances persist regardless).
+    /// - [`SupervisorError::EngineStopped`]: the actor is gone.
+    pub(crate) async fn start_restored(
+        &self,
+        apps: Vec<ResolvedApp>,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        self.start_with(apps, BatchPolicy::PerApp).await
+    }
+
+    async fn start_with(
+        &self,
+        apps: Vec<ResolvedApp>,
+        policy: BatchPolicy,
+    ) -> Result<Vec<ProcessInfo>, SupervisorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Msg::Command(Command::Start { apps, reply }))
+            .send(Msg::Command(Command::Start {
+                apps,
+                policy,
+                reply,
+            }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -1969,11 +2048,15 @@ impl<R: ProcessRunner> Actor<R> {
             // begun — it would register + spawn a child the shutdown
             // aggregation (computed from `online` ids at the moment it ran)
             // can never know to kill, orphaning it after the actor exits.
-            Command::Start { apps, reply } => {
+            Command::Start {
+                apps,
+                policy,
+                reply,
+            } => {
                 let result = if self.shutting_down {
                     Err(SupervisorError::EngineStopped)
                 } else {
-                    self.do_start(apps, None)
+                    self.do_start(apps, None, policy)
                 };
                 let _ = reply.send(result);
                 false
@@ -2154,7 +2237,13 @@ impl<R: ProcessRunner> Actor<R> {
         {
             return Ok(to_info(&slot.entry, &self.smits));
         }
-        let started = self.do_start(vec![app], Some(source))?;
+        // `PerApp`, and this is the whole reason the policy is a parameter.
+        // A dog that cannot start must land in the dogs table as `Errored`,
+        // which `spawn_fresh`'s failure arm registers on purpose and
+        // `dogs::spawn_dog_watch` subscribes to. A refusal would leave the
+        // operator who enabled it no trace at all. There is no half-batch to
+        // prevent here either: a dog start is always exactly one app.
+        let started = self.do_start(vec![app], Some(source), BatchPolicy::PerApp)?;
         started
             .into_iter()
             .next()
@@ -2186,6 +2275,7 @@ impl<R: ProcessRunner> Actor<R> {
         &mut self,
         apps: Vec<ResolvedApp>,
         dog: Option<DogSource>,
+        policy: BatchPolicy,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
         // Assembled at instance 0 and with no credentials: neither changes
         // which file exec names, which is all `preflight` reads. The real
@@ -2215,7 +2305,16 @@ impl<R: ProcessRunner> Actor<R> {
             }
             match self.runner.preflight(&assemble(app, 0, &self.paths, None)) {
                 Preflight::Unknown => {}
-                Preflight::Impossible(reason) => refusals.push(format!("{name}: {reason}")),
+                // Only ever a refusal under `AllOrNothing`. Under `PerApp`
+                // it is logged like a `Doubtful` and the app goes on to
+                // register: see `BatchPolicy::PerApp` for the two callers
+                // and why each needs the row rather than the refusal.
+                Preflight::Impossible(reason) if policy == BatchPolicy::AllOrNothing => {
+                    refusals.push(format!("{name}: {reason}"));
+                }
+                Preflight::Impossible(reason) => {
+                    tracing::warn!(sheep = %name, "{reason}");
+                }
                 // Reported, never refused. A `Doubtful` is a claim about the
                 // daemon's environment rather than about a path, and the
                 // daemon's environment under the unit `shep startup`
@@ -8949,6 +9048,59 @@ mod tests {
         assert_eq!(errored.dog, Some(DogSource::BuiltIn));
     }
 
+    /// fails if a dog whose binary is missing is refused instead of being
+    /// registered `Errored`.
+    ///
+    /// `do_start_dog` shares `do_start` with `Request::Start`, so the
+    /// pre-registration check written for a Flockfile batch reached dogs too
+    /// and turned a visible wreck into no trace at all. Three things depend
+    /// on the row: [`Actor::spawn_fresh`]'s failure arm registers it on
+    /// purpose and says so in its own doc, `shep dogs` renders it, and
+    /// `dogs::spawn_dog_watch` is a subscriber whose entire business is a
+    /// dog reaching `Errored`. An operator who enabled a dog wants to be
+    /// told it is broken, not to find nothing there.
+    ///
+    /// `refusing` is load-bearing and this case cannot fail without it.
+    /// `ScriptedRunner` reads nothing from a spec, so its `preflight`
+    /// answers `Unknown` like the trait default, the validating pass never
+    /// refuses anything, and the assertions below would hold whichever way
+    /// `do_start_dog` passed its policy.
+    ///
+    /// The error is asserted too, not only the row. `SpawnFailed` is a spawn
+    /// that was really attempted and really failed; `CannotStart` would mean
+    /// the batch was refused, which is the regression, and the two are
+    /// otherwise indistinguishable from the caller.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_cannot_spawn_is_registered_errored_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = broadcast::channel(64);
+        // Empty scripts, so the spawn this now reaches fails on its own too:
+        // the point is that it is REACHED, and that the wreck is registered.
+        let runner = ScriptedRunner::new(Vec::new()).refusing(&["bark"]);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+
+        let err = handle
+            .start_dog(dog_app("bark"), DogSource::BuiltIn)
+            .await
+            .expect_err("nothing can spawn against an empty script pool");
+
+        assert!(
+            matches!(err, SupervisorError::SpawnFailed(_)),
+            "a dog must reach its spawn and fail there, not be refused \
+             before it registers: {err:?}"
+        );
+        let listed = handle.list().await;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|i| (i.name.as_str(), i.status, i.dog.clone()))
+                .collect::<Vec<_>>(),
+            vec![("bark", ProcStatus::Errored, Some(DogSource::BuiltIn))],
+            "the dogs table must still show the dog, and show it broken"
+        );
+        handle.shutdown().await;
+    }
+
     /// fails if a reload's replacement is built without the marker.
     /// `shep reload bark` names the dog exactly, so it reaches it (a
     /// wildcard would not), and an unmarked replacement turns the dog into a
@@ -10890,6 +11042,7 @@ mod tests {
         let (reply, answer) = oneshot::channel();
         actor.handle_command(Command::Start {
             apps: vec![normalize(AppConfig::minimal("api", "./api")).unwrap()],
+            policy: BatchPolicy::AllOrNothing,
             reply,
         });
 
@@ -10992,6 +11145,7 @@ mod tests {
         let (reply, _answer) = oneshot::channel();
         actor.handle_command(Command::Start {
             apps: vec![normalize(app).unwrap()],
+            policy: BatchPolicy::AllOrNothing,
             reply,
         });
         assert!(

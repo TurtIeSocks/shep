@@ -53,6 +53,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   specifically, and everything else is a suspicion the spawn reports as it
   always did.
 
+- Keep the pre-registration refusal to the one caller it was written for.
+  `do_start` is shared, so the check reached two callers that must not have
+  it. A dog whose binary is missing was refused and left no trace, where it
+  belongs in the dogs table as `Errored`: `spawn_fresh` registers that row on
+  purpose, `shep dogs` renders it, and `dogs::spawn_dog_watch` subscribes to
+  it, so an operator who enabled a broken dog needs to see it rather than
+  find nothing. Worse, restoring a muster roll refused the WHOLE roll when
+  one saved app's binary had gone missing, so a machine came back from a
+  reboot with nothing running at all, unattended. Both now register each app
+  on its own merits, via a `BatchPolicy` the call site states explicitly.
+  All-or-nothing stays what `shep start` against a Flockfile does, which is
+  the case the check exists for and the only one where an operator is holding
+  a terminal.
+
 - Explain a bare program's spawn failure in the reply, not only in the log.
   When a `script` or `interpreter` with no `/` in it fails to spawn, the
   `SpawnFailed` message now carries "`node` is not on the shepherd's PATH
