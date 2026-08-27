@@ -719,6 +719,13 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
+    /// - [`SupervisorError::CannotStart`] — at least one app provably could
+    ///   not run, so NOTHING was registered and the flock is exactly as it
+    ///   was. Carries one `"<name>: <reason>"` per refused app, never one
+    ///   per failed check. All or nothing, which is what an operator typing
+    ///   `shep start` against a Flockfile wants: a typo in the third app of
+    ///   eleven leaves nothing half-registered rather than a flock matching
+    ///   neither the file nor what was there before.
     /// - [`SupervisorError::SpawnFailed`] — the first instance that failed
     ///   to spawn (already-registered instances persist regardless).
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
