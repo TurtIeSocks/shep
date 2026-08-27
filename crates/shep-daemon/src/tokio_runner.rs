@@ -229,8 +229,65 @@ fn to_nix_operator_signal(sig: OperatorSignal) -> Signal {
     }
 }
 
+/// Why exec will not find `spec.program`, when that is a question with one
+/// answer.
+///
+/// A `Some` is a certainty, never a suspicion. Every form this cannot decide
+/// cheaply and safely returns `None` and is left to fail at the spawn as it
+/// always did, because refusing a Flockfile that would have run is far worse
+/// than the partial-registration bug the caller is fixing
+/// ([`ProcessRunner::preflight`]). Two such forms:
+///
+/// - a relative path with no `cwd`. The child would resolve it against the
+///   DAEMON's working directory, whatever the shepherd happened to be
+///   autostarted from, and a refusal is not worth betting on that.
+/// - a bare command with no usable `PATH` in `spec.env`. `assemble`'s
+///   `base_env` always seeds one, so only a spec built some other way gets
+///   here.
+///
+/// The bare-command arm searches `spec.env`'s own `PATH`, not the daemon's
+/// ambient one: that map IS the child's whole environment (`spawn` calls
+/// `env_clear` then `envs`), so it is the exact list exec is about to walk.
+/// `node` and `npx` in a real Flockfile take this arm.
+///
+/// Existence only, never the executable bit: a file that is there and cannot
+/// be exec'd is the spawn's business, and mode bits under a `user`/`group`
+/// drop are not a thing to be confident about from here.
+fn program_not_found(spec: &SpawnSpec) -> Option<String> {
+    if spec.program.is_empty() {
+        return None;
+    }
+    let program = Path::new(&spec.program);
+    if spec.program.contains('/') {
+        let full = if program.is_absolute() {
+            program.to_path_buf()
+        } else {
+            spec.cwd.as_ref()?.join(program)
+        };
+        return (!full.exists()).then(|| format!("no such file: {}", full.display()));
+    }
+    let path = spec.env.get("PATH").filter(|value| !value.is_empty())?;
+    let found = path
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .any(|dir| Path::new(dir).join(program).exists());
+    (!found).then(|| format!("`{}` is not on the shepherd's PATH ({path})", spec.program))
+}
+
 impl ProcessRunner for TokioRunner {
     type Proc = TokioProc;
+
+    /// Reports a `program` that provably is not there, and nothing else.
+    ///
+    /// `program` is what `assemble` resolved the app's `script` and
+    /// `interpreter` down to, so this checks the one file exec will name and
+    /// never a script that an interpreter takes as its first ARGUMENT: an
+    /// app running `npx next start` is checked at `npx`, and `next` is
+    /// npx's business. Deliberately under-tightened, per
+    /// [`program_not_found`].
+    fn preflight(&self, spec: &SpawnSpec) -> Option<String> {
+        program_not_found(spec)
+    }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         let mut command = Command::new(&spec.program);
@@ -1008,6 +1065,7 @@ fn spawn_channel_pumps(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::time::Duration;
 
@@ -1717,6 +1775,98 @@ mod tests {
                 .expect("its sender must outlive the write")
                 .is_ok()
         );
+    }
+
+    /// A [`SpawnSpec`] carrying only what [`program_not_found`] reads. Every
+    /// other field is left at whatever is cheapest: nothing below spawns
+    /// anything, so nothing below can be affected by them.
+    fn preflight_spec(program: &str, cwd: Option<PathBuf>, path: Option<&str>) -> SpawnSpec {
+        let mut env = BTreeMap::new();
+        if let Some(path) = path {
+            env.insert("PATH".to_string(), path.to_string());
+        }
+        SpawnSpec {
+            name: "web".to_string(),
+            program: program.to_string(),
+            args: Vec::new(),
+            cwd,
+            env,
+            out_file: PathBuf::from("/dev/null"),
+            err_file: PathBuf::from("/dev/null"),
+            channel: false,
+            stdin: false,
+            credentials: None,
+        }
+    }
+
+    /// fails if a form the preflight must not decide starts being refused.
+    ///
+    /// This is the direction that costs a working Flockfile, so it is the
+    /// list worth pinning as a sweep rather than one representative case.
+    /// Every entry here is a real shape from the testbed Flockfile that
+    /// produced the defect: absolute (`heatrotom`), relative to a `cwd`
+    /// (`obscura`), a bare command on PATH (`node`, `npx`).
+    #[test]
+    fn a_program_that_is_really_there_is_never_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("srv");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let path_dir = dir.path().to_string_lossy().into_owned();
+
+        for spec in [
+            preflight_spec(&bin.to_string_lossy(), None, None),
+            preflight_spec("./srv", Some(dir.path().to_path_buf()), None),
+            preflight_spec("srv", None, Some(&path_dir)),
+            // The second PATH entry rather than the first, so a search that
+            // only ever looks at one directory fails here.
+            preflight_spec("srv", None, Some(&format!("/nonexistent:{path_dir}"))),
+            // Not decidable, and so not decided: a relative path with no
+            // `cwd` would be resolved against whatever directory the
+            // shepherd was autostarted from.
+            preflight_spec("./srv", None, None),
+            // Likewise a bare name with no PATH to search.
+            preflight_spec("srv", None, None),
+            preflight_spec("srv", None, Some("")),
+            preflight_spec("", None, None),
+        ] {
+            assert_eq!(
+                program_not_found(&spec),
+                None,
+                "refused a spec it cannot be certain about: {spec:?}"
+            );
+        }
+    }
+
+    /// fails if the check stops catching the defect: the third app of an
+    /// eleven-app Flockfile pointing at an unbuilt binary, which registered
+    /// two apps, failed, and never reached the other eight.
+    ///
+    /// The reason string is asserted to carry the resolved PATH, not the
+    /// `./proto-enum-api` the operator wrote, because "no such file:
+    /// ./proto-enum-api" is exactly the message that left them guessing
+    /// which directory it was looked for in.
+    #[test]
+    fn a_program_that_is_provably_absent_is_named_with_the_path_that_was_tried() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let relative = program_not_found(&preflight_spec(
+            "./proto-enum-api",
+            Some(dir.path().to_path_buf()),
+            None,
+        ))
+        .expect("a relative script under a real cwd is decidable");
+        assert_eq!(
+            relative,
+            format!("no such file: {}/./proto-enum-api", dir.path().display())
+        );
+
+        let absolute = program_not_found(&preflight_spec("/nonexistent/srv", None, None))
+            .expect("an absolute script is decidable");
+        assert_eq!(absolute, "no such file: /nonexistent/srv");
+
+        let bare = program_not_found(&preflight_spec("node", None, Some("/nonexistent")))
+            .expect("a bare command against a real PATH is decidable");
+        assert_eq!(bare, "`node` is not on the shepherd's PATH (/nonexistent)");
     }
 
     // Everything else in this module needs a real OS child and lives in

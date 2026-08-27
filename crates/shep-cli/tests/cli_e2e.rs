@@ -6173,3 +6173,74 @@ fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
 
     graceful_kill(home);
 }
+
+/// One app whose script does not exist refuses the whole Flockfile, before
+/// anything is registered, and names every app that failed.
+///
+/// The defect: the third app of eleven pointed at an unbuilt binary. Apps
+/// one and two registered and started, app three failed to spawn, and apps
+/// four through eleven were never reached. The flock matched neither the
+/// file nor its previous state, and only `shep delete all` recovered it.
+///
+/// The empty listing at the end is the assertion that matters and the one
+/// the exit code alone cannot make: `start` reported a failure before this
+/// change too, with `good` left registered and running behind it.
+///
+/// What a broken implementation this catches: the check dropped (`good` is
+/// in the listing); the check run inside the registering loop rather than
+/// before it (`good` is registered before `unbuilt` is reached, same
+/// symptom); the error reporting only the count and not the path (the
+/// `never-built` assertion).
+#[test]
+fn one_absent_script_refuses_the_whole_flockfile_and_registers_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    // `good` FIRST, so a check that runs per app as it registers would have
+    // registered it by the time it reached `unbuilt`.
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"good\"\nscript = \"{}\"\n\n\
+             [[app]]\nname = \"unbuilt\"\nscript = \"{}/never-built\"\n",
+            script.display(),
+            dir.path().display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the spawn-failed exit code: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unbuilt"),
+        "the refusal must name the app: {stderr}"
+    );
+    assert!(
+        stderr.contains("never-built"),
+        "the refusal must name the path it looked at: {stderr}"
+    );
+
+    let flock = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("flock")
+        .output()
+        .unwrap();
+    assert_success(&flock);
+    let envelope: serde_json::Value = serde_json::from_slice(&flock.stdout).unwrap();
+    assert_eq!(
+        envelope["data"].as_array().map(Vec::len),
+        Some(0),
+        "a Flockfile refused as a whole must leave NOTHING registered: {}",
+        envelope
+    );
+
+    graceful_kill(home);
+}

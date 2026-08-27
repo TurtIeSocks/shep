@@ -10,7 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixes
+
+- Check every app in a `Start` batch before registering any of it, and
+  register nothing if any of them fails. One app pointing at a script that
+  does not exist used to register and start the apps ahead of it, fail on
+  that one, and never reach the apps behind it, leaving a flock that matched
+  neither the Flockfile nor its previous state. The error now names every app
+  that failed and the path each was looked for at, rather than the first
+  failure alone. Passwd resolution for `user`/`group` is hoisted into the
+  same pass for the same reason.
+
 ### Additions
+
+- Add `ProcessRunner::preflight`, the reason a `SpawnSpec` cannot be spawned
+  when that is knowable without trying. Defaulted to `None` ("nothing
+  knowable in advance", never "this will work"), so an out-of-tree
+  implementor is unaffected and a runner that never touches the filesystem
+  gives the honest answer. `TokioRunner` reports a program that provably is
+  not there: an absolute path, a path relative to a `cwd`, or a bare command
+  against the PATH the child will actually be given. Deliberately narrow.
+  Existence only, never the executable bit; a relative path with no `cwd` and
+  a bare command with no PATH are both left to the spawn, because refusing a
+  Flockfile that would have run is worse than the bug it addresses.
 
 - Answer `Request::ConfigDrift`: report which of a set of apps name a
   registered sheep whose stored config differs, and in which fields. Reads

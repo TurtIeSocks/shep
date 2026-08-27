@@ -739,6 +739,43 @@ pub trait ProcessRunner: Send + Sync + 'static {
     ///
     /// - [`RunnerError::SpawnFailed`] — exec failure, permissions, missing binary.
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError>;
+
+    /// The reason `spec` cannot be spawned, if that is knowable without
+    /// trying
+    ///
+    /// Lets a caller refuse a whole batch before registering any of it. The
+    /// defect this exists for: an eleven-app Flockfile whose third app
+    /// pointed at an unbuilt binary registered and started apps one and two,
+    /// failed on three, and never reached four through eleven, leaving a
+    /// flock that matched neither the file nor its previous state.
+    ///
+    /// `Option<String>` rather than `Result<(), RunnerError>`: nothing has
+    /// been attempted here, so there is no OS refusal to report, and
+    /// [`RunnerError::SpawnFailed`]'s own `Display` would say "process spawn
+    /// failed" about a process that was never spawned. The string is one
+    /// reason, no trailing punctuation, ready to be printed after a sheep's
+    /// name.
+    ///
+    /// `None` means "nothing knowable in advance", NOT "this will work".
+    /// A `Some` must therefore be a certainty rather than a suspicion:
+    /// refusing a Flockfile that would have run is far worse than the bug
+    /// this addresses, so anything an implementation cannot decide cheaply
+    /// and safely belongs in the `None` arm, where the spawn reports it as
+    /// it always did.
+    ///
+    /// # Default implementation
+    ///
+    /// `None`, always. A defaulted method rather than a required one for the
+    /// reason [`RunningProcess::signal_process`] gives: this is a `pub`
+    /// trait in a published library, and adding a required method to one is
+    /// a break for an out-of-tree implementor (IR-20). The default is also
+    /// the honest answer for a runner that never touches the filesystem,
+    /// which is what the crate's own fakes are.
+    #[must_use]
+    fn preflight(&self, spec: &SpawnSpec) -> Option<String> {
+        let _ = spec;
+        None
+    }
 }
 
 /// Everything a spawn needs, pre-assembled by the assembler (a later task)

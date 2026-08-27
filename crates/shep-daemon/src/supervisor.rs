@@ -2140,8 +2140,22 @@ impl<R: ProcessRunner> Actor<R> {
     }
 
     /// Expands each app through `instance_slots` + `assemble`, spawning one
-    /// instance per slot. Already-registered entries persist even when a
-    /// later spawn in the batch fails.
+    /// instance per slot, after checking every app in the batch.
+    ///
+    /// Nothing at all is registered if any app fails that check, and the
+    /// error names every one that did rather than the first. The defect
+    /// this exists for: the third app of an eleven-app Flockfile pointed at
+    /// an unbuilt binary, so apps one and two registered and started, app
+    /// three failed to spawn, and apps four through eleven were never
+    /// reached. The flock then matched neither the file nor its previous
+    /// state.
+    ///
+    /// A spawn that fails ANYWAY still leaves the batch part-registered, and
+    /// that is not a case this can close: exec is the only thing that knows
+    /// for certain, and the first instance is already running by the time
+    /// the second one is attempted. What it closes is the knowable half, and
+    /// [`ProcessRunner::preflight`] is deliberately narrow about what counts
+    /// as knowable.
     ///
     /// `dog` is written onto every entry this registers, and is `None` for
     /// every caller but [`Self::do_start_dog`] — see [`ProcessEntry::dog`]
@@ -2151,16 +2165,42 @@ impl<R: ProcessRunner> Actor<R> {
         apps: Vec<ResolvedApp>,
         dog: Option<DogSource>,
     ) -> Result<Vec<ProcessInfo>, SupervisorError> {
+        // Assembled at instance 0 and with no credentials: neither changes
+        // which file exec names, which is all `preflight` reads. The real
+        // per-instance spec is built again below.
+        let mut refusals = Vec::new();
+        // Resolved once per app in this Start batch, not once per instance:
+        // every instance of the same app shares one identity, and respawn()
+        // reuses this same value from ProcessEntry for every future restart
+        // instead of re-touching the passwd database (crate::privilege's
+        // module doc). Hoisted above the registering loop for this
+        // function's own reason: a passwd lookup that fails on the fourth
+        // app must not leave three registered either.
+        let mut credentials = Vec::with_capacity(apps.len());
+        for app in &apps {
+            let name = &app.config().name;
+            match privilege::resolve(app.config()) {
+                Ok(resolved) => credentials.push(resolved),
+                Err(err) => refusals.push(format!("{name}: {err}")),
+            }
+            if let Some(reason) = self.runner.preflight(&assemble(app, 0, &self.paths, None)) {
+                refusals.push(format!("{name}: {reason}"));
+            }
+        }
+        if !refusals.is_empty() {
+            return Err(SupervisorError::SpawnFailed(format!(
+                "nothing was registered; {} of {} apps cannot start: {}",
+                refusals.len(),
+                apps.len(),
+                refusals.join("; "),
+            )));
+        }
+
         let mut results = Vec::new();
-        for app in apps {
+        // Lengths agree exactly here: every app above pushed onto one of the
+        // two vectors, and a non-empty `refusals` has already returned.
+        for (app, credentials) in apps.into_iter().zip(credentials) {
             let name = app.config().name.clone();
-            // Resolved once per app in this Start batch, not once per
-            // instance: every instance of the same app shares one identity,
-            // and respawn() reuses this same value from ProcessEntry for
-            // every future restart instead of re-touching the passwd
-            // database (crate::privilege's module doc).
-            let credentials = privilege::resolve(app.config())
-                .map_err(|err| SupervisorError::SpawnFailed(err.to_string()))?;
             let mut existing: Vec<u32> = self
                 .sheep
                 .values()
