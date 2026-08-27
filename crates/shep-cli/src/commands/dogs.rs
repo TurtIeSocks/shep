@@ -365,7 +365,6 @@ pub fn vet_binary(path: &Path, home: &Path) -> Result<VettedBinary, AdoptRefusal
     // commands` gate), so there is no non-unix build of this function to
     // guard against.
     #[cfg(unix)]
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     if metadata.permissions().mode() & 0o111 == 0 {

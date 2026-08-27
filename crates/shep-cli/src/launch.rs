@@ -534,7 +534,6 @@ mod tests {
 
     /// Whether `fd` is marked close-on-exec right now.
     #[cfg(unix)]
-    #[cfg(unix)]
     fn is_close_on_exec(fd: RawFd) -> bool {
         let flags = fcntl(fd, FcntlArg::F_GETFD).unwrap();
         FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC)

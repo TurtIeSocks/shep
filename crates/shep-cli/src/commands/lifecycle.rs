@@ -142,7 +142,7 @@ pub(crate) fn target_exit_code(err: &TargetError) -> ExitCode {
 /// why. `process.argv[1]` is the absolute path, per `-e`'s argv layout
 /// (identical to `-p`'s).
 const JS_BRIDGE_SCRIPT: &str = "try { \
-     process.stdout.write(JSON.stringify(require(process.argv[1]))); \
+     process.stdout.write(JSON.stringify(require(process.env.SHEP_FLOCKFILE_PATH))); \
  } catch (err) { \
      process.stderr.write(err && err.message ? String(err.message) : String(err)); \
      process.exitCode = 1; \
@@ -150,12 +150,22 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 
 /// Evaluates a `.js` Flockfile through node and returns its JSON.
 ///
-/// The path is passed as an **argument**, never interpolated into the
-/// JavaScript source: a path containing `'`, `\` or a newline would
-/// otherwise escape the string literal, and adding a second way to inject
-/// code into a file whose own code we are already about to run is
-/// gratuitous. Under `-p` / `-e`, node puts the first user argument at
-/// `process.argv[1]`.
+/// The path is passed in the **environment**, as `SHEP_FLOCKFILE_PATH`, and
+/// never interpolated into the JavaScript source: a path containing `'`,
+/// `\` or a newline would otherwise escape the string literal, and adding a
+/// second way to inject code into a file whose own code we are already
+/// about to run is gratuitous.
+///
+/// It used to be an argument, read back as `process.argv[1]`. That is
+/// correct on unix and against a plain `node.exe`, and it broke on the
+/// Windows CI runner: node reached `require` with `C:` and failed with
+/// `EISDIR: illegal operation on a directory, lstat 'C:'`, so the path was
+/// re-parsed somewhere between this `Command` and node's own argv. A `.cmd`
+/// shim earlier on `PATH` than the real binary is the likeliest culprit,
+/// since `cmd.exe` does not use the argument-escaping convention
+/// `std::process::Command` writes for. The fix does not depend on settling
+/// which layer did it: an environment variable is not a command line, so
+/// nothing in between can re-split it.
 ///
 /// The path must be absolute — `require("x.js")` with no leading `./` is a
 /// *package* specifier and resolves against `node_modules`, not the cwd.
@@ -206,7 +216,7 @@ fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
     let output = std::process::Command::new("node")
         .arg("-e")
         .arg(JS_BRIDGE_SCRIPT)
-        .arg(&absolute)
+        .env("SHEP_FLOCKFILE_PATH", &absolute)
         .stdin(std::process::Stdio::null())
         .output();
     let output = match output {

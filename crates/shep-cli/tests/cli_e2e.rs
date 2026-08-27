@@ -3236,8 +3236,8 @@ fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"minutely\"\nscript = '{script}\"\ncron_restart = \"* * * * *\"\n\n\
-             [[app]]\nname = \"unscheduled\"\nscript = '{script}\"\n",
+            "[[app]]\nname = \"minutely\"\nscript = '{script}'\ncron_restart = \"* * * * *\"\n\n\
+             [[app]]\nname = \"unscheduled\"\nscript = '{script}'\n",
             script = script.display(),
         ),
     );
@@ -3342,8 +3342,8 @@ fn a_real_memory_breach_restarts_a_sheep() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"greedy\"\nscript = '{script}\"\nmax_memory = \"{BREACH_LIMIT}\"\n\n\
-             [[app]]\nname = \"unlimited\"\nscript = '{script}\"\n",
+            "[[app]]\nname = \"greedy\"\nscript = '{script}'\nmax_memory = \"{BREACH_LIMIT}\"\n\n\
+             [[app]]\nname = \"unlimited\"\nscript = '{script}'\n",
             script = script.display(),
         ),
     );
