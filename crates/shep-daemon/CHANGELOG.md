@@ -109,6 +109,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell inherits that shell's PATH, which measured two kilobytes and buried
   the sentence that mattered.
 
+- Every reply carrying a listing now comes back in the same order the flock
+  listing does: by name, then by id. `ListFlock`, `Describe` and `Mustered`
+  already grouped by name; `Stop`, `Restart`, `Delete`, `Scale`, `Reopen`,
+  `Flush`, `Trigger`, `Signal` and `SendLine` came back by id, so one session
+  against one flock printed two different orders. Wire-observable, and so
+  visible under `--format json` as well as in a table.
+
 ### Additions
 
 - Add `SupervisorError::CannotStart`, a `Start` batch refused before anything

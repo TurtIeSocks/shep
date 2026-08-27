@@ -1089,8 +1089,17 @@ impl App {
         }
     }
 
-    /// The ids the table draws, in id order: the whole flock, or whatever the
-    /// filter leaves of it.
+    /// The ids the table draws, in name-then-id order: the whole flock, or
+    /// whatever the filter leaves of it.
+    ///
+    /// The order is the one every operator-facing shep listing takes
+    /// ([`shep_core::protocol::sort_flock`]'s own doc). `flock` is a
+    /// `BTreeMap<u32, Row>`, so iterating it is id order, which is why the
+    /// sequence is materialised and re-keyed here rather than taken from the
+    /// map. That matters more in this pane than anywhere else: the table
+    /// repolls every two seconds, so a key that is not total would let two
+    /// instances of one app swap places under the operator's cursor between
+    /// refreshes. `(name, id)` is total, since no two sheep share both.
     ///
     /// [`Self::rows`], [`Self::select_at`], [`Self::select_by`],
     /// [`Self::reseat`] and [`Self::selected_index`] all read this sequence
@@ -1105,10 +1114,14 @@ impl App {
     /// [`Self::filter`].
     fn visible_ids(&self) -> impl Iterator<Item = u32> + '_ {
         let needle = self.filter.to_lowercase();
-        self.flock.iter().filter_map(move |(id, row)| {
-            let shown = needle.is_empty() || row.info.name.to_lowercase().contains(&needle);
-            shown.then_some(*id)
-        })
+        let mut visible: Vec<(&str, u32)> = self
+            .flock
+            .iter()
+            .filter(|(_, row)| needle.is_empty() || row.info.name.to_lowercase().contains(&needle))
+            .map(|(id, row)| (row.info.name.as_str(), *id))
+            .collect();
+        visible.sort_unstable();
+        visible.into_iter().map(|(_name, id)| id)
     }
 
     /// How many rows the table draws.
@@ -1204,8 +1217,8 @@ impl App {
         Effect::RefreshSelected
     }
 
-    /// The flock the table draws, in id order: the whole flock, or whatever
-    /// the filter leaves of it. See [`Self::all_rows`] for the unfiltered
+    /// The flock the table draws, in name-then-id order: the whole flock, or
+    /// whatever the filter leaves of it. See [`Self::all_rows`] for the unfiltered
     /// sequence a pane describing the machine as a whole, not the table's
     /// current view, needs instead.
     #[must_use]
@@ -1217,6 +1230,10 @@ impl App {
 
     /// Every sheep the shepherd last reported, in id order, whatever the
     /// filter hides.
+    ///
+    /// Id order, unlike [`Self::rows`]: nothing renders this sequence as a
+    /// list. The host strip sums it, and a sum does not care what order it
+    /// arrives in.
     ///
     /// The host strip reads this rather than [`Self::rows`]: Phase 16 review
     /// Important #4 caught `flock cpu`/`flock mem` silently summing the FILTERED
@@ -1473,7 +1490,12 @@ mod tests {
     }
 
     /// `started()`'s three sheep with the gate open and the cursor parked in
-    /// the middle, on `api` at id 2.
+    /// the middle, on `web` at id 1.
+    ///
+    /// The table reads by name (`App::visible_ids`), so the middle row is the
+    /// middle NAME: `api` 2, `web` 1, `worker` 3. The ids are deliberately
+    /// left disagreeing with the display order, so a test that walks the
+    /// cursor and then asserts an id cannot pass by reading the map.
     ///
     /// Mid-list on purpose. Half the tests below assert that a stray `j` did
     /// NOT move the cursor, and a cursor already clamped at either end would
@@ -1511,8 +1533,8 @@ mod tests {
         );
         let armed = app.action().expect("armed");
         assert_eq!(armed.verb, ActionVerb::Stop);
-        assert_eq!(armed.id, 2);
-        assert_eq!(armed.name, "api");
+        assert_eq!(armed.id, 1);
+        assert_eq!(armed.name, "web");
         assert!(!armed.sent, "nothing has gone out");
     }
 
@@ -1631,7 +1653,7 @@ mod tests {
         app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
         app.update(Msg::Event(BusEvent::Process {
             event: ProcessEventKind::Delete,
-            info: sheep(2, "api", ProcStatus::Stopped),
+            info: sheep(1, "web", ProcStatus::Stopped),
             manually: true,
             at_ms: 0,
         }));
@@ -1872,12 +1894,12 @@ mod tests {
     fn a_deleted_selection_falls_to_the_row_that_took_its_place() {
         let (mut app, t0) = started();
         app.update(Msg::Key(KeyPress::SelectDown));
-        assert_eq!(app.selected(), Some(2), "api, at index 1");
+        assert_eq!(app.selected(), Some(1), "web, at index 1 by name");
 
-        // api dies; web and worker remain. Index 1 is now worker.
+        // web dies; api and worker remain. Index 1 is now worker.
         app.update(Msg::Snapshot {
             rows: vec![
-                sheep(1, "web", ProcStatus::Online),
+                sheep(2, "api", ProcStatus::Online),
                 sheep(3, "worker", ProcStatus::Online),
             ],
             at: t0,
@@ -1888,10 +1910,10 @@ mod tests {
         app.update(Msg::Key(KeyPress::SelectLast));
         assert_eq!(app.selected(), Some(3));
         app.update(Msg::Snapshot {
-            rows: vec![sheep(1, "web", ProcStatus::Online)],
+            rows: vec![sheep(2, "api", ProcStatus::Online)],
             at: t0,
         });
-        assert_eq!(app.selected(), Some(1));
+        assert_eq!(app.selected(), Some(2));
 
         // An empty flock selects nothing at all, rather than an id that is gone.
         app.update(Msg::Snapshot {
@@ -2028,7 +2050,7 @@ mod tests {
             Effect::None,
             "no file is read once the link is lost"
         );
-        assert_eq!(app.selected(), Some(2), "but the cursor moved anyway");
+        assert_eq!(app.selected(), Some(1), "but the cursor moved anyway");
         assert_eq!(app.update(Msg::Key(KeyPress::SelectLast)), Effect::None);
         assert_eq!(app.selected(), Some(3));
     }
@@ -2508,11 +2530,19 @@ mod tests {
     /// A dashboard whose filter is set without any keymap involved. Task 2
     /// wires `/` to this; this task proves the sequence underneath it.
     ///
-    /// Four sheep, two of which contain `web`: `web` at id 1 and `web-worker`
-    /// at id 3, with `api` at id 2 sitting BETWEEN them in the map. The gap is
-    /// deliberate. It is what makes `j` stepping over a hidden row a
+    /// Four sheep, two of which contain `web`: `api-web` at id 1 and
+    /// `web-worker` at id 4, with `cron` and `queue` sitting BETWEEN them. The
+    /// gap is deliberate. It is what makes `j` stepping over a hidden row a
     /// falsifiable claim rather than one a contiguous fixture would pass by
     /// accident.
+    ///
+    /// The names are what they are because the table reads by NAME. The old
+    /// fixture was `web` 1, `api` 2, `web-worker` 3, `cron` 4, which put the
+    /// gap in the id order alone: sorted by name, `web` and `web-worker` are
+    /// adjacent and nothing can ever sit between them that the query `web`
+    /// does not also match. Every "stepped over a hidden row" test here would
+    /// have gone on passing over a contiguous pair. `api-web` sorts before
+    /// `cron`, which is what puts two hidden rows back in the middle.
     fn filtered(query: &str) -> App {
         let t0 = Instant::now();
         let mut app = App::new(
@@ -2523,15 +2553,65 @@ mod tests {
         );
         app.update(Msg::Snapshot {
             rows: vec![
-                sheep(1, "web", ProcStatus::Online),
-                sheep(2, "api", ProcStatus::Online),
-                sheep(3, "web-worker", ProcStatus::Online),
-                sheep(4, "cron", ProcStatus::Online),
+                sheep(1, "api-web", ProcStatus::Online),
+                sheep(2, "cron", ProcStatus::Online),
+                sheep(3, "queue", ProcStatus::Online),
+                sheep(4, "web-worker", ProcStatus::Online),
             ],
             at: t0,
         });
         app.set_filter(query.to_string());
         app
+    }
+
+    /// fails if the table draws in id order, or if two instances of one app
+    /// are left in an order the map decides.
+    ///
+    /// `flock` is a `BTreeMap<u32, Row>`, so a build that simply iterates it
+    /// draws by id. The fixture makes those two answers impossible to
+    /// confuse: by id it is `web` 0, `api` 1, `web` 2; by name and then id it
+    /// is `api` 1, `web` 0, `web` 2.
+    ///
+    /// The two `web` rows carry the clustered-app case, but be clear about
+    /// what they can and cannot catch here, because it is not what the
+    /// equivalent test in `shep-core` catches. Measured with the tiebreak
+    /// removed (`sort_by(|a, b| a.0.cmp(b.0))`, a STABLE name-only key): this
+    /// test still passed. `flock` is a `BTreeMap<u32, Row>`, so the rows
+    /// arrive in id order already and a stable name sort leaves them in it.
+    /// The tiebreak is unfalsifiable from this pane, and pretending otherwise
+    /// is how a test comes to assert something nothing could break. What this
+    /// DOES catch, measured with the sort deleted outright, is the whole
+    /// defect: the rows came back `web` 0, `api` 1, `web` 2, straight off the
+    /// map.
+    ///
+    /// The key stays `(name, id)` regardless, because the reason it is total
+    /// does not depend on where the rows came from, and because this pane
+    /// repolls every two seconds -- a key that is not total is what would let
+    /// two rows swap places under the operator's cursor.
+    #[test]
+    fn the_table_draws_by_name_then_by_id() {
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/rin/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: vec![
+                sheep(0, "web", ProcStatus::Online),
+                sheep(1, "api", ProcStatus::Online),
+                sheep(2, "web", ProcStatus::Online),
+            ],
+            at: t0,
+        });
+
+        let drawn: Vec<(&str, u32)> = app
+            .rows()
+            .iter()
+            .map(|row| (row.info.name.as_str(), row.info.id))
+            .collect();
+        assert_eq!(drawn, vec![("api", 1), ("web", 0), ("web", 2)]);
     }
 
     /// fails if the table stops narrowing, or if the flock's real size stops
@@ -2542,7 +2622,7 @@ mod tests {
     #[test]
     fn a_filter_narrows_the_rows_and_leaves_the_real_size_readable() {
         let app = filtered("web");
-        assert_eq!(app.rows().len(), 2, "web and web-worker");
+        assert_eq!(app.rows().len(), 2, "api-web and web-worker");
         assert_eq!(app.flock_len(), 4, "the flock did not get smaller");
     }
 
@@ -2553,7 +2633,7 @@ mod tests {
     #[test]
     fn the_filter_matches_a_substring_and_not_a_whole_name() {
         assert_eq!(filtered("wor").rows().len(), 1, "web-worker, by its middle");
-        assert_eq!(filtered("w").rows().len(), 2);
+        assert_eq!(filtered("w").rows().len(), 2, "api-web, by its own middle");
     }
 
     /// fails if either `to_lowercase` is dropped. Both directions, because
@@ -2587,11 +2667,15 @@ mod tests {
     #[test]
     fn j_and_k_step_only_over_visible_rows() {
         let mut app = filtered("web");
-        assert_eq!(app.selected(), Some(1), "the first visible sheep");
+        assert_eq!(app.selected(), Some(1), "api-web, the first visible sheep");
         app.update(Msg::Key(KeyPress::SelectDown));
-        assert_eq!(app.selected(), Some(3), "web-worker, skipping api at id 2");
+        assert_eq!(
+            app.selected(),
+            Some(4),
+            "web-worker, skipping the hidden cron and queue"
+        );
         app.update(Msg::Key(KeyPress::SelectDown));
-        assert_eq!(app.selected(), Some(3), "clamped at the last visible row");
+        assert_eq!(app.selected(), Some(4), "clamped at the last visible row");
         app.update(Msg::Key(KeyPress::SelectUp));
         assert_eq!(app.selected(), Some(1));
     }
@@ -2601,7 +2685,7 @@ mod tests {
     fn select_last_lands_on_the_last_visible_row() {
         let mut app = filtered("web");
         app.update(Msg::Key(KeyPress::SelectLast));
-        assert_eq!(app.selected(), Some(3), "web-worker, not cron at id 4");
+        assert_eq!(app.selected(), Some(4), "web-worker, not queue at id 3");
     }
 
     /// fails if a filter that hides the selection snaps to row 0, or drops the
@@ -2613,11 +2697,11 @@ mod tests {
     fn a_filter_that_hides_the_selection_clamps_to_the_nearest_visible_row() {
         let mut app = filtered("");
         app.update(Msg::Key(KeyPress::SelectLast));
-        assert_eq!(app.selected(), Some(4), "cron, position 3 of 4");
+        assert_eq!(app.selected(), Some(4), "web-worker, position 3 of 4");
         app.set_filter("web".to_string());
         assert_eq!(
             app.selected(),
-            Some(3),
+            Some(4),
             "position 3 clamps to the last visible row, which is web-worker"
         );
     }
@@ -2648,10 +2732,10 @@ mod tests {
         let t1 = Instant::now();
         app.update(Msg::Snapshot {
             rows: vec![
-                sheep(1, "web", ProcStatus::Online),
-                sheep(2, "api", ProcStatus::Online),
-                sheep(3, "web-worker", ProcStatus::Online),
-                sheep(4, "cron", ProcStatus::Online),
+                sheep(1, "api-web", ProcStatus::Online),
+                sheep(2, "cron", ProcStatus::Online),
+                sheep(3, "queue", ProcStatus::Online),
+                sheep(4, "web-worker", ProcStatus::Online),
             ],
             at: t1,
         });

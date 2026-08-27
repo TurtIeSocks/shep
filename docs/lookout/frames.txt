@@ -32,12 +32,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -66,12 +66,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         errored          -        14        1          -       -         1h 18m    edge        -            
   3     billing-r…  waiting-restart  -        3         1          -       -         1h 19m    -           -            
   4     cron        stopped          -        0         SIGTERM    -       -         1h 21m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -132,12 +132,12 @@ shep lookout   /home/rin/.shep       6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12…
   ID    NAME      STATUS           CPU     UPTIME  
 ───────────────────────────────────────────────────
-> 0     web       online           3.4%    1h 25m  
-  1     web       online           2.9%    1h 26m  
-  2     api       online           7.1%    1h 28m  
+> 2     api       online           7.1%    1h 28m  
   3     billing…  online           0.8%    1h 29m  
   4     cron      online           0.1%    1h 31m  
   5     metrics   online           0.4%    1h 32m  
+  0     web       online           3.4%    1h 25m  
+  1     web       online           2.9%    1h 26m  
                                                    
                                                    
                                                    
@@ -163,12 +163,12 @@ the shepherd stopped answering — reconnecting (attempt 3)
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -197,12 +197,12 @@ the shepherd has died — these values are frozen as of 2026-08-14 14:32:07
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 15m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 16m    edge        -            
 > 2     api         errored          -        14        1          -       -         1h 18m    edge        -            
   3     billing-r…  waiting-restart  -        3         1          -       -         1h 19m    -           -            
   4     cron        stopped          -        0         SIGTERM    -       -         1h 21m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 22m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 15m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 16m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -230,12 +230,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -264,8 +264,8 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-> 1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
+  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -282,8 +282,8 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-> 1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
+  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -318,12 +318,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -341,12 +341,12 @@ q quit   j/k select   g/G first/last   r refresh   / filter                     
 shep lookout   /home/rin/.shep                                                                            6 in the flock
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
-  2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
+> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
 q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
@@ -358,12 +358,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -392,12 +392,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -426,12 +426,12 @@ shep lookout   /h… 6 in the flock
 host  load 2.31 4.10 3.88 / 10 c…
   ID    NAME      STATUS         
 ─────────────────────────────────
-  0     web       online         
-  1     web       online         
 > 2     api       online         
   3     billing…  online         
   4     cron      online         
   5     metrics   online         
+  0     web       online         
+  1     web       online         
                                  
                                  
                                  
@@ -456,12 +456,12 @@ shep lookout   /home/rin/.shep                                                  
 host  usage is not available on this platform   flock cpu 14.7%   flock mem 716.0M                                      
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -490,12 +490,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
   3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
   4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -524,12 +524,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
   2     api         errored          -        14        1          -       -         1h 18m    edge        -            
   3     billing-r…  waiting-restart  -        3         1          -       -         1h 19m    -           -            
 > 4     cron        stopped          -        0         SIGTERM    -       -         1h 21m    -           -            
   5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
+  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
+  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -558,12 +558,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
 > 2     api                online           48219    1         -          7.1%    241.0M    1h 28m  
   3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
   4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
   5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
+  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
+  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -576,12 +576,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
 > 2     api                online           48219    1         -          7.1%    241.0M    1h 28m  
   3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
   4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
   5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
+  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
+  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -594,11 +594,11 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 7.6%   flock mem 475.0M  …
   ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
 > 3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
   4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
   5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
+  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
+  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -612,12 +612,12 @@ shep lookout   /home/rin/.shep                                                  
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
 > 2     api                online           48299    2         -          7.1%    241.0M    1h 18m  
   3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
   4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
   5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
+  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
+  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -631,12 +631,12 @@ the shepherd stopped answering — reconnecting (attempt 3)
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
 > 2     api                online           48219    1         -          7.1%    241.0M    1h 28m  
   3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
   4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
   5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
+  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
+  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
 the shepherd stopped answering — reconnecting (attempt 3)                            control enabled

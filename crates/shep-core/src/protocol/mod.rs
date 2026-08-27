@@ -18,7 +18,7 @@ pub use request::{
     ActionOutcome, ActionReply, DogSectionToml, DogSource, Envelope, ExitInfo, Hello, HelloAck,
     HelloReply, Lamb, LineOutcome, LineReply, ProcessInfo, ProcessInfoBuilder, Reply, Request,
     Response, RpcError, RpcErrorCode, SelectorSpec, SheepDrift, SignalOutcome, SignalReply, Smit,
-    SmitError,
+    SmitError, sort_flock,
 };
 pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 

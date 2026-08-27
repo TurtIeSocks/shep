@@ -318,7 +318,11 @@ fn tail_log_files(
         .values()
         .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref()))
         .collect();
-    matched.sort_unstable_by_key(|info| info.id);
+    // Name then id, the one order every operator-facing shep listing takes
+    // (`shep_core::protocol::sort_flock`'s own doc). Not `sort_flock` itself:
+    // this is a `Vec<&ProcessInfo>` borrowed out of the cache, and copying the
+    // rows to reach the helper would buy nothing but a clone per sheep.
+    matched.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
 
     let mut failure = false;
 

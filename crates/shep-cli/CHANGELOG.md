@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an operator would be a worse surprise than the bug being fixed. Field names
   only, never values, since `env` carries secrets.
 
+- `shep lookout`'s flock table draws by name, then by id, rather than by id.
+  It repolls every two seconds, so the tiebreak is what stops two instances of
+  one app swapping places under the cursor between refreshes.
+
+- `shep bleats` tails a flock's log files in name order, and `shep flock`
+  against a stopped shepherd lists the saved roll in name order. Both used
+  the order they happened to be handed.
+
 - Table columns are padded by the columns a name draws in, not by its
   character count. A CJK or emoji glyph counts as one character and draws as
   two, so a name built from them hung over its own column and pushed every

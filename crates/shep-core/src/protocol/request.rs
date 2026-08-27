@@ -688,6 +688,38 @@ pub struct ProcessInfo {
     pub smit: Option<String>,
 }
 
+/// Orders one flock listing the way every operator-facing surface presents
+/// one: by name, then by id.
+///
+/// # Why name first
+///
+/// An id is assigned at registration, so ordering by it sorts the flock by
+/// an accident of history rather than by anything an operator is looking
+/// for. It is not stable either: a `delete all` followed by a fresh start
+/// moved a real thirteen-app flock from ids 0-10 to 11-21 with nothing
+/// about the apps having changed. A name is what an operator scans a long
+/// listing for, and it survives that churn.
+///
+/// # Why id breaks the tie
+///
+/// A name is unique to an APP, not to a sheep: an app stocked to four
+/// instances puts four rows under one name. Name alone is therefore not a
+/// total order, and an unstable sort would let those four shuffle between
+/// refreshes — visible in `shep flock` and worse in `shep lookout`, which
+/// repolls every two seconds. The id keeps its other job unchanged: it is
+/// still how an operator addresses one instance at `shep stop 11`. It stops
+/// being a sort key and stays an addressing key.
+///
+/// The daemon's own `snapshot_all` sorts the richer `(name, instance, id)`,
+/// which agrees with this one on every listing where the ids were handed out
+/// in instance order and is strictly more stable where a reload has given a
+/// slot a fresh id. [`ProcessInfo`] carries no instance number, so this is
+/// the finest key expressible over a listing that has already crossed the
+/// wire.
+pub fn sort_flock(listing: &mut [ProcessInfo]) {
+    listing.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
+}
+
 impl ProcessInfo {
     /// Starts a builder for one sheep's row.
     ///
@@ -2493,6 +2525,36 @@ mod tests {
         assert_eq!(
             format!("{response:?}"),
             "DogSection { toml: DogSectionToml(<70 bytes>) }"
+        );
+    }
+
+    /// The fixture is built so the two candidate orders CANNOT agree: read
+    /// by id it is `web/1, api/2, web/0`, read by name it is
+    /// `api, web, web`. A listing that happened to be alphabetical already,
+    /// or whose ids happened to ascend with its names, would pass under
+    /// either rule and prove nothing.
+    ///
+    /// The two `web` rows are the tiebreak half, and they are the reason a
+    /// multi-instance fixture is required: their ids are seeded out of order
+    /// (1 before 0), so a sort keyed on name alone would leave them as it
+    /// found them and fail the last assertion while passing the first.
+    #[test]
+    fn a_listing_sorts_by_name_then_by_id() {
+        let mut listing = vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online).build(),
+            ProcessInfo::builder(2, "api", ProcStatus::Online).build(),
+            ProcessInfo::builder(0, "web", ProcStatus::Online).build(),
+        ];
+        sort_flock(&mut listing);
+
+        let seen: Vec<(&str, u32)> = listing
+            .iter()
+            .map(|info| (info.name.as_str(), info.id))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("api", 2), ("web", 0), ("web", 1)],
+            "name first, then id inside a name"
         );
     }
 }
