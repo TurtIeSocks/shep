@@ -98,9 +98,23 @@ async fn wait_for_log(path: &PathBuf, needle: &str) -> String {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // An empty log says only that nothing arrived, not why. On the CI runner
+    // this fired with `last saw ""`, which left the interesting half unasked:
+    // a sheep that failed to launch at all reports it on stderr, and the
+    // runner writes that to a sibling file nobody was reading.
+    let sibling = path.with_file_name(path.file_name().and_then(|name| name.to_str()).map_or_else(
+        || "web-err.log".to_string(),
+        |name| name.replace("out", "err"),
+    ));
     panic!(
-        "{needle:?} never reached {}; last saw {last:?}",
-        path.display()
+        "{needle:?} never reached {}; last saw {last:?}\n\
+         out file exists: {}, len {:?}\n\
+         stderr file {}: {:?}",
+        path.display(),
+        path.exists(),
+        std::fs::metadata(path).map(|m| m.len()).ok(),
+        sibling.display(),
+        std::fs::read_to_string(&sibling).ok(),
     );
 }
 
