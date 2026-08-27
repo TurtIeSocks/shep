@@ -86,7 +86,7 @@ const polyglotRows: ExampleRow[] = [
 
 <DocsLayout
   title="Examples"
-  description="Seven small Rust programs and a Flockfile that always run, plus a second, polyglot layer over the top for Node, Bun, Python and Go — watch shep's supervision behaviours happen instead of reading about them."
+  description="Seven small Rust programs and a Flockfile that need only cargo and a Unix host, plus a second, polyglot layer over the top for Node, Bun, Python and Go — watch shep's supervision behaviours happen instead of reading about them."
   crumb="Start here / Examples"
   activeSlug="examples"
 >
@@ -120,10 +120,24 @@ const polyglotRows: ExampleRow[] = [
     </p>
 
     <Callout variant="careful">
-      No config edits needed. Every path in <code>examples/Flockfile.toml</code>
-      is relative to <code>examples/</code> itself — a Flockfile app with no
+      Unix, not just cargo. Six of the seven build and run anywhere Rust
+      does, but <code>stubborn</code> traps <code>SIGTERM</code> with a
+      Unix signal mask — on any other platform it prints why and exits 1
+      instead of running at all. <code>shep start</code> processes a
+      Flockfile top to bottom and stops at the first app that fails to
+      spawn (see <a href="#polyglot">the polyglot layer</a> below for the
+      same rule hitting a missing runtime), so on a non-Unix host this file
+      does not run straight through as shown. Comment out
+      <code>stubborn</code>'s <code>[[app]]</code> block to run the other
+      six.
+    </Callout>
+
+    <Callout variant="careful">
+      No config edits needed otherwise. Every path in
+      <code>examples/Flockfile.toml</code> is relative to
+      <code>examples/</code> itself — a Flockfile app with no
       <code>cwd</code> runs where its Flockfile lives — so cloning the repo
-      and running the commands below just works.
+      and running the commands below just works, on a Unix host.
     </Callout>
 
     <h2>Run it</h2>
