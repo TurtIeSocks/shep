@@ -6156,6 +6156,11 @@ fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
     // The edit, over the same path the daemon was told about.
     write_flockfile(&dir, &body(elsewhere.path(), "hunter2-after"));
     let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    // Drift is a warning, not a failure. Without this the test reads only
+    // stderr, so a change that turned the report into a refusal would keep
+    // it green while breaking every operator script that runs `shep start`
+    // twice.
+    assert_success(&again);
 
     let stderr = String::from_utf8_lossy(&again.stderr);
     assert!(
