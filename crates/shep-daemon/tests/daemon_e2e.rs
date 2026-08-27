@@ -271,16 +271,26 @@ impl Client {
             body,
         })
         .await;
+        // Bounded like every other wait in this file. It was the one that was
+        // not, and a daemon that never answers turned that into a hang with
+        // no output rather than a failure: on 2026-08-27 the Windows CI legs
+        // sat in `Reopen` here until the job was cancelled, three times, and
+        // the log said only "has been running for over 60 seconds". The
+        // deadline is what makes an unanswered request name itself.
         let mut skipped = Vec::new();
-        let reply = loop {
-            match self.next_frame().await {
-                ServerFrame::Reply(reply) if reply.id == id => break reply,
-                // Anything else (a bus event, an unrelated reply, or a
-                // future frame kind this client doesn't know about) is set
-                // aside rather than dropped — see `pending`'s own doc.
-                other => skipped.push(other),
+        let reply = tokio::time::timeout(RECV_TIMEOUT, async {
+            loop {
+                match self.next_frame().await {
+                    ServerFrame::Reply(reply) if reply.id == id => break reply,
+                    // Anything else (a bus event, an unrelated reply, or a
+                    // future frame kind this client doesn't know about) is set
+                    // aside rather than dropped — see `pending`'s own doc.
+                    other => skipped.push(other),
+                }
             }
-        };
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for a reply to request {id}"));
         requeue(&mut self.pending, skipped);
         track_spawned(&self.spawned, &reply);
         reply
