@@ -755,13 +755,28 @@ async fn resume_all(
     ExitCode::Success
 }
 
-/// Every distinct name in `infos`, in the order they appear.
+/// Every distinct name in `infos`, in the order they first appear.
 ///
-/// The listing is already sorted by name, so this is a scan rather than a set.
+/// Order-INDEPENDENT, and that is the whole of it. This compared each name
+/// against the previous one alone, which drops a duplicate only when the two
+/// are adjacent, and so was correct only for a caller handing over a
+/// name-sorted slice. One caller does not: `start_one`'s Flockfile and path
+/// arm builds its set from the resolved apps in the file's own order, so two
+/// instances of one app listed either side of a third produced a SECOND
+/// `Request::Restart` and restarted that app twice in one invocation.
+///
+/// The selector arm did hand over sorted rows, but only because the daemon
+/// sorts its listing that way -- a cross-version assumption about a peer,
+/// not an invariant this function can hold itself. Both callers are now safe
+/// regardless.
+///
+/// A `Vec` scan rather than a `HashSet`: this runs over the sheep one
+/// selector matched, which is tens of rows, and it has to preserve first-seen
+/// order for the notice it feeds.
 fn unique_names<'a>(infos: &[&'a ProcessInfo]) -> Vec<&'a str> {
     let mut names: Vec<&str> = Vec::with_capacity(infos.len());
     for info in infos {
-        if names.last() != Some(&info.name.as_str()) {
+        if !names.contains(&info.name.as_str()) {
             names.push(&info.name);
         }
     }
@@ -2145,6 +2160,37 @@ mod tests {
             "a bare name may still be a file, so the unresolvable message stands"
         );
         assert_eq!(miss("11", &empty), None, "and so may a bare id");
+    }
+
+    /// fails if a name repeated NON-ADJACENTLY produces two respawns.
+    ///
+    /// `unique_names` compared each name against the previous one only, which
+    /// drops a duplicate solely when the two sit next to each other. That is
+    /// true of a name-sorted listing and NOT true of `start_one`'s Flockfile
+    /// and path arm, which builds its set from the resolved apps in the file's
+    /// own order. Two instances of one app listed either side of a third then
+    /// produced a second `Request::Restart` and restarted that app twice in
+    /// one invocation.
+    ///
+    /// The fixture is `web`, `api`, `web` precisely because a sorted one
+    /// cannot exhibit it: sorted, the two `web` rows are adjacent and the old
+    /// code was already correct. First-seen order is asserted too, since the
+    /// notice this feeds reads as a list.
+    #[test]
+    fn unique_names_drops_a_duplicate_that_is_not_adjacent() {
+        use shep_core::status::ProcStatus;
+
+        let rows = [
+            ProcessInfo::builder(0, "web", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(1, "api", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Stopped).build(),
+        ];
+        let borrowed: Vec<&ProcessInfo> = rows.iter().collect();
+        assert_eq!(
+            unique_names(&borrowed),
+            vec!["web", "api"],
+            "one entry per name, in the order each was first seen"
+        );
     }
 
     /// fails if `shep start all` calls a flock empty while it holds dogs.
