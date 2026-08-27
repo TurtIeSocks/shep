@@ -1,9 +1,10 @@
 ---
 /*
- * Examples (examples/Flockfile.toml, examples/src/bin/*.rs). Every command
- * and behaviour on this page was run against a real `shep start
- * examples/Flockfile.toml`, under its own $SHEP_HOME, before this page was
- * written.
+ * Examples (examples/Flockfile.toml, examples/Flockfile.polyglot.toml,
+ * examples/src/bin/*.rs, examples/polyglot/*). Every command and behaviour
+ * on this page was run for real: the Rust set under its own throwaway
+ * $SHEP_HOME, and the polyglot set the same way with node, bun, python3
+ * and go all actually installed, before this page was written.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
@@ -16,7 +17,7 @@ interface ExampleRow {
   watch: string;
 }
 
-const rows: ExampleRow[] = [
+const rustRows: ExampleRow[] = [
   {
     program: "http_server",
     demonstrates: "The baseline every probe example needs.",
@@ -53,11 +54,39 @@ const rows: ExampleRow[] = [
     watch: "shep bleats noisy -f, alternating stdout and stderr lines.",
   },
 ];
+
+const polyglotRows: ExampleRow[] = [
+  {
+    program: "node-http / node-http-cluster",
+    demonstrates: "The pm2 audience's default case, plus instances above 1.",
+    watch: "curl 127.0.0.1:19090/, then 19091 through 19094 for each clustered instance.",
+  },
+  {
+    program: "bun-http",
+    demonstrates: "interpreter, and shep.toml's [interpreters] mapping.",
+    watch: "The same node-http.js, curl 127.0.0.1:19095/, and a runtime field in the response body instead of a different file.",
+  },
+  {
+    program: "python-app",
+    demonstrates: "interpreter pointed at a venv's own python, not a bare python3.",
+    watch: "curl 127.0.0.1:19096/ after examples/polyglot/setup-venv.sh.",
+  },
+  {
+    program: "go-http",
+    demonstrates: "A build step, then no interpreter field at all.",
+    watch: "curl 127.0.0.1:19097/ after examples/polyglot/go-http/build.sh.",
+  },
+  {
+    program: "static-site",
+    demonstrates: "shep serve — no program of the operator's own.",
+    watch: "curl 127.0.0.1:19098/ after shep serve examples/polyglot/static-site --port 19098.",
+  },
+];
 ---
 
 <DocsLayout
   title="Examples"
-  description="Seven small programs and one Flockfile — build them, start them, and watch shep's supervision behaviours happen instead of reading about them."
+  description="Seven small Rust programs and a Flockfile that always run, plus a second, polyglot layer over the top for Node, Bun, Python and Go — watch shep's supervision behaviours happen instead of reading about them."
   crumb="Start here / Examples"
   activeSlug="examples"
 >
@@ -65,13 +94,29 @@ const rows: ExampleRow[] = [
     <h1>Examples</h1>
     <ReferencePills slug="examples" />
     <p class="lede">
-      Every page in this section describes what shep does. This one is seven
-      tiny programs and a Flockfile that make it happen where you can watch:
-      a probe waiting, a stop signal being ignored, a memory ceiling firing,
-      a crash loop backing off. Everything lives under
+      Every page in this section describes what shep does. This one is
+      seven tiny programs and a Flockfile that make it happen where you can
+      watch: a probe waiting, a stop signal being ignored, a memory ceiling
+      firing, a crash loop backing off. Everything lives under
       <code>examples/</code> — a workspace member of its own, built by
       <code>cargo build --release</code> but never on the path a plain
       <code>cargo install shep</code> walks.
+    </p>
+    <p>
+      That first set is Rust on purpose: it needs nothing but a Rust
+      toolchain, works from a fresh clone, and is what
+      <code>examples/Flockfile.toml</code> starts. A second layer,
+      <code>examples/Flockfile.polyglot.toml</code>, runs the same ideas
+      against Node, Bun, Python and Go — the stacks most shep operators
+      actually run, and the ones the Rust set structurally can't stand in
+      for: a real Node HTTP server, the same source file under two
+      different runtimes, a Python interpreter resolved through a venv
+      instead of PATH, a Go binary with a build step, and a static site
+      served with no program of the operator's own at all. It's a separate
+      file and a separate section below because it needs runtimes the Rust
+      set doesn't — see <a href="#polyglot">The polyglot layer</a> for
+      exactly which ones, and what happens to the rest of the file when one
+      is missing.
     </p>
 
     <Callout variant="careful">
@@ -105,7 +150,7 @@ const rows: ExampleRow[] = [
         <span class="col-does">Watch for</span>
       </div>
       {
-        rows.map((r) => (
+        rustRows.map((r) => (
           <div class="row">
             <span class="col-name">
               <code>{r.program}</code>
@@ -157,6 +202,142 @@ interval = "3s"`}</CodeBlock>
       Roughly three seconds pass — one <code>"caught SIGTERM, still not
       dying"</code> line in its log, then silence — before
       <code>shep flock</code> reports it stopped by <code>SIGKILL</code>.
+    </p>
+
+    <h2 id="polyglot">The polyglot layer</h2>
+    <p>
+      <code>examples/Flockfile.polyglot.toml</code> needs, per app,
+      <code>node</code>, <code>bun</code>, <code>python3</code>, or
+      <code>go</code> — never all four to run any single one of them.
+      Two setup steps, once, before the runtimes that need them:
+    </p>
+    <div class="terminal">
+      <div><span class="prompt">$</span> examples/polyglot/setup-venv.sh</div>
+      <div><span class="prompt">$</span> examples/polyglot/go-http/build.sh</div>
+      <div><span class="prompt">$</span> export SHEP_HOME="$(mktemp -d)"</div>
+      <div><span class="prompt">$</span> shep start examples/Flockfile.polyglot.toml</div>
+    </div>
+    <div class="field-table">
+      <div class="row header">
+        <span class="col-name">Program</span>
+        <span class="col-does">Demonstrates</span>
+        <span class="col-does">Watch for</span>
+      </div>
+      {
+        polyglotRows.map((r) => (
+          <div class="row">
+            <span class="col-name">
+              <code>{r.program}</code>
+            </span>
+            <span class="col-does">{r.demonstrates}</span>
+            <span class="col-does">{r.watch}</span>
+          </div>
+        ))
+      }
+    </div>
+
+    <Callout variant="careful">
+      A missing runtime does not sink the whole file, but it does sink
+      everything listed AFTER it. <code>shep start</code> processes a
+      Flockfile's apps top to bottom and stops at the first one that fails
+      to spawn (<code>shep start --help</code>: "Several are started in
+      turn, not atomically") — every app already online stays online, and
+      the failing app reports why
+      (<code>SpawnFailed: No such file or directory</code>), but nothing
+      below it in the file is even attempted in that same invocation.
+      Missing <code>bun</code> would silently keep <code>python-app</code>
+      and <code>go-http</code> from starting too, not just
+      <code>bun-http</code>. If a runtime isn't installed, comment out that
+      app's <code>[[app]]</code> block rather than leaving it in.
+    </Callout>
+
+    <h3>One file, two runtimes</h3>
+    <p>
+      <code>node-http</code> and <code>bun-http</code> run the exact same
+      script, <code>examples/polyglot/node-http.js</code> — only
+      <code>interpreter</code> changes, from <code>"node"</code> to
+      <code>"bun"</code>:
+    </p>
+    <CodeBlock label="examples/Flockfile.polyglot.toml">{`[[app]]
+name        = "node-http"
+script      = "polyglot/node-http.js"
+interpreter = "node"
+args        = ["19090"]
+
+[[app]]
+name        = "bun-http"
+script      = "polyglot/node-http.js"
+interpreter = "bun"
+args        = ["19095"]`}</CodeBlock>
+    <p class="fine">
+      shep never inspects the script; <code>interpreter</code> is a plain
+      program name, spawned with the script as its first argument. A
+      <code>shep.toml</code> <code>[interpreters]</code> table does the same
+      job automatically, by extension, so every app in a flock doesn't
+      have to spell <code>interpreter</code> out by hand:
+    </p>
+    <CodeBlock label="shep.toml">{`[interpreters]
+js = "node"
+py = "python3"`}</CodeBlock>
+    <p class="fine">
+      An app's own <code>interpreter</code> field, when it sets one — as
+      every app in <code>examples/Flockfile.polyglot.toml</code> does —
+      always wins over the extension map. The map exists for a flock of
+      apps that all use the same handful of extensions and would rather
+      not repeat <code>interpreter = "node"</code> five times.
+    </p>
+
+    <h3>instances, without reuse_port</h3>
+    <p>
+      <code>node-http-cluster</code> is the same script again,
+      <code>instances = 4</code>. Each instance gets its own
+      <code>SHEP_INSTANCE</code> env var (0 through 3), and the script adds
+      that to its base port — four separate listeners on 19091 through
+      19094, not one port shared four ways. pm2's cluster mode puts all N
+      instances behind one port using <code>SO_REUSEPORT</code>; shep's
+      <code>reuse_port</code> field exists in the schema for exactly that
+      but is refused at load while nothing implements the mechanism yet
+      (verified: setting <code>reuse_port = true</code> anywhere in this
+      file fails the whole file to load, not just that one app) — which is
+      why this example offsets the port instead of sharing it.
+    </p>
+
+    <h3>A venv's own python</h3>
+    <p>
+      The classic failure <code>python-app</code> exists to head off: an
+      app that runs fine from a shell — your venv is active — and does not
+      under a supervisor, because the supervisor never activated anything
+      and a bare <code>python3</code> resolved against whatever's on ITS
+      PATH instead. <code>interpreter</code> points straight at the venv's
+      own binary:
+    </p>
+    <CodeBlock label="examples/Flockfile.polyglot.toml">{`[[app]]
+name        = "python-app"
+script      = "polyglot/python-app.py"
+interpreter = "polyglot/venv/bin/python3"
+args        = ["19096"]`}</CodeBlock>
+
+    <h3>A build step, then no interpreter</h3>
+    <p>
+      <code>go-http</code> is compiled, not interpreted:
+      <code>examples/polyglot/go-http/build.sh</code> runs
+      <code>go build</code> first, and the Flockfile entry that follows has
+      no <code>interpreter</code> field at all — a native executable
+      already runs itself.
+    </p>
+
+    <h3>shep serve, not an app</h3>
+    <p>
+      <code>examples/polyglot/static-site</code> isn't in the Flockfile at
+      all. <code>shep serve</code> registers its own sheep for a directory
+      with no program of the operator's own:
+    </p>
+    <div class="terminal">
+      <div><span class="prompt">$</span> shep serve examples/polyglot/static-site --port 19098</div>
+    </div>
+    <p class="fine">
+      See <a href="/docs/serve">Serve</a> for <code>--bind</code>,
+      <code>--auth</code>, and everything else it refuses by default.
     </p>
 
     <h2>Where to go next</h2>

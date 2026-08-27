@@ -1,0 +1,101 @@
+# A second layer over examples/Flockfile.toml, for readers who have these
+# runtimes installed and want to see shep drive their own stack rather than
+# a Rust binary. The seven apps in examples/Flockfile.toml need nothing but
+# cargo and are the entry point that always runs; nothing here replaces or
+# reorders them. This file needs, per app below: node, bun, python3, and go.
+# `shep serve` (see the bottom of this file) needs none of them.
+#
+#   $ shep start examples/Flockfile.polyglot.toml
+#
+# `shep start` processes a Flockfile's apps top to bottom and stops at the
+# first one that fails to spawn (`shep start --help`: "Several are started
+# in turn, not atomically"). A missing runtime reports
+# `SpawnFailed: No such file or directory` naming that app -- but every app
+# BELOW it in this file is never even attempted in that same invocation,
+# while every app ABOVE it, already online, stays online. Missing bun,
+# third below, would silently prevent python-app and go-http from starting
+# too, not just bun-http. If you are missing a runtime, comment out that
+# app's `[[app]]` block below rather than leaving it in and hoping the ones
+# after it still start.
+#
+# Setup, once, per runtime you want to see:
+#
+#   $ examples/polyglot/setup-venv.sh       # python-app's own interpreter
+#   $ examples/polyglot/go-http/build.sh    # go-http's compiled binary
+#
+# node and bun need no build step -- `interpreter` runs their source
+# directly. Ports continue examples/Flockfile.toml's numbering, one range
+# up: 19081/19082/19084 there, 19090 and up here.
+
+# --- 1. Node: the pm2 audience's default case -------------------------------
+# A plain HTTP server. `interpreter = "node"` is the whole story -- shep
+# does not know or care that this script is JavaScript, only that "node" is
+# a program on its own PATH to run it with.
+[[app]]
+name        = "node-http"
+script      = "polyglot/node-http.js"
+interpreter = "node"
+args        = ["19090"]
+
+# --- 2. Node, clustered ------------------------------------------------------
+# The same script, `instances = 4`. Each instance gets its own
+# `SHEP_INSTANCE` (0-3), and node-http.js adds that to its base port, so
+# this is four separate listeners on 19091-19094, not one port shared four
+# ways. A real `reuse_port` -- the mechanism pm2's cluster mode uses to put
+# all N instances behind one port -- is in the Flockfile schema already
+# (crates/shep-core/src/config/app.rs) but refused at load while nothing
+# implements it yet, which is why this entry does not set it: `reuse_port
+# = true` here would fail examples/Flockfile.polyglot.toml to load, not
+# just this one app.
+[[app]]
+name        = "node-http-cluster"
+script      = "polyglot/node-http.js"
+interpreter = "node"
+args        = ["19091"]
+instances   = 4
+
+# --- 3. Bun, same file -------------------------------------------------------
+# Only `interpreter` changed, from "node" to "bun" -- same script, same
+# args shape, a different runtime entirely. This is the clearest
+# demonstration there is that `interpreter` is a plain program name and
+# shep.toml's own `[interpreters]` table (extension -> program, e.g.
+# `js = "node"`) is the same idea applied automatically by file extension
+# instead of spelled out per app -- see the docs page for the shep.toml
+# snippet.
+[[app]]
+name        = "bun-http"
+script      = "polyglot/node-http.js"
+interpreter = "bun"
+args        = ["19095"]
+
+# --- 4. Python behind its own venv ------------------------------------------
+# `interpreter` points at the venv's OWN python3, not a bare "python3" that
+# resolves against whichever PATH the daemon happens to have -- the classic
+# failure this heads off is an app that works in a shell (your venv is
+# active) and does not under a supervisor (it never was). Run
+# examples/polyglot/setup-venv.sh first.
+[[app]]
+name        = "python-app"
+script      = "polyglot/python-app.py"
+interpreter = "polyglot/venv/bin/python3"
+args        = ["19096"]
+
+# --- 5. Go: a build step, then no interpreter at all ------------------------
+# `go build` produces a native executable, so this entry has no
+# `interpreter` field -- run examples/polyglot/go-http/build.sh first, and
+# a compiled program is its own interpreter. Compare app 1 above: same
+# shape of Flockfile entry, minus one field, because the artifact itself
+# no longer needs one.
+[[app]]
+name   = "go-http"
+script = "polyglot/go-http/go-http"
+args   = ["19097"]
+
+# --- 6. A static site, and shep serve ---------------------------------------
+# Not an [[app]] entry -- shep serve is its own command, registering its
+# own sheep, for a directory with no program of the operator's own at all:
+#
+#   $ shep serve examples/polyglot/static-site --port 19098
+#
+# See the site's /docs/serve page for --bind, --auth, and everything else
+# it refuses by default.
