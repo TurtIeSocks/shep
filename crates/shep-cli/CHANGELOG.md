@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Colour reaches the seven `Render` impls that are not the flock table.
+  `colour_cell` had only ever appeared inside `FlockRows`, so one of eight
+  tables was coloured and the same dog read one way under `shep dogs` and
+  another under `shep flock`. The dogs table and the `enable`/`disable`/
+  `adopt`/`rehome` confirmations now take the flock table's own rules, and
+  `shep empty`'s table mutes its id and its placeholders. `describe`'s lamb
+  table stays plain: two identity columns with no state, no reading and no
+  placeholder, so there is nothing for a colour to carry.
+
 - `shep start` takes the selector grammar every other lifecycle verb takes:
   `all`, `fold:<name>`, `/regex/`, globs, and a bare id. `shep stop
   fold:backed` worked and `shep start fold:backed` refused with "backed is not

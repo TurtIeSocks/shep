@@ -110,17 +110,13 @@ impl Render for FlockRows {
         for (row, p) in rows.iter_mut().zip(&self.0) {
             row[2] = status_cell(p.status, presentation, status_word);
             colour_cell(&mut row[0], Role::Ink3, presentation);
-            if row[3] == "-" {
-                colour_cell(&mut row[3], Role::Ink3, presentation);
-            }
+            mute_a_dash(&mut row[3], presentation);
             colour_cell(&mut row[4], restarts_role(p.restarts), presentation);
             colour_cell(&mut row[5], exit_role(p.pid, p.last_exit), presentation);
             colour_cell(&mut row[6], cpu_role(p.cpu_percent), presentation);
             colour_cell(&mut row[7], mem_role(p.memory_bytes), presentation);
             colour_cell(&mut row[9], Role::Ink3, presentation);
-            if row[10] == "-" {
-                colour_cell(&mut row[10], Role::Ink3, presentation);
-            }
+            mute_a_dash(&mut row[10], presentation);
         }
         rows
     }
@@ -194,11 +190,17 @@ impl Render for FlockRows {
     const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
 }
 
-/// One sheep's STATUS cell, per spec §2 -- the only place in this module a
-/// face or a colour belongs, and the only STATUS cell any `Render` impl in
-/// this crate dresses up: `DogRows`/`DogEnabledRow`/`DogDisabledRow` render
-/// their own STATUS text unchanged, because a dog is not a sheep and this
-/// feature was never about giving one a face.
+/// One STATUS cell, per spec §2 -- the only place in this module a face or a
+/// colour for a status is decided, and now shared by every table with a
+/// STATUS column rather than by `FlockRows` alone.
+///
+/// It used to be `FlockRows`' own, on the grounds that a dog is not a sheep
+/// and the feature was never about giving one a face. That left seven of the
+/// eight tables in this module plain while one was coloured, so the same dog
+/// read one way under `shep dogs` and another under `shep flock`. Rin's
+/// ruling is that the treatment extends: a dog is supervised exactly as a
+/// sheep is, and `vocabulary.rs` stays the single source for the faces and
+/// the status-to-role mapping rather than growing a second set for dogs.
 ///
 /// - `presentation.level.sheep()` decides whether a face appears at all
 ///   ([`vocabulary::face`], always exactly 5 columns).
@@ -225,6 +227,43 @@ fn status_cell(status: ProcStatus, presentation: Presentation, status_word: bool
     };
     colour_cell(&mut text, vocabulary::role_of(status), presentation);
     text
+}
+
+/// The [`ProcStatus`] a free-text STATUS cell is naming, if it is naming one.
+///
+/// The dog-action rows ([`DogEnabledRow`] and its three siblings) carry
+/// `status` as a `String`, because it holds either a real status rendering or
+/// a sentence saying why no shepherd answered. A sentence has no role, so
+/// this is what keeps colour off it: a cell that names a status is coloured
+/// like one, and a cell that explains something is left alone.
+///
+/// Matched against each variant's own [`fmt::Display`](std::fmt::Display)
+/// rather than against a second table of strings, so this cannot drift from
+/// the rendering it is inverting. What it CAN miss is a variant added to
+/// `ProcStatus` and not added to `EVERY` below, which
+/// `every_status_is_recognised_by_its_own_rendering` is the guard for.
+fn status_named_by(text: &str) -> Option<ProcStatus> {
+    const EVERY: [ProcStatus; 6] = [
+        ProcStatus::Starting,
+        ProcStatus::Online,
+        ProcStatus::Stopping,
+        ProcStatus::Stopped,
+        ProcStatus::Errored,
+        ProcStatus::WaitingRestart,
+    ];
+    EVERY.into_iter().find(|status| status.to_string() == text)
+}
+
+/// Colours a cell [`Role::Ink3`] when it holds the `-` placeholder, and
+/// leaves it alone otherwise.
+///
+/// `FlockRows` applies this to PID and SMIT; the rule is that an absent value
+/// must not compete with a real one, and it is the same rule wherever a table
+/// prints a dash. Factored out because seven tables now want it.
+fn mute_a_dash(cell: &mut String, presentation: Presentation) {
+    if cell == "-" {
+        colour_cell(cell, Role::Ink3, presentation);
+    }
 }
 
 /// Wraps `cell` in [`crate::output::paint::style_for`]'s span for `role`, or
@@ -472,6 +511,33 @@ impl Render for DogRows {
             .collect()
     }
 
+    /// The same treatment `FlockRows` gives its own columns, on the five this
+    /// table shares with it, so the same dog reads the same way under
+    /// `shep dogs` as a sheep does under `shep flock`.
+    ///
+    /// STATUS takes the face and the colour ([`status_cell`]); RESTARTS,
+    /// CPU and MEM take the same three ramps; a `-` in PID is muted.
+    ///
+    /// SOURCE is muted throughout rather than ramped. It says where a
+    /// binary came from, never whether the dog is healthy, which is exactly
+    /// the role FOLD plays in the sheep table -- and this table's own
+    /// `PRIORITIES` already treats the two as the same kind of column.
+    ///
+    /// NAME and UPTIME stay plain, matching `FlockRows`: a name has no state
+    /// to report, and an uptime has no threshold anyone agreed on.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let mut rows = self.rows();
+        for (row, p) in rows.iter_mut().zip(&self.0) {
+            colour_cell(&mut row[1], Role::Ink3, presentation);
+            row[2] = status_cell(p.status, presentation, status_word);
+            mute_a_dash(&mut row[3], presentation);
+            colour_cell(&mut row[4], restarts_role(p.restarts), presentation);
+            colour_cell(&mut row[5], cpu_role(p.cpu_percent), presentation);
+            colour_cell(&mut row[6], mem_role(p.memory_bytes), presentation);
+        }
+        rows
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -548,6 +614,15 @@ impl Render for DogRows {
 #[derive(Debug, Serialize)]
 pub struct LambRows(pub Vec<Lamb>);
 
+/// `LambRows` gets NO colour, and that is a decision rather than an
+/// omission.
+///
+/// Both its columns are identity: which process, and what it is running. A
+/// lamb has no status, no restart count, no resource reading, and no
+/// placeholder -- `pid` is a real number on every row and `name` is a real
+/// string. There is nothing here for a colour to carry, and the rule is that
+/// every colour carries information. Muting one of two columns would just be
+/// picking one to look faded.
 impl Render for LambRows {
     fn headers() -> &'static [&'static str] {
         &["PID", "NAME"]
@@ -627,6 +702,38 @@ impl Render for DogEnabledRow {
         ]]
     }
 
+    /// The dog-action rows' shared treatment, spelled out here once and
+    /// pointed at from the other three.
+    ///
+    /// SOURCE is muted, the same call `DogRows` makes: it says where the
+    /// binary came from, never whether anything is healthy.
+    ///
+    /// STATUS is coloured only when it NAMES a status. This field holds
+    /// either a real `ProcStatus` rendering or a sentence saying why no
+    /// shepherd answered ([`Self::status`]'s own doc), and a sentence has no
+    /// role to wear -- colouring it would be decoration, which is the one
+    /// thing the rule here forbids. [`status_named_by`] is what tells the two
+    /// apart.
+    ///
+    /// SHEPHERD is left plain deliberately, and it was the closest call in
+    /// this table. `false` is worth knowing -- it means the config changed
+    /// and nothing is running yet -- but the STATUS cell beside it already
+    /// says so in a whole sentence, so a colour here would be a second
+    /// decoration saying what the text already says. That is the same
+    /// reasoning `lookout/theme.rs` gives for not putting a face in its own
+    /// flock pane.
+    ///
+    /// NAME stays plain, matching every other table in this module.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let mut rows = self.rows();
+        let row = &mut rows[0];
+        colour_cell(&mut row[1], Role::Ink3, presentation);
+        if let Some(status) = status_named_by(&row[3]) {
+            row[3] = status_cell(status, presentation, status_word);
+        }
+        rows
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -693,6 +800,17 @@ impl Render for DogDisabledRow {
         ]]
     }
 
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let mut rows = self.rows();
+        let row = &mut rows[0];
+        colour_cell(&mut row[1], Role::Ink3, presentation);
+        if let Some(status) = status_named_by(&row[3]) {
+            row[3] = status_cell(status, presentation, status_word);
+        }
+        rows
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -749,6 +867,17 @@ impl Render for DogAdoptedRow {
             self.shepherd_acted.to_string(),
             self.status.clone(),
         ]]
+    }
+
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let mut rows = self.rows();
+        let row = &mut rows[0];
+        colour_cell(&mut row[1], Role::Ink3, presentation);
+        if let Some(status) = status_named_by(&row[3]) {
+            row[3] = status_cell(status, presentation, status_word);
+        }
+        rows
     }
 
     /// # Panics
@@ -815,6 +944,17 @@ impl Render for DogRehomedRow {
             self.shepherd_acted.to_string(),
             self.status.clone(),
         ]]
+    }
+
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let mut rows = self.rows();
+        let row = &mut rows[0];
+        colour_cell(&mut row[1], Role::Ink3, presentation);
+        if let Some(status) = status_named_by(&row[3]) {
+            row[3] = status_cell(status, presentation, status_word);
+        }
+        rows
     }
 
     /// # Panics
@@ -888,6 +1028,32 @@ impl Render for FlushedRows {
                 ]
             })
             .collect()
+    }
+
+    /// Two of the four columns, and no more, because two of them have
+    /// nothing to say.
+    ///
+    /// ID is muted, exactly as `FlockRows` mutes its own: it never changes
+    /// and it is chrome beside the thing this table is about.
+    ///
+    /// A `-` in either path column is muted, the placeholder rule this
+    /// module applies everywhere. A real path is left plain: it is the
+    /// subject of the table rather than a reading about it, there is no
+    /// threshold to ramp against and no fault to mark, and colouring the
+    /// widest column on the row for no information would be exactly the
+    /// decoration the rule forbids.
+    ///
+    /// No STATUS column here at all -- see this type's own doc for why
+    /// `flush` renders the files rather than the lifecycle -- so there is no
+    /// face and no status colour to give.
+    fn rows_for(&self, presentation: Presentation, _status_word: bool) -> Vec<Vec<String>> {
+        let mut rows = self.rows();
+        for row in &mut rows {
+            colour_cell(&mut row[0], Role::Ink3, presentation);
+            mute_a_dash(&mut row[2], presentation);
+            mute_a_dash(&mut row[3], presentation);
+        }
+        rows
     }
 
     /// # Panics
@@ -3152,6 +3318,240 @@ pub(crate) mod tests {
                 })
             ),
             Role::Bark
+        );
+    }
+
+    // --- Colour: the seven tables that are not the flock listing ---------
+    //
+    // Colour was commissioned as "colour the flock table" and delivered
+    // exactly that, so `colour_cell` appeared in one of the eight `Render`
+    // impls in this module and nowhere else. These pin what each of the
+    // other seven now does AND what it deliberately does not, because
+    // "nothing is coloured" and "everything is coloured" are both wrong and
+    // a presence check alone cannot tell either from the rule.
+    //
+    // Every assertion below compares against the exact painted string rather
+    // than looking for an escape byte. A presence check would pass on a cell
+    // painted the WRONG role, which is the failure that matters here: a
+    // healthy dog painted `Bark` reads as broken.
+
+    /// The 256-colour presentation these cases render at.
+    fn coloured() -> Presentation {
+        use crate::style::StyleLevel;
+        Presentation::new(
+            StyleLevel::Full,
+            None,
+            Some(std::ffi::OsStr::new("xterm-256color")),
+            None,
+            200,
+        )
+    }
+
+    /// `text` as `colour_cell` would paint it for `role`. Built through
+    /// `paint::style_for`, the same function the renderer calls, so this
+    /// compares the ROLE and not merely the presence of an escape.
+    fn painted(text: &str, role: Role) -> String {
+        let mut cell = text.to_string();
+        colour_cell(&mut cell, role, coloured());
+        cell
+    }
+
+    /// One dog, with readings chosen so every ramp lands on a known side:
+    /// four restarts (above zero), 0.0% CPU (idle, which is muted rather
+    /// than green), and 3 MiB (below the MEM boundary).
+    fn sample_dog(status: ProcStatus, pid: Option<u32>) -> ProcessInfo {
+        ProcessInfo::builder(9, "log-rotate", status)
+            .pid(pid)
+            .restarts(4)
+            .uptime_ms(41_000)
+            .cpu_percent(pid.map(|_| 0.0))
+            .memory_bytes(pid.map(|_| 3 * 1024 * 1024))
+            .dog(Some(DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            }))
+            .build()
+    }
+
+    /// fails if the dogs table stops matching the flock table on the five
+    /// columns the two share, or if it starts colouring a column that has
+    /// nothing to say.
+    ///
+    /// The same dog used to read one way under `shep dogs` and another under
+    /// `shep flock`, because only one of the two tables had ever been
+    /// coloured.
+    #[test]
+    fn the_dogs_table_is_coloured_by_the_flock_tables_own_rules() {
+        let rows =
+            DogRows(vec![sample_dog(ProcStatus::Online, Some(14_110))]).rows_for(coloured(), true);
+        let row = &rows[0];
+
+        assert_eq!(row[0], "log-rotate", "NAME is plain, as in the flock table");
+        assert_eq!(row[1], painted("adopted", Role::Ink3), "SOURCE is chrome");
+        assert_eq!(
+            row[2],
+            painted("(o.o) online", Role::Meadow),
+            "STATUS takes the face and the role, from vocabulary.rs"
+        );
+        assert_eq!(row[3], "14110", "a real PID is left plain");
+        assert_eq!(row[4], painted("4", Role::Butter), "RESTARTS above zero");
+        assert_eq!(row[5], painted("0.0%", Role::Ink3), "idle CPU is not news");
+        assert_eq!(row[6], painted("3.0M", Role::Meadow), "MEM below the ramp");
+        assert_eq!(row[7], "41s", "UPTIME is plain, as in the flock table");
+    }
+
+    /// fails if a stopped dog's `-` placeholders stop being muted, or if its
+    /// STATUS stops carrying the role a stopped sheep's does.
+    ///
+    /// The sibling of the case above, and it exists because that one cannot
+    /// reach the placeholder branch: a running dog has a real PID, CPU and
+    /// MEM in every cell.
+    #[test]
+    fn a_stopped_dogs_placeholders_are_muted() {
+        let rows = DogRows(vec![sample_dog(ProcStatus::Stopped, None)]).rows_for(coloured(), true);
+        let row = &rows[0];
+
+        assert_eq!(row[2], painted("(-.-) stopped", Role::Ink3));
+        assert_eq!(row[3], painted("-", Role::Ink3), "PID");
+        assert_eq!(row[5], painted("-", Role::Ink3), "CPU");
+        assert_eq!(row[6], painted("-", Role::Ink3), "MEM");
+    }
+
+    /// fails if a dog-action row colours a STATUS cell holding a SENTENCE.
+    ///
+    /// `DogEnabledRow::status` is a `String` carrying either a real status
+    /// rendering or a sentence saying why no shepherd answered. A sentence
+    /// has no role, so painting it would be decoration, which the governing
+    /// rule forbids. Both halves are asserted in one case because a build
+    /// that coloured everything and a build that coloured nothing each pass
+    /// one half.
+    #[test]
+    fn a_dog_action_row_colours_a_status_and_never_a_sentence() {
+        let acted = DogEnabledRow {
+            name: "log-rotate".to_string(),
+            source: DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            },
+            shepherd_acted: true,
+            status: "online".to_string(),
+        };
+        let row = &acted.rows_for(coloured(), true)[0];
+        assert_eq!(row[1], painted("adopted", Role::Ink3), "SOURCE is chrome");
+        assert_eq!(row[3], painted("(o.o) online", Role::Meadow));
+
+        let sentence = "no shepherd running; the config was written";
+        let unacted = DogEnabledRow {
+            name: "log-rotate".to_string(),
+            source: DogSource::BuiltIn,
+            shepherd_acted: false,
+            status: sentence.to_string(),
+        };
+        let row = &unacted.rows_for(coloured(), true)[0];
+        assert_eq!(row[3], sentence, "a sentence is left exactly as it was");
+    }
+
+    /// fails if the SHEPHERD column starts carrying a colour, or if NAME
+    /// does.
+    ///
+    /// Deliberate, and it was the closest call in that table. `false` is
+    /// worth knowing, but the STATUS cell beside it already says so in a
+    /// whole sentence, and a colour that repeats its neighbour is
+    /// decoration.
+    #[test]
+    fn a_dog_action_row_leaves_the_name_and_the_shepherd_column_plain() {
+        let row = &DogDisabledRow {
+            name: "log-rotate".to_string(),
+            source: DogSource::BuiltIn,
+            shepherd_acted: false,
+            status: "no shepherd running".to_string(),
+        }
+        .rows_for(coloured(), true)[0];
+        assert_eq!(row[0], "log-rotate");
+        assert_eq!(row[2], "false");
+    }
+
+    /// fails if `rehome`'s own `-` SOURCE stops being muted.
+    ///
+    /// `DogRehomedRow` is the only one of the four whose SOURCE can be
+    /// absent, and it reaches the same muting either way -- it is chrome
+    /// when it says `adopted` and a placeholder when it says `-`.
+    #[test]
+    fn a_rehomed_row_with_nothing_to_forget_still_mutes_its_source() {
+        let row = &DogRehomedRow {
+            name: "metrics".to_string(),
+            source: None,
+            shepherd_acted: true,
+            status: "stopped".to_string(),
+        }
+        .rows_for(coloured(), true)[0];
+        assert_eq!(row[1], painted("-", Role::Ink3));
+        assert_eq!(row[3], painted("(-.-) stopped", Role::Ink3));
+    }
+
+    /// fails if `flush`'s table stops muting its ID, or starts colouring a
+    /// real path.
+    ///
+    /// A path is the SUBJECT of this table rather than a reading about it:
+    /// no threshold to ramp against, no fault to mark, and the widest column
+    /// on the row. Only the `-` a peer daemon predating the field produces
+    /// is muted.
+    #[test]
+    fn a_flushed_row_mutes_its_id_and_its_dash_and_leaves_a_path_alone() {
+        let mut without = sample_info(1, "cron", 0);
+        without.out_file = None;
+        without.err_file = None;
+        let rows =
+            FlushedRows(vec![sample_info(0, "web", 60_000), without]).rows_for(coloured(), true);
+
+        assert_eq!(rows[0][0], painted("0", Role::Ink3), "ID is chrome");
+        assert_eq!(rows[0][1], "web", "NAME is plain");
+        assert_eq!(
+            rows[0][2], "/logs/web-0-out.log",
+            "a real path carries no colour"
+        );
+        assert_eq!(rows[1][2], painted("-", Role::Ink3), "the placeholder does");
+        assert_eq!(rows[1][3], painted("-", Role::Ink3));
+    }
+
+    /// fails if `LambRows` grows a colour.
+    ///
+    /// Both its columns are identity and neither has a state, a reading or a
+    /// placeholder, so there is nothing for a colour to carry. Pinned rather
+    /// than left implicit because "this one is deliberately plain" and "this
+    /// one was forgotten" look identical in a diff, and the second is
+    /// exactly what happened to the other seven tables.
+    #[test]
+    fn lamb_rows_carry_no_colour_at_all() {
+        let rows = LambRows(vec![Lamb::new(48_302, "node")]).rows_for(coloured(), true);
+        assert_eq!(rows[0], vec!["48302".to_string(), "node".to_string()]);
+    }
+
+    /// fails if a `ProcStatus` variant is added without being added to
+    /// `status_named_by`'s own list.
+    ///
+    /// That list is what decides whether a dog-action row's STATUS cell is
+    /// coloured, and a variant missing from it would silently render plain
+    /// rather than fail to compile. Driven off `Display`, so it also fails
+    /// if the two ever disagree.
+    #[test]
+    fn every_status_is_recognised_by_its_own_rendering() {
+        for status in [
+            ProcStatus::Starting,
+            ProcStatus::Online,
+            ProcStatus::Stopping,
+            ProcStatus::Stopped,
+            ProcStatus::Errored,
+            ProcStatus::WaitingRestart,
+        ] {
+            assert_eq!(
+                status_named_by(&status.to_string()),
+                Some(status),
+                "{status} is not recognised by its own rendering"
+            );
+        }
+        assert_eq!(
+            status_named_by("no shepherd running"),
+            None,
+            "and a sentence is not mistaken for one"
         );
     }
 

@@ -94,6 +94,44 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       on that same row says it never started at all.
     </p>
 
+    <h2>The dogs table</h2>
+    <p>
+      Dogs get their own table, under a <code>Dogs</code> caption, wherever
+      one appears beside a flock listing. It carries the columns a dog can
+      actually fill: no <code>ID</code> and no <code>FOLD</code>, since a dog
+      is supervised rather than grouped, and a <code>SOURCE</code> column the
+      sheep table has no use for.
+    </p>
+    <CodeBlock label="shep dogs">{`┌────────────┬─────────┬──────────────┬──────┬──────────┬─────┬──────┬────────┐
+│ NAME       │ SOURCE  │ STATUS       │ PID  │ RESTARTS │ CPU │ MEM  │ UPTIME │
+├────────────┼─────────┼──────────────┼──────┼──────────┼─────┼──────┼────────┤
+│ log-rotate │ adopted │ (o.o) online │ 7868 │ 0        │ -   │ 6.6M │ 2s     │
+└────────────┴─────────┴──────────────┴──────┴──────────┴─────┴──────┴────────┘`}</CodeBlock>
+    <p>
+      The colours are the flock table's, on the five columns the two share:
+      the same face and status colour, the same restart colour above zero,
+      the same two-tier ramps for CPU and MEM. <code>SOURCE</code> is muted
+      like <code>FOLD</code> is, because it says where a binary came from and
+      never whether the dog is healthy. So the same dog reads the same way
+      under <code>shep dogs</code>, under <code>shep flock</code>, and after
+      <code>shep restart log-rotate</code>.
+    </p>
+    <p>
+      <code>enable</code>, <code>disable</code>, <code>adopt</code> and
+      <code>rehome</code> print a one-row confirmation with the same
+      treatment. Their <code>STATUS</code> holds either a status or a
+      sentence saying why no shepherd answered, and only a status is
+      coloured; a sentence is left plain, because a colour that repeats the
+      words beside it is decoration rather than information.
+    </p>
+    <Callout variant="note">
+      Two tables carry no colour on purpose. <code>describe</code>'s lamb
+      table is two identity columns with no state to report, and
+      <code>shep empty</code>'s table is mostly file paths, which are the
+      subject of that table rather than a reading about it. Every colour
+      shep prints carries information; none is decoration.
+    </Callout>
+
     <h2>After a lifecycle command</h2>
     <p>
       <code>start</code>, <code>stop</code>, <code>restart</code>,
