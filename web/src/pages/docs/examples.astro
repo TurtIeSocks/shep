@@ -152,8 +152,8 @@ const polyglotRows: ExampleRow[] = [
     <div class="terminal">
       <div><span class="prompt">$</span> cargo build --release --workspace</div>
       <div><span class="prompt">$</span> export SHEP_HOME="$(mktemp -d)"</div>
-      <div><span class="prompt">$</span> shep start examples/Flockfile.toml</div>
-      <div><span class="prompt">$</span> shep flock</div>
+      <div><span class="prompt">$</span> ./target/release/shep start examples/Flockfile.toml</div>
+      <div><span class="prompt">$</span> ./target/release/shep flock</div>
     </div>
 
     <h2>What each one demonstrates</h2>
@@ -210,7 +210,7 @@ interval = "3s"`}</CodeBlock>
       <code>kill_timeout</code> to 3 seconds, short enough to watch land:
     </p>
     <div class="terminal">
-      <div><span class="prompt">$</span> shep stop stubborn</div>
+      <div><span class="prompt">$</span> ./target/release/shep stop stubborn</div>
     </div>
     <p class="fine">
       Roughly three seconds pass — one <code>"caught SIGTERM, still not
@@ -229,7 +229,7 @@ interval = "3s"`}</CodeBlock>
       <div><span class="prompt">$</span> examples/polyglot/setup-venv.sh</div>
       <div><span class="prompt">$</span> examples/polyglot/go-http/build.sh</div>
       <div><span class="prompt">$</span> export SHEP_HOME="$(mktemp -d)"</div>
-      <div><span class="prompt">$</span> shep start examples/Flockfile.polyglot.toml</div>
+      <div><span class="prompt">$</span> ./target/release/shep start examples/Flockfile.polyglot.toml</div>
     </div>
     <div class="field-table">
       <div class="row header">
@@ -355,7 +355,7 @@ args        = ["19096"]`}</CodeBlock>
       with no program of the operator's own:
     </p>
     <div class="terminal">
-      <div><span class="prompt">$</span> shep serve examples/polyglot/static-site --port 19098</div>
+      <div><span class="prompt">$</span> ./target/release/shep serve examples/polyglot/static-site --port 19098</div>
     </div>
     <p class="fine">
       See <a href="/docs/serve">Serve</a> for <code>--bind</code>,
