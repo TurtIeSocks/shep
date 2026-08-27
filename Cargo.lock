@@ -2169,6 +2169,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "shep-examples"
+version = "0.1.5"
+dependencies = [
+ "nix 0.29.0",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

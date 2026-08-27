@@ -1,0 +1,37 @@
+[package]
+name = "shep-examples"
+description = "Small runnable programs that demonstrate shep's supervision behaviours: probes, restarts, memory limits, graceful stop and the log plane. Not published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# `cargo build --release` at the workspace root builds every member,
+# including this one, but it is never on the dependency path of the shipped
+# `shep`/`shep-runtime`/`shep-dev` binaries — `cargo install shep` resolves
+# only shep-cli's own graph and never reaches this crate. See
+# crates/shep-daemon/examples/reuse_port_sheep.rs for the same reasoning
+# applied to a single fixture; this crate is the same idea grown into a
+# standalone member because these programs are documentation, not test
+# scaffolding, and need a stable path a Flockfile can name.
+#
+# `publish = false` keeps `cargo publish --workspace` (and release-plz) from
+# ever trying to ship it; release-plz.toml does not list it either.
+
+# Every binary here is a plain executable — no shared library, no crate-level
+# public API — so `src/bin/*.rs` is autodiscovered with no `[[bin]]` table
+# needed per binary.
+
+# Signal handling without a crate: `stubborn.rs` blocks SIGTERM with
+# `nix::sys::signal::SigSet::thread_block` and waits on it with `sigwait`,
+# both safe functions, so this crate stays `#![forbid(unsafe_code)]` the way
+# `crates/shep-daemon/examples/reuse_port_sheep.rs` already does for the same
+# reason. `nix` is already a workspace dependency (shep-daemon), so this adds
+# no new crate — only `signal`, already in the workspace's default feature
+# list for `nix`, is used.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[lints]
+workspace = true

@@ -6,6 +6,11 @@ members = [
     "crates/shep-client",
     "crates/shep-cli",
     "crates/shep-cli-redirect",
+    # Small runnable demos of shep's supervision behaviours (probes, restart
+    # policy, memory limits, graceful stop, the log plane). `publish = false`
+    # in its own manifest, and release-plz.toml marks it `release = false`
+    # too — never part of a release.
+    "examples",
 ]
 
 [workspace.package]
