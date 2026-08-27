@@ -14,16 +14,25 @@
 #
 # See web/src/pages/docs/examples.astro for what to watch for on each one.
 
+# Ports are 19081/19082/19084 -- the 19080-and-up range on purpose. 8081,
+# 8082 and 8084 are common defaults elsewhere (Tomcat, proxies, a second
+# instance of nearly anything) and this file is meant to run on your own
+# machine, the machine most likely to already have something listening on
+# one of them. If 19081/19082/19084 collide with something of yours too,
+# change the port argument on the app that collides and the matching
+# readiness_probe target next to it -- both need to agree, since the probe
+# is polling the port its own app just bound.
+
 # --- 1. The baseline every probe example needs -----------------------------
 # Binds a port, answers 200 to anything. Point curl at it, or use it as the
 # shape a real readiness probe polls.
 [[app]]
 name        = "http-server"
 script      = "../target/release/http_server"
-args        = ["8081"]
+args        = ["19081"]
 
 # --- 2. A readiness probe waiting, and listen_timeout expiring -------------
-# slow_boot sleeps 8s before it binds port 8082. Its readiness_probe polls
+# slow_boot sleeps 8s before it binds port 19082. Its readiness_probe polls
 # that port every second; listen_timeout is set to 4s, deliberately shorter
 # than the boot delay, so the probe never once passes before the deadline.
 # Watch `shep flock` and the daemon's own log: the sheep goes Online anyway
@@ -35,12 +44,12 @@ args        = ["8081"]
 [[app]]
 name             = "slow-boot"
 script           = "../target/release/slow_boot"
-args             = ["8082", "8"]
+args             = ["19082", "8"]
 listen_timeout   = "4s"
 
 [app.readiness_probe]
 kind             = "http"
-target           = "http://127.0.0.1:8082/"
+target           = "http://127.0.0.1:19082/"
 interval         = "1s"
 timeout          = "1s"
 
@@ -58,7 +67,7 @@ timeout          = "1s"
 [[app]]
 name             = "http-server-gated-by-sentinel"
 script           = "../target/release/http_server"
-args             = ["8084"]
+args             = ["19084"]
 listen_timeout   = "120s"
 
 [app.readiness_probe]
