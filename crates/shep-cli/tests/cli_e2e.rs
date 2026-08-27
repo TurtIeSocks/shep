@@ -6356,6 +6356,22 @@ fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
         Some(7),
         "the one app that cannot run still fails the command: {output:?}"
     );
+    // The useful sentence reaches the operator's own terminal, not only the
+    // shepherd's log. The batch check can never send it here -- a doubt must
+    // not fail a batch, and the `Start` reply is about the batch -- but once
+    // THIS app's spawn has failed the reply is about this app, and
+    // `SpawnFailed` already carries free-form text, so it needs no protocol
+    // change to say so.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not on the shepherd's PATH"),
+        "the reply must explain WHY the program was not found, not only that \
+         it was not: {stderr}"
+    );
+    assert!(
+        stderr.contains("shep-no-such-interpreter-xyz") && stderr.contains("no-interpreter"),
+        "naming the program and the sheep: {stderr}"
+    );
 
     let data = poll_flock_data(home, FLOCK_DEADLINE, |data| {
         data.as_array().is_some_and(|rows| {

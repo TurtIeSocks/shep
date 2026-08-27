@@ -2529,11 +2529,35 @@ impl<R: ProcessRunner> Actor<R> {
                 // `spec.program` and `spec.cwd` verbatim, not a resolution of
                 // the two: they are what the Flockfile said, which is where
                 // the operator has to make the edit.
-                let attempted = match &spec.cwd {
-                    Some(cwd) => format!("`{}` in {}", spec.program, cwd.display()),
-                    None => format!("`{}`", spec.program),
+                //
+                // A `Doubtful` verdict REPLACES that clause rather than
+                // joining it. This is the one channel the "not on the
+                // shepherd's PATH" sentence has to an operator holding a
+                // terminal: the batch check only ever logs it, because a
+                // doubt must not fail a batch and the `Start` reply is about
+                // the batch. Once THIS app's own spawn has failed, the reply
+                // is about this app, and the sentence belongs in it. It
+                // needs no protocol change: `SpawnFailed` already carries
+                // free-form text.
+                //
+                // Re-asking the runner rather than reading `error`'s kind:
+                // `RunnerError` carries the OS message already stringified,
+                // and widening it to carry an `ErrorKind` would be a public
+                // change to say something the runner can already answer. A
+                // second PATH walk, on a path that has already failed.
+                //
+                // Only `Doubtful`. An `Impossible` here means the file went
+                // away between the check and the spawn, and "tried `./srv`
+                // in /srv" names the literal the operator wrote plus the
+                // directory, which is what they need in order to edit it.
+                let attempted = match self.runner.preflight(&spec) {
+                    Preflight::Doubtful(reason) => reason,
+                    _ => match &spec.cwd {
+                        Some(cwd) => format!("tried `{}` in {}", spec.program, cwd.display()),
+                        None => format!("tried `{}`", spec.program),
+                    },
                 };
-                Err(format!("{error}; tried {attempted}"))
+                Err(format!("{error}; {attempted}"))
             }
         }
     }

@@ -46,6 +46,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before. Refusing there would keep a whole flock down at boot over one app's
   interpreter, which is worse than the partial registration being fixed.
 
+  A filesystem error that is not "no such file" never refuses a batch either.
+  `Path::exists` returns `false` on any `fs::metadata` error, so a permission
+  error on an intermediate directory, an unsettled mount and a race all read
+  identically to "absent"; the check now matches `ErrorKind::NotFound`
+  specifically, and everything else is a suspicion the spawn reports as it
+  always did.
+
+- Explain a bare program's spawn failure in the reply, not only in the log.
+  When a `script` or `interpreter` with no `/` in it fails to spawn, the
+  `SpawnFailed` message now carries "`node` is not on the shepherd's PATH
+  (...)" in place of the bare "tried `node`" clause, so an operator at a
+  terminal gets the diagnosis rather than only `No such file or directory`.
+  No protocol change: `SpawnFailed` already carries free-form text. A PATH of
+  more than four entries is summarised, because a daemon autostarted from a
+  shell inherits that shell's PATH, which measured two kilobytes and buried
+  the sentence that mattered.
+
 ### Additions
 
 - Add `SupervisorError::CannotStart`, a `Start` batch refused before anything
@@ -68,7 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TokioRunner` answers `Impossible` for a `/`-containing path that is not on
   the filesystem, `Doubtful` for a bare command missing from the `PATH` the
   child will actually be given, and `Unknown` for everything else, including
-  a relative path with no `cwd`. Existence only, never the executable bit.
+  a relative path with no `cwd` and any filesystem error other than
+  `NotFound`. Existence only, never the executable bit.
 
 - Answer `Request::ConfigDrift`: report which of a set of apps name a
   registered sheep whose stored config differs, and in which fields. Reads
