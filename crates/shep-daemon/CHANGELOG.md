@@ -201,9 +201,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved yet, which tells "this app asked for nobody" apart from "nobody
   has asked yet". Both credential fixes above turn on that distinction.
 - `fake::ScriptedRunner::spawned_as` and `spawn_count`, behind `test-fakes`.
-  The fake becomes nobody, so recording the credentials a spawn was asked for
-  is the only way a test can assert the identity it carried rather than merely
-  that it happened.
+  The fake starts no process, so it drops no privilege and changes no identity
+  at all. Recording what a spawn was ASKED for is therefore the only way a test
+  can assert the identity it carried rather than merely that it happened.
 
 ## [0.1.0] - 2026-08-26
 

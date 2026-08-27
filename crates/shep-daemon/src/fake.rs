@@ -679,8 +679,10 @@ impl ProcessRunner for ScriptedRunner {
     ///   answered that wrong for every spawn would be worse than one that
     ///   could not answer at all. What it changes is below, gated on it.
     /// - `stdin`, gated the same way and for the same reason.
-    /// - `credentials`, recorded rather than applied — the fake becomes
-    ///   nobody — so a test can assert the identity a spawn carried, through
+    /// - `credentials`, recorded rather than applied. The fake starts no
+    ///   process, so it drops no privilege and changes no identity at all,
+    ///   which is exactly why recording what it was ASKED for is the only way
+    ///   a test can assert the identity a spawn carried, through
     ///   [`ScriptedRunner::spawned_as`].
     ///
     /// Real fd-3 delivery, refusal, and timeout — the facts this flag alone
