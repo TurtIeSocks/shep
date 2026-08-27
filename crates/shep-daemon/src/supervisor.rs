@@ -1161,8 +1161,14 @@ impl SupervisorHandle {
     }
 
     /// Sends `action` over the shepherd channel of every sheep matching
-    /// `selector` and answers with one id-sorted row per match, carrying what
-    /// each app said back or why nothing came.
+    /// `selector` and answers with one row per match, carrying what each app
+    /// said back or why nothing came.
+    ///
+    /// Rows come back in the one order every operator-facing listing takes: by name, then
+    /// by id (`shep_core::protocol::sort_flock`). They were id-sorted until
+    /// that rule was made the only one; this table carries an ID and a NAME
+    /// column exactly as a flock listing does, so an operator reading both in
+    /// one session should not have to read two orders.
     ///
     /// Answers on completion rather than on acceptance: an action has no
     /// floor on how long it takes, so an acceptance would tell a caller
@@ -1216,8 +1222,8 @@ impl SupervisorHandle {
     }
 
     /// Delivers `sig` to the OWN process of every sheep matching `selector` —
-    /// never its process group — and answers with one id-sorted row per
-    /// match.
+    /// never its process group — and answers with one row per match, in the one order every operator-facing listing takes: by name, then
+    /// by id (`shep_core::protocol::sort_flock`).
     ///
     /// Unlike [`Self::trigger`], there is nothing to wait out: a `kill(2)`
     /// either returns or does not, so this answers as soon as every matched
@@ -1245,8 +1251,9 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
-    /// Writes `line` to every matched sheep's stdin, and answers with one
-    /// id-sorted row per match.
+    /// Writes `line` to every matched sheep's stdin, and answers with one row
+    /// per match, in the one order every operator-facing listing takes: by name, then
+    /// by id (`shep_core::protocol::sort_flock`).
     ///
     /// Unlike [`Self::signal`], each write can genuinely wait — a pipe write
     /// blocks until the app reads — so the reply is bounded per sheep at
@@ -1288,8 +1295,14 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)
     }
 
-    /// Full flock listing, grouped by app name (each app's instances kept
-    /// in their own instance-slot order, ties from a reload broken by id).
+    /// Full flock listing, by name and then by id
+    /// (`shep_core::protocol::sort_flock`, which `snapshot_all` calls).
+    ///
+    /// It used to keep each app's instances in their own instance-slot order
+    /// with reload ties broken by id. That is a finer key and no listing that
+    /// has crossed the wire can reproduce it, since `ProcessInfo` carries no
+    /// instance number, so it was dropped for the one rule every reply now
+    /// shares. See `snapshot_all` for the whole of that reasoning.
     ///
     /// Convenience over `Self::list_checked` for callers that don't need
     /// to distinguish "actor gone" from "empty flock" — mainly tests.
@@ -1925,8 +1938,12 @@ enum ReplyKind {
 /// turns on whether the request was fully satisfied.
 #[derive(Debug)]
 pub(crate) struct Scaled {
-    /// The app's surviving instances, in instance-slot order. On a partial
-    /// scale-up this is what came up, never the count asked for.
+    /// The app's surviving instances, by name and then by id
+    /// (`shep_core::protocol::sort_flock`). Every row here shares one name,
+    /// so in practice that is id order -- but it is the shared rule that says
+    /// so, not a rule of this reply's own, which is what stops the two
+    /// drifting. On a partial scale-up this is what came up, never the count
+    /// asked for.
     pub(crate) instances: Vec<ProcessInfo>,
     /// The app's config as it now stands, with the ACHIEVED `instances` count.
     pub(crate) app: ResolvedApp,
@@ -5985,7 +6002,7 @@ type LineWait = (u32, String, oneshot::Receiver<Result<(), RunnerError>>);
 
 /// Awaits every write's acknowledgement, each under its own
 /// [`STDIN_WRITE_TIMEOUT`], and answers `reply` with `settled` and the results
-/// in id order.
+/// by name and then by id, the order `spawn_trigger_task`'s own note gives.
 ///
 /// The waits run CONCURRENTLY — `join_all`, not a `for` loop. Unlike
 /// `spawn_trigger_task`, whose per-row waits carry no shared bound, every wait

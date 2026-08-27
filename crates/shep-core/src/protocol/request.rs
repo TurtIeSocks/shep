@@ -1174,8 +1174,10 @@ pub enum Response {
     /// listed here as the no-op success it is, so this carries the same
     /// matches `Describe` would.
     Reloading(Vec<ProcessInfo>),
-    /// Answer to `Scale` — the app's instances that will REMAIN, one row each,
-    /// in instance-slot order.
+    /// Answer to `Scale` — the app's instances that will REMAIN, one row
+    /// each, by name and then by id ([`sort_flock`]). Every row shares one
+    /// name here, so that is id order in practice; it is stated as the shared
+    /// rule rather than as this reply's own so the two cannot drift.
     ///
     /// Scaling up, these are the instances that exist, the new ones included,
     /// and the answer is complete.
