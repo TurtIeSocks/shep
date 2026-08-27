@@ -13,6 +13,7 @@ use shep_core::paths::ShepPaths;
 use crate::cli::RuntimeArgs;
 use crate::commands::foreground::{self, ForegroundOptions};
 use crate::commands::lifecycle::{resolve_target, target_exit_code};
+#[cfg(unix)]
 use crate::commands::reap;
 use crate::exit::ExitCode;
 use crate::output::Streams;
@@ -67,13 +68,25 @@ pub async fn runtime(
     // Read once, right here, and nowhere else in the crate: it exists only
     // to make the PID-1 split reachable from a test harness, following the
     // panic probe's shape in `lib.rs`'s `run_argv`. See decision 14.
+    // The PID-1 split is a unix-only concern, and skipping it on Windows is
+    // correct rather than a shortcut. It exists because a unix init process
+    // inherits every orphan on the machine and must `waitpid` them or leak
+    // zombies; Windows has no zombie state and no reparent-to-init rule, so
+    // a Windows container entrypoint has nothing to reap and goes straight
+    // to supervising its flock.
+    #[cfg(windows)]
+    return foreground::run(streams, quiet, options).await;
+
+    #[cfg(unix)]
     let forced = std::env::var_os("SHEP_FORCE_INIT").is_some();
+    #[cfg(unix)]
     if !reap::should_split(std::process::id(), args.supervise, forced) {
         return foreground::run(streams, quiet, options).await;
     }
     // `Infallible` is an ordinary uninhabited enum, not the never type `!`,
     // so it does not coerce to `ExitCode` as a bare tail expression — the
     // empty match is what performs that coercion. `run_init` never returns.
+    #[cfg(unix)]
     match reap::run_init().await {}
 }
 

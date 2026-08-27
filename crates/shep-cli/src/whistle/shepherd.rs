@@ -239,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn two_calls_survive_a_shepherd_that_restarted_in_between() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
 
         let (first, first_served) =
             shep_client::testing::fake_daemon_accepting_repeatedly(&socket, Response::Pong);
@@ -260,6 +260,24 @@ mod tests {
         // The shepherd goes away entirely: task aborted, socket file removed.
         // A `Shepherd` holding a connection would be holding a dead one.
         first.abort();
+        // AWAITED, not just aborted. `JoinHandle::abort` only REQUESTS
+        // cancellation — the task's resources, the bound listener among
+        // them, are released when it is actually reclaimed. On unix that
+        // race is invisible because the socket file is unlinked explicitly
+        // below; on Windows the still-live pipe instance makes the rebind
+        // fail with `ERROR_ACCESS_DENIED`, since `Listener::bind` asks for
+        // `first_pipe_instance`. Awaiting the cancellation is what makes
+        // "the shepherd went away" actually true before the next one binds.
+        let _ = first.await;
+        // Unix only: on that tier the listener leaves a socket FILE behind
+        // that outlives the aborted task, so the address stays connectable
+        // until it is unlinked and the test would not be simulating a
+        // departed shepherd without this. A named pipe has no directory
+        // entry and stops existing when its last handle closes — which the
+        // abort above already did — so there is nothing to remove, and
+        // asking to remove it fails with `ERROR_INVALID_PARAMETER` (87)
+        // rather than doing nothing.
+        #[cfg(unix)]
         std::fs::remove_file(&socket).unwrap();
 
         let (second, _second_served) =

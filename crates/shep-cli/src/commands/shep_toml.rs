@@ -26,7 +26,23 @@
 //! `flock(2)` and unix mode bits are both Unix-only, and Windows is shep's
 //! 0% tier where no verb runs at all.
 
+// `clippy::result_large_err` fires on every `Result<_, ShepTomlError>`
+// signature in this module on Windows, and on none of them on macOS or
+// Linux. The lint compares the error against a fixed 128-byte threshold, and
+// `ShepTomlError` — a `PathBuf` plus a `toml_edit::TomlError` — sits close
+// enough to it that the platform's own layout decides which side it lands
+// on. Nothing about this module is different on Windows; only the
+// measurement is.
+//
+// Allowed rather than fixed, deliberately. The fix the lint wants is boxing
+// the error, which would change a `pub enum`'s shape for every consumer on
+// every platform to satisfy a perf lint about a path that runs a handful of
+// times per command and always ends in file I/O. Revisit if this type grows
+// a genuinely large variant, which is a different fact from the one here.
+#![allow(clippy::result_large_err)]
+
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -43,6 +59,7 @@ use crate::style::StyleLevel;
 /// mode here is the guard rather than a second one behind `$SHEP_HOME`'s.
 /// It is also what a `tar`, a `cp -p` or a backup of `$SHEP_HOME` carries
 /// out with the file, somewhere no directory mode follows it.
+#[cfg_attr(windows, allow(dead_code))]
 const CONFIG_FILE_MODE: u32 = 0o600;
 
 /// Extensions [`ShepToml::write_starter_interpreters`] maps, in the order
@@ -526,10 +543,13 @@ impl ShepToml {
 /// spelling of the number, so a change to the daemon's posture cannot pass
 /// this by.
 fn create_home_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(shep_daemon::boot::DIR_MODE)
-        .create(dir)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    // Windows has no scalar mode; `shep_daemon::boot::create_dir_at_dir_mode`
+    // carries the argument for what protects `$SHEP_HOME` there instead.
+    #[cfg(unix)]
+    builder.mode(shep_daemon::boot::DIR_MODE);
+    builder.create(dir)
 }
 
 /// Creates the staging file the config is written through, in `parent` so
@@ -541,11 +561,15 @@ fn create_home_dir(dir: &Path) -> std::io::Result<()> {
 /// umask leaves it. Same shape, and same reasoning, as
 /// `barks::create_ring_file`.
 fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
-    tempfile::Builder::new()
-        .prefix("shep")
-        .suffix(".toml.tmp")
-        .permissions(std::fs::Permissions::from_mode(CONFIG_FILE_MODE))
-        .tempfile_in(parent)
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("shep").suffix(".toml.tmp");
+    // `shep.toml` can hold a webhook token, so on unix it is created `0600`
+    // at the `open` itself rather than chmod'ed after. On Windows it
+    // inherits `$SHEP_HOME`'s ACL — the same gap `create_home_dir` above
+    // names, and the reason the operator docs say so out loud.
+    #[cfg(unix)]
+    builder.permissions(std::fs::Permissions::from_mode(CONFIG_FILE_MODE));
+    builder.tempfile_in(parent)
 }
 
 /// An exclusive advisory lock over one `shep.toml`, held for as long as
@@ -565,7 +589,13 @@ fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile>
 struct ConfigLock {
     /// `flock(2)` is released by this handle's `Drop`. Named with a
     /// leading underscore because it is held, never read.
+    #[cfg(unix)]
     _flock: nix::fcntl::Flock<std::fs::File>,
+    /// The lock file, opened with `share_mode(0)`. The same primitive and
+    /// the same sibling-file shape [`shep_core::kv`] and
+    /// [`shep_core::barks`] use; see either for the full argument.
+    #[cfg(windows)]
+    _handle: std::fs::File,
 }
 
 impl ConfigLock {
@@ -575,6 +605,35 @@ impl ConfigLock {
     /// The lock file could not be created beside `path`, or `flock` failed
     /// for a reason other than contention (contention blocks rather than
     /// failing).
+    #[cfg(windows)]
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Another handle already holds share access this open denies.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        /// How long a contended retry sleeps. The unix arm blocks in the
+        /// kernel; this polls, for the reason `shep_core::kv` documents.
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let lock_path = lock_path(path);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&lock_path)
+            {
+                Ok(handle) => return Ok(Self { _handle: handle }),
+                Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn acquire(path: &Path) -> std::io::Result<Self> {
         use nix::fcntl::{Flock, FlockArg};
 
@@ -710,7 +769,12 @@ impl core::error::Error for ShepTomlError {
     }
 }
 
-#[cfg(test)]
+// `unix` because the config-writing cases assert a `0600` mode and an inode preserved across an atomic rename — guarantees the Windows tier
+// deliberately makes differently, each argued at its own call site
+// above. What Windows claims instead is covered by `tests/cli_e2e.rs`
+// and by the real-flock verification in the Windows port's own notes;
+// this module's unix coverage is unchanged.
+#[cfg(all(test, unix))]
 mod tests {
     use shep_core::config::DaemonConfig;
 

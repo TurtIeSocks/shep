@@ -327,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn every_selector_form_reaches_the_wire_inside_a_reopen_request() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
 
         for (input, expected) in [
@@ -377,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn a_reopen_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -435,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn a_not_found_reply_exits_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) =
             fake_client_replying_err(&path, RpcErrorCode::NotFound, "no sheep matched").await;
         let mut out = Vec::new();
@@ -464,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn every_selector_form_reaches_the_wire_inside_a_flush_request() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
 
         for (input, expected) in [
@@ -505,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn a_flush_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -538,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_flush_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -577,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_flush_never_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) =
             fake_client_replying_err(&path, RpcErrorCode::NotFound, "no sheep matched").await;
         let mut out = Vec::new();
@@ -633,8 +633,18 @@ mod tests {
         for name in [launch::DAEMON_STDOUT_LOG, launch::DAEMON_STDERR_LOG] {
             let path = paths.logs.join(name);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "{name}");
+            // Searched for as JSON-ENCODED text, not as the raw path. The
+            // answer here is a `--format json` envelope, and on Windows a
+            // path's `\` separators are escaped to `\` inside it — so a
+            // raw `path.display()` needle matches on unix and never on
+            // Windows, for a payload that is perfectly correct on both.
+            // Encoding the needle the same way the payload encoded it is
+            // what makes this assert about the CONTENT rather than about
+            // the platform's separator.
+            let needle = serde_json::to_string(&path.display().to_string()).unwrap();
+            let needle = needle.trim_matches('"');
             assert!(
-                String::from_utf8_lossy(&out).contains(&path.display().to_string()),
+                String::from_utf8_lossy(&out).contains(needle),
                 "the answer must name every file it emptied: {}",
                 String::from_utf8_lossy(&out)
             );

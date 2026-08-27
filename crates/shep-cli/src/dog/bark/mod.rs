@@ -205,14 +205,13 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
         let mut rules = rules;
         let append_lock = Arc::new(Mutex::new(()));
 
-        let mut sigterm =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(sigterm) => sigterm,
-                Err(err) => {
-                    eprintln!("shep dog bark: could not install a SIGTERM handler: {err}");
-                    return ExitCode::Failure;
-                }
-            };
+        let mut sigterm = match crate::shutdown::Terminate::install() {
+            Ok(sigterm) => sigterm,
+            Err(err) => {
+                eprintln!("shep dog bark: could not install a shutdown handler: {err}");
+                return ExitCode::Failure;
+            }
+        };
 
         let mut poll_interval =
             tokio::time::interval_at(tokio::time::Instant::now() + poll_period, poll_period);

@@ -157,6 +157,33 @@ tempfile.workspace = true
 # this is the first real use of an already-resolved version, not a new one.
 anstyle.workspace = true
 
+# The lookout TUI, the MCP server behind `shep whistle`, and the schema
+# generator beside it. **These four were `[target.'cfg(unix)'.dependencies]`
+# and are now unconditional**, and the comment they replace is worth keeping
+# in mind rather than simply deleting: it argued that declaring them
+# everywhere "would build a terminal stack, `crossterm_winapi` and a second
+# `windows-sys` face into a binary that cannot use any of it".
+#
+# That was correct while the Windows build refused every verb before it could
+# reach either module. It stopped being correct when the Windows tier became
+# real: `src/lookout/` and `src/whistle/` both compile and run there now — a
+# `crossterm_winapi` face is what makes the dashboard work on a Windows
+# terminal, not dead weight — so the cost the comment was avoiding is now the
+# cost of the feature. The `x86_64-pc-windows-gnu` cross-check does get
+# slower, which is the price and is worth naming.
+ratatui.workspace = true
+crossterm.workspace = true
+# The MCP server behind `shep whistle`.
+rmcp.workspace = true
+# The schema generator, beside it. Declared rather than reached through
+# `rmcp::schemars`, because `#[derive(JsonSchema)]` in `src/whistle/` expands
+# to absolute `schemars::` paths.
+schemars.workspace = true
+# Two `ratatui` transitive floors, only ever read by `-Z minimal-versions`;
+# see the workspace `Cargo.toml`'s comments on each.
+time.workspace = true
+instability.workspace = true
+
 [dev-dependencies]
 # `test-util` for `#[tokio::test(start_paused = true)]` — `crate::http`'s own
 # "a peer that says nothing is dropped at the timeout" test, matching how
@@ -190,40 +217,11 @@ proptest.workspace = true
 # here rather than left to feature unification with shep-daemon (which enables
 # it for `sys.rs`) — a crate that uses a feature says so, or it breaks the day
 # the other crate stops needing it.
+
+# `nix::fcntl::fcntl` and `FcntlArg::F_SETFD`/`FdFlag` — the inherited-fd
+# sweep in `launch.rs`, which has no Windows counterpart to need.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }
-# The lookout TUI. Unix-only for the same reason `nix` above is: `src/lookout/`
-# is `#[cfg(unix)]`, because it needs a unix socket to reach a shepherd, and
-# the Windows build refuses every verb before it could reach this module.
-# Declaring these two unconditionally would build a terminal stack,
-# `crossterm_winapi` and a second `windows-sys` face into a binary that cannot
-# use any of it — and would slow the `--target x86_64-pc-windows-gnu` check the
-# phase gate runs.
-ratatui.workspace = true
-crossterm.workspace = true
-# Not used by any code in this crate — see the workspace `Cargo.toml`'s own
-# comment on this pin. It exists only to force `-Z minimal-versions` to a
-# `time` floor high enough for `ratatui-widgets`' `calendar.rs` (pulled in by
-# `ratatui` above unconditionally, unix-only like this whole block) to
-# compile. Living here rather than at the workspace level keeps it out of
-# the Windows dependency graph, same as `ratatui`/`crossterm` themselves.
-time.workspace = true
-# Same reasoning, same pin style, one more `ratatui` transitive floor: see
-# the workspace `Cargo.toml`'s comment on this one too.
-instability.workspace = true
-# The MCP server behind `shep whistle`. Unix-only for the same reason
-# `ratatui` and `crossterm` above are: `src/whistle/` is `#[cfg(unix)]`,
-# because it needs a unix socket to reach a shepherd, and the Windows leg of
-# `main.rs::run` refuses every verb before it could reach this module.
-# Declaring it unconditionally would build an MCP stack, a schema generator
-# and the `futures` facade into a binary that cannot use any of it, and would
-# slow the `--target x86_64-pc-windows-gnu` check the phase gate runs.
-rmcp.workspace = true
-# The schema generator, beside it and unix-only for the same reason. Declared
-# rather than reached through `rmcp::schemars`, because `#[derive(JsonSchema)]`
-# in `src/whistle/` expands to absolute `schemars::` paths.
-schemars.workspace = true
-
 # A process-group assertion and a teardown Drop guard both need to signal a
 # real pid; same cfg(unix) dev-only shape shep-daemon uses. The workspace
 # default nix features (signal, process, user) already cover `getpgid` and

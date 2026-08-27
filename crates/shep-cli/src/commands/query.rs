@@ -548,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn flock_asks_the_daemon_to_list_the_whole_flock() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -574,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn describe_sends_the_parsed_selector_in_its_compiled_form() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
 
         for (input, expected) in [
@@ -617,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -650,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn fold_asks_the_daemon_for_that_fold_and_nothing_wider() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -687,7 +687,7 @@ mod tests {
     #[tokio::test]
     async fn flock_response_round_trips_into_rendered_flock_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_with_ack(&path, sample_ack()).await;
         daemon.reply_to_list(vec![sample_info()]);
 
@@ -720,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn describe_response_round_trips_into_rendered_flock_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_with_ack(&path, sample_ack()).await;
         daemon.reply_to_describe(vec![sample_info()]);
 
@@ -855,7 +855,7 @@ mod tests {
             (Format::Table, StyleLevel::Bare, false),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("s.sock");
+            let path = shep_client::testing::control_address(dir.path());
             let (client, _daemon) = fake_client_on(&path).await;
 
             let mut out = Vec::new();

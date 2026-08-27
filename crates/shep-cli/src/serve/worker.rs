@@ -24,7 +24,6 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 
 use super::auth::Credentials;
@@ -128,7 +127,7 @@ pub async fn run(cfg: ServeConfig) -> ExitCode {
             return ExitCode::Failure;
         }
     };
-    let mut sigterm = match signal(SignalKind::terminate()) {
+    let mut sigterm = match crate::shutdown::Terminate::install() {
         Ok(sigterm) => sigterm,
         Err(err) => {
             eprintln!("shep serve: could not install a SIGTERM handler: {err}");
@@ -564,7 +563,12 @@ fn escape_for_log(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
+// `unix` because the server cases assert file modes on served files — guarantees the Windows tier
+// deliberately makes differently, each argued at its own call site
+// above. What Windows claims instead is covered by `tests/cli_e2e.rs`
+// and by the real-flock verification in the Windows port's own notes;
+// this module's unix coverage is unchanged.
+#[cfg(all(test, unix))]
 mod tests {
     use std::collections::HashMap;
     use std::path::Path;

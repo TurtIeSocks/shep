@@ -79,6 +79,7 @@ impl Credentials {
 /// three-function public surface (Phase 15 decision 1) and this type is not
 /// part of it — nothing outside this crate can match on it, so there is no
 /// downstream matcher for the attribute to protect.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug)]
 pub enum AuthError {
     /// Reading `path` failed at the OS level — missing, a directory, or a

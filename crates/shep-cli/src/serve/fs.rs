@@ -11,6 +11,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
 use nix::fcntl::OFlag;
 
 /// The stderr line an operator sees when [`contain`] refuses a component for
@@ -148,12 +149,31 @@ pub async fn contain(root: &Path, segments: &[String], follow_symlinks: bool) ->
 /// `None` if the open failed for any reason, or if the thing opened is not a
 /// regular file. Every one of them is the caller's 404.
 pub async fn open_regular(path: &Path) -> Option<(tokio::fs::File, u64)> {
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(OFlag::O_NOFOLLOW.bits() | OFlag::O_NONBLOCK.bits())
-        .open(path)
-        .await
-        .ok()?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(OFlag::O_NOFOLLOW.bits() | OFlag::O_NONBLOCK.bits());
+    }
+    // `FILE_FLAG_OPEN_REPARSE_POINT` is the Windows analogue of
+    // `O_NOFOLLOW`: it opens the reparse point itself rather than following
+    // it, so a symlink or directory junction swapped in after `contain`'s
+    // walk is opened as the link and then refused by the `is_file` check
+    // below rather than silently followed out of the docroot.
+    //
+    // Worth naming because the threat model is not identical: on Windows a
+    // directory JUNCTION needs no privilege to create, where a file symlink
+    // does, so the race this closes is cheaper for an attacker to attempt
+    // here than on unix. That makes the flag more load-bearing on this
+    // platform, not less.
+    #[cfg(windows)]
+    {
+        /// `FILE_FLAG_OPEN_REPARSE_POINT`.
+        const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).await.ok()?;
     let metadata = file.metadata().await.ok()?;
     if !metadata.is_file() {
         return None;
@@ -161,7 +181,12 @@ pub async fn open_regular(path: &Path) -> Option<(tokio::fs::File, u64)> {
     Some((file, metadata.len()))
 }
 
-#[cfg(test)]
+// `unix` because the containment cases build symlinks with `std::os::unix::fs::symlink` and assert `O_NOFOLLOW` — guarantees the Windows tier
+// deliberately makes differently, each argued at its own call site
+// above. What Windows claims instead is covered by `tests/cli_e2e.rs`
+// and by the real-flock verification in the Windows port's own notes;
+// this module's unix coverage is unchanged.
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::Duration;
 

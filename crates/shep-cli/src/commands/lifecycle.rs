@@ -1102,7 +1102,7 @@ mod tests {
         )
         .unwrap();
 
-        let sock = dir.path().join("s.sock");
+        let sock = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&sock).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1447,7 +1447,7 @@ mod tests {
         use shep_core::status::ProcStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_on(&path).await;
         daemon.reply_to_list(vec![
             shep_core::protocol::ProcessInfo::builder(7, "zeus-auth", ProcStatus::Stopped).build(),
@@ -1496,7 +1496,7 @@ mod tests {
         use shep_core::status::ProcStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_on(&path).await;
         daemon.reply_to_list(vec![
             shep_core::protocol::ProcessInfo::builder(7, "zeus-auth", ProcStatus::Online).build(),
@@ -1533,7 +1533,7 @@ mod tests {
     #[tokio::test]
     async fn a_target_that_matches_nothing_is_a_usage_error_naming_what_was_tried() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1591,7 +1591,7 @@ mod tests {
     #[tokio::test]
     async fn a_selector_reaches_the_wire_in_its_compiled_form() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
 
         #[derive(Clone, Copy, Debug)]
@@ -1657,7 +1657,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1687,7 +1687,7 @@ mod tests {
     #[tokio::test]
     async fn a_not_found_reply_exits_not_found_rather_than_being_swallowed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) =
             fake_client_replying_err(&path, RpcErrorCode::NotFound, "no sheep matched").await;
         let mut out = Vec::new();
@@ -1729,7 +1729,7 @@ mod tests {
     #[tokio::test]
     async fn start_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let srv = dir.path().join("srv");
         std::fs::write(&srv, "").unwrap();
@@ -1780,7 +1780,7 @@ mod tests {
     #[tokio::test]
     async fn a_fold_flag_lands_on_the_resolved_app() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let srv = dir.path().join("srv");
         std::fs::write(&srv, "").unwrap();
@@ -1835,7 +1835,7 @@ mod tests {
     #[tokio::test]
     async fn a_shep_toml_mapping_fills_an_unset_interpreter() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let srv = dir.path().join("srv.js");
         std::fs::write(&srv, "").unwrap();
@@ -1878,7 +1878,7 @@ mod tests {
     #[tokio::test]
     async fn a_flockfile_interpreter_outranks_the_shep_toml_mapping() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let flockfile = dir.path().join("Flockfile.toml");
         std::fs::write(
@@ -1922,7 +1922,7 @@ mod tests {
     #[tokio::test]
     async fn the_interpreter_flag_outranks_a_flockfiles_own_field() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let flockfile = dir.path().join("Flockfile.toml");
         std::fs::write(
@@ -1976,7 +1976,7 @@ mod tests {
     #[tokio::test]
     async fn the_request_carries_the_app_name_and_the_count() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -2012,7 +2012,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_stock_exits_invalid_config_and_prints_the_reason() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) = fake_client_replying_err(
             &path,
             RpcErrorCode::InvalidConfig,
