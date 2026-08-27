@@ -6204,6 +6204,23 @@ fn piped_table_output_at_the_default_style_carries_no_box_or_escape() {
 
 // --- Issue 1/2/3: adopt ergonomics and `shep <dogname>` dispatch ---------
 
+/// Spells a path the way `shep adopt` records it, so a comparison is between
+/// two spellings of the same file rather than between two files.
+///
+/// `adopt` canonicalizes what it vetted, and canonicalizing does two things a
+/// test cannot spell for itself. It strips Windows' `\\?\` prefix (shep's own
+/// doing, so `shep.toml` stays hand-editable), and it expands 8.3 short
+/// names. The second is what actually bit: `%TEMP%` on a GitHub Windows
+/// runner is `C:\Users\RUNNER~1\...`, which canonicalizes to `runneradmin`,
+/// so the substring check failed on a box whose username is longer than eight
+/// characters and passed on every developer machine whose username is not.
+fn as_adopt_records_it(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).expect("canonicalize the recorded binary");
+    shep_core::paths::strip_verbatim_prefix(&canonical)
+        .display()
+        .to_string()
+}
+
 /// Issue 1's first repro, verbatim: `cargo install shep-log-rotate` puts
 /// the binary on `$PATH` under its own name, and `shep adopt` used to be
 /// unable to find it there at all.
@@ -6229,7 +6246,7 @@ fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
     assert_success(&output);
     let written = std::fs::read_to_string(home.path().join("shep.toml")).unwrap();
     assert!(
-        written.contains(&binary.display().to_string()),
+        written.contains(&as_adopt_records_it(&binary)),
         "the $PATH hit must be the recorded binary: {written}"
     );
 }
@@ -6265,7 +6282,7 @@ fn shep_adopt_expands_a_leading_tilde_path() {
     assert_success(&output);
     let written = std::fs::read_to_string(shep_home.path().join("shep.toml")).unwrap();
     assert!(
-        written.contains(&binary.display().to_string()),
+        written.contains(&as_adopt_records_it(&binary)),
         "the ~/-expanded binary must be the one recorded: {written}"
     );
 }

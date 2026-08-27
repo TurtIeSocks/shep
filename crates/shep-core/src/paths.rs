@@ -5,6 +5,60 @@
 
 use std::path::{Path, PathBuf};
 
+/// Drops the `\\?\` extended-length prefix Windows' `canonicalize` adds
+///
+/// `std::fs::canonicalize` returns a verbatim path on Windows, so a binary at
+/// `C:\tools\dog.exe` comes back as `\\?\C:\tools\dog.exe`. That form is
+/// correct and every Win32 call accepts it, which is exactly why it leaks
+/// quietly: nothing inside shep breaks, and it surfaces only once the path
+/// reaches something that is not Win32. Two such places are already known.
+/// Node's `require` reads the leading `\\` as a UNC share and fails on `C:`.
+/// And `shep adopt` records the vetted binary in `shep.toml`, where the prefix
+/// is simply noise in a file an operator edits by hand.
+///
+/// So this is for paths that LEAVE shep: written to config, shown to an
+/// operator, or handed to another program. Paths that stay inside and are
+/// compared against each other must not use it. `serve`'s docroot containment
+/// check is the case that matters, where both sides being canonical is the
+/// security property, and rewriting one side would weaken it.
+///
+/// Only `\\?\C:\` is unwrapped, because that is the one shape `canonicalize`
+/// produces for a local file. A verbatim UNC path (`\\?\UNC\server\share`)
+/// is left alone: no host here can mount a share to test that branch, and an
+/// unexercised guess is worth less than a documented gap.
+///
+/// **A path long enough to need the prefix is out of scope.** Above `MAX_PATH`
+/// the prefix is load-bearing rather than decorative, and stripping it can
+/// produce a path that no longer opens. Nothing in shep's own layout comes
+/// close, and the alternative is a conditional rule whose behavior changes at
+/// a length nobody can see, so the simple rule is the one kept.
+#[cfg(windows)]
+#[must_use]
+pub fn strip_verbatim_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    let Prefix::VerbatimDisk(letter) = prefix.kind() else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+
+    let mut rebuilt = PathBuf::from(format!("{}:\\", char::from(letter)));
+    rebuilt.extend(components.filter(|part| !matches!(part, Component::RootDir)));
+    std::borrow::Cow::Owned(rebuilt)
+}
+
+/// Passes the path through: only Windows' `canonicalize` prefixes its output
+///
+/// See the Windows sibling for what this exists to undo.
+#[cfg(not(windows))]
+#[must_use]
+pub fn strip_verbatim_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// Resolved filesystem layout for one shep home
 ///
 /// All paths are derived from `$SHEP_HOME` (default `<home>/.shep`); nothing
@@ -110,6 +164,69 @@ impl ShepPaths {
 
 #[cfg(test)]
 mod tests {
+    /// Pins the strip directly, because no end-to-end case can. Node resolves
+    /// a `\\?\` path on some versions and not others, so the `.js` flockfile
+    /// cases passed on the development machine both before this existed and
+    /// after, while failing on the CI runner both times. Asserting on the
+    /// rewritten path is the part that holds either way.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_prefix_is_stripped() {
+        let rewritten = super::strip_verbatim_prefix(std::path::Path::new(r"\\?\C:\tmp\flock.js"));
+        assert_eq!(
+            rewritten.as_os_str(),
+            std::ffi::OsStr::new(r"C:\tmp\flock.js"),
+            "node reads the leading `\\\\` as a UNC share and lstats `C:`, so \
+             the verbatim prefix must not reach it"
+        );
+
+        let plain = std::path::Path::new(r"C:\tmp\flock.js");
+        assert_eq!(
+            super::strip_verbatim_prefix(plain).as_os_str(),
+            plain.as_os_str(),
+            "a path with no verbatim prefix must pass through untouched"
+        );
+    }
+
+    /// Guards the assumption the strip rests on: that `canonicalize` really
+    /// does hand back a prefixed path, and that the rewrite clears it without
+    /// breaking what it points at. If a future Windows or std stops adding
+    /// the prefix, this stays green and the strip becomes a no-op rather
+    /// than a wrong answer.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_canonicalized_path_comes_back_free_of_the_prefix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("dog.exe");
+        std::fs::write(&file, b"not really an exe").expect("write file");
+
+        let canonical = std::fs::canonicalize(&file).expect("canonicalize");
+        let rewritten = super::strip_verbatim_prefix(&canonical);
+        let shown = rewritten.display().to_string();
+
+        assert!(
+            !shown.starts_with(r"\\?\"),
+            "the path an operator will read still carries a verbatim prefix: {shown}"
+        );
+        assert!(
+            std::path::Path::new(&shown).is_file(),
+            "stripping the prefix must not break the path: {shown}"
+        );
+    }
+
+    /// The unix build has nothing to strip, and the helper exists there only
+    /// so call sites do not each carry a `cfg`. Pinned so it stays that way.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_unix_path_passes_through_untouched() {
+        let plain = std::path::Path::new("/tmp/flock.js");
+        assert_eq!(
+            super::strip_verbatim_prefix(plain).as_os_str(),
+            plain.as_os_str(),
+            "the non-Windows arm must be an identity"
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

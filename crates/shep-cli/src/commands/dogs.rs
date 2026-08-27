@@ -375,7 +375,13 @@ pub fn vet_binary(path: &Path, home: &Path) -> Result<VettedBinary, AdoptRefusal
     // symlink loop or a race with something deleting the file between the
     // two calls is the only way it could fail, and either way there is
     // nothing more specific than `Missing` to report.
-    let canonical = path.canonicalize().map_err(|_| AdoptRefusal::Missing)?;
+    // The vetted path is recorded in `shep.toml` under `adopted_dogs`, a file
+    // an operator opens and edits, so Windows' verbatim prefix is stripped
+    // before it gets there rather than after.
+    let canonical = path
+        .canonicalize()
+        .map(|abs| shep_core::paths::strip_verbatim_prefix(&abs).into_owned())
+        .map_err(|_| AdoptRefusal::Missing)?;
     let group_writable = writability(&canonical)?;
     // Spawned with no arguments — an adopted dog is run exactly this way
     // (`dog_app`'s own doc) — and torn down unconditionally: `kill` is
