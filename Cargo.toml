@@ -140,6 +140,11 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # defined at tokio-stream-0.1.3/src/wrappers/broadcast.rs:22, so 0.1.3 is
 # the correct floor.
 tokio-stream = { version = "0.1.3", default-features = false, features = ["sync"] }
+# Windows only, shep-daemon only: the job-object API that stands in for a
+# unix process group (`sys_windows.rs`, the crate's only unsafe surface on
+# that platform). Already present in the lock as a transitive dependency of
+# tokio/mio, so naming it directly adds an edge rather than a crate.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Console"] }
 # `shep-cli`'s dev-dependencies, for Task 12's real-binary e2e tier
 # (`crates/shep-cli/tests/cli_e2e.rs`). Neither crate has any call site yet —
 # this phase's other tasks land the assertions that actually exercise them —
