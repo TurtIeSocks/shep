@@ -153,8 +153,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
-- Add `SupervisorError::CannotStart`, a `Start` batch refused before anything
-  was registered. Separate from `SpawnFailed` because nothing was spawned,
+- Add `SupervisorError::CannotStart`, a command refused before it registered
+  or spawned anything: a `Start` batch whose checking pass rejected an app, or
+  a `shep stock` on an app whose `user` will not resolve. Separate from `SpawnFailed` because nothing was spawned,
   and an operator told "spawn failed" about a spawn that never happened is
   being pointed at the wrong place; the two also differ in what they leave
   behind, which is the part that matters operationally. It maps to the

@@ -595,10 +595,15 @@ pub enum SupervisorError {
     NotFound,
     /// Spawn failed (carries the runner's message).
     SpawnFailed(String),
-    /// A `Start` batch was refused before anything was registered, because
-    /// at least one app in it provably could not run. Carries one
-    /// `"<name>: <reason>"` entry per such app, joined by `"; "`, behind a
-    /// count and the fact that nothing was registered.
+    /// A command that would have started processes was refused before any of
+    /// them was registered, because what it was asked to start provably could
+    /// not run. Carries `"<name>: <reason>"` per app that could not.
+    ///
+    /// Two callers. A `Start` batch refused in its checking pass, which
+    /// prefixes the list with a count and the fact that nothing was
+    /// registered; and a `Scale` whose app has a `user`/`group` that will not
+    /// resolve, which is one app and carries just the pair. What unites them
+    /// is not the verb but the guarantee below.
     ///
     /// Separate from [`Self::SpawnFailed`] because NOTHING WAS SPAWNED, and
     /// an operator reading "spawn failed" about a spawn that never happened
@@ -981,7 +986,9 @@ impl SupervisorHandle {
     /// bus. A matched sheep that is not `Online` has nothing to replace and
     /// is a no-op success in that answer. Nothing here re-reads config: the
     /// replacement is spawned from the stored `ResolvedApp` and the
-    /// credentials resolved at the first `Start`.
+    /// credentials the instance resolved at its own first spawn, which for a
+    /// sheep restored from the muster roll is its first restart rather than a
+    /// `Start`.
     ///
     /// # Errors
     ///
@@ -1028,6 +1035,12 @@ impl SupervisorHandle {
     /// - [`SupervisorError::NotFound`] — no app of that name is registered.
     /// - [`SupervisorError::InvalidScale`] — a count of `0`, or a target that
     ///   is a dog.
+    /// - [`SupervisorError::CannotStart`] — the app's `user`/`group` could
+    ///   not be resolved, so no instance could be assembled. Nothing was
+    ///   spawned, nothing was removed, and the stored instance count is
+    ///   unchanged: the flock is exactly as it was. Only reachable for an app
+    ///   that has never resolved its identity, which today means one
+    ///   registered at rest from the muster roll rather than started.
     /// - [`SupervisorError::ReloadInFlight`] — the app is mid-reload.
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
     ///
@@ -3527,15 +3540,34 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         let current = u32::try_from(slots.len()).unwrap_or(u32::MAX);
-        // Off an instance that already exists, so in practice this is the
-        // identity that instance is running under and the resolve inside
-        // never happens. It is reached through the one seam anyway, because
-        // "already exists" is a claim about a live entry and a scale is not
-        // the place to bet the flock's identity on it.
+        // Off an instance that already exists, so for a RUNNING app this is
+        // the identity that instance is already under and the resolve inside
+        // never happens. It is reached through the one seam anyway, and the
+        // failure arm is not dead code: an app registered at rest from the
+        // muster roll has never resolved anything, and scaling one up is a
+        // real route to a passwd lookup that can fail.
+        //
+        // `CannotStart`, not `SpawnFailed`, and not `InvalidScale`. Nothing
+        // has been spawned, nothing removed, and the config write-back is
+        // still ahead, so the flock this returns on is untouched -- which is
+        // exactly the promise `CannotStart` documents and the one an
+        // operator needs. `SpawnFailed` would name a spawn that never
+        // happened, and `InvalidScale` maps to `InvalidConfig` and means "ask
+        // for a different count", which is not something the caller can do
+        // about a `user` that will not resolve.
+        //
+        // Measured, because the obvious claim for this change is wrong: both
+        // `CannotStart` and `SpawnFailed` map to `RpcErrorCode::SpawnFailed`,
+        // and the CLI frames a reply by its CODE, so `shep stock` prints
+        // "error[spawn_failed]: the daemon reported SpawnFailed: <message>"
+        // either way. The operator's sentence does not change at all. What
+        // changes is what a caller matching `SupervisorError` sees, and what
+        // this daemon's own log says through the variant's `Display`, which
+        // is "start refused" rather than a spawn that never happened.
         let credentials = match self.credentials_for_spawn(slots[0].1) {
             Ok(credentials) => credentials,
             Err(err) => {
-                let _ = reply.send(Err(SupervisorError::SpawnFailed(err.to_string())));
+                let _ = reply.send(Err(SupervisorError::CannotStart(format!("{name}: {err}"))));
                 return;
             }
         };
@@ -3681,9 +3713,9 @@ impl<R: ProcessRunner> Actor<R> {
     /// live process in its slot buys the overlap nobody can use yet.
     ///
     /// Nothing here re-reads configuration. The replacement is assembled from
-    /// the drainee's stored [`ResolvedApp`] and the credentials resolved at
-    /// the first `Start`, which is what [`ProcessEntry::credentials`]' own
-    /// once-only rule requires; a config-rereading verb would be a different
+    /// the drainee's stored [`ResolvedApp`] and the credentials that instance
+    /// resolved at its own first spawn, which is what
+    /// [`ProcessEntry::credentials`]' own once-only rule requires; a config-rereading verb would be a different
     /// feature with a different argument shape.
     fn handle_reload(
         &mut self,
@@ -3921,7 +3953,9 @@ impl<R: ProcessRunner> Actor<R> {
     ///   function's own carve-out on the swap's phase instead.
     ///
     /// The mark is undone if the spawn fails, and nothing can observe it in
-    /// between — the actor is synchronous here and emits no event.
+    /// between — the actor is synchronous here and emits no event. An
+    /// identity that will not resolve returns before the mark is made at all,
+    /// which leaves the drainee where it stood by never moving it.
     fn spawn_replacement(&mut self, old_id: u32) -> Result<u32, String> {
         // `Credentials` is `Copy`; reused, never re-resolved. A drainee is
         // by definition running, so the seam finds a resolved identity and
@@ -14474,6 +14508,53 @@ mod tests {
             "`AllOrNothing` registers nothing at all, this app included"
         );
         assert_eq!(actor.runner.spawn_count(), 0);
+    }
+
+    // fails if scaling up an app whose `user` will not resolve spawns
+    // anything, changes the stored count, or reports the refusal as a spawn
+    // that failed. Reachable because an app registered at rest has never
+    // resolved its identity: it is the muster roll's own entry, one `shep
+    // stock` away from a passwd lookup.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn scaling_an_app_whose_user_will_not_resolve_leaves_the_flock_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits(); 4]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+        let registered = actor.register_at_rest(&app);
+
+        let (reply, answer) = oneshot::channel();
+        actor.handle_scale("web", 3, reply);
+        let err = answer
+            .await
+            .expect("handle_scale answers every call")
+            .expect_err("an unresolvable user must refuse the scale");
+
+        // `CannotStart` rather than `SpawnFailed`: no spawn was attempted, and
+        // the flock is exactly as it was.
+        let SupervisorError::CannotStart(message) = &err else {
+            panic!("expected CannotStart, got {err:?}");
+        };
+        assert!(
+            message.contains("web") && message.contains(NO_SUCH_USER),
+            "the refusal must name the app and the user it could not resolve: {message}"
+        );
+        assert_eq!(actor.runner.spawn_count(), 0);
+        assert_eq!(
+            actor.sheep.len(),
+            1,
+            "no instance may be registered by a scale that could not resolve an identity"
+        );
+        assert_eq!(
+            actor.sheep[&registered.id].entry.spec.config().instances,
+            1,
+            "the stored count must not be written back for a scale that did not happen"
+        );
+        assert_eq!(
+            actor.sheep[&registered.id].entry.credentials,
+            SpawnIdentity::Unresolved,
+            "a failed resolution settles nothing: the next attempt must ask again"
+        );
     }
 
     // fails if either route into `respawn_failed` lands a sheep in `Errored`
