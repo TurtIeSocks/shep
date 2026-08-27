@@ -21,7 +21,7 @@ use shep_core::status::ProcStatus;
 
 use crate::dog_index::AvailableDog;
 use crate::style::Presentation;
-use crate::vocabulary;
+use crate::vocabulary::{self, Role};
 
 use super::Render;
 
@@ -77,13 +77,27 @@ impl Render for FlockRows {
             .collect()
     }
 
-    /// [`Self::rows`], with the STATUS cell (index 2, parallel to
-    /// `headers()`) dressed up per spec §2: the face always, when
-    /// `presentation.level.sheep()`; the word too, when `status_word`; the
-    /// whole cell coloured with `output::paint::style_for` when
-    /// `presentation.colour`. Reuses [`Self::rows`] for the other eight
-    /// columns rather than rebuilding them, so the two never drift on
-    /// anything but the one cell this method exists to change.
+    /// [`Self::rows`], with every cell the governing rule ("every colour
+    /// must carry information") allows dressed up:
+    ///
+    /// - STATUS (index 2): the face always, when `presentation.level.sheep()`;
+    ///   the word too, when `status_word`; the whole cell coloured per
+    ///   [`status_cell`].
+    /// - ID and FOLD: always `Role::Ink3` -- chrome, the way `pm2` dims its
+    ///   namespace column, never a fact about the row.
+    /// - PID and SMIT: `Role::Ink3` only when the cell reads `-` -- an
+    ///   absent value should not shout as loud as a real one.
+    /// - RESTARTS: `Role::Ink3` at zero, `Role::Butter` above it -- a
+    ///   restart count above zero is the single most useful glanceable
+    ///   signal in this table.
+    /// - EXIT: `Role::Bark` for a genuine failure (a nonzero code or a
+    ///   signal), `Role::Ink3` otherwise (a clean `0`, or no exit recorded
+    ///   yet -- both render `-` or an uneventful number).
+    /// - CPU and MEM: a magnitude ramp -- see [`cpu_role`]/[`mem_role`] for
+    ///   the thresholds and the reasoning behind them.
+    ///
+    /// Reuses [`Self::rows`] for the cell text itself rather than rebuilding
+    /// it, so this method only ever decides colour, never content.
     ///
     /// `status_word` is a plain parameter, not part of `Presentation`,
     /// because it is not a fact resolved once at the seam the way `level`/
@@ -95,6 +109,18 @@ impl Render for FlockRows {
         let mut rows = self.rows();
         for (row, p) in rows.iter_mut().zip(&self.0) {
             row[2] = status_cell(p.status, presentation, status_word);
+            colour_cell(&mut row[0], Role::Ink3, presentation);
+            if row[3] == "-" {
+                colour_cell(&mut row[3], Role::Ink3, presentation);
+            }
+            colour_cell(&mut row[4], restarts_role(p.restarts), presentation);
+            colour_cell(&mut row[5], exit_role(p.pid, p.last_exit), presentation);
+            colour_cell(&mut row[6], cpu_role(p.cpu_percent), presentation);
+            colour_cell(&mut row[7], mem_role(p.memory_bytes), presentation);
+            colour_cell(&mut row[9], Role::Ink3, presentation);
+            if row[10] == "-" {
+                colour_cell(&mut row[10], Role::Ink3, presentation);
+            }
         }
         rows
     }
@@ -197,11 +223,101 @@ fn status_cell(status: ProcStatus, presentation: Presentation, status_word: bool
     } else {
         status.to_string()
     };
-    if presentation.colour {
-        let style = super::paint::style_for(vocabulary::role_of(status), presentation.deep_colour);
-        text = format!("{style}{text}{style:#}");
-    }
+    colour_cell(&mut text, vocabulary::role_of(status), presentation);
     text
+}
+
+/// Wraps `cell` in [`crate::output::paint::style_for`]'s span for `role`, or
+/// leaves it untouched when `presentation.colour` is off -- the one place
+/// [`Self::rows_for`](Render::rows_for) applies colour, so every column it
+/// dresses up (STATUS included, through [`status_cell`] above) goes through
+/// the identical wrap rather than each cell reimplementing the same two
+/// lines.
+fn colour_cell(cell: &mut String, role: Role, presentation: Presentation) {
+    if !presentation.colour {
+        return;
+    }
+    let style = super::paint::style_for(role, presentation.deep_colour);
+    *cell = format!("{style}{cell}{style:#}");
+}
+
+/// MEM's colour boundary, in bytes: below it, a live RSS is an ordinary
+/// footprint (a small worker, a sidecar, a CLI wrapper); at or above it,
+/// `Role::Butter` marks a sheep worth a second look. 128 MiB sits cleanly
+/// between the two footprints a real flock actually shows side by side --
+/// shep-testbed's own live flock (this task's own verification fixture)
+/// carries an app at 3.8M and one at 800M, and this threshold puts them on
+/// opposite sides of the ramp rather than leaving them to read identically,
+/// which is the whole complaint this task exists to fix.
+const MEM_ELEVATED_BYTES: u64 = 128 * 1024 * 1024;
+
+/// [`Role`] for a MEM cell. `None` (no live process to sample) is
+/// [`Role::Ink3`], the same "no honest value" colour every dash in this
+/// table gets; otherwise the cell is coloured by [`MEM_ELEVATED_BYTES`]'s
+/// two-tier ramp.
+fn mem_role(memory_bytes: Option<u64>) -> Role {
+    match memory_bytes {
+        None => Role::Ink3,
+        Some(bytes) if bytes >= MEM_ELEVATED_BYTES => Role::Butter,
+        Some(_) => Role::Meadow,
+    }
+}
+
+/// CPU's colour boundary, in percent of one core. Sustained use at or above
+/// this is unusual for a steady-state service and worth a glance;
+/// below it is ordinary load, not damage -- `Role::Bark` stays reserved for
+/// an actual fault (EXIT, below), never for a busy-but-healthy sheep.
+const CPU_ELEVATED_PERCENT: f32 = 50.0;
+
+/// [`Role`] for a CPU cell. `None` (not running) and `0.0%` (idle) are both
+/// [`Role::Ink3`] -- neither is news, and an idle sheep printing the same
+/// muted colour as one with no honest value to report is the point, not a
+/// coincidence. A busy sheep is coloured by [`CPU_ELEVATED_PERCENT`]'s
+/// two-tier ramp.
+fn cpu_role(cpu_percent: Option<f32>) -> Role {
+    match cpu_percent {
+        None => Role::Ink3,
+        Some(cpu) if cpu <= 0.0 => Role::Ink3,
+        Some(cpu) if cpu >= CPU_ELEVATED_PERCENT => Role::Butter,
+        Some(_) => Role::Meadow,
+    }
+}
+
+/// [`Role`] for a RESTARTS cell: `Role::Ink3` at zero, `Role::Butter` above
+/// it. Spec's own ruling (this task's brief) -- a restart count above zero
+/// is the single most useful glanceable signal in the table, so it gets the
+/// same "something to look at" colour `theme.rs`'s own `attention` does,
+/// never `Role::Bark`, which stays reserved for a genuine fault.
+const fn restarts_role(restarts: u32) -> Role {
+    if restarts == 0 {
+        Role::Ink3
+    } else {
+        Role::Butter
+    }
+}
+
+/// [`Role`] for an EXIT cell, mirroring [`exit_cell`]'s own branches rather
+/// than parsing the rendered text back apart: a live process (`pid.is_some()`,
+/// the cell reads `-`) and a clean `0` exit both get `Role::Ink3`, the same
+/// "nothing to report" colour a dash gets everywhere else in this table.
+/// Only a nonzero code or a signal -- an actual failure -- earns
+/// `Role::Bark`.
+fn exit_role(pid: Option<u32>, last_exit: Option<ExitInfo>) -> Role {
+    if pid.is_some() {
+        return Role::Ink3;
+    }
+    match last_exit {
+        Some(ExitInfo {
+            code: Some(code), ..
+        }) if code != 0 => Role::Bark,
+        Some(ExitInfo {
+            signal: Some(_), ..
+        }) => Role::Bark,
+        // A clean `0` exit, an exit the daemon could not characterize (both
+        // fields `None`), or no exit recorded at all -- none of the three is
+        // news.
+        _ => Role::Ink3,
+    }
 }
 
 /// The EXIT column's cell: the last exit's code or signal name for a sheep
@@ -2903,5 +3019,159 @@ pub(crate) mod tests {
             "the flock listing's drop order changed; if that is deliberate, \
              change this test and say why in the commit"
         );
+    }
+
+    // --- Colour: MEM/CPU/RESTARTS/EXIT/ID/FOLD/placeholder roles ----------
+    //
+    // These pin the boundary of each ramp directly against `Role`, rather
+    // than through a snapshot: a snapshot passes whatever was accepted into
+    // it, so it cannot by itself prove a colour is keyed to the right fact.
+    // These can fail on their own if a threshold or a branch moves.
+
+    /// fails if MEM's ramp boundary moves without a test noticing, or if
+    /// either side of it stops being the role the governing rule ("every
+    /// colour must carry information") calls for: `None` is the same
+    /// "nothing to report" colour a dash gets everywhere else in the table,
+    /// and the boundary itself is inclusive on the `Butter` side.
+    #[test]
+    fn mem_role_ramps_at_its_documented_boundary() {
+        assert_eq!(mem_role(None), Role::Ink3);
+        assert_eq!(mem_role(Some(MEM_ELEVATED_BYTES - 1)), Role::Meadow);
+        assert_eq!(mem_role(Some(MEM_ELEVATED_BYTES)), Role::Butter);
+        // The two live figures this task's own verification fixture named:
+        // a light app and a heavy one must land on opposite sides.
+        assert_eq!(mem_role(Some(3_800_000)), Role::Meadow, "3.8M is light");
+        assert_eq!(mem_role(Some(800_000_000)), Role::Butter, "800M is heavy");
+    }
+
+    /// fails on the same class of regression as `mem_role`'s own test,
+    /// pointed at CPU: idle (`0.0%`) must stay `Ink3` even though it is
+    /// technically "below the ramp", since idle is not news, and the
+    /// boundary itself is inclusive on the `Butter` side.
+    #[test]
+    fn cpu_role_ramps_at_its_documented_boundary() {
+        assert_eq!(cpu_role(None), Role::Ink3);
+        assert_eq!(cpu_role(Some(0.0)), Role::Ink3);
+        assert_eq!(cpu_role(Some(0.1)), Role::Meadow);
+        assert_eq!(cpu_role(Some(CPU_ELEVATED_PERCENT - 0.1)), Role::Meadow);
+        assert_eq!(cpu_role(Some(CPU_ELEVATED_PERCENT)), Role::Butter);
+        assert_eq!(cpu_role(Some(99.0)), Role::Butter);
+    }
+
+    /// fails if a restart count of exactly zero stops being muted, or if
+    /// one restart stops being coloured at all -- an operator's single most
+    /// useful glanceable signal in this table (this task's own brief).
+    #[test]
+    fn restarts_role_is_ink3_only_at_exactly_zero() {
+        assert_eq!(restarts_role(0), Role::Ink3);
+        assert_eq!(restarts_role(1), Role::Butter);
+        assert_eq!(restarts_role(u32::MAX), Role::Butter);
+    }
+
+    /// fails if `exit_role` starts painting a clean `0` exit, a still-running
+    /// sheep, or an uncharacterised exit as if they were a fault, or if it
+    /// stops painting a genuine one. Mirrors `exit_cell`'s own branches
+    /// directly rather than going through the rendered `-`/number text, so
+    /// this cannot pass by accident the way a text-sniffing test could if
+    /// `exit_cell`'s own formatting ever changed.
+    #[test]
+    fn exit_role_is_bark_only_for_a_genuine_failure() {
+        // Still running: the cell itself reads `-`, and running is not a
+        // fault regardless of what a *previous* exit recorded.
+        assert_eq!(
+            exit_role(
+                Some(1234),
+                Some(ExitInfo {
+                    code: Some(1),
+                    signal: None
+                })
+            ),
+            Role::Ink3
+        );
+        // Not running, no exit ever recorded.
+        assert_eq!(exit_role(None, None), Role::Ink3);
+        // Not running, a clean exit.
+        assert_eq!(
+            exit_role(
+                None,
+                Some(ExitInfo {
+                    code: Some(0),
+                    signal: None
+                })
+            ),
+            Role::Ink3
+        );
+        // Not running, the daemon could not characterize the exit.
+        assert_eq!(
+            exit_role(
+                None,
+                Some(ExitInfo {
+                    code: None,
+                    signal: None
+                })
+            ),
+            Role::Ink3
+        );
+        // Not running, a genuine nonzero exit code.
+        assert_eq!(
+            exit_role(
+                None,
+                Some(ExitInfo {
+                    code: Some(1),
+                    signal: None
+                })
+            ),
+            Role::Bark
+        );
+        // Not running, killed by a signal.
+        assert_eq!(
+            exit_role(
+                None,
+                Some(ExitInfo {
+                    code: None,
+                    signal: Some(9)
+                })
+            ),
+            Role::Bark
+        );
+    }
+
+    /// fails if `rows_for` stops colouring ID/FOLD as chrome, stops muting a
+    /// `-` placeholder, or starts colouring a real (non-dash) PID/SMIT value
+    /// it was never asked to. Goes through the real seam (`rows_for`, not
+    /// the role helpers directly) because this is the one property that is
+    /// about which CELLS get touched, not about a threshold.
+    #[test]
+    fn chrome_and_placeholder_columns_are_coloured_and_nothing_else_is() {
+        use crate::style::{Presentation, StyleLevel};
+
+        let presentation = Presentation::new(
+            StyleLevel::Full,
+            None,
+            Some(std::ffi::OsStr::new("xterm-256color")),
+            None,
+            200,
+        );
+        // One row with a real PID and no fold (so PID is a real value, and
+        // FOLD is the placeholder) and one without a PID (so PID is the
+        // placeholder).
+        let mut running = sample_info(0, "web", 60_000);
+        running.fold = None;
+        let mut stopped = sample_info(1, "cron", 0);
+        stopped.pid = None;
+        stopped.fold = None;
+        let flock = FlockRows(vec![running, stopped]);
+
+        let rows = flock.rows_for(presentation, true);
+
+        // ID: chrome, always coloured.
+        assert!(rows[0][0].contains('\u{1b}'), "{:?}", rows[0][0]);
+        assert!(rows[1][0].contains('\u{1b}'), "{:?}", rows[1][0]);
+        // PID: a real value is left plain; the placeholder is coloured.
+        assert!(!rows[0][3].contains('\u{1b}'), "{:?}", rows[0][3]);
+        assert!(rows[1][3].contains('\u{1b}'), "{:?}", rows[1][3]);
+        // FOLD: chrome, always coloured, `-` here on both rows.
+        assert!(rows[0][9].contains('\u{1b}'), "{:?}", rows[0][9]);
+        assert!(rows[1][9].contains('\u{1b}'), "{:?}", rows[1][9]);
     }
 }
