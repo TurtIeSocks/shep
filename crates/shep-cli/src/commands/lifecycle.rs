@@ -147,6 +147,46 @@ pub(crate) fn target_exit_code(err: &TargetError) -> ExitCode {
 /// needing quoting ever reaches a command line.
 const JS_BRIDGE_FILE: &str = "shep-flockfile-bridge.js";
 
+/// Rewrites a canonicalized path into one node's `require` can resolve.
+///
+/// On Windows `std::fs::canonicalize` returns an extended-length path, so a
+/// flockfile at `C:\tmp\flock.js` comes back as `\\?\C:\tmp\flock.js`. Node's
+/// module resolver does not understand the `\\?\` prefix: it reads the leading
+/// `\\` as a UNC share, walks off the front of the path, and fails with
+/// ``EISDIR: illegal operation on a directory, lstat 'C:'``. That error names
+/// `C:` and never the flockfile, which is what made it read for two rounds of
+/// CI like an argument-quoting fault rather than a path-shape one.
+///
+/// Only the `\\?\C:\` form is unwrapped, because that is the only shape
+/// `canonicalize` produces for a local file. A verbatim UNC path
+/// (`\\?\UNC\server\share`) would need the same treatment and does not get it:
+/// no Windows host here can mount a share to test the branch against, and an
+/// unexercised guess is worth less than a documented gap.
+#[cfg(windows)]
+fn node_readable_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    let Prefix::VerbatimDisk(letter) = prefix.kind() else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+
+    let mut rebuilt = std::path::PathBuf::from(format!("{}:\\", char::from(letter)));
+    rebuilt.extend(components.filter(|part| !matches!(part, Component::RootDir)));
+    std::borrow::Cow::Owned(rebuilt)
+}
+
+/// Passes the path through: only Windows' `canonicalize` prefixes its output.
+///
+/// See the Windows sibling for what this exists to undo.
+#[cfg(not(windows))]
+fn node_readable_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// The bridge run by [`evaluate_js_flockfile`], written to a file rather
 /// than passed to `node -e`.
 ///
@@ -266,7 +306,10 @@ fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
     let output = std::process::Command::new("node")
         .arg(JS_BRIDGE_FILE)
         .current_dir(scratch.path())
-        .env("SHEP_FLOCKFILE_PATH", &absolute)
+        .env(
+            "SHEP_FLOCKFILE_PATH",
+            node_readable_path(&absolute).as_os_str(),
+        )
         .stdin(std::process::Stdio::null())
         .output();
     let output = match output {
@@ -1142,6 +1185,55 @@ pub async fn stock(client: &Client, streams: &mut Streams<'_>, args: &StockArgs)
 
 #[cfg(test)]
 mod tests {
+    /// Pins the prefix strip directly, because the end-to-end `.js` cases
+    /// cannot prove it. Node resolves a `\\?\` path correctly on some
+    /// versions and not others, so those cases passed on this machine while
+    /// failing on the CI runner, both before the strip existed and after.
+    /// Asserting on the rewritten path is the part that holds either way.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_prefix_is_stripped_before_node_sees_the_path() {
+        let rewritten = super::node_readable_path(std::path::Path::new(r"\\?\C:\tmp\flock.js"));
+        assert_eq!(
+            rewritten.as_os_str(),
+            std::ffi::OsStr::new(r"C:\tmp\flock.js"),
+            "node reads the leading `\\\\` as a UNC share and lstats `C:`, so \
+             the verbatim prefix must not reach it"
+        );
+
+        let plain = std::path::Path::new(r"C:\tmp\flock.js");
+        assert_eq!(
+            super::node_readable_path(plain).as_os_str(),
+            plain.as_os_str(),
+            "a path with no verbatim prefix must pass through untouched"
+        );
+    }
+
+    /// Guards the assumption the strip rests on: that `canonicalize` really
+    /// does hand back a prefixed path here, and that the rewrite clears it.
+    /// If a future Windows or std stops adding the prefix, this stays green
+    /// and the strip becomes a no-op rather than a wrong answer.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_canonicalized_flockfile_comes_back_free_of_the_prefix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let flockfile = dir.path().join("flock.js");
+        std::fs::write(&flockfile, "module.exports = { apps: [] };").expect("write flockfile");
+
+        let canonical = std::fs::canonicalize(&flockfile).expect("canonicalize");
+        let rewritten = super::node_readable_path(&canonical);
+        let shown = rewritten.display().to_string();
+
+        assert!(
+            !shown.starts_with(r"\\?\"),
+            "the path handed to node still carries a verbatim prefix: {shown}"
+        );
+        assert!(
+            std::path::Path::new(&shown).is_file(),
+            "stripping the prefix must not break the path: {shown}"
+        );
+    }
+
     use super::*;
     use crate::cli::Format;
     use shep_client::DEFAULT_DEADLINE;
