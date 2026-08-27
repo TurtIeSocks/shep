@@ -60,7 +60,7 @@ use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasRegistry};
 use crate::kill::kill_process;
-use crate::privilege::{self, Credentials};
+use crate::privilege::{self, Credentials, PrivilegeError, SpawnIdentity};
 use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
@@ -2492,6 +2492,53 @@ impl<R: ProcessRunner> Actor<R> {
         Ok(results)
     }
 
+    /// The credentials `id`'s next spawn must apply, resolved once if this
+    /// entry has never had them resolved.
+    ///
+    /// The ONE seam through which a stored [`SpawnIdentity`] becomes the
+    /// settled `Option<Credentials>` [`assemble`] takes, which is what keeps
+    /// the two meanings of "no credentials" from being confused at a spawn
+    /// site:
+    ///
+    /// - An entry resolved at its `Start` answers from that stored value and
+    ///   never touches the passwd database again. A running app's identity
+    ///   therefore cannot change underneath it, and a restart cannot fail on
+    ///   a passwd database that has changed since.
+    /// - An entry that has never been resolved -- registered at rest from
+    ///   the muster roll, or registered `Errored` because this very
+    ///   resolution failed -- resolves here, and stores the answer so the
+    ///   guarantee above holds from its first spawn onward. Falling back to
+    ///   the shepherd's own identity instead would start the child as the
+    ///   daemon with nothing said about it.
+    ///
+    /// A failed resolution stores nothing: the entry stays
+    /// [`SpawnIdentity::Unresolved`], so a later restart asks again rather
+    /// than inheriting a refusal from a passwd database that has since been
+    /// fixed.
+    ///
+    /// # Errors
+    /// - Whatever [`privilege::resolve`] refused this app's `user`/`group`
+    ///   for: no such user, no such group, an unreadable database, or a
+    ///   non-root daemon asked to change identity.
+    fn credentials_for_spawn(&mut self, id: u32) -> Result<Option<Credentials>, PrivilegeError> {
+        let slot = self
+            .sheep
+            .get(&id)
+            .expect("credentials_for_spawn: unknown id");
+        match slot.entry.credentials {
+            SpawnIdentity::Resolved(credentials) => Ok(credentials),
+            SpawnIdentity::Unresolved => {
+                let credentials = privilege::resolve(slot.entry.spec.config())?;
+                self.sheep
+                    .get_mut(&id)
+                    .expect("credentials_for_spawn: the entry was read a moment ago")
+                    .entry
+                    .credentials = SpawnIdentity::Resolved(credentials);
+                Ok(credentials)
+            }
+        }
+    }
+
     /// Registers one app as a member of the flock without spawning anything.
     ///
     /// The flock is a membership list, not a list of live processes. `stop`
@@ -2523,7 +2570,10 @@ impl<R: ProcessRunner> Actor<R> {
         self.next_id += 1;
         // Assembled for its log paths only: nothing is spawned here, but the
         // entry has to name the files a later `restart` will append to, the
-        // same way the failure arm of `spawn_fresh` does.
+        // same way the failure arm of `spawn_fresh` does. `None` credentials
+        // here are inert for the same reason -- this spec never reaches a
+        // runner, and the entry below records that the real question has not
+        // been asked yet.
         let spec = assemble(app, 0, &self.paths, None);
         let entry = ProcessEntry {
             id,
@@ -2535,7 +2585,11 @@ impl<R: ProcessRunner> Actor<R> {
             started_at: None,
             budget: RestartBudget::default(),
             reload: ReloadState::None,
-            credentials: None,
+            // Never looked up: this is a membership record, not a `Start`.
+            // The first spawn of this entry resolves it (`respawn`), so a
+            // restored app comes up under its configured `user` rather than
+            // under the shepherd's own identity.
+            credentials: SpawnIdentity::Unresolved,
             out_file: spec.out_file.clone(),
             err_file: spec.err_file.clone(),
             dog: None,
@@ -2648,7 +2702,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: Some(tokio::time::Instant::now()),
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
-                    credentials,
+                    credentials: SpawnIdentity::Resolved(credentials),
                     out_file,
                     err_file,
                     dog,
@@ -2722,7 +2776,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: None,
                     budget: RestartBudget::default(),
                     reload: ReloadState::None,
-                    credentials,
+                    credentials: SpawnIdentity::Resolved(credentials),
                     out_file,
                     err_file,
                     dog,
@@ -2805,13 +2859,27 @@ impl<R: ProcessRunner> Actor<R> {
     /// failure. Callers pass `origin == CommandOrigin::Operator`, never a
     /// literal, wherever a command is what got them here.
     fn respawn(&mut self, id: u32, manually: bool) -> ProcessInfo {
+        // Reused as-is once resolved (never re-resolved): a restart must
+        // never re-touch the passwd database, and must never silently change
+        // identity out from under an already-running app. An entry that has
+        // never been resolved -- restored from the muster roll, or left
+        // `Errored` by a refused start -- resolves HERE, because coming up
+        // as the shepherd instead would be a privilege downgrade nothing
+        // reports.
+        let credentials = match self.credentials_for_spawn(id) {
+            Ok(credentials) => credentials,
+            Err(err) => {
+                tracing::warn!(
+                    id,
+                    %err,
+                    "restart refused: this app's user could not be resolved"
+                );
+                return self.respawn_failed(id, manually);
+            }
+        };
         let slot = self.sheep.get(&id).expect("respawn: unknown id");
         let app = slot.entry.spec.clone();
         let instance = slot.entry.instance;
-        // Reused as-is from the initial Start (never re-resolved): a
-        // restart must never re-touch the passwd database, and must never
-        // silently change identity out from under an already-running app.
-        let credentials = slot.entry.credentials;
         // Computed ahead of the mutable borrow below (IMPORTANT-3): this
         // respawn's new epoch, one past the slot's current one.
         let next_epoch = slot.epoch + 1;
@@ -2890,47 +2958,59 @@ impl<R: ProcessRunner> Actor<R> {
                 }
                 info
             }
-            Err(_error) => {
-                // The deferred aggregation reply has no per-id error slot
-                // (locked model): a failed respawn simply lands the entry in
-                // Errored, same as a budget-exhausted crash loop.
-                let slot = self
-                    .sheep
-                    .get_mut(&id)
-                    .expect("respawn: entry vanished mid-respawn");
-                slot.entry.status = ProcStatus::Errored;
-                slot.entry.pid = None;
-                slot.entry.started_at = None;
-                // Cleared, because nothing exited here: the spawn itself
-                // failed, so there is no exit to report. Leaving the
-                // previous process's code in place would show a sheep that
-                // once crashed with 1 as still crashing with 1 while it is
-                // in fact failing to start at all -- and telling those two
-                // apart is the whole reason this field exists.
-                slot.entry.last_exit = None;
-                slot.ctl = None;
-                // Already `None` on every route into a respawn: all three
-                // callers reach it only for an id whose `ctl` is clear, and
-                // the two are cleared in the same breath. Written anyway, so
-                // that "these two go together" is something a reader can see
-                // at each site rather than infer from the callers.
-                slot.to_child = None;
-                slot.signals = None;
-                slot.to_stdin = None;
-                slot.ready_tx = None;
-                let info = to_info(&slot.entry, &self.smits);
-                self.emit(ProcessEventKind::Errored, info.clone(), manually);
-                // The same terminal status `Decision::Errored` reaches, and it
-                // needs the same disarm: a respawn that fails to spawn (the
-                // binary replaced mid-deploy, `EAGAIN`, a cwd that is gone)
-                // would otherwise leave the name-group's cron worker and watch
-                // live, and the enforcer armed against a pid that no longer
-                // exists. Re-disarming an already-disarmed id is a no-op by
-                // construction, so this is safe from every caller.
-                self.disarm_extras(id, &info.name);
-                info
-            }
+            Err(_error) => self.respawn_failed(id, manually),
         }
+    }
+
+    /// Lands `id` in the terminal state a respawn that could not start
+    /// reaches: `Errored`, every handle cleared, its lifecycle extras
+    /// disarmed.
+    ///
+    /// Two callers, failing for different reasons at different moments -- a
+    /// runner that refused the spawn, and a `user` that could not be
+    /// resolved before a spawn could be attempted -- and the state they
+    /// leave behind has to be identical, because it is the same state: a
+    /// sheep that is not running, and whose watch, cron and memory
+    /// enforcement are not armed against a pid that does not exist.
+    fn respawn_failed(&mut self, id: u32, manually: bool) -> ProcessInfo {
+        // The deferred aggregation reply has no per-id error slot
+        // (locked model): a failed respawn simply lands the entry in
+        // Errored, same as a budget-exhausted crash loop.
+        let slot = self
+            .sheep
+            .get_mut(&id)
+            .expect("respawn: entry vanished mid-respawn");
+        slot.entry.status = ProcStatus::Errored;
+        slot.entry.pid = None;
+        slot.entry.started_at = None;
+        // Cleared, because nothing exited here: the spawn itself
+        // failed, so there is no exit to report. Leaving the
+        // previous process's code in place would show a sheep that
+        // once crashed with 1 as still crashing with 1 while it is
+        // in fact failing to start at all -- and telling those two
+        // apart is the whole reason this field exists.
+        slot.entry.last_exit = None;
+        slot.ctl = None;
+        // Already `None` on every route into a respawn: all three
+        // callers reach it only for an id whose `ctl` is clear, and
+        // the two are cleared in the same breath. Written anyway, so
+        // that "these two go together" is something a reader can see
+        // at each site rather than infer from the callers.
+        slot.to_child = None;
+        slot.signals = None;
+        slot.to_stdin = None;
+        slot.ready_tx = None;
+        let info = to_info(&slot.entry, &self.smits);
+        self.emit(ProcessEventKind::Errored, info.clone(), manually);
+        // The same terminal status `Decision::Errored` reaches, and it
+        // needs the same disarm: a respawn that fails to spawn (the
+        // binary replaced mid-deploy, `EAGAIN`, a cwd that is gone)
+        // would otherwise leave the name-group's cron worker and watch
+        // live, and the enforcer armed against a pid that no longer
+        // exists. Re-disarming an already-disarmed id is a no-op by
+        // construction, so this is safe from every caller.
+        self.disarm_extras(id, &info.name);
+        info
     }
 
     /// Offers `manual` the `manual` marker on a RUNNING sheep, starting its
@@ -3368,12 +3448,18 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         let current = u32::try_from(slots.len()).unwrap_or(u32::MAX);
-        let credentials = self
-            .sheep
-            .get(&slots[0].1)
-            .expect("handle_scale: id read off this map a moment ago")
-            .entry
-            .credentials;
+        // Off an instance that already exists, so in practice this is the
+        // identity that instance is running under and the resolve inside
+        // never happens. It is reached through the one seam anyway, because
+        // "already exists" is a claim about a live entry and a scale is not
+        // the place to bet the flock's identity on it.
+        let credentials = match self.credentials_for_spawn(slots[0].1) {
+            Ok(credentials) => credentials,
+            Err(err) => {
+                let _ = reply.send(Err(SupervisorError::SpawnFailed(err.to_string())));
+                return;
+            }
+        };
 
         // The spawn/remove pass runs FIRST and the config write-back second,
         // which is the opposite of the obvious order and is the whole of this
@@ -3758,11 +3844,16 @@ impl<R: ProcessRunner> Actor<R> {
     /// The mark is undone if the spawn fails, and nothing can observe it in
     /// between — the actor is synchronous here and emits no event.
     fn spawn_replacement(&mut self, old_id: u32) -> Result<u32, String> {
+        // `Credentials` is `Copy`; reused, never re-resolved. A drainee is
+        // by definition running, so the seam finds a resolved identity and
+        // touches nothing -- but a reload must not be the one path that
+        // would fall back to the shepherd if that ever stopped holding.
+        let credentials = self
+            .credentials_for_spawn(old_id)
+            .map_err(|err| err.to_string())?;
         let drainee = &self.sheep[&old_id].entry;
         let app = drainee.spec.clone();
         let instance = drainee.instance;
-        // `Credentials` is `Copy`; reused, never re-resolved.
-        let credentials = drainee.credentials;
         let restarts = drainee.restarts;
         // Carried across the swap for the same reason `restarts` is: the
         // replacement is the same instance continuing, not a new one, and
@@ -3807,7 +3898,7 @@ impl<R: ProcessRunner> Actor<R> {
                     started_at: Some(tokio::time::Instant::now()),
                     budget: RestartBudget::default(),
                     reload: ReloadState::Replacement,
-                    credentials,
+                    credentials: SpawnIdentity::Resolved(credentials),
                     out_file,
                     err_file,
                     dog,
@@ -5552,12 +5643,20 @@ impl<R: ProcessRunner> Actor<R> {
         let supervisor = SupervisorHandle {
             tx: self.tx.clone(),
         };
-        // `Credentials` is `Copy`, which is why this needs no clone.
+        // `Credentials` is `Copy`, which is why this needs no clone. This
+        // spec is assembled for `spec_prober` alone and is never spawned, so
+        // the unresolved arm costs nothing: extras are armed only for a
+        // process that is already running, which resolved its identity
+        // before it could start.
+        let credentials = match slot.entry.credentials {
+            SpawnIdentity::Resolved(creds) => creds,
+            SpawnIdentity::Unresolved => None,
+        };
         let spec = assemble(
             &slot.entry.spec,
             slot.entry.instance,
             &self.paths,
-            slot.entry.credentials,
+            credentials,
         );
         self.registry
             .arm(&slot.entry, spec_prober(&spec), extras, &supervisor);
@@ -9289,17 +9388,19 @@ mod tests {
         );
         assert_eq!(
             identity("b-mine"),
-            Some(Some(Credentials {
+            Some(SpawnIdentity::Resolved(Some(Credentials {
                 uid: own_uid.as_raw(),
                 gid: None
-            })),
+            }))),
             "the app that asked for a user must run as that user"
         );
         assert_eq!(
             identity("c-plain"),
-            Some(None),
+            Some(SpawnIdentity::Resolved(None)),
             "the app that asked for no user must be registered, and must run \
-             as the daemon rather than as somebody else's uid"
+             as the daemon rather than as somebody else's uid. `Resolved(None)` \
+             rather than a bare `None`: this app was ASKED, and answered \
+             nobody, which is not the same fact as never having been asked"
         );
     }
 
@@ -14052,6 +14153,161 @@ mod tests {
             stdin: false,
             credentials: None,
         }
+    }
+
+    // --- Identity: which user a spawn actually runs as ----------------
+    //
+    // `ProcessEntry::credentials` decides the uid a child comes up under,
+    // and nothing on the wire reports it: `ProcessInfo` carries no identity
+    // field, and `shep describe` shows an app running as the shepherd
+    // exactly as it shows one running as the user it asked for. So every
+    // case below asserts the identity a spawn CARRIED -- read off the
+    // `SpawnSpec` the runner was handed, through `ScriptedRunner::spawned_as`
+    // -- or the identity the entry stored. A case that asserted a row exists,
+    // or that a restart succeeded, would pass just as happily on the silent
+    // downgrade these exist to catch.
+
+    /// A bare actor holding nothing at all, for the cases that drive
+    /// registration and respawn directly.
+    ///
+    /// Direct because neither of the things they assert on is reachable from
+    /// outside: [`ProcessEntry::credentials`] is crate-internal by design,
+    /// and the identity a spawn carried lives on the `SpawnSpec` the runner
+    /// received rather than on any reply.
+    fn actor_with_an_empty_flock(
+        dir: &tempfile::TempDir,
+        scripts: Vec<ProcScript>,
+    ) -> Actor<ScriptedRunner> {
+        let (events, _events_rx) = broadcast::channel(64);
+        let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
+        Actor {
+            runner: ScriptedRunner::new(scripts),
+            paths: test_paths(dir),
+            events,
+            tx,
+            sheep: HashMap::new(),
+            next_id: 0,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+            smits: Smits::new(),
+        }
+    }
+
+    /// The name this test process is already running under.
+    ///
+    /// The only user a non-root test can ask for and get a real, permitted
+    /// passwd lookup out of: `privilege::resolve` refuses any request that
+    /// would CHANGE identity unless the daemon is root, and becoming
+    /// ourselves changes nothing.
+    #[cfg(unix)]
+    fn own_user_name() -> String {
+        nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .unwrap()
+            .expect("this process has a passwd entry")
+            .name
+    }
+
+    /// A user name no passwd database has an entry for, so `resolve` fails
+    /// the same way whether or not the test runs as root.
+    const NO_SUCH_USER: &str = "definitely-not-a-real-shep-user";
+
+    // fails if an app restored from the muster roll comes back running as
+    // the shepherd. `register_at_rest` records membership and never resolves
+    // anything, so the entry's identity is unresolved until its first spawn;
+    // a respawn that read that as "this app asked for nobody" would hand the
+    // child the daemon's own identity instead of the configured one, with no
+    // error anywhere.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_app_restarts_under_its_configured_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+        let app = app_with("web", |app| app.user = Some(own_user_name()));
+
+        let info = actor.register_at_rest(&app);
+        assert_eq!(
+            actor.sheep[&info.id].entry.credentials,
+            SpawnIdentity::Unresolved,
+            "a membership record is not a `Start`: nothing has looked this app's user up yet"
+        );
+
+        actor.respawn(info.id, true);
+
+        let wanted = Credentials {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: None,
+        };
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(wanted),
+            "the restarted child must carry the identity its `user` resolves to; `None` here is \
+             the child running as the shepherd, which is the downgrade"
+        );
+        assert_eq!(
+            actor.sheep[&info.id].entry.credentials,
+            SpawnIdentity::Resolved(Some(wanted)),
+            "resolved once at the first spawn and stored, so no later restart looks it up again"
+        );
+    }
+
+    // fails if a restored app whose `user` cannot be resolved is started as
+    // the shepherd instead of refused. A `Start` refuses this config
+    // outright; reaching a spawn through the roll must not be a way around
+    // that.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_app_whose_user_cannot_be_resolved_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut actor = actor_with_an_empty_flock(&dir, vec![ProcScript::never_exits()]);
+        let app = app_with("web", |app| app.user = Some(NO_SUCH_USER.to_string()));
+
+        let info = actor.register_at_rest(&app);
+        let after = actor.respawn(info.id, true);
+
+        assert_eq!(
+            actor.runner.spawn_count(),
+            0,
+            "nothing may be spawned for an app whose identity could not be resolved"
+        );
+        assert_eq!(after.status, ProcStatus::Errored);
+        assert_eq!(
+            actor.sheep[&info.id].entry.credentials,
+            SpawnIdentity::Unresolved,
+            "a failed resolution settles nothing: the next restart must ask again"
+        );
+    }
+
+    // fails if a restart re-resolves an identity the entry already holds.
+    // The pinned uid below is one no lookup of this app's `user` could
+    // produce, so a respawn that touched the passwd database again would
+    // come back with this machine's own uid and be seen doing it.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_reuses_a_resolved_identity_rather_than_looking_it_up_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _rx) = actor_with_one_online_sheep(&dir, vec![ProcScript::never_exits()]);
+        let pinned = Credentials {
+            uid: 4242,
+            gid: Some(4243),
+        };
+        let entry = &mut actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registers id 0")
+            .entry;
+        entry.spec = app_with("web", |app| app.user = Some(own_user_name()));
+        entry.credentials = SpawnIdentity::Resolved(Some(pinned));
+
+        actor.respawn(0, true);
+
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(pinned),
+            "a running app's identity must survive its restart untouched"
+        );
     }
 
     // ---------------------------------------------------------------

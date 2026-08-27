@@ -41,6 +41,48 @@ pub struct Credentials {
     pub gid: Option<u32>,
 }
 
+/// What identity an entry's next spawn will run under, and whether that
+/// question has been asked yet.
+///
+/// "This app asked for nobody in particular, so the child runs as the
+/// shepherd" and "nobody has looked this app's `user` up yet" are different
+/// facts, and a spawn that confuses them starts the child as the shepherd
+/// when the app asked for someone else. A plain `Option<Credentials>` on
+/// `ProcessEntry` spelled both `None`, so the confusion was not something a
+/// caller could be careful about. (`ProcessEntry` is crate-internal, hence
+/// code font rather than a link.)
+///
+/// This type is what [`assemble`](crate::assemble::assemble) does NOT take:
+/// the assembler still wants a settled `Option<Credentials>`, so reaching one
+/// from a stored identity means saying out loud which of the two cases is in
+/// hand.
+///
+/// `Debug` is derived, like [`Credentials`]' own: a uid and a gid are
+/// ordinary numbers an operator can read out of `id`, not secrets, and the
+/// daemon's own logs are more useful for naming which one a refused spawn
+/// wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnIdentity {
+    /// `resolve` has never run for this entry (code font, not a link: the
+    /// function is crate-internal while this type is not).
+    ///
+    /// Two entries reach this: one registered at rest from the muster roll,
+    /// which is a membership record rather than a `Start`, and one
+    /// registered `Errored` BECAUSE its resolution failed. Both must resolve
+    /// before they can spawn, and neither may fall back to the shepherd's
+    /// own identity.
+    Unresolved,
+    /// `resolve` has run, and this is what it said: `Some` when the app
+    /// named a `user` or a `group`, `None` when it named neither and the
+    /// child correctly runs as the shepherd.
+    ///
+    /// Settled for the life of the entry. A restart reuses this value rather
+    /// than looking the name up a second time, so a running app's identity
+    /// can never change underneath it and no restart re-touches the passwd
+    /// database.
+    Resolved(Option<Credentials>),
+}
+
 /// Error resolving an app's `user`/`group` config to numeric ids
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrivilegeError {

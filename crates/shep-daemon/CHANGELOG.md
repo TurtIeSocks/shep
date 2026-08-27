@@ -127,6 +127,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inconsistency this change exists to end, one layer down. It now calls
   `sort_flock`, so the two cannot drift.
 
+- A sheep restored from the muster roll comes back under its configured
+  `user`/`group` rather than under the shepherd. `register_at_rest` records
+  membership without resolving anything, and `ProcessEntry::credentials`
+  spelled "nobody has looked this app up yet" and "this app asked for nobody"
+  the same way, as `None`. A later `shep restart` read the second meaning and
+  started the child as the daemon: no error, no warning, and nothing in `shep
+  describe` to see it by. The field is now a `SpawnIdentity`, which tells the
+  two apart, and every spawn path reaches a usable `Option<Credentials>`
+  through one seam that resolves an unresolved entry instead of falling back.
+  An app that resolved once is still settled for good, so a restart neither
+  re-reads the passwd database nor changes a running app's identity underneath
+  it.
+
 ### Additions
 
 - Add `SupervisorError::CannotStart`, a `Start` batch refused before anything
@@ -160,6 +173,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule `Start` follows plus one of its own: an unnormalized config would
   report every default it did not spell out as a difference from the
   normalized copy the flock stores.
+
+- `privilege::SpawnIdentity` — the type behind the fix above.
+- `fake::ScriptedRunner::spawned_as` and `spawn_count`, behind `test-fakes`.
+  The fake becomes nobody, so recording the credentials a spawn was asked for
+  is the only way a test can assert the identity it carried rather than merely
+  that it happened.
 
 ## [0.1.0] - 2026-08-26
 
