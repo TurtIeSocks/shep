@@ -350,10 +350,15 @@ impl core::error::Error for AdoptRefusal {}
 /// shebang naming an absent interpreter, on a binary needing a missing
 /// dynamic library.
 ///
+/// `home` and `name` are the ones this invocation resolved, not the ambient
+/// ones — the probe is handed exactly the environment the adopted dog will
+/// run under, so it is vetted against the daemon the operator named and
+/// under the section key `adopt` is about to record.
+///
 /// # Errors
 /// The refusal, which the caller renders. Nothing here is a shep fault, so
 /// none of these is an [`ExitCode::Internal`].
-pub fn vet_binary(path: &Path, home: &Path) -> Result<VettedBinary, AdoptRefusal> {
+pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, AdoptRefusal> {
     let metadata = std::fs::metadata(path).map_err(|_| AdoptRefusal::Missing)?;
     if !metadata.is_file() {
         return Err(AdoptRefusal::NotAFile);
@@ -400,12 +405,25 @@ pub fn vet_binary(path: &Path, home: &Path) -> Result<VettedBinary, AdoptRefusal
     // refused despite working perfectly once adopted. Vetting has to model
     // the real thing, not an idealised one.
     //
+    // `SHEP_DOG_NAME` rides along for the same reason, and it is `name`
+    // rather than the binary's file stem because the operator's `--name` is
+    // what `adopt` is about to record. One rule with no exception at this
+    // seam: every way shep runs a dog -- supervised, `shep <name>`, and this
+    // probe -- hands it the same two variables, so a dog is never vetted
+    // under a contract it will not meet again.
+    //
+    // Not directly asserted by a test, unlike the other two paths, and that
+    // is a property of the probe rather than an oversight: this child is
+    // killed on sight (immediately, on every kernel but macOS), so anything
+    // it writes to prove what it received is a race with its own teardown.
+    //
     // Stdio goes to null. A candidate that writes on its way up would
     // otherwise scribble over the operator's terminal mid-vet, and a hostile
     // one could imitate shep's own output at the exact moment somebody is
     // deciding whether to trust it.
     match Command::new(&canonical)
         .env("SHEP_HOME", home)
+        .env("SHEP_DOG_NAME", name)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -620,7 +638,7 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
     if collides_with_a_verb(&name) {
         return fail_adopt_name_collision(streams, &name);
     }
-    let vetted = match vet_binary(&candidate, &paths.home) {
+    let vetted = match vet_binary(&candidate, &paths.home, &name) {
         Ok(vetted) => vetted,
         Err(refusal) => return fail_adopt(streams, &candidate, &refusal),
     };
@@ -1186,18 +1204,18 @@ mod tests {
     fn a_binary_shep_has_never_seen_is_vetted_before_anything_is_written() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            vet_binary(&dir.path().join("nope"), dir.path()),
+            vet_binary(&dir.path().join("nope"), dir.path(), "probe"),
             Err(AdoptRefusal::Missing)
         );
         assert_eq!(
-            vet_binary(dir.path(), dir.path()),
+            vet_binary(dir.path(), dir.path(), "probe"),
             Err(AdoptRefusal::NotAFile)
         );
 
         let plain = dir.path().join("plain");
         std::fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
         assert_eq!(
-            vet_binary(&plain, dir.path()),
+            vet_binary(&plain, dir.path(), "probe"),
             Err(AdoptRefusal::NotExecutable)
         );
 
@@ -1205,7 +1223,7 @@ mod tests {
         // mode bit, so a `vet_binary` that refused for some other reason
         // fails here rather than passing for the wrong one.
         chmod(&plain, 0o755);
-        let vetted = vet_binary(&plain, dir.path()).unwrap();
+        let vetted = vet_binary(&plain, dir.path(), "probe").unwrap();
         assert_eq!(vetted.path, plain.canonicalize().unwrap());
         assert!(
             vetted.group_writable.is_empty(),
@@ -1217,7 +1235,7 @@ mod tests {
         std::fs::write(&bogus, b"\x7fELF\x00\x00\x00 not really").unwrap();
         chmod(&bogus, 0o755);
         assert!(matches!(
-            vet_binary(&bogus, dir.path()),
+            vet_binary(&bogus, dir.path(), "probe"),
             Err(AdoptRefusal::WillNotExec { .. })
         ));
     }
@@ -1238,7 +1256,7 @@ mod tests {
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
         chmod(&bin, 0o757);
         assert_eq!(
-            vet_binary(&bin, dir.path()),
+            vet_binary(&bin, dir.path(), "probe"),
             Err(AdoptRefusal::WorldWritable {
                 path: bin.canonicalize().unwrap(),
             }),
@@ -1249,7 +1267,7 @@ mod tests {
         chmod(&bin, 0o755);
         chmod(dir.path(), 0o777);
         assert_eq!(
-            vet_binary(&bin, dir.path()),
+            vet_binary(&bin, dir.path(), "probe"),
             Err(AdoptRefusal::WorldWritable {
                 path: bin.canonicalize().unwrap().parent().unwrap().to_path_buf(),
             }),
@@ -1275,7 +1293,7 @@ mod tests {
         chmod(&bin, 0o775);
         chmod(&deploy, 0o775);
 
-        let vetted = vet_binary(&bin, dir.path()).unwrap();
+        let vetted = vet_binary(&bin, dir.path(), "otel").unwrap();
         assert_eq!(
             vetted.group_writable,
             vec![bin.canonicalize().unwrap(), deploy.canonicalize().unwrap()],

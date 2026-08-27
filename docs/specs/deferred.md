@@ -682,9 +682,25 @@ Deferred rather than picked, because the live hole is closed and the right
 answer depends on whether shep expects more error text to come off the wire.
 `shep install`, if it is ever built, would be exactly that.
 
-### A dog cannot learn the name it was adopted under, and getting it wrong is silent
+### A dog cannot learn the name it was adopted under, and getting it wrong is silent -- FIXED, 2026-08-27
 
-Found 2026-08-20 while building `shep-log-rotate`, the first fully external dog.
+**Fixed by option 1 below**, the environment variable: every way shep runs a
+dog now sets `SHEP_DOG_NAME` to the name it was registered under, beside the
+`SHEP_HOME` it already set. Three seams, so a dog is never run under a
+contract it will not meet again: `shep_daemon::dogs::dog_app` (supervised),
+`run_adopted_dog` (`shep <name>`), and `vet_binary`'s exec probe during
+`adopt` itself. The last of the three carries no test of its own, and its
+comment says why rather than leaving the gap to be found: the probe child is
+killed on sight, immediately on every kernel but macOS, so anything it wrote
+to prove what it received would race its own teardown.
+
+Options 2 and 3 were not taken and did not need to be. Option 2 (letting
+`DogConfig` tell an absent section from an unadopted name) is a wire change,
+and handing the dog the key removes the guess that made the ambiguity
+reachable. Option 3 (documenting the pid trick) is in `docs/dogs.md`
+anyway, now as the fallback for an older shep rather than as the answer.
+
+The original entry follows.
 
 An adopted dog is spawned with **no argv at all** and **one** environment
 entry. `dogs.rs`'s `dog_app` maps `DogSource::Adopted { path }` to

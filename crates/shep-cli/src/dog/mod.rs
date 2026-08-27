@@ -48,8 +48,10 @@ const BUILT_IN_DOGS: [&str; 2] = ["metrics", "bark"];
 /// A dog's connection to the shepherd, and its own configuration.
 ///
 /// The whole of the dog contract from the dog's side: locate the socket
-/// from `$SHEP_HOME` (the one variable a dog inherits), connect, handshake,
-/// ask for `[dog.<name>]`, parse it. A dog has no useful work before this
+/// from `$SHEP_HOME` (one of the two variables a dog inherits, the other
+/// being `$SHEP_DOG_NAME` — which a built-in dog does not need, since its
+/// own `dog <name>` argv already names it), connect, handshake, ask for
+/// `[dog.<name>]`, parse it. A dog has no useful work before this
 /// exists — metrics polls the shepherd, bark subscribes to it — so nothing
 /// here is deferred or made optional.
 pub struct DogRuntime {

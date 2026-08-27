@@ -16,11 +16,11 @@
 //!
 //! **Where the configuration comes from** is [`dog_section`], reached over
 //! the socket as `Request::DogConfig`. A dog inherits `$SHEP_HOME` and
-//! nothing else it did not already need in order to exec: it connects to the
-//! socket that names, handshakes, and asks for its own `[dog.<name>]`
-//! section. The reply is opaque text the dog parses, so a third-party dog is
-//! bound to the shape of its own section and not to shep's config model,
-//! file discovery, or layering rules.
+//! `$SHEP_DOG_NAME` and nothing else it did not already need in order to
+//! exec: it connects to the socket the first names, handshakes, and asks for
+//! the `[dog.<name>]` section the second names. The reply is opaque text the
+//! dog parses, so a third-party dog is bound to the shape of its own section
+//! and not to shep's config model, file discovery, or layering rules.
 //!
 //! ## Why the section travels over the socket
 //!
@@ -118,12 +118,15 @@ impl core::error::Error for DogError {
 ///
 /// A built-in dog is `<this binary> dog <name>`; an adopted one is the
 /// operator's binary with no arguments. Either way the child's environment
-/// carries exactly one thing it did not already need in order to exec:
-/// `SHEP_HOME`, which is how every client locates the socket. No
-/// `[dog.<name>]` value is ever placed here — a dog asks for its section
-/// over the socket (`Request::DogConfig`), because the environment is
-/// readable from the process table, inherited by every child, and captured
-/// into crash dumps.
+/// carries exactly two things it did not already need in order to exec:
+/// `SHEP_HOME`, which is how every client locates the socket, and
+/// `SHEP_DOG_NAME`, which is the name this dog was registered under and so
+/// the `name` its `Request::DogConfig` has to carry. No `[dog.<name>]`
+/// value is ever placed here — a dog asks for its section over the socket,
+/// because the environment is readable from the process table, inherited by
+/// every child, and captured into crash dumps. The section's KEY is not one
+/// of its values, and a dog that cannot learn it cannot ask for the section
+/// at all.
 ///
 /// `autorestart` and the restart budget are left at their defaults: a dog
 /// is supervised exactly as a sheep is.
@@ -155,6 +158,28 @@ pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogErro
     config
         .env
         .insert("SHEP_HOME".to_string(), paths.home.display().to_string());
+    // The name the operator registered this dog under — the `[dog.<name>]`
+    // key its own section lives beneath, and so the `name` it has to put in
+    // `Request::DogConfig`. A built-in dog reads it out of its argv; an
+    // adopted one has no argv at all and used to have no way to learn it,
+    // so a third-party dog had to hardcode a name and hope the operator
+    // typed the same one. A mismatch is silent on both sides — `dog_section`
+    // answers a name nobody adopted with the same empty string a registered
+    // dog with no section gets — so the whole of an operator's
+    // configuration could be discarded and everything still looked healthy.
+    //
+    // An environment entry rather than an argv, deliberately: the argv
+    // decision above still holds (an argv shep invents is one more thing a
+    // foreign binary has to agree with before it can start), and a dog that
+    // ignores a variable it does not recognize starts exactly as it did.
+    //
+    // Safe to place here for the same reason `SHEP_HOME` is, and for no
+    // other: a name is not a secret. The rule this does not break is that
+    // no `[dog.<name>]` VALUE travels in the environment — that is the key,
+    // not the section.
+    config
+        .env
+        .insert("SHEP_DOG_NAME".to_string(), spec.name.clone());
     normalize(config).map_err(|err| DogError::Config(err.to_string()))
 }
 
@@ -336,8 +361,14 @@ mod tests {
     /// spawns, and captured into crash dumps. The assertion is over the
     /// ASSEMBLED spec, not the config, because `assemble` is where an env
     /// map would actually be merged.
+    ///
+    /// Also fails if the section's KEY stops travelling there, which is the
+    /// opposite rule and not a contradiction of it: `SHEP_DOG_NAME` is what
+    /// a dog puts in `Request::DogConfig` to ask for the section in the
+    /// first place, so withholding it withholds the configuration rather
+    /// than protecting it.
     #[test]
-    fn a_dogs_child_environment_carries_shep_home_and_no_configuration() {
+    fn a_dogs_child_environment_carries_shep_home_and_its_name_and_no_configuration() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::write(
@@ -354,6 +385,11 @@ mod tests {
         assert_eq!(
             assembled.env.get("SHEP_HOME"),
             Some(&paths.home.display().to_string())
+        );
+        assert_eq!(
+            assembled.env.get("SHEP_DOG_NAME"),
+            Some(&"bark".to_string()),
+            "a dog is told the name its own section lives under"
         );
         assert!(
             !assembled
@@ -404,6 +440,43 @@ mod tests {
             adopted.config().name,
             "otel",
             "the NAME is the config key, never the filename"
+        );
+    }
+
+    /// fails if an ADOPTED dog is left to guess the name it was registered
+    /// under. A built-in dog can read its own argv (`dog <name>`, asserted
+    /// above); an adopted one is given no argv at all, on purpose, so the
+    /// environment is the only channel it has. Without this it has to
+    /// hardcode a name and hope the operator typed the same one — and a
+    /// mismatch is answered with the same empty section a dog with no
+    /// configuration gets, so it looks exactly like working.
+    ///
+    /// Asserted on the name the operator chose, not on the binary's file
+    /// stem: `shep adopt ./shep-otel --name telemetry` registers
+    /// `telemetry`, and the filename is not the key.
+    #[test]
+    fn an_adopted_dog_is_told_the_name_it_was_registered_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+
+        let adopted = dog_app(
+            &DogSpec {
+                name: "telemetry".to_string(),
+                source: DogSource::Adopted {
+                    path: "/usr/local/bin/shep-otel".to_string(),
+                },
+            },
+            &paths,
+        )
+        .unwrap();
+
+        assert!(
+            adopted.config().args.is_empty(),
+            "the name arrives without shep inventing an argv for a foreign binary"
+        );
+        assert_eq!(
+            adopted.config().env.get("SHEP_DOG_NAME"),
+            Some(&"telemetry".to_string())
         );
     }
 

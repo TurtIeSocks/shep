@@ -324,7 +324,7 @@ fn dispatch_adopted_dog(argv: &[OsString], err: &clap::Error) -> Option<std::pro
         .ok()
         .flatten()?;
     let dog_argv = argv[index + 1..].to_vec();
-    Some(run_adopted_dog(&path, &paths.home, &dog_argv))
+    Some(run_adopted_dog(&path, &paths.home, name, &dog_argv))
 }
 
 /// Scans `prefix` — the argv tokens before the one clap could not place —
@@ -359,14 +359,22 @@ fn home_before(prefix: &[OsString]) -> Option<PathBuf> {
 }
 
 /// Runs `path` — an adopted dog's binary — the way an operator invoking it
-/// by name expects: `extra_args` passed through exactly as typed,
-/// `$SHEP_HOME` the one environment variable it needs to find the
-/// shepherd, stdio inherited so an interactive dog behaves like any other
-/// program run directly from a shell.
+/// by name expects: `extra_args` passed through exactly as typed, the two
+/// environment variables every dog is promised (`$SHEP_HOME` to find the
+/// shepherd, `$SHEP_DOG_NAME` to name its own `[dog.<name>]` section),
+/// stdio inherited so an interactive dog behaves like any other program run
+/// directly from a shell.
+///
+/// `name` is the token the operator typed, which is what
+/// [`dispatch_adopted_dog`] resolved `path` from, so a dog run this way and
+/// the same dog run by the shepherd agree about what they are called. They
+/// have to: a dog invoked here to print or check its own configuration
+/// would otherwise be reading a different section than the one it runs
+/// under.
 ///
 /// **A second invocation mode, deliberately distinct from the supervised
-/// one.** A dog the shepherd starts gets no argv and this same one env
-/// entry (`shep_daemon::dogs::dog_app`'s own doc — that contract is
+/// one.** A dog the shepherd starts gets no argv and these same two env
+/// entries (`shep_daemon::dogs::dog_app`'s own doc — that contract is
 /// unchanged by this function existing); a dog an operator names on the
 /// command line gets whatever they typed after it, because passing
 /// arguments through is the entire reason to invoke it this way instead
@@ -376,10 +384,16 @@ fn home_before(prefix: &[OsString]) -> Option<PathBuf> {
 /// own code, or `128 + signal` if it died by one — the same reading
 /// `commands::reap::classify` gives a reaped supervisor.
 #[cfg(unix)]
-fn run_adopted_dog(path: &Path, home: &Path, extra_args: &[OsString]) -> std::process::ExitCode {
+fn run_adopted_dog(
+    path: &Path,
+    home: &Path,
+    name: &str,
+    extra_args: &[OsString],
+) -> std::process::ExitCode {
     let status = std::process::Command::new(path)
         .args(extra_args)
         .env("SHEP_HOME", home)
+        .env("SHEP_DOG_NAME", name)
         .status();
     match status {
         Ok(status) => std::process::ExitCode::from(dog_exit_code(status)),
@@ -819,7 +833,8 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
 ///
 /// `Dog` DOES go through this shared gate, unlike `Completions`/`Daemon`: a
 /// dog resolves `$SHEP_HOME` exactly the way every ordinary verb does (the
-/// daemon sets it as the one environment variable a dog's child inherits).
+/// daemon sets it, alongside `SHEP_DOG_NAME`, as the two environment
+/// variables a dog's child inherits).
 /// It is still dispatched immediately after, ahead of the locked-streams
 /// block below, for the unrelated reason that block's own comment gives —
 /// it runs until signalled, so it may not hold a stdout/stderr guard for a
@@ -1864,6 +1879,56 @@ mod tests {
         assert!(
             dispatch_adopted_dog(&argv, &err).is_some(),
             "an adopted dog must dispatch instead of falling through to clap's own error"
+        );
+    }
+
+    /// fails if `shep <name>` runs a dog under a different contract than the
+    /// shepherd does. Both channels promise the same two variables
+    /// (`shep_daemon::dogs::dog_app`), and this is the half an operator
+    /// drives by hand -- a dog invoked here to print or check its own
+    /// configuration would otherwise read a different `[dog.<name>]` section
+    /// than the one it runs under, which is the whole failure
+    /// `SHEP_DOG_NAME` exists to end.
+    ///
+    /// The name asserted is the token the operator typed, never the script's
+    /// file stem: `mydog.sh` is adopted here as `telemetry`, and the key is
+    /// the name.
+    ///
+    /// No race to wait out: `run_adopted_dog` uses `Command::status`, which
+    /// does not return until the child has exited, so the file it writes is
+    /// complete by the time this reads it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dog_run_by_name_is_given_the_same_home_and_name_the_shepherd_gives_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".shep");
+        std::fs::create_dir_all(&home).unwrap();
+        let seen = dir.path().join("seen");
+        let script = dir.path().join("mydog.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$SHEP_HOME\" \"$SHEP_DOG_NAME\" \"$1\" > {}\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        let mut mode = std::fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&script, mode).unwrap();
+
+        run_adopted_dog(&script, &home, "telemetry", &[OsString::from("koji")]);
+
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            vec![
+                home.display().to_string().as_str(),
+                "telemetry",
+                // Still passed through untouched: the name arrives beside
+                // the operator's arguments, never in place of them.
+                "koji",
+            ]
         );
     }
 
