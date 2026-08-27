@@ -883,13 +883,13 @@ impl SupervisorHandle {
     /// Attaches `smit` to the sheep called `sheep`, scoped to `conn`, or
     /// clears this connection's own mark with `None`.
     ///
-    /// `smit` arrives as a `String` rather than a
-    /// [`Smit`](shep_core::protocol::Smit) because the type has already done
-    /// its job by the time this is called: it validated at the wire's edge,
-    /// which is where a third party's text has to be refused. The newtype
-    /// rides the whole way down anyway, so the compiler and not a comment is
-    /// what stops a later caller inside this crate from handing over a string
-    /// nothing checked. It becomes a `String` only at the map insert.
+    /// `smit` arrives as a [`Smit`](shep_core::protocol::Smit) and stays one
+    /// the whole way down. The type did its real work at the wire's edge,
+    /// which is where a third party's text has to be refused, but carrying
+    /// it further costs nothing and means the compiler rather than a comment
+    /// is what stops a later caller inside this crate from handing over a
+    /// string nothing checked. It becomes a `String` only at the map insert,
+    /// where `Smits` stores the rendered text against the name.
     ///
     /// A clear from a connection that did not paint the mark is a no-op that
     /// still answers `Ok` — see [`Command::SetSmit`] for why one dog may
