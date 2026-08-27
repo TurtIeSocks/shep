@@ -1915,7 +1915,9 @@ Three independent things agree with that and disagree with the comments:
 
 What is wrong is only the wording. `rows.rs:137-157` and the test comment at `rows.rs:2866-2871` both introduce a list sorted by ascending priority as "in that dropping order" / "in the order they are given up". It is the reverse: ascending priority is the order they **survive** in, longest-lasting first. The neighbouring sentence at `:2869-2871` ("the ones answering 'is it healthy' outlast the ones answering 'which one is it'") describes the true behaviour correctly, which is presumably how this survived. Fix both wordings in this task; do not change a single number.
 
-**So SMIT gets priority 8 and drops first of all.** "Among the first columns to yield" is Rin's phrase, and 8 is the literal reading of it. Two supporting arguments worth putting in the code comment: it is by far the widest column, so dropping it recovers the most; and it is the only column whose content is recoverable by asking somebody else (`shep deploy survey`), where nothing but a wider terminal brings FOLD back.
+**So SMIT gets priority 8 and drops first of all.** "Among the first columns to yield" is Rin's phrase, and 8 is the literal reading of it. The supporting argument worth putting in the code comment: it is by far the widest column, so dropping it buys back the most room for one column lost.
+
+**Corrected after review.** An earlier draft of this task offered a second argument, that SMIT is the only column whose content another command can recover by asking the deploy dog, where nothing but a wider terminal brings FOLD back. That is false, and `output.astro` disproves it on the same screen: `--format json` carries every field at any width, so every column is recoverable that way and none is special. The priority is unaffected; only the decorative reason goes. Do not reintroduce it.
 
 **And it goes last in the header order**, after FOLD. The alternative worth naming: next to NAME would read better, since a smit is about which sheep this is. Against it: mid-table insertion moves every existing snapshot's layout more than the end does, and a column that is first to drop reads oddly in the middle of ones that outlast it. Ordered last, position and priority agree.
 
@@ -1968,9 +1970,9 @@ In `crates/shep-cli/src/output/table.rs`'s `mod tests`, beside the existing snap
         insta::assert_snapshot!(rendered);
     }
 
-    /// fails if a smit stops yielding first on a narrow terminal. It is the
-    /// widest column and the only one whose content another command can
-    /// recover, which is what makes it the right thing to give up first.
+    /// fails if a smit stops yielding first on a narrow terminal. It is by
+    /// far the widest column, so giving it up buys back the most room for
+    /// one column lost.
     #[test]
     fn a_smit_is_the_first_column_dropped_when_the_window_narrows() {
         let rendered = table_of(&mixed_flock_with_smits(), full_at(FULL_WIDTH - 1));
@@ -2088,10 +2090,8 @@ are pinned. One test would not have been enough -- a full-width test alone
 passes just as happily with the priority set to 1, and the narrow test is
 what fails.
 
-Two supporting reasons it yields first, both in the code comment: it is by
-far the widest column, so dropping it recovers the most, and it is the only
-column whose content another command can recover. Nothing but a wider
-terminal brings FOLD back.
+One supporting reason it yields first, in the code comment: it is by far the
+widest column, so dropping it buys back the most room for one column lost.
 
 Also corrects two comments that stated the drop order backwards. The
 renderer gives up the HIGHEST priority number first, so the real order is

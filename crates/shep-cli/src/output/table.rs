@@ -1031,9 +1031,9 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
-    /// fails if a smit stops yielding first on a narrow terminal. It is the
-    /// widest column and the only one whose content another command can
-    /// recover, which is what makes it the right thing to give up first.
+    /// fails if a smit stops yielding first on a narrow terminal. It is by
+    /// far the widest column, so giving it up buys back the most room for
+    /// one column lost.
     #[test]
     fn a_smit_is_the_first_column_dropped_when_the_window_narrows() {
         let rendered = table_of(&mixed_flock_with_smits(), full_at(FULL_WIDTH - 1));
