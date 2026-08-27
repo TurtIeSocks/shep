@@ -214,7 +214,7 @@ pub trait Render: Serialize {
     /// written that way first, and the mutation that deleted it killed no
     /// test: every table in the crate that can actually render a `-` already
     /// overrides this and reaches the rule through [`rows::Paint::Default`],
-    /// and the five that do not override it cannot produce a dash at all. A
+    /// and the seven that do not override it cannot produce a dash at all. A
     /// default nothing reaches is a path that rots unwatched, so the rule
     /// lives in `paint` alone, where it is exercised.
     ///

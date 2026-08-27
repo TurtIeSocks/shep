@@ -33,13 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two, `startup`'s, `barks` and `kill`, plus `import`'s `REUSE_PORT`. Seven
   stay plain on purpose, each with the reason recorded on its impl.
 
-### Fixes
-
-- Cell colour is keyed on a column's NAME rather than its index. The old
-  `rows_for` painted `row[0]`, `row[4]`, `row[9]` and `row[10]`, which are
-  facts about one table's column order: reordering columns repointed every one
-  of them with nothing failing to compile and no test able to notice.
-
 - Colour reaches the seven `Render` impls that are not the flock table.
   `colour_cell` had only ever appeared inside `FlockRows`, so one of eight
   tables was coloured and the same dog read one way under `shep dogs` and
@@ -68,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meant.
 
 ### Fixes
+
+- Cell colour is keyed on a column's NAME rather than its index. The old
+  `rows_for` painted `row[0]`, `row[4]`, `row[9]` and `row[10]`, which are
+  facts about one table's column order: reordering columns repointed every one
+  of them with nothing failing to compile and no test able to notice.
 
 - Say so when a Flockfile app names a sheep the flock already has under a
   different config, instead of ignoring the edit in silence. `shep start` on
