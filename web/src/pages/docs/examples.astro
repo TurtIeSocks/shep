@@ -293,13 +293,21 @@ py = "python3"`}</CodeBlock>
       <code>instances = 4</code>. Each instance gets its own
       <code>SHEP_INSTANCE</code> env var (0 through 3), and the script adds
       that to its base port — four separate listeners on 19091 through
-      19094, not one port shared four ways. pm2's cluster mode puts all N
-      instances behind one port using <code>SO_REUSEPORT</code>; shep's
-      <code>reuse_port</code> field exists in the schema for exactly that
-      but is refused at load while nothing implements the mechanism yet
-      (verified: setting <code>reuse_port = true</code> anywhere in this
-      file fails the whole file to load, not just that one app) — which is
-      why this example offsets the port instead of sharing it.
+      19094, not one port shared four ways. That is a genuinely different
+      shape from pm2's own cluster mode, which does not use
+      <code>SO_REUSEPORT</code> at all: pm2 runs Node's built-in
+      <code>cluster</code> module, where a single primary process holds the
+      one listening socket and hands each accepted connection to a worker
+      round robin. shep's own <code>reuse_port</code> field is the more
+      interesting half of this contrast, because it is real: a reload
+      overlaps the old and new instance on the same port today, and
+      <code>reuse_port</code> is what a Flockfile will assert an app is
+      doing for itself once shep grows a reload mode that stops overlapping
+      by default. It is accepted by the schema and refused at load while
+      nothing implements it yet (verified: setting <code>reuse_port =
+      true</code> anywhere in this file fails the whole file to load, not
+      just that one app) — which is why this example offsets the port
+      instead of sharing it.
     </p>
 
     <h3>A venv's own python</h3>
