@@ -35,6 +35,7 @@ Free on crates.io (verified 2026-08-07): `shep`, `shepd`, plus reserves `bleat`,
 | send a signal to one process | signal | **signal** — stays plain, deliberately: `shep signal web SIGKILL` is a loaded gun, and rule 2 below keeps destructive/precise operations free of whimsy, the same reason `kill` stayed `kill` | `shep signal <selector> <signal>` |
 | write to a process's stdin | sendline | **whisper** — completes the pair `bleats` already started: bleats is what the sheep says to you, whisper is what you say to the sheep, down a channel nobody else hears; `shep sendline` stays as an alias | `shep whisper <selector> <line>` |
 | ad-hoc key/value store | kv store | **set** / **get** / **unset** — plain names, not themed | `shep set`, `shep get`, `shep unset` |
+| a marker a dog attaches to a sheep | deploy tag | **smit** (a farmer's paint mark on a sheep) | `ProcessInfo.smit`, the SMIT column in `shep flock`/lookout; shep stores and paints the string verbatim and never parses it |
 
 ## Usage rules (readability > theme)
 

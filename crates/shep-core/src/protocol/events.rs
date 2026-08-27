@@ -206,6 +206,10 @@ mod tests {
                         code: Some(1),
                         signal: None,
                     }),
+                    // A non-ASCII marker on purpose: this snapshot is what
+                    // pins the encoding a subscriber reads, and a smit is
+                    // the one field on this row a third party writes.
+                    smit: Some("\u{25b2} main@a1b2c3".to_string()),
                 },
                 manually: false,
                 at_ms: 1_700_000_000_000,
@@ -341,6 +345,7 @@ mod tests {
                     dog: None,
                     lambs: None,
                     last_exit: None,
+                    smit: None,
                 },
                 manually: true,
                 at_ms: 0,

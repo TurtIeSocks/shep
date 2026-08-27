@@ -52,7 +52,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       "memory_bytes": 1212416,
       "dog": null,
       "lambs": null,
-      "last_exit": null
+      "last_exit": null,
+      "smit": null
     },
     {
       "id": 1,
@@ -68,7 +69,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       "memory_bytes": 1212416,
       "dog": null,
       "lambs": null,
-      "last_exit": null
+      "last_exit": null,
+      "smit": null
     }
   ]
 }`}</CodeBlock>
@@ -148,6 +150,12 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
         a few hundred milliseconds old, most often. Table format prints the
         same case as <code>-</code>, for the same reason: a confident zero
         would be a claim shep can't back up.
+      </li>
+      <li>
+        <code>smit</code> is <code>null</code> until a dog attaches one over
+        the client protocol's <code>SetSmit</code> request. shep stores and
+        reports the string verbatim, and never parses it — see
+        <a href="/docs/terminology">terminology</a>.
       </li>
     </ul>
 

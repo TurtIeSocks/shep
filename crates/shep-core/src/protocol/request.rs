@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::AppConfig;
 use crate::status::ProcStatus;
@@ -46,6 +46,159 @@ pub enum SelectorSpec {
     /// By fold name
     Fold(String),
 }
+
+/// A short marker a dog attaches to a sheep for `shep flock` to paint.
+///
+/// shep stores one and prints it. It does not parse it, has no opinion about
+/// what it means, and never will: `▲ main@a1b2c3` is a deploy tool's
+/// sentence, not shep's, and keeping it that way is what makes this a general
+/// mechanism rather than one feature's field.
+///
+/// # The rule
+///
+/// A smit is non-empty once whitespace is discounted, at most
+/// [`Self::MAX_CHARS`] characters, and carries no [`char::is_control`]
+/// character — `\u{1b}` included, which `is_control` already covers and which
+/// is named separately in this doc anyway, because it is the one an attacker
+/// reaches for and a reader should not have to know the classification to see
+/// that it is handled.
+///
+/// Refused, never repaired. The text is stored exactly as it arrived: shep
+/// does not trim it, strip from it, or otherwise hand back something the
+/// publisher did not send. `crate::kv`'s key grammar and value cap set the
+/// same precedent for the same kind of value, and the publisher here is a
+/// program, so a refusal it can see and fix beats mangling it cannot.
+///
+/// # Why the cap counts characters
+///
+/// [`Self::MAX_CHARS`] is a count of `char`s, not of bytes and not of display
+/// columns. Bytes would refuse a legitimate CJK smit at roughly a third of
+/// its apparent length. Display columns are what a table renderer measures,
+/// but they depend on the terminal and on a width table this parser has no
+/// business carrying. Characters are the honest thing a validator can promise
+/// cheaply. 48 is measured against the reference smit `▲ main@a1b2c3` at
+/// thirteen: room for a long branch name, without letting one column swallow
+/// the table.
+///
+/// # Why validation lives here rather than at the renderer
+///
+/// `shep`'s own `output::width::sanitize_cell` deliberately KEEPS a
+/// well-formed CSI sequence, because shep's colouring is made of them, so it
+/// is not a guard against a third party's string. Refusing here means `shep
+/// flock`, `shep describe`, `--format json`, the lookout, the MCP tool schema
+/// and every bus subscriber are safe by construction instead of six places
+/// each remembering.
+///
+/// `Debug` is derived, and that is the deliberate decision (IR-41): a smit
+/// carries no environment and no secret. It is a string a dog asked to have
+/// painted in public, so redacting it would hide the thing an operator is
+/// debugging.
+///
+/// # Example
+/// ```
+/// use shep_core::protocol::Smit;
+///
+/// assert_eq!("▲ main@a1b2c3".parse::<Smit>()?.as_str(), "▲ main@a1b2c3");
+/// assert!("\u{1b}[2Jgone".parse::<Smit>().is_err()); // no escapes
+/// # Ok::<(), shep_core::protocol::SmitError>(())
+/// ```
+// wire format: changing this is a breaking change
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Smit(String);
+
+impl Smit {
+    /// The longest a smit may be, in characters. See the type doc for why
+    /// characters rather than bytes or display columns.
+    pub const MAX_CHARS: usize = 48;
+
+    /// The marker as text, exactly as its publisher sent it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Smit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl core::str::FromStr for Smit {
+    type Err = SmitError;
+
+    /// # Errors
+    /// - [`SmitError::Empty`] — nothing but whitespace.
+    /// - [`SmitError::TooLong`] — over [`Self::MAX_CHARS`] characters.
+    /// - [`SmitError::Unprintable`] — a control character, `\u{1b}` included.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.trim().is_empty() {
+            return Err(SmitError::Empty);
+        }
+        let chars = text.chars().count();
+        if chars > Self::MAX_CHARS {
+            return Err(SmitError::TooLong { chars });
+        }
+        if text.chars().any(char::is_control) {
+            return Err(SmitError::Unprintable);
+        }
+        Ok(Self(text.to_string()))
+    }
+}
+
+/// Hand-written rather than derived, and that is the whole security property.
+///
+/// A derived impl would accept anything a `String` accepts, so a smit
+/// carrying `\u{1b}[2J` would reach the daemon's memory and every listing
+/// built from it. `docs/dogs.md` tells dog authors to speak this wire
+/// directly, so a dog written in another language never runs
+/// [`core::str::FromStr`] — the daemon has to validate what it decodes, not
+/// trust that it was constructed properly.
+impl<'de> Deserialize<'de> for Smit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // String, not &str: a non-borrowing deserializer cannot always borrow
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Why a string is not a [`Smit`].
+///
+/// `#[non_exhaustive]`: shep-core is a published library and a further
+/// refusal — a grapheme-cluster cap, say, or a bidi-override rule — must not
+/// break an out-of-tree consumer's `match` (IR-20).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmitError {
+    /// Over [`Smit::MAX_CHARS`] characters; carries the count that was sent.
+    TooLong {
+        /// How many characters the string held.
+        chars: usize,
+    },
+    /// A control character, `\u{1b}` included — the sequence that would let a
+    /// third party's string drive an operator's terminal.
+    Unprintable,
+    /// Empty, or nothing but whitespace.
+    Empty,
+}
+
+impl fmt::Display for SmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong { chars } => write!(
+                f,
+                "a smit is at most {} characters; this one is {chars}",
+                Smit::MAX_CHARS
+            ),
+            Self::Unprintable => {
+                f.write_str("a smit may not contain a control character, an escape included")
+            }
+            Self::Empty => f.write_str("a smit may not be empty"),
+        }
+    }
+}
+
+impl core::error::Error for SmitError {}
 
 /// One RPC request (Phase 1 verb set; later phases extend)
 // wire format: changing existing variants is a breaking change
@@ -121,6 +274,25 @@ pub enum Request {
         /// `instances == 0` for every other path into the daemon, and `shep
         /// delete` is the verb for removing an app.
         count: u32,
+    },
+    /// Attach a short marker to `sheep` for `shep flock` to paint, or clear
+    /// it with `None`.
+    ///
+    /// By NAME rather than a selector, for [`Self::Scale`]'s reason (see its
+    /// own doc above): a smit belongs to a sheep, not to one of its
+    /// instances, and every instance of that name shows it — including one
+    /// spawned after the smit was painted.
+    ///
+    /// Held in memory and scoped to the connection that sent it. When that
+    /// connection closes, for any reason, the smits it painted go with it. A
+    /// publisher therefore republishes rather than publishing on change.
+    ///
+    /// shep does not parse it and has no opinion about what it means.
+    SetSmit {
+        /// Which sheep.
+        sheep: String,
+        /// The marker, or `None` to clear it.
+        smit: Option<Smit>,
     },
     /// Reopen every matched sheep's log files, for an external rotator that
     /// has renamed them (`create`-mode rotation)
@@ -479,6 +651,20 @@ pub struct ProcessInfo {
     /// it. It updates only on the next exit, never cleared by one starting
     /// back up.
     pub last_exit: Option<ExitInfo>,
+    /// The marker a dog has asked to have painted beside this sheep, or
+    /// `None` when no dog has painted one — which also covers a peer daemon
+    /// that predates the field, the same skew rule [`Self::out_file`]
+    /// documents for itself.
+    ///
+    /// A `String` rather than a [`Smit`], deliberately: a client decoding a
+    /// listing from a daemon that already validated the text should not have
+    /// to re-run the parser, and [`ProcessInfo`] is a report rather than an
+    /// input. The validation that makes this safe to print happened at the
+    /// daemon's ingress — see [`Smit`] for why there and not at the renderer.
+    ///
+    /// Every instance of a name shows the same marker: smits are keyed by
+    /// sheep name, not by instance id.
+    pub smit: Option<String>,
 }
 
 impl ProcessInfo {
@@ -512,6 +698,7 @@ impl ProcessInfo {
                 dog: None,
                 lambs: None,
                 last_exit: None,
+                smit: None,
             },
         }
     }
@@ -602,6 +789,12 @@ impl ProcessInfoBuilder {
     /// has never exited under this daemon.
     pub fn last_exit(mut self, last_exit: Option<ExitInfo>) -> Self {
         self.info.last_exit = last_exit;
+        self
+    }
+
+    /// Sets the marker a dog has painted on this sheep; `None` when none has.
+    pub fn smit(mut self, smit: Option<String>) -> Self {
+        self.info.smit = smit;
         self
     }
 
@@ -840,6 +1033,16 @@ impl fmt::Debug for DogSectionToml {
 /// call started". A single `Listing(Vec<ProcessInfo>)` would have to
 /// relitigate all three as a breaking change.
 // wire format: changing existing variants is a breaking change
+//
+// `large_enum_variant` allowed, not fixed: `DogStarted` holds a whole
+// `ProcessInfo` inline where every other variant holds a `Vec` of them, and
+// adding `smit` to that struct is what pushed the spread past the lint's
+// threshold. Clippy's remedy is to box the payload, which would be a source
+// break for every `Response::DogStarted(info)` in and out of this workspace
+// — for nothing: a `Response` is built once per reply and serialized
+// immediately, so the size it occupies on one stack frame in between is not
+// a cost anybody pays. The wire shape is identical either way.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -885,6 +1088,15 @@ pub enum Response {
     /// — the same split `Reloading` already makes between an acceptance and
     /// the swaps that follow it.
     Scaled(Vec<ProcessInfo>),
+    /// Answer to `SetSmit` — every instance of the named sheep, one row
+    /// each, each carrying the smit as it now stands.
+    ///
+    /// Its own variant rather than one of the ten above, on this enum's own
+    /// stated terms: each of them names which request it answers so that one
+    /// can diverge later without a protocol bump. A future `SetSmit` reply
+    /// that also reported which connection holds the mark would have nowhere
+    /// to go if this shared `Scaled`.
+    SmitPainted(Vec<ProcessInfo>),
     /// Answer to `Delete` — ids removed
     Deleted(Vec<u32>),
     /// Answer to `Reopen` — every matched sheep, running or not. A sheep with
@@ -1085,6 +1297,7 @@ mod tests {
                 code: Some(1),
                 signal: None,
             }),
+            smit: None,
         }
     }
 
@@ -1172,6 +1385,19 @@ mod tests {
                 .lambs,
             Some(vec![Lamb::new(4243, "node")]),
             "an empty `lambs` setter body is invisible to the comparison above"
+        );
+
+        // `smit` is the third, on the same terms, and it is the field a
+        // third party writes — so an empty setter body here would silently
+        // drop every dog's mark rather than merely lose a decoration.
+        assert_eq!(
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .smit(Some("\u{25b2} main@a1b2c3".to_string()))
+                .build()
+                .smit
+                .as_deref(),
+            Some("\u{25b2} main@a1b2c3"),
+            "an empty `smit` setter body is invisible to the comparison above"
         );
     }
 
@@ -1597,6 +1823,31 @@ mod tests {
                     line: "reload-config".to_string(),
                 },
             },
+            // The second verb here with no `selector` key, and the only one
+            // whose payload a third party writes. Both halves of its
+            // `Option` are pinned — a paint and a clear — because a dog
+            // author reading this fixture needs the clear frame's exact
+            // shape and would otherwise have to guess `null`.
+            Envelope {
+                id: 20,
+                deadline_ms: None,
+                body: Request::SetSmit {
+                    sheep: "web".to_string(),
+                    smit: Some(
+                        "\u{25b2} main@a1b2c3"
+                            .parse()
+                            .expect("the reference smit is valid"),
+                    ),
+                },
+            },
+            Envelope {
+                id: 21,
+                deadline_ms: None,
+                body: Request::SetSmit {
+                    sheep: "web".to_string(),
+                    smit: None,
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
@@ -1827,8 +2078,94 @@ mod tests {
                         .build(),
                 ])),
             },
+            // The one row that pins a smit on the wire. `sample_info()`
+            // carries none, deliberately (see `every_setter_writes_its_own_
+            // field_and_no_other` for why it cannot), so without this row
+            // the field is pinned only in its absent shape — and the absent
+            // shape is not the one a dog's reader has to parse.
+            Reply {
+                id: 25,
+                result: Ok(Response::SmitPainted(vec![
+                    ProcessInfo::builder(3, "web", ProcStatus::Online)
+                        .pid(Some(4242))
+                        .smit(Some("\u{25b2} main@a1b2c3".to_string()))
+                        .build(),
+                ])),
+            },
         ];
         insta::assert_json_snapshot!("reply_wire_v1", replies);
+    }
+
+    /// fails if the new field breaks an older peer, on the same terms as
+    /// `last_exit` and `lambs` before it. A daemon that predates smits sends
+    /// no `smit` key, and this decoding to `None` rather than erroring is
+    /// what keeps `PROTOCOL_VERSION` at 1.
+    #[test]
+    fn a_process_info_without_a_smit_key_still_deserializes() {
+        let fixture = r#"{"id":1,"name":"web","status":"online","pid":42,"restarts":0,"uptime_ms":10,"fold":null,"out_file":null,"err_file":null,"cpu_percent":null,"memory_bytes":null,"dog":null,"lambs":null,"last_exit":null}"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.smit, None);
+    }
+
+    /// fails if the daemon accepts a smit it should refuse. [`Smit`] must
+    /// validate on the way IN, not only in `FromStr`: `docs/dogs.md` tells
+    /// dog authors to speak this wire directly, so a dog written in another
+    /// language never runs our parser.
+    #[test]
+    fn a_smit_is_validated_when_it_is_deserialized_not_only_when_parsed() {
+        for bad in [
+            r#""\u001b[2Jgone""#.to_string(),                    // an escape
+            r#""a\nb""#.to_string(),                             // a newline
+            r#""""#.to_string(),                                 // empty
+            r#""   ""#.to_string(),                              // whitespace
+            format!(r#""{}""#, "x".repeat(Smit::MAX_CHARS + 1)), // too long
+        ] {
+            assert!(
+                serde_json::from_str::<Smit>(&bad).is_err(),
+                "a daemon must refuse this on the wire: {bad}"
+            );
+        }
+        assert!(serde_json::from_str::<Smit>(r#""\u25b2 main@a1b2c3""#).is_ok());
+    }
+
+    /// fails if a smit stops travelling as a bare JSON string. It is a
+    /// newtype with a hand-written `Deserialize`, and the pair only agrees
+    /// with itself if the serialize side stays transparent — a `Smit` that
+    /// serialized as `{"0":"..."}` would round-trip through nothing.
+    #[test]
+    fn a_smit_travels_as_a_bare_string() {
+        let smit: Smit = "\u{25b2} main@a1b2c3".parse().expect("valid");
+        let json = serde_json::to_string(&smit).unwrap();
+        assert_eq!(json, "\"\u{25b2} main@a1b2c3\"");
+        assert_eq!(serde_json::from_str::<Smit>(&json).unwrap(), smit);
+    }
+
+    /// fails if the cap starts counting bytes or display columns. Forty-eight
+    /// CJK characters are 144 bytes and roughly 96 columns, and all three
+    /// numbers disagree — a byte cap would refuse this legitimate smit at a
+    /// third of its apparent length.
+    #[test]
+    fn a_smit_is_capped_in_characters_not_bytes() {
+        let cjk = "\u{7f8a}".repeat(Smit::MAX_CHARS);
+        assert_eq!(cjk.len(), Smit::MAX_CHARS * 3);
+        assert!(cjk.parse::<Smit>().is_ok(), "{cjk}");
+        assert_eq!(
+            "x".repeat(Smit::MAX_CHARS + 1).parse::<Smit>(),
+            Err(SmitError::TooLong {
+                chars: Smit::MAX_CHARS + 1
+            })
+        );
+    }
+
+    /// fails if a smit is repaired rather than refused. Trimming or stripping
+    /// would hand an operator a mark its publisher never sent, and would put
+    /// shep in the business of editing a string it has agreed not to
+    /// understand.
+    #[test]
+    fn a_smit_is_stored_exactly_as_it_arrived() {
+        let padded: Smit = "  main@a1b2c3  ".parse().expect("valid");
+        assert_eq!(padded.as_str(), "  main@a1b2c3  ");
+        assert_eq!(padded.to_string(), "  main@a1b2c3  ");
     }
 
     #[test]

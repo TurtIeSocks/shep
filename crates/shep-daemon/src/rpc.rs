@@ -37,7 +37,7 @@ use crate::bus::TopicFilter;
 use crate::dogs::DogSpec;
 use crate::limits::stats::StatsState;
 use crate::snapshot::{FlockRegistry, SnapshotError, write_atomic};
-use crate::supervisor::{SupervisorError, SupervisorHandle};
+use crate::supervisor::{ConnId, SupervisorError, SupervisorHandle};
 
 /// Deadline applied when a client sends none (spec §6: 5s default).
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
@@ -181,12 +181,12 @@ pub(crate) fn budget(deadline_ms: Option<u64>) -> Duration {
 /// stronger would need per-command cancellation inside the actor, which the
 /// supervisor's locked `Command` surface (Phase 2a) deliberately does not
 /// have.
-pub(crate) async fn dispatch(envelope: Envelope, ctx: &RpcContext) -> Outcome {
+pub(crate) async fn dispatch(envelope: Envelope, conn: ConnId, ctx: &RpcContext) -> Outcome {
     let id = envelope.id;
     with_deadline(
         id,
         budget(envelope.deadline_ms),
-        run(id, envelope.body, ctx),
+        run(id, conn, envelope.body, ctx),
     )
     .await
 }
@@ -213,7 +213,7 @@ async fn with_deadline<F: Future<Output = Outcome> + Send>(
     }
 }
 
-async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
+async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outcome {
     let reply = |result| Outcome::Reply(Reply { id, result });
     match request {
         Request::Ping => reply(Ok(Response::Pong)),
@@ -378,6 +378,19 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             }
             Err(err) => reply(Err(rpc_error(&err))),
         },
+        // Scoped to `conn`, which is what makes a smit ephemeral: the
+        // connection layer forgets this one's marks in its own tail, and that
+        // tail is the single cleanup site the whole design turns on.
+        //
+        // `smit` arrives already validated — `Smit`'s hand-written
+        // `Deserialize` refused a control character before this arm was
+        // reached — so the only refusal left here is a name nothing holds.
+        Request::SetSmit { sheep, smit } => {
+            match ctx.supervisor.set_smit(conn, &sheep, smit).await {
+                Ok(infos) => reply(Ok(Response::SmitPainted(infos))),
+                Err(err) => reply(Err(rpc_error(&err))),
+            }
+        }
         Request::SaveRoll => match ctx.save_roll_now().await {
             Ok(Some(saved)) => reply(Ok(Response::RollSaved {
                 // Lossy on purpose, matching `to_info`'s treatment of log
@@ -739,6 +752,15 @@ mod tests {
     use shep_core::status::ProcStatus;
     use shep_core::values::UpDuration;
     use tokio::time::Instant;
+
+    /// Dispatches on a connection of its own, shadowing [`super::dispatch`]
+    /// so no case in this module has to name a [`ConnId`] it does not care
+    /// about. One fresh id per call is the honest reading: each of these is
+    /// one client asking one thing, and nothing here spans two requests on
+    /// the same connection.
+    async fn dispatch(envelope: Envelope, ctx: &RpcContext) -> Outcome {
+        super::dispatch(envelope, ConnId::next(), ctx).await
+    }
 
     fn envelope(id: u64, body: Request) -> Envelope {
         Envelope {

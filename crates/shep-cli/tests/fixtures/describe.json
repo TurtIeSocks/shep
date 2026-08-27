@@ -21,7 +21,8 @@
           "name": "sleep"
         }
       ],
-      "last_exit": null
+      "last_exit": null,
+      "smit": null
     }
   ]
 }

@@ -30,14 +30,14 @@ All three panes at 120x30: the host strip under the title, the detail pane and t
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -65,14 +65,14 @@ One errored, one waiting to restart, one stopped, with the selection parked on t
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -         [0m
-  4     cron                       [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge        -            [0m
+  3     billing-r…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -           -            [0m
+  4     cron        [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -166,14 +166,14 @@ The shepherd stopped answering. Five attempts over about eight seconds before th
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;221mthe shepherd stopped answering — reconnecting (attempt 3)[0m                                                               [0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -201,14 +201,14 @@ The ladder ran out. Last known values stay, the uptime clock has stopped, and so
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;166mthe shepherd has died — these values are frozen as of 2026-08-14 14:32:07[0m                                               [0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 15m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 16m    edge      [0m
-> 2     api                        [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -         [0m
-  4     cron                       [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 22m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 15m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 16m    edge        -            [0m
+> 2     api         [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge        -            [0m
+  3     billing-r…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -           -            [0m
+  4     cron        [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 22m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -235,14 +235,14 @@ sheep 2  api   [0m[38;5;166merrored[0m   pid -   restarts 14   uptime 1h 18m 
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -327,14 +327,14 @@ shep lookout   /home/rin/.shep                                                  
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
@@ -351,14 +351,14 @@ shep lookout   /home/rin/.shep                                                  
 12 rows: no optional panes at all. This is 12a's frame, and the only thing that changed is the two-column gutter the marker sits in.
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-> 0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-  2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+> 0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+  2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
 [0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only[0m
@@ -369,14 +369,14 @@ The feed under a burst: 3.8 megabytes were never read and some hundreds of lines
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -404,14 +404,14 @@ The selected sheep has never written a log in this $SHEP_HOME. The feed names th
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -470,14 +470,14 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 4821…[0m
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  usage is not available on this platform   flock cpu 14.7%   flock mem 716.0M                                      [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -505,14 +505,14 @@ The detail pane with a lamb list: how many descendants the shepherd's walk found
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-> 2     api                        [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -         [0m
-  4     cron                       [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+> 2     api         [0m[38;5;29monline         [0m  48219    1         -          7.1%    241.0M    1h 28m    edge        -            [0m
+  3     billing-r…  [0m[38;5;29monline         [0m  48230    0         -          0.8%    96.0M     1h 29m    -           -            [0m
+  4     cron        [0m[38;5;29monline         [0m  48233    0         -          0.1%    8.0M      1h 31m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -540,14 +540,14 @@ The same pane on a stopped sheep. The shepherd had no pid to walk from and left 
 
 shep lookout   /home/rin/.shep                                                                           [0m[38;5;245m 6 in the flock[0m
 [0m[38;5;245mhost  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            [0m
-  [0m[38;5;245mID    NAME                       STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD      [0m
+  [0m[38;5;245mID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         [0m
 [0m[38;5;245m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-  0     web                        [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge      [0m
-  1     web                        [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge      [0m
-  2     api                        [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge      [0m
-  3     billing-reconciliation-w…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -         [0m
-> 4     cron                       [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -         [0m
-  5     metrics                    [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -         [0m
+  0     web         [0m[38;5;29monline         [0m  48211    0         -          3.4%    182.0M    1h 25m    edge        -            [0m
+  1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
+  2     api         [0m[38;5;166merrored        [0m  -        14        1          -       -         1h 18m    edge        -            [0m
+  3     billing-r…  [0m[38;5;221mwaiting-restart[0m  -        3         1          -       -         1h 19m    -           -            [0m
+> 4     cron        [0m[38;5;245mstopped        [0m  -        0         SIGTERM    -       -         1h 21m    -           -            [0m
+  5     metrics     [0m[38;5;29monline         [0m  48240    0         -          0.4%    11.0M     1h 32m    -           -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m

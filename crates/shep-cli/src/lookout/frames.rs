@@ -1270,7 +1270,10 @@ mod tests {
         };
         for (name, want) in [
             ("api", "1"),
-            ("billing-reconciliation-w", "1"),
+            // "billing-r", not the fuller prefix this used before task 7:
+            // the SMIT column added at this frame's width narrows NAME
+            // enough that the truncation lands one syllable earlier.
+            ("billing-r", "1"),
             ("cron", "SIGTERM"),
         ] {
             let row = row_of(name);
