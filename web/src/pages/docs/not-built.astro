@@ -3,7 +3,8 @@
  * What's not built (docs/specs/deferred.md, docs/specs/windows-estimate.md).
  * deferred.md is the single list this page ports from — re-check this page
  * whenever that file changes. As of the 2026-08-12 spec↔implementation
- * audit plus the 2026-08-15 Windows ruling.
+ * audit, plus the 2026-08-26 Windows tier landing (which reversed the
+ * 2026-08-15 ruling this page used to carry).
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
@@ -12,7 +13,7 @@ import Callout from "../../components/docs/Callout.astro";
 
 <DocsLayout
   title="What's not built yet"
-  description="Windows, entirely, plus a short list of deliberate cuts and open design questions: sourced from docs/specs/deferred.md."
+  description="What the Windows tier does not do, plus a short list of deliberate cuts and open design questions: sourced from docs/specs/deferred.md."
   crumb="Reference / What's not built"
   activeSlug="not-built"
 >
@@ -20,62 +21,79 @@ import Callout from "../../components/docs/Callout.astro";
     <h1>What's not built yet</h1>
     <ReferencePills slug="not-built" />
     <p class="lede">
-      shep is feature-complete for v1 on macOS and Linux: every verb in the
-      CLI reference, the whistle MCP server, all four lookout panes, dogs,
-      serve/dev/runtime, and config and packaging. This page is the honest
-      remainder: one platform, and a short list of smaller cuts, each with
-      the reason it isn't here yet.
+      shep is feature-complete for v1 on macOS, Linux and Windows: every verb
+      in the CLI reference, the whistle MCP server, all four lookout panes,
+      dogs, serve/dev/runtime, and config and packaging. This page is the
+      honest remainder: what the newest platform does not do, and a short
+      list of smaller cuts, each with the reason it isn't here yet.
     </p>
 
-    <h2>Windows: the whole tier, not partial</h2>
+    <h2>Windows: built, with two named limits</h2>
     <p>
-      Every command prints <code>shep does not yet support Windows</code> and
-      exits <code>1</code>. This isn't a gap in an otherwise-working port:
-      no Windows code path exists to be partial. WSL2 covers the common case
-      today.
+      <strong>This section used to say the opposite.</strong> Until
+      2026-08-26 every command on Windows printed <code>shep does not yet
+      support Windows</code> and exited <code>1</code>, and the costed
+      decision below was to keep it that way. A Windows host became
+      available, the tier was built, and it is kept here rather than deleted
+      because the estimate turned out to be a good one and the record of what
+      it got right is worth more than a tidy page.
+    </p>
+    <p>
+      The day-to-day loop works: <code>start</code>, <code>stop</code>,
+      <code>restart</code>, <code>reload</code>, <code>flock</code>,
+      <code>describe</code>, <code>bleats</code>, <code>delete</code>,
+      <code>save</code>/<code>muster</code>, <code>lookout</code>,
+      <code>whistle</code> and the dogs — over a named pipe instead of a unix
+      socket, with each sheep contained in a job object instead of a process
+      group.
     </p>
     <Callout variant="careful">
-      This was a costed decision, not an indefinite punt. The earlier
-      estimate ("roughly +30-40% on the daemon's process-control layer")
-      was, in its own words, mostly guesswork. A real survey replaced it on
-      2026-08-15: <strong>roughly 36-49 tasks across 4-5 phases, and a
-      redesign wearing a port's clothes</strong>, not a port on its own. Rin
-      ruled Windows out of v1 once that number existed to act on, rather than
-      leaving it last on a list behind a guess.
+      <strong>Two limits are real and are not going to be papered over.</strong>
+      Windows has nothing SIGTERM-shaped that can be delivered to an
+      arbitrary process, so <code>shep stop</code> waits out the app's whole
+      <code>kill_timeout</code> and then terminates it — unless the app opts
+      into the shepherd channel with <code>shutdown_with_message</code>,
+      which is the supported graceful path there. And
+      <code>shep startup</code> is not built: boot-time supervision on
+      Windows means a Service Control Manager service, a different program
+      shape rather than a fifth unit template. Run <code>shep start</code> in
+      your own session, or wrap <code>shep runtime</code> in NSSM or WinSW.
     </Callout>
     <p>
-      Most of the surface is mechanical: 145 <code>cfg(unix)</code> sites,
-      and un-gating them is close to free, since four whole module trees
-      (<code>commands</code>, <code>dog</code>, <code>lookout</code>,
-      <code>whistle</code>) turn out to contain no Unix API calls at all. The
-      cost concentrates in a handful of places where the
-      <strong>behaviour</strong>, not just the API, has no Windows analogue:
+      The estimate's own shape predictions all held. The 145
+      <code>cfg(unix)</code> sites really were the cheap part — only ten
+      files in the CLI contained a Unix API call at all, and four whole
+      module trees contained none. The cost concentrated exactly where it
+      was predicted to:
     </p>
     <ul>
       <li>
-        <strong>Graceful stop has no equivalent.</strong>
-        <code>CTRL_BREAK_EVENT</code> reaches only console apps carrying
-        their own handler, so <code>shep stop</code> would degrade to
-        <code>shep kill</code> for anything that didn't opt into the
-        shepherd channel.
+        <strong>Graceful stop has no equivalent</strong>, and the runner
+        refuses rather than pretending: an arm that returned success having
+        done nothing would turn every <code>shep stop</code> into a silent
+        wait-then-kill with no line saying why.
       </li>
       <li>
-        <strong>The shepherd channel can't be fd 3.</strong>
-        <code>cmd.exe</code> has no fd-3 redirection, so the channel would
-        need to become a named pipe named by an environment variable instead:
-        the wire format survives, the transport doesn't.
+        <strong>The shepherd channel is not fd 3.</strong> It is a named pipe
+        whose path arrives as <code>$SHEP_CHANNEL_PIPE</code>; the app opens
+        it itself. The wire format is untouched, so
+        <code>shep trigger</code>'s correlation id survives unchanged.
+        <code>SHEP_CHANNEL_FD</code> is deliberately not set there, so an app
+        can branch on which variable is present rather than on the platform.
       </li>
       <li>
-        <strong><code>user</code>/<code>group</code> would refuse
-        permanently.</strong> Dropping privilege on Windows needs a logon
-        session or a primary-token privilege: a different feature, not a
-        different call.
+        <strong><code>user</code>/<code>group</code> refuse permanently.</strong>
+        Dropping privilege on Windows needs a logon session or a
+        primary-token privilege: a different feature, not a different call.
       </li>
     </ul>
     <p class="fine">
-      Also on the table and not yet decided: whether permanent non-support is
-      the right long-term answer. A tier isn't built once, it's maintained
-      forever on a platform nobody on this project runs day to day.
+      Two things the estimate did not anticipate, both found only by running
+      the code: a Windows child started with a genuinely empty environment
+      fails before <code>main</code> (many Win32 APIs read
+      <code>%SystemRoot%</code>), and an append-mode handle cannot be
+      truncated there, which broke <code>shep start</code>'s autostart
+      outright. Neither is visible to a compiler.
     </p>
 
     <h2>Five smaller cuts, argued for rather than just missing</h2>

@@ -27,9 +27,11 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     </p>
 
     <Callout variant="careful">
-      shep is pre-1.0, so anything here can still change, and only macOS
-      and Linux work. On Windows every command prints
-      <code>shep does not yet support Windows</code> and exits 1.
+      shep is pre-1.0, so anything here can still change. macOS, Linux and
+      Windows all work; the Windows tier is newer, and two limits are worth
+      knowing before you rely on it — <code>shep stop</code> has no graceful
+      signal to send unless your app reads the shepherd channel, and
+      <code>shep startup</code> is not built there.
     </Callout>
 
     <h2>1. Install it</h2>

@@ -18,9 +18,12 @@ called `kill`, error messages are written in plain technical English, and
 every themed verb has a straight alias that works forever.
 
 > **Status: `0.1.0`, and pre-1.0 means anything can still change.** It runs
-> on macOS and Linux. On Windows every command prints `shep does not yet
-> support Windows` and exits 1, which is a real answer but not a useful one.
-> The [roadmap](#whats-not-built-yet) below says what is missing.
+> on macOS, Linux and Windows. The Windows tier is newer than the other two
+> and ships with two documented limits: `shep stop` has no graceful signal
+> to send unless the app opts into the shepherd channel, and `shep startup`
+> (boot-time service installation) is not built. Both are spelled out under
+> [Windows](#windows) below. The [roadmap](#whats-not-built-yet) says what
+> is missing everywhere.
 
 ## Try it
 
@@ -214,11 +217,32 @@ sheep already in the flock. Rendered frames of it are in
 coloured version, read with `less -R`). What's left of the v1.0 queue is
 smaller now: OTLP export on the metrics dog.
 
-shep runs on Linux and macOS. Windows is v1.1+, ruled out of v1 outright
-rather than left half-done: the estimate came in at roughly 36-49 tasks over
-4-5 phases, and it is a redesign, not a port — graceful stop, the shepherd
-channel, and privilege-dropping each need a different mechanism on that
-platform, not a Unix one carried across.
+shep runs on Linux, macOS and Windows.
+
+<a name="windows"></a>
+
+**Windows** works for the whole day-to-day loop — `start`, `stop`, `restart`,
+`reload`, `flock`, `describe`, `bleats`, `delete`, `save`/`muster`, `lookout`,
+`whistle`, the dogs — over a named pipe instead of a unix socket, with each
+sheep contained in a job object instead of a process group. Two differences
+are real and are not going to be papered over:
+
+- **`shep stop` has no polite signal to send.** Windows offers nothing
+  SIGTERM-shaped that can be delivered to an arbitrary process, so a sheep
+  that has not opted into the shepherd channel gets its full `kill_timeout`
+  and is then terminated. Set `shutdown_with_message = true` and read the
+  channel if your app needs a clean shutdown; that path is unchanged from
+  Unix apart from how the handle is obtained (`$SHEP_CHANNEL_PIPE` instead
+  of fd 3).
+- **`shep startup` is not built.** Boot-time supervision on Windows means a
+  Service Control Manager service, which is a different program shape rather
+  than a fifth unit template. Run `shep start` in your own session, or wrap
+  `shep runtime` in NSSM or WinSW.
+
+`user`/`group` in a Flockfile are refused on Windows, permanently: dropping
+privilege there needs a logon session or a primary-token privilege, which is
+a materially different and security-sensitive feature rather than a different
+call.
 [docs/specs/windows-estimate.md](docs/specs/windows-estimate.md) has the
 detail. WSL2 covers the common case today.
 
