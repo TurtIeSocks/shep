@@ -162,10 +162,9 @@ impl Render for FlockRows {
     // is this row even here".
     //
     // SMIT sits above FOLD, at the very top: it is by far the widest
-    // column, so dropping it recovers the most space, and it is the only
-    // column whose content is recoverable another way -- asking the deploy
-    // dog again (`shep deploy survey`), where nothing but a wider terminal
-    // brings FOLD back.
+    // column, so dropping it recovers the most space for one column lost.
+    // Rin's ruling is that it belongs among the first columns to yield, and
+    // 8 is the literal reading of that.
     const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
 }
 

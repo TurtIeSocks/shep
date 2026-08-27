@@ -247,10 +247,9 @@ const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 /// by the other's.
 ///
 /// SMIT (task 7) sits above FOLD, at the very top: it is by far the widest
-/// column, so it is the first one to go, and the only one whose content is
-/// recoverable another way -- asking the deploy dog again. That is the
-/// same reasoning `output::rows::FlockRows::PRIORITIES` gives for its own
-/// priority 8, the highest number in that table.
+/// column, so it is the first one to go. That is the same reasoning
+/// `output::rows::FlockRows::PRIORITIES` gives for its own priority 8, the
+/// highest number in that table.
 const TIERS: &[(u16, &[Column])] = &[
     (116, ALL),
     (101, NO_SMIT),
