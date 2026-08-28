@@ -10,6 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `AppConfig::reuse_port` is accepted rather than refused, and now decides how
+  a reload runs. `normalize` used to reject any Flockfile that set it, on the
+  grounds that nothing read it and a config key that silently does nothing is
+  worse than one that will not load. Something reads it now: an app that sets
+  it gets a reload that overlaps its two instances, and a probed app that
+  leaves it unset gets one that drains before it spawns. See `shep-daemon`'s
+  entry for why that distinction exists.
+- No existing configuration can change behaviour because of this. `normalize`
+  refused the field, so no Flockfile that loads today contains it, and `shep
+  import` stopped writing it for cluster-mode pm2 apps before that.
+
+### Removals
+
+- `NormalizeError::ReusePortUnimplemented`, with the refusal it reported.
+  Nothing can construct it any more.
+
 ## [0.1.8] - 2026-08-28
 
 

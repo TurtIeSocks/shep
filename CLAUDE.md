@@ -302,17 +302,21 @@ audit-debt phase.
 2026-08-28.** shep never binds an app's listening socket and never sets
 `SO_REUSEPORT` on one. The only socket it binds is its own control socket at
 `$SHEP_HOME/run/shep.sock`, which is a different thing entirely and does fail
-loudly when its path exceeds the platform limit. What `reload` gives is an
-unconditional overlap (SpawnNew, AwaitReady, DrainOld, ReapOld), and whether
-that overlap is zero-downtime depends on the app having
-set `SO_REUSEPORT` on its own listener; without it the second instance takes
-`EADDRINUSE`. The `reuse_port` Flockfile key is REFUSED at parse time, not
-ignored: "reuse_port is accepted by the schema but not yet implemented, so
-shep refuses it rather than ignoring it." README.md's `## Reloading` section
-and `web/src/components/landing/Features.astro` both state this correctly; only
-this file was wrong, which is worse than it sounds, because this is the file
-every session reads first. It put the false claim into a README draft on
-2026-08-28 before Rin caught it. Phase 11 merged too: the six remaining daemon-surface
+loudly when its path exceeds the platform limit. Whether a reload's overlap is
+zero-downtime depends on the app having set `SO_REUSEPORT` on its own
+listener; without it the second instance takes `EADDRINUSE`.
+
+**The overlap stopped being unconditional later the same day**, and this file
+carried the old claim for a few hours, which is worse than it sounds because
+this is the file every session reads first. `reuse_port` is no longer refused
+at parse time: it is the field that decides which of two reloads an app gets.
+An app with a `readiness_probe` and no `reuse_port` is reloaded SERIALLY
+(DrainOld, ReapOld, SpawnNew, AwaitReady), because a probe asks an address and
+an address cannot say which of two overlapping instances answered it. Anything
+else still overlaps (SpawnNew, AwaitReady, DrainOld, ReapOld): no probe,
+`wait_ready`, or `reuse_port = true`. See `ReloadMode` in `supervisor.rs`, and
+`docs/specs/deferred.md` for the three residuals that fix does not cover.
+Phase 11 merged too: the six remaining daemon-surface
 verbs — `shep stock` (alias `scale`), `shep signal`, `shep whisper` (alias
 `sendline`), the KV store's `set`/`get`/`unset`, lambs in `describe`, and
 the `channel.*` bus topic. Phase 12a merged: `shep lookout`'s shell and its
@@ -363,7 +367,8 @@ moments. Then 2026-08-19 added `ProcessInfo::last_exit` and an EXIT column
 (a wire change), `shep bleats`' backlog and `--lines`, an opt-in
 `[interpreters]` mapping with `--interpreter`, `~/` expansion in every
 Flockfile path, a Flockfile app's `cwd` defaulting to its own directory, and
-`reuse_port` refused rather than silently ignored. `shep init` is in flight.
+`reuse_port` refused rather than silently ignored (which it no longer is; see
+the reload paragraph above). `shep init` is in flight.
 
 **Verb count: 40 generated, 41 listed, and the difference is `help`.**
 `./web/scripts/generate-cli-reference.sh` prints its own number every time it
