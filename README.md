@@ -38,8 +38,9 @@ turns whatever `pm2 save` last wrote into a Flockfile. It reads `--from`, or
 The difference worth switching for is that shep tells you the truth about what
 it did. `shep reload` does not claim zero-downtime, because shep never binds
 your app's listening socket and so cannot promise it. A refusal names the
-sheep, the path it tried, and what to change. A command that touched one sheep still shows you the other
-eleven, because the question you actually had was whether anything else moved.
+sheep, the path it tried, and what to change. A command that touched one
+sheep still shows you the other eleven, because the question you actually
+had was whether anything else moved.
 
 Where the sheep vocabulary would cost clarity it gets dropped. `kill` is
 called `kill`, errors are plain technical English, and every themed verb has a
@@ -102,11 +103,12 @@ Two `api` rows, because the new instance is up before the old one goes down.
 shep spawns, waits for readiness, drains, then reaps.
 
 That overlap is not zero-downtime on its own, and `reload --help` says so.
-shep binds its own control socket and nothing else, never your app's listener,
-so both instances want the same port unless your app sets `SO_REUSEPORT` on it.
-Without that the second one takes `EADDRINUSE`. The `reuse_port` Flockfile key is refused at parse time rather
-than accepted and ignored, for the same reason: nothing reads it yet, and a
-config key that silently does nothing is worse than one that says so.
+shep binds its own control socket and nothing else, never your app's
+listener, so both instances want the same port unless your app sets
+`SO_REUSEPORT` on it. Without that the second one takes `EADDRINUSE`. The
+`reuse_port` Flockfile key is refused at parse time rather than accepted and
+ignored, for the same reason: nothing reads it yet, and a config key that
+silently does nothing is worse than one that says so.
 
 ## Watching it
 
