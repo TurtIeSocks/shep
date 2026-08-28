@@ -2089,6 +2089,29 @@ struct SheepSlot {
     /// a reply nobody will ever write, and the debts it leaves behind belong
     /// to a process a replacement under this id never was.
     actions: ActionWaits,
+    /// This instance's readiness wait ended without a signal, and a reload
+    /// left it standing anyway.
+    ///
+    /// The one state in which a process is up, registered, and known not to
+    /// be serving. It is reachable from two places, both in the reload
+    /// machinery and both meaning the same thing: the replacement never
+    /// proved itself and there was no instance left to hand back to, so it
+    /// was neither killed nor called `Online` (see
+    /// [`Actor::reload_ready_result`] for the argument).
+    ///
+    /// Read in exactly one place — [`Actor::advance_reload`]'s replaceable
+    /// test — and that is what it is for. A reload replaces `Online`
+    /// instances, so without this the instance a failed reload left behind
+    /// would be beyond the reach of the reload that rolls it back: a deploy
+    /// tool would swap the release directory, ask for a reload, and be told
+    /// `Ok` by a daemon that had quietly skipped the only instance there
+    /// was. Measured on the testbed, 2026-08-28, where it left the app down
+    /// behind an otherwise correct refusal.
+    ///
+    /// Cleared wherever the id gets a new process or a new verdict, which is
+    /// [`Actor::respawn`]'s success arm and [`Actor::went_online`]. Both are
+    /// the moment the fact stops being true rather than a tidy-up.
+    ready_failed: bool,
 }
 
 impl SheepSlot {
@@ -2912,6 +2935,7 @@ impl<R: ProcessRunner> Actor<R> {
                 epoch: 0,
                 ready_tx: None,
                 actions: ActionWaits::default(),
+                ready_failed: false,
             },
         );
         Registration::Fresh(info)
@@ -3053,6 +3077,7 @@ impl<R: ProcessRunner> Actor<R> {
                         epoch: 0,
                         ready_tx,
                         actions: ActionWaits::default(),
+                        ready_failed: false,
                     },
                 );
                 self.emit(ProcessEventKind::Start, info.clone(), true);
@@ -3099,6 +3124,7 @@ impl<R: ProcessRunner> Actor<R> {
                         epoch: 0,
                         ready_tx: None,
                         actions: ActionWaits::default(),
+                        ready_failed: false,
                     },
                 );
                 self.emit(ProcessEventKind::Errored, info, true);
@@ -3225,6 +3251,10 @@ impl<R: ProcessRunner> Actor<R> {
                 slot.entry.pid = Some(pid);
                 slot.entry.started_at = Some(tokio::time::Instant::now());
                 slot.entry.restarts += 1;
+                // A different process under the same id, so the verdict an
+                // earlier reload reached about the last one does not apply to
+                // it. See `SheepSlot::ready_failed`.
+                slot.ready_failed = false;
                 slot.ctl = Some(handles.ctl);
                 slot.log_ctl = Some(log_ctl);
                 slot.to_child = Some(to_child);
@@ -3996,14 +4026,14 @@ impl<R: ProcessRunner> Actor<R> {
         // thing until the first respawn and then quietly stop being.
         let mut queues: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
         for id in matched {
-            let entry = &self
+            let slot = self
                 .sheep
                 .get(&id)
-                .expect("handle_reload: `matched` holds ids read off this map a moment ago")
-                .entry;
-            if entry.status != ProcStatus::Online {
+                .expect("handle_reload: `matched` holds ids read off this map a moment ago");
+            if !reload_eligible(slot) {
                 continue;
             }
+            let entry = &slot.entry;
             queues
                 .entry(entry.spec.config().name.clone())
                 .or_default()
@@ -4073,9 +4103,8 @@ impl<R: ProcessRunner> Actor<R> {
         }
         while let Some(old_id) = queue.pop_front() {
             let slot = self.sheep.get(&old_id);
-            let replaceable = slot.is_some_and(|slot| {
-                slot.entry.status == ProcStatus::Online && slot.manual.is_none()
-            });
+            let replaceable =
+                slot.is_some_and(|slot| reload_eligible(slot) && slot.manual.is_none());
             if !replaceable {
                 // Logged for the reason `handle_extra_restart` logs its four
                 // drops: a whole reload can end here having replaced nothing,
@@ -4393,6 +4422,7 @@ impl<R: ProcessRunner> Actor<R> {
                         epoch: 0,
                         ready_tx: Some(ready_tx),
                         actions: ActionWaits::default(),
+                        ready_failed: false,
                     },
                 );
                 // The instance being replaced announces itself BEFORE its
@@ -4508,7 +4538,8 @@ impl<R: ProcessRunner> Actor<R> {
             );
             self.reloads.remove(&name);
             self.clear_reload(new_id);
-            if let Some(slot) = self.sheep.get(&new_id) {
+            if let Some(slot) = self.sheep.get_mut(&new_id) {
+                slot.ready_failed = true;
                 let info = to_info(&slot.entry, &self.smits);
                 self.emit(ProcessEventKind::ReloadAbandoned, info, true);
             }
@@ -4789,6 +4820,9 @@ impl<R: ProcessRunner> Actor<R> {
              that instance"
         );
         let info = self.set_status(new_id, ProcStatus::Starting);
+        if let Some(slot) = self.sheep.get_mut(&new_id) {
+            slot.ready_failed = true;
+        }
         self.emit(ProcessEventKind::ReloadAbandoned, info, true);
     }
 
@@ -6415,6 +6449,11 @@ impl<R: ProcessRunner> Actor<R> {
     /// liveness probe armed against an app that has not finished starting
     /// fails its threshold and restarts the app before it ever comes up.
     fn went_online(&mut self, id: u32, info: ProcessInfo, manually: bool) {
+        // Whatever an earlier reload concluded about this instance, it is
+        // serving now. See `SheepSlot::ready_failed`.
+        if let Some(slot) = self.sheep.get_mut(&id) {
+            slot.ready_failed = false;
+        }
         self.emit(ProcessEventKind::Online, info, manually);
         self.arm_extras(id);
     }
@@ -6700,6 +6739,21 @@ impl From<ExitOutcome> for ExitInfo {
 /// `&ResolvedApp` structurally cannot reach `instance`, so every instance of
 /// a clustered app would probe whatever the unexpanded variable left behind
 /// — the same port, every time.
+/// Whether this instance's STATUS lets a reload replace it.
+///
+/// `Online` is the ordinary answer, and `ready_failed` is the one exception:
+/// an instance a failed reload left up and not serving (see
+/// [`SheepSlot::ready_failed`]). Both doors into a reload ask this — the
+/// selector pass in [`Actor::handle_reload`], which decides what goes in the
+/// queue, and [`Actor::advance_reload`], which decides what comes out of it —
+/// and a reload that got two different answers from them would either drop an
+/// instance silently or reach one it had already ruled out. `advance_reload`
+/// adds the `manual` half on its own, because an unclaimed marker is a fact
+/// about the moment the swap starts rather than about the selector pass.
+fn reload_eligible(slot: &SheepSlot) -> bool {
+    slot.entry.status == ProcStatus::Online || slot.ready_failed
+}
+
 fn spec_prober(spec: &SpawnSpec) -> Arc<dyn Prober> {
     Arc::new(OsProber::new(spec.cwd.clone(), spec.env.clone()))
 }
@@ -9202,6 +9256,7 @@ mod tests {
             epoch,
             ready_tx: None,
             actions: ActionWaits::default(),
+            ready_failed: false,
         };
         let mut sheep = HashMap::new();
         sheep.insert(0, slot);
@@ -9477,6 +9532,65 @@ mod tests {
         );
     }
 
+    // fails if the instance a failed reload left behind is beyond the reach
+    // of the reload meant to roll it back.
+    //
+    // The gap this closes was made by the fix above it, and was found on the
+    // testbed rather than here: refusing to call an unready replacement
+    // `Online` is right, and it also took that instance out of the set
+    // `advance_reload` will replace, since a reload replaces `Online`
+    // instances. A deploy tool's rollback then swapped the release directory,
+    // asked for a reload, and got `Ok` from a daemon that had skipped the only
+    // instance the app had. Correct refusal, app still down.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_can_still_replace_the_instance_a_failed_reload_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _mailbox) = actor_with_one_online_sheep_of(&dir, probed_app("web"), vec![]);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+        let slot = actor.sheep.get_mut(&0).expect("the fixture's sheep");
+        slot.ctl = Some(ctl_tx);
+        // Exactly what `reload_ready_result` leaves behind when a replacement
+        // never answers and there is no drainee to hand back to.
+        slot.entry.status = ProcStatus::Starting;
+        slot.ready_failed = true;
+
+        // Through `handle_reload`, not `advance_reload`. The selector pass
+        // has its own eligibility filter and it is the one a rollback meets
+        // first: an earlier version of this case called `advance_reload`
+        // directly, passed, and missed the fact that nothing was reaching it.
+        let (reply, _rx) = oneshot::channel();
+        actor.handle_reload(&ProcessSelector::Name("web".to_string()), reply);
+
+        assert!(
+            actor.reloads.contains_key("web"),
+            "a parked instance is still replaceable, or nothing can roll it back"
+        );
+        assert_eq!(actor.reloads["web"].swap.old_id, 0);
+    }
+
+    // fails if a sheep that is merely STARTING becomes replaceable too. The
+    // widening above is one flag wide on purpose: an instance still inside its
+    // own readiness wait has a verdict coming, and draining it to make room
+    // for a replacement would throw away the start that was already happening.
+    #[tokio::test(start_paused = true)]
+    async fn an_ordinarily_starting_sheep_is_still_skipped_by_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _mailbox) = actor_with_one_online_sheep_of(&dir, probed_app("web"), vec![]);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+        let slot = actor.sheep.get_mut(&0).expect("the fixture's sheep");
+        slot.ctl = Some(ctl_tx);
+        slot.entry.status = ProcStatus::Starting;
+
+        let (reply, _rx) = oneshot::channel();
+        actor.handle_reload(&ProcessSelector::Name("web".to_string()), reply);
+
+        assert!(
+            actor.reloads.is_empty(),
+            "a sheep still waiting on its own readiness is left to finish"
+        );
+        assert_eq!(actor.sheep[&0].entry.status, ProcStatus::Starting);
+    }
+
     // --- Reload: the post-drain check an overlap still owes ---
 
     // fails if the second probe is asked of a swap that does not need it, or
@@ -9677,6 +9791,7 @@ mod tests {
                 epoch: 0,
                 ready_tx: None,
                 actions: ActionWaits::default(),
+                ready_failed: false,
             },
         );
         let (events, _events_rx) = broadcast::channel(64);
@@ -9737,6 +9852,7 @@ mod tests {
                     epoch: 0,
                     ready_tx: None,
                     actions: ActionWaits::default(),
+                    ready_failed: false,
                 },
             );
         }
@@ -9931,6 +10047,7 @@ mod tests {
                     epoch: 0,
                     ready_tx: None,
                     actions: ActionWaits::default(),
+                    ready_failed: false,
                 },
             );
         }
@@ -13393,6 +13510,7 @@ mod tests {
                 epoch: 0,
                 ready_tx: None,
                 actions: ActionWaits::default(),
+                ready_failed: false,
             },
         );
         id
