@@ -86,6 +86,13 @@ git_release_enable = true
 # force-pushes this branch on every push to main, and each force-push starts
 # an incremental review that the title gate did not stop. The label is
 # re-checked on every one of them.
+#
+# The label has to EXIST in the repository first. release-plz opens the pull
+# request and then calls GitHub's label endpoint, so a name nothing has
+# defined can leave the pull request opened and unlabelled with the job
+# failing around it. `release` was created for this on 2026-08-28. Renaming or
+# deleting it silently un-skips every release pull request, because
+# .coderabbit.yaml matches the name and nothing checks the two still agree.
 pr_labels = ["release"]
 
 # Generated from conventional commits through release-plz-changelog.toml.
