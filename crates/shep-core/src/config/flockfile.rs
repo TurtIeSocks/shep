@@ -7,10 +7,12 @@
 
 use core::fmt;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "schema")]
 use schemars::Schema;
+
 use serde::Deserialize;
 
 use crate::config::AppConfig;
@@ -71,9 +73,18 @@ struct RawFlockfile {
     ///
     /// Nested under one key rather than allowing loose top-level keys, so
     /// exactly one name is reserved and a typo anywhere else still fails.
+    ///
+    /// A map of ignored values rather than `IgnoredAny`, which would have
+    /// accepted `dog = 5` and `dog = ["a"]` as happily as a table. Not reading
+    /// what a dog wrote is the point; not caring whether it wrote a table at
+    /// all is a different thing, and it would have made the one key this file
+    /// adds the one key where a typo does not fail loudly.
     #[serde(default)]
-    #[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
-    dog: Option<serde::de::IgnoredAny>,
+    #[cfg_attr(
+        feature = "schema",
+        schemars(with = "Option<BTreeMap<String, serde_json::Value>>")
+    )]
+    dog: Option<BTreeMap<String, serde::de::IgnoredAny>>,
     #[serde(default, rename = "app")]
     apps: Vec<AppConfig>,
 }
@@ -743,6 +754,23 @@ script = "./srv"
             Flockfile::parse(src, FlockFormat::Toml).expect("a dog's table is not an error");
         assert_eq!(flock.apps.len(), 1);
         assert_eq!(flock.apps[0].name, "web");
+    }
+
+    /// fails if `dog` accepts something that is not a table.
+    ///
+    /// Not reading what a dog wrote is deliberate. Not caring whether it wrote
+    /// a table at all is a different thing, and it would make this the one key
+    /// in the document where a typo does not fail loudly, which is the rule
+    /// the rest of the file is built on.
+    #[test]
+    fn a_dog_that_is_not_a_table_is_refused() {
+        for value in ["5", "\"nope\"", "[1, 2]", "true"] {
+            let src = format!("dog = {value}\n\n[[app]]\nname = \"web\"\nscript = \"./srv\"\n");
+            assert!(
+                Flockfile::parse(&src, FlockFormat::Toml).is_err(),
+                "`dog = {value}` is not a table and must be refused"
+            );
+        }
     }
 
     /// fails if a typo anywhere else stops failing loudly.

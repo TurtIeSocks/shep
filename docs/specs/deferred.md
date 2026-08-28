@@ -1626,11 +1626,19 @@ overlap zero-downtime in the first place, makes it worse rather than better:
 the kernel balances across both sockets, so even a probe that arrives late may
 be answered by the instance on its way out.
 
-What it costs downstream: `shep-deploy`'s `verify = "probed"` is documented as
-the safe default with automatic rollback. It watches for a new process reaching
-`Online`, so a release that starts and never becomes ready is verified,
-recorded as deployed, and left serving nothing. That crate's README now says
+What it costs downstream: `shep-deploy`'s `verify = "probed"` watches for a new
+process reaching `Online`. The replacement gets there on the drainee's answer,
+so it is marked `Ready` and then `Online` while never having served anything
+itself, and the deploy that was waiting on exactly that signal records success.
+The release is left in place, serving nothing. That crate's README now says
 what its verification actually checks and points here.
+
+**The workaround that exists today is `wait_ready = true`.** It selects
+`ReadinessSource::Channel`, and the channel is per instance: `spawn_readiness_task`
+creates a fresh `oneshot` per spawned id, so the drainee has no way to answer
+the replacement's. An app that can write `{"kind":"ready"}` on its shepherd
+channel therefore gets a reload gate that means what it says, today, with none
+of the work below. An app that cannot is the case this entry is about.
 
 ### The options, none of them free
 

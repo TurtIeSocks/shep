@@ -360,7 +360,8 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
       },`}</CodeBlock>
     <p class="fine">
       That's the real first twenty lines, unedited. <code>head -20</code>
-      cuts off mid-<code>"app"</code> block, and the <code>"$schema"</code>
+      stops just after <code>"app"</code> closes and before
+      <code>"dog"</code> begins, and the <code>"$schema"</code>
       key's own description is one long escaped line explaining itself,
       not the tidied multi-line prose above. The full document closes
       <code>"app"</code>, adds the <code>"dog"</code> key described below,
