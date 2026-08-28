@@ -863,9 +863,13 @@ async fn resume_all(
     match live.as_slice() {
         [] => {}
         [one] => {
+            // The operator's own token, not the sheep's name: `shep start 0`
+            // asked about one instance, and answering it with `shep restart
+            // zam` would suggest a command that replaces all ten.
+            let retype = selector.unwrap_or(one.name.as_str());
             let message = format!(
-                "{} is already {}; `shep restart {}` replaces it.",
-                one.name, one.status, one.name
+                "{} is already {}; `shep restart {retype}` replaces it.",
+                one.name, one.status
             );
             streams.aside("start", &message);
         }
@@ -2669,6 +2673,36 @@ mod tests {
             "the two that were down, and not the one that was up"
         );
         assert!(said.contains("already"), "the live one is reported: {said}");
+    }
+
+    /// fails if the notice for a single live row suggests a command wider
+    /// than the one the operator typed.
+    ///
+    /// `shep start 0` against a live instance answered "`shep restart zam`
+    /// replaces it", which replaces all ten. The suggestion has to be the
+    /// operator's own token whenever there is one; only a path or Flockfile
+    /// target, which is not a selector and cannot be quoted back, falls back
+    /// to the name.
+    #[tokio::test]
+    async fn the_already_up_notice_quotes_the_operators_own_token() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, _envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0]), &[])).await;
+
+        let (code, said) = start_against(&client, "0").await;
+
+        assert_eq!(code, ExitCode::Success);
+        assert!(
+            said.contains("`shep restart 0`"),
+            "the one row the operator named: {said}"
+        );
+        assert!(
+            !said.contains("`shep restart zam`"),
+            "never the name, which would replace every instance of it: {said}"
+        );
     }
 
     /// fails if one row failing to spawn abandons the rows after it.
