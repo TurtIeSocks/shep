@@ -41,23 +41,34 @@ reviews:
     # that release-plz generated from commits already reviewed on their own
     # pull requests, and .github/workflows/release-plz-pr.yml auto-merges it
     # behind the `main` ruleset without a human in front of it. Eight of the
-    # last twenty pull requests here were releases, and CodeRabbit read every
-    # one; #38 got a 5.4 KB walkthrough and an approval nobody read.
+    # twenty pull requests before this rule went in were releases, and
+    # CodeRabbit read every one; #38 got a 5.4 KB walkthrough and an approval
+    # nobody read.
     #
-    # Matched on the title, not the author. `ignore_usernames` looks like the
-    # tidier answer and is the wrong one: release-plz posts under
-    # RELEASE_PLZ_TOKEN, which is the maintainer's PAT, so the release pull
-    # requests are authored by the same account as every other pull request
-    # in the repository. Ignoring that username would ignore all of them.
+    # Matched on a LABEL, which release-plz attaches itself through
+    # `pr_labels` in release-plz.toml. `!release` means "review everything
+    # except a pull request carrying this label".
     #
-    # The trailing `v` is load-bearing. Matching is a case-insensitive
-    # substring, so a bare "chore: release" would also swallow a real pull
-    # request titled "chore: release process cleanup". Every release-plz
-    # title here is "chore: release v0.1.9" and friends. If release-plz ever
-    # changes that format this stops matching and reviews come back, which is
-    # the failure worth having.
-    ignore_title_keywords:
-      - "chore: release v"
+    # ## Two mechanisms that look right and are not
+    #
+    # `ignore_usernames` is the tidier-looking answer and is wrong here:
+    # release-plz posts under RELEASE_PLZ_TOKEN, which is the maintainer's
+    # PAT, so its pull requests are authored by the same account as every
+    # other pull request in this repository. Ignoring that username would
+    # ignore all of them.
+    #
+    # `ignore_title_keywords: ["chore: release v"]` was tried first and did
+    # NOT hold, which is worth recording so nobody re-derives it. On #40 the
+    # configuration was present on the head commit, carried that exact
+    # keyword, and the title was "chore: release v0.1.10" -- and CodeRabbit
+    # reviewed it anyway, reporting a commit RANGE rather than a whole pull
+    # request. That is the tell: release-plz force-pushes its branch on every
+    # push to main, each force-push starts an incremental review, and the
+    # title gate does not appear to be re-evaluated on those. A label is
+    # checked per review instead of parsed once, so it survives the
+    # force-push that defeated the keyword.
+    labels:
+      - "!release"
 
   # Excluded because a comment on any of these cannot be acted on without
   # regenerating the file, which means the comment belongs on the generator
