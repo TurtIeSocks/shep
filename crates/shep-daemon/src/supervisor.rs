@@ -4460,7 +4460,7 @@ impl<R: ProcessRunner> Actor<R> {
                         .sheep
                         .get_mut(&old_id)
                         .expect("spawn_replacement: the drainee was marked a moment ago");
-                    drainee.entry.status = ProcStatus::Online;
+                    drainee.entry.status = restored_status(drainee);
                     drainee.entry.reload = ReloadState::None;
                 }
                 Err(error.to_string())
@@ -4884,18 +4884,21 @@ impl<R: ProcessRunner> Actor<R> {
         // block holds a mutable borrow while it decides it.
         let kept = self.sheep.get_mut(&job.swap.old_id).map(|drainee| {
             drainee.entry.reload = ReloadState::None;
-            // `Online` only where going back to serving is actually true.
-            // Two abandonments reach a drainee for which it is not. When the
-            // drainee's OWN exit is what triggered this, its task is already
-            // gone and the ordinary decision path is about to set the status
-            // anyway. When an operator's `stop` matched both halves and the
-            // replacement's exit landed first, the drainee is mid-kill-ladder
-            // with that command holding its marker. `Stopping` is the honest
-            // status for both, and writing `Online` over it hands an operator
-            // a live pid for a process on its way out — and starts
+            // Restored only where going back to what it was is actually
+            // available. Two abandonments reach a drainee for which it is not.
+            // When the drainee's OWN exit is what triggered this, its task is
+            // already gone and the ordinary decision path is about to set the
+            // status anyway. When an operator's `stop` matched both halves and
+            // the replacement's exit landed first, the drainee is
+            // mid-kill-ladder with that command holding its marker. `Stopping`
+            // is the honest status for both, and writing over it hands an
+            // operator a live pid for a process on its way out — and starts
             // `handle_extra_restart`'s `Online` guard passing for it again.
+            //
+            // WHAT it goes back to is `restored_status`'s to say, because a
+            // drainee is no longer always an instance that was serving.
             if drainee.ctl.is_some() && drainee.manual.is_none() {
-                drainee.entry.status = ProcStatus::Online;
+                drainee.entry.status = restored_status(drainee);
             }
             to_info(&drainee.entry, &self.smits)
         });
@@ -6809,6 +6812,28 @@ impl From<ExitOutcome> for ExitInfo {
 /// about the moment the swap starts rather than about the selector pass.
 fn reload_eligible(slot: &SheepSlot) -> bool {
     slot.entry.status == ProcStatus::Online || slot.ready_failed
+}
+
+/// The status a drainee goes back to when its swap is undone.
+///
+/// `Online` for an instance that was serving, which is nearly every one of
+/// them. `Starting` for one an earlier reload had already parked, which is the
+/// case [`reload_eligible`] opened up: that instance never proved it could
+/// serve, so restoring it to `Online` would invent the exact claim this whole
+/// change exists to stop making, and would invent it on the rollback path
+/// where somebody is watching for it. `ready_failed` stays set alongside, so
+/// the next attempt can still replace it.
+///
+/// Shared by the two sites that undo a swap for the reason [`reload_eligible`]
+/// is shared by the two that start one: they answer one question, and a reload
+/// that got two different answers would restore a status it had just refused
+/// to write.
+fn restored_status(slot: &SheepSlot) -> ProcStatus {
+    if slot.ready_failed {
+        ProcStatus::Starting
+    } else {
+        ProcStatus::Online
+    }
 }
 
 fn spec_prober(spec: &SpawnSpec) -> Arc<dyn Prober> {
@@ -9652,6 +9677,81 @@ mod tests {
             "a sheep still waiting on its own readiness is left to finish"
         );
         assert_eq!(actor.sheep[&0].entry.status, ProcStatus::Starting);
+    }
+
+    // fails if undoing a swap invents an `Online` the instance never had.
+    //
+    // The hole this closes was opened by the widening two cases up. Once a
+    // parked instance is replaceable, it can be a DRAINEE, and both sites that
+    // undo a swap restored a drainee to `Online` because until now every
+    // drainee had been serving. A rollback whose own replacement fails to
+    // spawn would then leave the app reading `online` while nothing answers,
+    // which is the claim this whole change exists to stop making, arrived at
+    // through the path added to recover from it.
+    #[tokio::test(start_paused = true)]
+    async fn undoing_a_swap_never_promotes_a_parked_drainee_to_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = probed_app("web");
+        // Overlap, so the drainee is marked and then restored in place; a
+        // serial swap has no drainee left to restore by the time it can fail.
+        app.reuse_port = true;
+        // No scripts, so `runner.spawn` fails and `spawn_replacement` takes
+        // the `Err` arm that does the restoring.
+        let (mut actor, _mailbox) = actor_with_one_online_sheep_of(&dir, app, vec![]);
+        let slot = actor.sheep.get_mut(&0).expect("the fixture's sheep");
+        slot.entry.status = ProcStatus::Starting;
+        slot.ready_failed = true;
+
+        actor
+            .spawn_replacement(0, ReloadMode::Overlap)
+            .expect_err("a runner with no scripts left cannot spawn");
+
+        let slot = actor.sheep.get(&0).expect("the drainee stays registered");
+        assert_eq!(
+            slot.entry.status,
+            ProcStatus::Starting,
+            "an instance that never proved itself is not restored to online"
+        );
+        assert_eq!(slot.entry.reload, ReloadState::None);
+        assert!(
+            slot.ready_failed,
+            "and it stays replaceable, or the next attempt cannot reach it"
+        );
+    }
+
+    // fails if the same promotion happens through `abort_reload` instead. The
+    // sibling above covers the spawn that never happened; this covers the swap
+    // that started and was given up.
+    #[tokio::test(start_paused = true)]
+    async fn abandoning_a_swap_never_promotes_a_parked_drainee_to_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = probed_app("web");
+        app.reuse_port = true;
+        let (mut actor, _mailbox) =
+            actor_with_one_online_sheep_of(&dir, app, vec![ProcScript::never_exits()]);
+        // A live control sender is what says this instance's task is still
+        // there to go back to; the fixture leaves it `None`.
+        let (ctl_tx, _ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+        let slot = actor.sheep.get_mut(&0).expect("the fixture's sheep");
+        slot.ctl = Some(ctl_tx);
+        slot.entry.status = ProcStatus::Starting;
+        slot.ready_failed = true;
+
+        let (reply, _rx) = oneshot::channel();
+        actor.handle_reload(&ProcessSelector::Name("web".to_string()), reply);
+        assert!(
+            actor.reloads.contains_key("web"),
+            "the parked instance is the one being replaced"
+        );
+
+        actor.abort_reload("web", "the replacement was not ready inside listen_timeout");
+
+        assert_eq!(
+            actor.sheep[&0].entry.status,
+            ProcStatus::Starting,
+            "an instance that never proved itself is not restored to online"
+        );
+        assert!(actor.sheep[&0].ready_failed);
     }
 
     // --- Reload: the post-drain check an overlap still owes ---
