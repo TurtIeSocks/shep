@@ -880,13 +880,19 @@ async fn resume_all(
         }
     }
 
+    // Every row is attempted and the FIRST failure is what the verb returns,
+    // the discipline `request_each` states for the selector-taking verbs:
+    // stopping at the first failure leaves the operator guessing which of the
+    // rest were touched. This returned early, so one app in a fold failing to
+    // spawn abandoned the fold's remaining apps in silence.
+    let mut failure: Option<ExitCode> = None;
     for sheep in asleep {
         let code = resume(client, streams, sheep, started).await;
         if code != ExitCode::Success {
-            return code;
+            failure = failure.or(Some(code));
         }
     }
-    ExitCode::Success
+    failure.unwrap_or(ExitCode::Success)
 }
 
 /// Every distinct name in `infos`, in the order they first appear.
@@ -2663,6 +2669,41 @@ mod tests {
             "the two that were down, and not the one that was up"
         );
         assert!(said.contains("already"), "the live one is reported: {said}");
+    }
+
+    /// fails if one row failing to spawn abandons the rows after it.
+    ///
+    /// `request_each` states the discipline for every selector-taking verb --
+    /// attempt them all, report the FIRST failure -- because stopping early
+    /// leaves the operator guessing which of the rest were touched.
+    /// `resume_all` returned on the first failure instead, so one app in a
+    /// fold failing to come up left the fold's remaining apps down without a
+    /// word about them.
+    #[tokio::test]
+    async fn a_row_that_cannot_spawn_does_not_abandon_the_rows_after_it() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[]), &[0])).await;
+
+        let (code, said) = start_against(&client, "all").await;
+
+        assert_eq!(code, ExitCode::SpawnFailed, "the first failure is the code");
+        assert_eq!(
+            respawns(&mut envelopes),
+            vec![
+                SelectorSpec::Id(0),
+                SelectorSpec::Id(1),
+                SelectorSpec::Id(2)
+            ],
+            "every row is attempted, not just the ones before the failure"
+        );
+        assert!(
+            said.contains("id 0"),
+            "and the failure names the row, not just the app: {said}"
+        );
     }
 
     /// fails if a Flockfile naming a clustered app starts only one instance.
