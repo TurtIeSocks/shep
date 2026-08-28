@@ -59,11 +59,15 @@ jobs:
   # never reports at all, so every required check sits at "Expected" forever
   # and a docs pull request can never merge. Same feature, opposite outcomes.
   #
-  # `changes` itself is in the ruleset's required checks. That closes the
-  # fail-open corner: if this job errors, its outputs are empty, every gated
-  # job skips, and skipped-counts-as-success would otherwise wave the pull
-  # request through with nothing run. With `changes` required, a filter
-  # failure is a red check instead.
+  # The fail-open corner is closed in the gate expression itself, not in the
+  # ruleset. If this job errors its outputs are empty, and a naive gate would
+  # skip every job while skipped-counts-as-success waves the pull request
+  # through with nothing run. So every gated `if:` also runs on
+  # `needs.changes.result != 'success'`: a filter failure runs the FULL
+  # matrix, which is the pre-gate behaviour and the safe direction. The
+  # `!cancelled()` prefix is what lets a job with a failed dependency run at
+  # all; without it, GitHub skips dependants of a failed job before reading
+  # their condition.
   #
   # Three docs paths count as RUST on purpose, because Rust tests pin them:
   # `docs/whistle/tools.md` is include_str!'d by whistle::catalogue's
@@ -105,7 +109,7 @@ jobs:
               - 'benches/**'
   lint:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -120,7 +124,7 @@ jobs:
       - run: cargo +1.93 clippy --workspace --all-targets --all-features -- -D warnings
   docs:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -138,7 +142,7 @@ jobs:
       - uses: crate-ci/typos@v1
   test:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     strategy:
       fail-fast: false
       matrix:
@@ -161,7 +165,7 @@ jobs:
       - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   minimal-versions:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # Resolves a whole second lockfile before it builds anything, so it never
     # gets the cache hit the other Linux jobs do.
@@ -174,7 +178,7 @@ jobs:
       - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   musl:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # Builds the whole tree for a second target, from cold, on the first run
     # of a branch.
@@ -210,7 +214,7 @@ jobs:
   # target's compile-time coverage.
   windows-gnu:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # 39s on the last green run; the floor is doing all the work.
     timeout-minutes: 10
@@ -222,7 +226,7 @@ jobs:
       - run: cargo check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu
   features:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     strategy:
       fail-fast: false
       matrix:
@@ -272,7 +276,7 @@ jobs:
   # `cfg(unix)` -- that is the platform split, not a filter typo.
   slow:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     strategy:
       fail-fast: false
       matrix:
@@ -302,7 +306,7 @@ jobs:
   # first, so this job never reached `daemon_e2e`.
   coverage:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # Instrumented builds are the slowest thing on Linux here, and this job
     # also installs a tool before it starts.
@@ -321,7 +325,7 @@ jobs:
         with: { name: coverage, path: lcov.info }
   bench:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.bench == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.bench == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     # `benches/` is its own `[workspace]` (see benches/Cargo.toml), excluded
     # from the root workspace on purpose so a bench-only dependency can never
     # end up in a shipped binary's tree. That means the `test` job's `1.88`
@@ -345,7 +349,7 @@ jobs:
       - run: cargo +${{ matrix.toolchain }} bench --manifest-path benches/Cargo.toml -- --test
   privileged:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
     # The one `#[ignore]`d test that is ignored for want of privilege rather
     # than by design: `real_runner.rs`'s privilege-drop case needs a real uid
     # change and a real supplementary-group clear, which needs root. The other
