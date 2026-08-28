@@ -86,9 +86,12 @@ jobs:
       bench: ${{ steps.filter.outputs.bench }}
     steps:
       - uses: actions/checkout@v4
-      # Moving tag, like every other action in this file: this workflow holds
-      # no secrets (the header up top has the full argument).
-      - uses: dorny/paths-filter@v3
+      # Pinned by commit like Swatinem/rust-cache above, not by moving tag
+      # like checkout and typos. This workflow holds no secrets, but this
+      # action's OUTPUT decides whether any test runs at all, so a moved tag
+      # here could silently skip the whole matrix rather than merely run
+      # different action code.
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         with:
           filters: |
