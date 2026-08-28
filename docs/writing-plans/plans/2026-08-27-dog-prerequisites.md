@@ -2490,7 +2490,7 @@ Separate commits, because they are four different asks and each should be revert
 - Consumes: Tasks 1 through 9.
 - Produces: the published `shep-client` that `shep-deploy`'s Task 12 waits on.
 
-**The changelogs are generated, so do not hand-write one.** This said the opposite until 2026-08-27, when `release-plz.toml` moved to `changelog_update = true` to match zendriver-rs. The two objections recorded against generation are handled rather than gone: `release-plz-changelog.toml` skips docs, test, ci, chore and style commits so a generated section no longer duplicates hand-written entries, and `typos` is a required check on `main`, so a misspelled commit subject blocks its own release pull request instead of landing in a tracked file. Write a conventional commit subject; the release pull request carries it. All four crates share one version through `[workspace.package]`.
+**The changelogs are generated, so do not hand-write one.** This said the opposite until 2026-08-27, when `release-plz.toml` moved to `changelog_update = true` to match zendriver-rs. The two objections recorded against generation are handled rather than gone: `release-plz-changelog.toml` skips docs, test, ci, chore and style commits so a generated section no longer duplicates hand-written entries, and `typos` is a required check on `main`, so a misspelled commit subject blocks its own release pull request instead of landing in a tracked file. Two commits survive those skips deliberately, and Step 1 says which. Write a conventional commit subject; the release pull request carries it. All four crates share one version through `[workspace.package]`.
 
 - [ ] **Step 1: Check what the release pull request will say**
 
@@ -2501,6 +2501,11 @@ git log --oneline main..HEAD
 ```
 
 Every line that should appear must start `feat`, `fix`, `perf` or `refactor`; `release-plz-changelog.toml` drops `docs`, `test`, `ci`, `chore` and `style`. A change that matters to an operator and landed under a dropped prefix is invisible in the release. If you find one, amend the subject rather than adding a changelog entry by hand.
+
+Two things survive the skips, and neither is a prefix you should reach for:
+
+- **Any commit marked breaking.** `protect_breaking_commits = true` keeps it whichever parser matched, so even `chore!:` reaches the changelog. That is the safety net, not a licence to file a breaking change under `chore`. Use `feat!` or `fix!` and let the exclamation mark do its own work.
+- **`chore: update Cargo.toml dependencies`**, release-plz's own synthetic lockstep bump. It is parsed before the generic `chore` skip and grouped under `Internal`, so a version bump carrying nothing else is visible rather than a silent empty section. Do not write that subject by hand; release-plz generates it.
 
 **Know what this costs, because it is a real loss.** `crates/shep-core/CHANGELOG.md:12-32`, the `last_exit` entry, runs twenty lines and carries the reasoning rather than the diff. A generated entry cannot do that: it gets one line. So the reasoning goes in the commit **body**, where `git log` and `git blame` keep it, and the changelog carries the subject. That is the trade this repository made on 2026-08-27 when it moved to `changelog_update = true`; it was `false` precisely because generation is shallower.
 

@@ -48,7 +48,11 @@
 # Both are handled rather than accepted. release-plz-changelog.toml skips
 # docs, test, ci, chore and style commits and emits Keep a Changelog form,
 # which is the form these files already use, so a generated section is short
-# and matches its neighbours. And `typos` is a required check on main, so a
+# and matches its neighbours. Two commits survive those skips on purpose:
+# release-plz's own `chore: update Cargo.toml dependencies`, which is parsed
+# before the generic chore skip and grouped under Internal so a lockstep bump
+# is not a silent empty section; and anything marked breaking, which
+# `protect_breaking_commits` keeps whichever parser matched it. And `typos` is a required check on main, so a
 # commit subject that would poison a changelog now blocks its own release PR
 # from merging instead of landing.
 #

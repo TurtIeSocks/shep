@@ -124,7 +124,8 @@ jobs:
           # The other no-op shape, and the one that got through on 2026-08-27.
           # release-plz bumps the version even when every commit since the last
           # release was filtered out by release-plz-changelog.toml, which skips
-          # docs, test, ci, chore and style. shep-deploy's release PR #1 was a
+          # docs, test, ci, chore and style, sparing only a breaking commit and
+          # release-plz's own dependency bump. shep-deploy's release PR #1 was a
           # lone `ci:` commit and came out as `## [0.1.1]` with nothing under
           # it: a contentless version header, which is exactly what zendriver's
           # 44 empty releases looked like. The version test above passes it, and
