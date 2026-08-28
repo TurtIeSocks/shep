@@ -434,10 +434,11 @@ a different problem: a pipe holds 64 KiB, so a child filling stdout blocks and
 never exits, and a deadline that read the pipes after the wait could not fire
 on the loudest children it exists for. `Command::output` spawns them for the
 same reason. The budget covers the reads as well as the wait, so a process
-node left behind on the inherited pipe cannot outlast it either. That case
-gets its own answer and its own sentence: node exited on its own there and
-nothing was killed, so a refusal claiming a kill would be describing a
-different failure.
+node left behind on an inherited pipe cannot hold `run_bounded` past the
+deadline. It can outlive the budget perfectly well, and shep has no handle on
+it: that process is not shep's child. So the case gets its own answer and its
+own sentence, because node exited on its own there and nothing was killed,
+and a refusal claiming a kill would be describing a different failure.
 
 **No knob.** 30s is a const, not a flag and not a `shep.toml` key. Nothing
 honest reaches it, and a config that does has a bug the operator wants to hear
