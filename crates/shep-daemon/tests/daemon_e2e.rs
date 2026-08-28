@@ -76,15 +76,25 @@ impl Fixture {
             &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),
             std::path::Path::new("/nonexistent"),
         );
-        let daemon = boot(
-            TokioRunner::new(),
-            paths.clone(),
-            BootOptions {
-                restore,
-                ..BootOptions::default()
-            },
+        // Bounded like every other wait in this file. `boot` binds the
+        // control address, which on Windows is a machine-global pipe
+        // name rather than a path under `dir`, so it is the one step
+        // here that can block on something outside this test's own
+        // tempdir. Unbounded, that is a silent CI hang; bounded, it is a
+        // named panic.
+        let daemon = tokio::time::timeout(
+            RECV_TIMEOUT,
+            boot(
+                TokioRunner::new(),
+                paths.clone(),
+                BootOptions {
+                    restore,
+                    ..BootOptions::default()
+                },
+            ),
         )
         .await
+        .expect("boot must not hang: the control address is already held")
         .expect("the daemon must boot on a fresh home");
         let ctx = daemon.context();
         let run = tokio::spawn(daemon.run());
@@ -98,7 +108,13 @@ impl Fixture {
     }
 
     async fn connect(&self) -> Client {
-        let stream = transport::connect(&self.paths.socket).await.unwrap();
+        // `transport::connect` retries ERROR_PIPE_BUSY forever, and its
+        // own doc says that is safe only because every caller bounds it.
+        // This one is a caller.
+        let stream = tokio::time::timeout(RECV_TIMEOUT, transport::connect(&self.paths.socket))
+            .await
+            .expect("connect must not hang: the pipe stayed busy")
+            .unwrap();
         let mut client = Client {
             frames: Framed::new(stream, codec()),
             next_id: 1,
@@ -718,22 +734,20 @@ async fn await_file_contents(path: &std::path::Path, expected: &str) {
 /// The sheep's own log path is read off the `Started` reply rather than
 /// derived here, so the test cannot disagree with the daemon about which
 /// file it is looking at.
-// TEMPORARY, must not survive this pull request. Re-ignored after 57d7d80
-// un-ignored it, because that experiment produced a result rather than a fix.
+// Ran ignored on Windows for four commits while the CI hang was chased.
+// What that cost bought: the case passes on the runner ALONE (2.05s) and
+// hung when the binary ran its cases together, and the RECV_TIMEOUT on
+// `Client::request` never fired, so whatever blocked was not a request
+// awaiting a reply.
 //
-// What it established, worth more than the green run it cost: this case
-// passes on the runner when run ALONE (2.05s, windows-probe on 59b120b) and
-// hangs when the daemon_e2e binary runs its seven cases together. The fault
-// is concurrency, not this test, so re-reading it line by line will not find
-// it.
+// That narrowed it to the two awaits in `Fixture` that had no deadline,
+// `boot` and `connect`, which are now bounded like everything else here.
+// `transport::connect` retries ERROR_PIPE_BUSY forever by design and its
+// doc says so; this fixture was a caller that did not bound it.
 //
-// It also rules out the obvious suspect. The RECV_TIMEOUT added to
-// `Client::request` in 4ac5ea7 did NOT fire, so whatever blocks is not a
-// request awaiting a reply. The unbounded wait is somewhere else.
-#[cfg_attr(
-    windows,
-    ignore = "hangs only when the suite runs concurrently; see comment"
-)]
+// Un-ignored deliberately rather than once a fix was proven: bounded, the
+// worst case is a named panic naming the step, which is a report. Ignored,
+// the worst case is a silent twelve-minute step, which is not.
 #[tokio::test]
 async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
