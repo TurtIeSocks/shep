@@ -20,6 +20,7 @@ use shep_core::selector::ProcessSelector;
 
 use crate::cli::Format;
 use crate::cli::{SelectorArgs, StartArgs, StockArgs};
+use crate::commands::bounded::{Bounded, run_bounded};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_flock, write_outcome};
@@ -139,6 +140,17 @@ pub(crate) fn target_exit_code(err: &TargetError) -> ExitCode {
     }
 }
 
+/// How long node gets to hand back a `.js` Flockfile's JSON before shep
+/// kills it.
+///
+/// 30s, against the ~60ms `node -e` spends requiring a small module on this
+/// machine and the couple of seconds a large dependency tree costs on a cold
+/// filesystem. It is not a performance dial: nothing waits on this except a
+/// config that has already gone wrong, so it is set far enough out that no
+/// honest module can reach it and near enough that an unattended `shep
+/// start` still ends.
+const JS_EVAL_BUDGET: Duration = Duration::from_secs(30);
+
 /// The script handed to `node -e`. Wraps the `require` in its own
 /// `try`/`catch` rather than letting an uncaught exception crash node and
 /// relying on node's own crash-dump formatting — see this function's doc for
@@ -179,10 +191,14 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 /// the path at `process.argv[1]`, never in the source), so it is a narrower
 /// implementation choice, not a different design.
 ///
-/// **There is no timeout.** A module that never returns — one that starts a
-/// server at require time — hangs here. The process is in the foreground and
-/// interruptible; adding a bound means a reaper thread in a crate that
-/// forbids unsafe code. Recorded in `docs/specs/deferred.md`.
+/// **`budget` bounds the whole evaluation**, and node is killed the moment it
+/// runs out. What has to happen inside it is node EXITING, not `require`
+/// returning: a module that leaves a server listening or a timer armed can
+/// assign `module.exports` and return while node's event loop stays alive, so
+/// this used to hang until somebody pressed Ctrl-C. That is a fair answer at
+/// a terminal and no answer at all for the CI job or provisioning script
+/// running `shep start` with nobody watching. [`run_bounded`] is the
+/// mechanism; [`JS_EVAL_BUDGET`] is what every caller passes.
 ///
 /// The `node_missing` sentence IS pinned, as of Phase 17, by `cli_e2e`'s
 /// `a_js_flockfile_without_node_says_so_and_says_what_to_do`. This doc used
@@ -200,20 +216,46 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 ///
 /// - [`TargetError::Read`] — the path could not be canonicalized.
 /// - [`TargetError::Js`] with `node_missing` — node is not on `PATH`.
-/// - [`TargetError::Js`] — node ran and failed, or could not be spawned.
-fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
+/// - [`TargetError::Js`] — node ran and failed, could not be spawned, was
+///   still running when `budget` ran out, or exited leaving a process of its
+///   own holding the output shep was reading.
+fn evaluate_js_flockfile(path: &Path, budget: Duration) -> Result<String, TargetError> {
     let absolute = std::fs::canonicalize(path).map_err(|source| TargetError::Read {
         path: path.to_path_buf(),
         source,
     })?;
-    let output = std::process::Command::new("node")
+    let mut command = std::process::Command::new("node");
+    command
         .arg("-e")
         .arg(JS_BRIDGE_SCRIPT)
         .arg(&absolute)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let output = match output {
-        Ok(output) => output,
+        .stdin(std::process::Stdio::null());
+    let output = match run_bounded(&mut command, budget) {
+        Ok(Bounded::Exited(output)) => output,
+        Ok(Bounded::Killed) => {
+            return Err(TargetError::Js {
+                detail: format!(
+                    "node was still running {} after {}s, so shep killed it; a Flockfile \
+                     module has to export its config and let node exit, and one that leaves a \
+                     server listening or a timer armed does not",
+                    path.display(),
+                    budget.as_secs_f32()
+                ),
+                node_missing: false,
+            });
+        }
+        Ok(Bounded::OutputHeldOpen) => {
+            return Err(TargetError::Js {
+                detail: format!(
+                    "node finished with {} within {}s, but a process it left behind still \
+                     holds the output shep was reading, so shep gave up on it; a Flockfile \
+                     module must not leave a child of its own on node's stdout or stderr",
+                    path.display(),
+                    budget.as_secs_f32()
+                ),
+                node_missing: false,
+            });
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(TargetError::Js {
                 detail: format!(
@@ -283,7 +325,8 @@ fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
 /// - [`TargetError::UnknownFlockfileFormat`] — `as_flockfile` is set and
 ///   `target`'s extension names no readable format.
 /// - [`TargetError::Js`] — `as_flockfile` is set, `target` is a `.js` file,
-///   and node could not be run or could not evaluate it.
+///   and node could not be run, could not evaluate it, or was still at it
+///   after [`JS_EVAL_BUDGET`].
 /// - [`TargetError::Unresolvable`] — `target` matched none of the above.
 pub fn resolve_target(
     target: &str,
@@ -312,7 +355,7 @@ pub fn resolve_target(
                 Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
             }
             None if path.extension().and_then(|e| e.to_str()) == Some("js") => {
-                let json = evaluate_js_flockfile(path)?;
+                let json = evaluate_js_flockfile(path, JS_EVAL_BUDGET)?;
                 let flockfile = Flockfile::parse(&json, FlockFormat::Json)?;
                 Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
             }
@@ -1756,6 +1799,41 @@ mod tests {
         assert!(err.to_string().contains("sheep dip empty"), "got: {err}");
     }
 
+    /// fails if a config module that keeps node alive hangs shep, which is
+    /// exactly what one did until this budget existed. `setInterval` leaves a
+    /// handle on node's event loop, so node stays running long after `require`
+    /// returned and `module.exports` was assigned -- the same mechanism as the
+    /// server-at-require-time shape `docs/specs/deferred.md` named, without
+    /// binding a port to get it.
+    ///
+    /// The budget is 200ms rather than [`JS_EVAL_BUDGET`] so the test costs a
+    /// fifth of a second; what it pins is that the bound is enforced and says
+    /// so, not what the shipped bound is.
+    #[test]
+    fn a_js_flockfile_that_keeps_node_alive_is_killed_and_says_why() {
+        if !node_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flock.js");
+        std::fs::write(
+            &path,
+            "setInterval(() => {}, 1000); module.exports = { app: [] };",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = evaluate_js_flockfile(&path, Duration::from_millis(200)).unwrap_err();
+
+        assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+        assert!(err.to_string().contains("still running"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "node was waited out rather than killed, in {:?}",
+            started.elapsed()
+        );
+    }
+
     /// fails if a pm2 ecosystem file is accepted, or if the refusal stops
     /// naming the key the operator has to change. Decision 2: this feature
     /// reads a Flockfile-shaped .js, and serde's own message is the answer.
@@ -2838,5 +2916,54 @@ mod tests {
             String::from_utf8(err).unwrap().contains("shep delete web"),
             "the daemon's own sentence has to reach the operator"
         );
+    }
+
+    /// Wall-clock tests, skipped by every CI job but the serial `slow` one.
+    ///
+    /// The case below needs a real node to START AND EXIT inside the budget,
+    /// which is a claim about how fast the machine is rather than about shep.
+    /// At 200ms it failed on four CI runners at once (arm, macos, musl and
+    /// the coverage job) while passing every local run: node took longer than
+    /// that to come up, so the run hit the deadline still running and shep
+    /// reported the kill it really had performed. The tier exists for exactly
+    /// this, and the budget here is 5s because a stalled read waits out
+    /// whatever is left of it, so the budget IS what the test costs.
+    mod slow {
+        use super::*;
+
+        /// fails if a module that leaves a process on node's stdout is
+        /// reported as a module shep killed. node itself exits here:
+        /// `detached` plus `unref` takes the child off node's event loop, and
+        /// `stdio: inherit` hands it the pipes shep is reading, so the wait
+        /// ends on its own and only the reads run out of budget.
+        #[test]
+        fn a_js_flockfile_leaving_a_process_on_the_pipe_says_that_instead() {
+            if !node_available() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("flock.js");
+            std::fs::write(
+                &path,
+                "require('child_process')\
+                 .spawn('sleep', ['30'], { detached: true, stdio: 'inherit' })\
+                 .unref(); \
+                 module.exports = { app: [] };",
+            )
+            .unwrap();
+
+            let err = evaluate_js_flockfile(&path, Duration::from_secs(5)).unwrap_err();
+
+            assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+            let message = err.to_string();
+            assert!(
+                message.contains("left behind still holds the output"),
+                "got: {message}"
+            );
+            assert!(
+                !message.contains("killed"),
+                "node exited on its own, so nothing was killed: {message}"
+            );
+        }
     }
 }

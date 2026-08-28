@@ -58,6 +58,15 @@ both halves: `cargo test -p shep --lib --bins --all-features`. `--bins`
 alone now runs almost nothing, since every unit test in the crate lives in the
 library.
 
+`shep` has a `mod slow` of its own as of 2026-08-28, one test, in
+`commands/lifecycle.rs`. It needs a real node to start and exit inside a
+budget, which is a claim about the machine's speed rather than about shep: at
+200ms it failed on four CI runners at once while passing every local run. Add
+`-- --skip ::slow::` to a shep-scoped run for the same reason the daemon one
+carries it. CI already covers it: the `slow` job runs `--workspace`, chosen so
+a `mod slow` outside shep-daemon could not end up skipped everywhere and run
+nowhere.
+
 ### The task gate — run once, when the task is otherwise done
 
 ```bash

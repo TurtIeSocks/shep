@@ -168,6 +168,13 @@ flockfile.json5`}</CodeBlock>
     </p>
     <CodeBlock>{`$ shep start flock.config.js --flockfile`}</CodeBlock>
     <p class="fine">
+      shep gives <code>node</code> 30 seconds to hand the config back and
+      exit, then kills it. Exporting the config is not enough by itself: a
+      module that leaves a server listening or a timer armed keeps node's
+      event loop alive, so node never exits. An unattended
+      <code>shep start</code> ends in a refusal instead of waiting forever.
+    </p>
+    <p class="fine">
       A pm2 <code>ecosystem.config.js</code> is not a Flockfile shep can read
       this way. shep never parses pm2's config format at all. That's what
       <code>shep import</code> is for: it reads a real <code>dump.pm2</code>
