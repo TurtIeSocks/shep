@@ -103,6 +103,8 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr).number }}
         run: |
+          set -euo pipefail
+
           # The version VALUE has to change, not merely appear in a file the
           # diff happens to touch. release-plz also rewrites intra-workspace
           # dependency versions inside Cargo.toml, so a path-presence test would
@@ -114,13 +116,26 @@ jobs:
           }
           base_sha="$(gh pr view "$PR_NUMBER" --json baseRefOid --jq .baseRefOid)"
           head_sha="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)"
-          if [ "$(manifest_version "$base_sha")" = "$(manifest_version "$head_sha")" ]; then
+          base_version="$(manifest_version "$base_sha")" || base_version=""
+          head_version="$(manifest_version "$head_sha")" || head_version=""
+          # Fail closed on a fetch error. Without this, ONE failed API call
+          # leaves an empty string, the two versions then differ, and the guard
+          # reads a network blip as "a version was bumped". Both failing is
+          # already safe, since two empty strings compare equal; it is the
+          # asymmetric failure that publishes.
+          if [ -z "$base_version" ] || [ -z "$head_version" ]; then
+            echo "::error::could not read Cargo.toml at $base_sha or at $head_sha, so a version change cannot be confirmed."
+            echo "::error::Refusing rather than guessing. Re-run the job."
+            exit 1
+          fi
+          if [ "$base_version" = "$head_version" ]; then
             echo "::error::release PR #$PR_NUMBER changes no version in Cargo.toml, so it will not be auto-merged."
             echo "::error::That is the no-op shape that looped on zendriver-rs on 2026-08-08, and also"
             echo "::error::what a hand-edited version leaves behind. Left open for a human: merge it if"
             echo "::error::the changelog entry is wanted, close it if this is a loop."
             exit 1
           fi
+
           # The other no-op shape, and the one that got through on 2026-08-27.
           # release-plz bumps the version even when every commit since the last
           # release was filtered out by release-plz-changelog.toml, which skips
@@ -130,6 +145,12 @@ jobs:
           # it: a contentless version header, which is exactly what zendriver's
           # 44 empty releases looked like. The version test above passes it, and
           # correctly so: the bump is real. The changelog is what is empty.
+          #
+          # Scoped to the changelogs' own added lines, and to the section the
+          # release adds. `gh pr diff` prints every file in the pull request, so
+          # a bullet added anywhere else would otherwise satisfy a guard whose
+          # whole question is whether the NEW VERSION has content.
+          #
           # Leading whitespace is tolerated even though the template's `trim =
           # true` strips it per line, which zendriver-rs's own generated
           # sections confirm: `crates/zendriver-fetcher/CHANGELOG.md` 0.2.0 has
@@ -137,12 +158,24 @@ jobs:
           # slack is here because this guard fails CLOSED. Drop `trim` from
           # release-plz-changelog.toml some day and a strict pattern would stop
           # every release with no signal beyond a red job nobody expects.
-          if ! gh pr diff "$PR_NUMBER" | grep -qE '^\+[[:space:]]*[-*][[:space:]]'; then
-            echo "::error::release PR #$PR_NUMBER bumps a version but adds no changelog entry, so it will not be auto-merged."
+          if ! gh pr diff "$PR_NUMBER" | awk '
+                /^diff --git /                 { in_log = 0 }
+                /^\+\+\+ b\/.*CHANGELOG\.md$/  { in_log = 1; under_new = 0; next }
+                !in_log                        { next }
+                /^\+## \[/                     { under_new = 1; next }
+                under_new && /^\+[[:space:]]*[-*][[:space:]]/ { found = 1 }
+                END                            { exit !found }
+              '; then
+            echo "::error::release PR #$PR_NUMBER bumps a version but its new changelog section is empty, so it will not be auto-merged."
             echo "::error::Every commit since the last release was filtered out by release-plz-changelog.toml."
             echo "::error::Left open for a human: close it, or land something worth releasing first."
             exit 1
           fi
+
+          # Handed to the merge step so it can bind to the head this guard
+          # actually read. See that step for why targeting the PR number alone
+          # is not enough.
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
 
       # Auto-merge so publishing stays hands-off: the merge pushes
       # "chore: release ..." to main, which triggers release-plz-release.yml.
@@ -175,11 +208,20 @@ jobs:
       # deleted, so `git branch --contains` finds nothing and release-plz
       # releases what is checked out. The old release-plz.yml carried a
       # dedicated step to refuse this case; squashing removes the case.
+      #
+      # `--match-head-commit` binds the merge to the commit the guard above
+      # actually inspected. Targeting the pull request number alone leaves a
+      # window: release-plz can push again between the guard and this step, and
+      # `--auto` then sits queued against whatever the head becomes, so the
+      # thing that merges need never have been the thing that was checked.
+      # With the SHA, a moved head refuses instead.
       - name: Auto-merge the release PR
         if: ${{ steps.release-plz.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr).number }}
+          HEAD_SHA: ${{ steps.noop-guard.outputs.head_sha }}
         run: |
-          gh pr merge --auto --squash "$PR_NUMBER" \
-            || gh pr merge --squash "$PR_NUMBER"
+          set -euo pipefail
+          gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_NUMBER" \
+            || gh pr merge --squash --match-head-commit "$HEAD_SHA" "$PR_NUMBER"
