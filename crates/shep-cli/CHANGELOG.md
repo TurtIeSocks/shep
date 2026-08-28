@@ -70,7 +70,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only way out, which is no answer at all for a CI job or a provisioning
   script running `shep start` with nobody watching. node gets 30 seconds now,
   then shep kills it and refuses with `InvalidConfig`, naming the file and the
-  likely cause.
+  likely cause. The near neighbour gets its own sentence rather than the same
+  one: a module that exits cleanly but leaves a process of its own holding
+  node's stdout is refused for that, since nothing was killed there.
 
 - Cell colour is keyed on a column's NAME rather than its index. The old
   `rows_for` painted `row[0]`, `row[4]`, `row[9]` and `row[10]`, which are

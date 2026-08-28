@@ -216,8 +216,9 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 ///
 /// - [`TargetError::Read`] — the path could not be canonicalized.
 /// - [`TargetError::Js`] with `node_missing` — node is not on `PATH`.
-/// - [`TargetError::Js`] — node ran and failed, could not be spawned, or was
-///   still running when `budget` ran out.
+/// - [`TargetError::Js`] — node ran and failed, could not be spawned, was
+///   still running when `budget` ran out, or exited leaving a process of its
+///   own holding the output shep was reading.
 fn evaluate_js_flockfile(path: &Path, budget: Duration) -> Result<String, TargetError> {
     let absolute = std::fs::canonicalize(path).map_err(|source| TargetError::Read {
         path: path.to_path_buf(),
@@ -231,12 +232,24 @@ fn evaluate_js_flockfile(path: &Path, budget: Duration) -> Result<String, Target
         .stdin(std::process::Stdio::null());
     let output = match run_bounded(&mut command, budget) {
         Ok(Bounded::Exited(output)) => output,
-        Ok(Bounded::TimedOut) => {
+        Ok(Bounded::Killed) => {
             return Err(TargetError::Js {
                 detail: format!(
                     "node was still running {} after {}s, so shep killed it; a Flockfile \
                      module has to export its config and let node exit, and one that leaves a \
                      server listening or a timer armed does not",
+                    path.display(),
+                    budget.as_secs_f32()
+                ),
+                node_missing: false,
+            });
+        }
+        Ok(Bounded::OutputHeldOpen) => {
+            return Err(TargetError::Js {
+                detail: format!(
+                    "node finished with {} within {}s, but a process it left behind still \
+                     holds the output shep was reading, so shep gave up on it; a Flockfile \
+                     module must not leave a child of its own on node's stdout or stderr",
                     path.display(),
                     budget.as_secs_f32()
                 ),
@@ -1818,6 +1831,41 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "node was waited out rather than killed, in {:?}",
             started.elapsed()
+        );
+    }
+
+    /// fails if a module that leaves a process on node's stdout is reported
+    /// as a module shep killed. node itself exits here: `detached` plus
+    /// `unref` takes the child off node's event loop, and `stdio: inherit`
+    /// hands it the pipes shep is reading, so the wait ends at once and only
+    /// the reads run out of budget.
+    #[test]
+    fn a_js_flockfile_leaving_a_process_on_the_pipe_says_that_instead() {
+        if !node_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flock.js");
+        std::fs::write(
+            &path,
+            "require('child_process')\
+             .spawn('sleep', ['5'], { detached: true, stdio: 'inherit' })\
+             .unref(); \
+             module.exports = { app: [] };",
+        )
+        .unwrap();
+
+        let err = evaluate_js_flockfile(&path, Duration::from_millis(200)).unwrap_err();
+
+        assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+        let message = err.to_string();
+        assert!(
+            message.contains("left behind still holds the output"),
+            "got: {message}"
+        );
+        assert!(
+            !message.contains("killed"),
+            "node exited on its own, so nothing was killed: {message}"
         );
     }
 

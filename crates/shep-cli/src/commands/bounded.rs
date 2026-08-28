@@ -38,15 +38,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// What a bounded run came back with.
 ///
-/// Not an `Option<Output>`: the timeout is the answer this type exists to
-/// carry, and a bare `None` at the call site says nothing about which of the
-/// two happened.
+/// Not an `Option<Output>`: which way the budget ran out is the answer this
+/// type exists to carry, and a bare `None` at the call site says nothing
+/// about it. The two failures need different sentences, because only one of
+/// them involves shep killing anything.
 #[derive(Debug)]
 pub(crate) enum Bounded {
-    /// The child exited on its own, inside the budget.
+    /// The child exited on its own inside the budget, and both its streams
+    /// arrived.
     Exited(Output),
-    /// The child outlived the budget and was killed.
-    TimedOut,
+    /// The child was still running at the deadline, and was killed.
+    Killed,
+    /// The child exited on its own, but something it left behind still holds
+    /// a captured pipe, so its output never arrived inside the budget.
+    /// Nothing was killed: whatever is holding the pipe is not shep's child
+    /// and shep has no handle on it.
+    OutputHeldOpen,
 }
 
 /// One of a child's output streams, read to the end on its own thread.
@@ -83,9 +90,11 @@ impl Draining {
 /// takes both pipes for itself. stdin is the caller's to decide and is left
 /// exactly as it was.
 ///
-/// The budget covers the reads as well as the wait. A child can exit while a
-/// grandchild it spawned holds the inherited pipe open, and a collection that
-/// blocked there would undo the whole point of the deadline.
+/// The budget covers the reads as well as the wait, and the two ends are
+/// reported apart. A child can exit while a grandchild it spawned holds the
+/// inherited pipe open: a collection that blocked there would undo the whole
+/// point of the deadline, and calling it [`Bounded::Killed`] would claim a
+/// kill that never happened.
 ///
 /// # Errors
 ///
@@ -110,28 +119,34 @@ pub(crate) fn run_bounded(command: &mut Command, budget: Duration) -> std::io::R
             .expect("stderr is piped on the line that spawned this child"),
     );
 
+    // `try_wait` first, deadline second. A child that exited in the last
+    // interval has already done its work, and killing it over the microseconds
+    // between its exit and this wakeup would throw away output shep asked for.
+    // Sleeping only as far as the deadline is what keeps that window down to
+    // one syscall rather than one poll interval.
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if Instant::now() >= deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             child.kill()?;
             // Reaped here rather than left to the `Child` drop, which does
             // not wait: a killed child nobody waits for is a zombie for as
             // long as shep runs.
             child.wait()?;
-            return Ok(Bounded::TimedOut);
+            return Ok(Bounded::Killed);
         }
-        std::thread::sleep(POLL_INTERVAL);
+        std::thread::sleep(POLL_INTERVAL.min(left));
     };
 
     let Some(stdout) = stdout.collect_within(deadline.saturating_duration_since(Instant::now()))
     else {
-        return Ok(Bounded::TimedOut);
+        return Ok(Bounded::OutputHeldOpen);
     };
     let Some(stderr) = stderr.collect_within(deadline.saturating_duration_since(Instant::now()))
     else {
-        return Ok(Bounded::TimedOut);
+        return Ok(Bounded::OutputHeldOpen);
     };
     Ok(Bounded::Exited(Output {
         status,
@@ -153,7 +168,7 @@ mod tests {
             .expect("the child spawns, and killing it is the only other syscall");
 
         assert!(
-            matches!(outcome, Bounded::TimedOut),
+            matches!(outcome, Bounded::Killed),
             "a 30s sleep cannot finish inside 100ms: {outcome:?}"
         );
         assert!(
@@ -181,6 +196,32 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout), "wool");
         assert_eq!(String::from_utf8_lossy(&output.stderr), "bleat");
+    }
+
+    /// fails if a child that exited is reported as killed. `sleep 5 &` in a
+    /// shell that exits straight after leaves a process holding the pipes it
+    /// inherited, so the wait ends at once and only the reads run out of
+    /// budget. Nothing is killed on that path, and the two answers exist so
+    /// the caller does not have to claim otherwise.
+    #[test]
+    fn a_child_whose_output_outlives_it_is_not_reported_as_killed() {
+        let started = Instant::now();
+        let outcome = run_bounded(
+            Command::new("sh").arg("-c").arg("sleep 5 & exit 0"),
+            Duration::from_millis(200),
+        )
+        .expect("sh is on every host this crate compiles for");
+
+        assert!(
+            matches!(outcome, Bounded::OutputHeldOpen),
+            "the shell exits at once and the backgrounded sleep holds both \
+             pipes: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget did not bound the reads, in {:?}",
+            started.elapsed()
+        );
     }
 
     /// fails if either stream is read after the wait rather than during it.
