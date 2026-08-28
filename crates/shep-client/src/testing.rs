@@ -840,10 +840,10 @@ pub async fn fake_client_answering(
     path: &Path,
     answer: impl Fn(&Request) -> Response + Send + 'static,
 ) -> (Client, mpsc::UnboundedReceiver<Envelope>) {
-    let listener = UnixListener::bind(path).unwrap();
+    let mut listener = Listener::bind(path).unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         handshake(&mut frames, sample_ack()).await;
         while let Some(Ok(frame)) = frames.next().await {
