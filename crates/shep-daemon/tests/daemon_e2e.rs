@@ -291,6 +291,7 @@ impl Client {
     /// broken kill ladder timed a reload measurement out and left one
     /// `reuse_port_sheep` reparented to init.
     async fn next_frame(&mut self) -> ServerFrame {
+        FRAMES_SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let frame = match self.pending.pop_front() {
             Some(frame) => frame,
             None => self.recv_as().await,
@@ -486,7 +487,10 @@ fn forever_app(name: &str) -> AppConfig {
     let script = "while :; do sleep 1; done".to_string();
     #[cfg(windows)]
     let script = "ping -n 9999 127.0.0.1 >nul".to_string();
-    shell_app(name, script)
+    let mut app = shell_app(name, script);
+    // Same reason as the Windows arm below.
+    app.autorestart = false;
+    app
 }
 
 /// A sheep that writes `line` to stdout and then stays up long enough to be
@@ -578,6 +582,13 @@ fn gated_announce_app(name: &str, marker: &std::path::Path) -> AppConfig {
     #[cfg(windows)]
     {
         let mut app = AppConfig::minimal(name, "powershell");
+        // The script exits, and `autorestart` is on by default, so without
+        // this the daemon restarts the sheep every five seconds for the
+        // rest of the test and the log gains a second `before` and a second
+        // `after` that the assertions below do not expect. Harmless while a
+        // run takes under two seconds, which is every run on a developer
+        // machine, and not harmless on a loaded runner.
+        app.autorestart = false;
         app.interpreter = Some("none".to_string());
         // `[Console]::Out` with an explicit flush, not `Write-Output`.
         // This script prints a line and then sits in a wait loop without
@@ -741,9 +752,88 @@ async fn log_lines_reach_a_log_subscriber() {
 /// Delete these calls once the hang is understood; the helper can stay.
 fn step(what: &str) {
     use std::io::Write as _;
+    if let Ok(mut last) = LAST_STEP.lock() {
+        *last = what.to_string();
+    }
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "[reopen] {what}");
     let _ = out.flush();
+}
+
+/// What [`step`] last recorded, for the watchdog to print.
+static LAST_STEP: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// How many frames `Client::next_frame` has handed out, for the watchdog.
+///
+/// The question it answers: a client blocked with this number frozen is
+/// waiting on a daemon that has gone quiet, and one blocked with it climbing
+/// is spinning on frames that never match.
+static FRAMES_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Aborts the test binary `secs` from now, printing what the test was doing,
+/// unless the returned guard is dropped first.
+///
+/// **A plain OS thread, and that is the entire point.** Every other deadline
+/// in this file is a `tokio::time::timeout`, and the failure this exists for
+/// is one where those do not fire. `reopen`'s wait for `after` is wrapped in
+/// a `RECV_TIMEOUT` and a `windows-latest` job sat inside it for seventeen
+/// minutes, twice, printing nothing. A timeout that does not fire means the
+/// runtime never polled it, and `#[tokio::test]` builds a CURRENT-THREAD
+/// runtime that this fixture also spawns the daemon onto: one blocking call
+/// anywhere on that thread stops the test, the daemon and the timer wheel
+/// together. A thread the runtime does not own is the only instrument that
+/// survives it.
+///
+/// `abort`, not a panic: a panic on this thread would not fail the test that
+/// is stuck on another one, and the process is not going to recover.
+///
+/// Scaffolding. Delete it with the `step` calls once the hang is understood.
+fn watchdog(secs: u64, files: Vec<std::path::PathBuf>) -> WatchdogGuard {
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&done);
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering;
+        for _ in 0..secs * 5 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let mut err = std::io::stderr().lock();
+        let last = LAST_STEP
+            .lock()
+            .map(|last| last.clone())
+            .unwrap_or_else(|_| "<poisoned>".to_string());
+        let _ = writeln!(err, "[watchdog] fired after {secs}s");
+        let _ = writeln!(err, "[watchdog]   last step: {last}");
+        let _ = writeln!(
+            err,
+            "[watchdog]   frames handed to the client: {}",
+            FRAMES_SEEN.load(Ordering::SeqCst)
+        );
+        for file in &files {
+            let _ = writeln!(
+                err,
+                "[watchdog]   {} exists={} contents={:?}",
+                file.display(),
+                file.exists(),
+                std::fs::read_to_string(file).ok(),
+            );
+        }
+        let _ = err.flush();
+        std::process::abort();
+    });
+    WatchdogGuard(done)
+}
+
+/// Disarms its [`watchdog`] when the test drops it, on any exit path.
+struct WatchdogGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Waits for `path` to hold exactly `expected`, failing at [`RECV_TIMEOUT`].
@@ -843,6 +933,9 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
 
     step("log file holds 'before'");
     let archive = out_file.with_extension("log.1");
+    // Armed here rather than at the top: these are the paths worth dumping,
+    // and `out_file` is not known until the daemon has answered `Start`.
+    let _watchdog = watchdog(45, vec![out_file.clone(), archive.clone(), marker.clone()]);
     step("renaming the live log file");
     std::fs::rename(&out_file, &archive).unwrap();
     assert!(!out_file.exists(), "sanity: the rename really moved it");
