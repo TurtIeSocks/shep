@@ -19,8 +19,8 @@ The face in the STATUS column is the fastest thing on the page to read:
 `(x.x)` errored.
 
 > Status: `0.1.7`, and pre-1.0 means anything can still change. macOS, Linux
-> and Windows. The Windows tier is the newest of the three and has two
-> documented limits, both under [Windows](#windows) below.
+> and Windows. The Windows tier is the newest of the three, and the three
+> things it will not do are under [Windows](#windows) below.
 
 ## Install
 
@@ -185,7 +185,7 @@ The day-to-day loop works: `start`, `stop`, `restart`, `reload`, `flock`,
 dogs. shep talks over a named pipe instead of a unix socket, and each sheep
 sits in a job object instead of a process group.
 
-Two limits are real, and are not going to be papered over:
+Three limits are real, and none of them is going to be papered over:
 
 - `shep stop` has no polite signal to send. Windows offers nothing
   SIGTERM-shaped that can be delivered to an arbitrary process, so a sheep
@@ -198,10 +198,15 @@ Two limits are real, and are not going to be papered over:
   than a fifth unit template. Run `shep start` in your own session, or wrap
   `shep runtime` in NSSM or WinSW.
 
-`user` and `group` in a Flockfile are refused there, permanently. Dropping
-privilege on Windows needs a logon session or a primary-token privilege,
-which is a different and security-sensitive feature rather than a different
-call.
+- `user` and `group` in a Flockfile are refused, permanently. Dropping
+  privilege on Windows needs a logon session or a primary-token privilege,
+  which is a different and security-sensitive feature rather than a
+  different call.
+
+Smaller things differ too, and they are listed in
+[docs/specs/deferred.md](docs/specs/deferred.md): most `shep signal` names
+have no Windows delivery, and `$SHEP_HOME` inherits its parent's ACL rather
+than being narrowed the way `0700` narrows it on unix.
 
 ## Building
 

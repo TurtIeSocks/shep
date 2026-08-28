@@ -35,8 +35,10 @@ launchd, openrc, rc.d).
 
 **v1.1 committed (design now, build later):** HTTP/SSE MCP transport; cgroup
 v2 enforcement (`enforce = "kernel"`); `@shep/io` npm shim (on demand); the
-whole Windows tier — named pipes, Job Objects, start/stop/list/logs,
-service integration, ctrl-event graceful stop, full e2e; vcs metadata (git
+Windows service integration (an SCM service, which `shep startup` does not
+build) — the rest of that tier, named pipes and Job Objects and
+start/stop/list/logs and its e2e, shipped instead, see §2's 2026-08-28
+amendment; vcs metadata (git
 revision shown in describe — `vcs` feature, off by default); `shep web`
 JSON status endpoint (if demand — metrics dog covers observability).
 

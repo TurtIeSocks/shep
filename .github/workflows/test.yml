@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93 --profile minimal --component clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo +1.93 fmt --all -- --check
       # `--all-features` mirrors the project's own task gate (CLAUDE.md).
       # Without it, everything behind shep-daemon's `test-fakes` feature is
@@ -66,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo +nightly doc --workspace --all-features --no-deps
         env: { RUSTDOCFLAGS: "-Dwarnings --cfg docsrs" }
   typos:
@@ -94,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # `--all-features` mirrors the task gate, as in `lint` above.
       - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   minimal-versions:
@@ -105,7 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly stable --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo +nightly generate-lockfile -Z minimal-versions
       - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   musl:
@@ -116,7 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   # CLAUDE.md's phase-gate cross-check
@@ -149,7 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64
       - run: cargo check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu
   features:
@@ -164,7 +164,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
       - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   # Tests that need a quiet machine, run serially in a job of their own.
@@ -212,7 +212,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots signal_ignored_then_kill_tree_reaps'
   # `cargo llvm-cov` on its own runs `cargo test --tests`, and `--tests` does
   # not build a package's examples. `daemon_e2e`'s two reload tests exec
@@ -236,7 +236,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component llvm-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: |
           source <(cargo llvm-cov show-env --sh)
@@ -261,7 +261,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with: { workspaces: benches }
       # `--test` runs each benchmark exactly once and asserts nothing: the
       # point on a shared runner is proving the harness still compiles and
@@ -286,7 +286,7 @@ jobs:
       image: rust:1.88
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # `--exact` with the one path, not a bare `--ignored`: the other two
       # `#[ignore]`s in the workspace (`barks.rs`'s `bark_race_child`,
       # `shep_toml.rs`'s `config_race_child`) are child halves that assert

@@ -341,9 +341,11 @@ are green.
 survives because what it says about a `1.0.0` still holds: an alpha is
 allowed an unsupported platform and a `1.0.0` is not. The day-to-day tier is
 built now and `windows-latest` runs the suite in CI, so this is no longer the
-thing standing between an alpha and a release. What remains is named rather
-than hidden: no graceful `stop` outside the shepherd channel, no
-`shep startup`, and no `user`/`group`.
+thing standing between an alpha and a release. Three refusals are permanent
+and deliberate: no graceful `stop` outside the shepherd channel, no
+`shep startup`, and no `user`/`group`. The smaller gaps that are not
+permanent, among them most `shep signal` names and the unix file modes, are
+in [specs/deferred.md](specs/deferred.md) rather than repeated here.
 
 **One v1.0 spec item is still unbuilt.** `shep serve`, `shep dev` and `shep
 runtime` shipped in Phase 15, and lookout's search/filter, its action keys,
