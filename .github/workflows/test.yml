@@ -330,11 +330,11 @@ jobs:
                   Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
           Write-Host "binary: $exe"
           $p = Start-Process -FilePath $exe -PassThru -NoNewWindow
-          if ($p.WaitForExit(180000)) {
+          if ($p.WaitForExit(90000)) {
             Write-Host "exited normally, code $($p.ExitCode)"
             exit 0
           }
-          Write-Host '================ STUCK after 180s ================'
+          Write-Host '================ STUCK after 90s ================'
           Write-Host '--- every process that could be part of this ---'
           Get-CimInstance Win32_Process |
             Where-Object { $_.Name -match 'daemon_e2e|powershell|pwsh|ping|cmd|conhost|WerFault' } |
@@ -345,6 +345,32 @@ jobs:
               Select-Object Id, ThreadState, WaitReason, TotalProcessorTime |
               Format-Table -AutoSize | Out-String -Width 200 | Write-Host
           } catch { Write-Host "thread read failed: $_" }
-          Write-Host '--- handles the test process holds on the log dir ---'
-          try { & tasklist /FI "PID eq $($p.Id)" /V } catch { }
+          Write-Host '--- what the sheep is waiting on ---'
+          # The sheep is the process whose command line carries the marker
+          # path. If it is genuinely in its Test-Path loop it wakes five
+          # times a second and its CPU time climbs; if it is blocked on a
+          # write to a pipe nobody is draining, it does not.
+          Get-CimInstance Win32_Process |
+            Where-Object { $_.Name -eq 'powershell.exe' -and $_.CommandLine -match 'Test-Path' } |
+            ForEach-Object {
+              $sheep = $_.ProcessId
+              Write-Host "sheep pid $sheep"
+              try {
+                (Get-Process -Id $sheep).Threads |
+                  Select-Object Id, ThreadState, WaitReason, TotalProcessorTime |
+                  Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+              } catch { Write-Host "sheep thread read failed: $_" }
+            }
+          Write-Host '--- does the marker exist, and what is in the logs ---'
+          # The whole question. The sheep polls for a file the test says it
+          # wrote; if it is on disk and the sheep has not noticed, that is a
+          # different bug from the test never having written it.
+          Get-ChildItem -Path $env:TEMP -Filter '.tmp*' -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              Get-ChildItem -Path $_.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object FullName, Length, LastWriteTime |
+                Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+              Get-ChildItem -Path $_.FullName -Recurse -File -Filter '*out.log*' -ErrorAction SilentlyContinue |
+                ForEach-Object { Write-Host "$($_.FullName): $(Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue | Out-String)" }
+            }
           taskkill /F /T /PID $p.Id 2>&1 | Write-Host
