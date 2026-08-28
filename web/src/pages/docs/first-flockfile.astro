@@ -338,34 +338,48 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
       for an editor to point at:
     </p>
     <CodeBlock>{`$ shep schema | head -20
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Flockfile",
-  "type": "object",
-  "properties": {
-    "$schema": {
-      "description": "The editor's schema hint, read and discarded.\\n\\nThis is the \\"future schema key\\" the comment above anticipated, added\\nHERE explicitly rather than by relaxing \`deny_unknown_fields\`: a\\ntypo'd key must still fail loudly, and exactly one more key is now\\nlegal. shep does not validate against the named schema and makes no\\npromise about it — it is a hint for the operator's editor, which is\\nthe only consumer that ever reads it.\\n\\nTOML Flockfiles do not need it: taplo's \`#:schema <url>\` directive is\\na comment, invisible to serde. JSON and JSON5 have no comment an\\neditor agrees to look in, which is why this field exists at all.",
-      "type": [
-        "string",
-        "null"
-      ],
-      "default": null
-    },
-    "app": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/AppConfig"
-      }
-    }`}</CodeBlock>
+  {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Flockfile",
+    "type": "object",
+    "properties": {
+      "$schema": {
+        "description": "The editor's schema hint, read and discarded.\\n\\nThis is the \\"future schema key\\" the comment above anticipated, added\\nHERE explicitly rather than by relaxing \`deny_unknown_fields\`: a\\ntypo'd key must still fail loudly, and exactly one more key is now\\nlegal. shep does not validate against the named schema and makes no\\npromise about it — it is a hint for the operator's editor, which is\\nthe only consumer that ever reads it.\\n\\nTOML Flockfiles do not need it: taplo's \`#:schema <url>\` directive is\\na comment, invisible to serde. JSON and JSON5 have no comment an\\neditor agrees to look in, which is why this field exists at all.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "app": {
+        "type": "array",
+        "default": [],
+        "items": {
+          "$ref": "#/$defs/AppConfig"
+        }
+      },`}</CodeBlock>
     <p class="fine">
       That's the real first twenty lines, unedited. <code>head -20</code>
       cuts off mid-<code>"app"</code> block, and the <code>"$schema"</code>
       key's own description is one long escaped line explaining itself,
       not the tidied multi-line prose above. The full document closes
-      <code>"app"</code>, adds <code>"additionalProperties": false</code>,
-      and a <code>"$defs"</code> section with one entry per Flockfile field.
+      <code>"app"</code>, adds the <code>"dog"</code> key described below,
+      then <code>"additionalProperties": false</code> and a
+      <code>"$defs"</code> section with one entry per Flockfile field.
       Run the command yourself to see the rest.
+    </p>
+    <p>
+      The <code>"dog"</code> key is the other one shep accepts and ignores. A
+      dog with per-app configuration has nowhere else to put it: it belongs
+      beside the app it describes, in the repository the dog deploys. Before
+      the key existed, a Flockfile carrying any of it was refused outright, so
+      an operator could not register their app at all. shep does not read what
+      is under <code>dog</code>, does not validate it, and promises nothing
+      about its shape: the dog that owns a key is the only thing that
+      understands it, and shep refusing a document because it does not
+      recognise another program's config is a coupling neither side wants.
+      Everything else still fails loudly, which is why it is one nested table
+      rather than loose top-level keys.
     </p>
     <p>
       That <code>"$schema"</code> key is real and accepted: a JSON or

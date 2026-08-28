@@ -49,6 +49,31 @@ struct RawFlockfile {
     /// editor agrees to look in, which is why this field exists at all.
     #[serde(default, rename = "$schema")]
     schema: Option<String>,
+    /// A dog's own per-app configuration, read and discarded.
+    ///
+    /// Added the same way `$schema` was, explicitly rather than by relaxing
+    /// `deny_unknown_fields`, so a typo'd key still fails loudly and exactly
+    /// one more key is legal.
+    ///
+    /// It exists because the alternative is a Flockfile no daemon will accept.
+    /// A dog that needs per-app configuration has nowhere to put it: shep-deploy
+    /// wants a build command for the app it deploys, which belongs beside that
+    /// app's declaration and nowhere else, and a Flockfile carrying one was
+    /// refused outright by `shep start`. Measured 2026-08-28 against shep
+    /// 0.1.8: an operator following shep-deploy's own README could not register
+    /// their app at all. `unknown field `build`, expected `$schema` or `app``.
+    ///
+    /// shep does not read what is in here, does not validate it, and makes no
+    /// promise about its shape. That is the point: the dog that owns a key
+    /// under this table is the only thing that understands it, and shep
+    /// refusing a document because it does not recognise another program's
+    /// config is a coupling neither side wants.
+    ///
+    /// Nested under one key rather than allowing loose top-level keys, so
+    /// exactly one name is reserved and a typo anywhere else still fails.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<serde_json::Value>"))]
+    dog: Option<serde::de::IgnoredAny>,
     #[serde(default, rename = "app")]
     apps: Vec<AppConfig>,
 }
@@ -199,6 +224,10 @@ impl Flockfile {
         };
         let RawFlockfile {
             schema: _schema,
+            // Discarded here, deliberately and by name. Whatever a dog wrote
+            // under `[dog]` is that dog's to read out of the file itself; shep
+            // only had to stop refusing the document for containing it.
+            dog: _dog,
             apps,
         } = raw;
         if apps.is_empty() {
@@ -682,6 +711,60 @@ args = ["job.py"]
         let max_memory = resolved(&schema, ref_node);
         assert_eq!(max_memory["type"], "string", "{max_memory}");
         assert_eq!(max_memory["pattern"], r"^\d+(G|M|K)?$", "{max_memory}");
+    }
+
+    /// fails if a Flockfile carrying a dog's own configuration is refused.
+    ///
+    /// A dog with per-app configuration has nowhere else to put it: it belongs
+    /// beside the app's declaration, in the repository the dog deploys. Before
+    /// this, `deny_unknown_fields` refused the whole document, so an operator
+    /// following shep-deploy's own README could not `shep start` their app at
+    /// all. Measured 2026-08-28 against shep 0.1.8: "unknown field `build`,
+    /// expected `$schema` or `app`".
+    ///
+    /// The contents are deliberately not validated. shep does not know what a
+    /// dog's keys mean and refusing a document for not recognising another
+    /// program's config is a coupling neither side wants.
+    #[test]
+    fn a_dog_table_is_accepted_and_ignored() {
+        let src = r#"
+[dog.deploy]
+command = "npm run build"
+artifacts = ["dist/app.js"]
+
+[dog.some-other-dog]
+anything = { nested = true, count = 3 }
+
+[[app]]
+name = "web"
+script = "./srv"
+"#;
+        let flock =
+            Flockfile::parse(src, FlockFormat::Toml).expect("a dog's table is not an error");
+        assert_eq!(flock.apps.len(), 1);
+        assert_eq!(flock.apps[0].name, "web");
+    }
+
+    /// fails if a typo anywhere else stops failing loudly.
+    ///
+    /// Exactly one more key is legal, which is the whole reason the table is
+    /// nested under one name rather than allowing loose top-level keys.
+    #[test]
+    fn a_key_that_is_not_dog_still_fails() {
+        let src = r#"
+[build]
+command = "npm run build"
+
+[[app]]
+name = "web"
+script = "./srv"
+"#;
+        let err = Flockfile::parse(src, FlockFormat::Toml)
+            .expect_err("an unknown top-level key must still be refused");
+        assert!(
+            format!("{err}").contains("build"),
+            "the refusal must name the key: {err}"
+        );
     }
 
     #[test]
