@@ -2384,23 +2384,24 @@ fn probed_sheep(name: &str, port: u16, mute_file: &std::path::Path) -> AppConfig
     app
 }
 
-/// fails if a probed app's reload spawns its replacement while the instance it
-/// is replacing is still bound to the probe's address.
+/// The control for the case below: a probed app whose replacement DOES serve
+/// still reloads, over a real daemon and a real probe.
 ///
-/// That overlap is what made a probe unable to answer its own question. The
-/// first probe lands at t=0 (`await_ready`'s `Probe` arm explains why it must),
-/// and at t=0 the outgoing instance is still listening, so it answers for the
-/// incoming one. Draining first is the fix, and this is the property that says
-/// so: the drainee's `Delete` reaches the bus before the replacement's `Start`,
-/// which under the old ordering it never could.
+/// Serialising a probed reload buys an honest readiness answer by giving up the
+/// overlap, and the thing to check about a trade like that is not only what it
+/// bought. This is the other half — the swap still completes, the replacement
+/// still lands in the same instance slot, and it still owns the port
+/// afterwards. Without it, an implementation that abandoned EVERY probed
+/// reload would pass the failure case and look correct.
 ///
 /// # Fails if
 ///
-/// **`ReloadMode::of` stops serialising a bare probe** — returning
-/// `Overlap` unconditionally puts the `Start` first and the assertion below
-/// names it.
+/// **The serial spawn stops inheriting the drainee's instance slot** — the
+/// fixture derives its port from `SHEP_INSTANCE`, so a replacement in another
+/// slot binds somewhere else, never answers this probe, and the reload is
+/// abandoned instead of finishing.
 #[tokio::test]
-async fn a_probed_reload_drains_before_it_spawns() {
+async fn a_probed_reload_of_a_working_release_still_finishes() {
     let _port_guard = RELOAD_PORT_LOCK.lock().await;
     let port = free_port();
     let dir = tempfile::tempdir().unwrap();
@@ -2443,23 +2444,20 @@ async fn a_probed_reload_drains_before_it_spawns() {
     };
     assert_eq!(accepted.len(), 1);
 
-    // Read once, in order. The `Delete` is the drainee's deregistration and
-    // the `Start` is the replacement's first appearance, so which arrives
-    // first IS which ordering ran.
-    let (first, info) = client
-        .next_process_event_of(&[ProcessEventKind::Delete, ProcessEventKind::Start])
+    // In order, because the question is which of the two endings the reload
+    // reached, and searching for one of them would find it whatever else had
+    // already been said.
+    let (ending, replacement) = client
+        .next_process_event_of(&[
+            ProcessEventKind::Reloaded,
+            ProcessEventKind::ReloadAbandoned,
+        ])
         .await;
     assert_eq!(
-        (first, info.id),
-        (ProcessEventKind::Delete, drainee_id),
-        "the instance being replaced goes before anything is spawned, or its \
-         replacement's probe is answered by it"
+        ending,
+        ProcessEventKind::Reloaded,
+        "a serial reload is slower than an overlapping one, not broken"
     );
-
-    // And the reload still finishes: a serial swap is slower, not broken.
-    let replacement = client
-        .await_any_process_event(ProcessEventKind::Reloaded)
-        .await;
     let replacement_pid = replacement.pid.expect("a replacement has a pid");
     assert_ne!(replacement_pid, drainee_pid);
     assert_eq!(replacement.status, ProcStatus::Online);
@@ -2491,8 +2489,13 @@ async fn a_probed_reload_drains_before_it_spawns() {
 ///
 /// # Fails if
 ///
-/// **The serial ordering goes** — with the drainee alive at t=0 the probe
-/// passes, and `Reloaded` arrives instead of `ReloadAbandoned`.
+/// **Both defences go at once.** Checked, and the AND is the finding rather
+/// than a caveat: with `ReloadMode::of` forced to `Overlap` this case still
+/// passes, because the post-drain probe then applies to it and catches the
+/// same release one step later. Only with `post_drain_probe` also returning
+/// `None` does it go red, on `left: Reloaded`, which is the production
+/// behaviour exactly. Two independent mechanisms cover a single-instance
+/// probed app, and each is enough on its own.
 ///
 /// **`reload_ready_result`'s `TimedOut` arm goes back to marking the
 /// replacement `Online`** — the abandonment still reaches the bus, and the
