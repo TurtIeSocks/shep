@@ -487,10 +487,7 @@ fn forever_app(name: &str) -> AppConfig {
     let script = "while :; do sleep 1; done".to_string();
     #[cfg(windows)]
     let script = "ping -n 9999 127.0.0.1 >nul".to_string();
-    let mut app = shell_app(name, script);
-    // Same reason as the Windows arm below.
-    app.autorestart = false;
-    app
+    shell_app(name, script)
 }
 
 /// A sheep that writes `line` to stdout and then stays up long enough to be
@@ -565,46 +562,61 @@ fn ready_app(name: &str, dir: &std::path::Path) -> AppConfig {
 /// `after`, then stays up — the fixture the log-rotation cases drive.
 fn gated_announce_app(name: &str, marker: &std::path::Path) -> AppConfig {
     #[cfg(unix)]
-    let script = format!(
-        "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
-        marker.display()
-    );
-    #[cfg(unix)]
     {
-        shell_app(name, script)
+        let script = format!(
+            "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
+            marker.display()
+        );
+        let mut app = shell_app(name, script);
+        app.autorestart = false;
+        app
     }
-    // PowerShell rather than `cmd` for this one fixture, and the reason is
-    // not style: `cmd /C` takes a single command STRING, and `goto` needs
-    // labels, which only exist in a batch FILE. A `goto`-based wait loop
-    // written as a one-liner silently does not loop — measured, as a
-    // fixture that printed `before` and `after` back to back and never
-    // waited for the marker at all. PowerShell has a real `while`.
+    // A batch FILE, and the two things it is not are both deliberate.
+    //
+    // Not a `cmd /C` one-liner: `cmd /C` takes a single command string
+    // and `goto` needs labels, which exist only in a file, so an inline
+    // loop silently does not loop. Measured, as a fixture that printed
+    // `before` and `after` back to back and never waited for the marker.
+    //
+    // Not `powershell -Command` either, which is what that measurement
+    // led to last time and what hung `windows-latest` for four runs. An
+    // out-of-process probe finally caught the sheep in the act: nine
+    // threads, every one in `Wait`, and 0.28s of CPU between them, all of
+    // it PowerShell's own startup. It was not polling for the marker. It
+    // was not running at all. Every other fixture in this file drives
+    // `cmd` and every one of them passes.
+    //
+    // `cmd`'s `echo` also writes a line at a time with nothing held back,
+    // which retires the separate question of what PowerShell buffers on a
+    // redirected stdout.
+    //
+    // `ping -n 2` is the sleep, for the reason `forever_app` gives:
+    // `timeout.exe` refuses to run with stdin redirected, and every
+    // sheep's is.
     #[cfg(windows)]
     {
-        let mut app = AppConfig::minimal(name, "powershell");
-        // The script exits, and `autorestart` is on by default, so without
-        // this the daemon restarts the sheep every five seconds for the
-        // rest of the test and the log gains a second `before` and a second
-        // `after` that the assertions below do not expect. Harmless while a
-        // run takes under two seconds, which is every run on a developer
-        // machine, and not harmless on a loaded runner.
-        app.autorestart = false;
-        app.interpreter = Some("none".to_string());
-        // `[Console]::Out` with an explicit flush, not `Write-Output`.
-        // This script prints a line and then sits in a wait loop without
-        // exiting, so anything PowerShell buffers on a redirected stdout
-        // stays buffered: the line the test is waiting for never arrives,
-        // `await_log_line` panics at RECV_TIMEOUT, and the panic is then
-        // swallowed by the hang below. Cost 17 minutes of a CI job before
-        // it was found, twice, in two different fixtures.
-        app.args = vec![
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            format!(
-                "[Console]::Out.WriteLine('before'); [Console]::Out.Flush(); while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 300 }}; [Console]::Out.WriteLine('after'); [Console]::Out.Flush(); Start-Sleep -Seconds 5",
-                marker.display()
-            ),
+        const CRLF: &str = "\r\n";
+        let script = marker.with_file_name("gated.cmd");
+        let body = [
+            "@echo off".to_string(),
+            "echo before".to_string(),
+            ":wait".to_string(),
+            format!("if exist \"{}\" goto ready", marker.display()),
+            "ping -n 2 127.0.0.1 >nul".to_string(),
+            "goto wait".to_string(),
+            ":ready".to_string(),
+            "echo after".to_string(),
+            "ping -n 6 127.0.0.1 >nul".to_string(),
+            String::new(),
         ];
+        std::fs::write(&script, body.join(CRLF))
+            .expect("the gated fixture script must be writable");
+        let mut app = shell_app(name, script.display().to_string());
+        // The script exits, and `autorestart` is on by default, so
+        // without this the daemon restarts the sheep five seconds after
+        // it finishes and the log gains a second `before` and a second
+        // `after` that the assertions do not expect.
+        app.autorestart = false;
         app
     }
 }
