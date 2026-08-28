@@ -233,18 +233,43 @@ pub enum Commands {
     Restart(SelectorArgs),
     /// Reload one or more sheep, one instance at a time.
     ///
-    /// Each instance is replaced by a fresh one, which has to start and
-    /// become ready before the instance it replaces is asked to go — so the
-    /// app gets a window in which it can hand over without dropping work.
+    /// Each instance is replaced by a fresh one that has to become ready
+    /// before the reload moves on, so a release that never comes up is
+    /// reported as a failure rather than as a success.
     ///
-    /// An app that binds a port has to set SO_REUSEPORT itself, before it
-    /// binds; shep binds nothing and cannot set it on the app's behalf.
-    /// Without it the replacement fails to bind on every reload and the
-    /// reload is abandoned with the old instance left serving. This command
-    /// has already exited 0 by then, so process.reload_abandoned on the bus
-    /// is the only report of it.
+    /// What that failure COSTS depends on the order, and the order depends on
+    /// the app.
     ///
-    /// That window is not zero downtime. The old listener's queue of
+    /// An app with a readiness_probe and no reuse_port is replaced serially:
+    /// the old instance drains first, then the new one starts in its place. A probe asks an
+    /// address, and an address cannot say which process answered it. Run both
+    /// at once and the outgoing instance answers for the incoming one, so
+    /// shep would call a release ready that never bound anything.
+    ///
+    /// The old instance is gone by the time the new one is judged, so there is
+    /// nothing to go back to. A replacement that never becomes ready is left
+    /// running and NOT marked online, and the reload is abandoned, which for a
+    /// one-instance app means the gap lasts until you act on it. A rollback
+    /// that points the app back at working code and reloads again is what ends
+    /// it; that reload can reach the instance this one left behind.
+    ///
+    /// Everything else overlaps, old and new running together: an app with no
+    /// probe, an app using wait_ready (its channel belongs to one instance,
+    /// so nothing else can answer it), and a probed app that sets reuse_port.
+    ///
+    /// An overlap asks the same thing of all three. Both instances are bound
+    /// at once, so an app that binds an address has to share the socket
+    /// itself, with SO_REUSEPORT set before it binds; shep binds nothing and
+    /// cannot set it on the app's behalf. Without that the replacement takes
+    /// EADDRINUSE on every reload, and the reload is abandoned with the old
+    /// instance left serving. This command has already exited 0 by then, so
+    /// process.reload_abandoned on the bus is the only report of it.
+    ///
+    /// reuse_port neither creates that requirement nor satisfies it. It is how
+    /// a probed app says it is already handling the sharing, and so asks for
+    /// the overlap back.
+    ///
+    /// An overlap is not zero downtime either. The old listener's queue of
     /// connections it has not accepted yet is dropped when it closes, so an
     /// app that does not stop accepting and finish what it has in hand
     /// before graceful_timeout runs out loses whatever was waiting there.

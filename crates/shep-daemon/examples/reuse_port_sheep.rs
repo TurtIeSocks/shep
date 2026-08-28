@@ -42,6 +42,14 @@
 //!   mostly what happens to work already in hand.
 //! - `SHEEP_DEFIANT` (optional, `1` to enable) — never act on `SIGTERM`. The
 //!   uncooperative half of the measurement.
+//! - `SHEEP_MUTE_FILE` (optional) — a path. If it EXISTS when this program
+//!   starts, the sheep runs without ever binding its port: it comes up, stays
+//!   up, answers nothing. That is a release that starts and does not serve,
+//!   which is the failure a readiness probe exists to catch and the one a
+//!   reload used to miss — the instance being replaced was still bound to the
+//!   probe's address and answered on the newcomer's behalf. The test creates
+//!   the file between the first instance's start and the reload, so the two
+//!   instances of one app differ without the app's config differing.
 //!
 //! Protocol: the server speaks first, writing `<pid>\n` and closing. The pid
 //! is what lets a caller attribute every answered connection to a process,
@@ -99,6 +107,8 @@ mod unix {
                 .unwrap_or(40),
         );
         let defiant = std::env::var("SHEEP_DEFIANT").is_ok_and(|raw| raw == "1");
+        let mute =
+            std::env::var("SHEEP_MUTE_FILE").is_ok_and(|path| std::path::Path::new(&path).exists());
 
         // Blocked before any thread exists, so every thread spawned below
         // inherits the mask and none of them can take the signal instead.
@@ -117,6 +127,23 @@ mod unix {
                 term.wait().expect("sigwait must not fail");
                 stopping.store(true, Ordering::Relaxed);
             });
+        }
+
+        if mute {
+            // Up and useless, on purpose. Nothing is bound, so a probe against
+            // this port can only be answered by some OTHER process — which is
+            // the whole point: if a reload calls this instance ready, it did so
+            // on the strength of an answer that was not this instance's.
+            println!(
+                "reuse_port_sheep pid={} port={port} MUTE (bound nothing)",
+                std::process::id()
+            );
+            loop {
+                if stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(ACCEPT_POLL);
+            }
         }
 
         let listener = bind_reuse_port(port);

@@ -40,7 +40,7 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
   {
     pm2: "pm2 reload",
     shep: "shep reload",
-    note: "needs the app to set SO_REUSEPORT itself: see below",
+    note: "N instances on one port need the app to set SO_REUSEPORT: see below",
   },
   { pm2: "pm2 delete", shep: "shep delete" },
   { pm2: "pm2 list / ls / status", shep: "shep flock", note: "alias: list, ls" },
@@ -251,11 +251,16 @@ cwd = "/srv/migrate"`}</CodeBlock>
       <code>shep import</code> names every app it found running in pm2
       cluster mode on stderr, and writes nothing into the Flockfile for it.
       It used to set <code>reuse_port = true</code>, which read like a
-      mitigation and was not one: no part of shep ever consulted that field,
-      so the line did nothing while looking like it did something. shep now
-      refuses the field outright rather than accepting a knob it does not
-      implement. The work is the app&rsquo;s either way. If it was never
-      written to call <code>reusePort: true</code>, cluster mode does not
+      mitigation and was not one: no part of shep consulted that field at
+      the time, so the line did nothing while looking like it did something.
+      The field is live now, and what it does is narrower than its name
+      suggests: it opts a <code>readiness_probe</code> app back into a reload
+      that overlaps its two instances. An app with no probe already overlaps,
+      and so does one using <code>wait_ready</code>, neither of which needs
+      the field. <code>import</code> still will not write it for you, because
+      only you know whether the app really does call
+      <code>reusePort: true</code>. The work is the app&rsquo;s either way.
+      If it was never written to share the socket, cluster mode does not
       work under shep however the Flockfile is written.
     </p>
 

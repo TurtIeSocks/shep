@@ -100,7 +100,7 @@ const fieldGroups: FieldGroup[] = [
   {
     title: "Networking & probes",
     fields: [
-      { name: "reuse_port", type: "bool", default: "false", does: "Refused. Nothing in shep reads it, so a Flockfile setting it is asking for behaviour that does not exist. Remove the line to load the file." },
+      { name: "reuse_port", type: "bool", default: "false", does: "Asserts the app sets SO_REUSEPORT itself, which lets a reload overlap the old and new instance. A probed app that leaves this off is reloaded serially instead: the old instance drains before the new one starts." },
       { name: "readiness_probe", type: "object?", default: "none", does: "HTTP/TCP/exec probe gating reload's await-ready step." },
       { name: "liveness_probe", type: "object?", default: "none", does: "HTTP/TCP/exec probe whose failures feed the restart policy." },
     ],

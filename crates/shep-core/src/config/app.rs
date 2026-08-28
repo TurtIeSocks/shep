@@ -365,17 +365,38 @@ pub struct AppConfig {
     /// is permission for the old and new instance to overlap during reload,
     /// not the socket option itself.
     ///
-    /// **This field is inert today.** shep never reads it: reload overlap
-    /// already happens unconditionally, so setting it changes nothing and
-    /// leaving it unset costs nothing. It is kept because `shep import`
-    /// writes it for a cluster-mode pm2 app and `shep flock` displays it, so
-    /// dropping it would silently discard a value out of an imported config.
-    /// It becomes load-bearing the day shep gains a reload mode that does NOT
-    /// overlap by default, which is when the permission it describes stops
-    /// being free — see `docs/specs/deferred.md`.
+    /// That permission is what the field buys, and it is read by exactly one
+    /// thing: which reload the daemon runs for the app.
+    ///
+    /// - **Unset**, and the app has a `readiness_probe`: reload is SERIAL.
+    ///   The instance being replaced is drained first and its replacement is
+    ///   spawned into the empty slot, so the app is down for the length of
+    ///   the drain. That is the cost of an honest answer — while both
+    ///   instances are up, a probe against an address cannot say which of
+    ///   them answered, and shep would take the outgoing instance's reply as
+    ///   proof the incoming one is ready.
+    /// - **Set**: reload OVERLAPS, which is what every reload did before this
+    ///   field was read. The replacement is spawned alongside the instance it
+    ///   replaces and takes over without a gap — if the app really does set
+    ///   `SO_REUSEPORT`. If it does not, the replacement takes `EADDRINUSE`
+    ///   and the reload fails, which is the failure this field exists to keep
+    ///   opt-in.
+    ///
+    /// An app with no `readiness_probe` overlaps either way: with nothing
+    /// probing an address, there is no answer for the wrong instance to give.
+    /// So does one using `wait_ready`, because the shepherd channel a
+    /// replacement reports on is its own — the instance being replaced has no
+    /// way to answer it. Both of those need `SO_REUSEPORT` as much as a
+    /// `reuse_port` app does if they bind an address, since they are overlapped
+    /// too; what this field changes is which apps get overlapped, not what an
+    /// overlap costs.
+    ///
+    /// Setting this on an app that does NOT set the socket option is the one
+    /// way to get it wrong, and shep cannot check it: the option is set
+    /// inside the child, after the fork, on a socket shep never sees.
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "group": "process",
-        "blurb": "Not built yet. Setting it is refused rather than quietly ignored"
+        "blurb": "The app sets SO_REUSEPORT itself, so reload may overlap the two instances"
     })))]
     pub reuse_port: bool,
     /// Readiness probe — gates reload's AwaitReady (spec §7)

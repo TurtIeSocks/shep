@@ -181,7 +181,14 @@ pub enum ReloadState {
         /// [`ProcessEntry::id`] of the new replacement instance — an entry
         /// ID, not an OS `pid`: the replacement is looked up by entry, and
         /// only gains an OS pid once it is actually spawned.
-        new_id: u32,
+        ///
+        /// `None` for the whole of a SERIAL reload's drain, which is the one
+        /// arrangement in which this instance is being replaced by something
+        /// that does not exist yet: a serial reload empties the instance slot
+        /// before it spawns into it, so there is no replacement to name until
+        /// this instance's own exit is handled. It is `Some` from the moment
+        /// there is an id to put in it, in either mode.
+        new_id: Option<u32>,
     },
     /// This entry is the replacement
     ///

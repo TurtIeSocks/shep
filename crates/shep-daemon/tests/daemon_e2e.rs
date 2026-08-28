@@ -29,7 +29,7 @@ use serde::de::DeserializeOwned;
 use shep_core::transport::{self, ClientStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-use shep_core::config::AppConfig;
+use shep_core::config::{AppConfig, ProbeConfig, ProbeKind};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, BusEvent, ChildMessage, Envelope, Hello, HelloAck, HelloReply, LineOutcome,
@@ -388,6 +388,33 @@ impl Client {
         };
         requeue(&mut self.pending, skipped);
         info
+    }
+
+    /// Reads frames until a `Process` event of one of `kinds` arrives, and
+    /// answers with WHICH — the ordering question neither sibling below can
+    /// be asked.
+    ///
+    /// They search: each passes over what it does not want and re-queues it,
+    /// so asking for a `Delete` and then a `Start` finds both whichever order
+    /// they were emitted in. A case whose subject IS the order has to read the
+    /// stream once, in the order the daemon wrote it, and stop at the first
+    /// event that answers the question.
+    async fn next_process_event_of(
+        &mut self,
+        kinds: &[ProcessEventKind],
+    ) -> (ProcessEventKind, ProcessInfo) {
+        let mut skipped = Vec::new();
+        let found = loop {
+            let frame = self.next_frame().await;
+            if let ServerFrame::Event(BusEvent::Process { event, info, .. }) = &frame
+                && kinds.contains(event)
+            {
+                break (*event, info.clone());
+            }
+            skipped.push(frame);
+        };
+        requeue(&mut self.pending, skipped);
+        found
     }
 
     /// Reads frames until a `Process` event of `kind` arrives for ANY sheep,
@@ -2050,6 +2077,37 @@ async fn await_serving(port: u16, pid: u32) {
     );
 }
 
+/// Polls `ListFlock` until `id` is `Online`, for a case that cannot wait on
+/// the event.
+///
+/// A probed app reaches `Online` a probe interval AFTER it starts answering,
+/// so [`await_serving`] returning is not the same fact — and a reload arriving
+/// in that gap finds nothing replaceable and quietly does nothing. The
+/// obvious wait, `await_process_event(id, Online)`, is unavailable to the two
+/// cases that need this: they read the event stream in emission order, so they
+/// subscribe only once the app is up, which is precisely the moment this is
+/// establishing.
+#[cfg(unix)]
+async fn await_online(client: &mut Client, id: u32) {
+    let online = tokio::time::timeout(RECV_TIMEOUT, async {
+        loop {
+            let listed = client.request(Request::ListFlock).await;
+            let Response::Flock(flock) = listed.result.unwrap() else {
+                panic!("expected flock")
+            };
+            if flock
+                .iter()
+                .any(|info| info.id == id && info.status == ProcStatus::Online)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(online.is_ok(), "id {id} must reach Online");
+}
+
 /// A port with nothing on it: bind `:0`, read what the OS chose, release it.
 ///
 /// The repo's existing idiom (`supervisor.rs`, `boot.rs` and `extras.rs` all do
@@ -2538,4 +2596,250 @@ async fn a_smit_carrying_an_escape_is_refused_at_the_daemon() {
     assert_eq!(smit_of(&mut looker, "web").await, None);
 
     fixture.shutdown().await;
+}
+
+// --- Reload: a probed app's replacement answers for itself ---
+
+/// `#[cfg(unix)]` for the reason `reload_under_load` is: these two drive
+/// `reuse_port_sheep`, whose Windows build is a stub that binds nothing and is
+/// not even found under that name (the binary is `reuse_port_sheep.exe`), so
+/// `reuse_port_sheep`'s own `is_file` assert is what fails first.
+///
+/// The `AwaitReady` window a probed reload gets here, as `listen_timeout`.
+///
+/// Both directions matter, which is why it is not simply "short". A
+/// replacement that WILL serve has to bind inside it, and one that will not
+/// costs the case its whole length before the abandonment lands — so this is
+/// the failing case's own runtime, twice over (the start's heuristic wait and
+/// the reload's probe).
+#[cfg(unix)]
+const PROBED_READY_WINDOW: UpDuration = UpDuration::from_millis(800);
+
+/// One `reuse_port_sheep` on `port`, gated on a TCP probe against the port it
+/// binds — the arrangement in which "is the new instance ready" and "is
+/// SOMETHING listening" are the same question, and so the one an overlapping
+/// reload could answer with the wrong process.
+#[cfg(unix)]
+fn probed_sheep(name: &str, port: u16, mute_file: &std::path::Path) -> AppConfig {
+    let mut app = AppConfig::minimal(name, &reuse_port_sheep().display().to_string());
+    app.interpreter = Some("none".to_string());
+    app.env
+        .insert("SHEEP_PORT_BASE".to_string(), port.to_string());
+    app.env.insert("SHEEP_HOLD_MS".to_string(), "0".to_string());
+    app.env.insert(
+        "SHEEP_MUTE_FILE".to_string(),
+        mute_file.display().to_string(),
+    );
+    app.readiness_probe = Some(ProbeConfig {
+        kind: ProbeKind::Tcp,
+        target: format!("127.0.0.1:{port}"),
+        interval: UpDuration::from_millis(50),
+        timeout: UpDuration::from_millis(200),
+        failure_threshold: 3,
+    });
+    app.listen_timeout = PROBED_READY_WINDOW;
+    app.graceful_timeout = DRAIN_WINDOW;
+    app.kill_timeout = DRAIN_WINDOW;
+    // Nothing may respawn behind the case: a restart would put a third process
+    // on this port and every assertion below would be about the wrong two.
+    app.autorestart = false;
+    app
+}
+
+/// The control for the case below: a probed app whose replacement DOES serve
+/// still reloads, over a real daemon and a real probe.
+///
+/// Serialising a probed reload buys an honest readiness answer by giving up the
+/// overlap, and the thing to check about a trade like that is not only what it
+/// bought. This is the other half — the swap still completes, the replacement
+/// still lands in the same instance slot, and it still owns the port
+/// afterwards. Without it, an implementation that abandoned EVERY probed
+/// reload would pass the failure case and look correct.
+///
+/// # Fails if
+///
+/// **The serial spawn stops inheriting the drainee's instance slot** — the
+/// fixture derives its port from `SHEP_INSTANCE`, so a replacement in another
+/// slot binds somewhere else, never answers this probe, and the reload is
+/// abandoned instead of finishing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_probed_reload_of_a_working_release_still_finishes() {
+    let _port_guard = RELOAD_PORT_LOCK.lock().await;
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mute = dir.path().join("mute");
+
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    let started = client
+        .request(Request::Start {
+            apps: vec![probed_sheep("web", port, &mute)],
+        })
+        .await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let drainee_id = infos[0].id;
+    let drainee_pid = infos[0].pid.expect("a real spawn reports a real pid");
+    await_serving(port, drainee_pid).await;
+    await_online(&mut client, drainee_id).await;
+
+    // Subscribed AFTER the app is up, deliberately. The cases below read the
+    // event stream in the order the daemon wrote it, and a subscription taken
+    // earlier would put the app's own `Start` in front of the reload's — an
+    // event from before the question was asked, answering it wrongly.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["process.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    let accepted = client
+        .request(Request::Reload {
+            selector: SelectorSpec::Name("web".to_string()),
+        })
+        .await;
+    let Response::Reloading(accepted) = accepted.result.unwrap() else {
+        panic!("expected an accepted reload")
+    };
+    assert_eq!(accepted.len(), 1);
+
+    // In order, because the question is which of the two endings the reload
+    // reached, and searching for one of them would find it whatever else had
+    // already been said.
+    let (ending, replacement) = client
+        .next_process_event_of(&[
+            ProcessEventKind::Reloaded,
+            ProcessEventKind::ReloadAbandoned,
+        ])
+        .await;
+    assert_eq!(
+        ending,
+        ProcessEventKind::Reloaded,
+        "a serial reload is slower than an overlapping one, not broken"
+    );
+    let replacement_pid = replacement.pid.expect("a replacement has a pid");
+    assert_ne!(replacement_pid, drainee_pid);
+    assert_eq!(replacement.status, ProcStatus::Online);
+    assert_eq!(
+        tally(&burst(port).await),
+        format!("{BURST}x served by {replacement_pid}"),
+        "the replacement owns the port once the swap is done"
+    );
+
+    let held = fixture.shutdown().await;
+    drop(held);
+    drop(dir);
+}
+
+/// fails if a release that starts and never serves is reported as a successful
+/// reload, when the instance it replaced could still answer the probe.
+///
+/// This is the production bug of 2026-08-28, reduced. Both instances run the
+/// same command; the second finds `SHEEP_MUTE_FILE` in place and binds
+/// nothing, which is what a release whose listener moved to the wrong port
+/// does. Under the old ordering the replacement's very first probe was
+/// answered by the instance still bound to that address, the swap committed on
+/// the strength of it, the drainee was killed, and `shep reload` reported
+/// success over a dead port.
+///
+/// What must happen instead: no `Reloaded`, an abandonment, and a flock whose
+/// one row is NOT `online` — the last of those being what a deploy tool reads,
+/// and therefore what turns this from a log line into a rollback.
+///
+/// # Fails if
+///
+/// **Both defences go at once.** Checked, and the AND is the finding rather
+/// than a caveat: with `ReloadMode::of` forced to `Overlap` this case still
+/// passes, because the post-drain probe then applies to it and catches the
+/// same release one step later. Only with `post_drain_probe` also returning
+/// `None` does it go red, on `left: Reloaded`, which is the production
+/// behaviour exactly. Two independent mechanisms cover a single-instance
+/// probed app, and each is enough on its own.
+///
+/// **`reload_ready_result`'s `TimedOut` arm goes back to marking the
+/// replacement `Online`** — the abandonment still reaches the bus, and the
+/// status assertion is the only thing left that reddens. That is the shape of
+/// the original bug: an event nobody was reading, over a status that lied.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_replacement_that_serves_nothing_is_refused_not_reported_reloaded() {
+    let _port_guard = RELOAD_PORT_LOCK.lock().await;
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mute = dir.path().join("mute");
+
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut client = fixture.connect().await;
+
+    let started = client
+        .request(Request::Start {
+            apps: vec![probed_sheep("web", port, &mute)],
+        })
+        .await;
+    let Response::Started(infos) = started.result.unwrap() else {
+        panic!("expected started")
+    };
+    let drainee_id = infos[0].id;
+    let drainee_pid = infos[0].pid.expect("a real spawn reports a real pid");
+    await_serving(port, drainee_pid).await;
+    await_online(&mut client, drainee_id).await;
+
+    // Subscribed AFTER the app is up, deliberately. The cases below read the
+    // event stream in the order the daemon wrote it, and a subscription taken
+    // earlier would put the app's own `Start` in front of the reload's — an
+    // event from before the question was asked, answering it wrongly.
+    let subscribed = client
+        .request(Request::Subscribe {
+            topics: vec!["process.*".to_string()],
+        })
+        .await;
+    assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
+
+    // The bad release, staged between the two spawns of one unchanged app.
+    std::fs::write(&mute, b"").expect("the marker must be writable");
+
+    let accepted = client
+        .request(Request::Reload {
+            selector: SelectorSpec::Name("web".to_string()),
+        })
+        .await;
+    let Response::Reloading(accepted) = accepted.result.unwrap() else {
+        panic!("expected an accepted reload")
+    };
+    assert_eq!(accepted.len(), 1);
+
+    // In order again, because the question is which of the two endings the
+    // reload reached, and searching for one of them would find it whatever
+    // else had already been said.
+    let (ending, info) = client
+        .next_process_event_of(&[
+            ProcessEventKind::Reloaded,
+            ProcessEventKind::ReloadAbandoned,
+        ])
+        .await;
+    assert_eq!(
+        ending,
+        ProcessEventKind::ReloadAbandoned,
+        "a replacement that binds nothing has not proved it can take over"
+    );
+    assert_ne!(info.id, drainee_id, "the abandonment names the replacement");
+
+    let listed = client.request(Request::ListFlock).await;
+    let Response::Flock(flock) = listed.result.unwrap() else {
+        panic!("expected flock")
+    };
+    assert_eq!(flock.len(), 1, "the app keeps the one instance it has left");
+    assert_eq!(
+        flock[0].status,
+        ProcStatus::Starting,
+        "a replacement that never answered its probe is never called online"
+    );
+
+    let held = fixture.shutdown().await;
+    drop(held);
+    drop(dir);
 }

@@ -18,7 +18,7 @@ The face in the STATUS column is the fastest thing on the page to read:
 `(o.o)` online, `(o~o)` starting, `(>_<)` waiting to restart, `(-.-)` stopped,
 `(x.x)` errored.
 
-> Status: `0.1.7`, and pre-1.0 means anything can still change. macOS, Linux
+> Status: `0.1.9`, and pre-1.0 means anything can still change. macOS, Linux
 > and Windows. The Windows tier is the newest of the three, and the three
 > things it will not do are under [Windows](#windows) below.
 
@@ -105,10 +105,15 @@ shep spawns, waits for readiness, drains, then reaps.
 That overlap is not zero-downtime on its own, and `reload --help` says so.
 shep binds its own control socket and nothing else, never your app's
 listener, so both instances want the same port unless your app sets
-`SO_REUSEPORT` on it. Without that the second one takes `EADDRINUSE`. The
-`reuse_port` Flockfile key is refused at parse time rather than accepted and
-ignored, for the same reason: nothing reads it yet, and a config key that
-silently does nothing is worse than one that says so.
+`SO_REUSEPORT` on it. Without that the second one takes `EADDRINUSE`.
+
+An app with a `readiness_probe` is reloaded the other way round: the old
+instance drains first, then the new one starts in its place. One row, and a
+gap while it happens. A probe asks an address, and an address cannot say
+which of two instances answered it. Run both at once and the outgoing one
+answers for the incoming one, so shep would call a release ready that never
+bound anything. `reuse_port = true` says your app really does share the
+socket, and buys the overlap back.
 
 ## Watching it
 

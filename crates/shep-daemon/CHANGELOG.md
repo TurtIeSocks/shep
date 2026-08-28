@@ -10,6 +10,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A reload's readiness probe could be answered by the instance the reload was
+  replacing, so a release that started and never served was verified, the
+  instance that COULD serve was drained, and the reload reported success over
+  a dead address. `await_ready` probes at t=0 by design, and at t=0 the
+  outgoing instance is still bound to the address the probe names, because the
+  drain runs only after readiness resolves. Found in production on 2026-08-28.
+- A reload's replacement is no longer marked `Online` when its readiness
+  deadline elapses. It used to be, whenever no old instance was left to
+  abandon back to, which is where the false success above was recorded. It is
+  still not killed, since with the drainee gone that would empty the instance
+  slot, but it keeps `Starting` and the reload is announced as abandoned.
+
+### Changed
+
+- A reload now runs one of two orderings, chosen per app. An app with a
+  `readiness_probe` and no `reuse_port` is replaced SERIALLY: the old instance
+  drains first and the replacement is spawned into the empty slot, so the only
+  process that can answer its probe is itself. The cost is a gap, the drain
+  plus the replacement's start. Everything else overlaps as before: an app with
+  no probe, an app using `wait_ready`, and an app whose `reuse_port` says it
+  sets `SO_REUSEPORT` itself.
+- An overlapping reload of a probed app asks its probe a second time once the
+  drained instance is reaped, and reports the reload failed if that one does
+  not pass. `SO_REUSEPORT` lets the kernel hand either instance a connection,
+  so even a late probe can be answered by the one on its way out. Exact for a
+  single-instance app; for a clustered one the surviving old instances can
+  still answer until the last swap.
+- A reload can replace an instance a previous reload left unready, which is
+  what lets a rollback run at all. Without it a deploy tool would swap the
+  release directory back, ask for a reload, and be told `Ok` by a daemon that
+  had skipped the only instance the app had.
+
 ## [0.1.9] - 2026-08-28
 
 ### Fixed
@@ -17,7 +51,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Read a PATH, and a path claim, the way Windows spells them
 - Drive the gated fixture with cmd, not PowerShell
 - Drive the kill-tree fixture with cmd too
-
 
 ## [0.1.8] - 2026-08-28
 
