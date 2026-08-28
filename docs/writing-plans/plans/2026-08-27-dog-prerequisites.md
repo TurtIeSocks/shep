@@ -64,7 +64,7 @@ Established 2026-08-27 by reading this tree at `2ea4226` (v0.1.3). Use these; do
 
 - **`PROTOCOL_VERSION` stays 1 for an additive field.** The precedent is `ProcessInfo::last_exit`, added 2026-08-19 and recorded in `crates/shep-core/CHANGELOG.md:14-32`: "Additive under `Option` on the same terms as every other field this struct has grown since Phase 3 -- `PROTOCOL_VERSION` stays **1**, and a peer that predates the field neither sends nor expects the key."
 - **Wire-additive and Rust-additive are different questions.** A `#[serde(default)]` field keeps the wire compatible; whether the Rust change is breaking depends on the variant's shape. Task 7 turns on this and carries the one decision in this plan that is Rin's.
-- **Changelogs are hand-written**, Keep a Changelog form, one per crate, `release-plz` does not generate them (`release-plz.toml`, `changelog_update = false`). All four real crates share one version through `[workspace.package]`.
+- **Changelogs are generated** by release-plz from conventional commits, in Keep a Changelog form, one per crate (`release-plz.toml`, `changelog_update = true`, template in `release-plz-changelog.toml`). This flipped on 2026-08-27; it read `changelog_update = false` when this plan was written, so do not hand-write an entry for your own change. Write a conventional commit subject and let the release pull request carry it. All four real crates share one version through `[workspace.package]`.
 - **`shep-deploy` consumes `shep-client` from crates.io.** Nothing here unblocks its Task 12 until this work is released. Task 10 is that step.
 
 ## What each task changes, and why the boundaries fall where they do
@@ -2490,7 +2490,7 @@ Separate commits, because they are four different asks and each should be revert
 - Consumes: Tasks 1 through 9.
 - Produces: the published `shep-client` that `shep-deploy`'s Task 12 waits on.
 
-**The changelogs are hand-written and release-plz will not do it.** `release-plz.toml` sets `changelog_update = false`, with its own reasoning recorded there: generation inserted 576 lines in a second style next to entries covering the same work, and copied a commit-message typo into a tracked file that the `typos` job then failed on. All four crates share one version through `[workspace.package]`.
+**The changelogs are generated, so do not hand-write one.** This said the opposite until 2026-08-27, when `release-plz.toml` moved to `changelog_update = true` to match zendriver-rs. The two objections recorded against generation are handled rather than gone: `release-plz-changelog.toml` skips docs, test, ci, chore and style commits so a generated section no longer duplicates hand-written entries, and `typos` is a required check on `main`, so a misspelled commit subject blocks its own release pull request instead of landing in a tracked file. Write a conventional commit subject; the release pull request carries it. All four crates share one version through `[workspace.package]`.
 
 - [ ] **Step 1: Write the `[Unreleased]` entries**
 

@@ -145,9 +145,10 @@ changelog tooling expect.
 
 ## The sequence
 
-**Every release after the first is one act: merge the release pull request.**
-release-plz opens it, and merging it tags, releases and uploads. Nothing
-below is something you run.
+**Every release after the first happens on its own.** release-plz opens the
+pull request, queues it to merge behind `main`'s required checks, and the
+resulting push tags, releases and uploads. Nothing below is something you
+run.
 
 What follows is how 0.1.0 was done by hand, kept because the checks in it are
 the ones release-plz now performs for you, and because knowing what they were
@@ -189,13 +190,20 @@ git push origin v0.1.0
 **Merging the release pull request is the irreversible step.** There is no
 tag to push and no local `cargo publish` in the sequence.
 
-`.github/workflows/release-plz.yml` has two jobs. `release-pr` maintains a
-pull request that bumps `[workspace.package]` from the conventional commits
-since the last release, on every push to `main`. `release` waits for
-`test.yml` to finish successfully against that same commit, then does
-nothing unless the manifest names a version that is not on crates.io, which
-is what makes the merge the act that publishes. It tags, creates the GitHub
-release, and uploads in dependency order.
+Two workflow files, one job each. `release-plz-pr.yml` maintains a pull
+request that bumps `[workspace.package]` and writes the changelogs from the
+conventional commits since the last release, on every push to `main`, then
+queues that pull request to merge itself. `release-plz-release.yml` runs on
+the resulting push and does nothing unless a manifest names a version that is
+not on crates.io. It tags, creates the GitHub release, and uploads in
+dependency order.
+
+**So a release needs no human step at all now.** Land an ordinary pull
+request on `main` and the version follows it out, once `main`'s required
+checks pass on the release pull request. The two things that can stop it are
+deliberate: a release pull request that bumps no version is left open and red
+rather than merged, and the `crates-io` environment will hold the publish if a
+required reviewer is ever configured there.
 
 The token lives in that workflow's `crates-io` environment, so a laptop never
 needs one. That environment is also where a required reviewer goes if this
@@ -208,13 +216,28 @@ more deliberate act than typing a `git push` of a tag, and the split's only
 visible effect was that merging the release PR did nothing and surprised the
 person who merged it.
 
-**`test.yml` is still the gate, and now it is actually wired as one.**
-`release` does not trigger on `push` at all; it triggers on `test.yml`'s
-`workflow_run` completing, checks that the run targeted `main` and
-succeeded, and checks out the exact commit `workflow_run` names. `push`
-alone would only mean "runs alongside", since both workflows would fire off
-the same event with no ordering between them -- this is what turns that into
-"waited for and required".
+**The gate moved out of the workflow and into a branch ruleset.** Until
+2026-08-27 the publish job triggered on `test.yml`'s `workflow_run` rather
+than on `push`, so that it could require a green run against the exact commit
+it was about to publish. `main` now carries a ruleset requiring `lint`,
+`docs`, `typos`, the `test` matrix, `features`, `musl` and `minimal-versions`,
+which means an untested commit cannot reach `main` for the publish job to find.
+The gate had nothing left to catch, so it went, and the workflow matches
+zendriver-rs's shape.
+
+Read that as a dependency, not a simplification: delete the ruleset and
+nothing checks anything before an upload. `slow`, `coverage`, `bench`,
+`privileged` and `windows-gnu` are deliberately not required. `slow` is the
+serial timing tier and has been the whole of CI's red for four consecutive
+runs; requiring a job that fails on a contended runner would block merges
+without telling anyone anything.
+
+**The release pull request is squashed, not merged.** release-plz 0.3.160,
+which the pinned action runs, substitutes the pull request's head commit for
+the commit it was handed when that commit is a merge commit, so `cargo publish`
+would package a tree that never landed on `main`. A squash leaves nothing for
+that lookup to find. The old workflow carried a step that refused merge
+commits outright; squashing removes the case instead of detecting it.
 
 If CI is unavailable and the publish has to happen from a laptop, the token
 goes in `CARGO_REGISTRY_TOKEN` and the command is `cargo publish --workspace`,
