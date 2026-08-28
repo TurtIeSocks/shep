@@ -2087,6 +2087,7 @@ async fn await_serving(port: u16, pid: u32) {
 /// cases that need this: they read the event stream in emission order, so they
 /// subscribe only once the app is up, which is precisely the moment this is
 /// establishing.
+#[cfg(unix)]
 async fn await_online(client: &mut Client, id: u32) {
     let online = tokio::time::timeout(RECV_TIMEOUT, async {
         loop {
@@ -2599,6 +2600,11 @@ async fn a_smit_carrying_an_escape_is_refused_at_the_daemon() {
 
 // --- Reload: a probed app's replacement answers for itself ---
 
+/// `#[cfg(unix)]` for the reason `reload_under_load` is: these two drive
+/// `reuse_port_sheep`, whose Windows build is a stub that binds nothing and is
+/// not even found under that name (the binary is `reuse_port_sheep.exe`), so
+/// `reuse_port_sheep`'s own `is_file` assert is what fails first.
+///
 /// The `AwaitReady` window a probed reload gets here, as `listen_timeout`.
 ///
 /// Both directions matter, which is why it is not simply "short". A
@@ -2606,12 +2612,14 @@ async fn a_smit_carrying_an_escape_is_refused_at_the_daemon() {
 /// costs the case its whole length before the abandonment lands — so this is
 /// the failing case's own runtime, twice over (the start's heuristic wait and
 /// the reload's probe).
+#[cfg(unix)]
 const PROBED_READY_WINDOW: UpDuration = UpDuration::from_millis(800);
 
 /// One `reuse_port_sheep` on `port`, gated on a TCP probe against the port it
 /// binds — the arrangement in which "is the new instance ready" and "is
 /// SOMETHING listening" are the same question, and so the one an overlapping
 /// reload could answer with the wrong process.
+#[cfg(unix)]
 fn probed_sheep(name: &str, port: u16, mute_file: &std::path::Path) -> AppConfig {
     let mut app = AppConfig::minimal(name, &reuse_port_sheep().display().to_string());
     app.interpreter = Some("none".to_string());
@@ -2654,6 +2662,7 @@ fn probed_sheep(name: &str, port: u16, mute_file: &std::path::Path) -> AppConfig
 /// fixture derives its port from `SHEP_INSTANCE`, so a replacement in another
 /// slot binds somewhere else, never answers this probe, and the reload is
 /// abandoned instead of finishing.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_probed_reload_of_a_working_release_still_finishes() {
     let _port_guard = RELOAD_PORT_LOCK.lock().await;
@@ -2755,6 +2764,7 @@ async fn a_probed_reload_of_a_working_release_still_finishes() {
 /// replacement `Online`** — the abandonment still reaches the bus, and the
 /// status assertion is the only thing left that reddens. That is the shape of
 /// the original bug: an event nobody was reading, over a status that lied.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_replacement_that_serves_nothing_is_refused_not_reported_reloaded() {
     let _port_guard = RELOAD_PORT_LOCK.lock().await;
