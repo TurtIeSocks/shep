@@ -218,10 +218,16 @@ pub async fn connect(addr: &Path) -> io::Result<ClientStream> {
 pub struct Listener {
     #[cfg(unix)]
     listener: tokio::net::UnixListener,
-    /// The idle instance the next client will connect to. Replaced on every
-    /// accept.
+    /// The idle instance the next client will connect to, taken on every
+    /// accept and replaced with a fresh one.
+    ///
+    /// `None` only between an accept handing out its connection and the
+    /// replacement being created, and across an accept whose replacement
+    /// could not be created at all. [`Self::accept`] makes one when it
+    /// finds the slot empty, which is what keeps a single failed `create`
+    /// from ending the daemon's ability to serve anyone.
     #[cfg(windows)]
-    server: tokio::net::windows::named_pipe::NamedPipeServer,
+    server: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
     /// The pipe name, kept so each replacement instance can be created on
     /// the same name.
     #[cfg(windows)]
@@ -268,7 +274,7 @@ impl Listener {
                 .reject_remote_clients(true)
                 .create(addr)?;
             Ok(Self {
-                server,
+                server: Some(server),
                 addr: addr.as_os_str().to_os_string(),
             })
         }
@@ -308,19 +314,49 @@ impl Listener {
         #[cfg(windows)]
         {
             use tokio::net::windows::named_pipe::ServerOptions;
+            // The slot is empty only if a previous accept could not create
+            // a replacement. Make one now rather than at that failure, so a
+            // transient `create` error costs one accept instead of the
+            // daemon's whole ability to serve.
+            if self.server.is_none() {
+                self.server = Some(
+                    ServerOptions::new()
+                        .reject_remote_clients(true)
+                        .create(&self.addr)?,
+                );
+            }
             // Resolves when a client attaches to the instance we hold.
-            self.server.connect().await?;
-            // Create the replacement BEFORE handing this one out, so there
-            // is never a window in which the pipe name has no idle instance
-            // and a connecting client sees ERROR_FILE_NOT_FOUND rather than
-            // the retryable ERROR_PIPE_BUSY. `first_pipe_instance` is
-            // deliberately NOT set here: it is set once, at `bind`, and
-            // setting it again would refuse to create the very instance
-            // this listener already owns the name for.
-            let next = ServerOptions::new()
+            let Some(server) = self.server.as_ref() else {
+                unreachable!("the slot was just filled")
+            };
+            server.connect().await?;
+            // Out of the slot BEFORE anything that can fail. Once a client
+            // has attached, this instance IS that connection and can never
+            // accept again, so leaving it in place would mean the next
+            // accept calling `connect` on a connected instance: Windows
+            // answers that with ERROR_PIPE_CONNECTED or ERROR_NO_DATA
+            // rather than waiting, and the daemon's accept loop, which
+            // logs an error and carries on, would spin on it forever
+            // instead of serving anyone.
+            let connected = self
+                .server
+                .take()
+                .unwrap_or_else(|| unreachable!("the slot was just filled"));
+            // `first_pipe_instance` is deliberately NOT set here: it is set
+            // once, at `bind`, and setting it again would refuse to create
+            // the very instance this listener already owns the name for.
+            //
+            // A failure here leaves the slot empty and the peer connected,
+            // which is the right way round. The alternative, `?` before the
+            // handoff, drops a peer that has already attached AND leaves a
+            // connected instance in the slot for the next accept to trip
+            // over. The error is not lost: the next accept re-creates and
+            // reports it, having handed this peer over first.
+            self.server = ServerOptions::new()
                 .reject_remote_clients(true)
-                .create(&self.addr)?;
-            Ok(std::mem::replace(&mut self.server, next))
+                .create(&self.addr)
+                .ok();
+            Ok(connected)
         }
     }
 }
