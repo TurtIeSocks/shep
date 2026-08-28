@@ -130,7 +130,14 @@ jobs:
           # it: a contentless version header, which is exactly what zendriver's
           # 44 empty releases looked like. The version test above passes it, and
           # correctly so: the bump is real. The changelog is what is empty.
-          if ! gh pr diff "$PR_NUMBER" | grep -qE '^\+[-*] '; then
+          # Leading whitespace is tolerated even though the template's `trim =
+          # true` strips it per line, which zendriver-rs's own generated
+          # sections confirm: `crates/zendriver-fetcher/CHANGELOG.md` 0.2.0 has
+          # its bullets at column 1 despite the template indenting them. The
+          # slack is here because this guard fails CLOSED. Drop `trim` from
+          # release-plz-changelog.toml some day and a strict pattern would stop
+          # every release with no signal beyond a red job nobody expects.
+          if ! gh pr diff "$PR_NUMBER" | grep -qE '^\+[[:space:]]*[-*][[:space:]]'; then
             echo "::error::release PR #$PR_NUMBER bumps a version but adds no changelog entry, so it will not be auto-merged."
             echo "::error::Every commit since the last release was filtered out by release-plz-changelog.toml."
             echo "::error::Left open for a human: close it, or land something worth releasing first."
