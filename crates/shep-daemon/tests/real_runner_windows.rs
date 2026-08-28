@@ -89,6 +89,7 @@ fn cmd_spec(dir: &tempfile::TempDir, args: &[&str]) -> SpawnSpec {
 /// single read immediately after the child exits is a race the test would
 /// lose intermittently rather than consistently — the worst kind.
 async fn wait_for_log(path: &PathBuf, needle: &str) -> String {
+    let started = tokio::time::Instant::now();
     let deadline = tokio::time::Instant::now() + SETTLE;
     let mut last = String::new();
     while tokio::time::Instant::now() < deadline {
@@ -107,10 +108,11 @@ async fn wait_for_log(path: &PathBuf, needle: &str) -> String {
         |name| name.replace("out", "err"),
     ));
     panic!(
-        "{needle:?} never reached {}; last saw {last:?}\n\
+        "{needle:?} never reached {} after {:?}; last saw {last:?}\n\
          out file exists: {}, len {:?}\n\
          stderr file {}: {:?}",
         path.display(),
+        started.elapsed(),
         path.exists(),
         std::fs::metadata(path).map(|m| m.len()).ok(),
         sibling.display(),
@@ -191,27 +193,15 @@ async fn kill_tree_stops_a_long_running_sheep_and_reports_a_recognisable_code() 
 /// This is the assertion that would go red if `spawn` ever stopped assigning
 /// the child to its job — a change that breaks nothing else, and that every
 /// other test in this file would keep passing through.
-// TEMPORARY, and it must not survive this pull request. Ignored on the same
-// terms as `daemon_e2e.rs`'s reopen case: to bank one green run that fills
-// the build cache, nothing more.
+// Ran ignored on Windows for four commits. On the runner this failed with
+// both log files present and ZERO bytes, so the sheep launched and wrote
+// nothing to either stream inside the deadline. The script above now
+// flushes stdout explicitly, which is the one explanation that fits an
+// empty stdout AND an empty stderr from a process that then sleeps for a
+// minute without exiting.
 //
-// This one costs more than that one, and the difference is worth stating.
-// Every wait here is bounded, so on CI this FAILS rather than hangs; what
-// hangs the step is the wreckage. The test deliberately spawns a grandchild
-// that outlives its parent, and if the job object does not reap it, a
-// ten-minute `ping` survives the test binary and holds the runner's step
-// open. So the hang is the symptom and the unreaped grandchild is the fault,
-// which means switching this off may well turn CI green while the thing it
-// guards is broken.
-//
-// **What it guards is a headline claim of this port**: that a per-sheep job
-// object kills the whole tree, and does it more reliably than the unix
-// process group, which `kill.rs` documents an escaped-`setsid` hole in. Do
-// not read a green Windows run with this ignored as evidence for that claim.
-#[cfg_attr(
-    windows,
-    ignore = "leaves an unreaped grandchild that hangs the CI step; re-enable before merge"
-)]
+// If that is wrong, the panic now says how long it waited, which separates
+// a slow start from a line that never comes.
 #[tokio::test]
 async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     let dir = tempfile::tempdir().unwrap();
@@ -220,8 +210,18 @@ async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     spec.args = vec![
         "-NoProfile".to_string(),
         "-Command".to_string(),
-        "$p = Start-Process ping -ArgumentList '-n','60','127.0.0.1' -PassThru          -WindowStyle Hidden; Write-Output ('LAMB=' + $p.Id); Start-Sleep -Seconds 60"
-            .to_string(),
+        // `[Console]::Out`, not `Write-Output`: this script prints one
+        // line and then sleeps for a minute, so anything PowerShell
+        // buffers on a redirected stdout does not reach the log until
+        // long after the test has given up waiting for it. The explicit
+        // flush is the whole point; the rest is the same script.
+        concat!(
+            "$p = Start-Process ping -ArgumentList '-n','60','127.0.0.1' ",
+            "-PassThru -WindowStyle Hidden; ",
+            "[Console]::Out.WriteLine('LAMB=' + $p.Id); [Console]::Out.Flush(); ",
+            "Start-Sleep -Seconds 60"
+        )
+        .to_string(),
     ];
     let runner = TokioRunner::new();
 
