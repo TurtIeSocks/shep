@@ -1590,3 +1590,65 @@ only ever has to lose once. Fetching at request time gives up the curation
 property completely no matter how good the sanitiser is, because the content
 a reviewer approved and the content actually being served are free to
 diverge starting with the very next upstream commit.
+
+## A readiness probe cannot verify a reload's replacement
+
+Found on 2026-08-28 by deploying real repositories with shep-deploy against a
+real shepherd, not by reading code. Two experiments, same broken release, same
+app, differing only in whether the old instance was answering:
+
+| old instance answering the probe | outcome |
+|---|---|
+| yes | the broken release was verified, recorded as deployed, exit 0, app down |
+| no | the broken release was correctly refused and rolled back, exit 12 |
+
+The second row is the machinery working. The first is the defect, and the
+mechanism is exact. `spawn_replacement` derives `ReadinessSource::of(config)`,
+which is `Probe` for an app with a `readiness_probe`. `await_ready`'s `Probe`
+arm probes immediately, and says why in its own comment: "the first probe must
+land at t=0, not after one `interval`". At t=0 the drainee is still listening
+on the address the probe names, because draining is what `reload_ready_result`
+does AFTER readiness resolves. So the old instance answers, the replacement is
+declared `Ready`, the old is drained, and the address goes dead.
+
+Timed, with a `listen_timeout` of ten seconds:
+
+```text
+t+0.0s  probe answers YES  status=online  pid=7349   the old release
+t+1.0s  probe answers no   status=online  pid=7745   the new one, already Online
+t+25.8s probe answers no   status=online  pid=7745
+```
+
+**This is not a bug in one line, it is a property of the arrangement.** An
+address probe cannot say which of two processes answered it, and an overlapping
+reload exists precisely to have two. `SO_REUSEPORT`, which is what makes the
+overlap zero-downtime in the first place, makes it worse rather than better:
+the kernel balances across both sockets, so even a probe that arrives late may
+be answered by the instance on its way out.
+
+What it costs downstream: `shep-deploy`'s `verify = "probed"` is documented as
+the safe default with automatic rollback. It watches for a new process reaching
+`Online`, so a release that starts and never becomes ready is verified,
+recorded as deployed, and left serving nothing. That crate's README now says
+what its verification actually checks and points here.
+
+### The options, none of them free
+
+1. **Probe after the drain, not before.** Keeps the overlap, adds a second
+   readiness check once the drainee is gone, and reports the reload failed if
+   it does not pass. Does not restore the old instance, which is already gone
+   by then, but it tells the truth, and a deploy dog with the previous release
+   still on disk can act on it. The most honest of the three and the most work.
+2. **Prefer the channel for a gated reload.** `wait_ready` is per process and
+   cannot be answered by the drainee. This means telling operators that a probe
+   does not gate a reload and `wait_ready` is what does, which is a real
+   demotion of the feature most apps can actually use.
+3. **Serialise: drain, then start, then probe.** Correct verification, no
+   overlap, no zero-downtime reload. Not worth it.
+
+Recommendation is 1, with the doc change from 2 alongside it, because even
+after 1 the pre-drain probe pass remains meaningless and should stop being
+described as verification.
+
+Not built here because it changes what a reload promises, which is Rin's call
+rather than a fix to apply on the way past.
