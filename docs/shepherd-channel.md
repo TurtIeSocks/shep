@@ -56,21 +56,9 @@ only that half:
   **Your app opens it itself**, for reading and writing, exactly as it would
   open any file. That open is the whole difference. Read the name out of
   the environment and do not try to reconstruct it: the trailing hex is
-  random per spawn.
-
-  **What that randomness does and does not buy, stated exactly, because a
-  client author is entitled to the real model.** A named pipe created with
-  the default security descriptor grants read to Everyone and restricts
-  write, so the channel is readable by any local account. shep does not set
-  a restrictive descriptor on it. The random name means the pipe cannot be
-  *predicted*, which closes the attack where a hostile local account parks
-  itself on a name it knew in advance. It does not close *watching*: the
-  pipe namespace is enumerable by any unprivileged local user (measured on
-  Windows 10, 190 pipes listed from a non-elevated session), so an account
-  polling it can see the name appear and race the real app to connect. Treat
-  the channel as carrying nothing you would not show another local account,
-  and see [deferred.md](specs/deferred.md) for the DACL that would close
-  this properly.
+  random per spawn. The channel is readable by other accounts on the same
+  machine, so do not put anything on it you would not show them. Detail in
+  [deferred.md](specs/deferred.md) if you run shep somewhere that matters.
 - `SHEP_CHANNEL_VERSION` is exported as before.
 - **`SHEP_CHANNEL_FD` is deliberately NOT set on Windows.** Branch on which
   variable is present rather than on the platform: an app that finds

@@ -100,11 +100,15 @@ platform allowed to write `unsafe`. That is a real design change to the seam
 rather than a one-line fix, which is why it is written down rather than
 squeezed into the Windows tier's own pull request.
 
-**Severity, honestly.** Local-only, needs an attacker already running code as
-another account on the same machine, and races a window measured in
-milliseconds. It is hardening, not an emergency. But `docs/shepherd-channel.md`
-tells app authors what the channel does and does not protect, and it should
-not tell them a random name is a wall when it is a speed bump.
+**Severity, honestly: this is recorded, not queued.** It needs an attacker
+already running code as a DIFFERENT account on the same machine, winning a
+millisecond race, against a Windows install running shep. Rin's read, and it
+is the right one: a shep-on-Windows user who also has a hostile local account
+on the same box is close to a nonexistent population, and the fix costs a
+redesign of the transport seam plus new unsafe FFI. Do not spend that on
+this. It is written down because the docs used to imply a random name was a
+security boundary, and a false claim in published docs is worth correcting
+whatever the exploit likelihood. The claim is fixed. The DACL is a someday.
 
 
 ### `cmd /C` cannot carry a quoted script from `std::process::Command` -- and it is not shep's bug
