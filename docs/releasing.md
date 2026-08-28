@@ -418,3 +418,5 @@ the crate it is building. They were never in danger of shipping.
 The largest archive is `shep-daemon` at 1.9 MiB uncompressed, 520 KiB
 compressed, which is `supervisor.rs` and `boot.rs` being large source files.
 That is well inside the 10 MiB registry limit.
+
+Canary for #44: this branch touches only this file, so every Rust job should skip.
