@@ -2484,7 +2484,7 @@ Separate commits, because they are four different asks and each should be revert
 ### Task 10: Changelogs, and the release that unblocks the dog
 
 **Files:**
-- Modify: `crates/shep-core/CHANGELOG.md`, `crates/shep-client/CHANGELOG.md`, `crates/shep-daemon/CHANGELOG.md`, `crates/shep-cli/CHANGELOG.md`
+- Modify: none. The changelogs are generated; this task reads commit subjects, runs the gate, and opens the pull request.
 
 **Interfaces:**
 - Consumes: Tasks 1 through 9.
@@ -2492,18 +2492,27 @@ Separate commits, because they are four different asks and each should be revert
 
 **The changelogs are generated, so do not hand-write one.** This said the opposite until 2026-08-27, when `release-plz.toml` moved to `changelog_update = true` to match zendriver-rs. The two objections recorded against generation are handled rather than gone: `release-plz-changelog.toml` skips docs, test, ci, chore and style commits so a generated section no longer duplicates hand-written entries, and `typos` is a required check on `main`, so a misspelled commit subject blocks its own release pull request instead of landing in a tracked file. Write a conventional commit subject; the release pull request carries it. All four crates share one version through `[workspace.package]`.
 
-- [ ] **Step 1: Write the `[Unreleased]` entries**
+- [ ] **Step 1: Check what the release pull request will say**
 
-Keep a Changelog form, matching the depth of the existing entries -- `crates/shep-core/CHANGELOG.md:12-32` (the `last_exit` entry) is the model, and it is long because it carries the reasoning rather than the diff.
+There is nothing to write here any more. release-plz generates each crate's section from the conventional commit subjects on this branch, so the subjects the earlier tasks committed **are** the changelog, one line each. This step is reading them back, not authoring.
 
-| Crate | Entries |
+```bash
+git log --oneline main..HEAD
+```
+
+Every line that should appear must start `feat`, `fix`, `perf` or `refactor`; `release-plz-changelog.toml` drops `docs`, `test`, `ci`, `chore` and `style`. A change that matters to an operator and landed under a dropped prefix is invisible in the release. If you find one, amend the subject rather than adding a changelog entry by hand.
+
+**Know what this costs, because it is a real loss.** `crates/shep-core/CHANGELOG.md:12-32`, the `last_exit` entry, runs twenty lines and carries the reasoning rather than the diff. A generated entry cannot do that: it gets one line. So the reasoning goes in the commit **body**, where `git log` and `git blame` keep it, and the changelog carries the subject. That is the trade this repository made on 2026-08-27 when it moved to `changelog_update = true`; it was `false` precisely because generation is shallower.
+
+Three subjects to get right, since they are the whole entry:
+
+| Crate | What the subject has to carry |
 |---|---|
-| `shep-core` | `ProcessInfo::reload_deadline_ms` and `ProcessInfo::smit`, both additive under `Option`, **`PROTOCOL_VERSION` stays 1** and say so in the words the `last_exit` entry uses. `Smit`, `SmitError`, `Request::SetSmit`, `Response::SmitPainted`. State explicitly that the deadline went on `ProcessInfo` rather than on `Response::Reloading` **because** reshaping a tuple variant under `#[serde(tag, content)]` would have been a retype and a version bump. |
-| `shep-daemon` | reports each instance's reload deadline; accepts and stores smits, connection-scoped and never persisted; `ConnId`. |
-| `shep-client` | `Client::reconnect`, `Client::reconnect_within`, `Reconnected`. Under `Added`, and a note under `Changed` that the crate now documents a `Client` as one connection that does not come back on its own. `crates/shep-client/CHANGELOG.md:21-22` says everything in that surface is a stability surface, so a new public method is an entry of its own. |
-| `shep-cli` (published as `shep`) | `rehome` keeps `[dog.<name>]` -- **under `Changed`, not `Added`**, because it changes documented shipped behaviour; the on-remove hook; the SMIT column; `--quiet` covering the hook report; exit codes 12 and up reserved for dogs. |
+| `shep-core` | That `ProcessInfo::reload_deadline_ms` and `ProcessInfo::smit` are additive and **`PROTOCOL_VERSION` stays 1**. The body explains that the deadline went on `ProcessInfo` rather than on `Response::Reloading` because reshaping a tuple variant under `#[serde(tag, content)]` would have been a retype and a version bump. |
+| `shep-client` | `Client::reconnect` and `Client::reconnect_within` are new public surface. `crates/shep-client/CHANGELOG.md:21-22` says everything there is a stability surface, so this is its own commit rather than a tail on another. |
+| `shep-cli` (published as `shep`) | `rehome` keeping `[dog.<name>]` is a `fix` or a `feat`, never a `chore`, or it vanishes from the release. |
 
-**`rehome`'s entry is the one to get right.** It is the only behaviour change in this branch that an existing operator could notice without asking for it, and what they notice is that something they expected to be deleted was not. Say what changed, say the settings are theirs, and say that re-adopting now finds them waiting.
+**`rehome`'s subject is the one to get right.** It is the only behaviour change in this branch an existing operator could notice without asking for it, and what they notice is that something they expected to be deleted was not. The subject says the settings are kept; the body says they are theirs and that re-adopting finds them waiting.
 
 - [ ] **Step 2: Run the full gate, once, at the branch level**
 
@@ -2535,18 +2544,15 @@ Give the second its own `CARGO_TARGET_DIR` so it does not invalidate the host ca
 
 **Then read CI, and do not call the branch green before you have.** `.github/workflows/test.yml` runs on every push and pull request, its `ubuntu-latest` and `ubuntu-24.04-arm` legs run the suite on real Linux, and its serial `slow` job is where the timing-sensitive tests live. Three separate breakages on 2026-08-19 were visible only there. Task 2's hook tests spawn real children and Task 6's e2e test waits on a real socket closing; if either proves contention-sensitive on a shared runner, it belongs in the `slow` job's skip list rather than being made to pass by widening a timeout.
 
-- [ ] **Step 3: Commit, then open the PR**
+- [ ] **Step 3: Open the PR**
 
-```bash
-git add crates/*/CHANGELOG.md
-git commit -m "docs(changelog): dog prerequisites"
-```
+There is no changelog commit to make. If `git status` shows a modified `CHANGELOG.md`, something hand-wrote an entry release-plz is about to generate again; drop it.
 
 The repository has been on pull requests since 0.1.0 was published; the push-to-main window is closed. The PR body is public-facing prose: run `humanizer` then `rin-voice` over it, use bullets, and do not hard-wrap the paragraphs, because GitHub renders comment fields with hard line breaks on and an 80-column wrap becomes a ragged third-width column.
 
 - [ ] **Step 4: Release, because the dog is waiting on crates.io**
 
-`shep-deploy` depends on `shep-client` **from crates.io**, so nothing in this branch unblocks its Task 12 until this is published. Releasing is one act: merge the release pull request release-plz opens. Publish order is `shep-core`, then `shep-client` and `shep-daemon`, then `shep` (`docs/releasing.md`).
+`shep-deploy` depends on `shep-client` **from crates.io**, so nothing in this branch unblocks its Task 12 until this is published. Releasing takes no act at all since 2026-08-27: release-plz opens the release pull request and queues it to merge behind main's required checks, and the resulting push publishes. Publish order is `shep-core`, then `shep-client` and `shep-daemon`, then `shep` (`docs/releasing.md`).
 
 Then tell `shep-deploy`: bump `shep-client`, and Task 12 is unblocked.
 

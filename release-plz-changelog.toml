@@ -55,4 +55,8 @@ commit_parsers = [
     { message = "^style", skip = true },
 ]
 filter_commits = true
+# The skips above drop `^chore`, which would also drop a breaking `chore!:`
+# commit: exactly the one that must never go missing from a changelog. This
+# keeps any commit marked breaking regardless of which parser matched it.
+protect_breaking_commits = true
 tag_pattern = "v[0-9].*"
