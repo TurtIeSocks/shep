@@ -146,21 +146,73 @@ As of 2026-08-25 the workflow's header no longer restates the count (the
 private-repo premise it existed to cost out is gone), so this file is now the
 only place it lives. Change a matrix and update it here.
 
-### `reuse_port` is accepted, stored, displayed — and never read -- FIXED, Phase 17
+### `reuse_port` is accepted, stored, displayed — and never read -- FIXED, 2026-08-28
 
-`AppConfig::reuse_port` has no production reader anywhere in the workspace.
-Reload's overlap between the old and new instance is unconditional, so the
-permission this field grants is one shep already takes.
+`AppConfig::reuse_port` had no production reader anywhere in the workspace.
+Reload's overlap between the old and new instance was unconditional, so the
+permission this field granted was one shep already took, and `normalize`
+refused it outright rather than accept a knob nothing implemented.
 
-Kept rather than removed: `shep import` sets it for a cluster-mode pm2 app and
-`shep flock` renders it, so deleting the field would silently drop a value out
-of a config an operator handed us. It costs one `bool` per app.
+The entry predicted its own ending correctly: "It stops being inert the day
+shep grows a reload mode that does not overlap by default, a `graceful = false`
+or a serial reload, at which point this is the field that says which apps may
+be overlapped." That day was 2026-08-28, and what forced it was not tidiness.
 
-It stops being inert the day shep grows a reload mode that does not overlap by
-default, a `graceful = false` or a serial reload, at which point this is the
-field that says which apps may be overlapped. Until then the doc comment on
-the field says plainly that it does nothing, which is the part that was
-missing.
+**A reload's readiness probe was being answered by the instance the reload was
+replacing.** `await_ready`'s `Probe` arm probes at t=0, deliberately, so a fast
+app is not held at `starting` for a whole interval; at t=0 the outgoing
+instance is still bound to the address the probe names, because the drain runs
+only after readiness resolves. An address probe cannot say which process
+answered it, and an overlapping reload exists to have two. Found by deploying
+real repositories against a real shepherd — a release whose listener bound the
+wrong port was verified, recorded as deployed, and reported `exit 0`, with the
+app down behind it.
+
+So a probed app with no `reuse_port` now reloads SERIALLY (`ReloadMode` in
+`supervisor.rs`): drain, then spawn into the empty slot, where the only process
+that can answer the probe is the replacement. `reuse_port` is the opt-in back
+to the overlap, for an app that really does set `SO_REUSEPORT` and can
+therefore hold two instances on one port. Nothing needed migrating: `normalize`
+refused the field, so no config that loads could contain it.
+
+`shep import` still does not write it for a cluster-mode pm2 app, which is
+deliberate and unchanged. Only the operator knows whether the app actually
+calls `reusePort: true`, and asserting it on their behalf would buy back the
+overlap that produces `EADDRINUSE` — see `from-pm2.astro`.
+
+### What the reload-readiness fix does NOT cover -- open, 2026-08-28
+
+Three residuals, recorded because each was a deliberate stopping point rather
+than an oversight.
+
+**The post-drain probe is exact only for a single-instance app.** An
+overlapping reload of a probed app (`reuse_port = true`) asks its probe a
+second time once the drainee is reaped, because `SO_REUSEPORT` means the kernel
+may hand either instance a connection and even a late probe can be answered by
+the one on its way out. With one process left, an answer proves that process
+answered. With a CLUSTER, a reload replaces one instance at a time, so the
+surviving old instances are still in the group and can still answer for a bad
+replacement until the last swap. Closing it needs a per-instance identity in
+the probe response — the app naming which process it is — which is exactly what
+`wait_ready` already provides and is why the code points a clustered app at the
+channel instead of growing a second mechanism.
+
+**A replacement that fails its readiness check keeps its process and loses its
+lifecycle extras.** It is left registered and `Starting` rather than killed,
+because with the drainee gone, killing it would empty the instance slot
+outright. But extras are armed at `went_online`, so an instance parked this way
+has no liveness loop and nothing will restart it on its own; the operator has
+to act on the `process.reload_abandoned` event. Arming a liveness loop against
+a process that is not `Online` is a wider change than this fix wanted —
+`handle_extra_restart` guards on that status for four separate callers.
+
+**A deploy tool's patience is sized off `listen_timeout + graceful_timeout`,
+and a `reuse_port` reload now costs one more `listen_timeout` than that.**
+shep-deploy derives its verify budget that way (`deploy.rs::budget`), so for
+the one combination of `reuse_port = true` AND a probe, the post-drain check
+can outlast the budget and roll back a healthy release. A false rollback rather
+than a false success, which is the right direction to fail, but it is a real
+interaction and the fix belongs on shep-deploy's side of the line.
 
 ### `bind_socket` surfaces an over-length `$SHEP_HOME` as a raw `ENAMETOOLONG` -- FIXED, Phase 17
 

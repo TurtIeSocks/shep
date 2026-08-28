@@ -233,18 +233,32 @@ pub enum Commands {
     Restart(SelectorArgs),
     /// Reload one or more sheep, one instance at a time.
     ///
-    /// Each instance is replaced by a fresh one, which has to start and
-    /// become ready before the instance it replaces is asked to go — so the
-    /// app gets a window in which it can hand over without dropping work.
+    /// Each instance is replaced by a fresh one that has to become ready
+    /// before the reload moves on, so a release that never comes up is
+    /// refused rather than taking the instance it replaced with it.
     ///
-    /// An app that binds a port has to set SO_REUSEPORT itself, before it
-    /// binds; shep binds nothing and cannot set it on the app's behalf.
-    /// Without it the replacement fails to bind on every reload and the
+    /// Which ORDER that happens in depends on the app.
+    ///
+    /// An app with a readiness_probe is replaced serially: the old instance
+    /// drains first, then the new one starts in its place. A probe asks an
+    /// address, and an address cannot say which process answered it. Run both
+    /// at once and the outgoing instance answers for the incoming one, so
+    /// shep would call a release ready that never bound anything. The cost is
+    /// a gap, the drain plus the new instance's start.
+    ///
+    /// Everything else overlaps, old and new running together: an app with no
+    /// probe, an app using wait_ready (its channel belongs to one instance,
+    /// so nothing else can answer it), and an app that sets reuse_port.
+    ///
+    /// reuse_port is how a probed app asks for the overlap back. It asserts
+    /// that the app sets SO_REUSEPORT itself, before it binds; shep binds
+    /// nothing and cannot set it on the app's behalf. Set it on an app that
+    /// does not and the replacement takes EADDRINUSE on every reload, and the
     /// reload is abandoned with the old instance left serving. This command
     /// has already exited 0 by then, so process.reload_abandoned on the bus
     /// is the only report of it.
     ///
-    /// That window is not zero downtime. The old listener's queue of
+    /// An overlap is not zero downtime either. The old listener's queue of
     /// connections it has not accepted yet is dropped when it closes, so an
     /// app that does not stop accepting and finish what it has in hand
     /// before graceful_timeout runs out loses whatever was waiting there.

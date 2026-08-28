@@ -315,15 +315,15 @@ py = "python3"`}</CodeBlock>
       <code>cluster</code> module, where a single primary process holds the
       one listening socket and hands each accepted connection to a worker
       round robin. shep's own <code>reuse_port</code> field is the more
-      interesting half of this contrast, because it is real: a reload
-      overlaps the old and new instance on the same port today, and
-      <code>reuse_port</code> is what a Flockfile will assert an app is
-      doing for itself once shep grows a reload mode that stops overlapping
-      by default. It is accepted by the schema and refused at load while
-      nothing implements it yet (verified: setting <code>reuse_port =
-      true</code> anywhere in this file fails the whole file to load, not
-      just that one app) — which is why this example offsets the port
-      instead of sharing it.
+      interesting half of this contrast, because it decides how a reload
+      runs: an app that sets it is asserting it calls
+      <code>SO_REUSEPORT</code> itself, and gets its two instances
+      overlapped during a reload. An app that does not, and that has a
+      <code>readiness_probe</code>, is reloaded serially instead: the old
+      instance drains before the new one starts, because a probe against a
+      shared address cannot tell you which of two instances answered it.
+      This example offsets the port rather than sharing it, so the question
+      never arises: four listeners, four ports, nothing to share.
     </p>
 
     <h3>A venv's own python</h3>
