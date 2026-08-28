@@ -414,19 +414,27 @@ floor — a combining mark measures zero and rides along with its base
 character, which is the case that matters, and both truncating callers stop
 on a whole `char` boundary.
 
-### A `.js` Flockfile has no evaluation timeout
+### A `.js` Flockfile has no evaluation timeout -- FIXED, 2026-08-28
 
-A `.js` module handed to `require()` and never returning — one that starts a
-server at require time rather than exporting config — hangs `shep start`
-forever. There is no bound on the wait.
+`evaluate_js_flockfile` takes a budget now, `JS_EVAL_BUDGET` is 30s, and node
+is killed once it passes. The refusal exits `InvalidConfig` and names the
+cause: *node was still evaluating <path> after 30s, so shep killed it; a
+Flockfile module has to export its config and return, and one that starts a
+server at require time never does.*
 
-Not built because a bound means a reaper thread in a crate that forbids
-unsafe code (`#![forbid(unsafe_code)]` on shep), for a case where the
-process is in the foreground, attached to the operator's own terminal, and
-already interruptible with Ctrl-C. What would force it: any path that
-evaluates a `.js` Flockfile unattended — a CI job or a provisioning script
-running `shep start` non-interactively, where nobody is watching to press
-Ctrl-C.
+**The reason recorded here for not building it was wrong**, which is the part
+worth keeping. A bound needs no reaper thread and no unsafe. `Child::try_wait`
+in a poll loop is safe std, and `commands/dogs.rs` already ran that exact loop
+for `adopt`'s exec probe. What the threads in `commands/bounded.rs` are for is
+a different problem: a pipe holds 64 KiB, so a child filling stdout blocks and
+never exits, and a deadline that read the pipes after the wait could not fire
+on the loudest children it exists for. `Command::output` spawns them for the
+same reason. The budget covers the reads as well as the wait, so a grandchild
+holding the inherited pipe open cannot outlast it either.
+
+**No knob.** 30s is a const, not a flag and not a `shep.toml` key. Nothing
+honest reaches it, and a config that does has a bug the operator wants to hear
+about rather than a setting they want to raise. Adding one later is additive.
 
 ### The missing-node error message has no test -- FIXED, Phase 17
 

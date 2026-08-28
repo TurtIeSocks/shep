@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod bleats;
+pub(crate) mod bounded;
 pub mod daemon;
 pub mod dev;
 pub mod dogs;
