@@ -360,14 +360,6 @@ pub fn normalize_with_home(
         // with no `WorkingDirectory=` (Rin, 2026-08-08).
         return Err(NormalizeError::WatchWithoutCwd { name: app.name });
     }
-    if app.reuse_port {
-        // Accepted, stored and displayed since it was added, and read by
-        // nothing. Refusing is the honest answer while that is true: an
-        // operator who writes it is asking for behaviour shep does not have,
-        // and finding out at parse time beats finding out from a port
-        // conflict in production.
-        return Err(NormalizeError::ReusePortUnimplemented { name: app.name });
-    }
     if app.watch_delay == Some(UpDuration::from_millis(0)) {
         // notify's debouncer derives its own poll tick as `watch_delay / 4`
         // and runs it on a dedicated OS thread, so a zero turns that thread
@@ -588,17 +580,6 @@ pub enum NormalizeError {
         /// Which field carried it.
         field: &'static str,
     },
-    /// `reuse_port` is set, and nothing reads it.
-    ///
-    /// Refused rather than ignored (Rin, 2026-08-19). The field parsed,
-    /// stored and displayed for several phases while no production code
-    /// consulted it, so a Flockfile could ask for `SO_REUSEPORT` and quietly
-    /// not get it. A config that silently does nothing is worse than one
-    /// that will not load.
-    ReusePortUnimplemented {
-        /// The sheep name, so the error names which Flockfile entry to edit.
-        name: String,
-    },
     /// `watch_delay` is `0`, which would spin the debouncer's own OS thread.
     /// Carries the app name.
     ZeroWatchDelay {
@@ -677,14 +658,6 @@ impl fmt::Display for NormalizeError {
                 "`{name}`: {field} begins with `~/` but no home directory could be found. \
                  Set $HOME, or write the path out in full."
             ),
-            Self::ReusePortUnimplemented { name } => {
-                write!(
-                    f,
-                    "`{name}`: reuse_port is accepted by the schema but not yet implemented, \
-                     so shep refuses it rather than ignoring it. Remove the line to load this \
-                     Flockfile."
-                )
-            }
             Self::WatchWithoutCwd { name } => {
                 write!(f, "sheep `{name}` has watch = true but no cwd to watch")
             }
@@ -853,38 +826,31 @@ mod tests {
         );
     }
 
-    /// Refused, not ignored. `reuse_port` parsed and stored for several
-    /// phases while no production code read it, so a Flockfile could ask for
-    /// `SO_REUSEPORT` and quietly not get it (Rin's call, 2026-08-19).
+    /// Loads, as of the day the daemon started reading it. The refusal that
+    /// stood here from 2026-08-19 was honest while no production code
+    /// consulted the field; now reload's mode is chosen from it, so refusing
+    /// would deny an operator the only way to ask for an overlapping reload.
+    ///
+    /// Nothing had to be migrated to get here: `normalize` refused every
+    /// config carrying the field, so no Flockfile that loads today can
+    /// contain it, and un-refusing cannot change what any existing
+    /// deployment does.
     #[test]
-    fn reuse_port_is_refused_while_nothing_implements_it() {
+    fn reuse_port_loads_now_that_reload_reads_it() {
         let mut app = AppConfig::minimal("web", "./server");
         app.reuse_port = true;
 
-        let err = normalize(app).expect_err("reuse_port must not load");
-        assert!(
-            matches!(err, NormalizeError::ReusePortUnimplemented { ref name } if name == "web"),
-            "the refusal names the entry to edit: {err:?}"
-        );
-
-        let rendered = err.to_string();
-        assert!(
-            rendered.contains("not yet implemented"),
-            "the message says why rather than just refusing: {rendered}"
-        );
-        assert!(
-            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
-            "no em or en dash in copy a user reads: {rendered}"
-        );
+        let resolved = normalize(app).expect("reuse_port is implemented");
+        assert!(resolved.config().reuse_port);
     }
 
     /// The default is off, so every Flockfile that does not mention it keeps
-    /// loading. Pins that the refusal above cannot become a wall for
-    /// everyone.
+    /// loading.
     #[test]
     fn an_app_that_never_mentions_reuse_port_still_normalizes() {
-        normalize(AppConfig::minimal("web", "./server"))
+        let resolved = normalize(AppConfig::minimal("web", "./server"))
             .expect("the common case must be untouched");
+        assert!(!resolved.config().reuse_port);
     }
     use crate::config::AppConfig;
 
