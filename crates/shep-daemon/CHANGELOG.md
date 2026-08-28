@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-28
+
+
 ### Fixes
 
 - Name the sheep and the path in a failed spawn's message. The whole error
