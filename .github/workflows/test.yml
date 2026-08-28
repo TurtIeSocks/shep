@@ -156,6 +156,15 @@ jobs:
       - uses: crate-ci/typos@v1
   test:
     needs: changes
+    # `!cancelled()` and nothing else. Without it, a FAILED `changes` job
+    # skips this job before matrix expansion, and the per-leg required checks
+    # go missing again through the one path the step gates cannot reach. With
+    # it, the legs always expand, and a failed filter makes every step's
+    # `result != 'success'` term true, so the full suite runs: fail closed,
+    # same as the job-level gates. The steps themselves deliberately do NOT
+    # carry `!cancelled()`; on a step it replaces the implicit `success()`,
+    # which would run `cargo test` after a failed toolchain install.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -243,6 +252,15 @@ jobs:
       - run: cargo check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu
   features:
     needs: changes
+    # `!cancelled()` and nothing else. Without it, a FAILED `changes` job
+    # skips this job before matrix expansion, and the per-leg required checks
+    # go missing again through the one path the step gates cannot reach. With
+    # it, the legs always expand, and a failed filter makes every step's
+    # `result != 'success'` term true, so the full suite runs: fail closed,
+    # same as the job-level gates. The steps themselves deliberately do NOT
+    # carry `!cancelled()`; on a step it replaces the implicit `success()`,
+    # which would run `cargo test` after a failed toolchain install.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
