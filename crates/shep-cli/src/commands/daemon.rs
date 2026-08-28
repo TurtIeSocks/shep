@@ -35,6 +35,7 @@ use shep_core::protocol::DogSource;
 use shep_core::values::UpDuration;
 use shep_daemon::boot::{BootError, BootOptions, RunningDaemon, boot};
 use shep_daemon::dogs::DogSpec;
+#[cfg(unix)]
 use shep_daemon::notify::NOTIFY_SOCKET_ENV;
 use shep_daemon::tokio_runner::TokioRunner;
 use tracing_subscriber::EnvFilter;
@@ -263,7 +264,14 @@ pub async fn boot_supervisor(
     // The one read of this variable in the workspace, here beside every
     // `SHEP_*` override rather than inside shep-daemon — see
     // `shep_daemon::notify::NOTIFY_SOCKET_ENV`'s own doc.
+    // Unix only: `$NOTIFY_SOCKET` is systemd's readiness protocol over a
+    // unix datagram socket, and Windows has nothing for it to address. The
+    // field stays on `BootOptions` for both — see `shep_daemon::boot`'s own
+    // note on why the config type's SHAPE should not change per platform.
+    #[cfg(unix)]
     let notify_socket = std::env::var_os(NOTIFY_SOCKET_ENV);
+    #[cfg(windows)]
+    let notify_socket: Option<std::ffi::OsString> = None;
     let mut options = boot_options(&config, args, notify_socket.as_deref());
     options.delete_flock_on_shutdown = delete_flock_on_shutdown;
     boot(TokioRunner::new(), paths, options)

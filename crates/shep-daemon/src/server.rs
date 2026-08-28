@@ -1,14 +1,19 @@
-//! The unix-tier connection layer: peer-cred auth, handshake, subscriptions
+//! The connection layer: peer auth, handshake, subscriptions
 //!
-//! [`RpcServer`] owns the bound [`UnixListener`] and accepts connections
-//! until told to stop. Every accepted connection runs `handle_conn` (private
-//! — the connection state machine is an implementation detail, not public
-//! API) in its own task: a same-uid check ([`check_peer`]), a version
+//! [`RpcServer`] owns the bound [`Listener`] and accepts connections until
+//! told to stop. Every accepted connection runs `handle_conn` (private — the
+//! connection state machine is an implementation detail, not public API) in
+//! its own task: a same-uid check ([`check_peer`], unix only), a version
 //! handshake, then a read loop that decodes envelopes and hands them to
 //! [`rpc::dispatch`](crate::rpc::dispatch) — the portable dispatcher Task 4
-//! built, which never sees a socket or a byte. This module is the only place
-//! that does: everything here is `#[cfg(unix)]`, built on `tokio::net`'s
-//! unix-domain-socket types.
+//! built, which never sees a socket or a byte.
+//!
+//! This module used to be the one place that did, and it was `#[cfg(unix)]`
+//! for that reason. It is not any more: the OS transport lives one crate
+//! down in [`shep_core::transport`], so the accept loop, the handshake and
+//! the connection state machine here are one implementation over a unix
+//! socket and a Windows named pipe alike. The single genuine platform
+//! difference left in this file is [`check_peer`].
 //!
 //! # Security
 //!
@@ -21,8 +26,6 @@ use core::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -31,6 +34,7 @@ use shep_core::protocol::{
     Envelope, Hello, HelloAck, HelloReply, PROTOCOL_VERSION, RpcError, RpcErrorCode, WireError,
     codec, decode_frame, encode_frame,
 };
+use shep_core::transport::{Listener, ServerReadHalf, ServerStream, ServerWriteHalf};
 
 use crate::bus::spawn_forwarder;
 use crate::rpc::{Outcome, RpcContext, dispatch};
@@ -41,12 +45,12 @@ pub const CONN_QUEUE: usize = 64;
 /// How long a connected peer has to send its `Hello` before the daemon closes.
 pub const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 
-type Frames = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
+type Frames = FramedRead<ServerReadHalf, LengthDelimitedCodec>;
 
 /// The control socket — shep's privilege boundary
 ///
-/// Wraps an already-bound [`UnixListener`] with the daemon-wide
-/// [`RpcContext`] and drives the accept loop.
+/// Wraps an already-bound [`Listener`] with the daemon-wide [`RpcContext`]
+/// and drives the accept loop.
 ///
 /// # Security
 ///
@@ -64,7 +68,18 @@ type Frames = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
 /// and refused unless the peer's uid equals the daemon's; this fails
 /// CLOSED — a connection whose credentials the OS will not report
 /// ([`AuthError::NoCredentials`]) is refused, not admitted, exactly like a
-/// confirmed uid mismatch. The handshake refuses protocol skew with a typed
+/// confirmed uid mismatch.
+///
+/// **Both of those sentences describe the unix tier.** Windows reaches the
+/// same posture by a different route and one step earlier: there is no
+/// `0700` directory and no post-accept credential check, because the control
+/// pipe's own ACL denies a foreign local user the open-for-write that
+/// speaking this protocol requires, and the OS enforces that at `CreateFile`
+/// time before any byte reaches this module.
+/// [`shep_core::transport`]'s module doc is the canonical account of that
+/// difference, including what it does and does not cover.
+///
+/// The handshake refuses protocol skew with a typed
 /// error ([`RpcErrorCode::ProtocolMismatch`]) rather than silence; frames
 /// are capped at [`shep_core::protocol::MAX_FRAME_BYTES`]. Every
 /// peer-supplied *pattern* is bounded before it can cost the daemon
@@ -106,14 +121,14 @@ type Frames = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
 /// accepted connection).
 #[derive(Debug)]
 pub struct RpcServer {
-    listener: UnixListener,
+    listener: Listener,
     ctx: RpcContext,
 }
 
 impl RpcServer {
     /// Wraps an already-bound listener with the request-handling context.
     #[must_use]
-    pub fn new(listener: UnixListener, ctx: RpcContext) -> Self {
+    pub fn new(listener: Listener, ctx: RpcContext) -> Self {
         Self { listener, ctx }
     }
 
@@ -135,7 +150,11 @@ impl RpcServer {
     /// `tokio::task::JoinSet` in place of the bare `tokio::spawn`), not
     /// yet built.
     pub async fn serve(self, mut shutdown: watch::Receiver<bool>) {
-        let Self { listener, ctx } = self;
+        // `mut` because `Listener::accept` needs `&mut self` on both
+        // platforms: a Windows named pipe server instance is consumed by
+        // whoever connects to it, so accepting means handing that instance
+        // out and creating the next one. See `shep_core::transport::Listener`.
+        let Self { mut listener, ctx } = self;
         // A shutdown signal that was ALREADY `true` before this loop's first
         // `changed()` call would otherwise never be observed: `changed()`
         // only resolves on a value newer than the one this receiver has
@@ -148,7 +167,7 @@ impl RpcServer {
             tokio::select! {
                 accepted = listener.accept() => {
                     match accepted {
-                        Ok((stream, _addr)) => {
+                        Ok(stream) => {
                             let ctx = ctx.clone();
                             tokio::spawn(async move {
                                 if let Err(err) = handle_conn(stream, ctx).await {
@@ -186,7 +205,15 @@ impl RpcServer {
 /// # Errors
 /// - [`AuthError::NoCredentials`] — the OS refused to report peer credentials.
 /// - [`AuthError::ForeignUid`] — the peer's uid is not the daemon's.
-pub fn check_peer(stream: &UnixStream, daemon_uid: u32) -> Result<u32, AuthError> {
+///
+/// # Platform
+///
+/// Unix only. There is no Windows counterpart, and there is not meant to be
+/// one: see [`handle_conn`]'s own comment and
+/// [`shep_core::transport`]'s module doc for why the pipe's ACL answers this
+/// question earlier than any post-accept check could.
+#[cfg(unix)]
+pub fn check_peer(stream: &tokio::net::UnixStream, daemon_uid: u32) -> Result<u32, AuthError> {
     let cred = stream
         .peer_cred()
         .map_err(|err| AuthError::NoCredentials(err.to_string()))?;
@@ -202,6 +229,11 @@ pub fn check_peer(stream: &UnixStream, daemon_uid: u32) -> Result<u32, AuthError
 }
 
 /// The daemon's effective uid.
+///
+/// # Platform
+///
+/// Unix only, alongside [`check_peer`], its only caller.
+#[cfg(unix)]
 #[must_use]
 pub fn daemon_uid() -> u32 {
     nix::unistd::geteuid().as_raw()
@@ -216,6 +248,7 @@ pub fn daemon_uid() -> u32 {
 /// mean something it does not, and shep-daemon is a published library an
 /// out-of-tree matcher should not break for (IR-20).
 #[non_exhaustive]
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
     /// The OS would not report peer credentials on this socket (carries the
@@ -340,12 +373,22 @@ impl From<std::io::Error> for ConnError {
 // auth before a single byte is read from the peer, the handshake before any
 // request, and the writer task joined on every exit path so a protocol-skew
 // refusal is guaranteed to reach the wire before the socket closes.
-async fn handle_conn(stream: UnixStream, ctx: RpcContext) -> Result<(), ConnError> {
+async fn handle_conn(stream: ServerStream, ctx: RpcContext) -> Result<(), ConnError> {
+    // Unix only, and its absence on Windows is a deliberate design decision
+    // rather than a gap — `shep_core::transport`'s module doc is the
+    // canonical writeup. In short: on unix the peer is admitted by the
+    // filesystem (`0700` on `$SHEP_HOME/run`) and this is the second layer
+    // behind that; on Windows the pipe's own ACL refuses a foreign user's
+    // open-for-write before a byte reaches this function, so the equivalent
+    // check has already happened, earlier and in the kernel. Adding a
+    // post-accept check there would need `ImpersonateNamedPipeClient` and
+    // raw FFI to re-answer a question the OS already answered.
+    #[cfg(unix)]
     check_peer(&stream, daemon_uid())?;
     // Minted after the peer check, not before: a connection refused for its
     // uid never reaches a handler, so it has nothing to scope.
     let conn = ConnId::next();
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, write_half) = shep_core::transport::split(stream);
     let mut frames = FramedRead::new(read_half, codec());
     let (out_tx, out_rx) = mpsc::channel::<Bytes>(CONN_QUEUE);
     let writer = tokio::spawn(write_loop(FramedWrite::new(write_half, codec()), out_rx));
@@ -454,7 +497,7 @@ async fn handshake(
 }
 
 async fn write_loop(
-    mut sink: FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+    mut sink: FramedWrite<ServerWriteHalf, LengthDelimitedCodec>,
     mut rx: mpsc::Receiver<Bytes>,
 ) {
     while let Some(bytes) = rx.recv().await {
@@ -488,7 +531,7 @@ mod tests {
     const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct Client {
-        frames: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+        frames: Framed<shep_core::transport::ClientStream, tokio_util::codec::LengthDelimitedCodec>,
     }
 
     impl Client {
@@ -516,9 +559,18 @@ mod tests {
         }
     }
 
-    /// Spawns `handle_conn` over a socketpair and hands back the client end.
-    fn connected(ctx: RpcContext) -> Client {
-        let (server, client) = UnixStream::pair().unwrap();
+    /// Spawns `handle_conn` over a real connected pair and hands back the
+    /// client end.
+    ///
+    /// A real transport on both platforms — a socketpair on unix, an actual
+    /// named pipe on Windows — rather than an in-memory duplex, because
+    /// several tests below turn on what a peer sees when the other side
+    /// closes, which only a real transport reproduces. `async` (it was not,
+    /// when it could call the synchronous `UnixStream::pair`) because
+    /// creating a pipe pair means connecting one, and every caller is
+    /// already inside a `#[tokio::test]`.
+    async fn connected(ctx: RpcContext) -> Client {
+        let (server, client) = shep_core::transport::connected_pair().await.unwrap();
         tokio::spawn(async move {
             let _ = handle_conn(server, ctx).await;
         });
@@ -530,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_acks_a_matching_protocol() {
         let h = harness(vec![]); // same helper shape as rpc.rs's tests
-        let mut client = connected(h.ctx.clone());
+        let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
@@ -547,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_refuses_protocol_skew_before_closing() {
         let h = harness(vec![]);
-        let mut client = connected(h.ctx.clone());
+        let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
                 client_version: "9.9.9".to_string(),
@@ -566,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_before_the_handshake_ends_the_connection() {
         let h = harness(vec![]);
-        let mut client = connected(h.ctx.clone());
+        let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Envelope {
                 id: 1,
@@ -580,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn ping_round_trips_over_the_socket() {
         let h = harness(vec![]);
-        let mut client = connected(h.ctx.clone());
+        let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
@@ -606,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_streams_only_matching_events() {
         let h = harness(vec![]);
-        let mut client = connected(h.ctx.clone());
+        let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
@@ -668,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn a_garbage_frame_ends_the_connection_without_panicking() {
         let h = harness(vec![]);
-        let mut client = connected(h.ctx.clone());
+        let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
@@ -697,7 +749,7 @@ mod tests {
         // `a_garbage_frame_ends_the_connection_without_panicking` test above
         // never subscribes, so it could not have caught this.
         let h = harness(vec![]);
-        let mut client = connected(h.ctx.clone());
+        let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
@@ -726,6 +778,11 @@ mod tests {
         );
     }
 
+    /// `cfg(unix)`, like [`check_peer`] itself. Windows has no counterpart
+    /// to gate: the pipe's ACL refuses a foreign user's open before
+    /// `handle_conn` is reached at all, so there is no post-accept decision
+    /// here for a test to exercise. See `shep_core::transport`'s module doc.
+    #[cfg(unix)]
     #[tokio::test]
     async fn peer_credentials_gate_on_uid() {
         // What this DOES prove: check_peer's own uid-comparison and error
@@ -743,7 +800,7 @@ mod tests {
         // Exercising the real cross-uid path needs a second OS user (root in
         // CI, or two accounts) actually connecting — out of reach for this
         // crate's test harness; see the report's security-review note.
-        let (a, _b) = UnixStream::pair().unwrap();
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
         let me = daemon_uid();
         assert_eq!(check_peer(&a, me).unwrap(), me);
         assert_eq!(
@@ -765,7 +822,7 @@ mod tests {
         // that truly never reads. Real time: real socket, matching this
         // whole test mod's rule.
         let h = harness(vec![]);
-        let mut client = connected(h.ctx.clone());
+        let mut client = connected(h.ctx.clone()).await;
         client
             .send(&Hello {
                 client_version: "0.1.0".to_string(),

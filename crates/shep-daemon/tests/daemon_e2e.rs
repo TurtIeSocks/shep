@@ -7,16 +7,26 @@
 //! IO wakeups arrive. IR-38 deviation deliberate — behavioral OS tests need
 //! their own binary so the unit tier stays paused-clock pure.
 
-#![cfg(unix)]
+// Part of this file's cases are `#[cfg(unix)]` — `/bin/sh` fixtures, process
+// groups, signal delivery — and their helpers go with them, so on Windows
+// those items compile unreachable. Same shape, and same reasoning, as
+// `shep-cli`'s `cli_e2e.rs`.
+#![cfg_attr(windows, allow(dead_code))]
+// Most of this file's cases are `#[cfg(unix)]` (their fixtures are `/bin/sh`
+// scripts), so on Windows the imports only those cases use are unread. The
+// gate belongs on the cases, which state their own reason, not on twenty
+// import lines.
+#![cfg_attr(windows, allow(unused_imports))]
 
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::net::UnixStream;
+use shep_core::transport::{self, ClientStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use shep_core::config::AppConfig;
@@ -66,15 +76,25 @@ impl Fixture {
             &|key| (key == "SHEP_HOME").then(|| home.display().to_string()),
             std::path::Path::new("/nonexistent"),
         );
-        let daemon = boot(
-            TokioRunner::new(),
-            paths.clone(),
-            BootOptions {
-                restore,
-                ..BootOptions::default()
-            },
+        // Bounded like every other wait in this file. `boot` binds the
+        // control address, which on Windows is a machine-global pipe
+        // name rather than a path under `dir`, so it is the one step
+        // here that can block on something outside this test's own
+        // tempdir. Unbounded, that is a silent CI hang; bounded, it is a
+        // named panic.
+        let daemon = tokio::time::timeout(
+            RECV_TIMEOUT,
+            boot(
+                TokioRunner::new(),
+                paths.clone(),
+                BootOptions {
+                    restore,
+                    ..BootOptions::default()
+                },
+            ),
         )
         .await
+        .expect("boot must not hang: the control address is already held")
         .expect("the daemon must boot on a fresh home");
         let ctx = daemon.context();
         let run = tokio::spawn(daemon.run());
@@ -88,7 +108,13 @@ impl Fixture {
     }
 
     async fn connect(&self) -> Client {
-        let stream = UnixStream::connect(&self.paths.socket).await.unwrap();
+        // `transport::connect` retries ERROR_PIPE_BUSY forever, and its
+        // own doc says that is safe only because every caller bounds it.
+        // This one is a caller.
+        let stream = tokio::time::timeout(RECV_TIMEOUT, transport::connect(&self.paths.socket))
+            .await
+            .expect("connect must not hang: the pipe stayed busy")
+            .unwrap();
         let mut client = Client {
             frames: Framed::new(stream, codec()),
             next_id: 1,
@@ -142,16 +168,58 @@ impl Fixture {
 /// doc) specifically so a group signal also reaches a `sleep 1`
 /// grandchild a leader-only signal would miss.
 impl Drop for Fixture {
+    /// Stops the daemon a panicking test never got to shut down, then
+    /// reaps what a unix sheep leaves behind.
+    ///
+    /// # The shutdown
+    ///
+    /// A test that panics skips its own `fixture.shutdown()`, so the daemon
+    /// task this fixture spawned is still running, still holding its
+    /// listener, when the next test in this binary starts. On Windows that
+    /// listener is a name in a machine-global namespace rather than a path
+    /// under this test's own tempdir, which is the one resource here that a
+    /// later test could contend for.
+    ///
+    /// **This is tidiness, not a fix for anything.** It was written as a fix
+    /// for the seventeen-minute `windows-latest` hang in
+    /// `reopen_moves_a_running_sheeps_log_onto_the_recreated_path`, on the
+    /// theory that dropping a current-thread runtime with a live daemon task
+    /// blocks and swallows the panic. A control run disproved it: with this
+    /// `shutdown()` removed, an injected panic in that same test still
+    /// reports in 1.74s and libtest still prints the message. Whatever hangs
+    /// on the runner is not this.
+    ///
+    /// `shutdown()` on the context alone, not a join: this runs during an
+    /// unwind and must not itself be able to block.
+    ///
+    /// # The pid sweep, on unix only
+    ///
+    /// A unix sheep that outlives its daemon is reparented to init, so only
+    /// an explicit `kill(-pgid)` reaps it, which is why the fixture bothers
+    /// to record every pid a reply carried. On Windows every sheep is
+    /// assigned to a job object it cannot leave
+    /// (`shep_daemon::sys_windows`), so the daemon going down takes the whole
+    /// flock with it, transitively. There is no orphan class there for a
+    /// sweep to catch. `real_runner_windows.rs` is where that containment is
+    /// actually asserted, and mutation-checked.
     fn drop(&mut self) {
-        let pids = self
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for &pid in pids.iter() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(-pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+        // `run` is `None` once `shutdown()` has taken it, so this is the
+        // panic path and nothing else.
+        if self.run.is_some() {
+            self.ctx.shutdown();
+        }
+        #[cfg(unix)]
+        {
+            let pids = self
+                .spawned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for &pid in pids.iter() {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
         }
     }
 }
@@ -160,7 +228,7 @@ impl Drop for Fixture {
 /// length-delimited/JSON codec directly — this tier proves the wire
 /// protocol itself, not a client crate built on top of it.
 struct Client {
-    frames: Framed<UnixStream, LengthDelimitedCodec>,
+    frames: Framed<ClientStream, LengthDelimitedCodec>,
     next_id: u64,
     hello_ack: Option<HelloAck>,
     // Frames read off the wire but not the one the CURRENT call was looking
@@ -245,16 +313,26 @@ impl Client {
             body,
         })
         .await;
+        // Bounded like every other wait in this file. It was the one that was
+        // not, and a daemon that never answers turned that into a hang with
+        // no output rather than a failure: on 2026-08-27 the Windows CI legs
+        // sat in `Reopen` here until the job was cancelled, three times, and
+        // the log said only "has been running for over 60 seconds". The
+        // deadline is what makes an unanswered request name itself.
         let mut skipped = Vec::new();
-        let reply = loop {
-            match self.next_frame().await {
-                ServerFrame::Reply(reply) if reply.id == id => break reply,
-                // Anything else (a bus event, an unrelated reply, or a
-                // future frame kind this client doesn't know about) is set
-                // aside rather than dropped — see `pending`'s own doc.
-                other => skipped.push(other),
+        let reply = tokio::time::timeout(RECV_TIMEOUT, async {
+            loop {
+                match self.next_frame().await {
+                    ServerFrame::Reply(reply) if reply.id == id => break reply,
+                    // Anything else (a bus event, an unrelated reply, or a
+                    // future frame kind this client doesn't know about) is set
+                    // aside rather than dropped — see `pending`'s own doc.
+                    other => skipped.push(other),
+                }
             }
-        };
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for a reply to request {id}"));
         requeue(&mut self.pending, skipped);
         track_spawned(&self.spawned, &reply);
         reply
@@ -366,6 +444,183 @@ impl Client {
     }
 }
 
+/// The interpreter a test fixture's inline script is written for, and the
+/// flag that makes it read one.
+///
+/// `/bin/sh -c` on unix, `cmd /C` on Windows. Every fixture below builds its
+/// app through one of the helpers here rather than naming an interpreter
+/// itself, so a case reads as what the sheep DOES rather than as which shell
+/// happens to run it.
+fn shell() -> (&'static str, &'static str) {
+    #[cfg(unix)]
+    {
+        ("/bin/sh", "-c")
+    }
+    #[cfg(windows)]
+    {
+        ("cmd", "/C")
+    }
+}
+
+/// An [`AppConfig`] running `script` under [`shell`].
+///
+/// `interpreter = "none"` on every one of these: the script is already
+/// written for a shell, so shep must not additionally resolve an interpreter
+/// from the program's extension.
+fn shell_app(name: &str, script: String) -> AppConfig {
+    let (program, flag) = shell();
+    let mut app = AppConfig::minimal(name, program);
+    app.interpreter = Some("none".to_string());
+    app.args = vec![flag.to_string(), script];
+    app
+}
+
+/// A sheep that stays up until something stops it.
+///
+/// `ping` rather than a sleep loop on Windows: `timeout.exe` refuses to run
+/// with stdin redirected (which every sheep's is), and `cmd` has no `sleep`
+/// at all. One long `ping` is the idiom, and it is a single process rather
+/// than a loop spawning one per second.
+fn forever_app(name: &str) -> AppConfig {
+    #[cfg(unix)]
+    let script = "while :; do sleep 1; done".to_string();
+    #[cfg(windows)]
+    let script = "ping -n 9999 127.0.0.1 >nul".to_string();
+    shell_app(name, script)
+}
+
+/// A sheep that writes `line` to stdout and then stays up long enough to be
+/// observed.
+fn announce_app(name: &str, line: &str) -> AppConfig {
+    #[cfg(unix)]
+    let script = format!("echo {line}; sleep 5");
+    #[cfg(windows)]
+    let script = format!("echo {line}& ping -n 6 127.0.0.1 >nul");
+    shell_app(name, script)
+}
+
+/// A sheep that sends one `ready` on the shepherd channel, then stays up.
+///
+/// **The two platforms reach the channel completely differently, which is
+/// the whole reason this is a helper rather than an inline string.** On unix
+/// it is fd 3, inherited, so a shell redirect `>&3` is the entire contract —
+/// the one `docs/shepherd-channel.md` publishes. Windows has no fd-3
+/// inheritance: the daemon exports the channel's pipe name as
+/// `%SHEP_CHANNEL_PIPE%` and the app opens it by name, which `cmd`'s own `>`
+/// redirect does directly.
+///
+/// So this fixture is the shortest end-to-end proof that the replacement
+/// contract is usable from a plain script rather than only from a program
+/// that links a pipe client — which was the open question when the fd-3
+/// contract had to be abandoned.
+///
+/// The caller still sets `wait_ready`: that is what makes `assemble` open
+/// the channel at all.
+fn ready_app(name: &str, dir: &std::path::Path) -> AppConfig {
+    #[cfg(unix)]
+    {
+        let _ = dir;
+        shell_app(
+            name,
+            r#"printf '{"kind":"ready"}
+' >&3; while :; do sleep 1; done"#
+                .to_string(),
+        )
+    }
+    // A `.cmd` FILE, not `cmd /C <script>`, and that is load-bearing.
+    // `std::process::Command` escapes an argument's inner quotes as `\"` --
+    // the MSVC C runtime convention, which `cmd.exe` does not share. cmd
+    // takes the backslash literally, so the redirect target arrives
+    // malformed and the line never reaches the pipe. Measured: the inline
+    // form failed with "The filename, directory name, or volume label syntax
+    // is incorrect". A script file's CONTENTS go through no such escaping.
+    #[cfg(windows)]
+    {
+        let script = dir.join(format!("{name}-ready.cmd"));
+        // Built with `push` rather than a joined literal: a CRLF escape
+        // inside a string literal proved easy to mangle through tooling,
+        // and a `.cmd` that ends up holding a bare CR does not parse.
+        let mut body = String::new();
+        for line in [
+            "@echo off",
+            "(echo {\"kind\":\"ready\"}) > \"%SHEP_CHANNEL_PIPE%\"",
+            "ping -n 9999 127.0.0.1 >nul",
+        ] {
+            body.push_str(line);
+            body.push('\r');
+            body.push('\n');
+        }
+        std::fs::write(&script, body).unwrap();
+        let mut app = AppConfig::minimal(name, &script.display().to_string());
+        app.interpreter = Some("none".to_string());
+        app
+    }
+}
+
+/// A sheep that writes `before`, waits for `marker` to appear, writes
+/// `after`, then stays up — the fixture the log-rotation cases drive.
+fn gated_announce_app(name: &str, marker: &std::path::Path) -> AppConfig {
+    #[cfg(unix)]
+    {
+        let script = format!(
+            "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
+            marker.display()
+        );
+        let mut app = shell_app(name, script);
+        app.autorestart = false;
+        app
+    }
+    // A batch FILE, and the two things it is not are both deliberate.
+    //
+    // Not a `cmd /C` one-liner: `cmd /C` takes a single command string
+    // and `goto` needs labels, which exist only in a file, so an inline
+    // loop silently does not loop. Measured, as a fixture that printed
+    // `before` and `after` back to back and never waited for the marker.
+    //
+    // Not `powershell -Command` either, which is what that measurement
+    // led to last time and what hung `windows-latest` for four runs. An
+    // out-of-process probe finally caught the sheep in the act: nine
+    // threads, every one in `Wait`, and 0.28s of CPU between them, all of
+    // it PowerShell's own startup. It was not polling for the marker. It
+    // was not running at all. Every other fixture in this file drives
+    // `cmd` and every one of them passes.
+    //
+    // `cmd`'s `echo` also writes a line at a time with nothing held back,
+    // which retires the separate question of what PowerShell buffers on a
+    // redirected stdout.
+    //
+    // `ping -n 2` is the sleep, for the reason `forever_app` gives:
+    // `timeout.exe` refuses to run with stdin redirected, and every
+    // sheep's is.
+    #[cfg(windows)]
+    {
+        const CRLF: &str = "\r\n";
+        let script = marker.with_file_name("gated.cmd");
+        let body = [
+            "@echo off".to_string(),
+            "echo before".to_string(),
+            ":wait".to_string(),
+            format!("if exist \"{}\" goto ready", marker.display()),
+            "ping -n 2 127.0.0.1 >nul".to_string(),
+            "goto wait".to_string(),
+            ":ready".to_string(),
+            "echo after".to_string(),
+            "ping -n 6 127.0.0.1 >nul".to_string(),
+            String::new(),
+        ];
+        std::fs::write(&script, body.join(CRLF))
+            .expect("the gated fixture script must be writable");
+        let mut app = shell_app(name, script.display().to_string());
+        // The script exits, and `autorestart` is on by default, so
+        // without this the daemon restarts the sheep five seconds after
+        // it finishes and the log gains a second `before` and a second
+        // `after` that the assertions do not expect.
+        app.autorestart = false;
+        app
+    }
+}
+
+/// the rebooted client.
 /// Records every live pid a reply's `ProcessInfo`s carry — see `Fixture`'s
 /// `spawned` field and `Drop` impl for why. Every `Response` variant that
 /// can carry a real spawned/listed pid is covered, not just `Started`: a
@@ -430,9 +685,7 @@ async fn handshake_then_start_list_and_stop_a_real_sheep() {
         .await;
     assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
 
-    let mut app = AppConfig::minimal("sleeper", "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    app.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
+    let app = forever_app("sleeper");
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.unwrap() else {
         panic!("expected started")
@@ -481,9 +734,7 @@ async fn log_lines_reach_a_log_subscriber() {
         .await;
     assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
 
-    let mut app = AppConfig::minimal("chatty", "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    app.args = vec!["-c".to_string(), "echo hello-flock; sleep 5".to_string()];
+    let app = announce_app("chatty", "hello-flock");
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.unwrap() else {
         panic!("expected started")
@@ -538,6 +789,13 @@ async fn await_file_contents(path: &std::path::Path, expected: &str) {
 /// The sheep's own log path is read off the `Started` reply rather than
 /// derived here, so the test cannot disagree with the daemon about which
 /// file it is looking at.
+// Ran ignored on Windows for four commits while this hung `windows-latest`
+// for twenty minutes a run, reporting one line and no location. It was
+// never this test: `gated_announce_app` drove a PowerShell sheep, and an
+// out-of-process probe on the runner caught that sheep with every thread
+// in `Wait` and 0.28s of CPU between them, all of it startup. It never ran
+// the loop it was written to run, so the marker this case writes was never
+// seen and `after` was never printed. The fixture is `cmd` now.
 #[tokio::test]
 async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -557,15 +815,7 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     // portable argument is a whole number of seconds (POSIX), which is why
     // the poll is that coarse.
     let marker = fixture.paths.home.join("go");
-    let mut app = AppConfig::minimal("rotator", "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    app.args = vec![
-        "-c".to_string(),
-        format!(
-            "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
-            marker.display()
-        ),
-    ];
+    let app = gated_announce_app("rotator", &marker);
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.unwrap() else {
         panic!("expected started")
@@ -613,6 +863,7 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     fixture.shutdown().await;
 }
 
+#[cfg(unix)]
 /// A reopen asked for over the socket puts a REMOVED log directory back at
 /// [`DIR_MODE`], the mode every directory shep creates is worth — the case a
 /// rotator that moves the directory aside rather than the files produces.
@@ -651,15 +902,7 @@ async fn reopen_recreates_a_removed_log_directory_owner_only() {
     // argument is a whole number of seconds (POSIX), which is why the sheep's
     // own poll is that coarse.
     let marker = fixture.paths.home.join("go");
-    let mut app = AppConfig::minimal("rotator", "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    app.args = vec![
-        "-c".to_string(),
-        format!(
-            "echo before; while [ ! -f {} ]; do sleep 1; done; echo after; sleep 5",
-            marker.display()
-        ),
-    ];
+    let app = gated_announce_app("rotator", &marker);
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.unwrap() else {
         panic!("expected started")
@@ -756,9 +999,7 @@ async fn flush_empties_the_recorded_path_and_leaves_a_renamed_archive_alone() {
         .await;
     assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
 
-    let mut app = AppConfig::minimal("noisy", "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    app.args = vec!["-c".to_string(), "echo before; sleep 5".to_string()];
+    let app = announce_app("noisy", "before");
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.unwrap() else {
         panic!("expected started")
@@ -846,15 +1087,10 @@ async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
         .await;
     assert_eq!(subscribed.result.unwrap(), Response::Subscribed);
 
-    let mut app = AppConfig::minimal("greeter", "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    // `wait_ready` is what makes `assemble` open fd 3 at all, so the same
-    // flag arms the gate and gives the child something to write to.
+    let mut app = ready_app("greeter", &fixture.paths.home);
+    // `wait_ready` is what makes `assemble` open the channel at all, so the
+    // same flag arms the gate and gives the child something to write to.
     app.wait_ready = true;
-    app.args = vec![
-        "-c".to_string(),
-        r#"printf '{"kind":"ready"}\n' >&3; while :; do sleep 1; done"#.to_string(),
-    ];
     app.listen_timeout = UpDuration::from_millis(600_000);
 
     let started = client.request(Request::Start { apps: vec![app] }).await;
@@ -916,6 +1152,8 @@ async fn a_wait_ready_sheep_goes_online_on_its_own_channel_message() {
 /// errors. So nothing here ever asserts on a send's own `Ok`/`Err`; the only
 /// proof either round trip landed is the `Replied` row itself, read back off
 /// the RPC reply.
+// `cfg(unix)` because its fixture is a `/bin/sh` script.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_triggered_action_reaches_a_real_child_and_answers_it_twice() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -970,6 +1208,8 @@ async fn a_triggered_action_reaches_a_real_child_and_answers_it_twice() {
 /// Bounded (IR-46) at both ends: `Client::request` bounds each frame it
 /// reads via `recv_as`'s own `RECV_TIMEOUT`, and `await_log_line` carries
 /// the same bound around its own wait.
+// `cfg(unix)` because its fixture is a `/bin/sh` script.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_line_written_to_a_real_sheeps_stdin_comes_back_on_its_stdout() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -1023,6 +1263,8 @@ async fn a_line_written_to_a_real_sheeps_stdin_comes_back_on_its_stdout() {
 /// proves the whole path — socketpair, newline framing, the bus, the topic
 /// filter, and the frame encoder — carries a `channel.metric` to a client that
 /// asked for `channel.*` and nothing else.
+// `cfg(unix)` because its fixture is a `/bin/sh` script.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_childs_metric_reaches_a_channel_subscriber_over_the_socket() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -1096,9 +1338,7 @@ async fn a_trigger_against_a_channelless_sheep_names_the_missing_channel() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    let mut app = AppConfig::minimal("mute", "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    app.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
+    let app = forever_app("mute");
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.unwrap() else {
         panic!("expected started")
@@ -1143,6 +1383,8 @@ async fn a_trigger_against_a_channelless_sheep_names_the_missing_channel() {
 /// the message sitting in the socket's own kernel buffer, which times out
 /// exactly the same way for a reason this test is not about. Reading first
 /// is what makes the silence itself the fact under test.
+// `cfg(unix)` because its fixture is a `/bin/sh` script.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_trigger_against_a_silent_child_times_out_rather_than_hitting_the_rpc_deadline() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -1190,7 +1432,7 @@ async fn protocol_skew_is_refused_over_the_real_socket() {
     // Built by hand, not through `Fixture::connect`: that helper always
     // sends a MATCHING protocol, and this test needs to send a mismatched
     // one instead.
-    let stream = UnixStream::connect(&fixture.paths.socket).await.unwrap();
+    let stream = transport::connect(&fixture.paths.socket).await.unwrap();
     let mut frames = Framed::new(stream, codec());
     frames
         .send(
@@ -1223,6 +1465,9 @@ async fn protocol_skew_is_refused_over_the_real_socket() {
     fixture.shutdown().await;
 }
 
+#[cfg(unix)]
+// `cfg(unix)` because its fixture is a `/bin/sh` script.
+#[cfg(unix)]
 #[tokio::test]
 async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
     let mut fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -1293,11 +1538,12 @@ async fn kill_daemon_shuts_the_flock_down_and_unlinks_the_socket() {
     // Engine unreachable: a fresh connect on the now-unlinked socket path
     // must fail, not hang or succeed against a daemon that never really left.
     assert!(
-        UnixStream::connect(&socket).await.is_err(),
+        transport::connect(&socket).await.is_err(),
         "the daemon must not still be answering after KillDaemon"
     );
 }
 
+#[cfg(unix)]
 /// Polls `kill(pid, None)` for ESRCH (no such process) instead of sleeping a
 /// fixed guess — see the comment at this fn's one multi-line call site
 /// (`kill_daemon_shuts_the_flock_down_and_unlinks_the_socket`) for exactly
@@ -1362,7 +1608,7 @@ async fn await_stale_socket(socket: &std::path::Path) {
         // interrupt, and this fn would then outlive the very budget it
         // exists to enforce.
         while !matches!(
-            UnixStream::connect(socket).await,
+            transport::connect(socket).await,
             Err(err) if matches!(err.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound)
         ) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1376,6 +1622,8 @@ async fn await_stale_socket(socket: &std::path::Path) {
     );
 }
 
+// `cfg(unix)` because it asserts recovery from a leftover socket FILE, which a named pipe never leaves.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
     let mut fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
@@ -1417,18 +1665,17 @@ async fn a_socket_left_behind_by_a_crash_does_not_block_the_next_boot() {
     rebooted.shutdown().await;
 }
 
+#[cfg(unix)]
+// `cfg(unix)` because its fixture is a `/bin/sh` script.
+#[cfg(unix)]
 #[tokio::test]
 async fn muster_restores_the_flock_across_a_daemon_lifetime() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
     let mut client = fixture.connect().await;
 
-    let mut alpha = AppConfig::minimal("alpha", "/bin/sh");
-    alpha.interpreter = Some("none".to_string());
-    alpha.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
-    let mut beta = AppConfig::minimal("beta", "/bin/sh");
-    beta.interpreter = Some("none".to_string());
+    let alpha = forever_app("alpha");
+    let mut beta = forever_app("beta");
     beta.instances = 2;
-    beta.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
     let started = client
         .request(Request::Start {
             apps: vec![alpha, beta],
@@ -1539,6 +1786,9 @@ impl Drop for PathGuard {
     }
 }
 
+#[cfg(unix)]
+// `cfg(unix)` because its fixture is a `/bin/sh` script.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_bare_interpreter_resolves_via_the_inherited_path() {
     // Deviation from the brief's literal bare-`"sh"` version (adversarial
@@ -1844,6 +2094,7 @@ fn reuse_port_sheep() -> std::path::PathBuf {
     path
 }
 
+#[cfg(unix)]
 /// Reloads one `reuse_port_sheep` while a caller connects continuously, and
 /// hands back every attempt made between the request and the swap finishing.
 ///
@@ -1961,6 +2212,7 @@ async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
     during
 }
 
+#[cfg(unix)]
 /// A reload of an app that drains costs a caller connecting continuously
 /// nothing.
 ///
@@ -2043,6 +2295,7 @@ async fn a_reload_costs_a_draining_app_no_connections() {
     );
 }
 
+#[cfg(unix)]
 /// A reload of an app that ignores its stop signal loses the caller work, and
 /// shep completes the swap anyway.
 ///
@@ -2104,9 +2357,10 @@ const SMIT: &str = "\u{25b2} main@a1b2c3";
 
 /// Starts one long-lived real sheep under `name` and answers with its id.
 async fn start_sheep(client: &mut Client, name: &str) -> u32 {
-    let mut app = AppConfig::minimal(name, "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    app.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
+    // `forever_app`, not an inline `/bin/sh` fixture: these three cases
+    // are about what a second client sees on the socket, and the shell
+    // that keeps the sheep alive is incidental to every one of them.
+    let app = forever_app(name);
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.expect("the sheep must start") else {
         panic!("expected started")

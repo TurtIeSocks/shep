@@ -8,3 +8,24 @@
 # Windows client, which the comparison then sees as a spurious diff on every
 # line — force LF on every platform instead of normalizing in the assertion.
 crates/shep-core/assets/flockfile.schema.json text eol=lf
+
+# The same trap, found the same way, once a Windows host actually ran the
+# suite. Each of these is compared byte-for-byte against a string this
+# workspace generates at runtime with `\n`, so a CRLF checkout reads as a
+# diff on every single line — three tests reddening for a reason that has
+# nothing to do with the code under test.
+#
+# `docs/whistle/tools.md` is `include_str!`ed by `whistle::catalogue`'s
+# `the_checked_in_catalogue_is_current`.
+docs/whistle/tools.md text eol=lf
+# `insta` writes its snapshots with `\n` and compares them the same way, so
+# every `.snap` in the workspace needs the same guarantee. `lookout::frames`'
+# `frames_are_pinned` is the one that caught it.
+*.snap text eol=lf
+# The rendered lookout deliverables, written by `frames.rs`'s own
+# `--ignored` writer and reviewed as fixed artifacts.
+docs/lookout/frames.txt text eol=lf
+docs/lookout/frames.ansi text eol=lf
+# Written by `web/scripts/generate-cli-reference.sh` with `\n`; a CRLF
+# checkout makes every regeneration look like a whole-file diff.
+web/src/data/cli-reference.generated.txt text eol=lf

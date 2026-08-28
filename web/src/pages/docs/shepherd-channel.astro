@@ -52,7 +52,8 @@ name = "web"
 script = "./server"
 channel = true`}</CodeBlock>
     <p class="fine">
-      The descriptor is <strong>fd 3</strong>, also exported as the{" "}
+      <strong>On unix</strong> the descriptor is <strong>fd 3</strong>, also
+      exported as the{" "}
       <code>SHEP_CHANNEL_FD</code> environment variable: read that instead
       of hardcoding <code>3</code> if you want to be robust to it changing
       later. It's a normal <em>blocking</em> file descriptor: a plain{" "}
@@ -122,6 +123,35 @@ for line in r:
         w.flush()
     elif msg["kind"] == "shutdown":
         sys.exit(0)`}</CodeBlock>
+    <h3>On Windows: open a named pipe instead</h3>
+    <p>
+      Windows has no fd-3 inheritance an app can rely on, so the daemon
+      exports{" "}
+      <code>SHEP_CHANNEL_PIPE</code> instead and your app opens that path
+      like any other file. <code>SHEP_CHANNEL_FD</code> is deliberately not
+      set there, so branch on which variable is present rather than on the
+      platform. Everything below the handle is identical: same
+      newline-delimited JSON, same message kinds, same correlation id.
+    </p>
+    <p class="fine">
+      Do not reconstruct the name: the trailing hex is random per spawn.
+      The channel is readable by other accounts on the same machine, so do
+      not put anything on it you would not show them.
+    </p>
+    <CodeBlock label="channel_app.py (both platforms)">{`import os, json, sys
+
+pipe = os.environ.get("SHEP_CHANNEL_PIPE")
+if pipe:                      # Windows: open the named pipe by name
+    r = open(pipe, "r", buffering=1)
+    w = open(pipe, "w", buffering=1)
+else:                         # unix: fd 3, or whatever SHEP_CHANNEL_FD says
+    fd = int(os.environ.get("SHEP_CHANNEL_FD", "3"))
+    r, w = os.fdopen(fd, "r", buffering=1), os.fdopen(fd, "w", buffering=1)
+
+w.write(json.dumps({"kind": "ready"}) + "\n")
+w.flush()
+# ... the loop below is unchanged`}</CodeBlock>
+
     <p>
       Started under shep with <code>channel = true</code> and{" "}
       <code>wait_ready = true</code>, then triggered from another terminal,
@@ -235,7 +265,7 @@ ID  NAME  OUTCOME     DETAIL
     <h2>Summary for the impatient</h2>
     <ul>
       <li>Ask for a channel with <code>channel = true</code> (or get one free from <code>wait_ready</code> / <code>shutdown_with_message</code>).</li>
-      <li>Read <code>SHEP_CHANNEL_FD</code>, open that fd, read/write newline-delimited JSON.</li>
+      <li>Read <code>SHEP_CHANNEL_FD</code> on unix, or <code>SHEP_CHANNEL_PIPE</code> on Windows, where the channel is a named pipe your app opens by path rather than an inherited fd. Exactly one is ever set, so branch on which one is present, not on the platform. Then read/write newline-delimited JSON.</li>
       <li>A plain blocking read works: no event loop required.</li>
       <li>Reply to every <code>action</code> message you receive, even ones you don't recognize, exactly once, promptly.</li>
       <li>Echo the <code>id</code>: one field, and it's what makes a slow action's answer land on the right trigger.</li>

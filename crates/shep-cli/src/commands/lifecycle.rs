@@ -154,23 +154,67 @@ const JS_EVAL_BUDGET: Duration = Duration::from_secs(30);
 /// The script handed to `node -e`. Wraps the `require` in its own
 /// `try`/`catch` rather than letting an uncaught exception crash node and
 /// relying on node's own crash-dump formatting — see this function's doc for
-/// why. `process.argv[1]` is the absolute path, per `-e`'s argv layout
-/// (identical to `-p`'s).
+/// why.
+/// The filename [`evaluate_js_flockfile`] writes [`JS_BRIDGE_SCRIPT`] to.
+///
+/// Deliberately plain ASCII with no spaces: it is passed to node as a bare
+/// relative argument, and the whole point of the file is that nothing
+/// needing quoting ever reaches a command line.
+const JS_BRIDGE_FILE: &str = "shep-flockfile-bridge.js";
+
+/// The bridge run by [`evaluate_js_flockfile`], written to a file rather
+/// than passed to `node -e`.
+///
+/// **It was `node -e <script>` and that did not survive Windows CI.** The
+/// symptom was node failing with `EISDIR: illegal operation on a directory,
+/// lstat 'C:'`, unchanged across two different ways of handing it the path,
+/// which is what ruled the path out as the cause: an identical message after
+/// changing the mechanism means the mechanism was not what broke.
+///
+/// The remaining suspect is this script itself crossing a command line. It
+/// contains `&&`, which is a `cmd.exe` operator, so a `node` that resolves
+/// to a `.cmd` shim rather than a real `node.exe` would have cmd re-parse
+/// and truncate it. That was never confirmed, because a machine with a real
+/// `node.exe` does not reproduce it.
+///
+/// Writing the script to a file removes the question rather than answering
+/// it. A file's contents cross no parser: not the MSVC C runtime's argument
+/// escaping, not `cmd.exe`'s, not any shim's. The only argument left is
+/// [`JS_BRIDGE_FILE`], a bare relative name with nothing in it to quote.
+///
+/// The path is still read from the environment and still never interpolated
+/// into the source, so the injection argument holds: a Flockfile path
+/// containing `'`, `\` or a newline cannot escape a string literal here,
+/// because there is no string literal for it to escape.
 const JS_BRIDGE_SCRIPT: &str = "try { \
-     process.stdout.write(JSON.stringify(require(process.argv[1]))); \
+     process.stdout.write(JSON.stringify(require(process.env.SHEP_FLOCKFILE_PATH))); \
  } catch (err) { \
-     process.stderr.write(err && err.message ? String(err.message) : String(err)); \
+     process.stderr.write('[bridge saw ' + String(process.env.SHEP_FLOCKFILE_PATH) + '] ' + (err && err.message ? String(err.message) : String(err))); \
      process.exitCode = 1; \
  }";
 
 /// Evaluates a `.js` Flockfile through node and returns its JSON.
 ///
-/// The path is passed as an **argument**, never interpolated into the
-/// JavaScript source: a path containing `'`, `\` or a newline would
-/// otherwise escape the string literal, and adding a second way to inject
-/// code into a file whose own code we are already about to run is
-/// gratuitous. Under `-p` / `-e`, node puts the first user argument at
-/// `process.argv[1]`.
+/// The script is written to a file and run as `node <file>` from that
+/// file's own directory; see [`JS_BRIDGE_SCRIPT`] for why it is not
+/// `node -e`.
+///
+/// The path is passed in the **environment**, as `SHEP_FLOCKFILE_PATH`, and
+/// never interpolated into the JavaScript source: a path containing `'`,
+/// `\` or a newline would otherwise escape the string literal, and adding a
+/// second way to inject code into a file whose own code we are already
+/// about to run is gratuitous.
+///
+/// It used to be an argument, read back as `process.argv[1]`. That is
+/// correct on unix and against a plain `node.exe`, and it broke on the
+/// Windows CI runner: node reached `require` with `C:` and failed with
+/// `EISDIR: illegal operation on a directory, lstat 'C:'`, so the path was
+/// re-parsed somewhere between this `Command` and node's own argv. A `.cmd`
+/// shim earlier on `PATH` than the real binary is the likeliest culprit,
+/// since `cmd.exe` does not use the argument-escaping convention
+/// `std::process::Command` writes for. The fix does not depend on settling
+/// which layer did it: an environment variable is not a command line, so
+/// nothing in between can re-split it.
 ///
 /// The path must be absolute — `require("x.js")` with no leading `./` is a
 /// *package* specifier and resolves against `node_modules`, not the cwd.
@@ -188,7 +232,7 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 /// never the message. `err.message` is written to stderr ourselves instead,
 /// which is what makes the sentence below actually name the failure. This
 /// stays inside the same mechanic the design calls for (`-p` / `-e` both put
-/// the path at `process.argv[1]`, never in the source), so it is a narrower
+/// the path in the environment, never in the source), so it is a narrower
 /// implementation choice, not a different design.
 ///
 /// **`budget` bounds the whole evaluation**, and node is killed the moment it
@@ -224,11 +268,34 @@ fn evaluate_js_flockfile(path: &Path, budget: Duration) -> Result<String, Target
         path: path.to_path_buf(),
         source,
     })?;
+    // The bridge is written to a file and run as `node loader.js` from that
+    // file's own directory, so the only argument node ever receives is a
+    // bare relative filename: no path, no quotes, no shell metacharacters.
+    // See [`JS_BRIDGE_SCRIPT`] for what this is defending against.
+    //
+    // `scratch` stays bound until this function returns, because dropping a
+    // `TempDir` deletes it: node has to still be able to read the loader for
+    // as long as `run_bounded` is waiting on it.
+    let scratch = tempfile::Builder::new()
+        .prefix("shep-js-bridge")
+        .tempdir()
+        .map_err(|source| TargetError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let loader = scratch.path().join(JS_BRIDGE_FILE);
+    std::fs::write(&loader, JS_BRIDGE_SCRIPT).map_err(|source| TargetError::Read {
+        path: loader.clone(),
+        source,
+    })?;
     let mut command = std::process::Command::new("node");
     command
-        .arg("-e")
-        .arg(JS_BRIDGE_SCRIPT)
-        .arg(&absolute)
+        .arg(JS_BRIDGE_FILE)
+        .current_dir(scratch.path())
+        .env(
+            "SHEP_FLOCKFILE_PATH",
+            shep_core::paths::strip_verbatim_prefix(&absolute).as_os_str(),
+        )
         .stdin(std::process::Stdio::null());
     let output = match run_bounded(&mut command, budget) {
         Ok(Bounded::Exited(output)) => output,
@@ -389,7 +456,11 @@ pub fn resolve_target(
                 target.to_string()
             } else {
                 std::fs::canonicalize(path)
-                    .map(|abs| abs.to_string_lossy().into_owned())
+                    .map(|abs| {
+                        shep_core::paths::strip_verbatim_prefix(&abs)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
                     .unwrap_or_else(|_| target.to_string())
             };
             let mut app = AppConfig::minimal(name.unwrap_or(stem), &script);
@@ -894,6 +965,7 @@ fn default_cwd_to_flockfile_dir(apps: Vec<AppConfig>, flockfile: &Path) -> Vec<A
     let Some(dir) = std::fs::canonicalize(flockfile)
         .ok()
         .and_then(|abs| abs.parent().map(Path::to_path_buf))
+        .map(|dir| shep_core::paths::strip_verbatim_prefix(&dir).into_owned())
     else {
         return apps;
     };
@@ -1475,6 +1547,7 @@ pub async fn stock(client: &Client, streams: &mut Streams<'_>, args: &StockArgs)
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::cli::Format;
     use shep_client::DEFAULT_DEADLINE;
@@ -1495,7 +1568,7 @@ mod tests {
         )
         .unwrap();
 
-        let sock = dir.path().join("s.sock");
+        let sock = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&sock).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1559,7 +1632,11 @@ mod tests {
         let apps = resolve_target(flockfile.to_str().unwrap(), None, &[], false)
             .expect("the Flockfile parses");
 
-        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        // The same shape the app is given: canonical, and on Windows without
+        // the verbatim prefix, which the daemon would otherwise echo back in
+        // `shep describe`.
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let expected = shep_core::paths::strip_verbatim_prefix(&canonical).into_owned();
         assert_eq!(
             apps[0].cwd.as_deref(),
             Some(expected.to_string_lossy().as_ref()),
@@ -1875,7 +1952,7 @@ mod tests {
         use shep_core::status::ProcStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_on(&path).await;
         daemon.reply_to_list(vec![
             shep_core::protocol::ProcessInfo::builder(7, "zeus-auth", ProcStatus::Stopped).build(),
@@ -1955,7 +2032,8 @@ mod tests {
         use shep_core::status::ProcStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        let address = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_on(&address).await;
         daemon.reply_to_list(a_flock_with_a_dog());
 
         let mut out = Vec::new();
@@ -2028,7 +2106,8 @@ mod tests {
         use shep_core::status::ProcStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        let address = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_on(&address).await;
         daemon.reply_to_list(a_flock_with_a_dog());
 
         let mut out = Vec::new();
@@ -2322,7 +2401,8 @@ mod tests {
         use shep_client::testing::fake_client_on;
 
         let dir = tempfile::tempdir().unwrap();
-        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        let address = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_on(&address).await;
         daemon.reply_to_list(a_foldable_flock());
 
         let mut out = Vec::new();
@@ -2366,7 +2446,7 @@ mod tests {
         use shep_core::status::ProcStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_on(&path).await;
         daemon.reply_to_list(vec![
             shep_core::protocol::ProcessInfo::builder(7, "zeus-auth", ProcStatus::Online).build(),
@@ -2403,7 +2483,7 @@ mod tests {
     #[tokio::test]
     async fn a_target_that_matches_nothing_is_a_usage_error_naming_what_was_tried() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -2464,7 +2544,7 @@ mod tests {
     #[tokio::test]
     async fn a_selector_reaches_the_wire_in_its_compiled_form() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
 
         #[derive(Clone, Copy, Debug)]
@@ -2530,7 +2610,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -2560,7 +2640,7 @@ mod tests {
     #[tokio::test]
     async fn a_not_found_reply_exits_not_found_rather_than_being_swallowed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) =
             fake_client_replying_err(&path, RpcErrorCode::NotFound, "no sheep matched").await;
         let mut out = Vec::new();
@@ -2602,7 +2682,7 @@ mod tests {
     #[tokio::test]
     async fn start_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let srv = dir.path().join("srv");
         std::fs::write(&srv, "").unwrap();
@@ -2653,7 +2733,7 @@ mod tests {
     #[tokio::test]
     async fn a_fold_flag_lands_on_the_resolved_app() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let srv = dir.path().join("srv");
         std::fs::write(&srv, "").unwrap();
@@ -2708,7 +2788,7 @@ mod tests {
     #[tokio::test]
     async fn a_shep_toml_mapping_fills_an_unset_interpreter() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let srv = dir.path().join("srv.js");
         std::fs::write(&srv, "").unwrap();
@@ -2751,7 +2831,7 @@ mod tests {
     #[tokio::test]
     async fn a_flockfile_interpreter_outranks_the_shep_toml_mapping() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let flockfile = dir.path().join("Flockfile.toml");
         std::fs::write(
@@ -2795,7 +2875,7 @@ mod tests {
     #[tokio::test]
     async fn the_interpreter_flag_outranks_a_flockfiles_own_field() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let flockfile = dir.path().join("Flockfile.toml");
         std::fs::write(
@@ -2849,7 +2929,7 @@ mod tests {
     #[tokio::test]
     async fn the_request_carries_the_app_name_and_the_count() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -2885,7 +2965,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_stock_exits_invalid_config_and_prints_the_reason() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) = fake_client_replying_err(
             &path,
             RpcErrorCode::InvalidConfig,

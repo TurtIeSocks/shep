@@ -2150,6 +2150,7 @@ dependencies = [
  "command-fds",
  "fsevent-sys",
  "futures-util",
+ "getrandom 0.4.3",
  "globset",
  "nix 0.29.0",
  "notify",
@@ -2166,6 +2167,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

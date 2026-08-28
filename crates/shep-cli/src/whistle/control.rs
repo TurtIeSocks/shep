@@ -191,7 +191,11 @@ fn unexpected_response() -> CallToolResult {
     }))
 }
 
-#[cfg(test)]
+// `unix` because its cases bind a raw `UnixListener` to stand in for a live shepherd.
+// The transport itself is portable (`shep_core::transport`) and its
+// own tests cover both platforms; these fixtures simply predate the
+// seam and were never rewritten onto it.
+#[cfg(all(test, unix))]
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
@@ -335,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn start_sheep_refuses_a_running_sheep_and_names_restart_sheep() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         // sample_info() is already Online, named "web" — exactly the
         // already-running case this test needs.
         let (daemon, served) = shep_client::testing::fake_daemon_accepting_repeatedly(
@@ -386,7 +390,7 @@ mod tests {
     #[tokio::test]
     async fn start_sheep_sends_a_restart_for_a_stopped_sheep() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let mut stopped = shep_client::testing::sample_info();
         stopped.status = shep_core::status::ProcStatus::Stopped;
         let mut restarted = shep_client::testing::sample_info();
@@ -444,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn start_sheep_refuses_the_whole_call_when_any_instance_is_running() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let rows: Vec<_> = [
             shep_core::status::ProcStatus::Online,
             shep_core::status::ProcStatus::Online,
@@ -504,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn a_reload_already_in_flight_reaches_the_model_in_the_shepherds_own_words() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let served = serve_connections_in_sequence(
             &socket,
             vec![Err((
@@ -552,7 +556,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_control_call_is_reported_not_retried() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let (daemon, served) = serve_one_request_then_hang(&socket);
 
         let whistle = whistle_at(socket);

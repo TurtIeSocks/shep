@@ -1,5 +1,46 @@
 # What a Windows tier costs
 
+> **Superseded 2026-08-26: the tier is built.** Everything below is kept as
+> written, because it turned out to be a good estimate and the record of why
+> is worth more than a tidy file. Read it as a forecast, not as current
+> state — `docs/specs/deferred.md`'s Windows entry has what actually shipped.
+>
+> **§5's recommendation was followed exactly, and it is what unblocked
+> this.** "Run the CI leg first" was the right first move: the answer was
+> that the ~10% of the tree outside `cfg(unix)` was already green on native
+> MSVC, in 17 seconds. §4's "nobody on this project has a Windows host" then
+> stopped being true, which removed the argument §5 actually rested on —
+> not that the work was hard, but that it would be done blind.
+>
+> **The shape predictions held; the cost predictions were pessimistic.** The
+> PORT/REDESIGN/DROP split was right in every case, which is what §4 said to
+> expect ("the *shape* is solid, because it falls out of API existence").
+> The task count was high: §1's claim that "the 145 `cfg(unix)`-family sites
+> are the least interesting number in the brief" was truer than it knew —
+> only ten files in `shep-cli` contained a Unix API call at all, and
+> un-gating really was an afternoon.
+>
+> **Three things this document did not anticipate**, each found only by
+> running the code on a real host, and each a silent failure rather than a
+> compile error:
+>
+> - `base_env()` is Unix-shaped. `env_clear()` without `SystemRoot` makes a
+>   Windows child fail before `main`; `powershell` produces no output and no
+>   error at all.
+> - `OpenOptions::append(true)` strips `FILE_WRITE_DATA`, so the
+>   `set_len(0)` in `launch.rs`'s `emptied_appending` returns
+>   `ERROR_ACCESS_DENIED` — which broke `shep start`'s autostart entirely.
+> - `git`'s `core.autocrlf` reddens three byte-exact fixture tests on any
+>   Windows checkout, for reasons having nothing to do with the port.
+>
+> §4's list of six unanswerable questions was the right list. Two now have
+> answers: **(1)** `CTRL_BREAK_EVENT` is not usable — a detached shepherd
+> shares no console with its sheep — so the honest answer was "no graceful
+> stop outside the channel", and that is what shipped. **(2)** breakaway is
+> a non-issue, because `Job::create` does not grant it, so a job member
+> cannot escape; `kill_tree` on Windows reaches strictly more of the tree
+> than its unix twin, verified by mutation.
+
 Written 2026-08-15, from five parallel surveys of the porting surface plus a
 spot-check of every claim marked REDESIGN or high-risk. Phase 15 was landing
 under the surveys as they ran; anything read from that in-flight work is

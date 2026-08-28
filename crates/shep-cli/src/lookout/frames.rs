@@ -1057,6 +1057,7 @@ mod tests {
     /// rather than a table row (or, worse, `None` of them) — exactly the
     /// case `ActionRefused`'s own assertions exercise, where the bar and the
     /// table disagree about `api` on purpose.
+    #[cfg_attr(windows, allow(dead_code))]
     fn row_for<'a>(frame: &'a str, name: &str) -> Option<&'a str> {
         frame.lines().find(|line| {
             let mut tokens = line.trim_start_matches('>').split_whitespace();
@@ -1070,6 +1071,7 @@ mod tests {
     /// width this test was not written against. `prefix` only needs to fit
     /// inside the eight-column floor `name_width` never shrinks below to be
     /// safe here.
+    #[cfg_attr(windows, allow(dead_code))]
     fn marked_row_name_starts_with(frame: &str, prefix: &str) -> bool {
         frame.lines().any(|line| {
             line.starts_with('>')
@@ -1091,6 +1093,25 @@ mod tests {
     /// the plan: "every clause of every caption is one assertion here, or it
     /// is deleted from the caption."
     #[test]
+    /// `cfg(unix)` because one scene's fixture carries a SIGNALLED exit, and
+    /// `output::rows::signal_label` resolves a signal number against the
+    /// running platform's own table on purpose — its doc argues that a
+    /// `ProcessInfo` is always rendered by a binary on the same OS as the
+    /// daemon that produced it, and `shep_core::signals::OperatorSignal`
+    /// deliberately refuses to map numbers to names at all ("a number means
+    /// different signals on different platforms, and shep will not guess").
+    ///
+    /// So Windows renders `15` where unix renders `SIGTERM`, and that is the
+    /// designed behaviour rather than a gap: a Windows `ExitOutcome` never
+    /// carries a signal in the first place (`tokio_runner`'s `wait` sets it
+    /// `None` unconditionally), so this arm is only ever reached by a
+    /// synthetic fixture like this one. The pinned artifacts under
+    /// `docs/lookout/` are unix renderings for the same reason.
+    ///
+    /// Windows lookout coverage is not lost with it: every other pane test
+    /// in this module runs on both platforms, and the dashboard itself was
+    /// exercised against a live Windows flock.
+    #[cfg(unix)]
     #[allow(clippy::too_many_lines)] // twenty-four captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
         // "All three panes at 120x30: the host strip under the title, the
@@ -1592,6 +1613,25 @@ mod tests {
     /// deliberate layout change is correct and expected, which is the
     /// opposite of IR-35's rule for the protocol snapshots in shep-core.
     /// Nobody may apply wire discipline to a border glyph.
+    /// `cfg(unix)` because one scene's fixture carries a SIGNALLED exit, and
+    /// `output::rows::signal_label` resolves a signal number against the
+    /// running platform's own table on purpose — its doc argues that a
+    /// `ProcessInfo` is always rendered by a binary on the same OS as the
+    /// daemon that produced it, and `shep_core::signals::OperatorSignal`
+    /// deliberately refuses to map numbers to names at all ("a number means
+    /// different signals on different platforms, and shep will not guess").
+    ///
+    /// So Windows renders `15` where unix renders `SIGTERM`, and that is the
+    /// designed behaviour rather than a gap: a Windows `ExitOutcome` never
+    /// carries a signal in the first place (`tokio_runner`'s `wait` sets it
+    /// `None` unconditionally), so this arm is only ever reached by a
+    /// synthetic fixture like this one. The pinned artifacts under
+    /// `docs/lookout/` are unix renderings for the same reason.
+    ///
+    /// Windows lookout coverage is not lost with it: every other pane test
+    /// in this module runs on both platforms, and the dashboard itself was
+    /// exercised against a live Windows flock.
+    #[cfg(unix)]
     #[test]
     fn frames_are_pinned() {
         for which in Scene::ALL {

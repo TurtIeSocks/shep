@@ -18,9 +18,9 @@ The face in the STATUS column is the fastest thing on the page to read:
 `(o.o)` online, `(o~o)` starting, `(>_<)` waiting to restart, `(-.-)` stopped,
 `(x.x)` errored.
 
-> Status: `0.1.7`, and pre-1.0 means anything can still change. macOS and
-> Linux. On Windows every command prints `shep does not yet support Windows`
-> and exits 1, which is a real answer but not a useful one.
+> Status: `0.1.7`, and pre-1.0 means anything can still change. macOS, Linux
+> and Windows. The Windows tier is the newest of the three, and the three
+> things it will not do are under [Windows](#windows) below.
 
 ## Install
 
@@ -178,6 +178,36 @@ Help             welcome init help completions style
 Full documentation, including a generated reference for every flag of every
 verb, is at [shep.turtlesocks.dev](https://shep.turtlesocks.dev).
 
+## Windows
+
+The day-to-day loop works: `start`, `stop`, `restart`, `reload`, `flock`,
+`describe`, `bleats`, `delete`, `save`/`muster`, `lookout`, `whistle`, and the
+dogs. shep talks over a named pipe instead of a unix socket, and each sheep
+sits in a job object instead of a process group.
+
+Three limits are real, and none of them is going to be papered over:
+
+- `shep stop` has no polite signal to send. Windows offers nothing
+  SIGTERM-shaped that can be delivered to an arbitrary process, so a sheep
+  that has not opted into the shepherd channel gets its full `kill_timeout`
+  and is then terminated. Set `shutdown_with_message = true` and read the
+  channel if your app needs a clean shutdown. Same path as unix, except the
+  handle arrives as `$SHEP_CHANNEL_PIPE` instead of fd 3.
+- `shep startup` is not built. Boot-time supervision on Windows means a
+  Service Control Manager service, which is a different program shape rather
+  than a fifth unit template. Run `shep start` in your own session, or wrap
+  `shep runtime` in NSSM or WinSW.
+
+- `user` and `group` in a Flockfile are refused, permanently. Dropping
+  privilege on Windows needs a logon session or a primary-token privilege,
+  which is a different and security-sensitive feature rather than a
+  different call.
+
+Smaller things differ too, and they are listed in
+[docs/specs/deferred.md](docs/specs/deferred.md): most `shep signal` names
+have no Windows delivery, and `$SHEP_HOME` inherits its parent's ACL rather
+than being narrowed the way `0700` narrows it on unix.
+
 ## Building
 
 ```bash
@@ -189,9 +219,10 @@ cargo test --workspace --all-features
 
 MSRV 1.88, edition 2024. `shep-core`, `shep-client` and `shep` are
 `#![forbid(unsafe_code)]`. `shep-daemon` denies it crate-wide and permits it in
-one file, `sys.rs`, for adopting a descriptor the daemon inherited. That is
-seven blocks, each with its own `// SAFETY:` note, and the whole of the
-workspace's unsafe surface.
+two files: `sys.rs`, for adopting a descriptor the daemon inherited, and
+`sys_windows.rs`, for the job object that holds a sheep and its lambs. That
+is seven blocks on unix and ten sites on Windows, each with its own
+`// SAFETY:` note, and the whole of the workspace's unsafe surface.
 
 ## License
 

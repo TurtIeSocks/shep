@@ -42,7 +42,6 @@ const queuedItems: ChalkboardItem[] = [
 ];
 
 const cutItems: ChalkboardItem[] = [
-  { anchor: "The whole Windows tier", display: "Windows" },
   { anchor: "HTTP/SSE MCP transport", display: "HTTP/SSE MCP transport" },
   { anchor: "cgroup v2 enforcement", display: "cgroup v2 enforcement" },
   { anchor: "@shep/io npm shim", display: "@shep/io npm shim" },

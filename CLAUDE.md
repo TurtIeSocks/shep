@@ -374,6 +374,34 @@ being asked before changing either. README.md deliberately quotes the grouping
 without a count, so there is no third number to keep in step.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
-Windows is 0%, not partial — every verb prints "not yet supported" and exits.
+
+**Windows is built and runs.** This line said "0%, not partial — every verb
+prints 'not yet supported' and exits" for eighteen phases, and that is no
+longer true of anything. A Windows host became available, and
+[windows-estimate.md](docs/specs/windows-estimate.md)'s own first
+recommendation — dispatch the CI leg before scoping anything — was run: the
+tree was already compile-green on native MSVC. Tier A is now implemented and
+verified against a live flock on real Windows.
+
+What that means for anyone editing this workspace:
+
+- **`cfg(unix)` is no longer a free choice.** `shep-client`, `shep-daemon`'s
+  `boot`/`server`/`tokio_runner`, and every `shep-cli` module tree are
+  portable now. The OS transport lives in ONE place,
+  `shep_core::transport` — a unix socket or a Windows named pipe — and
+  everything above it (codec, handshake, actor, RPC dispatch) carries no
+  platform gate at all. Adding one back is a design decision, not a shrug.
+- **A per-sheep job object replaces the process group.** `sys_windows.rs` is
+  the crate's only unsafe on that platform, mirroring `sys.rs`'s rule. It is
+  stronger than the unix design: `kill.rs` documents an escaped-`setsid`
+  hole that a job simply does not have.
+- **Three refusals are permanent and deliberate**, each argued at its own
+  call site: no graceful signal outside the shepherd channel, no
+  `shep startup` (that is Tier B — an SCM service), and no `user`/`group`.
+- **The local gate does not run Windows tests.** `cargo test` on a Mac never
+  compiles a `cfg(windows)` item, and the `windows-gnu` cross-check is
+  `cargo check`, which executes nothing. `.github/workflows/test.yml`'s
+  `windows-latest` legs are what actually run this tier. Read the CI result.
+
 Project memory (cross-session state) tracks decisions; docs above are the
 source of truth.

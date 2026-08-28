@@ -184,7 +184,11 @@ pub(crate) fn render_ping(streams: &mut Streams<'_>, status: &ShepherdStatus) ->
     }
 }
 
-#[cfg(test)]
+// `unix` because its cases bind a raw `UnixListener` to stand in for a live shepherd.
+// The transport itself is portable (`shep_core::transport`) and its
+// own tests cover both platforms; these fixtures simply predate the
+// seam and were never rewritten onto it.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -242,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn a_socket_that_handshakes_but_never_answers_is_not_online() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wedged.sock");
+        let path = shep_client::testing::control_address(dir.path());
         // Accepts and completes nothing: the connect succeeds, the
         // handshake does not, so `Client::connect` itself fails here. The
         // assertion is that this is reported rather than raised.

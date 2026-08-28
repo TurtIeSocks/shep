@@ -93,7 +93,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -121,7 +121,7 @@ mod tests {
     #[tokio::test]
     async fn a_not_found_reply_exits_not_found_rather_than_being_swallowed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) =
             fake_client_replying_err(&path, RpcErrorCode::NotFound, "no sheep matched").await;
         let mut out = Vec::new();
@@ -151,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn the_request_carries_the_selector_action_params_and_trigger_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -188,7 +188,7 @@ mod tests {
     #[tokio::test]
     async fn an_unrecognised_response_exits_internal() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();

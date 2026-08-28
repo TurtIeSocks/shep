@@ -17,19 +17,16 @@
 #![doc(test(attr(deny(warnings))))]
 #![forbid(unsafe_code)]
 
-// Unix-only: built on `tokio::net::UnixStream`, and — via `spawn` — on the
-// exit-code contract of a `shep daemon` child. Gated at the `mod` line so
-// each module's own `#[cfg(test)]` block goes with it; an inner
-// `#![cfg(unix)]` would leave the declaration visible and the tests behind.
-// Platform tiering follows shep-daemon's ruling — see the phase-3 plan's
-// Global Constraints and `shep-daemon/Cargo.toml:34-40`.
-#[cfg(unix)]
+// Portable on both tiers as of the Windows port. These modules used to be
+// `#[cfg(unix)]` because `connection` named `tokio::net::UnixStream`
+// directly; it names `shep_core::transport::ClientStream` now, so the OS
+// choice is made one crate down and nothing here has a platform arm at all.
+// `spawn`'s other half of the old justification — the exit-code contract of
+// a `shep daemon` child — was never Unix-specific: it reads
+// `ExitStatus::code()`, which every platform has.
 mod actor;
-#[cfg(unix)]
 mod client;
-#[cfg(unix)]
 mod connection;
-#[cfg(unix)]
 mod events;
 // `spawn` stays a public module rather than a flattened re-export: the
 // exit-code contract (`spawn::DAEMON_ALREADY_RUNNING`) reads better
@@ -38,16 +35,12 @@ mod events;
 // `mod` declaration merges with the module file's own `//!` docs and
 // resolves in crate-root scope, breaking that module's intra-doc links to
 // its own siblings.
-#[cfg(unix)]
 pub mod spawn;
-#[cfg(unix)]
 pub use client::{
     Client, DEADLINE_GRACE, DEFAULT_DEADLINE, LOG_PLANE_DEADLINE, RequestError, START_DEADLINE,
     TRIGGER_DEADLINE,
 };
-#[cfg(unix)]
 pub use connection::{ConnectError, HANDSHAKE_TIMEOUT};
-#[cfg(unix)]
 pub use events::{EventStream, Lagged};
 /// The trait [`EventStream`] implements.
 ///
@@ -78,13 +71,12 @@ pub use events::{EventStream, Lagged};
 ///     _pending_hint(events)
 /// }
 /// ```
-#[cfg(unix)]
 #[doc(inline)]
 pub use futures_util::Stream;
 
-// Unix-only for the same reason as `connection` above: every fake here
-// binds a `UnixListener`.
-#[cfg(all(unix, any(test, feature = "test-support")))]
+// Portable for the same reason as `connection` above: every fake here binds
+// a `shep_core::transport::Listener` rather than a `UnixListener`.
+#[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
 pub use shep_core;

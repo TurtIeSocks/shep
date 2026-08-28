@@ -295,8 +295,7 @@ where
     let mut events = events;
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut sigterm = crate::shutdown::Terminate::install().ok();
 
     // Set once each, when their source runs dry. See this function's doc.
     let mut keys_done = false;

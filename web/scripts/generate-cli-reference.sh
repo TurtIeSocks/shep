@@ -26,7 +26,14 @@ shep() { env -u SHEP_HOME -u SHEP_STYLE -u NO_COLOR "$BIN" "$@"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# `shep` on unix, `shep.exe` on Windows. Checked in that order rather than
+# branching on `$OSTYPE`: this script runs under Git Bash and WSL as well as
+# a native shell, and which of those is "Windows" is not a question worth
+# asking when the artifact itself answers it.
 BIN="$REPO_ROOT/target/release/shep"
+if [[ ! -x "$BIN" && -x "$BIN.exe" ]]; then
+  BIN="$BIN.exe"
+fi
 OUT="$SCRIPT_DIR/../src/data/cli-reference.generated.txt"
 
 if [[ ! -x "$BIN" ]]; then

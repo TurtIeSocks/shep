@@ -43,6 +43,42 @@ speaks, so this is not a negotiation — it is there so a defensive app can
 notice a version it has never seen and say so, rather than failing to parse a
 line with nothing to connect that failure to a protocol change.
 
+## On Windows: a named pipe, not fd 3
+
+**Everything above this heading describes the unix tier.** Windows has no
+fd-3 inheritance a child can rely on — `cmd.exe` has no `<&3` redirection,
+and the mechanism shep uses on unix (`command-fds`, a `pre_exec` crate) does
+not exist there. So the descriptor half of the contract is replaced, and
+only that half:
+
+- The daemon exports **`SHEP_CHANNEL_PIPE`**, whose value is a named-pipe
+  path like `\\.\pipe\shep-channel-1234-0-9f3c1a2b4d5e6f708192a3b4c5d6e7f8`.
+  **Your app opens it itself**, for reading and writing, exactly as it would
+  open any file. That open is the whole difference. Read the name out of
+  the environment and do not try to reconstruct it: the trailing hex is
+  random per spawn. The channel is readable by other accounts on the same
+  machine, so do not put anything on it you would not show them. Detail in
+  [deferred.md](specs/deferred.md) if you run shep somewhere that matters.
+- `SHEP_CHANNEL_VERSION` is exported as before.
+- **`SHEP_CHANNEL_FD` is deliberately NOT set on Windows.** Branch on which
+  variable is present rather than on the platform: an app that finds
+  `SHEP_CHANNEL_PIPE` should open it, one that finds `SHEP_CHANNEL_FD`
+  should use that descriptor, and one that finds neither was not given a
+  channel.
+
+**The wire format below is unchanged** — same newline-delimited JSON, same
+`ready`/`metric`/`action-reply` outbound and `shutdown`/`action` inbound
+shapes, same correlation id. A named pipe opened in byte mode is a blocking
+byte stream, so "read a line, parse it, act on it" still describes it
+exactly.
+
+**This matters more on Windows than on unix**, and it is worth being blunt
+about why. Windows has no way to deliver anything SIGTERM-shaped to another
+process, so `shep stop` on an app that has NOT opted into this channel waits
+out the app's whole `kill_timeout` and then terminates it. **The channel is
+the only graceful shutdown available on that platform.** Set
+`shutdown_with_message = true`, read the pipe, and act on `shutdown`.
+
 ## The wire format
 
 Newline-delimited JSON, one complete message per line, in both directions.
@@ -161,7 +197,8 @@ with any subscriber seeing, not just the one who asked.
 
 - Ask for a channel with `channel = true` (or get one for free from
   `wait_ready` / `shutdown_with_message`).
-- Read `SHEP_CHANNEL_FD`, open that fd, read/write newline-delimited JSON.
+- Read `SHEP_CHANNEL_FD` on unix or `SHEP_CHANNEL_PIPE` on Windows (exactly
+  one is ever set), open it, read/write newline-delimited JSON.
 - A plain blocking read works — no event loop required.
 - Reply to every `action` message you receive, even ones you don't
   recognize, and reply exactly once, promptly.

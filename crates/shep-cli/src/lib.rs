@@ -30,94 +30,65 @@
 #![forbid(unsafe_code)]
 
 mod cli;
-#[cfg(unix)]
 mod commands;
 mod completions;
-#[cfg(unix)]
 mod dog;
 mod dog_index;
 mod exit;
 mod fetch;
 mod flourish;
 mod http;
-#[cfg(unix)]
 mod launch;
-#[cfg(unix)]
 mod lookout;
 mod output;
 mod serve;
-#[cfg(unix)]
+mod shutdown;
 mod status;
 mod style;
 mod terminal_safe;
 mod vocabulary;
 mod welcome;
-#[cfg(unix)]
 mod whistle;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
-#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Parser;
 
-#[cfg(unix)]
 use cli::{AdoptArgs, Commands, DaemonArgs, Format};
 use cli::{Cli, GlobalArgs};
-#[cfg(unix)]
 use commands::admin;
-#[cfg(unix)]
 use commands::bleats;
-#[cfg(unix)]
 use commands::daemon::{daemon_exit_code, run_daemon};
-#[cfg(unix)]
 use commands::dev;
-#[cfg(unix)]
 use commands::dogs;
-#[cfg(unix)]
 use commands::import;
-#[cfg(unix)]
 use commands::kv;
-#[cfg(unix)]
 use commands::lifecycle;
-#[cfg(unix)]
 use commands::logs;
-#[cfg(unix)]
 use commands::muster;
-#[cfg(unix)]
 use commands::query;
-#[cfg(unix)]
 use commands::runtime;
-#[cfg(unix)]
 use commands::schema;
 // Imports the function directly, not the module: `commands::serve` would
 // collide in this scope with the crate-root `serve` module (the static-file
 // implementation `commands::serve::serve` itself calls into).
-#[cfg(unix)]
 use commands::serve::serve as serve_command;
-#[cfg(unix)]
 use commands::shep_toml::{ShepToml, ShepTomlError};
-#[cfg(unix)]
 use commands::signal;
 #[cfg(unix)]
 use commands::startup;
-#[cfg(unix)]
 use commands::trigger;
-#[cfg(unix)]
 use commands::whisper;
 use exit::ExitCode;
-#[cfg(unix)]
 use launch::launch_daemon;
 use output::Streams;
-#[cfg(unix)]
 use shep_client::Client;
-#[cfg(unix)]
 use shep_client::spawn::{SpawnOutcome, connect_or_spawn};
 use shep_core::paths::ShepPaths;
 
-#[cfg(unix)]
 use crate::commands::init;
 
 /// The `shep` entry point. Parses this process's arguments and runs one verb.
@@ -178,7 +149,6 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
     // clap variant, so it carries no `--help` entry and no command-surface
     // footprint. See `lookout::term::probe_panic_for_test`'s doc for why
     // this exists and what it replaces.
-    #[cfg(unix)]
     if std::env::var_os("SHEP_TERM_PANIC_PROBE").is_some() {
         lookout::term::probe_panic_for_test();
     }
@@ -193,7 +163,6 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
     // dog. Sync, and cheap for the overwhelming majority of invocations
     // that parse cleanly (`Ok` short-circuits `if let Err` immediately) —
     // see `dispatch_adopted_dog`'s own doc for the whole contract.
-    #[cfg(unix)]
     if let Err(ref err) = parsed
         && let Some(code) = dispatch_adopted_dog(&argv, err)
     {
@@ -295,7 +264,6 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
 /// on an unset builder option to keep two error shapes from colliding is
 /// exactly the kind of coupling that breaks silently the day someone
 /// upstream of this function sets it for an unrelated reason.
-#[cfg(unix)]
 fn dispatch_adopted_dog(argv: &[OsString], err: &clap::Error) -> Option<std::process::ExitCode> {
     if err.kind() != clap::error::ErrorKind::InvalidSubcommand {
         return None;
@@ -344,7 +312,6 @@ fn dispatch_adopted_dog(argv: &[OsString], err: &clap::Error) -> Option<std::pro
 /// Windows rather than merely unreachable keeps the Windows tier's own
 /// `cargo check` gate free of one more dead-code warning for a function
 /// with no caller there at all.
-#[cfg(unix)]
 fn home_before(prefix: &[OsString]) -> Option<PathBuf> {
     let mut tokens = prefix.iter();
     while let Some(arg) = tokens.next() {
@@ -383,7 +350,6 @@ fn home_before(prefix: &[OsString]) -> Option<PathBuf> {
 /// Exit code mirrors shell convention via [`dog_exit_code`]: the child's
 /// own code, or `128 + signal` if it died by one — the same reading
 /// `commands::reap::classify` gives a reaped supervisor.
-#[cfg(unix)]
 fn run_adopted_dog(
     path: &Path,
     home: &Path,
@@ -416,6 +382,18 @@ fn dog_exit_code(status: std::process::ExitStatus) -> u8 {
     }
 }
 
+/// `status`'s own exit code.
+///
+/// No `128 + signal` arm, because there are no signals: every Windows
+/// process exit carries a code, so `ExitStatus::code()` is never `None`
+/// there and the shell convention the unix arm reproduces has nothing to
+/// encode. The `unwrap_or` is defensive only — reaching it would mean the OS
+/// reported an exit with no status at all.
+#[cfg(windows)]
+fn dog_exit_code(status: std::process::ExitStatus) -> u8 {
+    status.code().unwrap_or(1) as u8
+}
+
 /// Prints the one-line shepherd status to stderr, for an invocation clap
 /// answers by itself.
 ///
@@ -428,7 +406,7 @@ fn dog_exit_code(status: std::process::ExitStatus) -> u8 {
 /// when `argv` names a `--home`: the parse that would have told us which
 /// home is the parse that just failed, and a line naming the wrong flock is
 /// worse than no line.
-#[cfg(unix)]
+#[cfg_attr(windows, allow(dead_code))]
 async fn print_shepherd_status(argv: &[OsString]) {
     if !std::io::stderr().is_terminal() || argv.iter().any(|a| a == "--home") {
         return;
@@ -612,6 +590,24 @@ fn style_write_is_overridden(source: style::StyleSource) -> bool {
 /// (`commands/daemon.rs`'s `ansi_enabled` does the same for `NO_COLOR`): the
 /// real call happens once, at [`run_argv`], and this stays a pure decision
 /// the test below can exercise directly.
+/// What `shep startup`/`shep unstartup` say on Windows.
+///
+/// A refusal that names the boundary rather than a bare "unsupported": the
+/// rest of shep works on this platform, and an operator who has just watched
+/// `shep start` succeed needs to know why this one verb does not, and what
+/// to do instead.
+///
+/// Boot-time supervision on Windows means a real service registered with the
+/// Service Control Manager, which is a different program shape rather than a
+/// sixth unit template — see `commands/mod.rs`'s note on the gated module.
+#[cfg(windows)]
+const WINDOWS_NO_SERVICE: &str = "\
+shep startup installs a boot-time service, and on Windows that means \
+registering with the Service Control Manager -- not yet built (Tier B in \
+docs/specs/windows-estimate.md).\n  \
+the shepherd itself works here: run `shep start` in your own session, or wrap \
+`shep runtime` in a service manager such as NSSM or WinSW.";
+
 fn must_render_bare(stdout_is_terminal: bool, fmt: cli::Format) -> bool {
     !stdout_is_terminal || fmt == cli::Format::Json
 }
@@ -621,7 +617,6 @@ fn must_render_bare(stdout_is_terminal: bool, fmt: cli::Format) -> bool {
 /// A type rather than a bare [`ExitCode`] because two of the three carry the
 /// path they are about, and an operator cannot act on a refusal that does not
 /// name it.
-#[cfg(unix)]
 #[derive(Debug)]
 enum HomeRefusal {
     /// None of `--home`, `$SHEP_HOME` or `$HOME` resolved a root directory.
@@ -639,7 +634,6 @@ enum HomeRefusal {
     },
 }
 
-#[cfg(unix)]
 impl core::fmt::Display for HomeRefusal {
     /// The operator-facing message, remedy included.
     ///
@@ -663,7 +657,6 @@ impl core::fmt::Display for HomeRefusal {
     }
 }
 
-#[cfg(unix)]
 impl core::error::Error for HomeRefusal {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
@@ -673,7 +666,6 @@ impl core::error::Error for HomeRefusal {
     }
 }
 
-#[cfg(unix)]
 impl HomeRefusal {
     /// The status the command ends with.
     ///
@@ -695,7 +687,6 @@ impl HomeRefusal {
 ///
 /// Every variant of [`HomeRefusal`]; see [`ensure_home_at`], which this wraps
 /// with the environment resolved.
-#[cfg(unix)]
 fn ensure_home(global: &GlobalArgs) -> Result<(ShepPaths, bool), HomeRefusal> {
     let paths = resolve_paths(global).map_err(|_| HomeRefusal::Unresolved)?;
     ensure_home_at(paths, global.home.is_some())
@@ -731,7 +722,6 @@ fn ensure_home(global: &GlobalArgs) -> Result<(ShepPaths, bool), HomeRefusal> {
 ///
 /// - [`HomeRefusal::Missing`] — `explicit`, and the directory is not there.
 /// - [`HomeRefusal::Io`] — the directory could not be created.
-#[cfg(unix)]
 fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool), HomeRefusal> {
     if paths.home.is_dir() {
         return Ok((paths, false));
@@ -790,7 +780,6 @@ fn ensure_home_at(paths: ShepPaths, explicit: bool) -> Result<(ShepPaths, bool),
 /// directory creation is visible to it, so ordering between the two does
 /// not matter; this is called after it regardless, for a `paths.home` that
 /// is already known to exist.
-#[cfg(unix)]
 fn scaffold_first_run_interpreters(paths: &ShepPaths) {
     if let Err(err) = ShepToml::edit(&paths.daemon_config, ShepToml::write_starter_interpreters) {
         let mut err_stream = std::io::stderr();
@@ -852,7 +841,6 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
 /// the same way, so it can tell the operator whether the value it just
 /// wrote is what will actually run or whether `--style`/`$SHEP_STYLE`
 /// still outranks it.
-#[cfg(unix)]
 async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
     let fmt = cli.global.format;
 
@@ -917,6 +905,8 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // `a_shep_home_that_does_not_exist_is_refused` for the trap that
         // guards -- but this gate fires first and says more.
         Commands::Startup(ref args) => {
+            #[cfg(windows)]
+            let _ = args;
             let (paths, home_is_new) = match ensure_home(&cli.global) {
                 Ok(resolved) => resolved,
                 Err(refusal) => {
@@ -945,9 +935,14 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 style,
                 fmt,
             };
+            #[cfg(unix)]
             return startup::startup(&mut streams, Some(paths.home.as_path()), args);
+            #[cfg(windows)]
+            return streams.fail(ExitCode::Failure, WINDOWS_NO_SERVICE);
         }
         Commands::Unstartup(ref args) => {
+            #[cfg(windows)]
+            let _ = args;
             let mut out = std::io::stdout().lock();
             let mut err = std::io::stderr().lock();
             let mut streams = Streams {
@@ -956,7 +951,10 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 style,
                 fmt,
             };
+            #[cfg(unix)]
             return startup::unstartup(&mut streams, args);
+            #[cfg(windows)]
+            return streams.fail(ExitCode::Failure, WINDOWS_NO_SERVICE);
         }
         // Needs no `$SHEP_HOME` at all — same reasoning as `Completions`
         // just above, and the same early spot for it.
@@ -1175,6 +1173,11 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 // the closure returned, which would rewrite (new inode,
                 // mode forced to `CONFIG_FILE_MODE`) a file this call is
                 // reporting as untouched.
+                // `result_large_err` on the closure, for the same reason and
+                // on the same platform as the module-wide allow in
+                // `commands::shep_toml` — see the banner there. The error
+                // type is that module's; this is one call site of it.
+                #[cfg_attr(windows, allow(clippy::result_large_err))]
                 if let Err(err) =
                     ShepToml::try_edit(&paths.daemon_config, |cfg| cfg.set_style_level(level))
                 {
@@ -1413,7 +1416,6 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
 }
 
 /// What both [`resolve_paths`] call sites report when nothing resolves a root.
-#[cfg(unix)]
 const UNRESOLVED_HOME: &str = "none of --home, $SHEP_HOME, or $HOME resolves a root directory";
 
 /// Emits one error envelope to stderr under a lock taken for just that write.
@@ -1428,7 +1430,6 @@ const UNRESOLVED_HOME: &str = "none of --home, $SHEP_HOME, or $HOME resolves a r
 /// Short-lived is the entire distinction from the guard [`run`]'s own comment
 /// warns about: it is a guard held for a whole process lifetime that wedges
 /// the daemon, never one held across a single write.
-#[cfg(unix)]
 fn emit_error_locked(fmt: Format, code: ExitCode, message: &str) {
     let mut err = std::io::stderr().lock();
     let _ = output::emit_error(&mut err, fmt, code.code_str(), message);
@@ -1446,7 +1447,6 @@ fn emit_error_locked(fmt: Format, code: ExitCode, message: &str) {
 /// either faking `connect_or_spawn` itself (testing nothing new) or spawning
 /// a real child from this test binary (the hang/flake risk this project
 /// avoids in unit tests).
-#[cfg(unix)]
 async fn connect_or_spawn_client(
     streams: &mut Streams<'_>,
     paths: &ShepPaths,
@@ -1471,7 +1471,6 @@ async fn connect_or_spawn_client(
 ///
 /// Reports rather than re-boots when one is already up, because typing
 /// `shep start` twice should say what happened, not silently do nothing.
-#[cfg(unix)]
 async fn start_bare_shepherd(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode {
     let before = status::ShepherdStatus::probe(paths).await;
     if let Some(online) = &before.online {
@@ -1536,7 +1535,6 @@ async fn start_bare_shepherd(streams: &mut Streams<'_>, paths: &ShepPaths) -> Ex
 /// This lives here and not in `shep-client` on purpose. That crate is
 /// published for embedders, and a library has no business telling its caller
 /// to run a shell command.
-#[cfg(unix)]
 fn unreachable_message(err: &shep_client::ConnectError) -> String {
     match err {
         shep_client::ConnectError::Connect { path, source }
@@ -1554,7 +1552,6 @@ fn unreachable_message(err: &shep_client::ConnectError) -> String {
 
 /// Connects to the daemon at `paths.socket`. Never autostarts — see
 /// [`run`]'s own doc for why that matters.
-#[cfg(unix)]
 async fn connect_client(streams: &mut Streams<'_>, paths: &ShepPaths) -> Result<Client, ExitCode> {
     match Client::connect(&paths.socket).await {
         Ok(client) => Ok(client),
@@ -1585,7 +1582,6 @@ async fn connect_client(streams: &mut Streams<'_>, paths: &ShepPaths) -> Result<
 /// `#[cfg(unix)]`: the only caller is `run`'s unix arm — the hidden
 /// `daemon` subcommand is the re-exec target `launch::launch_daemon`
 /// spawns, and that launcher itself only exists on this tier.
-#[cfg(unix)]
 async fn run_daemon_command(fmt: Format, global: &GlobalArgs, args: &DaemonArgs) -> ExitCode {
     let paths = match resolve_paths(global) {
         Ok(paths) => paths,
@@ -1602,36 +1598,6 @@ async fn run_daemon_command(fmt: Format, global: &GlobalArgs, args: &DaemonArgs)
             code
         }
     }
-}
-
-/// The Windows arm of `run`: parsing, help, and every unit test above still
-/// work on this target; every verb below this line does not exist here yet
-/// (spec §11's functional tier — named-pipe RPC is future work, tracked by
-/// `ShepPaths::pipe_name`, not built here).
-///
-/// Routed through [`output::emit_error`], same as the unix arm's own
-/// placeholders, rather than a bare `eprintln!` — so this refusal already
-/// honours `--format json` rather than only ever printing prose.
-///
-/// `async fn` purely so the call site in `main` needs no `cfg` of its own —
-/// it awaits nothing, and the resulting `clippy::unused_async` is
-/// pedantic-only, so it does not trip the gate.
-///
-/// `style` is [`run_argv`]'s resolved [`style::Presentation`], threaded
-/// through for the same reason the unix arm takes it — a uniform `run`
-/// signature across both `cfg` arms — even though nothing on this arm
-/// renders a table yet to read it back.
-#[cfg(windows)]
-async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
-    let mut out = std::io::stdout().lock();
-    let mut err = std::io::stderr().lock();
-    let mut streams = Streams {
-        out: &mut out,
-        err: &mut err,
-        style,
-        fmt: cli.global.format,
-    };
-    streams.fail(ExitCode::Failure, "shep does not yet support Windows")
 }
 
 #[cfg(test)]
@@ -2384,10 +2350,18 @@ mod tests {
         };
         let paths = resolve_paths(&global).unwrap();
         assert_eq!(paths.home, std::path::Path::new("/tmp/explicit"));
+        // The control address is the one field that is a different KIND of
+        // thing per platform — a socket file on unix, a named-pipe name on
+        // Windows. `ShepPaths::socket`'s own doc carries the argument; this
+        // asserts that `--home` reaches that derivation on both, rather than
+        // skipping the check on the platform where it changed.
+        #[cfg(unix)]
         assert_eq!(
             paths.socket,
             std::path::Path::new("/tmp/explicit/run/shep.sock")
         );
+        #[cfg(windows)]
+        assert_eq!(paths.socket, std::path::Path::new(&paths.pipe_name()));
     }
 
     /// fails if the hard rule's condition drifts from "piped, or JSON" —
