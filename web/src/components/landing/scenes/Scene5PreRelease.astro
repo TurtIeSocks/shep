@@ -20,9 +20,11 @@ import SceneSection from "../SceneSection.astro";
     </div>
     <p>
       Early days, and pre-1.0 means anything can still change. Install
-      with <code>cargo install shep</code> and it runs on macOS and Linux. On Windows every command prints
-      <code>shep does not yet support Windows</code> and exits 1. That's a
-      real answer, but not a useful one.
+      with <code>cargo install shep</code> and it runs on macOS, Linux and
+      Windows. The Windows tier is the newest of the three, and it refuses
+      two things out loud rather than papering over them: a graceful
+      <code>stop</code> for an app that has not opted into the shepherd
+      channel, and <code>shep startup</code>.
     </p>
     <a href="#chalkboard" class="cta press" style="--shadow-offset:5px; --press-offset:2px;">
       See exactly what's missing
