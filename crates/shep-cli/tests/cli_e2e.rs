@@ -1286,6 +1286,31 @@ fn wait_for_dog_pid(home: &Path, name: &str) -> nix::unistd::Pid {
 /// still carries the same [`CMD_TIMEOUT`] every other case does, so nothing
 /// here can block unbounded.
 fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output {
+    bleats_no_follow_until(home, args, |stdout| !stdout.is_empty())
+}
+
+/// [`bleats_no_follow_until_written`], for a caller that needs more than one
+/// line: waits until every string in `needles` is present in one reading.
+///
+/// A sheep's two streams reach two files, and the daemon's log pump fills
+/// them independently, so "stdout is non-empty" is a weaker condition than
+/// "both markers are there". A caller asserting on both would otherwise take
+/// the first reading that had either, and read the other one's absence as a
+/// failure. That is a race rather than a slow runner: it went red on the
+/// Windows leg while every other platform passed the same commit.
+fn bleats_no_follow_until_contains(home: &Path, args: &[&str], needles: &[&str]) -> Output {
+    bleats_no_follow_until(home, args, |stdout| {
+        needles.iter().all(|needle| stdout.contains(needle))
+    })
+}
+
+/// The retry loop both of the above share: runs the command until `done`
+/// accepts its stdout or [`BLEATS_DEADLINE`] expires.
+///
+/// Takes the condition as a parameter for the reason [`poll_flock_data`]
+/// does — the wait belongs to the caller's assertion, and a helper that
+/// decides it centrally can only ever be right for one caller.
+fn bleats_no_follow_until(home: &Path, args: &[&str], done: impl Fn(&str) -> bool) -> Output {
     let start = Instant::now();
     loop {
         let output = shep(home)
@@ -1294,7 +1319,7 @@ fn bleats_no_follow_until_written(home: &Path, args: &[&str]) -> Output {
             .args(args)
             .output()
             .unwrap();
-        if !output.stdout.is_empty() || start.elapsed() >= BLEATS_DEADLINE {
+        if done(&String::from_utf8_lossy(&output.stdout)) || start.elapsed() >= BLEATS_DEADLINE {
             return output;
         }
         std::thread::sleep(BLEATS_POLL_INTERVAL);
@@ -2256,7 +2281,11 @@ fn bleats_no_follow_prints_what_a_sheep_actually_wrote() {
     guard.adopt_home(home);
     assert_success(&boot);
 
-    let both = bleats_no_follow_until_written(home, &["all"]);
+    let both = bleats_no_follow_until_contains(
+        home,
+        &["all"],
+        &["bleater-out-marker", "bleater-err-marker"],
+    );
     assert_eq!(
         both.status.code(),
         Some(0),
