@@ -9,7 +9,7 @@ use shep_core::{
     status::ProcStatus,
 };
 
-use crate::privilege::Credentials;
+use crate::privilege::SpawnIdentity;
 
 /// Lifecycle state of one managed process instance
 #[derive(Debug, Clone)]
@@ -38,10 +38,21 @@ pub struct ProcessEntry {
     /// readiness wait resolving, and an exit being decided — so the variant
     /// docs below are what those paths are keying on.
     pub reload: ReloadState,
-    /// Resolved once at the initial `Start` and reused for every later
-    /// respawn — never re-resolved, so a restart never re-touches the
-    /// passwd database (see [`crate::privilege::resolve`]).
-    pub credentials: Option<Credentials>,
+    /// The identity this entry's next spawn runs under.
+    ///
+    /// Resolved once — at the initial `Start` for an entry that got one, at
+    /// the first spawn otherwise — and reused for every later respawn, so a
+    /// restart never re-touches the passwd database and never changes a
+    /// running app's identity underneath it (see
+    /// [`crate::privilege::resolve`]).
+    ///
+    /// [`SpawnIdentity::Unresolved`] until that happens, and that is a
+    /// different fact from an app that asked for no user at all: an entry
+    /// registered at rest from the muster roll, or registered `Errored`
+    /// because its `user` could not be resolved, has never been looked up,
+    /// and starting it as the shepherd would be a silent privilege
+    /// downgrade rather than the configured behaviour.
+    pub credentials: SpawnIdentity,
     /// Where this instance's stdout is appended, copied from the
     /// [`SpawnSpec`](crate::runner::SpawnSpec) that
     /// [`assemble`](crate::assemble::assemble) built.

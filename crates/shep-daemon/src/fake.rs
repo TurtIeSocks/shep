@@ -14,9 +14,10 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::channel::{ChildMessage, ShepherdMessage};
+use crate::privilege::Credentials;
 use crate::runner::{
-    ExitOutcome, LogCtl, LogLine, ProcIo, ProcessRunner, RunnerError, RunningProcess, SpawnSpec,
-    StdinWrite, StopSignal,
+    ExitOutcome, LogCtl, LogLine, Preflight, ProcIo, ProcessRunner, RunnerError, RunningProcess,
+    SpawnSpec, StdinWrite, StopSignal,
 };
 
 /// Capacity of every channel the fake wires up — generous enough that no
@@ -370,6 +371,15 @@ struct SpawnedProc {
     /// Every line written to this spawn's stdin, in write order — read back
     /// via [`ScriptedRunner::stdin_lines`].
     stdin_lines: Arc<Mutex<Vec<String>>>,
+    /// The identity this spawn was asked to run under, copied off
+    /// [`SpawnSpec::credentials`] — read back via
+    /// [`ScriptedRunner::spawned_as`].
+    ///
+    /// The fake runs no program, so it cannot BECOME anyone; recording what
+    /// it was asked for is the only way a supervisor-tier test can assert
+    /// the identity a spawn actually carried rather than merely that a
+    /// spawn happened.
+    credentials: Option<Credentials>,
 }
 
 /// The pid [`ScriptedRunner`] gives the first proc it spawns; each later
@@ -383,6 +393,28 @@ pub const FIRST_SCRIPTED_PID: u32 = 1000;
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
 pub struct ScriptedRunner {
     scripts: Mutex<VecDeque<ProcScript>>,
+    /// Sheep names whose [`ProcessRunner::spawn`] fails, by name because
+    /// that is what a caller has.
+    ///
+    /// Sibling to [`Self::refuse`] and needed for the same class of reason:
+    /// scripts are consumed in spawn ORDER, so a test cannot make one
+    /// PARTICULAR app of several fail by arranging the script list. Reaching
+    /// `do_start`'s per-app failure handling needs a failure that lands on a
+    /// named app while its neighbours succeed.
+    ///
+    /// Checked before a script is popped, so a sheep named here consumes
+    /// nothing and the apps around it still get the scripts they were meant
+    /// to have.
+    fail_spawn: Mutex<Vec<String>>,
+    /// Sheep names whose [`ProcessRunner::preflight`] answers
+    /// [`Preflight::Impossible`], by name because that is what a caller has.
+    ///
+    /// Empty by default, which is this fake's whole point: it reads nothing
+    /// from a spec and so answers [`Preflight::Unknown`] for everything, the
+    /// same as the trait's own default. The supervisor's validating pass is
+    /// otherwise unreachable from a unit test, and a test written against
+    /// the default cannot fail no matter what that pass does.
+    refuse: Mutex<Vec<String>>,
     /// State + IO for every spawn, indexed by spawn order, behind ONE lock.
     /// Two separate `Mutex`es here (one for state, one for IO) would let
     /// concurrent spawns interleave their critical sections and desync a
@@ -404,7 +436,30 @@ impl ScriptedRunner {
         Self {
             scripts: Mutex::new(scripts.into_iter().collect()),
             spawned: Mutex::new(Vec::new()),
+            refuse: Mutex::new(Vec::new()),
+            fail_spawn: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Makes `spawn` fail for these sheep, without consuming a script.
+    ///
+    /// For reaching `do_start`'s per-app failure handling, which needs one
+    /// named app of several to fail while the others come up. Script order
+    /// alone cannot express that.
+    #[must_use]
+    pub fn failing_to_spawn(self, names: &[&str]) -> Self {
+        *self.fail_spawn.lock().unwrap() = names.iter().map(|n| (*n).to_string()).collect();
+        self
+    }
+
+    /// Makes `preflight` answer [`Preflight::Impossible`] for these sheep.
+    ///
+    /// For reaching the supervisor's pre-registration validating pass, which
+    /// no other fake behaviour can enter.
+    #[must_use]
+    pub fn refusing(self, names: &[&str]) -> Self {
+        *self.refuse.lock().unwrap() = names.iter().map(|n| (*n).to_string()).collect();
+        self
     }
 
     /// `kill_tree()` call count per proc, indexed by spawn order — the only
@@ -417,6 +472,34 @@ impl ScriptedRunner {
             .iter()
             .map(|p| p.state.kill_count.load(Ordering::SeqCst))
             .collect()
+    }
+
+    /// The credentials the spawn at `spawn_index` was asked to apply, as
+    /// they stood on its [`SpawnSpec`].
+    ///
+    /// `None` means the spawn carried no credentials at all, which is the
+    /// child running as the shepherd. A test about a privilege drop must
+    /// assert on THIS rather than on the spawn's existence: a downgraded
+    /// spawn and a correct one are alike in every other way the fake can
+    /// report.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[must_use]
+    #[track_caller]
+    pub fn spawned_as(&self, spawn_index: usize) -> Option<Credentials> {
+        self.spawned.lock().unwrap()[spawn_index].credentials
+    }
+
+    /// How many spawns this runner has been asked for.
+    ///
+    /// A refused spawn that never reached the runner does not appear here,
+    /// which is what lets a test say "nothing was started" rather than
+    /// "nothing came up".
+    #[must_use]
+    pub fn spawn_count(&self) -> usize {
+        self.spawned.lock().unwrap().len()
     }
 
     /// Every raw signal number an explicit `signal()` call has recorded for
@@ -570,21 +653,50 @@ impl ScriptedRunner {
 impl ProcessRunner for ScriptedRunner {
     type Proc = FakeProc;
 
-    /// Every field of `spec` besides `spec.channel` is still read by nothing
-    /// here: the fake writes no files (`spec.out_file`/`err_file`) and runs
-    /// no program (`spec.program`/`args`/`env`/`cwd`/`credentials`), which is
-    /// what keeps it deterministic and instant under the paused clock — see
-    /// this module's own top-level `WHY`. `spec.channel` is the one exception,
-    /// because `begin_action` (`supervisor.rs`) now treats "does this sheep
-    /// have a channel" as load-bearing, and a fake that answered that
-    /// question wrong for every spawn would be worse than one that could not
-    /// answer it at all. What that one flag changes is below, gated on it.
+    /// [`Preflight::Impossible`] for a name given to [`Self::refusing`],
+    /// [`Preflight::Unknown`] for everything else.
+    fn preflight(&self, spec: &SpawnSpec) -> Preflight {
+        if self.refuse.lock().unwrap().contains(&spec.name) {
+            return Preflight::Impossible(format!("no such file: {}", spec.program));
+        }
+        Preflight::Unknown
+    }
+
+    /// Six fields of `spec` are read by nothing here: `program`, `args`,
+    /// `env` and `cwd`, because the fake runs no program, and `out_file` and
+    /// `err_file`, because it writes no files. That is what keeps it
+    /// deterministic and instant under the paused clock — see this module's
+    /// own top-level `WHY`.
+    ///
+    /// The other four are read, and this list is the whole of it rather than
+    /// a blanket claim with exceptions hung off it. That shape is what let
+    /// the paragraph go stale twice:
+    ///
+    /// - `name`, to match against [`ScriptedRunner::failing_to_spawn`], so a
+    ///   case can pick WHICH app's spawn refuses.
+    /// - `channel`, because `begin_action` (`supervisor.rs`) treats "does
+    ///   this sheep have a channel" as load-bearing, and a fake that
+    ///   answered that wrong for every spawn would be worse than one that
+    ///   could not answer at all. What it changes is below, gated on it.
+    /// - `stdin`, gated the same way and for the same reason.
+    /// - `credentials`, recorded rather than applied. The fake starts no
+    ///   process, so it drops no privilege and changes no identity at all,
+    ///   which is exactly why recording what it was ASKED for is the only way
+    ///   a test can assert the identity a spawn carried, through
+    ///   [`ScriptedRunner::spawned_as`].
     ///
     /// Real fd-3 delivery, refusal, and timeout — the facts this flag alone
     /// cannot reach, since nothing here is a real socketpair to a real child
     /// — are proven against [`crate::tokio_runner::TokioRunner`] instead, in
     /// `tests/daemon_e2e.rs`.
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+        // Before the script is popped, so a sheep named to `failing_to_spawn`
+        // leaves the list alone for the apps around it.
+        if self.fail_spawn.lock().unwrap().contains(&spec.name) {
+            return Err(RunnerError::SpawnFailed(
+                "No such file or directory (os error 2)".to_string(),
+            ));
+        }
         let script = self
             .scripts
             .lock()
@@ -774,6 +886,7 @@ impl ProcessRunner for ScriptedRunner {
             reopens,
             flushes,
             stdin_lines,
+            credentials: spec.credentials,
         });
         drop(spawned);
 

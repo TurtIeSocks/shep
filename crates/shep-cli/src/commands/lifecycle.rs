@@ -15,12 +15,15 @@ use std::time::Duration;
 
 use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
-use shep_core::protocol::{Request, Response, SelectorSpec};
+use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec};
+use shep_core::selector::ProcessSelector;
 
+use crate::cli::Format;
 use crate::cli::{SelectorArgs, StartArgs, StockArgs};
+use crate::commands::bounded::{Bounded, run_bounded};
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
-use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, write_outcome};
+use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_flock, write_outcome};
 
 /// What [`resolve_target`] can fail with. Module-scoped per IR-18, and named
 /// for the function rather than the verb on purpose: `start`'s own
@@ -44,8 +47,8 @@ pub enum TargetError {
     },
     /// The source read fine but failed Flockfile validation.
     Flockfile(FlockfileError),
-    /// `target` was not `-`, had no recognised Flockfile extension, and did
-    /// not name an existing path.
+    /// `target` named nothing at any tier of `start`'s precedence: no sheep
+    /// by id or name, no fold, no Flockfile, and no path on disk.
     Unresolvable {
         /// The raw target string, verbatim, so the reported message names
         /// exactly what was tried.
@@ -84,7 +87,8 @@ impl std::fmt::Display for TargetError {
             Self::Flockfile(err) => write!(f, "{err}"),
             Self::Unresolvable { target } => write!(
                 f,
-                "{target} is not `-`, a recognised Flockfile, or an existing path"
+                "{target} is not a sheep, a fold, `-`, a recognised Flockfile, or an \
+                 existing path"
             ),
             Self::UnknownFlockfileFormat { path } => write!(
                 f,
@@ -135,6 +139,17 @@ pub(crate) fn target_exit_code(err: &TargetError) -> ExitCode {
         } => ExitCode::InvalidConfig,
     }
 }
+
+/// How long node gets to hand back a `.js` Flockfile's JSON before shep
+/// kills it.
+///
+/// 30s, against the ~60ms `node -e` spends requiring a small module on this
+/// machine and the couple of seconds a large dependency tree costs on a cold
+/// filesystem. It is not a performance dial: nothing waits on this except a
+/// config that has already gone wrong, so it is set far enough out that no
+/// honest module can reach it and near enough that an unattended `shep
+/// start` still ends.
+const JS_EVAL_BUDGET: Duration = Duration::from_secs(30);
 
 /// The script handed to `node -e`. Wraps the `require` in its own
 /// `try`/`catch` rather than letting an uncaught exception crash node and
@@ -220,10 +235,14 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 /// the path in the environment, never in the source), so it is a narrower
 /// implementation choice, not a different design.
 ///
-/// **There is no timeout.** A module that never returns — one that starts a
-/// server at require time — hangs here. The process is in the foreground and
-/// interruptible; adding a bound means a reaper thread in a crate that
-/// forbids unsafe code. Recorded in `docs/specs/deferred.md`.
+/// **`budget` bounds the whole evaluation**, and node is killed the moment it
+/// runs out. What has to happen inside it is node EXITING, not `require`
+/// returning: a module that leaves a server listening or a timer armed can
+/// assign `module.exports` and return while node's event loop stays alive, so
+/// this used to hang until somebody pressed Ctrl-C. That is a fair answer at
+/// a terminal and no answer at all for the CI job or provisioning script
+/// running `shep start` with nobody watching. [`run_bounded`] is the
+/// mechanism; [`JS_EVAL_BUDGET`] is what every caller passes.
 ///
 /// The `node_missing` sentence IS pinned, as of Phase 17, by `cli_e2e`'s
 /// `a_js_flockfile_without_node_says_so_and_says_what_to_do`. This doc used
@@ -241,8 +260,10 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 ///
 /// - [`TargetError::Read`] — the path could not be canonicalized.
 /// - [`TargetError::Js`] with `node_missing` — node is not on `PATH`.
-/// - [`TargetError::Js`] — node ran and failed, or could not be spawned.
-fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
+/// - [`TargetError::Js`] — node ran and failed, could not be spawned, was
+///   still running when `budget` ran out, or exited leaving a process of its
+///   own holding the output shep was reading.
+fn evaluate_js_flockfile(path: &Path, budget: Duration) -> Result<String, TargetError> {
     let absolute = std::fs::canonicalize(path).map_err(|source| TargetError::Read {
         path: path.to_path_buf(),
         source,
@@ -251,6 +272,10 @@ fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
     // file's own directory, so the only argument node ever receives is a
     // bare relative filename: no path, no quotes, no shell metacharacters.
     // See [`JS_BRIDGE_SCRIPT`] for what this is defending against.
+    //
+    // `scratch` stays bound until this function returns, because dropping a
+    // `TempDir` deletes it: node has to still be able to read the loader for
+    // as long as `run_bounded` is waiting on it.
     let scratch = tempfile::Builder::new()
         .prefix("shep-js-bridge")
         .tempdir()
@@ -263,17 +288,41 @@ fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
         path: loader.clone(),
         source,
     })?;
-    let output = std::process::Command::new("node")
+    let mut command = std::process::Command::new("node");
+    command
         .arg(JS_BRIDGE_FILE)
         .current_dir(scratch.path())
         .env(
             "SHEP_FLOCKFILE_PATH",
             shep_core::paths::strip_verbatim_prefix(&absolute).as_os_str(),
         )
-        .stdin(std::process::Stdio::null())
-        .output();
-    let output = match output {
-        Ok(output) => output,
+        .stdin(std::process::Stdio::null());
+    let output = match run_bounded(&mut command, budget) {
+        Ok(Bounded::Exited(output)) => output,
+        Ok(Bounded::Killed) => {
+            return Err(TargetError::Js {
+                detail: format!(
+                    "node was still running {} after {}s, so shep killed it; a Flockfile \
+                     module has to export its config and let node exit, and one that leaves a \
+                     server listening or a timer armed does not",
+                    path.display(),
+                    budget.as_secs_f32()
+                ),
+                node_missing: false,
+            });
+        }
+        Ok(Bounded::OutputHeldOpen) => {
+            return Err(TargetError::Js {
+                detail: format!(
+                    "node finished with {} within {}s, but a process it left behind still \
+                     holds the output shep was reading, so shep gave up on it; a Flockfile \
+                     module must not leave a child of its own on node's stdout or stderr",
+                    path.display(),
+                    budget.as_secs_f32()
+                ),
+                node_missing: false,
+            });
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(TargetError::Js {
                 detail: format!(
@@ -343,7 +392,8 @@ fn evaluate_js_flockfile(path: &Path) -> Result<String, TargetError> {
 /// - [`TargetError::UnknownFlockfileFormat`] — `as_flockfile` is set and
 ///   `target`'s extension names no readable format.
 /// - [`TargetError::Js`] — `as_flockfile` is set, `target` is a `.js` file,
-///   and node could not be run or could not evaluate it.
+///   and node could not be run, could not evaluate it, or was still at it
+///   after [`JS_EVAL_BUDGET`].
 /// - [`TargetError::Unresolvable`] — `target` matched none of the above.
 pub fn resolve_target(
     target: &str,
@@ -372,7 +422,7 @@ pub fn resolve_target(
                 Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
             }
             None if path.extension().and_then(|e| e.to_str()) == Some("js") => {
-                let json = evaluate_js_flockfile(path)?;
+                let json = evaluate_js_flockfile(path, JS_EVAL_BUDGET)?;
                 let flockfile = Flockfile::parse(&json, FlockFormat::Json)?;
                 Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
             }
@@ -436,8 +486,13 @@ pub fn resolve_target(
 }
 
 /// Sends `body` with `deadline` (`None` defers to the client's own default),
-/// renders whatever the daemon answers through [`emit`], and maps every way
-/// that can go wrong to its exit code.
+/// renders whatever the daemon answers through [`render_outcome`], and maps
+/// every way that can go wrong to its exit code.
+///
+/// `stock` is the only caller. It renders the flock afterwards for the same
+/// reason every other verb in this file does -- see [`render_outcome`] -- and
+/// its `extract` still names the narrow payload, because that is what
+/// `--format json` gets.
 ///
 /// `extract` pulls the verb's own payload out of `Response`; `Response` is
 /// `#[non_exhaustive]` (Global Constraints), so an answer `extract` does not
@@ -457,13 +512,7 @@ where
 {
     match client.request_with_deadline(body, deadline).await {
         Ok(response) => match extract(response) {
-            Some(payload) => write_outcome(emit(
-                &mut *streams.out,
-                streams.fmt,
-                command,
-                payload,
-                streams.style,
-            )),
+            Some(payload) => render_outcome(client, streams, command, payload).await,
             None => {
                 let message = "the daemon answered with a response this client does not understand";
                 streams.fail(ExitCode::Internal, message)
@@ -542,6 +591,182 @@ where
     (collected, failure)
 }
 
+/// Which sheep in `flock` a `start` target names, under the precedence
+/// [`start_one`] documents.
+///
+/// # The two tiers this function is
+///
+/// A `Name` token is tried as an exact sheep name first and as a FOLD name
+/// second, which is what makes `shep start backed` reach a fold called
+/// `backed` without the `fold:` prefix. Every other selector form means one
+/// thing already and is matched as itself.
+///
+/// # Dogs
+///
+/// A wildcard passes a dog by; an exact name or id reaches it. The same rule
+/// [`ProcessSelector::is_exact`] states for the daemon's own matching, and for
+/// the same reason: a dog is a process an operator installed, not a member of
+/// the flock `all` means. The fold fallback counts as a wildcard even though
+/// it came from a `Name` token, because the operator named a group rather than
+/// a process.
+fn flock_matches(selector: &ProcessSelector, flock: &[ProcessInfo]) -> Vec<ProcessInfo> {
+    let sheep_only = |flock: &[ProcessInfo], keep: &dyn Fn(&ProcessInfo) -> bool| {
+        flock
+            .iter()
+            .filter(|info| info.dog.is_none())
+            .filter(|info| keep(info))
+            .cloned()
+            .collect::<Vec<ProcessInfo>>()
+    };
+    match selector {
+        ProcessSelector::Name(wanted) => {
+            let named: Vec<ProcessInfo> = flock
+                .iter()
+                .filter(|info| &info.name == wanted)
+                .cloned()
+                .collect();
+            if !named.is_empty() {
+                return named;
+            }
+            sheep_only(flock, &|info| info.fold.as_deref() == Some(wanted.as_str()))
+        }
+        ProcessSelector::Id(wanted) => flock
+            .iter()
+            .filter(|info| info.id == *wanted)
+            .cloned()
+            .collect(),
+        other => sheep_only(flock, &|info| {
+            other.matches(&info.name, info.id, info.fold.as_deref())
+        }),
+    }
+}
+
+/// Whether `target` carries a marker that makes it unmistakably a selector,
+/// and so what to say when it matched nothing.
+///
+/// Only the message differs. `start` still falls through to the Flockfile and
+/// path tiers for every token, because a marker being present does not make a
+/// file of that name stop existing -- `/srv/app/` parses as a `/regex/` and is
+/// also a real directory somebody might type. What this decides is whether
+/// `shep start fold:typo` reports "no sheep is in a fold called typo" or the
+/// baffling "fold:typo is not a sheep, a fold, `-`, a recognised Flockfile, or
+/// an existing path" that sent an operator looking for a file by that name.
+fn selector_miss(
+    target: &str,
+    selector: &ProcessSelector,
+    flock: &[ProcessInfo],
+) -> Option<String> {
+    match selector {
+        // Phrased off the SHEEP count, never off `flock.is_empty()`.
+        // `flock_matches` passes a dog by for every wildcard, so `all`
+        // matching nothing means there are no sheep -- which is not the same
+        // as an empty flock, and saying "the flock is empty" while
+        // `shep flock` prints dog rows on the same machine is a plain
+        // contradiction an operator would have to reconcile themselves.
+        ProcessSelector::All if flock.iter().any(|info| info.dog.is_some()) => Some(
+            "no sheep in the flock; there is nothing to start. The dogs listed \
+             by `shep dogs` are not sheep and `all` never reaches them"
+                .to_string(),
+        ),
+        ProcessSelector::All => Some("the flock is empty; there is nothing to start".to_string()),
+        ProcessSelector::Fold(fold) => Some(format!("no sheep is in a fold called {fold}")),
+        ProcessSelector::Regex(_) => Some(format!("no sheep matched {target}")),
+        // A bare name or id carries no marker, so it may equally have been
+        // meant as a filename. The unresolvable message names every tier.
+        ProcessSelector::Name(_) | ProcessSelector::Id(_) => None,
+    }
+}
+
+/// Whether `target` could name a sheep or a fold at all.
+///
+/// A sheep name may not contain a path separator and may not be `.` or `..`
+/// (`shep_core::config::normalize`), so a token carrying one cannot be a
+/// sheep however the flock is configured. Making that a rule rather than a
+/// coincidence is what gives an operator whose fold shares a name with a file
+/// a way to say which they meant: `./backed` is the file, always.
+///
+/// Applied to the `Name` form only. `/regex/`, `fold:`, `all` and a glob are
+/// markers rather than names, and `/web/` legitimately contains slashes.
+fn is_reachable_as_a_name(selector: &ProcessSelector) -> bool {
+    match selector {
+        ProcessSelector::Name(name) => !name.contains(['/', '\\']) && name != "." && name != "..",
+        _ => true,
+    }
+}
+
+/// Renders what a lifecycle verb should leave on the operator's screen: the
+/// rows it touched under `--format json`, and the WHOLE flock as a table
+/// otherwise.
+///
+/// # Why the whole flock, and why only in a table
+///
+/// `shep start koji` used to print a one-row table containing koji. The
+/// question an operator has after starting one app is almost never "did that
+/// one app start" -- the exit code already answered that -- it is "what does
+/// the flock look like now", which is the question `shep flock` exists for
+/// and which a one-row table cannot answer. Every lifecycle verb here now
+/// prints exactly what `shep flock` would print, so the answer is the same
+/// shape whichever verb asked it.
+///
+/// `--format json` keeps the narrow payload, deliberately, and this is the
+/// one place the two surfaces diverge on purpose. A script that runs
+/// `shep stop web --format json` asked about `web` and wants the rows for
+/// `web`; widening its `data` to the whole flock would break every consumer
+/// reading `data[0]` to learn what it just stopped, for no gain -- a script
+/// that wants the flock has `shep flock --format json`. So the rule is: the
+/// human surface answers "what now", the machine surface answers "what did I
+/// just touch".
+///
+/// # The cost
+///
+/// One extra `ListFlock` round trip per lifecycle verb in table form. The
+/// reply a lifecycle verb gets back carries only the rows it touched, and
+/// widening those responses would be a wire change -- a bigger decision than
+/// this behaviour needs, and one that would still leave `delete` unable to
+/// describe a flock it had just removed rows from. A fresh listing needs no
+/// protocol change and is the same request `shep flock` already makes.
+///
+/// # Dogs
+///
+/// Routed through [`emit_flock`], not [`emit`], so a dog renders through the
+/// dogs table with its `SOURCE` column rather than through the sheep table
+/// with an ID, a face, and a `FOLD` and `SMIT` it can never fill.
+/// `shep restart log-rotate` used to draw the same dog in two shapes
+/// depending on which verb asked.
+///
+/// # Errors
+///
+/// Never returns a listing failure as this verb's failure. The verb already
+/// did its work and already reported its own outcome; failing the command
+/// because the receipt could not be fetched would turn a successful restart
+/// into a non-zero exit. An unreachable or unrecognised listing prints
+/// nothing extra and reports success, the same call [`flock_now`] makes for
+/// its own reasons.
+async fn render_outcome<T: Render>(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    command: &str,
+    narrow: T,
+) -> ExitCode {
+    if streams.fmt == Format::Json {
+        return write_outcome(emit(
+            &mut *streams.out,
+            streams.fmt,
+            command,
+            narrow,
+            streams.style,
+        ));
+    }
+    let listing = flock_now(client).await;
+    write_outcome(emit_flock(
+        &mut *streams.out,
+        streams.fmt,
+        command,
+        listing,
+        streams.style,
+    ))
+}
+
 /// Renders `err` and returns the exit code `start` reports it as.
 fn fail_target(streams: &mut Streams<'_>, err: &TargetError) -> ExitCode {
     let code = target_exit_code(err);
@@ -578,29 +803,110 @@ fn fail_target(streams: &mut Streams<'_>, err: &TargetError) -> ExitCode {
 /// the identical broken script reported `error[spawn_failed]` -- reproduced
 /// live and fixed here, since this is the one place that turns a `Restart`
 /// answer into `start`'s own exit code.
+fn is_live(info: &ProcessInfo) -> bool {
+    use shep_core::status::ProcStatus;
+    matches!(
+        info.status,
+        ProcStatus::Online | ProcStatus::Starting | ProcStatus::Stopping
+    )
+}
+
+/// Brings every sheep in `matched` up, and reports the ones that were already
+/// up rather than replacing them.
+///
+/// `selector` is the operator's own token when the match came from the
+/// selector tier, and `None` when it came from a path or Flockfile that
+/// resolved to apps the flock already has. The distinction is the difference
+/// between a suggestion that works and one that does not: `shep restart
+/// fold:backed` is a command, and `shep restart ./rotom.sh` is not, because
+/// `restart` takes selectors and a path is not one. So a single sheep is
+/// always named by its own name, and a group falls back to listing the names
+/// when there is no selector to quote.
+///
+/// The already-up set gets ONE notice however large it is. `shep start all`
+/// against a healthy thirteen-app flock would otherwise print thirteen
+/// notices saying the same thing.
+///
+/// Respawns are issued per NAME, not per row: `Request::Restart` with a name
+/// selector reaches every instance of a clustered app, so a fold holding a
+/// four-instance app would otherwise send the same request four times.
+async fn resume_all(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    selector: Option<&str>,
+    matched: &[ProcessInfo],
+    started: &mut Vec<ProcessInfo>,
+) -> ExitCode {
+    let (live, asleep): (Vec<&ProcessInfo>, Vec<&ProcessInfo>) =
+        matched.iter().partition(|info| is_live(info));
+
+    match live.as_slice() {
+        [] => {}
+        [one] => {
+            let message = format!(
+                "{} is already {}; `shep restart {}` replaces it.",
+                one.name, one.status, one.name
+            );
+            streams.aside("start", &message);
+        }
+        several => {
+            let names: Vec<&str> = unique_names(several);
+            let retype = selector.map_or_else(|| names.join(" "), str::to_string);
+            let message = format!(
+                "{} are already running; `shep restart {retype}` replaces them.",
+                names.join(", ")
+            );
+            streams.aside("start", &message);
+        }
+    }
+
+    for name in unique_names(&asleep) {
+        let code = resume(client, streams, name, started).await;
+        if code != ExitCode::Success {
+            return code;
+        }
+    }
+    ExitCode::Success
+}
+
+/// Every distinct name in `infos`, in the order they first appear.
+///
+/// Order-INDEPENDENT, and that is the whole of it. This compared each name
+/// against the previous one alone, which drops a duplicate only when the two
+/// are adjacent, and so was correct only for a caller handing over a
+/// name-sorted slice. One caller does not: `start_one`'s Flockfile and path
+/// arm builds its set from the resolved apps in the file's own order, so two
+/// instances of one app listed either side of a third produced a SECOND
+/// `Request::Restart` and restarted that app twice in one invocation.
+///
+/// The selector arm did hand over sorted rows, but only because the daemon
+/// sorts its listing that way -- a cross-version assumption about a peer,
+/// not an invariant this function can hold itself. Both callers are now safe
+/// regardless.
+///
+/// A `Vec` scan rather than a `HashSet`: this runs over the sheep one
+/// selector matched, which is tens of rows, and it has to preserve first-seen
+/// order for the notice it feeds.
+fn unique_names<'a>(infos: &[&'a ProcessInfo]) -> Vec<&'a str> {
+    let mut names: Vec<&str> = Vec::with_capacity(infos.len());
+    for info in infos {
+        if !names.contains(&info.name.as_str()) {
+            names.push(&info.name);
+        }
+    }
+    names
+}
+
 async fn resume(
     client: &Client,
     streams: &mut Streams<'_>,
-    existing: &shep_core::protocol::ProcessInfo,
+    name: &str,
     started: &mut Vec<shep_core::protocol::ProcessInfo>,
 ) -> ExitCode {
-    use shep_core::status::ProcStatus;
-
-    if matches!(
-        existing.status,
-        ProcStatus::Online | ProcStatus::Starting | ProcStatus::Stopping
-    ) {
-        let message = format!(
-            "{} is already {}; `shep restart {}` replaces it.",
-            existing.name, existing.status, existing.name
-        );
-        streams.aside("start", &message);
-        return ExitCode::Success;
-    }
     let (procs, failure) = request_each(
         client,
         streams,
-        &[SelectorSpec::Name(existing.name.clone())],
+        &[SelectorSpec::Name(name.to_string())],
         None,
         |selector| Request::Restart { selector },
         |response| match response {
@@ -620,8 +926,7 @@ async fn resume(
     // does: an error on stderr and nothing on stdout.
     if any_restart_failed(&procs) {
         let message = format!(
-            "{} could not be started; see `shep bleats {}` or its log files for why",
-            existing.name, existing.name
+            "{name} could not be started; see `shep bleats {name}` or its log files for why"
         );
         return streams.fail(ExitCode::SpawnFailed, &message);
     }
@@ -691,6 +996,57 @@ async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
     match client.request(Request::ListFlock).await {
         Ok(Response::Flock(procs)) => procs,
         _ => Vec::new(),
+    }
+}
+
+/// Says so when a Flockfile app the flock already has is registered under a
+/// different config, naming the sheep and the fields that differ.
+///
+/// The defect this exists for: an operator edits `cwd` on two apps, re-runs
+/// `shep start`, and both keep running the old one. `Request::Start` on a
+/// name the flock already has adds instances rather than reconciling config,
+/// which is what `shep stock` depends on, so the edit is simply not applied.
+/// It was also not reported, which is the half being fixed: the edit
+/// vanished without a word and the apps crash-looped against a path that no
+/// longer applied.
+///
+/// Reports rather than applies. Whether `start` should reconcile by default,
+/// or grow an `--update` flag, is Rin's call and neither is taken here; a
+/// running flock changing its cwd or argv underneath an operator would be a
+/// worse surprise than the one being fixed.
+///
+/// Field NAMES only, never values: this reaches an operator's terminal and
+/// `env` carries secrets, so a differing `env` says `env` and stops (IR-41).
+/// [`AppConfig::drifted_fields`] is where that rule is enforced.
+///
+/// Silent on an unreachable daemon, an unexpected answer, or a daemon too
+/// old to know the request, the same call [`flock_now`] makes: failing a
+/// `start` over a warning it could not compute would trade a working command
+/// for a defensive one.
+///
+/// One request for the whole invocation, not one per app.
+async fn report_config_drift(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    resumed: &[(AppConfig, shep_core::protocol::ProcessInfo)],
+) {
+    if resumed.is_empty() {
+        return;
+    }
+    let apps = resumed.iter().map(|(app, _)| app.clone()).collect();
+    let Ok(Response::Drifted(drifted)) = client.request(Request::ConfigDrift { apps }).await else {
+        return;
+    };
+    for drift in drifted {
+        let name = &drift.name;
+        let fields = drift.fields.join(", ");
+        let message = format!(
+            "{name} is registered with a different config ({fields}). `shep start` \
+             adds instances to a sheep the flock already has; it does not apply \
+             config edits, so the edit is not in effect. To apply it: `shep \
+             delete {name}`, then start again."
+        );
+        streams.aside("start", &message);
     }
 }
 
@@ -765,14 +1121,14 @@ pub async fn start(
             &mut started,
         )
         .await;
-        if !started.is_empty() {
-            let wrote = write_outcome(emit(
-                &mut *streams.out,
-                streams.fmt,
-                "start",
-                FlockRows(started),
-                streams.style,
-            ));
+        // Printed whenever the verb did its work, not only when it touched a row.
+        // `shep start koji` against a koji that is already online starts nothing
+        // and succeeds, and the flock is still the answer to what happens next --
+        // before this it printed the notice and no table at all. A verb that
+        // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
+        // `assert_json_error` pins crate-wide.
+        if !started.is_empty() || code == ExitCode::Success {
+            let wrote = render_outcome(client, streams, "start", FlockRows(started)).await;
             if wrote != ExitCode::Success {
                 return wrote;
             }
@@ -802,14 +1158,14 @@ pub async fn start(
     // One table for the whole invocation, matching `stop` and `restart`. A
     // header per target would be the only place in the CLI where asking for
     // three things prints three tables.
-    if !started.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "start",
-            FlockRows(started),
-            streams.style,
-        ));
+    // Printed whenever the verb did its work, not only when it touched a row.
+    // `shep start koji` against a koji that is already online starts nothing
+    // and succeeds, and the flock is still the answer to what happens next --
+    // before this it printed the notice and no table at all. A verb that
+    // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
+    // `assert_json_error` pins crate-wide.
+    if !started.is_empty() || failure.is_none() {
+        let wrote = render_outcome(client, streams, "start", FlockRows(started)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -843,23 +1199,47 @@ async fn start_one(
     // directory's Flockfile". The caller does the discovery, because the
     // no-target-and-no-Flockfile case never reaches here: it brings a
     // shepherd up and stops.
-    // A target naming a sheep the flock already has is that sheep, not a new
-    // one. Checked before the path arms below, or `shep start zeus-auth` on a
-    // registered-but-stopped sheep is read as a filename, fails to resolve,
-    // and reports that nothing by that name is on disk -- while the sheep sits
-    // in the listing.
     //
-    // Only when the target is not itself a readable target: an explicit path
-    // or Flockfile still means what it says, so `shep start ./server.js` is
-    // never diverted by a coincidence of names.
-    let mut listing: Option<Vec<shep_core::protocol::ProcessInfo>> = None;
-    if let Some(name) = target {
-        let is_path_like = name == "-" || args.flockfile || Path::new(name).exists();
-        if !is_path_like {
+    // Everything from here to `resolve_target` is the precedence in
+    // `StartArgs::targets`' own help: a sheep by id or name, then a fold, then
+    // a Flockfile, then a path. Each tier claims the token only if the token
+    // actually resolves there, so a name the flock does not have still reaches
+    // the file of that name.
+    //
+    // `-` and `--flockfile` skip the flock entirely. Both say outright that
+    // the token is a source to read, and neither has ever meant anything else.
+    let mut listing: Option<Vec<ProcessInfo>> = None;
+    let mut missed: Option<String> = None;
+    if let Some(token) = target
+        && token != "-"
+        && !args.flockfile
+    {
+        // Parsed client-side, exactly as every selector-taking verb does, so a
+        // malformed one is a local usage error rather than a round trip. This
+        // is also what makes `shep start fold:backed` and `shep start all`
+        // work at all: `start` used to take a different argument grammar from
+        // every other lifecycle verb, so folds were actionable everywhere
+        // except the verb that creates things.
+        let selector = match parse_selector(streams, token) {
+            Ok(selector) => selector,
+            Err(code) => return code,
+        };
+        if is_reachable_as_a_name(&selector) {
             let flock = flock_now(client).await;
-            if let Some(existing) = flock.iter().find(|info| info.name == name) {
-                return resume(client, streams, existing, started).await;
+            let matched = flock_matches(&selector, &flock);
+            if !matched.is_empty() {
+                // No `report_config_drift` on this path, and that is not an
+                // omission: drift is a comparison between a config the
+                // operator just supplied and the one the flock stores. A
+                // selector supplies no config -- `shep start fold:backed`
+                // names sheep, not a Flockfile -- so there is nothing to
+                // compare and nothing that could have been silently ignored.
+                return resume_all(client, streams, Some(token), &matched, started).await;
             }
+            // Held for the failure path below rather than reported here: the
+            // token may still name a Flockfile or a path, and only if it names
+            // neither does the shape it was written in decide the message.
+            missed = selector_miss(token, &selector, &flock);
             listing = Some(flock);
         }
     }
@@ -884,10 +1264,34 @@ async fn start_one(
         Vec::new()
     };
 
-    let apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
+    let mut apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
         Ok(apps) => apps,
+        // The last tier refused too, so the token named nothing anywhere. A
+        // token written unmistakably as a selector is reported as one -- `shep
+        // start fold:typo` says no sheep is in a fold called typo, rather than
+        // reporting that no file called `fold:typo` is on disk, which is the
+        // answer to a question nobody asked. Exit 3, matching what every other
+        // verb returns for a selector that matched nothing.
+        Err(TargetError::Unresolvable { .. }) if missed.is_some() => {
+            let message = missed.unwrap_or_default();
+            return streams.fail(ExitCode::NotFound, &message);
+        }
         Err(err) => return fail_target(streams, &err),
     };
+
+    if let Some(fold) = &args.fold {
+        for app in &mut apps {
+            app.fold = Some(fold.clone());
+        }
+    }
+    // After the per-app defaults above, so an explicit flag wins over both
+    // the script form's "where you are" default and a Flockfile's own value.
+    if let Some(cwd) = &args.cwd {
+        for app in &mut apps {
+            app.cwd = Some(cwd.clone());
+        }
+    }
+    apply_interpreters(&mut apps, interpreters, args.interpreter.as_deref());
     // The same rule the bare-name lookup above applies, now that the target
     // has become a set of named apps: a name the flock already has is that
     // sheep. Without this, `shep start ./thing` against a running `thing`
@@ -903,12 +1307,21 @@ async fn start_one(
     let mut fresh = Vec::new();
     for app in apps {
         match flock.iter().find(|info| info.name == app.name) {
-            Some(existing) => resumed.push(existing.clone()),
+            Some(existing) => resumed.push((app, existing.clone())),
             None => fresh.push(app),
         }
     }
-    for existing in &resumed {
-        let code = resume(client, streams, existing, started).await;
+    // Before the resumes below, not after: an operator who edited the file
+    // and gets a wall of restart output should read why none of it applied
+    // at the top of the run rather than under it.
+    report_config_drift(client, streams, &resumed).await;
+    if !resumed.is_empty() {
+        // `None`, not the operator's token: this arm reached the flock through
+        // a Flockfile or a path, so there is no selector to quote back in the
+        // "already running" notice. `shep restart ./rotom.sh` is not a
+        // command. See `resume_all`'s own doc.
+        let existing: Vec<ProcessInfo> = resumed.iter().map(|(_, info)| info.clone()).collect();
+        let code = resume_all(client, streams, None, &existing, started).await;
         if code != ExitCode::Success {
             return code;
         }
@@ -916,21 +1329,7 @@ async fn start_one(
     if fresh.is_empty() {
         return ExitCode::Success;
     }
-    let mut apps = fresh;
-
-    if let Some(fold) = &args.fold {
-        for app in &mut apps {
-            app.fold = Some(fold.clone());
-        }
-    }
-    // After the per-app defaults above, so an explicit flag wins over both
-    // the script form's "where you are" default and a Flockfile's own value.
-    if let Some(cwd) = &args.cwd {
-        for app in &mut apps {
-            app.cwd = Some(cwd.clone());
-        }
-    }
-    apply_interpreters(&mut apps, interpreters, args.interpreter.as_deref());
+    let apps = fresh;
 
     let (procs, failure) = request_each(
         client,
@@ -968,14 +1367,9 @@ pub async fn stop(client: &Client, streams: &mut Streams<'_>, args: &SelectorArg
         },
     )
     .await;
-    if !procs.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "stop",
-            FlockRows(procs),
-            streams.style,
-        ));
+    // See `start`'s own note: printed whenever the verb did its work.
+    if !procs.is_empty() || failure.is_none() {
+        let wrote = render_outcome(client, streams, "stop", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1021,14 +1415,8 @@ pub async fn restart(client: &Client, streams: &mut Streams<'_>, args: &Selector
     // the operator reads them from `shep flock`. Consistency across verbs is
     // worth more here than this verb keeping its table on the one path where
     // it has bad news to deliver.
-    if !procs.is_empty() && failed.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "restart",
-            FlockRows(procs),
-            streams.style,
-        ));
+    if (!procs.is_empty() || failure.is_none()) && failed.is_empty() {
+        let wrote = render_outcome(client, streams, "restart", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1073,14 +1461,9 @@ pub async fn reload(client: &Client, streams: &mut Streams<'_>, args: &SelectorA
         },
     )
     .await;
-    if !procs.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "reload",
-            FlockRows(procs),
-            streams.style,
-        ));
+    // See `start`'s own note: printed whenever the verb did its work.
+    if !procs.is_empty() || failure.is_none() {
+        let wrote = render_outcome(client, streams, "reload", FlockRows(procs)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1106,14 +1489,28 @@ pub async fn delete(client: &Client, streams: &mut Streams<'_>, args: &SelectorA
         },
     )
     .await;
-    if !ids.is_empty() {
-        let wrote = write_outcome(emit(
-            &mut *streams.out,
-            streams.fmt,
-            "delete",
-            DeletedIds(ids),
-            streams.style,
-        ));
+    // See `start`'s own note: printed whenever the verb did its work. The
+    // aside below is guarded separately -- there is nothing to name when
+    // nothing was deleted.
+    if !ids.is_empty() || failure.is_none() {
+        // The listing this prints no longer holds what was deleted, so the
+        // ids go to stderr rather than being lost. Named as ids and not as
+        // names because ids are all `Response::Deleted` carries, and inventing
+        // the names would need a second listing taken before the delete.
+        let count = ids.len();
+        let listed = ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<String>>()
+            .join(", ");
+        if count > 0 && streams.fmt != Format::Json {
+            let message = match count {
+                1 => format!("deleted 1 sheep, id {listed}"),
+                n => format!("deleted {n} sheep, ids {listed}"),
+            };
+            streams.aside("delete", &message);
+        }
+        let wrote = render_outcome(client, streams, "delete", DeletedIds(ids)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1479,6 +1876,41 @@ mod tests {
         assert!(err.to_string().contains("sheep dip empty"), "got: {err}");
     }
 
+    /// fails if a config module that keeps node alive hangs shep, which is
+    /// exactly what one did until this budget existed. `setInterval` leaves a
+    /// handle on node's event loop, so node stays running long after `require`
+    /// returned and `module.exports` was assigned -- the same mechanism as the
+    /// server-at-require-time shape `docs/specs/deferred.md` named, without
+    /// binding a port to get it.
+    ///
+    /// The budget is 200ms rather than [`JS_EVAL_BUDGET`] so the test costs a
+    /// fifth of a second; what it pins is that the bound is enforced and says
+    /// so, not what the shipped bound is.
+    #[test]
+    fn a_js_flockfile_that_keeps_node_alive_is_killed_and_says_why() {
+        if !node_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flock.js");
+        std::fs::write(
+            &path,
+            "setInterval(() => {}, 1000); module.exports = { app: [] };",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = evaluate_js_flockfile(&path, Duration::from_millis(200)).unwrap_err();
+
+        assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+        assert!(err.to_string().contains("still running"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "node was waited out rather than killed, in {:?}",
+            started.elapsed()
+        );
+    }
+
     /// fails if a pm2 ecosystem file is accepted, or if the refusal stops
     /// naming the key the operator has to change. Decision 2: this feature
     /// reads a Flockfile-shaped .js, and serde's own message is the answer.
@@ -1560,6 +1992,448 @@ mod tests {
         );
     }
 
+    /// The flock a `render_outcome` test hands the fake: two sheep the verb
+    /// did not touch, one it did, and a dog.
+    ///
+    /// The names are chosen so the narrow payload and the full listing cannot
+    /// be confused for one another: a test that asserted "the output mentions
+    /// koji" would pass on the one-row table this change replaces, so every
+    /// assertion below is on the exact SET of rows.
+    fn a_flock_with_a_dog() -> Vec<shep_core::protocol::ProcessInfo> {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+        vec![
+            ProcessInfo::builder(0, "golbat", ProcStatus::Online).build(),
+            ProcessInfo::builder(1, "koji", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(2, "rotom", ProcStatus::Online).build(),
+            ProcessInfo::builder(3, "log-rotate", ProcStatus::Online)
+                .dog(Some(DogSource::Adopted {
+                    path: "/usr/local/bin/shep-log-rotate".to_string(),
+                }))
+                .build(),
+        ]
+    }
+
+    /// fails if a lifecycle verb prints only the rows it touched.
+    ///
+    /// `shep start koji` printed a one-row table containing koji. The question
+    /// after starting one app is "what does the flock look like now", which a
+    /// one-row table cannot answer.
+    ///
+    /// The narrow payload handed in is koji ALONE, and the armed listing has
+    /// four entries, so the two are distinguishable by row count as well as by
+    /// content -- a build that kept rendering the narrow payload prints one
+    /// row and fails on the first assertion rather than passing on a
+    /// coincidence of names.
+    #[tokio::test]
+    async fn a_lifecycle_verb_renders_the_whole_flock_as_a_table() {
+        use shep_client::testing::fake_client_on;
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        daemon.reply_to_list(a_flock_with_a_dog());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let touched = vec![ProcessInfo::builder(1, "koji", ProcStatus::Stopped).build()];
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            render_outcome(&client, &mut streams, "stop", FlockRows(touched)).await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        let printed = String::from_utf8(out).unwrap();
+        // Split at the caption rather than filtering the whole output: the two
+        // tables have different columns, so a NAME read from the wrong one is
+        // a different field. This is also what proves the dog is in the SECOND
+        // table and not merely somewhere on the page.
+        let (sheep, dogs) = printed
+            .split_once("\nDogs\n")
+            .unwrap_or_else(|| panic!("the dogs table needs its own caption: {printed}"));
+        let sheep_names: Vec<&str> = sheep
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .filter(|word| *word != "NAME")
+            .collect();
+        assert_eq!(
+            sheep_names,
+            vec!["golbat", "koji", "rotom"],
+            "every sheep, not only the one that was stopped, and no dog among \
+             them: {printed}"
+        );
+        // Column 1, not 0: the dogs table leads with ID now, exactly as the
+        // sheep table does.
+        let dog_names: Vec<&str> = dogs
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .filter(|word| *word != "NAME")
+            .collect();
+        assert_eq!(
+            dog_names,
+            vec!["log-rotate"],
+            "the dog renders through the dogs table: {printed}"
+        );
+        assert!(
+            dogs.contains("SOURCE") && dogs.contains("adopted"),
+            "with the SOURCE column the sheep table has not: {printed}"
+        );
+    }
+
+    /// fails if `--format json` is widened to the whole flock, or if it pays
+    /// for a listing it does not render.
+    ///
+    /// The machine surface answers a different question from the human one. A
+    /// script that runs `shep stop koji --format json` asked about koji and
+    /// reads `data[0]` to learn what it stopped; handing it four rows, three
+    /// of which it never asked about, breaks it silently.
+    ///
+    /// `list_flock_count` is the second half and is not decoration: it is what
+    /// proves the JSON path SKIPS the listing rather than fetching one and
+    /// discarding it. Without it a build that always asked and then chose what
+    /// to print would pass.
+    #[tokio::test]
+    async fn the_json_surface_keeps_the_rows_the_verb_touched() {
+        use shep_client::testing::fake_client_on;
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        daemon.reply_to_list(a_flock_with_a_dog());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let touched = vec![ProcessInfo::builder(1, "koji", ProcStatus::Stopped).build()];
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Json,
+            };
+            render_outcome(&client, &mut streams, "stop", FlockRows(touched)).await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        let envelope: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = envelope["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["koji"],
+            "only what the verb touched: {envelope}"
+        );
+        assert_eq!(
+            daemon.list_flock_count(),
+            0,
+            "and no listing was fetched to build it"
+        );
+    }
+
+    /// A flock in which every tier of `start`'s precedence has something to
+    /// find, and each tier's answer is distinguishable from the others'.
+    ///
+    /// `golbat` and `koji` are in the fold `backed`; `rotom` is not in any
+    /// fold; `log-rotate` is a dog. The name `backed` is a fold and NOT a
+    /// sheep, which is the whole point: a build that only ever matched names
+    /// finds nothing for it.
+    fn a_foldable_flock() -> Vec<shep_core::protocol::ProcessInfo> {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+        vec![
+            ProcessInfo::builder(0, "golbat", ProcStatus::Stopped)
+                .fold(Some("backed".to_string()))
+                .build(),
+            ProcessInfo::builder(1, "koji", ProcStatus::Stopped)
+                .fold(Some("backed".to_string()))
+                .build(),
+            ProcessInfo::builder(2, "rotom", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(3, "log-rotate", ProcStatus::Online)
+                .dog(Some(DogSource::BuiltIn))
+                .build(),
+        ]
+    }
+
+    /// The names `flock_matches` picks, so a case below reads as the rule it
+    /// is about rather than as a fold of `ProcessInfo` fields.
+    fn matched_names(target: &str) -> Vec<String> {
+        let selector = ProcessSelector::parse(target).expect("the fixture uses valid selectors");
+        flock_matches(&selector, &a_foldable_flock())
+            .into_iter()
+            .map(|info| info.name)
+            .collect()
+    }
+
+    /// The precedence `StartArgs::targets`' own help states, one case per
+    /// tier, driven through the function that decides it.
+    ///
+    /// `shep stop fold:backed` already worked and `shep start fold:backed`
+    /// refused with "backed is not `-`, a recognised Flockfile, or an existing
+    /// path", because `start` took a different argument grammar from every
+    /// other lifecycle verb. Folds were actionable everywhere except the verb
+    /// that creates things.
+    #[test]
+    fn a_start_target_walks_the_precedence() {
+        assert_eq!(
+            matched_names("koji"),
+            vec!["koji"],
+            "tier 1: a sheep by name"
+        );
+        assert_eq!(matched_names("1"), vec!["koji"], "tier 1: a sheep by id");
+        assert_eq!(
+            matched_names("fold:backed"),
+            vec!["golbat", "koji"],
+            "tier 2: a fold, named as one"
+        );
+        assert_eq!(
+            matched_names("backed"),
+            vec!["golbat", "koji"],
+            "tier 2: the same fold, named bare"
+        );
+        assert!(
+            matched_names("nosuchthing").is_empty(),
+            "and a token that is none of those falls through to the file tiers"
+        );
+    }
+
+    /// fails if a name that is BOTH a sheep and a fold resolves to the fold.
+    ///
+    /// The order is name before fold, and this is the only fixture that can
+    /// tell the two apart: `a_start_target_walks_the_precedence`'s `backed` is
+    /// a fold and not a sheep, so it would pass under either order.
+    #[test]
+    fn a_sheep_outranks_a_fold_of_the_same_name() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let flock = vec![
+            ProcessInfo::builder(0, "backed", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(1, "koji", ProcStatus::Stopped)
+                .fold(Some("backed".to_string()))
+                .build(),
+        ];
+        let selector = ProcessSelector::parse("backed").unwrap();
+        let names: Vec<String> = flock_matches(&selector, &flock)
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        assert_eq!(names, vec!["backed"], "the sheep, not the fold it names");
+    }
+
+    /// fails if a wildcard sweeps up a dog.
+    ///
+    /// The same rule `ProcessSelector::is_exact` states for the daemon's own
+    /// matching: a dog is a process an operator installed, not a member of the
+    /// flock `all` means, so `shep start all` must pass it by while
+    /// `shep start log-rotate` still reaches it. The fold fallback counts as a
+    /// wildcard even though the token was a bare name, because the operator
+    /// named a group.
+    #[test]
+    fn a_wildcard_passes_a_dog_by_and_an_exact_name_reaches_it() {
+        assert_eq!(
+            matched_names("all"),
+            vec!["golbat", "koji", "rotom"],
+            "no dog in the sweep"
+        );
+        assert_eq!(
+            matched_names("log-rotate"),
+            vec!["log-rotate"],
+            "but naming it outright reaches it"
+        );
+    }
+
+    /// fails if a token carrying a path separator is tried as a sheep or a
+    /// fold.
+    ///
+    /// This is the escape hatch, and it has to be a rule rather than a
+    /// coincidence: somebody whose fold shares a name with a file in the
+    /// current directory needs a way to say which they meant, and the
+    /// precedence alone gives them none. A sheep name may never contain a path
+    /// separator (`shep_core::config::normalize`), so `./backed` is always the
+    /// file.
+    ///
+    /// `/web/` is in the same case for the opposite reason: it is full of
+    /// slashes and is a regex, not a name, so the rule is on the PARSED form
+    /// rather than on the raw token.
+    #[test]
+    fn a_token_with_a_path_separator_is_never_a_name() {
+        let path = ProcessSelector::parse("./backed").unwrap();
+        assert!(
+            !is_reachable_as_a_name(&path),
+            "./backed can only be a file"
+        );
+        let bare = ProcessSelector::parse("backed").unwrap();
+        assert!(is_reachable_as_a_name(&bare), "backed may be either");
+        let regex = ProcessSelector::parse("/web/").unwrap();
+        assert!(
+            is_reachable_as_a_name(&regex),
+            "a regex is not a name, so the separator rule does not apply to it"
+        );
+    }
+
+    /// fails if `shep start fold:typo` reports that no FILE called `fold:typo`
+    /// is on disk.
+    ///
+    /// That was the error Rin actually hit, and it sent her looking for a file
+    /// she had never asked about. A token written unmistakably as a selector
+    /// is reported as one; a bare name or id carries no marker and may equally
+    /// have been meant as a filename, so it keeps the message that names every
+    /// tier.
+    #[test]
+    fn a_selector_that_matched_nothing_is_reported_as_a_selector() {
+        let miss = |target: &str, flock: &[shep_core::protocol::ProcessInfo]| {
+            selector_miss(target, &ProcessSelector::parse(target).unwrap(), flock)
+        };
+        let empty: [shep_core::protocol::ProcessInfo; 0] = [];
+
+        assert_eq!(
+            miss("fold:typo", &empty).as_deref(),
+            Some("no sheep is in a fold called typo")
+        );
+        assert_eq!(
+            miss("zz-*", &empty).as_deref(),
+            Some("no sheep matched zz-*")
+        );
+        assert_eq!(
+            miss("all", &empty).as_deref(),
+            Some("the flock is empty; there is nothing to start")
+        );
+        assert_eq!(
+            miss("koji", &empty),
+            None,
+            "a bare name may still be a file, so the unresolvable message stands"
+        );
+        assert_eq!(miss("11", &empty), None, "and so may a bare id");
+    }
+
+    /// fails if a name repeated NON-ADJACENTLY produces two respawns.
+    ///
+    /// `unique_names` compared each name against the previous one only, which
+    /// drops a duplicate solely when the two sit next to each other. That is
+    /// true of a name-sorted listing and NOT true of `start_one`'s Flockfile
+    /// and path arm, which builds its set from the resolved apps in the file's
+    /// own order. Two instances of one app listed either side of a third then
+    /// produced a second `Request::Restart` and restarted that app twice in
+    /// one invocation.
+    ///
+    /// The fixture is `web`, `api`, `web` precisely because a sorted one
+    /// cannot exhibit it: sorted, the two `web` rows are adjacent and the old
+    /// code was already correct. First-seen order is asserted too, since the
+    /// notice this feeds reads as a list.
+    #[test]
+    fn unique_names_drops_a_duplicate_that_is_not_adjacent() {
+        use shep_core::status::ProcStatus;
+
+        let rows = [
+            ProcessInfo::builder(0, "web", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(1, "api", ProcStatus::Stopped).build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Stopped).build(),
+        ];
+        let borrowed: Vec<&ProcessInfo> = rows.iter().collect();
+        assert_eq!(
+            unique_names(&borrowed),
+            vec!["web", "api"],
+            "one entry per name, in the order each was first seen"
+        );
+    }
+
+    /// fails if `shep start all` calls a flock empty while it holds dogs.
+    ///
+    /// `flock_matches` passes a dog by for every wildcard, so `all` matching
+    /// nothing means there are no SHEEP. Reading that as an empty flock made
+    /// `shep start all` print "the flock is empty" on a machine where
+    /// `shep flock` was printing dog rows at the same moment, which is a
+    /// contradiction an operator has to reconcile on their own.
+    ///
+    /// Both halves in one case, because a build that always says "no sheep"
+    /// and a build that always says "empty" each pass one of them.
+    #[test]
+    fn an_all_that_matched_nothing_counts_sheep_and_not_dogs() {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+
+        let all = ProcessSelector::parse("all").unwrap();
+        let dogs_only = [ProcessInfo::builder(0, "log-rotate", ProcStatus::Online)
+            .dog(Some(DogSource::BuiltIn))
+            .build()];
+
+        let said = selector_miss("all", &all, &dogs_only).expect("a miss is reported");
+        assert!(
+            said.starts_with("no sheep in the flock"),
+            "a flock holding only dogs is not empty: {said}"
+        );
+        assert!(
+            said.contains("`shep dogs`"),
+            "and it says where the rows an operator can see came from: {said}"
+        );
+
+        let empty: [ProcessInfo; 0] = [];
+        assert_eq!(
+            selector_miss("all", &all, &empty).as_deref(),
+            Some("the flock is empty; there is nothing to start"),
+            "with nothing registered at all, empty is the honest word"
+        );
+    }
+
+    /// fails if `shep start fold:typo` exits anything but 3, or if it reaches
+    /// the daemon with a `Start`.
+    ///
+    /// Driven through the VERB rather than through `selector_miss`, because
+    /// the mapping from "matched nothing" to an exit code lives in `start_one`
+    /// and a unit test of the message alone cannot see it. Exit 3 is what
+    /// `shep stop fold:typo` already returns, which is the consistency this
+    /// whole change is about.
+    #[tokio::test]
+    async fn a_start_on_an_empty_fold_exits_not_found_without_a_start_request() {
+        use shep_client::testing::fake_client_on;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        daemon.reply_to_list(a_foldable_flock());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            start(
+                &client,
+                &mut streams,
+                &start_args("fold:typo"),
+                None,
+                &BTreeMap::new(),
+            )
+            .await
+        };
+
+        assert_eq!(code, ExitCode::NotFound);
+        let said = String::from_utf8(err).unwrap();
+        assert!(
+            said.contains("no sheep is in a fold called typo"),
+            "the refusal names the fold, not a file: {said}"
+        );
+        assert!(
+            !said.contains("existing path"),
+            "and never mentions a path nobody asked about: {said}"
+        );
+        assert!(out.is_empty(), "stdout stays empty on a failure");
+    }
+
     /// A sheep that is already up is reported, never restarted. Someone who
     /// typed `start` did not ask for their live service to be replaced, and
     /// `restart` is right there.
@@ -1627,17 +2501,20 @@ mod tests {
             .await
         };
         assert_eq!(code, ExitCode::Usage);
-        // One request, and it is the flock lookup: a target is a sheep's name
-        // before it is a filename, so `start` has to ask before it can say
-        // the target resolves to nothing. What must never reach the daemon is
-        // a `Start` carrying an app built from an unresolvable target.
-        let asked = envelopes
-            .try_recv()
-            .expect("the flock is consulted before the target is read as a path");
-        assert_eq!(asked.body, Request::ListFlock);
+        // NOTHING reaches the daemon. `./does-not-exist` carries a path
+        // separator, and a sheep name may never contain one
+        // (`shep_core::config::normalize`), so the token cannot be a sheep or
+        // a fold and `start` skips the flock lookup rather than asking a
+        // question whose answer it already knows. A target with no separator
+        // does ask -- `a_target_naming_a_stopped_sheep_is_acted_on_not_
+        // resolved_as_a_path` is the case that proves it.
+        //
+        // What must never reach the daemon either way is a `Start` carrying an
+        // app built from an unresolvable target.
         assert!(
             envelopes.try_recv().is_err(),
-            "and nothing else: an unresolvable target must not become a Start"
+            "a target that can only be a path costs no round trip, and an \
+             unresolvable one must never become a Start"
         );
         assert!(String::from_utf8(err).unwrap().contains("./does-not-exist"));
     }
@@ -2116,5 +2993,54 @@ mod tests {
             String::from_utf8(err).unwrap().contains("shep delete web"),
             "the daemon's own sentence has to reach the operator"
         );
+    }
+
+    /// Wall-clock tests, skipped by every CI job but the serial `slow` one.
+    ///
+    /// The case below needs a real node to START AND EXIT inside the budget,
+    /// which is a claim about how fast the machine is rather than about shep.
+    /// At 200ms it failed on four CI runners at once (arm, macos, musl and
+    /// the coverage job) while passing every local run: node took longer than
+    /// that to come up, so the run hit the deadline still running and shep
+    /// reported the kill it really had performed. The tier exists for exactly
+    /// this, and the budget here is 5s because a stalled read waits out
+    /// whatever is left of it, so the budget IS what the test costs.
+    mod slow {
+        use super::*;
+
+        /// fails if a module that leaves a process on node's stdout is
+        /// reported as a module shep killed. node itself exits here:
+        /// `detached` plus `unref` takes the child off node's event loop, and
+        /// `stdio: inherit` hands it the pipes shep is reading, so the wait
+        /// ends on its own and only the reads run out of budget.
+        #[test]
+        fn a_js_flockfile_leaving_a_process_on_the_pipe_says_that_instead() {
+            if !node_available() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("flock.js");
+            std::fs::write(
+                &path,
+                "require('child_process')\
+                 .spawn('sleep', ['30'], { detached: true, stdio: 'inherit' })\
+                 .unref(); \
+                 module.exports = { app: [] };",
+            )
+            .unwrap();
+
+            let err = evaluate_js_flockfile(&path, Duration::from_secs(5)).unwrap_err();
+
+            assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+            let message = err.to_string();
+            assert!(
+                message.contains("left behind still holds the output"),
+                "got: {message}"
+            );
+            assert!(
+                !message.contains("killed"),
+                "node exited on its own, so nothing was killed: {message}"
+            );
+        }
     }
 }

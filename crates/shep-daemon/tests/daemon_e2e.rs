@@ -296,6 +296,40 @@ impl Client {
         reply
     }
 
+    /// Sends a hand-built request body, past [`Request`]'s own types and so
+    /// past every validating newtype on them, and answers with the reply if
+    /// one arrives — `None` when the daemon ended the connection instead,
+    /// which is what it does with any body it cannot decode.
+    ///
+    /// Deliberately does not go through [`Self::next_frame`]: that one panics
+    /// on a closed connection, and a closed connection is one of the two
+    /// answers a caller here is asking about.
+    async fn request_raw(&mut self, body: serde_json::Value) -> Option<Reply> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&serde_json::json!({
+            "id": id,
+            "deadline_ms": serde_json::Value::Null,
+            "body": body,
+        }))
+        .await;
+        let mut skipped = Vec::new();
+        let reply = loop {
+            let frame = tokio::time::timeout(RECV_TIMEOUT, self.frames.next())
+                .await
+                .expect("timed out waiting for a frame");
+            let Some(frame) = frame else {
+                break None; // the daemon closed on us: a refusal, not a hang
+            };
+            match decode_frame(&frame.unwrap()).unwrap() {
+                ServerFrame::Reply(reply) if reply.id == id => break Some(reply),
+                other => skipped.push(other),
+            }
+        };
+        requeue(&mut self.pending, skipped);
+        reply
+    }
+
     /// Reads frames until a `Process` event of `kind` for `id` arrives,
     /// re-queueing (never discarding) everything else — see `pending`'s doc.
     async fn await_process_event(&mut self, id: u32, kind: ProcessEventKind) -> ProcessInfo {
@@ -2253,4 +2287,192 @@ async fn a_reload_costs_a_defiant_app_the_work_it_will_not_finish() {
         "an app that will not drain must be seen to lose connections: {}",
         tally(&during)
     );
+}
+
+/// The reference smit, the one `shep-deploy` paints: a mark and a revision,
+/// thirteen characters, and nothing shep understands.
+const SMIT: &str = "\u{25b2} main@a1b2c3";
+
+/// Starts one long-lived real sheep under `name` and answers with its id.
+async fn start_sheep(client: &mut Client, name: &str) -> u32 {
+    let mut app = AppConfig::minimal(name, "/bin/sh");
+    app.interpreter = Some("none".to_string());
+    app.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
+    let started = client.request(Request::Start { apps: vec![app] }).await;
+    let Response::Started(infos) = started.result.expect("the sheep must start") else {
+        panic!("expected started")
+    };
+    infos[0].id
+}
+
+/// What `shep flock` would paint for `name` right now, read over the socket
+/// rather than out of the daemon's memory: the whole point of these cases is
+/// what a SECOND client sees.
+async fn smit_of(client: &mut Client, name: &str) -> Option<String> {
+    let listed = client.request(Request::ListFlock).await;
+    let Response::Flock(flock) = listed.result.expect("the flock must list") else {
+        panic!("expected flock")
+    };
+    flock
+        .into_iter()
+        .find(|info| info.name == name)
+        .expect("the sheep must still be registered")
+        .smit
+}
+
+/// Waits for `name`'s smit to clear, answering `false` at [`RECV_TIMEOUT`].
+///
+/// Polls rather than sleeping a fixed guess, exactly as
+/// [`await_file_contents`] does: the daemon learns of a closed socket
+/// asynchronously, so a bare sleep here is the flake this suite has already
+/// paid for elsewhere.
+async fn await_smit_cleared(client: &mut Client, name: &str) -> bool {
+    tokio::time::timeout(RECV_TIMEOUT, async {
+        while smit_of(client, name).await.is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// fails if a smit outlives the connection that painted it.
+///
+/// This is the whole lifecycle decision and it cannot be unit-tested: a
+/// supervisor test that calls the forget path proves only that the function
+/// it just wrote does what it says. What has to hold is that CLOSING A REAL
+/// SOCKET reaches it — through `handle_conn`'s tail, the actor's mailbox,
+/// and `to_info`. Persisting a smit means `shep flock` shows a mark
+/// attributed to a dog that no longer exists, forever, with nothing to clear
+/// it but a daemon restart.
+#[tokio::test]
+async fn a_smit_dies_with_the_connection_that_painted_it() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    // The observer outlives the painter, deliberately: the question is what a
+    // DIFFERENT client sees before and after, so it must not be the
+    // connection whose closing is under test.
+    let mut looker = fixture.connect().await;
+    start_sheep(&mut looker, "web").await;
+
+    let mut painter = fixture.connect().await;
+    let painted = painter
+        .request(Request::SetSmit {
+            sheep: "web".to_string(),
+            smit: Some(SMIT.parse().expect("the reference smit must be valid")),
+        })
+        .await;
+    assert!(
+        matches!(painted.result, Ok(Response::SmitPainted(_))),
+        "{painted:?}"
+    );
+
+    assert_eq!(
+        smit_of(&mut looker, "web").await,
+        Some(SMIT.to_string()),
+        "a smit must be visible to every client, not only its painter"
+    );
+
+    drop(painter);
+
+    assert!(
+        await_smit_cleared(&mut looker, "web").await,
+        "the smit outlived the connection that painted it"
+    );
+
+    fixture.shutdown().await;
+}
+
+/// fails if one dog's disconnect clears another dog's smit, or if a dog can
+/// clear a smit it did not paint.
+///
+/// Without this case, connection scoping is indistinguishable from "any
+/// disconnect wipes everything", which is not the rule and would make a
+/// second dog's mark disappear whenever the first one restarted.
+#[tokio::test]
+async fn one_dogs_disconnect_leaves_another_dogs_smit_alone() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut looker = fixture.connect().await;
+    start_sheep(&mut looker, "web").await;
+    start_sheep(&mut looker, "api").await;
+
+    let mut deployer = fixture.connect().await;
+    let mut watcher = fixture.connect().await;
+    for (client, sheep) in [(&mut deployer, "web"), (&mut watcher, "api")] {
+        let painted = client
+            .request(Request::SetSmit {
+                sheep: sheep.to_string(),
+                smit: Some(SMIT.parse().expect("the reference smit must be valid")),
+            })
+            .await;
+        assert!(
+            matches!(painted.result, Ok(Response::SmitPainted(_))),
+            "{painted:?}"
+        );
+    }
+
+    // A clear only takes effect from the connection that painted it.
+    let ignored = watcher
+        .request(Request::SetSmit {
+            sheep: "web".to_string(),
+            smit: None,
+        })
+        .await;
+    assert!(
+        matches!(ignored.result, Ok(Response::SmitPainted(_))),
+        "{ignored:?}"
+    );
+    assert_eq!(
+        smit_of(&mut looker, "web").await,
+        Some(SMIT.to_string()),
+        "one dog cleared a smit another dog painted"
+    );
+
+    drop(deployer);
+
+    assert!(
+        await_smit_cleared(&mut looker, "web").await,
+        "the smit outlived the connection that painted it"
+    );
+    assert_eq!(
+        smit_of(&mut looker, "api").await,
+        Some(SMIT.to_string()),
+        "one dog's disconnect cleared another dog's smit"
+    );
+
+    fixture.shutdown().await;
+}
+
+/// fails if a smit can drive an operator's terminal. The renderer is NOT the
+/// guard: `output::width::sanitize_cell` deliberately keeps a well-formed
+/// CSI sequence, because shep's own colouring is made of them. The daemon
+/// refusing is what makes every downstream reader safe without each of them
+/// remembering.
+///
+/// The frame is built past the `Smit` parser deliberately, so this tests the
+/// DAEMON's refusal rather than the client's: `docs/dogs.md` tells dog
+/// authors to speak this wire directly, and a hand-rolled dog in another
+/// language never runs our parser. A malformed body is refused the way every
+/// other one on this socket is — the connection ends, with no reply — so
+/// either answer is a refusal and neither is a stored smit.
+#[tokio::test]
+async fn a_smit_carrying_an_escape_is_refused_at_the_daemon() {
+    let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    let mut looker = fixture.connect().await;
+    start_sheep(&mut looker, "web").await;
+
+    let mut rogue = fixture.connect().await;
+    let refused = rogue
+        .request_raw(serde_json::json!({
+            "kind": "set_smit",
+            "sheep": "web",
+            "smit": "\u{1b}[2Jgone",
+        }))
+        .await;
+    assert!(
+        refused.as_ref().is_none_or(|reply| reply.result.is_err()),
+        "the daemon accepted a smit carrying an escape: {refused:?}"
+    );
+    assert_eq!(smit_of(&mut looker, "web").await, None);
+
+    fixture.shutdown().await;
 }

@@ -12,6 +12,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Additions
 
+- Add `Request::ConfigDrift`, `Response::Drifted`, `SheepDrift`, and
+  `AppConfig::drifted_fields`. `ConfigDrift` asks which of a set of apps name
+  a sheep the flock already has under a DIFFERENT config, and changes
+  nothing. `Start` on an already-registered name adds instances rather than
+  reconciling config, which `shep stock` depends on, so an operator who
+  edited a Flockfile and re-ran `shep start` had the edit ignored with no
+  error and no warning; this is what a caller asks in order to say so.
+  `SheepDrift` carries the sheep's name and the names of the differing
+  fields, never their values, because `AppConfig::env` holds secrets and the
+  answer is printed at an operator (IR-41). `drifted_fields` compares through
+  serde rather than field by field, so a field added to `AppConfig` is
+  compared without a second edit, and sorts the result explicitly rather than
+  leaning on `serde_json::Map` being a `BTreeMap`, which holds only while the
+  additive `preserve_order` feature is off anywhere in the graph. Additive: `PROTOCOL_VERSION` stays **1**, a
+  daemon that predates the request answers its existing "does not implement
+  that request" error, and every previously pinned wire fixture is unchanged.
+
+- Add `protocol::sort_flock`, the one ordering rule every operator-facing
+  listing takes: by name, then by id. An id is assigned at registration, so
+  ordering by it sorts the flock by an accident of history rather than by
+  anything an operator is looking for, and it is not stable -- a `delete all`
+  followed by a fresh start moved a real thirteen-app flock from ids 0-10 to
+  11-21 with nothing about the apps having changed. The id keeps its other
+  job: it is still how one instance of a clustered app is addressed. It stops
+  being a sort key and stays an addressing key.
+
+## [0.1.1] - 2026-08-26
+
+### Additions
+
 - Add `ExitInfo` and `ProcessInfo::last_exit` — why a sheep's process most
   recently stopped existing under this daemon: an exit code, a raw unix
   signal number, or `None` while it has never exited under this daemon (or

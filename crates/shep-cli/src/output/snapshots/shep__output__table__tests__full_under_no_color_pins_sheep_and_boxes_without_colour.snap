@@ -1,5 +1,6 @@
 ---
 source: crates/shep-cli/src/output/table.rs
+assertion_line: 1104
 expression: rendered
 ---
 ┌────┬────────┬────────┬──────┬──────────┬──────┬─────┬─────┬────────┬──────┐
@@ -10,3 +11,4 @@ expression: rendered
 │ 2  │ api    │ (x.x)  │ -    │ 4        │ -    │ -   │ -   │ 0s     │ -    │
 │ 3  │ cron   │ (-.-)  │ -    │ 0        │ -    │ -   │ -   │ 0s     │ -    │
 └────┴────────┴────────┴──────┴──────────┴──────┴─────┴─────┴────────┴──────┘
+  SMIT hidden. Widen the window, or use --format json.

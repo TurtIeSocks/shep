@@ -432,7 +432,7 @@ one. What would force it: an app class where the sheep is a supervisor that
 does not forward signals to its own workers, which is a real shape and simply
 has not come up here yet.
 
-### `lookout`'s flock table and bleats feed measure `char`s, not display columns
+### `lookout`'s flock table and bleats feed measure `char`s, not display columns -- FIXED, 2026-08-26
 
 [`crates/shep-cli/src/lookout/view/flock.rs`](../../crates/shep-cli/src/lookout/view/flock.rs)'s
 `fit` — the function every truncated line in `shep lookout` goes through —
@@ -456,19 +456,77 @@ dependency this phase's review declined to add for a cosmetic gap. What would
 force it: an operator running `shep lookout` against sheep with CJK names or
 logs, where a missing `…` is confusing rather than theoretical.
 
-### A `.js` Flockfile has no evaluation timeout
+**Fixed 2026-08-26, and the dependency argument had expired.** `unicode-width`
+was already in this tree twice over — `ratatui-core` pulls it for its own
+grapheme measurement, and `shep-core` reaches it through `serde-saphyr`'s
+`annotate-snippets` — so naming it directly in `crates/shep-cli/Cargo.toml`
+added **zero crates**. `Cargo.lock` resolves one `unicode-width`, before and
+after.
 
-A `.js` module handed to `require()` and never returning — one that starts a
-server at require time rather than exporting config — hangs `shep start`
-forever. There is no bound on the wait.
+**Three call sites, not one.** Reading the code to fix `fit` turned up the
+same fault in the other two places shep pads a cell, neither of them recorded
+here:
 
-Not built because a bound means a reaper thread in a crate that forbids
-unsafe code (`#![forbid(unsafe_code)]` on shep), for a case where the
-process is in the foreground, attached to the operator's own terminal, and
-already interruptible with Ctrl-C. What would force it: any path that
-evaluates a `.js` Flockfile unattended — a CI job or a provisioning script
-running `shep start` non-interactively, where nobody is watching to press
-Ctrl-C.
+- `output/width.rs`'s `visible_width`, which every cell of the box-drawn
+  table (`shep style full`, the default) is padded by. Its own doc called the
+  `char` count "a deliberate floor" whose alternative was "a `unicode-width`
+  dependency for a case nobody has hit" — true when written, and the same
+  sentence that stops being true the moment `lookout` needs the crate anyway.
+- `output/table.rs`'s `render_table`, the `shep style plain` renderer, which
+  measured with `chars().count()` and padded with `{cell:<width$}` — a format
+  spec that pads by character count, so measuring alone would not have fixed
+  it.
+
+Fixing one and not the others would have left the same CJK name aligned under
+`full` and crooked under `plain`, which is worse than uniformly wrong. All
+three now share one rule, `output::width::char_columns`, and the two `str`-level
+questions stay separate on purpose: `visible_width` discounts ANSI escapes
+because its callers write raw bytes to a terminal that interprets them, and
+`fit` does not, because ratatui never interprets an escape inside a `Span` —
+a log line carrying `\x1b[32m` draws a literal `32m` and occupies three
+columns. Measuring that as zero would under-count the exact cell the fix was
+for.
+
+`fit` now returns exactly `width` columns in **both** branches. A double-width
+character that will not fit the last column before the `…` is dropped and the
+column padded, because there is no half of it to draw and a short cell shifts
+every column after it on that row alone.
+
+Mutation-checked: restoring the `char` count reddens 6 tests across all three
+surfaces. Grapheme clustering is still not done and is still a deliberate
+floor — a combining mark measures zero and rides along with its base
+character, which is the case that matters, and both truncating callers stop
+on a whole `char` boundary.
+
+### A `.js` Flockfile has no evaluation timeout -- FIXED, 2026-08-28
+
+`evaluate_js_flockfile` takes a budget now, `JS_EVAL_BUDGET` is 30s, and node
+is killed once it passes. The refusal exits `InvalidConfig` and names the
+cause: *node was still running <path> after 30s, so shep killed it; a
+Flockfile module has to export its config and let node exit, and one that
+leaves a server listening or a timer armed does not.*
+
+What the budget waits for is node EXITING, not `require` returning. A module
+can assign `module.exports` and return while an armed timer holds the event
+loop open, which is the shape the unit test uses.
+
+**The reason recorded here for not building it was wrong**, which is the part
+worth keeping. A bound needs no reaper thread and no unsafe. `Child::try_wait`
+in a poll loop is safe std, and `commands/dogs.rs` already ran that exact loop
+for `adopt`'s exec probe. What the threads in `commands/bounded.rs` are for is
+a different problem: a pipe holds 64 KiB, so a child filling stdout blocks and
+never exits, and a deadline that read the pipes after the wait could not fire
+on the loudest children it exists for. `Command::output` spawns them for the
+same reason. The budget covers the reads as well as the wait, so a process
+node left behind on an inherited pipe cannot hold `run_bounded` past the
+deadline. It can outlive the budget perfectly well, and shep has no handle on
+it: that process is not shep's child. So the case gets its own answer and its
+own sentence, because node exited on its own there and nothing was killed,
+and a refusal claiming a kill would be describing a different failure.
+
+**No knob.** 30s is a const, not a flag and not a `shep.toml` key. Nothing
+honest reaches it, and a config that does has a bug the operator wants to hear
+about rather than a setting they want to raise. Adding one later is additive.
 
 ### The missing-node error message has no test -- FIXED, Phase 17
 
@@ -610,7 +668,7 @@ and was not expanded should say so.
 
 Found 2026-08-20 while building `shep-log-rotate`. Its `max_age` setting is a
 log-retention window, so the natural spelling is `7d`. The grammar is
-`^\d+(h|m|s)?$` (`crates/shep-core/src/values.rs`), so `7d` is refused and a
+`^\d+(ms|h|m|s)?$` (`crates/shep-core/src/values.rs`), so `7d` is refused and a
 week has to be written `168h`. A month is `720h`.
 
 **For shep itself the grammar is right and should not change on this
@@ -642,7 +700,27 @@ So parse-only is available cheaply and asymmetrically, if it is wanted. Not
 picked here: the grammar is Rin's, it is a wire decision, and the exercise's
 job was to find the friction rather than resolve it.
 
-### `shep adopt`'s vetting runs the candidate against the WRONG `$SHEP_HOME`
+### `shep adopt`'s vetting runs the candidate against the WRONG `$SHEP_HOME` -- FIXED, 2026-08-25
+
+**Fixed in `8a8056b`, by (1) and (3) below.** `vet_binary` now takes the
+home this invocation resolved and passes it to the probe, so `shep adopt
+--home /tmp/scratch ./my-dog` vets the candidate against `/tmp/scratch` and
+not against whatever the shell happened to have. The probe's stdin, stdout
+and stderr all go to `Stdio::null()`, so a candidate can no longer write on
+the operator's terminal during the command that is deciding whether to trust
+it.
+
+**(2) was considered and deliberately not taken.** A real adopted dog runs
+with the daemon's own filtered environment, so `env_clear()` would vet under
+stricter conditions than the dog will ever meet, and a binary needing
+`DYLD_LIBRARY_PATH` or its like would be refused despite working perfectly
+once adopted. Vetting has to model the real thing rather than an idealised
+one. `vet_binary`'s own comment carries that reasoning.
+
+The probe also carries `SHEP_DOG_NAME` now, for the same reason it carries
+`SHEP_HOME`: see the dog-name entry below.
+
+The original entry follows.
 
 Found 2026-08-20, the hard way, while building `shep-log-rotate`. It came
 within a `max_size` default of rotating the live `~/.shep` that supervises
@@ -691,7 +769,33 @@ Three fixes, cheap, and they compose:
 Deferred only because it is Rin's call how far to take it. (1) alone is a
 two-line change and fixes the case that was actually hit.
 
-### `emit_error`'s table arm prints whatever it is handed, unsanitised
+### `emit_error`'s table arm prints whatever it is handed, unsanitised -- FIXED, 2026-08-25
+
+**Fixed in `f34d88b`, by (1) below**, and wider than (1) as written.
+`emit_error` runs its message through `terminal_safe::sanitise` before
+either arm sees it, so the class is closed at the one place every caller
+passes through rather than in each error type.
+
+Two things the entry did not anticipate, both in the fix:
+
+- **`emit_notice` gets the same treatment.** It is a sibling emitter with
+  its own envelope, and leaving it out would have left the hole open on
+  every `bleats` notice.
+- **The JSON arm is sanitised too, not only the table arm.** `serde_json`
+  escapes a control byte to `\u001b`, so a terminal never renders it
+  directly, but `shep ... --format json | jq -r .error.message` unescapes
+  it straight back onto a terminal.
+
+`code` is deliberately left alone: every one is a `&'static str` from
+`ExitCode::code_str` or a literal at the call site, so none is ever
+attacker-supplied.
+
+**(2), the `TerminalSafe` newtype, was not built.** It pushes the
+obligation to where the string is built, which is where it belongs, and it
+is still the better answer if shep grows much more error text off the wire.
+`shep install` remains the case that would force it.
+
+The original entry follows.
 
 Found 2026-08-23 by the adversarial review of `shep dogs --available`, and
 recorded because the instance was fixed while the class was not.
@@ -724,9 +828,25 @@ Deferred rather than picked, because the live hole is closed and the right
 answer depends on whether shep expects more error text to come off the wire.
 `shep install`, if it is ever built, would be exactly that.
 
-### A dog cannot learn the name it was adopted under, and getting it wrong is silent
+### A dog cannot learn the name it was adopted under, and getting it wrong is silent -- FIXED, 2026-08-27
 
-Found 2026-08-20 while building `shep-log-rotate`, the first fully external dog.
+**Fixed by option 1 below**, the environment variable: every way shep runs a
+dog now sets `SHEP_DOG_NAME` to the name it was registered under, beside the
+`SHEP_HOME` it already set. Three seams, so a dog is never run under a
+contract it will not meet again: `shep_daemon::dogs::dog_app` (supervised),
+`run_adopted_dog` (`shep <name>`), and `vet_binary`'s exec probe during
+`adopt` itself. The last of the three carries no test of its own, and its
+comment says why rather than leaving the gap to be found: the probe child is
+killed on sight, immediately on every kernel but macOS, so anything it wrote
+to prove what it received would race its own teardown.
+
+Options 2 and 3 were not taken and did not need to be. Option 2 (letting
+`DogConfig` tell an absent section from an unadopted name) is a wire change,
+and handing the dog the key removes the guess that made the ambiguity
+reachable. Option 3 (documenting the pid trick) is in `docs/dogs.md`
+anyway, now as the fallback for an older shep rather than as the answer.
+
+The original entry follows.
 
 An adopted dog is spawned with **no argv at all** and **one** environment
 entry. `dogs.rs`'s `dog_app` maps `DogSource::Adopted { path }` to
@@ -1139,8 +1259,8 @@ has no `.js` entry in it. The document it reads is Flockfile-shaped (an `app`
 array, sheep-native field names), not a pm2 `ecosystem.config.js` — pointing
 `--flockfile` at a real pm2 ecosystem file gets serde's own `unknown field
 `apps`, expected `app`` refusal, and `shep import` remains the only pm2 path.
-A `.js` module that never returns hangs `shep start` forever; there is no
-timeout, recorded as known debt below.
+A `.js` module that keeps node alive hung `shep start` forever until the 30s
+`JS_EVAL_BUDGET` landed on 2026-08-28; see the entry above.
 
 **schemars JSON-schema export** (spec §5) **shipped**, Phase 14, behind a
 non-default `schema` feature on shep-core that shep turns on. The schema

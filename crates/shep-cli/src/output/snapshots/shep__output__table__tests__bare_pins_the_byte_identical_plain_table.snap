@@ -1,9 +1,10 @@
 ---
 source: crates/shep-cli/src/output/table.rs
+assertion_line: 1082
 expression: rendered
 ---
-ID  NAME    STATUS    PID   RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD
-0   web     online    1234  0         -     -    -    1h 2m   -
-1   worker  starting  -     0         -     -    -    0s      -
-2   api     errored   -     4         -     -    -    0s      -
-3   cron    stopped   -     0         -     -    -    0s      -
+ID  NAME    STATUS    PID   RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
+0   web     online    1234  0         -     -    -    1h 2m   -     -
+1   worker  starting  -     0         -     -    -    0s      -     -
+2   api     errored   -     4         -     -    -    0s      -     -
+3   cron    stopped   -     0         -     -    -    0s      -     -

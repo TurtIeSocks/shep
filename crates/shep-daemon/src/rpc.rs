@@ -37,7 +37,7 @@ use crate::bus::TopicFilter;
 use crate::dogs::DogSpec;
 use crate::limits::stats::StatsState;
 use crate::snapshot::{FlockRegistry, SnapshotError, write_atomic};
-use crate::supervisor::{SupervisorError, SupervisorHandle};
+use crate::supervisor::{ConnId, SupervisorError, SupervisorHandle};
 
 /// Deadline applied when a client sends none (spec §6: 5s default).
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
@@ -181,12 +181,12 @@ pub(crate) fn budget(deadline_ms: Option<u64>) -> Duration {
 /// stronger would need per-command cancellation inside the actor, which the
 /// supervisor's locked `Command` surface (Phase 2a) deliberately does not
 /// have.
-pub(crate) async fn dispatch(envelope: Envelope, ctx: &RpcContext) -> Outcome {
+pub(crate) async fn dispatch(envelope: Envelope, conn: ConnId, ctx: &RpcContext) -> Outcome {
     let id = envelope.id;
     with_deadline(
         id,
         budget(envelope.deadline_ms),
-        run(id, envelope.body, ctx),
+        run(id, conn, envelope.body, ctx),
     )
     .await
 }
@@ -213,7 +213,7 @@ async fn with_deadline<F: Future<Output = Outcome> + Send>(
     }
 }
 
-async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
+async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outcome {
     let reply = |result| Outcome::Reply(Reply { id, result });
     match request {
         Request::Ping => reply(Ok(Response::Pong)),
@@ -270,6 +270,25 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
                     Err(err) => reply(Err(rpc_error(&err))),
                 }
             }
+        },
+        // Re-normalized for the reason `Start` is, plus one of its own: an
+        // unnormalized config would report every default it did not spell
+        // out as a difference from the normalized copy the flock stores, so
+        // a Flockfile that changed nothing would be reported as drifting in
+        // a dozen fields.
+        //
+        // Nothing is recorded in the registry: this answers a question and
+        // registers nothing, so a `ConfigDrift` must not be able to change
+        // what the next `shep save` writes.
+        Request::ConfigDrift { apps } => match normalize_all(apps) {
+            Err(err) => reply(Err(RpcError {
+                code: RpcErrorCode::InvalidConfig,
+                message: err.to_string(),
+            })),
+            Ok(resolved) => match ctx.supervisor.config_drift(resolved).await {
+                Ok(drifted) => reply(Ok(Response::Drifted(drifted))),
+                Err(err) => reply(Err(rpc_error(&err))),
+            },
         },
         Request::Stop { selector } => {
             selector_call(id, selector, |s| ctx.supervisor.stop(s), Response::Stopped).await
@@ -378,6 +397,19 @@ async fn run(id: u64, request: Request, ctx: &RpcContext) -> Outcome {
             }
             Err(err) => reply(Err(rpc_error(&err))),
         },
+        // Scoped to `conn`, which is what makes a smit ephemeral: the
+        // connection layer forgets this one's marks in its own tail, and that
+        // tail is the single cleanup site the whole design turns on.
+        //
+        // `smit` arrives already validated — `Smit`'s hand-written
+        // `Deserialize` refused a control character before this arm was
+        // reached — so the only refusal left here is a name nothing holds.
+        Request::SetSmit { sheep, smit } => {
+            match ctx.supervisor.set_smit(conn, &sheep, smit).await {
+                Ok(infos) => reply(Ok(Response::SmitPainted(infos))),
+                Err(err) => reply(Err(rpc_error(&err))),
+            }
+        }
         Request::SaveRoll => match ctx.save_roll_now().await {
             Ok(Some(saved)) => reply(Ok(Response::RollSaved {
                 // Lossy on purpose, matching `to_info`'s treatment of log
@@ -574,6 +606,20 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             code: RpcErrorCode::SpawnFailed,
             message: msg.clone(),
         },
+        // The same code as `SpawnFailed` above, on the rule this function
+        // already applies twice below: `RpcErrorCode` is versioned, a client
+        // predating a new code cannot decode the reply at all, and that costs
+        // the operator the message as well as the code. "Could not start it",
+        // and exit 7, is true of a batch refused before it was registered.
+        //
+        // The bare payload rather than `err.to_string()`, unlike the two
+        // `Internal` groups below: those share a code with something else and
+        // need `Display` to tell them apart, while this message already opens
+        // with "nothing was registered" and says everything the prefix would.
+        SupervisorError::CannotStart(msg) => RpcError {
+            code: RpcErrorCode::SpawnFailed,
+            message: msg.clone(),
+        },
         // `Internal` — an "unexpected daemon-side failure", which a log path
         // the daemon can no longer open, or can no longer empty, both are.
         // No code of its own: the wire enum is versioned, and a client that
@@ -739,6 +785,15 @@ mod tests {
     use shep_core::status::ProcStatus;
     use shep_core::values::UpDuration;
     use tokio::time::Instant;
+
+    /// Dispatches on a connection of its own, shadowing [`super::dispatch`]
+    /// so no case in this module has to name a [`ConnId`] it does not care
+    /// about. One fresh id per call is the honest reading: each of these is
+    /// one client asking one thing, and nothing here spans two requests on
+    /// the same connection.
+    async fn dispatch(envelope: Envelope, ctx: &RpcContext) -> Outcome {
+        super::dispatch(envelope, ConnId::next(), ctx).await
+    }
 
     fn envelope(id: u64, body: Request) -> Envelope {
         Envelope {

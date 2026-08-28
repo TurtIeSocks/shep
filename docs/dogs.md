@@ -220,11 +220,15 @@ again after a reboot from a different working directory than the one
 Once adopted, `shep <name> [args...]` runs the dog directly — the same
 `git foo` runs `git-foo` precedent, resolved against adopted dogs only
 (never a `$PATH` scan). It's a second invocation mode, distinct from the
-one the shepherd itself uses: a dog the shepherd starts gets no argv and
-one environment variable (`$SHEP_HOME`, below); a dog you name on the
-command line gets whatever you typed after it, passed straight through,
-plus that same `$SHEP_HOME`. A built-in verb or alias always wins over
-a same-named dog.
+one the shepherd itself uses: an adopted dog the shepherd starts gets no
+argv and two environment variables (`$SHEP_HOME` and `$SHEP_DOG_NAME`,
+below); a dog you name on the command line gets whatever you typed after
+it, passed straight through, plus those same two. A built-in verb or alias
+always wins over a same-named dog.
+
+No argv is the adopted case specifically. The two built-in dogs are
+started as `shep dog <name>` and read their own name from that argv, but
+neither is a dog anybody writes: they ship inside the binary.
 
 `rehome <name>` is `disable`'s counterpart for a third-party dog: it stops
 it if running and forgets the registration in `shep.toml` entirely, rather
@@ -235,25 +239,36 @@ The wire a third-party dog speaks is the same client protocol
 every other client of this daemon: connect to the Unix socket at
 `$SHEP_HOME/run/shep.sock`, send `Hello`, wait for `HelloAck`, then send
 `Request::DogConfig { name }` to fetch your own `[dog.<name>]` section as
-opaque text — parse it however your own config shape wants. The one
-variable an adopted dog inherits from the shepherd's environment is
-`$SHEP_HOME`, which is how it finds that socket in the first place; no
-`[dog.<name>]` value ever rides along beside it, for the reason given
-above.
+opaque text — parse it however your own config shape wants. Shep sets two
+variables of its own on a dog: `$SHEP_HOME`, which is how it finds that
+socket in the first place, and `$SHEP_DOG_NAME`, which is the `name` to put
+in that request. No `[dog.<name>]` value ever rides along beside them, for
+the reason given above. A section's key is not one of its values.
 
-**Knowing which name to ask for is your problem, and getting it wrong is
-silent.** A dog is given no argv and that one variable, so nothing tells it
-what the operator typed at `shep adopt`. And a `DogConfig` for a name nobody
-adopted comes back as the empty string -- exactly what a registered dog with
-no section gets, because a dog with no configuration is the ordinary case
-rather than a fault. So a one-character mismatch between the name you expect
-and the name the operator used discards their entire section for you, uses
-every default instead, and prints nothing on either side. Hardcoding a name
-and documenting it works, as long as you say so loudly. Working it out is
-better: your process knows its own pid, `ListFlock` reports a pid per entry,
-and the entry that is marked a dog and carries your pid is you -- its `name`
-is the key your section lives under. `shep-log-rotate` does the second and
-falls back to the first out loud.
+Those two are what shep ADDS, not the whole environment. A dog is a
+supervised process like any other, so it also starts from the small base
+every sheep gets: `PATH`, plus whichever of `HOME`, `USER`, `LANG` and `TZ`
+the shepherd itself has, plus `SHEP_INSTANCE`. Nothing from `[dog.<name>]`
+is in there.
+
+**Read `$SHEP_DOG_NAME` rather than hardcoding a name.** It holds the name
+you are registered under, which is the operator's `--name` if they gave one
+and otherwise your own file stem with a leading `shep-` stripped. Shep sets
+it every way it runs you: supervised, `shep <name>`, and the exec probe
+during `adopt` itself.
+
+Getting the name wrong is silent, which is the whole reason the variable
+exists. A `DogConfig` for a name nobody adopted comes back as the empty
+string, exactly what a registered dog with no section gets, because a dog
+with no configuration is the ordinary case rather than a fault. So a
+one-character mismatch discards the operator's entire section, uses every
+default instead, and prints nothing on either side.
+
+An absent `$SHEP_DOG_NAME` means you are not being run by a shep that sets
+it. The fallback for that case: your process knows its own pid, `ListFlock`
+reports a pid per entry, and the entry that is marked a dog and carries your
+pid is you. `shep-log-rotate` does this, and it was the only option before
+the variable existed.
 
 **Never send `Request::Flush` as part of rotating anything.** Its name reads
 like settling a buffer and it does the opposite of what a rotator wants: it

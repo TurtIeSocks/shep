@@ -61,7 +61,11 @@ pub(crate) const fn role_of(status: ProcStatus) -> Role {
 pub(crate) const fn face(status: ProcStatus) -> &'static str {
     match status {
         ProcStatus::Online => "(o.o)",
-        ProcStatus::Starting | ProcStatus::WaitingRestart => "(o~o)",
+        ProcStatus::Starting => "(o~o)",
+        // A sheep waiting to be picked back up reads differently from one
+        // coming up fresh -- the two used to share `(o~o)` and were
+        // indistinguishable at a glance.
+        ProcStatus::WaitingRestart => "(>_<)",
         ProcStatus::Stopping | ProcStatus::Stopped => "(-.-)",
         ProcStatus::Errored => "(x.x)",
     }
@@ -111,12 +115,16 @@ mod tests {
     }
 
     /// A sleeping sheep and a startled one must not look the same at a
-    /// glance, or the face carries nothing the colour did not.
+    /// glance, or the face carries nothing the colour did not. `WaitingRestart`
+    /// joins this list now that it has its own face -- it used to share
+    /// `Starting`'s, which this test could not have caught since it never
+    /// looked at the pair.
     #[test]
     fn the_faces_are_distinct_from_one_another() {
         let faces = [
             face(ProcStatus::Online),
             face(ProcStatus::Starting),
+            face(ProcStatus::WaitingRestart),
             face(ProcStatus::Stopped),
             face(ProcStatus::Errored),
         ];

@@ -38,6 +38,7 @@ use shep_core::transport::{Listener, ServerReadHalf, ServerStream, ServerWriteHa
 
 use crate::bus::spawn_forwarder;
 use crate::rpc::{Outcome, RpcContext, dispatch};
+use crate::supervisor::ConnId;
 
 /// Frames queued toward one client before the connection back-pressures.
 pub const CONN_QUEUE: usize = 64;
@@ -384,29 +385,39 @@ async fn handle_conn(stream: ServerStream, ctx: RpcContext) -> Result<(), ConnEr
     // raw FFI to re-answer a question the OS already answered.
     #[cfg(unix)]
     check_peer(&stream, daemon_uid())?;
+    // Minted after the peer check, not before: a connection refused for its
+    // uid never reaches a handler, so it has nothing to scope.
+    let conn = ConnId::next();
     let (read_half, write_half) = shep_core::transport::split(stream);
     let mut frames = FramedRead::new(read_half, codec());
     let (out_tx, out_rx) = mpsc::channel::<Bytes>(CONN_QUEUE);
     let writer = tokio::spawn(write_loop(FramedWrite::new(write_half, codec()), out_rx));
 
-    let outcome = converse(&mut frames, &out_tx, &ctx).await;
+    let outcome = converse(&mut frames, &out_tx, conn, &ctx).await;
 
     // Drop the queue's sender and JOIN the writer before returning, on EVERY
     // path: a protocol-skew refusal is written by that task, so returning the
     // error early would close the socket before the client ever saw why.
     drop(out_tx);
     let _ = writer.await;
+    // Beside the two lines above for the same reason their comment gives:
+    // this block is on EVERY path out. A smit belongs to the connection that
+    // painted it, and this is the one place that is true of. After the writer
+    // join, so a client that painted and immediately read still sees its own
+    // mark in the reply it was already sent.
+    ctx.supervisor.forget_smits(conn).await;
     outcome
 }
 
 async fn converse(
     frames: &mut Frames,
     out: &mpsc::Sender<Bytes>,
+    conn: ConnId,
     ctx: &RpcContext,
 ) -> Result<(), ConnError> {
     handshake(frames, out, ctx).await?;
     let mut forwarder: Option<JoinHandle<()>> = None;
-    let outcome = read_loop(frames, out, ctx, &mut forwarder).await;
+    let outcome = read_loop(frames, out, conn, ctx, &mut forwarder).await;
     // EVERY path out of read_loop — Ok or any `?`-propagated Err — lands
     // here: a live forwarder MUST be aborted, not just dropped. Dropping a
     // JoinHandle detaches the task rather than stopping it, and a detached
@@ -424,13 +435,14 @@ async fn converse(
 async fn read_loop(
     frames: &mut Frames,
     out: &mpsc::Sender<Bytes>,
+    conn: ConnId,
     ctx: &RpcContext,
     forwarder: &mut Option<JoinHandle<()>>,
 ) -> Result<(), ConnError> {
     while let Some(frame) = frames.next().await {
         let frame = frame?; // oversize/short frame ends the connection
         let envelope: Envelope = decode_frame(&frame).map_err(ConnError::Decode)?;
-        match dispatch(envelope, ctx).await {
+        match dispatch(envelope, conn, ctx).await {
             Outcome::Reply(reply) => send(out, &reply).await?,
             Outcome::Subscribe { reply, filter } => {
                 send(out, &reply).await?; // ordered ahead of any event by the queue

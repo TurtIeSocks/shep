@@ -34,7 +34,8 @@ expression: replies
             "last_exit": {
               "code": 1,
               "signal": null
-            }
+            },
+            "smit": null
           }
         ]
       }
@@ -105,7 +106,8 @@ expression: replies
             "last_exit": {
               "code": 1,
               "signal": null
-            }
+            },
+            "smit": null
           }
         ]
       }
@@ -146,7 +148,8 @@ expression: replies
           "last_exit": {
             "code": 1,
             "signal": null
-          }
+          },
+          "smit": null
         }
       }
     }
@@ -306,7 +309,8 @@ expression: replies
             "last_exit": {
               "code": 1,
               "signal": null
-            }
+            },
+            "smit": null
           }
         ]
       }
@@ -373,7 +377,8 @@ expression: replies
                 "name": "sh"
               }
             ],
-            "last_exit": null
+            "last_exit": null,
+            "smit": null
           }
         ]
       }
@@ -402,7 +407,59 @@ expression: replies
             "last_exit": {
               "code": null,
               "signal": 15
-            }
+            },
+            "smit": null
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 25,
+    "result": {
+      "Ok": {
+        "kind": "smit_painted",
+        "data": [
+          {
+            "id": 3,
+            "name": "web",
+            "status": "online",
+            "pid": 4242,
+            "restarts": 0,
+            "uptime_ms": 0,
+            "fold": null,
+            "out_file": null,
+            "err_file": null,
+            "cpu_percent": null,
+            "memory_bytes": null,
+            "dog": null,
+            "lambs": null,
+            "last_exit": null,
+            "smit": "▲ main@a1b2c3"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 26,
+    "result": {
+      "Ok": {
+        "kind": "drifted",
+        "data": [
+          {
+            "name": "web",
+            "fields": [
+              "cwd"
+            ]
+          },
+          {
+            "name": "api",
+            "fields": [
+              "args",
+              "env",
+              "script"
+            ]
           }
         ]
       }

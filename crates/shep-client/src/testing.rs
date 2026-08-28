@@ -225,6 +225,10 @@ pub fn sample_info() -> ProcessInfo {
             code: Some(1),
             signal: None,
         }))
+        // The reference smit a deploy dog paints, non-ASCII and all: this
+        // fixture's job is that every `Option` is `Some`, and a mark shep
+        // does not understand is exactly what this field carries in life.
+        .smit(Some("\u{25b2} main@a1b2c3".to_string()))
         .build()
 }
 

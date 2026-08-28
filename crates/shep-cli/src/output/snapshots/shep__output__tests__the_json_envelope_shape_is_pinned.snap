@@ -23,7 +23,8 @@ expression: out
       "last_exit": {
         "code": 1,
         "signal": null
-      }
+      },
+      "smit": "▲ main@a1b2c3"
     },
     {
       "id": 2,
@@ -42,7 +43,8 @@ expression: out
       "last_exit": {
         "code": 1,
         "signal": null
-      }
+      },
+      "smit": "▲ main@a1b2c3"
     },
     {
       "id": 3,
@@ -61,7 +63,8 @@ expression: out
       "last_exit": {
         "code": 1,
         "signal": null
-      }
+      },
+      "smit": "▲ main@a1b2c3"
     }
   ]
 }

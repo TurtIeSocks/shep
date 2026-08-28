@@ -25,6 +25,7 @@
 //! side of the channel sees a clean EOF once the child closes or exits
 //! rather than being kept artificially open by our own leftover reference.
 
+use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
@@ -52,8 +53,9 @@ use tokio::sync::mpsc;
 use crate::boot::DIR_MODE;
 use crate::channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 use crate::runner::{
-    ExitOutcome, FlushError, LogCtl, LogLine, ProcIo, ProcessRunner, ReopenError, RunnerError,
-    RunningProcess, SpawnSpec, StdinWrite, StopSignal, check_log_ancestry, open_log_path,
+    ExitOutcome, FlushError, LogCtl, LogLine, Preflight, ProcIo, ProcessRunner, ReopenError,
+    RunnerError, RunningProcess, SpawnSpec, StdinWrite, StopSignal, check_log_ancestry,
+    open_log_path,
 };
 
 /// Capacity of every channel a spawn wires up — generous enough that a
@@ -375,8 +377,165 @@ fn to_nix_operator_signal(sig: OperatorSignal) -> Signal {
     }
 }
 
+/// What exec will make of `spec.program`, before anything is spawned.
+///
+/// Two arms, and which one a program takes is decided by a single `/`:
+///
+/// - **With a `/`** the program is a path, and a path is a claim about the
+///   filesystem this can settle. Absolute, or relative to `spec.cwd`, and
+///   either way the file is either there or it is not.
+///   [`Preflight::Impossible`], which its caller refuses a whole batch over.
+/// - **Without one** it is a bare command exec resolves through `PATH`, and
+///   that is a claim about an environment rather than about a path. At most
+///   [`Preflight::Doubtful`], never `Impossible`. See [`Preflight`] for the
+///   argument; the short version is that a `shep startup` unit's `PATH` is
+///   not the operator's shell's, so refusing a batch here would keep a whole
+///   flock down over one app's interpreter.
+///
+/// The PATH searched is `spec.env`'s own, not the daemon's ambient one: that
+/// map IS the child's whole environment (`spawn` calls `env_clear` then
+/// `envs`), so it is the exact list exec is about to walk, and naming it in
+/// the message is what tells an operator which `PATH` was actually looked in.
+///
+/// [`Preflight::Unknown`] for everything else, which is anything that would
+/// have to be guessed at:
+///
+/// - a program that resolves, whether by path or on `PATH`. Reported as
+///   "nothing knowable", not as "this will work": the executable bit, the
+///   shebang and the `user`/`group` drop are all still ahead of it.
+/// - a relative path with no `cwd`. The child would resolve it against the
+///   DAEMON's working directory, whatever the shepherd happened to be
+///   autostarted from.
+/// - a bare command with no usable `PATH` in `spec.env`. `assemble`'s
+///   `base_env` always seeds one, so only a spec built some other way gets
+///   here.
+/// - an empty program, which `normalize` refuses upstream.
+///
+/// Existence only, never the executable bit: a file that is there and cannot
+/// be exec'd is the spawn's business, and mode bits under a `user`/`group`
+/// drop are not a thing to be confident about from here. And existence is
+/// read through [`definitely_absent`] rather than [`Path::exists`], which
+/// collapses a permission error into "absent" -- see that function for why
+/// the distinction decides whether a flock comes up.
+fn what_exec_will_find(spec: &SpawnSpec) -> Preflight {
+    if spec.program.is_empty() {
+        return Preflight::Unknown;
+    }
+    let program = Path::new(&spec.program);
+    if spec.program.contains('/') {
+        let full = if program.is_absolute() {
+            program.to_path_buf()
+        } else {
+            match &spec.cwd {
+                Some(cwd) => cwd.join(program),
+                None => return Preflight::Unknown,
+            }
+        };
+        if !definitely_absent(&full) {
+            return Preflight::Unknown;
+        }
+        return Preflight::Impossible(format!("no such file: {}", full.display()));
+    }
+    let Some(path) = spec.env.get("PATH").filter(|value| !value.is_empty()) else {
+        return Preflight::Unknown;
+    };
+    // Absent from the PATH only if EVERY entry says so, and only if every
+    // entry that did not was a plain `NotFound`. One unreadable directory
+    // means exec may still find the program there, and claiming otherwise
+    // would put a sentence in the shepherd's log that is simply untrue.
+    // Cheaper to be wrong here than in the arm above -- this one can only
+    // reach a log line, never a refusal -- but a misleading message is the
+    // same class of fault either way.
+    for dir in path.split(':').filter(|dir| !dir.is_empty()) {
+        match fs::metadata(Path::new(dir).join(program)) {
+            Ok(_) => return Preflight::Unknown,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Preflight::Unknown,
+        }
+    }
+    Preflight::Doubtful(format!(
+        "`{}` is not on the shepherd's PATH ({})",
+        spec.program,
+        summarise_path(path)
+    ))
+}
+
+/// How many `PATH` entries a preflight message names before summarising the
+/// rest.
+///
+/// Four, because the `PATH` that matters here is a startup unit's and
+/// [`base_env`](crate::assemble)'s fallback for a unit that has none is three
+/// entries (`/usr/local/bin:/usr/bin:/bin`). The case an operator actually
+/// hits therefore prints in full, with one to spare.
+///
+/// The case being cut off is an interactive shell's `PATH`, measured at
+/// thirty-one entries and just over two kilobytes on this machine, which is
+/// unreadable in a terminal error. It is also the case where printing it in
+/// full teaches nothing: a daemon autostarted from a shell inherited that
+/// operator's own `PATH`, so it is the one they would go and check anyway.
+const PATH_ENTRIES_IN_MESSAGE: usize = 4;
+
+/// `path` as a message should print it: in full when short, and otherwise its
+/// first [`PATH_ENTRIES_IN_MESSAGE`] entries with a count of the rest.
+///
+/// The shape of the `PATH` is what the reader needs, not every byte of it.
+/// Seeing `/usr/local/bin:/usr/bin:/bin` is what tells an operator the
+/// shepherd is running under a unit rather than under their shell, which is
+/// the whole diagnosis.
+fn summarise_path(path: &str) -> String {
+    let entries: Vec<&str> = path.split(':').filter(|dir| !dir.is_empty()).collect();
+    if entries.len() <= PATH_ENTRIES_IN_MESSAGE {
+        return path.to_string();
+    }
+    format!(
+        "{} and {} more entries",
+        entries[..PATH_ENTRIES_IN_MESSAGE].join(":"),
+        entries.len() - PATH_ENTRIES_IN_MESSAGE,
+    )
+}
+
+/// Whether the filesystem says, without qualification, that `path` is not
+/// there.
+///
+/// [`Path::exists`] is the obvious call here and is the wrong one. It is
+/// documented to return `false` on ANY [`fs::metadata`] error, so a
+/// permission error on an intermediate directory, an unsettled mount and a
+/// race all read identically to "absent". Every one of those would have made
+/// [`what_exec_will_find`] answer [`Preflight::Impossible`] and refuse a
+/// whole batch on a filesystem that was merely unavailable for a moment,
+/// which is the failure mode that verdict exists to avoid.
+///
+/// So: `NotFound` and nothing else. `PermissionDenied` included, anything
+/// that is not a flat "no such file" is a suspicion rather than a certainty
+/// and belongs in [`Preflight::Unknown`], where the spawn reports it as it
+/// always did and no other app in the batch pays for it.
+///
+/// Follows symlinks, as `exists` did and as exec does: a symlink whose
+/// target is gone answers `NotFound` here, which is a real certainty and the
+/// right one. A directory and a file with no execute bit both answer `Ok`
+/// and so are not absent, which is also right -- neither can be exec'd, but
+/// that is the spawn's business and not a claim this can settle.
+fn definitely_absent(path: &Path) -> bool {
+    matches!(fs::metadata(path), Err(err) if err.kind() == io::ErrorKind::NotFound)
+}
+
 impl ProcessRunner for TokioRunner {
     type Proc = TokioProc;
+
+    /// Reports a `program` that provably is not there, and nothing else.
+    ///
+    /// `program` is what `assemble` resolved the app's `script` and
+    /// `interpreter` down to, so this checks the one file exec will name and
+    /// never a script that an interpreter takes as its first ARGUMENT: an
+    /// app running `npx next start` is checked at `npx`, and `next` is
+    /// npx's business.
+    ///
+    /// Deliberately under-tightened: see this module's `what_exec_will_find`
+    /// for every form it declines to decide, and for why a bare command is
+    /// only ever doubted while a path can be refused.
+    fn preflight(&self, spec: &SpawnSpec) -> Preflight {
+        what_exec_will_find(spec)
+    }
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         let mut command = Command::new(&spec.program);
@@ -1328,7 +1487,10 @@ fn spawn_channel_pumps<S>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
 
     use tokio::io::DuplexStream;
@@ -2045,6 +2207,255 @@ mod tests {
                 .expect("its sender must outlive the write")
                 .is_ok()
         );
+    }
+
+    /// A [`SpawnSpec`] carrying only what [`what_exec_will_find`] reads. Every
+    /// other field is left at whatever is cheapest: nothing below spawns
+    /// anything, so nothing below can be affected by them.
+    fn preflight_spec(program: &str, cwd: Option<PathBuf>, path: Option<&str>) -> SpawnSpec {
+        let mut env = BTreeMap::new();
+        if let Some(path) = path {
+            env.insert("PATH".to_string(), path.to_string());
+        }
+        SpawnSpec {
+            name: "web".to_string(),
+            program: program.to_string(),
+            args: Vec::new(),
+            cwd,
+            env,
+            out_file: PathBuf::from("/dev/null"),
+            err_file: PathBuf::from("/dev/null"),
+            channel: false,
+            stdin: false,
+            credentials: None,
+        }
+    }
+
+    /// fails if a form the preflight must not decide starts being refused.
+    ///
+    /// This is the direction that costs a working Flockfile, so it is the
+    /// list worth pinning as a sweep rather than one representative case.
+    /// Every entry here is a real shape from the testbed Flockfile that
+    /// produced the defect: absolute (`heatrotom`), relative to a `cwd`
+    /// (`obscura`), a bare command on PATH (`node`, `npx`).
+    #[test]
+    fn a_program_that_is_really_there_is_nothing_to_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("srv");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let path_dir = dir.path().to_string_lossy().into_owned();
+
+        for spec in [
+            preflight_spec(&bin.to_string_lossy(), None, None),
+            preflight_spec("./srv", Some(dir.path().to_path_buf()), None),
+            preflight_spec("srv", None, Some(&path_dir)),
+            // The second PATH entry rather than the first, so a search that
+            // only ever looks at one directory fails here.
+            preflight_spec("srv", None, Some(&format!("/nonexistent:{path_dir}"))),
+            // Not decidable, and so not decided: a relative path with no
+            // `cwd` would be resolved against whatever directory the
+            // shepherd was autostarted from.
+            preflight_spec("./srv", None, None),
+            // Likewise a bare name with no PATH to search.
+            preflight_spec("srv", None, None),
+            preflight_spec("srv", None, Some("")),
+            preflight_spec("", None, None),
+        ] {
+            assert_eq!(
+                what_exec_will_find(&spec),
+                Preflight::Unknown,
+                "reported something about a spec it cannot be certain about: {spec:?}"
+            );
+        }
+    }
+
+    /// fails if the check stops catching the defect: the third app of an
+    /// eleven-app Flockfile pointing at an unbuilt binary, which registered
+    /// two apps, failed, and never reached the other eight.
+    ///
+    /// `Impossible`, which its caller refuses the whole batch over, and only
+    /// ever for a program with a `/` in it. A path is a claim about the
+    /// filesystem, and this is what makes it a claim the daemon can settle.
+    ///
+    /// The reason string is asserted to carry the RESOLVED path, not the
+    /// `./proto-enum-api` the operator wrote, because "no such file:
+    /// ./proto-enum-api" is exactly the message that left them guessing
+    /// which directory it was looked for in.
+    #[test]
+    fn an_absent_path_is_impossible_and_names_the_path_that_was_tried() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            what_exec_will_find(&preflight_spec(
+                "./proto-enum-api",
+                Some(dir.path().to_path_buf()),
+                None,
+            )),
+            Preflight::Impossible(format!(
+                "no such file: {}/./proto-enum-api",
+                dir.path().display()
+            )),
+        );
+        assert_eq!(
+            what_exec_will_find(&preflight_spec("/nonexistent/srv", None, None)),
+            Preflight::Impossible("no such file: /nonexistent/srv".to_string()),
+        );
+    }
+
+    /// fails if a filesystem error that is not "no such file" is ever read as
+    /// absence.
+    ///
+    /// [`Path::exists`] returns `false` on ANY [`fs::metadata`] error, so an
+    /// unreadable intermediate directory, an unsettled mount and a race all
+    /// look exactly like a missing file. Under the previous `exists` call
+    /// each of them answered [`Preflight::Impossible`] and refused a whole
+    /// batch over a filesystem that was merely unavailable for a moment.
+    ///
+    /// Two provocations, because one of them cannot be trusted to bite
+    /// everywhere:
+    ///
+    /// - **A metadata error that is not absence.** On unix that is
+    ///   `ENOTDIR`: a regular file used as an intermediate path component.
+    ///   Uid-independent, so it runs on every machine and in every
+    ///   container, and this is the case that keeps the test honest when
+    ///   the second one is skipped. Windows needs a different provocation,
+    ///   because a path through a file answers `ERROR_PATH_NOT_FOUND`
+    ///   there, which IS absence and would make the case vacuous. An
+    ///   invalid filename is used instead, for `ERROR_INVALID_NAME`.
+    /// - **`EACCES`**, a `chmod 000` directory. Unix only, and not for
+    ///   want of the scenario: Windows has no `set_permissions` that can
+    ///   produce it, so reproducing it there means an ACL edit rather
+    ///   than a one-line chmod. The scenario an operator
+    ///   actually hits, and the one worth naming, but root bypasses
+    ///   directory search permission, so under a root CI container the
+    ///   `chmod` does not bite and the lookup would answer a true
+    ///   `NotFound`. Skipped there rather than asserted vacuously.
+    ///
+    /// The mode is restored BEFORE the assertion rather than after: a failed
+    /// assertion panics, and a `TempDir` whose `Drop` cannot descend into a
+    /// `chmod 000` directory turns one red test into a leaked directory and
+    /// a second, unrelated error.
+    #[test]
+    fn a_filesystem_error_that_is_not_absence_is_never_impossible() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // ENOTDIR: `wall` is a file, so nothing can be under it.
+        #[cfg(unix)]
+        let unreadable = {
+            let wall = dir.path().join("wall");
+            fs::write(&wall, "not a directory").unwrap();
+            wall.join("srv")
+        };
+        // ERROR_INVALID_NAME: `<` cannot appear in a Windows filename, so
+        // the name is refused before anything is looked up. A path through
+        // a file will not do here: Windows answers that with
+        // ERROR_PATH_NOT_FOUND, which is absence, and the assertion below
+        // would be vacuous.
+        #[cfg(windows)]
+        let unreadable = dir.path().join("no<such<name");
+        let kind = fs::metadata(&unreadable).unwrap_err().kind();
+        assert_ne!(
+            kind,
+            io::ErrorKind::NotFound,
+            "the provocation must be an error OTHER than not-found, or this \
+             case proves nothing: {kind:?}"
+        );
+        assert_eq!(
+            what_exec_will_find(&preflight_spec(&unreadable.to_string_lossy(), None, None)),
+            Preflight::Unknown,
+            "a path shep could not read is a suspicion, not a certainty, and \
+             must never refuse a batch"
+        );
+
+        // EACCES: an unreadable directory between the cwd and the program.
+        // Unix only: see this test's doc for why Windows gets no
+        // equivalent rather than a weaker one.
+        #[cfg(unix)]
+        {
+            if nix::unistd::Uid::effective().is_root() {
+                return;
+            }
+            let locked = dir.path().join("locked");
+            fs::create_dir(&locked).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let behind_the_wall = locked.join("srv");
+            let observed = fs::metadata(&behind_the_wall)
+                .map(|_| ())
+                .map_err(|e| e.kind());
+            let verdict = what_exec_will_find(&preflight_spec(
+                &behind_the_wall.to_string_lossy(),
+                None,
+                None,
+            ));
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+            assert_eq!(
+                observed,
+                Err(io::ErrorKind::PermissionDenied),
+                "the chmod must actually bite, or the assertion below is vacuous"
+            );
+            assert_eq!(
+                verdict,
+                Preflight::Unknown,
+                "a permission error on the way to the program must not take the rest \
+                 of the flock down with it"
+            );
+        }
+    }
+
+    /// fails if a bare command off the PATH ever becomes `Impossible`, which
+    /// is the assertion this case exists for.
+    ///
+    /// `Doubtful` is reported and carried on with, never refused. The
+    /// daemon's own PATH under the unit `shep startup` installs is not the
+    /// shell an operator tested in: homebrew's `node` on Apple Silicon is in
+    /// `/opt/homebrew/bin` and nvm's is under `$HOME`, so a `shep startup`
+    /// flock whose one Node app cannot resolve `node` must still bring up
+    /// every other app. Refusing here would keep the whole flock down.
+    ///
+    /// The PATH that was searched is in the message on purpose. "`node` is
+    /// not on the shepherd's PATH" without saying WHICH path sends an
+    /// operator to check the one in their terminal, which is the one that
+    /// works.
+    #[test]
+    fn a_bare_command_off_the_path_is_only_ever_doubtful() {
+        let found = what_exec_will_find(&preflight_spec("node", None, Some("/nonexistent")));
+
+        assert_eq!(
+            found,
+            Preflight::Doubtful("`node` is not on the shepherd's PATH (/nonexistent)".to_string()),
+        );
+        assert!(
+            !matches!(found, Preflight::Impossible(_)),
+            "a claim about an environment must never refuse a batch"
+        );
+    }
+
+    /// fails if a long PATH is printed in full, or a short one is not.
+    ///
+    /// This message reaches a terminal now, not only the shepherd's log:
+    /// `spawn_fresh` puts a `Doubtful` reason into the reply once that app's
+    /// own spawn has failed. An interactive shell's PATH measured just over
+    /// two kilobytes across thirty-one entries on this machine, and dumping
+    /// that into `error[spawn_failed]:` buries the sentence that matters.
+    ///
+    /// The short case is the one that must survive intact: a `shep startup`
+    /// unit with no PATH of its own gets `assemble`'s three-entry fallback,
+    /// and seeing those three IS the diagnosis.
+    #[test]
+    fn a_long_path_is_summarised_and_a_startup_units_own_path_is_not() {
+        let fallback = "/usr/local/bin:/usr/bin:/bin";
+        assert_eq!(
+            summarise_path(fallback),
+            fallback,
+            "the PATH a unit actually gets must print in full"
+        );
+
+        let long = "/a:/b:/c:/d:/e:/f";
+        assert_eq!(summarise_path(long), "/a:/b:/c:/d and 2 more entries");
+
+        // Exactly at the cap, which is where an off-by-one would show.
+        assert_eq!(summarise_path("/a:/b:/c:/d"), "/a:/b:/c:/d");
     }
 
     // Everything else in this module needs a real OS child and lives in

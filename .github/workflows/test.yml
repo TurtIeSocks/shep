@@ -96,7 +96,7 @@ jobs:
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
       - uses: Swatinem/rust-cache@v2
       # `--all-features` mirrors the task gate, as in `lint` above.
-      - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots'
+      - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   minimal-versions:
     runs-on: ubuntu-latest
     # Resolves a whole second lockfile before it builds anything, so it never
@@ -107,7 +107,7 @@ jobs:
       - run: rustup toolchain install nightly stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly generate-lockfile -Z minimal-versions
-      - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots'
+      - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   musl:
     runs-on: ubuntu-latest
     # Builds the whole tree for a second target, from cold, on the first run
@@ -118,7 +118,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --skip ::slow:: --skip two_concurrent_boots'
+      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   # CLAUDE.md's phase-gate cross-check
   # (`cargo check --workspace --all-targets --all-features --target
   # x86_64-pc-windows-gnu`) had no workflow behind it, so it only ran when a
@@ -165,8 +165,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots'
-      - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots'
+      - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+      - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   # Tests that need a quiet machine, run serially in a job of their own.
   #
   # Two groups belong here and neither is a flaky test in the usual sense:
@@ -177,8 +177,14 @@ jobs:
   # neighbour can stretch. `two_concurrent_boots_on_a_stale_socket_exactly_one_wins`
   # races two threads for the same $SHEP_HOME and asserts exactly one wins,
   # which depends on the loser looking after the winner has bound.
+  # `signal_ignored_then_kill_tree_reaps` is the same shape: it gives a shell
+  # 100ms to install `trap "" TERM` before signalling it, then asserts the
+  # process survived, so a runner that cannot schedule that shell inside the
+  # window reports a working trap as a broken one. The test's own comment
+  # names the race. Seen failing once on macos/1.88 while passing five of
+  # five locally at 0.41s each.
   #
-  # Every other job skips both groups so the matrix stays fast and honest.
+  # Every other job skips these groups so the matrix stays fast and honest.
   # This job runs them with `--test-threads=1` so the only load is their own.
   # They are NOT `#[ignore]`d: the tier's own doc says it exists so the full
   # suite covers the real backend, and this project has already found a Linux
@@ -207,7 +213,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots'
+      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots signal_ignored_then_kill_tree_reaps'
   # `cargo llvm-cov` on its own runs `cargo test --tests`, and `--tests` does
   # not build a package's examples. `daemon_e2e`'s two reload tests exec
   # `examples/reuse_port_sheep`, the SO_REUSEPORT fixture the whole reload
@@ -235,7 +241,7 @@ jobs:
       - run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          cargo test --workspace --locked -- --skip ::slow:: --skip two_concurrent_boots
+          cargo test --workspace --locked -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps
           cargo llvm-cov report --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with: { name: coverage, path: lcov.info }

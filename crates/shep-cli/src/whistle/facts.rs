@@ -87,6 +87,9 @@ pub struct SheepRow {
     /// How this sheep's process most recently stopped; absent while it has
     /// never exited under this daemon.
     pub last_exit: Option<ExitInfoRow>,
+    /// The marker a dog has asked to have painted beside this sheep; absent
+    /// when none has. Opaque text the daemon validated but never parsed.
+    pub smit: Option<String>,
 }
 
 /// Where a dog came from. Mirrors `DogSource`'s tagged wire shape exactly.
@@ -150,6 +153,7 @@ impl From<&ProcessInfo> for SheepRow {
                 .as_ref()
                 .map(|lambs| lambs.iter().map(LambRow::from).collect()),
             last_exit: info.last_exit.as_ref().map(ExitInfoRow::from),
+            smit: info.smit.clone(),
         }
     }
 }

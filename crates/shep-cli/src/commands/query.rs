@@ -130,7 +130,7 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode
         .ok()
         .and_then(|bytes| serde_json::from_slice::<FlockSnapshot>(&bytes).ok());
 
-    let sheep: Vec<RolledSheep> = saved
+    let mut sheep: Vec<RolledSheep> = saved
         .map(|roll| {
             roll.apps
                 .into_iter()
@@ -142,6 +142,12 @@ pub fn flock_from_roll(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode
                 .collect()
         })
         .unwrap_or_default();
+    // The roll is stored in whatever order it was written, which is neither
+    // meaningful nor stable. Name is the whole key here: a roll holds one
+    // entry per APP, not per instance, so there are no two rows to break a
+    // tie between and no id to break it with. Same first key as every other
+    // listing shep prints (`shep_core::protocol::sort_flock`).
+    sheep.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
     if streams.fmt == Format::Table {
         let _ = writeln!(

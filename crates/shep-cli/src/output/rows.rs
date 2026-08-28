@@ -21,7 +21,7 @@ use shep_core::status::ProcStatus;
 
 use crate::dog_index::AvailableDog;
 use crate::style::Presentation;
-use crate::vocabulary;
+use crate::vocabulary::{self, Role};
 
 use super::Render;
 
@@ -43,6 +43,7 @@ impl Render for FlockRows {
     fn headers() -> &'static [&'static str] {
         &[
             "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD",
+            "SMIT",
         ]
     }
 
@@ -70,18 +71,33 @@ impl Render for FlockRows {
                         .map_or_else(|| "-".to_string(), super::human_bytes),
                     super::human_duration(p.uptime_ms),
                     p.fold.clone().unwrap_or_else(|| "-".to_string()),
+                    p.smit.clone().unwrap_or_else(|| "-".to_owned()),
                 ]
             })
             .collect()
     }
 
-    /// [`Self::rows`], with the STATUS cell (index 2, parallel to
-    /// `headers()`) dressed up per spec §2: the face always, when
-    /// `presentation.level.sheep()`; the word too, when `status_word`; the
-    /// whole cell coloured with `output::paint::style_for` when
-    /// `presentation.colour`. Reuses [`Self::rows`] for the other eight
-    /// columns rather than rebuilding them, so the two never drift on
-    /// anything but the one cell this method exists to change.
+    /// [`Self::rows`], with every cell the governing rule ("every colour
+    /// must carry information") allows dressed up:
+    ///
+    /// - STATUS (index 2): the face always, when `presentation.level.sheep()`;
+    ///   the word too, when `status_word`; the whole cell coloured per
+    ///   [`status_cell`].
+    /// - ID and FOLD: always `Role::Ink3` -- chrome, the way `pm2` dims its
+    ///   namespace column, never a fact about the row.
+    /// - PID and SMIT: `Role::Ink3` only when the cell reads `-` -- an
+    ///   absent value should not shout as loud as a real one.
+    /// - RESTARTS: `Role::Ink3` at zero, `Role::Butter` above it -- a
+    ///   restart count above zero is the single most useful glanceable
+    ///   signal in this table.
+    /// - EXIT: `Role::Bark` for a genuine failure (a nonzero code or a
+    ///   signal), `Role::Ink3` otherwise (a clean `0`, or no exit recorded
+    ///   yet -- both render `-` or an uneventful number).
+    /// - CPU and MEM: a magnitude ramp -- see [`cpu_role`]/[`mem_role`] for
+    ///   the thresholds and the reasoning behind them.
+    ///
+    /// Reuses [`Self::rows`] for the cell text itself rather than rebuilding
+    /// it, so this method only ever decides colour, never content.
     ///
     /// `status_word` is a plain parameter, not part of `Presentation`,
     /// because it is not a fact resolved once at the seam the way `level`/
@@ -90,11 +106,13 @@ impl Render for FlockRows {
     /// it on `Presentation` would have made it crate-wide state that ~100
     /// call sites construct for a question only this one method ever asks.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let mut rows = self.rows();
-        for (row, p) in rows.iter_mut().zip(&self.0) {
-            row[2] = status_cell(p.status, presentation, status_word);
-        }
-        rows
+        paint(
+            self.rows(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, _cell, index| process_info_paint(header, &self.0[index]),
+        )
     }
 
     /// # Panics
@@ -112,6 +130,7 @@ impl Render for FlockRows {
             "MEM" => "memory_bytes",
             "UPTIME" => "uptime_ms",
             "FOLD" => "fold",
+            "SMIT" => "smit",
             other => panic!("FlockRows::headers() does not include {other:?}"),
         }
     }
@@ -135,14 +154,17 @@ impl Render for FlockRows {
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
-    // "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD"]`. `flock` is the
-    // table this whole feature is drawn of, so it is the one payload type
-    // the design spec gives an explicit priority table: ID/NAME/STATUS never
-    // drop (`0`), then UPTIME, PID, MEM, RESTARTS, CPU, EXIT, FOLD, in that
-    // dropping order. `flock_priorities_line_up_with_flock_headers` (below)
-    // pins both the length and which three columns sit at `0`, because
-    // these two arrays drift silently -- a header inserted without its
-    // priority shifts every priority after it onto the wrong column.
+    // "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD", "SMIT"]`. `flock`
+    // is the table this whole feature is drawn of, so it is the one payload
+    // type the design spec gives an explicit priority table: ID/NAME/STATUS
+    // never drop (`0`), then, in the order they survive as the terminal
+    // narrows (ascending priority), UPTIME, PID, MEM, RESTARTS, CPU, EXIT,
+    // FOLD, SMIT -- so the real give-up order, highest priority first, is
+    // SMIT, FOLD, EXIT, CPU, RESTARTS, MEM, PID, UPTIME.
+    // `flock_priorities_line_up_with_flock_headers` (below) pins both the
+    // length and which three columns sit at `0`, because these two arrays
+    // drift silently -- a header inserted without its priority shifts every
+    // priority after it onto the wrong column.
     //
     // EXIT and FOLD are the only two columns sharing the "6 and up" tier,
     // and deliberately not tied at the same number (task 49): EXIT is
@@ -151,17 +173,28 @@ impl Render for FlockRows {
     // says why" -- and least when everything is healthy, where it renders
     // `-` for every row. FOLD, an organizational label rather than a
     // diagnostic, keeps its long-standing spot as the single most droppable
-    // column; EXIT sits one tier below it, so a narrowing terminal loses
-    // FOLD before it loses the one column that answers "why is this row
-    // even here".
-    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7];
+    // column below SMIT; EXIT sits one tier below FOLD, so a narrowing
+    // terminal loses FOLD before it loses the one column that answers "why
+    // is this row even here".
+    //
+    // SMIT sits above FOLD, at the very top: it is by far the widest
+    // column, so dropping it recovers the most space for one column lost.
+    // Rin's ruling is that it belongs among the first columns to yield, and
+    // 8 is the literal reading of that.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
 }
 
-/// One sheep's STATUS cell, per spec §2 -- the only place in this module a
-/// face or a colour belongs, and the only STATUS cell any `Render` impl in
-/// this crate dresses up: `DogRows`/`DogEnabledRow`/`DogDisabledRow` render
-/// their own STATUS text unchanged, because a dog is not a sheep and this
-/// feature was never about giving one a face.
+/// One STATUS cell, per spec §2 -- the only place in this module a face or a
+/// colour for a status is decided, and now shared by every table with a
+/// STATUS column rather than by `FlockRows` alone.
+///
+/// It used to be `FlockRows`' own, on the grounds that a dog is not a sheep
+/// and the feature was never about giving one a face. That left seven of the
+/// eight tables in this module plain while one was coloured, so the same dog
+/// read one way under `shep dogs` and another under `shep flock`. Rin's
+/// ruling is that the treatment extends: a dog is supervised exactly as a
+/// sheep is, and `vocabulary.rs` stays the single source for the faces and
+/// the status-to-role mapping rather than growing a second set for dogs.
 ///
 /// - `presentation.level.sheep()` decides whether a face appears at all
 ///   ([`vocabulary::face`], always exactly 5 columns).
@@ -186,11 +219,369 @@ fn status_cell(status: ProcStatus, presentation: Presentation, status_word: bool
     } else {
         status.to_string()
     };
-    if presentation.colour {
-        let style = super::paint::style_for(vocabulary::role_of(status), presentation.deep_colour);
-        text = format!("{style}{text}{style:#}");
-    }
+    colour_cell(&mut text, vocabulary::role_of(status), presentation);
     text
+}
+
+/// What one cell should become, decided from its column's NAME.
+///
+/// Three answers and no more, because a fourth would be a way to paint a cell
+/// without saying which rule painted it.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Paint {
+    /// Nothing of this cell's own. The `-` placeholder rule still applies,
+    /// which is the one treatment every table in the crate shares.
+    Default,
+    /// Wrap the cell in this role's span.
+    Role(Role),
+    /// Replace the cell with [`status_cell`]: the face, the word, and the
+    /// role the status wears. The only variant that changes CONTENT rather
+    /// than only colour, which is why STATUS cannot be expressed as a role.
+    Status(ProcStatus),
+}
+
+/// Paints one table's cells, asking `paint_of` for each by COLUMN NAME.
+///
+/// The single seam every colouring impl goes through. See
+/// [`Render::rows_for`](super::Render::rows_for) for why a name and never an
+/// index.
+///
+/// `zip` against `headers` deliberately stops at the shorter of the two: a
+/// row longer than its header list is malformed, `render_table` has its own
+/// guard for that, and painting past the last header would be inventing a
+/// column name to key on.
+///
+/// # Why `paint_of` is handed the cell and not the row
+///
+/// Every rule in this module decides a column from its OWN value: SOURCE from
+/// the source text, OUTCOME from the outcome kind, RESULT from the result
+/// word. Handing the closure the whole row let those rules reach the deciding
+/// value by index -- `row[1]`, `row[2]`, `row[3]` -- which is the exact
+/// coupling keying on the header name exists to remove, just moved one level
+/// in. Reordering `DogEnabledRow::headers` would have repointed them with
+/// nothing failing to compile.
+///
+/// So the closure gets `(header, cell, index)` and there is no row to index
+/// into. `index` remains only for the rules keyed off the SOURCE STRUCT
+/// rather than the rendered text ([`process_info_paint`] reads a
+/// `ProcessInfo`), and it addresses the payload, never a sibling cell.
+pub(super) fn paint<F>(
+    mut rows: Vec<Vec<String>>,
+    headers: &[&'static str],
+    presentation: Presentation,
+    status_word: bool,
+    paint_of: F,
+) -> Vec<Vec<String>>
+where
+    F: Fn(&str, &str, usize) -> Paint,
+{
+    for (index, row) in rows.iter_mut().enumerate() {
+        for (cell, header) in row.iter_mut().zip(headers) {
+            match paint_of(header, cell, index) {
+                Paint::Status(status) => *cell = status_cell(status, presentation, status_word),
+                Paint::Role(role) => colour_cell(cell, role, presentation),
+                Paint::Default => mute_a_dash(cell, presentation),
+            }
+        }
+    }
+    rows
+}
+
+/// The treatment every column read off a [`ProcessInfo`] wears, wherever it
+/// appears.
+///
+/// Shared by `FlockRows`, `DogRows` and `FlushedRows`, which between them
+/// carry different subsets of these columns in different orders. That is the
+/// whole point: the sheep table and the dogs table now agree column for
+/// column, and neither impl restates a single rule.
+///
+/// A column absent from this match wears [`Paint::Default`], which is right
+/// for the three that genuinely have nothing to report: NAME and UPTIME (no
+/// state, and no threshold anyone agreed on), and OUT_FILE/ERR_FILE, which
+/// are the subject of `flush`'s table rather than a reading about it.
+fn process_info_paint(header: &str, p: &ProcessInfo) -> Paint {
+    match header {
+        // Chrome. Both are stable labels an operator reads past rather than
+        // reads, so they are muted for the same reason: an unchanging value
+        // must not draw the eye away from one that moves.
+        "ID" | "FOLD" => Paint::Role(Role::Ink3),
+        "STATUS" => Paint::Status(p.status),
+        "RESTARTS" => Paint::Role(restarts_role(p.restarts)),
+        "EXIT" => Paint::Role(exit_role(p.pid, p.last_exit)),
+        "CPU" => Paint::Role(cpu_role(p.cpu_percent)),
+        "MEM" => Paint::Role(mem_role(p.memory_bytes)),
+        "SOURCE" => p
+            .dog
+            .as_ref()
+            .map_or(Paint::Default, |source| Paint::Role(source_role(source))),
+        // PID and SMIT reach the dash rule, which is all either needs: a real
+        // pid and a real smit are both plain, and an absent one is muted.
+        _ => Paint::Default,
+    }
+}
+
+/// [`Role`] for a SOURCE cell: the only column in the crate carrying a TRUST
+/// distinction.
+///
+/// `built-in` is shep running its own code -- `metrics`, `bark` -- and is the
+/// unremarkable case, so it is muted like every other label that never needs
+/// a second look.
+///
+/// `adopted` is a third-party binary running at the daemon's own trust level,
+/// from a path an operator supplied, with no sandboxing beyond it. That is
+/// worth knowing at a glance and it is not a fault: the operator chose it
+/// deliberately. `Role::Butter` is exactly that distinction everywhere else
+/// in this module -- the same role a restart count above zero wears.
+///
+/// `unknown` -- a `DogSource` variant this client predates -- takes Butter
+/// too, and NOT `Role::Bark`. It is tempting to paint it as a fault, since it
+/// is the one value where shep cannot say what is running at its own trust
+/// level. But the dog is very often perfectly healthy and the real cause is a
+/// client older than its daemon; painting a working dog red is the same
+/// mistake `mem_role`'s own doc refuses when it declines a third tier. Both
+/// non-built-in values answer the question the column exists to answer --
+/// shep's own code, or something else -- and that is the line Rin drew.
+fn source_role(source: &DogSource) -> Role {
+    match source {
+        DogSource::BuiltIn => Role::Ink3,
+        _ => Role::Butter,
+    }
+}
+
+/// The treatment the four dog-action rows wear: `enable`, `disable`, `adopt`
+/// and `rehome`, which share the columns `NAME SOURCE SHEPHERD STATUS`.
+///
+/// Keyed off the RENDERED cell rather than off the struct, unlike
+/// [`process_info_paint`]. The four types carry `source` as a `DogSource`, an
+/// `Option<DogSource>` and a `status` as free text, so reading the rendered
+/// text back is what lets one function serve all four instead of four
+/// near-identical ones differing only in how they reach the same two facts.
+///
+/// `cell` is the cell of the column named by `header`, never a sibling: see
+/// [`paint`]'s own doc for why this takes a cell rather than a row.
+///
+/// SOURCE takes [`source_role`], the same trust distinction the dogs table
+/// draws. `rehome`'s can be absent, which renders `-` and reaches the dash
+/// rule instead.
+///
+/// STATUS is coloured only when it NAMES a status. The field holds either a
+/// real `ProcStatus` rendering or a sentence saying why no shepherd answered,
+/// and a sentence has no role to wear; painting one would be decoration.
+///
+/// SHEPHERD is left plain, and it was the closest call here. `false` is worth
+/// knowing -- the config changed and nothing is running yet -- but the STATUS
+/// cell beside it already says exactly that in a whole sentence, so a colour
+/// would be a second decoration repeating its neighbour. That is the same
+/// reasoning `lookout/theme.rs` gives for keeping a face out of its own flock
+/// pane.
+fn dog_action_paint(header: &str, cell: &str) -> Paint {
+    match header {
+        "SOURCE" => match cell {
+            "built-in" => Paint::Role(Role::Ink3),
+            "-" => Paint::Default,
+            _ => Paint::Role(Role::Butter),
+        },
+        "STATUS" => status_named_by(cell).map_or(Paint::Default, Paint::Status),
+        _ => Paint::Default,
+    }
+}
+
+/// [`Role`] for one OUTCOME cell, over the eleven kinds the three per-sheep
+/// reply tables between them produce (`trigger`, `signal`, `whisper`).
+///
+/// One function rather than three, because no two of the three vocabularies
+/// share a kind with a different meaning, and because the four tiers answer
+/// the same question every time: did it work, is there nothing to report, is
+/// there a gap the operator can close, or did it fail.
+///
+/// - `Meadow` -- it worked.
+/// - `Ink3` -- nothing to report. `skipped` is a reload drainee and
+///   `not_running` is a sheep with no live process; neither is a failure and
+///   neither is news, which is what a muted cell says everywhere else here.
+/// - `Butter` -- a gap the operator can close. `no_channel` and `no_stdin`
+///   each name the config field that would have opened one.
+/// - `Bark` -- it failed. Reserved for exactly that, as everywhere else.
+///
+/// An unrecognised kind takes `Butter` rather than `Bark`: it means this
+/// client is older than the daemon, not that anything is broken. The same
+/// call [`source_role`] makes for its own `unknown`.
+fn outcome_role(kind: &str) -> Role {
+    match kind {
+        "replied" | "delivered" | "sent" => Role::Meadow,
+        "skipped" | "not_running" => Role::Ink3,
+        "timed_out" | "failed" | "not_written" => Role::Bark,
+        _ => Role::Butter,
+    }
+}
+
+/// The treatment the three per-sheep reply tables wear. They share the
+/// columns `ID NAME OUTCOME DETAIL` exactly.
+///
+/// ID is muted, the same chrome call [`process_info_paint`] makes for the
+/// same column name. OUTCOME takes [`outcome_role`]. DETAIL is left plain: it
+/// is free-form explanatory text of unbounded length, it is only ever present
+/// when OUTCOME has already said what happened, and colouring a whole
+/// sentence the colour of the word beside it is decoration.
+///
+/// `cell` is the cell of the column named by `header`, never a sibling: see
+/// [`paint`]'s own doc for why this takes a cell rather than a row.
+fn reply_paint(header: &str, cell: &str) -> Paint {
+    match header {
+        "ID" => Paint::Role(Role::Ink3),
+        "OUTCOME" => Paint::Role(outcome_role(cell)),
+        _ => Paint::Default,
+    }
+}
+
+/// The [`ProcStatus`] a free-text STATUS cell is naming, if it is naming one.
+///
+/// The dog-action rows ([`DogEnabledRow`] and its three siblings) carry
+/// `status` as a `String`, because it holds either a real status rendering or
+/// a sentence saying why no shepherd answered. A sentence has no role, so
+/// this is what keeps colour off it: a cell that names a status is coloured
+/// like one, and a cell that explains something is left alone.
+///
+/// Matched against each variant's own [`fmt::Display`](std::fmt::Display)
+/// rather than against a second table of strings, so this cannot drift from
+/// the rendering it is inverting. What it CAN miss is a variant added to
+/// `ProcStatus` and not added to `EVERY` below, which
+/// `every_status_is_recognised_by_its_own_rendering` is the guard for.
+fn status_named_by(text: &str) -> Option<ProcStatus> {
+    const EVERY: [ProcStatus; 6] = [
+        ProcStatus::Starting,
+        ProcStatus::Online,
+        ProcStatus::Stopping,
+        ProcStatus::Stopped,
+        ProcStatus::Errored,
+        ProcStatus::WaitingRestart,
+    ];
+    EVERY.into_iter().find(|status| status.to_string() == text)
+}
+
+/// Colours a cell [`Role::Ink3`] when it holds the `-` placeholder, and
+/// leaves it alone otherwise.
+///
+/// The rule is that an absent value must not compete with a real one, and it
+/// holds wherever a table prints a dash. It is [`Render::rows_for`]'s own
+/// default now, so every table in the crate gets it without asking and no
+/// impl has to remember; [`Paint::Default`] is what an impl returns to say
+/// "this cell has nothing of its own to say, apply the dash rule".
+pub(super) fn mute_a_dash(cell: &mut String, presentation: Presentation) {
+    if cell == "-" {
+        colour_cell(cell, Role::Ink3, presentation);
+    }
+}
+
+/// Wraps `cell` in [`crate::output::paint::style_for`]'s span for `role`, or
+/// leaves it untouched when `presentation.colour` is off -- the one place
+/// [`Self::rows_for`](Render::rows_for) applies colour, so every column it
+/// dresses up (STATUS included, through [`status_cell`] above) goes through
+/// the identical wrap rather than each cell reimplementing the same two
+/// lines.
+pub(super) fn colour_cell(cell: &mut String, role: Role, presentation: Presentation) {
+    if !presentation.colour {
+        return;
+    }
+    let style = super::paint::style_for(role, presentation.deep_colour);
+    *cell = format!("{style}{cell}{style:#}");
+}
+
+/// MEM's colour boundary, in bytes: below it, a live RSS is an ordinary
+/// footprint (a small worker, a sidecar, a CLI wrapper); at or above it,
+/// `Role::Butter` marks a sheep worth a second look. 128 MiB sits cleanly
+/// between the two footprints a real flock actually shows side by side --
+/// shep-testbed's own live flock (this task's own verification fixture)
+/// carries an app at 3.8M and one at 800M, and this threshold puts them on
+/// opposite sides of the ramp rather than leaving them to read identically,
+/// which is the whole complaint this task exists to fix.
+const MEM_ELEVATED_BYTES: u64 = 128 * 1024 * 1024;
+
+/// [`Role`] for a MEM cell. `None` (no live process to sample) is
+/// [`Role::Ink3`], the same "no honest value" colour every dash in this
+/// table gets; otherwise the cell is coloured by [`MEM_ELEVATED_BYTES`]'s
+/// two-tier ramp.
+///
+/// # What this deliberately cannot show
+///
+/// Two tiers saturate. A flock of several large but healthy services
+/// renders its whole MEM column one uniform [`Role::Butter`], unable to
+/// separate 160M from 4G, and on such a flock the colour carries no
+/// information at all.
+///
+/// A third tier is the obvious answer and is worse. The only role left is
+/// [`Role::Bark`], which is reserved for faults everywhere else in this
+/// table and in the lookout both, so a healthy 4G service would render as
+/// though it had broken. Adding a fifth role instead would mean adding it
+/// to `vocabulary.rs`, which is deliberately the single source both
+/// renderers read, and paying for it in the lookout's theme as well, for a
+/// distinction only some flocks need.
+///
+/// So the ramp answers "is this one unusual for this flock" and not "how
+/// much memory is this". `--format json` carries the exact number for any
+/// reader who needs the second question answered.
+fn mem_role(memory_bytes: Option<u64>) -> Role {
+    match memory_bytes {
+        None => Role::Ink3,
+        Some(bytes) if bytes >= MEM_ELEVATED_BYTES => Role::Butter,
+        Some(_) => Role::Meadow,
+    }
+}
+
+/// CPU's colour boundary, in percent of one core. Sustained use at or above
+/// this is unusual for a steady-state service and worth a glance;
+/// below it is ordinary load, not damage -- `Role::Bark` stays reserved for
+/// an actual fault (EXIT, below), never for a busy-but-healthy sheep.
+const CPU_ELEVATED_PERCENT: f32 = 50.0;
+
+/// [`Role`] for a CPU cell. `None` (not running) and `0.0%` (idle) are both
+/// [`Role::Ink3`] -- neither is news, and an idle sheep printing the same
+/// muted colour as one with no honest value to report is the point, not a
+/// coincidence. A busy sheep is coloured by [`CPU_ELEVATED_PERCENT`]'s
+/// two-tier ramp.
+fn cpu_role(cpu_percent: Option<f32>) -> Role {
+    match cpu_percent {
+        None => Role::Ink3,
+        Some(cpu) if cpu <= 0.0 => Role::Ink3,
+        Some(cpu) if cpu >= CPU_ELEVATED_PERCENT => Role::Butter,
+        Some(_) => Role::Meadow,
+    }
+}
+
+/// [`Role`] for a RESTARTS cell: `Role::Ink3` at zero, `Role::Butter` above
+/// it. Spec's own ruling (this task's brief) -- a restart count above zero
+/// is the single most useful glanceable signal in the table, so it gets the
+/// same "something to look at" colour `theme.rs`'s own `attention` does,
+/// never `Role::Bark`, which stays reserved for a genuine fault.
+const fn restarts_role(restarts: u32) -> Role {
+    if restarts == 0 {
+        Role::Ink3
+    } else {
+        Role::Butter
+    }
+}
+
+/// [`Role`] for an EXIT cell, mirroring [`exit_cell`]'s own branches rather
+/// than parsing the rendered text back apart: a live process (`pid.is_some()`,
+/// the cell reads `-`) and a clean `0` exit both get `Role::Ink3`, the same
+/// "nothing to report" colour a dash gets everywhere else in this table.
+/// Only a nonzero code or a signal -- an actual failure -- earns
+/// `Role::Bark`.
+fn exit_role(pid: Option<u32>, last_exit: Option<ExitInfo>) -> Role {
+    if pid.is_some() {
+        return Role::Ink3;
+    }
+    match last_exit {
+        Some(ExitInfo {
+            code: Some(code), ..
+        }) if code != 0 => Role::Bark,
+        Some(ExitInfo {
+            signal: Some(_), ..
+        }) => Role::Bark,
+        // A clean `0` exit, an exit the daemon could not characterize (both
+        // fields `None`), or no exit recorded at all -- none of the three is
+        // news.
+        _ => Role::Ink3,
+    }
 }
 
 /// The EXIT column's cell: the last exit's code or signal name for a sheep
@@ -267,14 +658,37 @@ fn signal_label(raw: i32) -> String {
 }
 
 /// The dogs half of a flock listing: the `ProcessInfo`s whose `dog` marker
-/// is set, rendered by where they came from rather than by their place in
-/// the flock.
+/// is set.
 ///
-/// No `ID` column, and that is the point of the split rather than an
-/// omission: ids reflect spawn order across one registry, so a dog booted
-/// alongside the flock lands among the sheep's numbers. Nobody sees that,
-/// because the two populations are never rendered together — which is what
-/// makes the shared id space cost nothing at the surface.
+/// # The columns line up with the sheep table
+///
+/// Every column the two tables share sits in the same ORDER, and each
+/// table's own columns come last:
+///
+/// ```text
+/// common:  ID  NAME  STATUS  PID  RESTARTS  EXIT  CPU  MEM  UPTIME
+/// sheep:   ... + FOLD  SMIT
+/// dogs:    ... + SOURCE
+/// ```
+///
+/// So an operator reading one table has learned the other. This used to have
+/// `SOURCE` second and no `ID` or `EXIT` at all, so the two tables printed
+/// under one `shep flock` disagreed on the position of every column after
+/// the first.
+///
+/// `ID` was left out deliberately once, on the grounds that ids reflect
+/// spawn order across the one registry so a dog booted alongside the flock
+/// lands among the sheep's numbers. Rin's ruling is that lining the tables
+/// up is worth more: the id is real, it is what `shep stop <id>` takes, and
+/// hiding it made the two tables look like different kinds of thing.
+/// `EXIT` joins for the same reason and needs no wire change either -- a dog
+/// exits exactly as a sheep does, and `last_exit` was already on the
+/// `ProcessInfo` this builds from, unrendered.
+///
+/// `FOLD` and `SMIT` stay off, and that is a different kind of absence: they
+/// are IMPOSSIBLE rather than empty. A dog belongs to no fold, and a smit is
+/// a mark a dog paints on a sheep, never one anything paints on a dog. A
+/// column that is structurally `-` on every row teaches nothing.
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
 pub struct DogRows(pub Vec<ProcessInfo>);
@@ -294,7 +708,7 @@ fn dog_source_label(source: &DogSource) -> &'static str {
 impl Render for DogRows {
     fn headers() -> &'static [&'static str] {
         &[
-            "NAME", "SOURCE", "STATUS", "PID", "RESTARTS", "CPU", "MEM", "UPTIME",
+            "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "SOURCE",
         ]
     }
 
@@ -303,7 +717,17 @@ impl Render for DogRows {
             .iter()
             .map(|p| {
                 vec![
+                    p.id.to_string(),
                     p.name.clone(),
+                    p.status.to_string(),
+                    p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                    p.restarts.to_string(),
+                    exit_cell(p.pid, p.last_exit),
+                    p.cpu_percent
+                        .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+                    p.memory_bytes
+                        .map_or_else(|| "-".to_string(), super::human_bytes),
+                    super::human_duration(p.uptime_ms),
                     // Never the adopted path — see `Self::JSON_ONLY`'s
                     // sibling reasoning on `FlockRows` for why a path stays
                     // out of the table. `None` reads as `-`: this row only
@@ -313,17 +737,23 @@ impl Render for DogRows {
                     p.dog.as_ref().map_or("-".to_string(), |source| {
                         dog_source_label(source).to_string()
                     }),
-                    p.status.to_string(),
-                    p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
-                    p.restarts.to_string(),
-                    p.cpu_percent
-                        .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
-                    p.memory_bytes
-                        .map_or_else(|| "-".to_string(), super::human_bytes),
-                    super::human_duration(p.uptime_ms),
                 ]
             })
             .collect()
+    }
+
+    /// [`process_info_paint`], the same function `FlockRows` uses. Nine of
+    /// this table's ten columns are shared with that one and now wear
+    /// identical treatments; SOURCE is the tenth and is the only rule
+    /// neither table states twice.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        paint(
+            self.rows(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, _cell, index| process_info_paint(header, &self.0[index]),
+        )
     }
 
     /// # Panics
@@ -331,58 +761,53 @@ impl Render for DogRows {
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
         match header {
+            "ID" => "id",
             "NAME" => "name",
-            "SOURCE" => "dog",
             "STATUS" => "status",
             "PID" => "pid",
             "RESTARTS" => "restarts",
+            "EXIT" => "last_exit",
             "CPU" => "cpu_percent",
             "MEM" => "memory_bytes",
             "UPTIME" => "uptime_ms",
+            "SOURCE" => "dog",
             other => panic!("DogRows::headers() does not include {other:?}"),
         }
     }
 
     const JSON_ONLY: &'static [&'static str] = &[
-        // Ids reflect spawn order across the one registry shared with the
-        // sheep half; a dog booted alongside the flock lands among the
-        // sheep's own numbers. No column, because the two populations are
-        // never rendered together for that number to be compared against —
-        // see this type's own doc comment.
-        "id",
         // Fold membership is a sheep concept — a dog is supervised, never
-        // grouped for a selector to match by fold.
+        // grouped for a selector to match by fold. Structurally absent, not
+        // merely empty, which is why it stays out of the table even now that
+        // the two tables otherwise line up.
         "fold",
         // Same reason `FlockRows` keeps them out of its own table: absolute
         // paths, often longer than every other column put together. They
         // ride the JSON so a programmatic consumer can still find them.
-        "out_file",
-        "err_file",
+        "out_file", "err_file",
         // Always `null` here: only `Describe` walks for lambs, and this
         // table renders `ListFlock`'s dog half. A dog is one process by
         // contract, so a lamb tree for one is not a rendering this table
         // needs to grow to cover.
         "lambs",
-        // No EXIT column here (task 49): the task that added `last_exit`
-        // scoped the new table column to `shep flock`'s own sheep table.
-        // Rides the JSON anyway, same as every other field on this wire, so
-        // a consumer switching on `ProcessInfo` shape alone still sees it.
-        "last_exit",
+        // A dog paints smits; nothing paints one on a dog. Structurally
+        // absent, like `fold` above, and in the JSON for the same
+        // shape-consistency reason as the rest of this list.
+        "smit",
     ];
 
-    // Parallel to `headers()` above: `["NAME", "SOURCE", "STATUS", "PID",
-    // "RESTARTS", "CPU", "MEM", "UPTIME"]`. NAME and STATUS are what
-    // identify a row -- the same floor `FlockRows` uses for its own
-    // ID/NAME/STATUS -- so they sit at `0`. The five columns this table
-    // shares with `FlockRows` (UPTIME, PID, MEM, RESTARTS, CPU) keep that
-    // table's own drop order exactly, so an operator who has learned one
-    // table's behaviour is not surprised by the other. SOURCE is the one
-    // column this table has that `FlockRows` does not: it says where the
-    // binary came from, not whether the dog is healthy, so it is the least
-    // essential column here -- the same role `FOLD` plays for the flock --
-    // and drops first. `dog_priorities_line_up_with_dog_headers` (below)
-    // pins both the length and which two columns sit at `0`.
-    const PRIORITIES: &'static [u8] = &[0, 6, 0, 2, 4, 5, 3, 1];
+    // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
+    // "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "SOURCE"]`. Now that the
+    // columns line up with the sheep table, so do their drop priorities:
+    // every one of the nine shared columns carries the exact number
+    // `FlockRows` gives it, so a narrowing terminal takes the two tables
+    // apart in the same order and an operator who has learned one is not
+    // surprised by the other. SOURCE takes `7`, the slot `FOLD` holds over
+    // there, for the reason that made them the same kind of column before
+    // this reorder: it says where the binary came from, not whether the dog
+    // is healthy. `dog_priorities_line_up_with_dog_headers` (below) pins
+    // both the length and which three columns sit at `0`.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7];
 }
 
 /// One sheep's lamb tree, as `describe`'s second table.
@@ -398,6 +823,14 @@ impl Render for DogRows {
 #[derive(Debug, Serialize)]
 pub struct LambRows(pub Vec<Lamb>);
 
+/// No colour, and that is a decision rather than an omission.
+///
+/// Both columns are identity: which process, and what it is running. A lamb
+/// has no status, no restart count, no resource reading, and no placeholder
+/// -- `pid` is a real number on every row and `name` is a real string. There
+/// is nothing here for a colour to carry, and the rule is that every colour
+/// carries information. Muting one of two columns would just be picking one
+/// to look faded.
 impl Render for LambRows {
     fn headers() -> &'static [&'static str] {
         &["PID", "NAME"]
@@ -477,6 +910,39 @@ impl Render for DogEnabledRow {
         ]]
     }
 
+    /// The dog-action rows' shared treatment, spelled out here once and
+    /// pointed at from the other three.
+    ///
+    /// SOURCE is muted, the same call `DogRows` makes: it says where the
+    /// binary came from, never whether anything is healthy.
+    ///
+    /// STATUS is coloured only when it NAMES a status. This field holds
+    /// either a real `ProcStatus` rendering or a sentence saying why no
+    /// shepherd answered ([`Self::status`]'s own doc), and a sentence has no
+    /// role to wear -- colouring it would be decoration, which is the one
+    /// thing the rule here forbids. [`status_named_by`] is what tells the two
+    /// apart.
+    ///
+    /// SHEPHERD is left plain deliberately, and it was the closest call in
+    /// this table. `false` is worth knowing -- it means the config changed
+    /// and nothing is running yet -- but the STATUS cell beside it already
+    /// says so in a whole sentence, so a colour here would be a second
+    /// decoration saying what the text already says. That is the same
+    /// reasoning `lookout/theme.rs` gives for not putting a face in its own
+    /// flock pane.
+    ///
+    /// NAME stays plain, matching every other table in this module.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| dog_action_paint(header, cell),
+        )
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -543,6 +1009,18 @@ impl Render for DogDisabledRow {
         ]]
     }
 
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| dog_action_paint(header, cell),
+        )
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -599,6 +1077,18 @@ impl Render for DogAdoptedRow {
             self.shepherd_acted.to_string(),
             self.status.clone(),
         ]]
+    }
+
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| dog_action_paint(header, cell),
+        )
     }
 
     /// # Panics
@@ -665,6 +1155,18 @@ impl Render for DogRehomedRow {
             self.shepherd_acted.to_string(),
             self.status.clone(),
         ]]
+    }
+
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| dog_action_paint(header, cell),
+        )
     }
 
     /// # Panics
@@ -740,6 +1242,26 @@ impl Render for FlushedRows {
             .collect()
     }
 
+    /// [`process_info_paint`] again, which for this table's four columns
+    /// comes out as: ID muted like every other id, NAME plain, and both path
+    /// columns left to the dash rule.
+    ///
+    /// A real path is deliberately plain. It is the subject of the table
+    /// rather than a reading about it, there is no threshold to ramp against
+    /// and no fault to mark, and colouring the widest column on the row for
+    /// no information is exactly the decoration the rule forbids. No STATUS
+    /// column here at all -- see this type's own doc for why `flush` renders
+    /// the files rather than the lifecycle.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        paint(
+            self.rows(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, _cell, index| process_info_paint(header, &self.0[index]),
+        )
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -783,6 +1305,9 @@ impl Render for FlushedRows {
         // a terminal. Stays in the JSON for shape consistency with every
         // other verb answering `ProcessInfo`.
         "last_exit",
+        // And the same again for the mark a dog painted: a flush neither
+        // reads nor changes it.
+        "smit",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "OUT_FILE",
@@ -841,6 +1366,26 @@ impl Render for EmptiedFiles {
             .collect()
     }
 
+    /// RESULT alone. `emptied` means a file was truncated; `absent` means
+    /// there was none to truncate, which is the state `flush` was asked to
+    /// produce rather than a failure, so it is muted rather than marked.
+    /// STREAM is one of two fixed words and FILE is a path; neither varies
+    /// in a way a colour could carry.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| match (header, cell) {
+                ("RESULT", "emptied") => Paint::Role(Role::Meadow),
+                ("RESULT", _) => Paint::Role(Role::Ink3),
+                _ => Paint::Default,
+            },
+        )
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -879,6 +1424,14 @@ impl Render for EmptiedFiles {
 #[serde(transparent)]
 pub struct DeletedIds(pub Vec<u32>);
 
+/// No colour, and NOT the muted ID every other table gives that column.
+///
+/// An ID is chrome elsewhere because it sits beside content and must not draw
+/// the eye away from it. Here it is the only column and it is the content, so
+/// muting it would fade the whole table and distinguish nothing. The same
+/// header can want different treatment when it is the entire row, which is
+/// the one place keying on the column name needs a deliberate exception
+/// rather than a shared rule.
 impl Render for DeletedIds {
     fn headers() -> &'static [&'static str] {
         &["ID"]
@@ -927,6 +1480,27 @@ impl Render for KillRow {
         vec![vec![self.pid.to_string(), self.socket_removed.to_string()]]
     }
 
+    /// SOCKET_REMOVED alone, and it earns a colour where most booleans in
+    /// this module do not: `false` means the socket file outlived the
+    /// daemon, which is exactly what the next boot has to contend with.
+    /// `Butter` and not `Bark` -- a leftover to clear is not a crash. PID
+    /// belongs to a process that has just gone away; there is nothing left
+    /// to say about it.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let removed = self.socket_removed;
+        paint(
+            self.rows(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, _cell, _index| match header {
+                "SOCKET_REMOVED" if removed => Paint::Role(Role::Meadow),
+                "SOCKET_REMOVED" => Paint::Role(Role::Butter),
+                _ => Paint::Default,
+            },
+        )
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -969,6 +1543,21 @@ pub struct RolledSheep {
 #[derive(Debug, Serialize)]
 pub struct RolledSheepRows(pub Vec<RolledSheep>);
 
+/// No colour, including on STATUS, which is the one place in this module a
+/// STATUS column goes unpainted.
+///
+/// It was painted first, on the reasoning that keying treatments by column
+/// NAME is exactly so the same header means the same thing everywhere. That
+/// reasoning is right in general and wrong here, because this column is a
+/// CONSTANT: `commands::query`'s `flock_from_roll` writes the literal
+/// `stopped` on every row, since nothing in a saved roll is running by
+/// definition. A colour identical on every row of every rendering of this
+/// table distinguishes nothing, and the rule the colour work runs on is that
+/// a colour carries information or the column does not get one. Rin's call,
+/// and it is the same call `AvailableDogRows` gets for CATEGORY.
+///
+/// INSTANCES is a count with no threshold anyone agreed on, and NAME is
+/// identity.
 impl Render for RolledSheepRows {
     fn headers() -> &'static [&'static str] {
         &["NAME", "INSTANCES", "STATUS"]
@@ -1022,6 +1611,9 @@ pub struct SavedRollRow {
     pub apps: u32,
 }
 
+/// No colour. A path and a count, both of them the report itself rather than
+/// a reading about it: no state, no threshold, and no outcome. Nothing here
+/// for a colour to carry.
 impl Render for SavedRollRow {
     fn headers() -> &'static [&'static str] {
         &["FILE", "APPS"]
@@ -1095,6 +1687,27 @@ impl Render for ImportRows {
                 ]
             })
             .collect()
+    }
+
+    /// REUSE_PORT alone, and only when it is `true`. This type's own doc
+    /// calls it "the column an operator scans for at a glance": a `true`
+    /// means the imported app relied on pm2 binding the port for it, shep
+    /// binds nothing, and the app itself has to set `SO_REUSEPORT`. That is
+    /// work the operator has to do, so it takes the same `Butter` a restart
+    /// count above zero takes. A `false` is the ordinary case and says
+    /// nothing.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| match (header, cell) {
+                ("REUSE_PORT", "true") => Paint::Role(Role::Butter),
+                _ => Paint::Default,
+            },
+        )
     }
 
     /// # Panics
@@ -1171,6 +1784,31 @@ impl Render for StartupSteps {
                 ]
             })
             .collect()
+    }
+
+    /// RESULT alone, over its three shapes. `ok` worked. `absent` is an
+    /// `unstartup` that found no unit to remove, which is the state it was
+    /// asked to produce rather than a failure (that field's own doc says
+    /// so), so it is muted. Anything else is the failure in one line, and a
+    /// half-installed unit is exactly what this verb's table exists to
+    /// catch, so it takes `Bark`.
+    ///
+    /// ACTION is one of three fixed words and TARGET is a path or a command;
+    /// neither varies in a way a colour could carry.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| match (header, cell) {
+                ("RESULT", "ok") => Paint::Role(Role::Meadow),
+                ("RESULT", "absent") => Paint::Role(Role::Ink3),
+                ("RESULT", _) => Paint::Role(Role::Bark),
+                _ => Paint::Default,
+            },
+        )
     }
 
     /// # Panics
@@ -1269,6 +1907,18 @@ impl Render for TriggeredRows {
                 ]
             })
             .collect()
+    }
+
+    /// [`reply_paint`], shared with the other two per-sheep reply tables.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| reply_paint(header, cell),
+        )
     }
 
     /// # Panics
@@ -1397,6 +2047,18 @@ impl Render for SignalledRows {
             .collect()
     }
 
+    /// [`reply_paint`], shared with the other two per-sheep reply tables.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| reply_paint(header, cell),
+        )
+    }
+
     /// # Panics
     /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
@@ -1467,6 +2129,18 @@ impl Render for SentLineRows {
                 ]
             })
             .collect()
+    }
+
+    /// [`reply_paint`], shared with the other two per-sheep reply tables.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| reply_paint(header, cell),
+        )
     }
 
     /// # Panics
@@ -1543,6 +2217,33 @@ impl Render for BarkRows {
                 ]
             })
             .collect()
+    }
+
+    /// SINKS alone. A bark that reached every sink it was configured for is
+    /// `Meadow`; one where any sink refused carries `(failed)` in the cell
+    /// ([`sinks_cell`]) and is `Bark`, which is a real delivery failure and
+    /// the reason an operator reads this table at all. A bark with no sinks
+    /// renders `-` and reaches the dash rule.
+    ///
+    /// WHEN is left plain even though it is the same shape of column ID is,
+    /// and the difference is worth stating: an id never changes and is read
+    /// past, while a timestamp is the thing an operator scans an alert feed
+    /// BY. Muting it would fade the column doing the most work. RULE,
+    /// SUBJECT and MESSAGE are the record itself.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        let rows = self.rows();
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| match (header, cell) {
+                ("SINKS", "-") => Paint::Default,
+                ("SINKS", sinks) if sinks.contains("(failed)") => Paint::Role(Role::Bark),
+                ("SINKS", _) => Paint::Role(Role::Meadow),
+                _ => Paint::Default,
+            },
+        )
     }
 
     /// # Panics
@@ -1637,6 +2338,8 @@ pub struct KvEntry {
 #[serde(transparent)]
 pub struct KvRows(pub Vec<KvEntry>);
 
+/// No colour. The store is opaque to shep: a key and a value are operator
+/// data, and shep has no opinion about either that a colour could express.
 impl Render for KvRows {
     fn headers() -> &'static [&'static str] {
         &["KEY", "VALUE"]
@@ -1683,6 +2386,13 @@ impl Render for KvRows {
 #[serde(transparent)]
 pub struct AvailableDogRows(pub Vec<AvailableDog>);
 
+/// No colour, and CATEGORY is the near miss worth naming. It is an
+/// organisational label, which is the shape `FOLD` and `SOURCE` both get
+/// muted for. But those two are muted so they recede behind a STATUS column
+/// beside them, and this table has no status and describes nothing that is
+/// running: it is a catalogue of dogs an operator could adopt. With no signal
+/// column for chrome to recede behind, muting one of four would be picking a
+/// column to look faded rather than telling anyone anything.
 impl Render for AvailableDogRows {
     fn headers() -> &'static [&'static str] {
         &["NAME", "PACKAGE", "CATEGORY", "DESCRIPTION"]
@@ -1755,6 +2465,17 @@ pub struct KvUnsetRow {
     pub removed: u32,
 }
 
+/// No colour, for [`DeletedIds`]' reason and one of its own.
+///
+/// One column, which is also the whole content: muting it would fade the
+/// entire table and distinguish nothing, since there is no second column for
+/// a muted one to recede behind.
+///
+/// `removed` is also a COUNT rather than an outcome, and it is `1` on every
+/// single-key `unset` -- a key that was not there exits `NotFound` before
+/// this is ever built (see the field's own doc). So the only value a colour
+/// could distinguish is `--all` against an already-empty store, and `0`
+/// reads as `0`.
 impl Render for KvUnsetRow {
     fn headers() -> &'static [&'static str] {
         &["REMOVED"]
@@ -1826,6 +2547,16 @@ pub(crate) mod tests {
                 code: Some(1),
                 signal: None,
             }))
+            // Fixed rather than id-derived, like `fold` and `cpu_percent`
+            // above. The literal a real dog paints, taken from shep-deploy's
+            // own renderer, so the drift check compares the cell against a
+            // string shep will actually be handed rather than a placeholder.
+            // Left `None` it would serialize as `null`, which
+            // `assert_no_drift`'s cell check skips rather than compares, and
+            // SMIT would quietly stop being watched: swapping the cell for a
+            // bogus string still passed the drift test until this line
+            // existed.
+            .smit(Some("\u{25b2} main@a1b2c3".to_string()))
             .build()
     }
 
@@ -2064,13 +2795,15 @@ pub(crate) mod tests {
     /// JSON value is the tagged `DogSource` object (`{"kind": "built_in"}`
     /// or `{"kind": "adopted", "path": ...}`), not a plain string this
     /// gate's cell comparison knows how to stringify — the test above pins
-    /// that mapping instead.
+    /// that mapping instead. `EXIT` joins for exactly the reason
+    /// `flock_rows_do_not_drift` gives for its own: `last_exit` is a nested
+    /// object, not a scalar.
     #[test]
     fn dog_rows_do_not_drift() {
         assert_no_drift(
             &DogRows(vec![dog_info("metrics", DogSource::BuiltIn)]),
             |j| &j[0],
-            &["UPTIME", "CPU", "MEM", "SOURCE"],
+            &["UPTIME", "CPU", "MEM", "SOURCE", "EXIT"],
         );
     }
 
@@ -2813,7 +3546,7 @@ pub(crate) mod tests {
     #[test]
     fn priorities_line_up_with_headers_for_every_render_impl() {
         assert_priorities_match_headers::<FlockRows>(&["ID", "NAME", "STATUS"]);
-        assert_priorities_match_headers::<DogRows>(&["NAME", "STATUS"]);
+        assert_priorities_match_headers::<DogRows>(&["ID", "NAME", "STATUS"]);
         assert_priorities_match_headers::<LambRows>(&["PID", "NAME"]);
         assert_priorities_match_headers::<DogEnabledRow>(&["NAME", "STATUS"]);
         assert_priorities_match_headers::<DogDisabledRow>(&["NAME", "STATUS"]);
@@ -2866,13 +3599,782 @@ pub(crate) mod tests {
             vec![
                 // The three that identify a sheep, and so never drop.
                 "ID", "NAME", "STATUS", //
-                // Then, in the order they are given up as the terminal
-                // narrows: the ones answering "is it healthy" outlast the
-                // ones answering "which one is it".
-                "UPTIME", "PID", "MEM", "RESTARTS", "CPU", "EXIT", "FOLD",
+                // Then, in the order they SURVIVE as the terminal narrows
+                // (ascending priority; the real give-up order is the
+                // reverse of this): the ones answering "is it healthy"
+                // outlast the ones answering "which one is it".
+                "UPTIME", "PID", "MEM", "RESTARTS", "CPU", "EXIT", "FOLD", "SMIT",
             ],
             "the flock listing's drop order changed; if that is deliberate, \
              change this test and say why in the commit"
         );
+    }
+
+    // --- Colour: MEM/CPU/RESTARTS/EXIT/ID/FOLD/placeholder roles ----------
+    //
+    // These pin the boundary of each ramp directly against `Role`, rather
+    // than through a snapshot: a snapshot passes whatever was accepted into
+    // it, so it cannot by itself prove a colour is keyed to the right fact.
+    // These can fail on their own if a threshold or a branch moves.
+
+    /// fails if MEM's ramp boundary moves without a test noticing, or if
+    /// either side of it stops being the role the governing rule ("every
+    /// colour must carry information") calls for: `None` is the same
+    /// "nothing to report" colour a dash gets everywhere else in the table,
+    /// and the boundary itself is inclusive on the `Butter` side.
+    #[test]
+    fn mem_role_ramps_at_its_documented_boundary() {
+        assert_eq!(mem_role(None), Role::Ink3);
+        assert_eq!(mem_role(Some(MEM_ELEVATED_BYTES - 1)), Role::Meadow);
+        assert_eq!(mem_role(Some(MEM_ELEVATED_BYTES)), Role::Butter);
+        // The two live figures this task's own verification fixture named:
+        // a light app and a heavy one must land on opposite sides.
+        assert_eq!(mem_role(Some(3_800_000)), Role::Meadow, "3.8M is light");
+        assert_eq!(mem_role(Some(800_000_000)), Role::Butter, "800M is heavy");
+    }
+
+    /// fails on the same class of regression as `mem_role`'s own test,
+    /// pointed at CPU: idle (`0.0%`) must stay `Ink3` even though it is
+    /// technically "below the ramp", since idle is not news, and the
+    /// boundary itself is inclusive on the `Butter` side.
+    #[test]
+    fn cpu_role_ramps_at_its_documented_boundary() {
+        assert_eq!(cpu_role(None), Role::Ink3);
+        assert_eq!(cpu_role(Some(0.0)), Role::Ink3);
+        assert_eq!(cpu_role(Some(0.1)), Role::Meadow);
+        assert_eq!(cpu_role(Some(CPU_ELEVATED_PERCENT - 0.1)), Role::Meadow);
+        assert_eq!(cpu_role(Some(CPU_ELEVATED_PERCENT)), Role::Butter);
+        assert_eq!(cpu_role(Some(99.0)), Role::Butter);
+    }
+
+    /// fails if a restart count of exactly zero stops being muted, or if
+    /// one restart stops being coloured at all -- an operator's single most
+    /// useful glanceable signal in this table (this task's own brief).
+    #[test]
+    fn restarts_role_is_ink3_only_at_exactly_zero() {
+        assert_eq!(restarts_role(0), Role::Ink3);
+        assert_eq!(restarts_role(1), Role::Butter);
+        assert_eq!(restarts_role(u32::MAX), Role::Butter);
+    }
+
+    /// fails if `exit_role` starts painting a clean `0` exit, a still-running
+    /// sheep, or an uncharacterised exit as if they were a fault, or if it
+    /// stops painting a genuine one. Mirrors `exit_cell`'s own branches
+    /// directly rather than going through the rendered `-`/number text, so
+    /// this cannot pass by accident the way a text-sniffing test could if
+    /// `exit_cell`'s own formatting ever changed.
+    #[test]
+    fn exit_role_is_bark_only_for_a_genuine_failure() {
+        // Still running: the cell itself reads `-`, and running is not a
+        // fault regardless of what a *previous* exit recorded.
+        assert_eq!(
+            exit_role(
+                Some(1234),
+                Some(ExitInfo {
+                    code: Some(1),
+                    signal: None
+                })
+            ),
+            Role::Ink3
+        );
+        // Not running, no exit ever recorded.
+        assert_eq!(exit_role(None, None), Role::Ink3);
+        // Not running, a clean exit.
+        assert_eq!(
+            exit_role(
+                None,
+                Some(ExitInfo {
+                    code: Some(0),
+                    signal: None
+                })
+            ),
+            Role::Ink3
+        );
+        // Not running, the daemon could not characterize the exit.
+        assert_eq!(
+            exit_role(
+                None,
+                Some(ExitInfo {
+                    code: None,
+                    signal: None
+                })
+            ),
+            Role::Ink3
+        );
+        // Not running, a genuine nonzero exit code.
+        assert_eq!(
+            exit_role(
+                None,
+                Some(ExitInfo {
+                    code: Some(1),
+                    signal: None
+                })
+            ),
+            Role::Bark
+        );
+        // Not running, killed by a signal.
+        assert_eq!(
+            exit_role(
+                None,
+                Some(ExitInfo {
+                    code: None,
+                    signal: Some(9)
+                })
+            ),
+            Role::Bark
+        );
+    }
+
+    // --- Colour: the seven tables that are not the flock listing ---------
+    //
+    // Colour was commissioned as "colour the flock table" and delivered
+    // exactly that, so `colour_cell` appeared in one of the eight `Render`
+    // impls in this module and nowhere else. These pin what each of the
+    // other seven now does AND what it deliberately does not, because
+    // "nothing is coloured" and "everything is coloured" are both wrong and
+    // a presence check alone cannot tell either from the rule.
+    //
+    // Every assertion below compares against the exact painted string rather
+    // than looking for an escape byte. A presence check would pass on a cell
+    // painted the WRONG role, which is the failure that matters here: a
+    // healthy dog painted `Bark` reads as broken.
+
+    /// The 256-colour presentation these cases render at.
+    fn coloured() -> Presentation {
+        use crate::style::StyleLevel;
+        Presentation::new(
+            StyleLevel::Full,
+            None,
+            Some(std::ffi::OsStr::new("xterm-256color")),
+            None,
+            200,
+        )
+    }
+
+    /// `text` as `colour_cell` would paint it for `role`. Built through
+    /// `paint::style_for`, the same function the renderer calls, so this
+    /// compares the ROLE and not merely the presence of an escape.
+    fn painted(text: &str, role: Role) -> String {
+        let mut cell = text.to_string();
+        colour_cell(&mut cell, role, coloured());
+        cell
+    }
+
+    /// One dog, with readings chosen so every ramp lands on a known side:
+    /// four restarts (above zero), 0.0% CPU (idle, which is muted rather
+    /// than green), and 3 MiB (below the MEM boundary).
+    fn sample_dog(status: ProcStatus, pid: Option<u32>) -> ProcessInfo {
+        ProcessInfo::builder(9, "log-rotate", status)
+            .pid(pid)
+            .restarts(4)
+            .uptime_ms(41_000)
+            .cpu_percent(pid.map(|_| 0.0))
+            .memory_bytes(pid.map(|_| 3 * 1024 * 1024))
+            .dog(Some(DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            }))
+            .build()
+    }
+
+    /// fails if the two tables stop agreeing on their shared columns, in
+    /// order.
+    ///
+    /// This is the property Rin asked for, and it is checked as a property
+    /// rather than by pinning two header lists: a list would pass by being
+    /// edited to match whatever the code now does, which is exactly how the
+    /// two drifted apart in the first place.
+    #[test]
+    fn the_sheep_and_dog_tables_share_a_column_order() {
+        let sheep = FlockRows::headers();
+        let dogs = DogRows::headers();
+
+        let common = [
+            "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME",
+        ];
+        assert_eq!(
+            &sheep[..common.len()],
+            &common,
+            "the sheep table leads with them"
+        );
+        assert_eq!(&dogs[..common.len()], &common, "and so does the dogs table");
+
+        assert_eq!(
+            &sheep[common.len()..],
+            &["FOLD", "SMIT"],
+            "the sheep table's own"
+        );
+        assert_eq!(&dogs[common.len()..], &["SOURCE"], "the dogs table's own");
+
+        // FOLD and SMIT are absent from the dogs table because they are
+        // IMPOSSIBLE for a dog, not because they are empty: a dog belongs to
+        // no fold, and a smit is a mark a dog paints ON a sheep.
+        assert!(
+            DogRows::JSON_ONLY.contains(&"fold") && DogRows::JSON_ONLY.contains(&"smit"),
+            "both still ride the JSON, with a reason recorded beside them"
+        );
+    }
+
+    /// fails if a shared column wears a different treatment in the two
+    /// tables.
+    ///
+    /// The two are painted by ONE function keyed on the column name, so this
+    /// is what says that function is actually reached from both rather than
+    /// reimplemented once each. It compares the painted CELLS, not the roles,
+    /// so it also catches a table that read the right rule off the wrong
+    /// column.
+    #[test]
+    fn a_shared_column_is_painted_the_same_in_both_tables() {
+        let mut as_sheep = sample_dog(ProcStatus::Online, Some(14_110));
+        as_sheep.dog = None;
+        let sheep = FlockRows(vec![as_sheep]).rows_for(coloured(), true);
+        let dogs =
+            DogRows(vec![sample_dog(ProcStatus::Online, Some(14_110))]).rows_for(coloured(), true);
+
+        for (index, header) in FlockRows::headers().iter().enumerate() {
+            let Some(there) = DogRows::headers().iter().position(|h| h == header) else {
+                continue;
+            };
+            assert_eq!(
+                sheep[0][index], dogs[0][there],
+                "{header} renders differently in the two tables"
+            );
+        }
+    }
+
+    /// fails if the colouring goes back to being keyed on a column's INDEX.
+    ///
+    /// The mechanism this guards is invisible in a diff and invisible in a
+    /// snapshot. `rows_for` used to paint `row[4]` with the restart ramp
+    /// because RESTARTS was the fifth column; move a column and that index
+    /// silently points somewhere else, nothing fails to compile, and the
+    /// wrong cell wears the ramp.
+    ///
+    /// # Why this drives a REVERSED header list
+    ///
+    /// Asserting against the real `FlockRows`/`DogRows` cannot catch it. The
+    /// reorder left the two tables sharing indices 0 through 8 exactly, so on
+    /// those columns a positional build and a name-keyed one paint
+    /// identically and only SOURCE tells them apart. A test that looked
+    /// convincing while resting on one column is the shape of test this
+    /// branch has already found three of.
+    ///
+    /// So this drives [`paint`] over a header list in REVERSE, which no real
+    /// table uses, and asserts every column still wears its own rule. Under
+    /// any index-keyed rule every one of these lands somewhere else.
+    #[test]
+    fn a_columns_colour_follows_its_name_and_not_its_position() {
+        let dog = sample_dog(ProcStatus::Online, Some(14_110));
+        let forwards = DogRows::headers();
+        let backwards: Vec<&'static str> = forwards.iter().copied().rev().collect();
+
+        let mut cells: Vec<String> = DogRows(vec![dog.clone()]).rows().remove(0);
+        cells.reverse();
+        let painted_rows = paint(vec![cells], &backwards, coloured(), true, |header, _, _| {
+            process_info_paint(header, &dog)
+        });
+
+        let at = |name: &str| backwards.iter().position(|h| *h == name).unwrap();
+        // Every one of these indices differs from the one the same column has
+        // in the real table, which is what makes the assertions load-bearing.
+        assert_eq!(painted_rows[0][at("ID")], painted("9", Role::Ink3));
+        assert_eq!(painted_rows[0][at("RESTARTS")], painted("4", Role::Butter));
+        assert_eq!(painted_rows[0][at("MEM")], painted("3.0M", Role::Meadow));
+        assert_eq!(painted_rows[0][at("CPU")], painted("0.0%", Role::Ink3));
+        assert_eq!(
+            painted_rows[0][at("SOURCE")],
+            painted("adopted", Role::Butter)
+        );
+        assert_eq!(
+            painted_rows[0][at("STATUS")],
+            painted("(o.o) online", Role::Meadow)
+        );
+        assert_eq!(painted_rows[0][at("NAME")], "log-rotate", "still plain");
+        assert_eq!(painted_rows[0][at("UPTIME")], "41s", "still plain");
+    }
+
+    /// The same reversed-header proof, pointed at every painter that is NOT
+    /// [`process_info_paint`].
+    ///
+    /// The sibling of `a_columns_colour_follows_its_name_and_not_its_position`
+    /// and the reason it needed one. That test covered `process_info_paint`
+    /// alone, while `dog_action_paint`, `reply_paint` and the four inline
+    /// closures each dispatched on the header NAME and then read the deciding
+    /// value at a fixed index -- `row[1]`, `row[3]`, `row[2]`, `rows[i][4]`.
+    /// Reordering `DogEnabledRow::headers` would have repointed all of them
+    /// with nothing failing to compile and nothing here to notice, which is
+    /// the exact defect the by-name rule exists to remove, moved one level
+    /// in.
+    ///
+    /// `paint` now hands each rule its OWN cell, so there is no row to index
+    /// into and the class of bug is gone by construction rather than by
+    /// inspection. This is what says so: every table below is painted through
+    /// a REVERSED header list, so every column sits somewhere it never sits
+    /// in life, and each still wears its own rule.
+    #[test]
+    fn every_painter_follows_the_column_name_and_not_the_position() {
+        /// Paints `rows` through `T`'s headers in reverse, and hands back a
+        /// lookup from column name to painted cell.
+        fn reversed<T: Render>(row: Vec<String>, paint_of: fn(&str, &str) -> Paint) -> Vec<String> {
+            let backwards: Vec<&'static str> = T::headers().iter().copied().rev().collect();
+            let mut cells = row;
+            cells.reverse();
+            let mut painted = paint(
+                vec![cells],
+                &backwards,
+                coloured(),
+                true,
+                |header, cell, _index| paint_of(header, cell),
+            )
+            .remove(0);
+            painted.reverse();
+            painted
+        }
+        let at =
+            |headers: &[&'static str], name: &str| headers.iter().position(|h| *h == name).unwrap();
+
+        // --- the four dog-action rows, through `dog_action_paint` ---------
+        let adopted = DogAdoptedRow {
+            name: "log-rotate".to_string(),
+            source: DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            },
+            shepherd_acted: true,
+            status: "online".to_string(),
+        };
+        let cells = reversed::<DogAdoptedRow>(adopted.rows().remove(0), dog_action_paint);
+        let h = DogAdoptedRow::headers();
+        assert_eq!(
+            cells[at(h, "SOURCE")],
+            painted("adopted", Role::Butter),
+            "SOURCE decided from SOURCE, wherever it sits"
+        );
+        assert_eq!(
+            cells[at(h, "STATUS")],
+            painted("(o.o) online", Role::Meadow),
+            "STATUS decided from STATUS"
+        );
+        assert_eq!(cells[at(h, "NAME")], "log-rotate", "NAME untouched");
+        assert_eq!(cells[at(h, "SHEPHERD")], "true", "SHEPHERD untouched");
+
+        // --- the three reply tables, through `reply_paint` ----------------
+        let reply = TriggeredRows(vec![ActionReply {
+            id: 0,
+            name: "web".to_string(),
+            outcome: ActionOutcome::TimedOut,
+        }]);
+        let cells = reversed::<TriggeredRows>(reply.rows().remove(0), reply_paint);
+        let h = TriggeredRows::headers();
+        assert_eq!(cells[at(h, "ID")], painted("0", Role::Ink3));
+        assert_eq!(cells[at(h, "OUTCOME")], painted("timed_out", Role::Bark));
+        assert_eq!(
+            cells[at(h, "DETAIL")],
+            "no reply within the app's own action_timeout",
+            "DETAIL untouched, and never mistaken for the OUTCOME beside it"
+        );
+
+        // --- the inline closures, which now share the same shape ----------
+        // Each of these decides its own column from its own cell, so driving
+        // them reversed proves the same property the two above do.
+        let emptied = EmptiedFiles(vec![EmptiedFile {
+            stream: "stdout",
+            file: "/logs/shepd.out.log".to_string(),
+            result: "emptied",
+        }])
+        .rows_for(coloured(), true);
+        assert_eq!(
+            emptied[0][at(EmptiedFiles::headers(), "RESULT")],
+            painted("emptied", Role::Meadow)
+        );
+
+        let steps = StartupSteps(vec![StartupStep {
+            action: "ran",
+            target: "launchctl load".to_string(),
+            result: "permission denied".to_string(),
+        }])
+        .rows_for(coloured(), true);
+        assert_eq!(
+            steps[0][at(StartupSteps::headers(), "RESULT")],
+            painted("permission denied", Role::Bark),
+            "an unrecognised RESULT is the failure line"
+        );
+    }
+
+    /// fails if SOURCE stops drawing the one trust distinction in the crate.
+    ///
+    /// `adopted` is a third-party binary running at the daemon's own trust
+    /// level from an operator-supplied path; `built-in` is shep running its
+    /// own code. Those must not look identical, which is what they did.
+    ///
+    /// `unknown` is deliberately Butter and NOT Bark: a `DogSource` this
+    /// client predates means the client is older than its daemon, and the dog
+    /// is very often perfectly healthy. Painting a working dog red is the
+    /// mistake `mem_role`'s own doc refuses when it declines a third tier.
+    #[test]
+    fn source_draws_the_trust_line_and_never_paints_a_working_dog_red() {
+        assert_eq!(source_role(&DogSource::BuiltIn), Role::Ink3);
+        assert_eq!(
+            source_role(&DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string()
+            }),
+            Role::Butter
+        );
+        assert_ne!(
+            source_role(&DogSource::BuiltIn),
+            source_role(&DogSource::Adopted {
+                path: "/x".to_string()
+            }),
+            "shep's own code and a third-party binary must not look the same"
+        );
+    }
+
+    /// fails if an outcome kind lands in the wrong tier.
+    ///
+    /// One function serves `trigger`, `signal` and `whisper`, so this covers
+    /// all eleven kinds the three produce. The `Bark` tier is the one that
+    /// matters most and the one most easily over-applied: `skipped` and
+    /// `not_running` are NOT failures, and an unrecognised kind is a version
+    /// gap rather than a fault.
+    #[test]
+    fn an_outcome_lands_in_the_tier_its_kind_calls_for() {
+        for worked in ["replied", "delivered", "sent"] {
+            assert_eq!(outcome_role(worked), Role::Meadow, "{worked}");
+        }
+        for quiet in ["skipped", "not_running"] {
+            assert_eq!(outcome_role(quiet), Role::Ink3, "{quiet}");
+        }
+        for failed in ["timed_out", "failed", "not_written"] {
+            assert_eq!(outcome_role(failed), Role::Bark, "{failed}");
+        }
+        for gap in ["no_channel", "no_stdin"] {
+            assert_eq!(outcome_role(gap), Role::Butter, "{gap}");
+        }
+        assert_eq!(
+            outcome_role("unknown"),
+            Role::Butter,
+            "a kind this client predates is a version gap, not a fault"
+        );
+    }
+
+    /// fails if the reply tables stop colouring their OUTCOME, or start
+    /// colouring their DETAIL.
+    ///
+    /// Driven through a real `TriggeredRows` rather than through
+    /// `outcome_role`, so it covers the wiring as well as the tiers. DETAIL
+    /// is free-form text that only exists when OUTCOME has already said what
+    /// happened; colouring a whole sentence the colour of the word beside it
+    /// is decoration.
+    #[test]
+    fn a_reply_table_colours_its_outcome_and_leaves_its_detail_alone() {
+        let rows = TriggeredRows(vec![
+            ActionReply {
+                id: 0,
+                name: "web".to_string(),
+                outcome: ActionOutcome::Replied {
+                    body: "swept 3".to_string(),
+                },
+            },
+            ActionReply {
+                id: 1,
+                name: "api".to_string(),
+                outcome: ActionOutcome::TimedOut,
+            },
+        ])
+        .rows_for(coloured(), true);
+
+        assert_eq!(rows[0][0], painted("0", Role::Ink3), "ID is chrome");
+        assert_eq!(rows[0][1], "web", "NAME is plain");
+        assert_eq!(rows[0][2], painted("replied", Role::Meadow));
+        assert_eq!(rows[0][3], "swept 3", "DETAIL carries no colour");
+        assert_eq!(rows[1][2], painted("timed_out", Role::Bark));
+        assert_eq!(
+            rows[1][3], "no reply within the app's own action_timeout",
+            "and neither does a failure's DETAIL"
+        );
+    }
+
+    /// fails if the `-` placeholder rule stops reaching a column whose own
+    /// rule declined to paint it.
+    ///
+    /// `BarkRows` returns [`Paint::Default`] for a SINKS cell holding `-`,
+    /// rather than one of the two roles it gives a real sink list, and
+    /// `Paint::Default` is what carries the placeholder rule. So this pins
+    /// the handoff: a column CAN have a rule of its own and still fall back
+    /// to the shared one for the value that has nothing to say.
+    ///
+    /// An earlier version of this test claimed it proved the rule reached a
+    /// table stating no rule at all, which was simply false -- `BarkRows` has
+    /// its own `rows_for`. The mutation that deleted the trait default killed
+    /// nothing, which is how the wrong target was found.
+    #[test]
+    fn a_placeholder_falls_back_to_the_shared_rule() {
+        let rows = BarkRows(vec![Bark {
+            at_ms: 0,
+            rule: "restart-storm".to_string(),
+            subject: "web".to_string(),
+            message: "restarted 5 times".to_string(),
+            sinks: Vec::new(),
+        }])
+        .rows_for(coloured(), true);
+        assert_eq!(rows[0][4], painted("-", Role::Ink3), "no sinks reads as -");
+    }
+
+    /// fails if a bark that failed to deliver reads the same as one that
+    /// delivered.
+    ///
+    /// A refused sink is the reason an operator reads this table at all: the
+    /// alert did not arrive. `sinks_cell` already appends `(failed)`, so the
+    /// colour agrees with the text rather than replacing it.
+    #[test]
+    fn a_bark_whose_sink_refused_is_marked() {
+        let bark = |error: Option<String>| Bark {
+            at_ms: 0,
+            rule: "restart-storm".to_string(),
+            subject: "web".to_string(),
+            message: "restarted 5 times".to_string(),
+            sinks: vec![SinkOutcome {
+                sink: "ops".to_string(),
+                error,
+            }],
+        };
+        let delivered = BarkRows(vec![bark(None)]).rows_for(coloured(), true);
+        assert_eq!(delivered[0][4], painted("ops", Role::Meadow));
+
+        let refused =
+            BarkRows(vec![bark(Some("connection refused".to_string()))]).rows_for(coloured(), true);
+        assert_eq!(refused[0][4], painted("ops(failed)", Role::Bark));
+    }
+
+    /// fails if the dogs table stops matching the flock table on the five
+    /// columns the two share, or if it starts colouring a column that has
+    /// nothing to say.
+    ///
+    /// The same dog used to read one way under `shep dogs` and another under
+    /// `shep flock`, because only one of the two tables had ever been
+    /// coloured.
+    #[test]
+    fn the_dogs_table_is_coloured_by_the_flock_tables_own_rules() {
+        let rows =
+            DogRows(vec![sample_dog(ProcStatus::Online, Some(14_110))]).rows_for(coloured(), true);
+        let row = &rows[0];
+
+        // Cell by cell, in the order the columns now sit, which is the sheep
+        // table's order for all nine shared columns.
+        assert_eq!(row[0], painted("9", Role::Ink3), "ID is chrome");
+        assert_eq!(row[1], "log-rotate", "NAME is plain, as in the flock table");
+        assert_eq!(
+            row[2],
+            painted("(o.o) online", Role::Meadow),
+            "STATUS takes the face and the role, from vocabulary.rs"
+        );
+        assert_eq!(row[3], "14110", "a real PID is left plain");
+        assert_eq!(row[4], painted("4", Role::Butter), "RESTARTS above zero");
+        assert_eq!(row[5], painted("-", Role::Ink3), "EXIT: still running");
+        assert_eq!(row[6], painted("0.0%", Role::Ink3), "idle CPU is not news");
+        assert_eq!(row[7], painted("3.0M", Role::Meadow), "MEM below the ramp");
+        assert_eq!(row[8], "41s", "UPTIME is plain, as in the flock table");
+        assert_eq!(
+            row[9],
+            painted("adopted", Role::Butter),
+            "SOURCE carries the trust distinction, and sits last"
+        );
+    }
+
+    /// fails if a stopped dog's `-` placeholders stop being muted, or if its
+    /// STATUS stops carrying the role a stopped sheep's does.
+    ///
+    /// The sibling of the case above, and it exists because that one cannot
+    /// reach the placeholder branch: a running dog has a real PID, CPU and
+    /// MEM in every cell.
+    #[test]
+    fn a_stopped_dogs_placeholders_are_muted() {
+        let rows = DogRows(vec![sample_dog(ProcStatus::Stopped, None)]).rows_for(coloured(), true);
+        let row = &rows[0];
+
+        assert_eq!(row[2], painted("(-.-) stopped", Role::Ink3));
+        assert_eq!(row[3], painted("-", Role::Ink3), "PID");
+        assert_eq!(row[6], painted("-", Role::Ink3), "CPU");
+        assert_eq!(row[7], painted("-", Role::Ink3), "MEM");
+    }
+
+    /// fails if a dog-action row colours a STATUS cell holding a SENTENCE.
+    ///
+    /// `DogEnabledRow::status` is a `String` carrying either a real status
+    /// rendering or a sentence saying why no shepherd answered. A sentence
+    /// has no role, so painting it would be decoration, which the governing
+    /// rule forbids. Both halves are asserted in one case because a build
+    /// that coloured everything and a build that coloured nothing each pass
+    /// one half.
+    #[test]
+    fn a_dog_action_row_colours_a_status_and_never_a_sentence() {
+        let acted = DogEnabledRow {
+            name: "log-rotate".to_string(),
+            source: DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            },
+            shepherd_acted: true,
+            status: "online".to_string(),
+        };
+        let row = &acted.rows_for(coloured(), true)[0];
+        assert_eq!(
+            row[1],
+            painted("adopted", Role::Butter),
+            "SOURCE says this is not shep's own code"
+        );
+        assert_eq!(row[3], painted("(o.o) online", Role::Meadow));
+
+        let sentence = "no shepherd running; the config was written";
+        let unacted = DogEnabledRow {
+            name: "log-rotate".to_string(),
+            source: DogSource::BuiltIn,
+            shepherd_acted: false,
+            status: sentence.to_string(),
+        };
+        let row = &unacted.rows_for(coloured(), true)[0];
+        assert_eq!(row[3], sentence, "a sentence is left exactly as it was");
+    }
+
+    /// fails if the SHEPHERD column starts carrying a colour, or if NAME
+    /// does.
+    ///
+    /// Deliberate, and it was the closest call in that table. `false` is
+    /// worth knowing, but the STATUS cell beside it already says so in a
+    /// whole sentence, and a colour that repeats its neighbour is
+    /// decoration.
+    #[test]
+    fn a_dog_action_row_leaves_the_name_and_the_shepherd_column_plain() {
+        let row = &DogDisabledRow {
+            name: "log-rotate".to_string(),
+            source: DogSource::BuiltIn,
+            shepherd_acted: false,
+            status: "no shepherd running".to_string(),
+        }
+        .rows_for(coloured(), true)[0];
+        assert_eq!(row[0], "log-rotate");
+        assert_eq!(row[2], "false");
+    }
+
+    /// fails if `rehome`'s own `-` SOURCE stops being muted.
+    ///
+    /// `DogRehomedRow` is the only one of the four whose SOURCE can be
+    /// absent, and it reaches the same muting either way -- it is chrome
+    /// when it says `adopted` and a placeholder when it says `-`.
+    #[test]
+    fn a_rehomed_row_with_nothing_to_forget_still_mutes_its_source() {
+        let row = &DogRehomedRow {
+            name: "metrics".to_string(),
+            source: None,
+            shepherd_acted: true,
+            status: "stopped".to_string(),
+        }
+        .rows_for(coloured(), true)[0];
+        assert_eq!(row[1], painted("-", Role::Ink3));
+        assert_eq!(row[3], painted("(-.-) stopped", Role::Ink3));
+    }
+
+    /// fails if `flush`'s table stops muting its ID, or starts colouring a
+    /// real path.
+    ///
+    /// A path is the SUBJECT of this table rather than a reading about it:
+    /// no threshold to ramp against, no fault to mark, and the widest column
+    /// on the row. Only the `-` a peer daemon predating the field produces
+    /// is muted.
+    #[test]
+    fn a_flushed_row_mutes_its_id_and_its_dash_and_leaves_a_path_alone() {
+        let mut without = sample_info(1, "cron", 0);
+        without.out_file = None;
+        without.err_file = None;
+        let rows =
+            FlushedRows(vec![sample_info(0, "web", 60_000), without]).rows_for(coloured(), true);
+
+        assert_eq!(rows[0][0], painted("0", Role::Ink3), "ID is chrome");
+        assert_eq!(rows[0][1], "web", "NAME is plain");
+        assert_eq!(
+            rows[0][2], "/logs/web-0-out.log",
+            "a real path carries no colour"
+        );
+        assert_eq!(rows[1][2], painted("-", Role::Ink3), "the placeholder does");
+        assert_eq!(rows[1][3], painted("-", Role::Ink3));
+    }
+
+    /// fails if `LambRows` grows a colour.
+    ///
+    /// Both its columns are identity and neither has a state, a reading or a
+    /// placeholder, so there is nothing for a colour to carry. Pinned rather
+    /// than left implicit because "this one is deliberately plain" and "this
+    /// one was forgotten" look identical in a diff, and the second is
+    /// exactly what happened to the other seven tables.
+    #[test]
+    fn lamb_rows_carry_no_colour_at_all() {
+        let rows = LambRows(vec![Lamb::new(48_302, "node")]).rows_for(coloured(), true);
+        assert_eq!(rows[0], vec!["48302".to_string(), "node".to_string()]);
+    }
+
+    /// fails if a `ProcStatus` variant is added without being added to
+    /// `status_named_by`'s own list.
+    ///
+    /// That list is what decides whether a dog-action row's STATUS cell is
+    /// coloured, and a variant missing from it would silently render plain
+    /// rather than fail to compile. Driven off `Display`, so it also fails
+    /// if the two ever disagree.
+    #[test]
+    fn every_status_is_recognised_by_its_own_rendering() {
+        for status in [
+            ProcStatus::Starting,
+            ProcStatus::Online,
+            ProcStatus::Stopping,
+            ProcStatus::Stopped,
+            ProcStatus::Errored,
+            ProcStatus::WaitingRestart,
+        ] {
+            assert_eq!(
+                status_named_by(&status.to_string()),
+                Some(status),
+                "{status} is not recognised by its own rendering"
+            );
+        }
+        assert_eq!(
+            status_named_by("no shepherd running"),
+            None,
+            "and a sentence is not mistaken for one"
+        );
+    }
+
+    /// fails if `rows_for` stops colouring ID/FOLD as chrome, stops muting a
+    /// `-` placeholder, or starts colouring a real (non-dash) PID/SMIT value
+    /// it was never asked to. Goes through the real seam (`rows_for`, not
+    /// the role helpers directly) because this is the one property that is
+    /// about which CELLS get touched, not about a threshold.
+    #[test]
+    fn chrome_and_placeholder_columns_are_coloured_and_nothing_else_is() {
+        use crate::style::{Presentation, StyleLevel};
+
+        let presentation = Presentation::new(
+            StyleLevel::Full,
+            None,
+            Some(std::ffi::OsStr::new("xterm-256color")),
+            None,
+            200,
+        );
+        // One row with a real PID and no fold (so PID is a real value, and
+        // FOLD is the placeholder) and one without a PID (so PID is the
+        // placeholder).
+        let mut running = sample_info(0, "web", 60_000);
+        running.fold = None;
+        let mut stopped = sample_info(1, "cron", 0);
+        stopped.pid = None;
+        stopped.fold = None;
+        let flock = FlockRows(vec![running, stopped]);
+
+        let rows = flock.rows_for(presentation, true);
+
+        // ID: chrome, always coloured.
+        assert!(rows[0][0].contains('\u{1b}'), "{:?}", rows[0][0]);
+        assert!(rows[1][0].contains('\u{1b}'), "{:?}", rows[1][0]);
+        // PID: a real value is left plain; the placeholder is coloured.
+        assert!(!rows[0][3].contains('\u{1b}'), "{:?}", rows[0][3]);
+        assert!(rows[1][3].contains('\u{1b}'), "{:?}", rows[1][3]);
+        // FOLD: chrome, always coloured, `-` here on both rows.
+        assert!(rows[0][9].contains('\u{1b}'), "{:?}", rows[0][9]);
+        assert!(rows[1][9].contains('\u{1b}'), "{:?}", rows[1][9]);
     }
 }

@@ -22,7 +22,11 @@
 pub(crate) mod paint;
 mod rows;
 mod table;
-mod width;
+// `pub(crate)` for `width::char_columns`, which `lookout::view::flock::fit`
+// pads by: one rule for how wide a `char` draws, shared by the two surfaces
+// that pad a cell, rather than a second copy that drifts on the first
+// double-width name. The same reasoning `paint` above is public for.
+pub(crate) mod width;
 
 use std::io;
 
@@ -200,9 +204,34 @@ pub trait Render: Serialize {
     fn rows(&self) -> Vec<Vec<String>>;
     /// The rows as this presentation wants them rendered.
     ///
-    /// Defaults to [`Self::rows`]: most payloads have nothing to dress up.
-    /// [`rows::FlockRows`] overrides it because its STATUS cell is the one
-    /// place a face and a colour belong. Only ever called from `table_of`'s
+    /// Defaults to [`Self::rows`]: a table with nothing to dress up says so
+    /// by not implementing this. An impl that wants colour overrides it and
+    /// calls [`rows::paint`], which keys each cell's treatment on the
+    /// column's NAME.
+    ///
+    /// The default deliberately does NOT apply the `-` placeholder rule, even
+    /// though that rule holds for every table that has a placeholder. It was
+    /// written that way first, and the mutation that deleted it killed no
+    /// test: every table in the crate that can actually render a `-` already
+    /// overrides this and reaches the rule through [`rows::Paint::Default`],
+    /// and the seven that do not override it cannot produce a dash at all. A
+    /// default nothing reaches is a path that rots unwatched, so the rule
+    /// lives in `paint` alone, where it is exercised.
+    ///
+    /// # Why by name, and never by index
+    ///
+    /// This used to be `FlockRows`' own method, painting `row[0]`, `row[4]`,
+    /// `row[9]` and `row[10]` by hardcoded index. An index is a fact about
+    /// one table's column ORDER, so reordering its columns silently
+    /// repoints every one of them: the wrong cells get painted, nothing
+    /// fails to compile, and no test catches it -- a snapshot pins whatever
+    /// was accepted into it, and only a human looking at a rendered table
+    /// would notice RESTARTS had started wearing the memory ramp. Reordering
+    /// the dogs table is what made that concrete. Keyed on the name, one
+    /// place says RESTARTS is coloured by `restarts_role`, and every table
+    /// carrying a RESTARTS column gets it wherever the column sits.
+    ///
+    /// Only ever called from `table_of`'s
     /// boxed path — the plain path keeps calling [`render_table`], which
     /// keeps calling [`Self::rows`], and that is what makes `bare` provably
     /// byte-identical rather than merely intended to be.
@@ -210,9 +239,9 @@ pub trait Render: Serialize {
     /// `status_word` is a plain parameter rather than a field on
     /// `Presentation`: it is `table_of`'s own per-attempt retry knob (spec
     /// §2's word-drops-before-a-column rule), never a fact resolved once at
-    /// the seam the way every `Presentation` field is. Only
-    /// [`rows::FlockRows`] reads it; every other default impl ignores it,
-    /// so the retry `table_of` makes is a harmless no-op for anything else.
+    /// the seam the way every `Presentation` field is. Only a STATUS column
+    /// reads it, so the retry `table_of` makes is a harmless no-op for a
+    /// table that has none.
     fn rows_for(&self, _presentation: Presentation, _status_word: bool) -> Vec<Vec<String>> {
         self.rows()
     }
@@ -826,9 +855,37 @@ mod tests {
         assert!(!sheep_table.contains("bark"), "a dog is not a sheep");
         assert!(dogs_table.contains("bark"));
         assert!(!dogs_table.contains("web"));
+        // The dogs table DOES carry an ID column, and its columns line up
+        // with the sheep table's for every header the two share. It used to
+        // lead with NAME and put SOURCE second, so the two tables printed one
+        // under the other disagreed on the position of every column after the
+        // first. `DogRows`' own doc carries the ruling.
         assert!(
-            !dogs_table.starts_with("ID"),
-            "the dogs table has no ID column"
+            dogs_table.starts_with("ID"),
+            "the dogs table leads with ID, as the sheep table does: {dogs_table}"
+        );
+        let shared: Vec<&str> = dogs_table
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .take(9)
+            .collect();
+        assert_eq!(
+            shared,
+            [
+                "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME"
+            ],
+            "the nine shared columns, in the sheep table's own order"
+        );
+        assert!(
+            dogs_table
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end()
+                .ends_with("SOURCE"),
+            "and this table's own column last"
         );
     }
 
@@ -1245,30 +1302,35 @@ mod tests {
     /// Spec §2: the STATUS word is the first thing dropped from that
     /// column, before any whole column is. `waiting-restart` (15
     /// characters) is the longest status word, chosen so face-plus-word
-    /// alone forces `FOLD` past a width face-alone comfortably fits —
+    /// alone forces a column past a width face-alone comfortably fits —
     /// exercising `Render::rows_for` and `table::render_boxed_ex` directly,
     /// the same two calls `table_of`'s own two-pass retry makes -- `table_of`
     /// could be driven at this same chosen width too now that width is an
     /// injected `Presentation` field rather than a real-terminal read, but
     /// this test stays at the lower level anyway, to pin the exact retry
     /// mechanics rather than `table_of`'s outer wrapping around them.
+    ///
+    /// Width 84, not this module's usual 80: task 7's `SMIT` column, empty
+    /// here and the highest priority number, is what face-alone now needs
+    /// dropped at 80 -- the same seven-column cost `output/table.rs`'s own
+    /// tests record for adding a column nobody's row fills.
     #[test]
     fn the_word_drops_before_a_whole_column_does() {
         let flock = FlockRows(vec![
             ProcessInfo::builder(1, "a", ProcStatus::WaitingRestart).build(),
         ]);
-        let presentation = Presentation::new(StyleLevel::Full, None, None, None, 80);
+        let presentation = Presentation::new(StyleLevel::Full, None, None, None, 84);
         let headers = FlockRows::headers();
 
         let wide = table::render_boxed_ex(
             headers,
             &flock.rows_for(presentation, true),
             FlockRows::PRIORITIES,
-            80,
+            84,
         );
         assert!(
             !wide.dropped.is_empty(),
-            "face-plus-word should already force a drop at 80: {}",
+            "face-plus-word should already force a drop at 84: {}",
             wide.rendered
         );
 
@@ -1276,15 +1338,15 @@ mod tests {
             headers,
             &flock.rows_for(presentation, false),
             FlockRows::PRIORITIES,
-            80,
+            84,
         );
         assert!(
             narrow.dropped.is_empty(),
-            "face-alone should fit every column at 80: {}",
+            "face-alone should fit every column at 84: {}",
             narrow.rendered
         );
         assert!(narrow.rendered.contains("FOLD"), "{}", narrow.rendered);
-        assert!(narrow.rendered.contains("(o~o)"), "{}", narrow.rendered);
+        assert!(narrow.rendered.contains("(>_<)"), "{}", narrow.rendered);
         assert!(
             !narrow.rendered.contains("waiting-restart"),
             "{}",

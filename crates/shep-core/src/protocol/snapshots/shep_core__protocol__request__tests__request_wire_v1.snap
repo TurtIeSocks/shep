@@ -48,7 +48,7 @@ expression: requests
           "min_uptime": "1s",
           "max_restarts": 16,
           "restart_delay": null,
-          "exp_backoff_restart_delay": null,
+          "exp_backoff_restart_delay": "100",
           "kill_signal": null,
           "kill_timeout": "1600",
           "shutdown_with_message": false,
@@ -227,6 +227,32 @@ expression: requests
         "kind": "all"
       },
       "line": "reload-config"
+    }
+  },
+  {
+    "id": 20,
+    "deadline_ms": null,
+    "body": {
+      "kind": "set_smit",
+      "sheep": "web",
+      "smit": "▲ main@a1b2c3"
+    }
+  },
+  {
+    "id": 21,
+    "deadline_ms": null,
+    "body": {
+      "kind": "set_smit",
+      "sheep": "web",
+      "smit": null
+    }
+  },
+  {
+    "id": 22,
+    "deadline_ms": null,
+    "body": {
+      "kind": "config_drift",
+      "apps": []
     }
   }
 ]

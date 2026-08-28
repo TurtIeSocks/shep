@@ -1745,6 +1745,79 @@ fn a_second_command_reuses_the_daemon_rather_than_spawning_a_second() {
     graceful_kill(home);
 }
 
+/// A lifecycle verb prints the whole flock, not only the sheep it touched.
+///
+/// `shep start koji` used to print a one-row table containing koji, which
+/// cannot answer the question an operator actually has after a lifecycle
+/// command: what does the flock look like now.
+///
+/// Driven over the real binary against a real daemon, because the unit tests
+/// for this behaviour drive `render_outcome` directly and so cannot say
+/// whether any verb is wired to it. The mutation they cannot catch is the one
+/// that matters most: a `stop` still calling `emit` with its own rows.
+///
+/// Three sheep and a stop of ONE, so the narrow answer and the full one differ
+/// by row count as well as by content. The name assertion is on the exact set
+/// -- a `contains("alpha")` would pass on the one-row table this replaces,
+/// since the row it prints is alpha's.
+///
+/// The `--format json` half is asserted in the same case, and it is not
+/// padding: the two surfaces answer different questions on purpose, so a
+/// change that widened both would fix the complaint and silently break every
+/// script reading `data[0]`.
+#[test]
+fn a_lifecycle_verb_prints_the_whole_flock_and_json_still_prints_what_it_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    for name in ["alpha", "gamma", "beta"] {
+        let started = shep(home)
+            .arg("start")
+            .arg(&script)
+            .arg("--name")
+            .arg(name)
+            .output()
+            .unwrap();
+        guard.adopt_home(home);
+        assert_success(&started);
+    }
+
+    let stopped = shep(home).arg("stop").arg("alpha").output().unwrap();
+    assert_success(&stopped);
+    let printed = String::from_utf8(stopped.stdout).unwrap();
+    let named: Vec<&str> = printed
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter(|word| *word != "NAME")
+        .collect();
+    assert_eq!(
+        named,
+        ["alpha", "beta", "gamma"],
+        "stopping one sheep prints the whole flock, in name order: {printed}"
+    );
+
+    let json = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("stop")
+        .arg("beta")
+        .output()
+        .unwrap();
+    assert_success(&json);
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let rows = envelope["data"].as_array().unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        ["beta"],
+        "the machine surface still answers what it touched: {envelope}"
+    );
+
+    graceful_kill(home);
+}
+
 // --- Case 3 --------------------------------------------------------------
 
 #[cfg(unix)]
@@ -6433,4 +6506,315 @@ fn an_unknown_verb_with_no_matching_dog_keeps_claps_own_suggestion() {
         stderr.contains("flock"),
         "clap's own did-you-mean must still suggest the real verb: {stderr}"
     );
+}
+
+/// A Flockfile edit to a sheep the flock already has is reported, naming the
+/// sheep and every field that changed, and naming no VALUE.
+///
+/// The defect: changing `cwd` on two apps and re-running `shep start` left
+/// both running the old one, with no error and no warning. `Request::Start`
+/// on an existing name adds instances rather than reconciling config, which
+/// is deliberate and is what `shep stock` depends on, so the edit was simply
+/// not applied. The silence was the bug, and the apps then crash-looped
+/// against a path that no longer applied.
+///
+/// What a broken implementation this catches: the drift check dropped
+/// entirely (no `cwd` in stderr); the drift computed against an
+/// unnormalized config (every default the file did not spell out reported
+/// as changed, and the `env`/`cwd` assertions drown in noise); the report
+/// carrying values rather than names, which is what the `hunter2` assertion
+/// is for (IR-41). Asserting only that the config was NOT silently replaced
+/// would pass on the broken code, since not replacing it is exactly what
+/// the broken code did.
+///
+/// A one-app Flockfile where the real report had two: one sheep is enough to
+/// prove the message exists, and the daemon-side unit tier
+/// (`supervisor.rs::config_drift_names_an_edited_sheeps_fields_and_changes_nothing`)
+/// is where multiple fields and an unregistered app are pinned, at no
+/// process-spawning cost.
+#[test]
+fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    // `env` carries a value that must never be printed, and `cwd` a second
+    // changed field, so a report that stopped at the first difference fails
+    // here too.
+    let body = |cwd: &Path, token: &str| {
+        format!(
+            "[[app]]\nname = \"edited\"\nscript = \"{}\"\ncwd = \"{}\"\n\
+             env = {{ API_TOKEN = \"{token}\" }}\n",
+            script.display(),
+            cwd.display(),
+        )
+    };
+    let flockfile = write_flockfile(&dir, &body(home, "hunter2-before"));
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+    poll_flock(home, |info| info["status"] == "online");
+
+    // The edit, over the same path the daemon was told about.
+    write_flockfile(&dir, &body(elsewhere.path(), "hunter2-after"));
+    let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    // Drift is a warning, not a failure. Without this the test reads only
+    // stderr, so a change that turned the report into a refusal would keep
+    // it green while breaking every operator script that runs `shep start`
+    // twice.
+    assert_success(&again);
+
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        stderr.contains("edited"),
+        "the report must name the sheep: {stderr}"
+    );
+    assert!(
+        stderr.contains("cwd") && stderr.contains("env"),
+        "the report must name every field that changed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("hunter2"),
+        "a field's VALUE must never reach an operator's terminal (IR-41): {stderr}"
+    );
+
+    graceful_kill(home);
+}
+
+/// One app whose script does not exist refuses the whole Flockfile, before
+/// anything is registered, and names every app that failed.
+///
+/// The defect: the third app of eleven pointed at an unbuilt binary. Apps
+/// one and two registered and started, app three failed to spawn, and apps
+/// four through eleven were never reached. The flock matched neither the
+/// file nor its previous state, and only `shep delete all` recovered it.
+///
+/// The empty listing at the end is the assertion that matters and the one
+/// the exit code alone cannot make: `start` reported a failure before this
+/// change too, with `good` left registered and running behind it.
+///
+/// What a broken implementation this catches: the check dropped (`good` is
+/// in the listing); the check run inside the registering loop rather than
+/// before it (`good` is registered before `unbuilt` is reached, same
+/// symptom); the error reporting only the count and not the path (the
+/// `never-built` assertion).
+#[test]
+fn one_absent_script_refuses_the_whole_flockfile_and_registers_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    // `good` FIRST, so a check that runs per app as it registers would have
+    // registered it by the time it reached `unbuilt`.
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"good\"\nscript = \"{}\"\n\n\
+             [[app]]\nname = \"unbuilt\"\nscript = \"{}/never-built\"\n",
+            script.display(),
+            dir.path().display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the spawn-failed exit code: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unbuilt"),
+        "the refusal must name the app: {stderr}"
+    );
+    assert!(
+        stderr.contains("never-built"),
+        "the refusal must name the path it looked at: {stderr}"
+    );
+
+    let flock = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("flock")
+        .output()
+        .unwrap();
+    assert_success(&flock);
+    let envelope: serde_json::Value = serde_json::from_slice(&flock.stdout).unwrap();
+    assert_eq!(
+        envelope["data"].as_array().map(Vec::len),
+        Some(0),
+        "a Flockfile refused as a whole must leave NOTHING registered: {}",
+        envelope
+    );
+
+    graceful_kill(home);
+}
+
+/// A spawn that fails for a reason no preflight could see still names the
+/// sheep and the path it tried, and the `cwd` it tried it in.
+///
+/// The whole error an operator got was `error[spawn_failed]: the daemon
+/// reported SpawnFailed: process spawn failed: No such file or directory
+/// (os error 2)`. On an eleven-app Flockfile that named neither which app
+/// had failed nor which path had been tried.
+///
+/// A script that EXISTS and cannot be exec'd, deliberately: the batch check
+/// (`one_absent_script_refuses_the_whole_flockfile_and_registers_nothing`)
+/// tests existence only, so this reaches the real `spawn` and its real
+/// `EACCES` rather than being refused before it. That is also the honest
+/// residue of that check: something can always still fail at exec, and this
+/// is what an operator reads when it does.
+#[test]
+fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let unrunnable = dir.path().join("unrunnable.sh");
+    std::fs::write(&unrunnable, "#!/bin/sh\nsleep 60\n").unwrap();
+    // Present, so the batch check passes it; no execute bit anywhere, which
+    // even a root-owned run cannot exec.
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&unrunnable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"locked-out\"\nscript = \"{}\"\n",
+            unrunnable.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the spawn-failed exit code: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("locked-out"),
+        "the error must name the sheep: {stderr}"
+    );
+    assert!(
+        stderr.contains("unrunnable.sh"),
+        "the error must name the script it tried: {stderr}"
+    );
+    // Canonicalized: `start` fills an app's absent `cwd` from the
+    // Flockfile's own directory through `canonicalize`, and on macOS a
+    // tempdir's `/var/...` resolves to `/private/var/...`.
+    let flockfile_dir = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(
+        stderr.contains(&format!("in {}", flockfile_dir.display())),
+        "the error must name the cwd it tried it in: {stderr}"
+    );
+
+    graceful_kill(home);
+}
+
+/// A bare command that is not on the shepherd's PATH does NOT take the rest
+/// of the flock down with it. It is reported, its own app fails to spawn as
+/// it always did, and every other app in the Flockfile comes up.
+///
+/// The asymmetry against
+/// [`one_absent_script_refuses_the_whole_flockfile_and_registers_nothing`] is
+/// the whole point, and it is a line between two kinds of claim. A `script`
+/// with a `/` in it is a claim about the filesystem, which the daemon can
+/// settle and an operator can fix with a typo correction, so the batch is
+/// refused. A bare command is a claim about an ENVIRONMENT, and the one that
+/// decides is the daemon's, not the shell an operator tested in: a `shep
+/// startup` unit gets whatever `PATH` launchd or systemd hands it, and
+/// `assemble`'s fallback is `/usr/local/bin:/usr/bin:/bin`. Node from
+/// homebrew on Apple Silicon lives in `/opt/homebrew/bin` and nvm's under
+/// `$HOME`, so a real Flockfile's `script = "node"` resolves in a terminal
+/// and not under the unit. Refusing the batch there would keep twelve
+/// working apps down over one app's interpreter.
+///
+/// What a broken implementation this catches: the bare-command case
+/// promoted back to a batch refusal (`resolvable` is missing from the
+/// listing, which is the assertion that matters); the report dropped
+/// altogether, so an operator whose interpreter vanished gets no clue in the
+/// shepherd's log (the log assertion).
+#[test]
+fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    // `resolvable` FIRST: it is the app that must survive, and a refusal of
+    // the whole batch would leave it unregistered rather than online.
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"resolvable\"\nscript = \"{}\"\n\n\
+             [[app]]\nname = \"no-interpreter\"\nscript = \"shep-no-such-interpreter-xyz\"\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let output = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+
+    // Exit 7 all the same: one app really did fail. What changed is what it
+    // took with it.
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the one app that cannot run still fails the command: {output:?}"
+    );
+    // The useful sentence reaches the operator's own terminal, not only the
+    // shepherd's log. The batch check can never send it here -- a doubt must
+    // not fail a batch, and the `Start` reply is about the batch -- but once
+    // THIS app's spawn has failed the reply is about this app, and
+    // `SpawnFailed` already carries free-form text, so it needs no protocol
+    // change to say so.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not on the shepherd's PATH"),
+        "the reply must explain WHY the program was not found, not only that \
+         it was not: {stderr}"
+    );
+    assert!(
+        stderr.contains("shep-no-such-interpreter-xyz") && stderr.contains("no-interpreter"),
+        "naming the program and the sheep: {stderr}"
+    );
+
+    let data = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["name"] == "resolvable" && row["status"] == "online")
+        })
+    });
+    // Found by hand rather than through `sheep_named`, which panics with its
+    // own message: the regression this case exists for makes the row ABSENT,
+    // and a red run has to say that rather than report a lookup failure deep
+    // in a helper.
+    let survivor = data
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["name"] == "resolvable"));
+    assert_eq!(
+        survivor.map(|row| &row["status"]).map(ToString::to_string),
+        Some("\"online\"".to_string()),
+        "an app whose own script resolves must come up regardless of a \
+         sibling's unresolvable interpreter, and must not be refused \
+         registration over it: {data}"
+    );
+
+    let log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
+    assert!(
+        log.contains("shep-no-such-interpreter-xyz") && log.contains("PATH"),
+        "the shepherd must still say which program it could not find: {log}"
+    );
+    assert!(
+        log.contains("no-interpreter"),
+        "and which sheep wanted it: {log}"
+    );
+
+    graceful_kill(home);
 }

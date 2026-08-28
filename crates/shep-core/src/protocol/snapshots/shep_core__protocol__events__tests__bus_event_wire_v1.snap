@@ -24,7 +24,8 @@ expression: events
         "last_exit": {
           "code": 1,
           "signal": null
-        }
+        },
+        "smit": "▲ main@a1b2c3"
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -64,7 +65,8 @@ expression: events
         "last_exit": {
           "code": 1,
           "signal": null
-        }
+        },
+        "smit": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -91,7 +93,8 @@ expression: events
         "last_exit": {
           "code": 1,
           "signal": null
-        }
+        },
+        "smit": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -118,7 +121,8 @@ expression: events
         "last_exit": {
           "code": 1,
           "signal": null
-        }
+        },
+        "smit": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -145,7 +149,8 @@ expression: events
         "last_exit": {
           "code": 1,
           "signal": null
-        }
+        },
+        "smit": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -172,7 +177,8 @@ expression: events
         "last_exit": {
           "code": 1,
           "signal": null
-        }
+        },
+        "smit": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -199,7 +205,8 @@ expression: events
         "last_exit": {
           "code": 1,
           "signal": null
-        }
+        },
+        "smit": null
       },
       "manually": false,
       "at_ms": 1700000000000

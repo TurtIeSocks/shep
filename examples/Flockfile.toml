@@ -1,0 +1,133 @@
+# Seven small apps, each demonstrating one thing shep does. Build them, then
+# start this file to watch every behaviour happen instead of reading about it:
+#
+#   $ cargo build --release --workspace
+#   $ shep start examples/Flockfile.toml
+#   $ shep flock
+#   $ shep logs -f
+#
+# `cwd` is left unset on every app below on purpose: an app with no `cwd`
+# runs where its Flockfile lives (crates/shep-core/src/config/normalize.rs),
+# so `script = "../target/release/http_server"` resolves the way you'd read
+# it from here, whether shep itself was started from the repo root or from
+# inside `examples/`.
+#
+# See web/src/pages/docs/examples.astro for what to watch for on each one.
+
+# Ports are 19081/19082/19084 -- the 19080-and-up range on purpose. 8081,
+# 8082 and 8084 are common defaults elsewhere (Tomcat, proxies, a second
+# instance of nearly anything) and this file is meant to run on your own
+# machine, the machine most likely to already have something listening on
+# one of them. If 19081/19082/19084 collide with something of yours too,
+# change the port argument on the app that collides and the matching
+# readiness_probe target next to it -- both need to agree, since the probe
+# is polling the port its own app just bound.
+
+# --- 1. The baseline every probe example needs -----------------------------
+# Binds a port, answers 200 to anything. Point curl at it, or use it as the
+# shape a real readiness probe polls.
+[[app]]
+name        = "http-server"
+script      = "../target/release/http_server"
+args        = ["19081"]
+
+# --- 2. A readiness probe waiting, and listen_timeout expiring -------------
+# slow_boot sleeps 8s before it binds port 19082. Its readiness_probe polls
+# that port every second; listen_timeout is set to 4s, deliberately shorter
+# than the boot delay, so the probe never once passes before the deadline.
+# Watch `shep flock` and the daemon's own log: the sheep goes Online anyway
+# at the 4s mark with a "readiness deadline elapsed; marking online anyway"
+# warning, NOT a restart — an ordinary start treats a slow app as slow, not
+# as failed, so it never turns into a restart loop. `listen_timeout` only
+# bites this hard for a *reload*, where a still-not-ready replacement aborts
+# instead: this app is the plain-start half of that story.
+[[app]]
+name             = "slow-boot"
+script           = "../target/release/slow_boot"
+args             = ["19082", "8"]
+listen_timeout   = "4s"
+
+[app.readiness_probe]
+kind             = "http"
+target           = "http://127.0.0.1:19082/"
+interval         = "1s"
+timeout          = "1s"
+
+# --- 3. An exec probe, the one probe kind with no everyday example ---------
+# http-server-gated-by-sentinel is a plain http_server, but shep won't call
+# it ready until ready_when_told exits 0 -- which it only does once a file
+# exists on disk. listen_timeout is stretched to 2 minutes so you have time
+# to create it by hand:
+#
+#   $ touch /tmp/shep-examples-sentinel
+#
+# Watch the next probe poll (every 3s) flip this sheep from starting to
+# online. Delete the file again and restart the sheep to watch it fail to
+# clear a poll instead.
+[[app]]
+name             = "http-server-gated-by-sentinel"
+script           = "../target/release/http_server"
+args             = ["19084"]
+listen_timeout   = "120s"
+
+[app.readiness_probe]
+kind             = "exec"
+target           = "../target/release/ready_when_told /tmp/shep-examples-sentinel"
+interval         = "3s"
+timeout          = "1s"
+
+# --- 4. Escalation past a stop signal ---------------------------------------
+# stubborn blocks SIGTERM and never acts on it. `kill_timeout` -- not
+# graceful_timeout, which only governs a *reload*'s drain -- is the grace
+# period shep gives a plain `shep stop`/`restart`/`delete` between the stop
+# signal and SIGKILL; it's cut to 3s here so the escalation is quick to
+# watch instead of the 1.6s default making it easy to miss:
+#
+#   $ shep stop stubborn
+#
+# Watch it print "caught SIGTERM, still not dying" once, then go silent and
+# actually exit 3s later once shep's kill ladder reaches SIGKILL -- a signal
+# nothing can trap.
+[[app]]
+name          = "stubborn"
+script        = "../target/release/stubborn"
+kill_timeout  = "3s"
+
+# --- 5. A memory ceiling firing ---------------------------------------------
+# leaky allocates 8MB every 300ms and never frees it -- roughly 26MB/s. The
+# polling memory-limit enforcer samples resident memory every 15s
+# (crates/shep-daemon/src/limits/mod.rs), so by the first sample this sheep
+# is already well past max_memory and gets restarted; watch it climb again
+# on each subsequent poll.
+[[app]]
+name        = "leaky"
+script      = "../target/release/leaky"
+args        = ["8", "300"]
+max_memory  = "150M"
+
+# --- 6. Restart policy, backoff and max_restarts ----------------------------
+# crasher exits 1 after 2s, every time. min_uptime is raised to 5s so that
+# 2s always counts as an unstable exit (the default 1s floor would let a 2s
+# life through as "stable" and this would just restart forever); max_restarts
+# is cut to 4 so it reaches errored in well under a minute instead of the
+# default 16 taking closer to a minute on its own. exp_backoff_restart_delay
+# is left at its 100ms default, growing x1.5 each attempt -- watch the gap
+# between restarts widen in `shep logs -f` as it counts down to errored.
+[[app]]
+name         = "crasher"
+script       = "../target/release/crasher"
+args         = ["1", "2"]
+min_uptime   = "5s"
+max_restarts = 4
+
+# --- 7. The log plane -------------------------------------------------------
+# noisy writes one line a second to stdout and stderr, alternating. Nothing
+# here needs configuring -- out_file/err_file both default to files under
+# $SHEP_HOME/logs -- so this app is bare on purpose, to show what a Flockfile
+# entry costs when you want none of the above. Watch it with:
+#
+#   $ shep bleats noisy -f
+[[app]]
+name    = "noisy"
+script  = "../target/release/noisy"
+args    = ["5"]

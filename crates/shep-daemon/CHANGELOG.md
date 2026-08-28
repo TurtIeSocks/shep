@@ -10,6 +10,204 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixes
+
+- Name the sheep and the path in a failed spawn's message. The whole error
+  an operator got was `process spawn failed: No such file or directory (os
+  error 2)`, which on an eleven-app Flockfile said neither which app had
+  failed nor which path had been tried. It now reads
+  ``<name>: process spawn failed: <os error>; tried `<script>` in <cwd>``,
+  with the `cwd` clause present only when the app sets one. The path is the `script`/`interpreter`
+  and `cwd` as the Flockfile spells them rather than a resolution of the two,
+  because that is where the edit has to be made. `shep stock`'s own partial-
+  scale reply gains the path too and does not repeat the name, which it
+  already opens with.
+
+- Check every app in a `Start` batch before registering any of it, and
+  register nothing if any of them fails. One app pointing at a `script` that
+  does not exist used to register and start the apps ahead of it, fail on
+  that one, and never reach the apps behind it, leaving a flock that matched
+  neither the Flockfile nor its previous state. The error now names every app
+  that failed and the path each was looked for at, rather than the first
+  failure alone. Passwd resolution for `user`/`group` is hoisted into the
+  same pass for the same reason.
+
+  The refusal reaches only a `script` or `interpreter` containing a `/`. A
+  path is a claim about the filesystem, which the daemon can settle and an
+  operator can fix with a typo correction. A BARE command is a claim about an
+  environment, and the environment that decides is the daemon's rather than
+  the shell an operator tested in: a `shep startup` unit gives the shepherd
+  whatever `PATH` launchd or systemd hands it, and shep's own fallback is
+  `/usr/local/bin:/usr/bin:/bin`, so homebrew's `node` on Apple Silicon
+  (`/opt/homebrew/bin`) and nvm's (under `$HOME`) both resolve in a terminal
+  and neither resolves under the unit. A bare command that does not resolve
+  is reported in the shepherd's log, naming the sheep and the program, and
+  the batch goes ahead; that one app's spawn then fails exactly as it did
+  before. Refusing there would keep a whole flock down at boot over one app's
+  interpreter, which is worse than the partial registration being fixed.
+
+  A filesystem error that is not "no such file" never refuses a batch either.
+  `Path::exists` returns `false` on any `fs::metadata` error, so a permission
+  error on an intermediate directory, an unsettled mount and a race all read
+  identically to "absent"; the check now matches `ErrorKind::NotFound`
+  specifically, and everything else is a suspicion the spawn reports as it
+  always did.
+
+- Keep the pre-registration refusal to the one caller it was written for.
+  `do_start` is shared, so the check reached two callers that must not have
+  it. A dog whose binary is missing was refused and left no trace, where it
+  belongs in the dogs table as `Errored`: `spawn_fresh` registers that row on
+  purpose, `shep dogs` renders it, and `dogs::spawn_dog_watch` subscribes to
+  it, so an operator who enabled a broken dog needs to see it rather than
+  find nothing. Worse, restoring a muster roll refused the WHOLE roll when
+  one saved app's binary had gone missing, so a machine came back from a
+  reboot with nothing running at all, unattended. Both now register each app
+  on its own merits, via a `BatchPolicy` the call site states explicitly.
+  All-or-nothing stays what `shep start` against a Flockfile does, which is
+  the case the check exists for and the only one where an operator is holding
+  a terminal.
+
+  The policy governs every point `do_start` can stop at, which took three
+  passes to get right: the pre-registration check, the spawn loop, and
+  `user`/`group` resolution. A `PerApp` batch now survives an app whose user
+  cannot be resolved, where one unresolvable name used to refuse an entire
+  muster restore.
+
+  Resolving credentials no longer builds a vector to zip against the apps.
+  That pairing was safe only while a failure returned early; once a failure
+  is SKIPPED, the two sequences drift, `zip` hands app 2 app 3's credentials,
+  and the last app is dropped without a word. That is a privilege
+  misassignment rather than a scheduling bug: the flock comes up looking
+  correct with processes under identities nobody chose. Each app now carries
+  its own credentials from the point of resolution, so there is no second
+  sequence to keep in step.
+
+  Under `PerApp`, an app whose credentials fail is registered `Errored` like
+  an app whose spawn fails, so it is visible in `shep flock` rather than
+  missing from it. It carries no identity, which is what still rules out the
+  outcome that matters: a later `shep restart` resolves it afresh and meets
+  the same refusal instead of coming up as the daemon. `AllOrNothing`
+  registers nothing at all, as it always has. Both causes are named in the
+  error either way.
+
+  The policy governs the SPAWN loop as well as the pre-registration check.
+  That loop returned on the first failure whatever the policy said, so a bad
+  entry that was not last still took every app after it down: `a-good` came
+  up, `b-bad` failed, and `c-good` was never registered at all. A muster roll
+  is written from a `BTreeMap` and restored in that order, so this was a
+  certainty whenever the broken name sorted first rather than a race. Under
+  `PerApp` a failed spawn now records that app, leaves it `Errored` and
+  visible, and moves to the next; the app's own remaining instances are
+  skipped, since they share a binary and would only add identical wrecks to
+  the listing. The error still names every app that failed, so the muster's
+  existing "failed to spawn one or more apps" log keeps its meaning.
+
+- Explain a bare program's spawn failure in the reply, not only in the log.
+  When a `script` or `interpreter` with no `/` in it fails to spawn, the
+  `SpawnFailed` message now carries "`node` is not on the shepherd's PATH
+  (...)" in place of the bare "tried `node`" clause, so an operator at a
+  terminal gets the diagnosis rather than only `No such file or directory`.
+  No protocol change: `SpawnFailed` already carries free-form text. A PATH of
+  more than four entries is summarised, because a daemon autostarted from a
+  shell inherits that shell's PATH, which measured two kilobytes and buried
+  the sentence that mattered.
+
+- Every reply carrying a listing now comes back in the same order the flock
+  listing does: by name, then by id. `ListFlock`, `Describe` and `Mustered`
+  already grouped by name; `Start`, `Stop`, `Restart`, `Reload`, `Scale`,
+  `Reopen`, `Flush`, `Trigger`, `Signal` and `SendLine` came back in whatever
+  order they were assembled, so one session against one flock printed two
+  different orders. Wire-observable, and so visible under `--format json` as
+  well as in a table. `Delete` is not in that list and never was: it answers
+  with ids alone, which the daemon already sorts.
+
+- `snapshot_all` takes the shared rule rather than a finer one of its own. It
+  sorted `(name, instance, id)`, which is more stable across a reload and
+  which no listing that has crossed the wire can reproduce, since
+  `ProcessInfo` carries no instance number. The two agreed until a reload
+  churned an id and then diverged, so `ListFlock` could order a reloaded app
+  differently from the `Restart` reply printed a second earlier -- the very
+  inconsistency this change exists to end, one layer down. It now calls
+  `sort_flock`, so the two cannot drift.
+
+- A sheep restored from the muster roll comes back under its configured
+  `user`/`group` rather than under the shepherd. `register_at_rest` records
+  membership without resolving anything, and `ProcessEntry::credentials`
+  spelled "nobody has looked this app up yet" and "this app asked for nobody"
+  the same way, as `None`. A later `shep restart` read the second meaning and
+  started the child as the daemon: no error, no warning, and nothing in `shep
+  describe` to see it by. The field is now a `SpawnIdentity`, which tells the
+  two apart, and every spawn path reaches a usable `Option<Credentials>`
+  through one seam that resolves an unresolved entry instead of falling back.
+  An app that resolved once is still settled for good, so a restart neither
+  re-reads the passwd database nor changes a running app's identity underneath
+  it.
+
+- Announce a credential-refused row once, not on every restore. The
+  `Errored` row a `PerApp` start leaves is registered idempotently by name, so
+  a second muster restore over a flock already holding it finds the row rather
+  than making one. The `ProcessEventKind::Errored` emit keyed on the row's
+  STATUS, which is `Errored` whether the call created it or found it, so the
+  repeat went out as a fresh transition and bark's `Trigger::GaveUp` read it as
+  one, paging twice for a row that had not changed whenever the two restores
+  sat further apart than its five-minute debounce. It keys on the registration now: `register_without_spawning` returns
+  whether it made the row, which is a question the row itself cannot answer.
+
+- Say why a restart produced no process. The event a failed restart emits
+  carries no reason and the reply has no per-id error slot, so the shepherd's
+  log was the only place to learn that a binary had been replaced mid-deploy
+  or that `fork` returned `EAGAIN` -- and that path discarded the runner's
+  error, leaving an `errored` row and nothing to read. The reason is now an
+  argument to the one function both failure routes go through, so there is no
+  way into that state without one.
+
+### Additions
+
+- Add `SupervisorError::CannotStart`, a command refused before it registered
+  or spawned anything: a `Start` batch whose checking pass rejected an app, or
+  a `shep stock` scale-UP of an app whose `user` will not resolve. A scale
+  that removes instances, or that asks for the count an app already has,
+  resolves nothing and cannot reach it. Separate from `SpawnFailed` because nothing was spawned,
+  and an operator told "spawn failed" about a spawn that never happened is
+  being pointed at the wrong place; the two also differ in what they leave
+  behind, which is the part that matters operationally. It maps to the
+  existing `RpcErrorCode::SpawnFailed` all the same, so exit 7 and every
+  older client are unchanged: `RpcErrorCode` is versioned and a client
+  predating a new code could not decode the reply at all.
+
+- Add `ProcessRunner::preflight` and `Preflight`, what a runner can tell
+  about a `SpawnSpec` before anything is spawned. Three verdicts, because a
+  caller registering a batch has three different things to do with the
+  answer: `Unknown` ("nothing knowable in advance", never "this will work"),
+  `Impossible` (a certainty, and the only one a caller may refuse a whole
+  batch over), and `Doubtful` (report it and carry on). `preflight` is
+  defaulted to `Unknown`, so an out-of-tree implementor is unaffected and a
+  runner that never touches the filesystem gives the honest answer.
+  `TokioRunner` answers `Impossible` for a `/`-containing path that is not on
+  the filesystem, `Doubtful` for a bare command missing from the `PATH` the
+  child will actually be given, and `Unknown` for everything else, including
+  a relative path with no `cwd` and any filesystem error other than
+  `NotFound`. Existence only, never the executable bit.
+
+- Answer `Request::ConfigDrift`: report which of a set of apps name a
+  registered sheep whose stored config differs, and in which fields. Reads
+  the flock and changes nothing -- it registers, spawns and records nothing,
+  so it is answered during a shutdown rather than refused the way `Start` is.
+  The incoming configs are re-normalized first, on the same untrusted-peer
+  rule `Start` follows plus one of its own: an unnormalized config would
+  report every default it did not spell out as a difference from the
+  normalized copy the flock stores.
+
+- `privilege::SpawnIdentity` — an entry's identity and whether it has been
+  resolved yet, which tells "this app asked for nobody" apart from "nobody
+  has asked yet". Both credential fixes above turn on that distinction.
+- `fake::ScriptedRunner::spawned_as` and `spawn_count`, behind `test-fakes`.
+  The fake starts no process, so it drops no privilege and changes no identity
+  at all. Recording what a spawn was ASKED for is therefore the only way a test
+  can assert the identity it carried rather than merely that it happened.
+
+## [0.1.0] - 2026-08-26
+
 ### Additions
 
 - Record every sheep's last exit outcome and carry it on `ProcessInfo`. The
@@ -20,54 +218,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an operator stop, a delete, a reload's drainee, a crash loop and shutdown
   alike. Cleared when a respawn fails to spawn at all, because nothing exited
   there and a stale code would read as a fresh crash.
-
-### Fixes
-
-- `shep serve`'s connection deadline is a config field rather than a constant
-  read at the use site, so its test can wait one out on a real clock. The test
-  previously paused the clock and raced tokio's auto-advance against live
-  socket IO, failing about one run in three.
-
-### Security and unsafe
-
-- Refuse, under a shepherd running as root, to open a log file whose ancestry
-  another local user could redirect — and warn about it, once per path, under
-  any other. An ancestor is loose when it is owned by neither the daemon's own
-  uid nor root, or when it is a world-writable directory. Ownership is the
-  load-bearing half: it catches an intermediate component swapped for a
-  symlink, which `O_NOFOLLOW` on the final component structurally cannot see,
-  and it catches an ordinary `0755` directory owned by an app's own
-  dropped-privilege `user`, which a write-bit test alone waves through. The
-  split by uid is deliberate — a loose ancestry is an escalation only for a
-  privileged daemon, and a developer logging to `/tmp` as themselves has
-  handed nobody anything they could not already do, so refusing there would
-  break a legitimate setup to no one's benefit. The sticky bit does not change
-  the answer: it restricts unlinking and renaming entries you do not own, not
-  creating new ones, and the attack plants a NEW entry at a path shep has not
-  created yet. A TOCTOU window remains between the check and the open, and
-  there is no portable way to close it while macOS is tier-1. The check costs
-  one `lstat(2)` per path component (7.8 µs for a nine-component path,
-  measured).
-- Open every log file with `O_NOFOLLOW`, in both halves of the log plane:
-  the pump's appending handle and the truncating one `shep flush` opens. An
-  app's `out_file`/`err_file` are free-form config, so a log path can name a
-  pre-existing directory shep neither created nor tightens — and there
-  another local user could plant a symlink where the log file was going to
-  be, have a root shepherd append the sheep's stdout through it, and have
-  `shep flush` empty its target. Dropping privileges with `user`/`group`
-  never helped, because log I/O never leaves the daemon, and the peer-cred
-  check was never in the path, because the attacker never touches the socket.
-  Both opens now fail instead, leaving the symlink and its target alone. The
-  guard covers only the FINAL path component: a symlinked parent directory
-  still resolves, and closing that needs `openat2(RESOLVE_NO_SYMLINKS)`,
-  which is Linux-only and so out of scope while macOS is tier-1. `O_APPEND`
-  rides alongside the new flag rather than being replaced by it — losing it
-  brings back the sparse hole after every rotation. An operator whose log
-  path legitimately IS a symlink is told so in those words, on the failure
-  path each verb already has: `ELOOP`'s own wording ("too many levels of
-  symbolic links") describes a loop they do not have.
-
-### Additions
 
 - `MemorySampler::identify` (defaulted) and `StatsState::lambs_of` — a
   sheep's parent-pid descendants, walked on demand and carried by `Describe`
@@ -706,6 +856,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixes
 
+- `shep serve`'s connection deadline is a config field rather than a constant
+  read at the use site, so its test can wait one out on a real clock. The test
+  previously paused the clock and raced tokio's auto-advance against live
+  socket IO, failing about one run in three.
+
 - A reply to a live trigger is no longer swallowed as a previous trigger's
   timeout debt when the app echoes the dispatch `id`.
 - The stop ladder no longer clamps an unrecognized `kill_signal` to SIGTERM —
@@ -785,6 +940,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   displaces either. What a restart *does* is unchanged either way — an
   automatic one resets the restart budget exactly as `shep restart` does,
   whichever of the four raised it.
+
+### Security and unsafe
+
+- Refuse, under a shepherd running as root, to open a log file whose ancestry
+  another local user could redirect — and warn about it, once per path, under
+  any other. An ancestor is loose when it is owned by neither the daemon's own
+  uid nor root, or when it is a world-writable directory. Ownership is the
+  load-bearing half: it catches an intermediate component swapped for a
+  symlink, which `O_NOFOLLOW` on the final component structurally cannot see,
+  and it catches an ordinary `0755` directory owned by an app's own
+  dropped-privilege `user`, which a write-bit test alone waves through. The
+  split by uid is deliberate — a loose ancestry is an escalation only for a
+  privileged daemon, and a developer logging to `/tmp` as themselves has
+  handed nobody anything they could not already do, so refusing there would
+  break a legitimate setup to no one's benefit. The sticky bit does not change
+  the answer: it restricts unlinking and renaming entries you do not own, not
+  creating new ones, and the attack plants a NEW entry at a path shep has not
+  created yet. A TOCTOU window remains between the check and the open, and
+  there is no portable way to close it while macOS is tier-1. The check costs
+  one `lstat(2)` per path component (7.8 µs for a nine-component path,
+  measured).
+- Open every log file with `O_NOFOLLOW`, in both halves of the log plane:
+  the pump's appending handle and the truncating one `shep flush` opens. An
+  app's `out_file`/`err_file` are free-form config, so a log path can name a
+  pre-existing directory shep neither created nor tightens — and there
+  another local user could plant a symlink where the log file was going to
+  be, have a root shepherd append the sheep's stdout through it, and have
+  `shep flush` empty its target. Dropping privileges with `user`/`group`
+  never helped, because log I/O never leaves the daemon, and the peer-cred
+  check was never in the path, because the attacker never touches the socket.
+  Both opens now fail instead, leaving the symlink and its target alone. The
+  guard covers only the FINAL path component: a symlinked parent directory
+  still resolves, and closing that needs `openat2(RESOLVE_NO_SYMLINKS)`,
+  which is Linux-only and so out of scope while macOS is tier-1. `O_APPEND`
+  rides alongside the new flag rather than being replaced by it — losing it
+  brings back the sparse hole after every rotation. An operator whose log
+  path legitimately IS a symlink is told so in those words, on the failure
+  path each verb already has: `ELOOP`'s own wording ("too many levels of
+  symbolic links") describes a loop they do not have.
 
 ### Changes
 

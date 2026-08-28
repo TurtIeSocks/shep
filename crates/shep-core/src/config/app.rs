@@ -157,6 +157,21 @@ pub struct AppConfig {
     })))]
     pub restart_delay: Option<UpDuration>,
     /// Initial backoff delay; grows ×1.5 capped at 15s (spec §4)
+    ///
+    /// Defaults to 100ms, not unset. An unstable exit (sooner than
+    /// `min_uptime`) with neither this nor `restart_delay` configured used
+    /// to restart with no delay at all, so an app that could never start
+    /// (a missing dependency, a bad config) burned its whole `max_restarts`
+    /// budget inside a second, logging the same failure dozens of times.
+    /// `min_uptime` already existed to name that case as unstable; only the
+    /// default that should have throttled it was missing.
+    ///
+    /// All of the above assumes `restart_delay` is unset. A fixed
+    /// `restart_delay` takes precedence over this field on every exit,
+    /// stable or not, so a stable exit restarts immediately only while
+    /// `restart_delay` stays unset, and setting this field to `"0"`
+    /// disables the backoff without producing an immediate restart if a
+    /// nonzero `restart_delay` is also configured.
     #[cfg_attr(feature = "schema", schemars(extend("init" = {
         "example": "5s",
         "group": "control",
@@ -426,7 +441,9 @@ impl Default for AppConfig {
             min_uptime: UpDuration::from_millis(1000),
             max_restarts: 16,
             restart_delay: None,
-            exp_backoff_restart_delay: None,
+            // Not None: see the field's doc comment. An unstable exit with
+            // no restart policy configured must not restart instantly.
+            exp_backoff_restart_delay: Some(UpDuration::from_millis(100)),
             kill_signal: None,
             kill_timeout: UpDuration::from_millis(1600),
             shutdown_with_message: false,
@@ -467,6 +484,68 @@ impl AppConfig {
             ..Self::default()
         }
     }
+
+    /// The names of the fields whose values differ between `self` and
+    /// `other`, in field-name order.
+    ///
+    /// Names only, never values. The one caller sends this list across the
+    /// wire to be printed at an operator, and [`AppConfig::env`] carries
+    /// secrets, so a differing `env` reports `"env"` and stops there (IR-41).
+    ///
+    /// Compare configs that have both been through
+    /// [`normalize`](fn@crate::config::normalize). Two configs differing only
+    /// in what normalization would have filled in are not a difference an
+    /// operator can act on, and reporting them would make the caller noisy
+    /// about nothing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use shep_core::config::AppConfig;
+    ///
+    /// let stored = AppConfig::minimal("web", "./srv");
+    /// let mut edited = stored.clone();
+    /// edited.cwd = Some("/srv".to_string());
+    ///
+    /// assert_eq!(stored.drifted_fields(&edited), vec!["cwd".to_string()]);
+    /// assert!(stored.drifted_fields(&stored).is_empty());
+    /// ```
+    #[must_use]
+    pub fn drifted_fields(&self, other: &Self) -> Vec<String> {
+        if self == other {
+            return Vec::new();
+        }
+        // Through serde rather than field by field, so a field added to this
+        // struct is compared without a second edit here. 44 hand-written
+        // comparisons is exactly the list that goes stale. `#[serde(default)]`
+        // with no `skip_serializing_if` means both sides serialize every
+        // field, so the two key sets are identical and iterating one is
+        // enough.
+        //
+        // Sorted explicitly rather than relying on `serde_json::Map` being a
+        // `BTreeMap`: it is one only while `serde_json`'s `preserve_order`
+        // feature is off, and that feature is additive, so ANY crate in the
+        // graph turning it on would make this an `IndexMap` and silently
+        // switch the order to serialization order. Nothing enables it today.
+        // The sort costs a few field names and makes the doc above true by
+        // construction instead of by a dependency's default feature set.
+        //
+        // An empty vector when either side fails to serialize as an object:
+        // there is no honest field list to report, and the caller must not
+        // fail over a warning it could not compute.
+        let (Ok(serde_json::Value::Object(mine)), Ok(serde_json::Value::Object(theirs))) =
+            (serde_json::to_value(self), serde_json::to_value(other))
+        else {
+            return Vec::new();
+        };
+        let mut fields: Vec<String> = mine
+            .iter()
+            .filter(|(key, value)| theirs.get(key.as_str()) != Some(value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        fields.sort_unstable();
+        fields
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +570,21 @@ mod tests {
         assert!(app.max_memory.is_none());
         assert!(app.fold.is_none());
         assert!(!app.channel);
+    }
+
+    /// fails if `exp_backoff_restart_delay` reverts to `None`. Defect 2:
+    /// with no restart policy configured, a crash-looping app used to
+    /// restart with no delay at all, burning `max_restarts` in well under a
+    /// second. `restart_delay` (the daemon-side function that reads this
+    /// field) is what actually applies the throttle; this test only pins
+    /// that the default an unconfigured app gets is "on".
+    #[test]
+    fn unstable_restarts_are_throttled_by_default() {
+        let app = AppConfig::minimal("web", "./srv");
+        assert_eq!(
+            app.exp_backoff_restart_delay,
+            Some(UpDuration::from_millis(100))
+        );
     }
 
     /// fails if `stdin` defaults to anything but false. The default is the
@@ -576,6 +670,61 @@ target = "http://127.0.0.1:8080/healthz"
         assert_eq!(
             format!("{app:?}"),
             "AppConfig { name: \"web\", script: \"./srv\", env: <2 vars>, .. }"
+        );
+    }
+
+    #[test]
+    fn an_unedited_config_has_drifted_in_no_field() {
+        let app = AppConfig::minimal("web", "./srv");
+
+        assert!(app.drifted_fields(&app.clone()).is_empty());
+    }
+
+    #[test]
+    fn drift_names_every_edited_field_and_no_other() {
+        // The defect this exists for: an operator edits `cwd` in a Flockfile
+        // and re-runs `shep start`. Two fields, not one, so a comparator
+        // that stopped at the first difference fails here.
+        let stored = AppConfig::minimal("proto-api", "./proto-enum-api");
+        let mut edited = stored.clone();
+        edited.cwd = Some("/Users/rin/GitHub/pogo-proto-api".to_string());
+        edited.args = vec!["-config".to_string(), "config.toml".to_string()];
+
+        assert_eq!(
+            stored.drifted_fields(&edited),
+            vec!["args".to_string(), "cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn drift_reports_env_by_name_and_never_by_value() {
+        let stored = AppConfig::minimal("web", "./srv");
+        let mut edited = stored.clone();
+        edited
+            .env
+            .insert("DATABASE_URL".to_string(), "postgres://hunter2".to_string());
+
+        let fields = edited.drifted_fields(&stored);
+
+        assert_eq!(fields, vec!["env".to_string()]);
+        // The whole point of returning names: this list is printed at an
+        // operator, so nothing from a value may reach it (IR-41).
+        assert!(!fields.concat().contains("hunter2"));
+    }
+
+    #[test]
+    fn drift_is_symmetric() {
+        let stored = AppConfig::minimal("web", "./srv");
+        let mut edited = stored.clone();
+        edited.instances = 4;
+
+        assert_eq!(
+            stored.drifted_fields(&edited),
+            edited.drifted_fields(&stored)
+        );
+        assert_eq!(
+            stored.drifted_fields(&edited),
+            vec!["instances".to_string()]
         );
     }
 }

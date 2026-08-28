@@ -3,6 +3,7 @@
 //! payload type.
 
 use super::Render;
+use super::width::visible_width;
 
 /// Renders any payload as the padded table, returned rather than printed so
 /// a test can read it. [`emit`](super::emit) calls this for `Format::Table`.
@@ -46,10 +47,10 @@ pub fn render_table<T: Render>(data: &T) -> String {
         );
     }
 
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    let mut widths: Vec<usize> = headers.iter().copied().map(visible_width).collect();
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
+            *width = (*width).max(visible_width(cell));
         }
     }
 
@@ -64,14 +65,20 @@ pub fn render_table<T: Render>(data: &T) -> String {
 /// Appends one row: every cell but the last padded to its column's width and
 /// followed by two spaces, the last cell unpadded so no line carries
 /// trailing whitespace.
+///
+/// Padded by hand rather than with `{cell:<width$}`, and the difference is
+/// the point: that format spec counts `char`s, so a CJK name gets half the
+/// spaces it needs and every column after it slides left. `boxed_row` below
+/// pads by [`visible_width`] for the same reason — this is the plain
+/// renderer catching up with the boxed one.
 fn write_row<'a>(out: &mut String, cells: impl Iterator<Item = &'a str>, widths: &[usize]) {
     let cells: Vec<&str> = cells.collect();
     let last = cells.len().saturating_sub(1);
     for (i, cell) in cells.into_iter().enumerate() {
-        if i == last {
-            out.push_str(cell);
-        } else {
-            out.push_str(&format!("{cell:<width$}", width = widths[i]));
+        out.push_str(cell);
+        if i != last {
+            let pad = widths[i].saturating_sub(visible_width(cell));
+            out.extend(core::iter::repeat_n(' ', pad));
             out.push_str("  ");
         }
     }
@@ -338,10 +345,10 @@ pub(crate) fn render_boxed_ex(
 fn column_widths(headers: &[&str], rows: &[Vec<String>], keep: &[usize]) -> Vec<usize> {
     keep.iter()
         .map(|&col| {
-            let mut w = crate::output::width::visible_width(headers[col]);
+            let mut w = visible_width(headers[col]);
             for row in rows {
                 if let Some(cell) = row.get(col) {
-                    w = w.max(crate::output::width::visible_width(cell));
+                    w = w.max(visible_width(cell));
                 }
             }
             w
@@ -356,7 +363,7 @@ fn column_widths(headers: &[&str], rows: &[Vec<String>], keep: &[usize]) -> Vec<
 fn boxed_row(cells: &[String], widths: &[usize]) -> String {
     let mut line = String::from("│");
     for (cell, w) in cells.iter().zip(widths) {
-        let pad = w.saturating_sub(crate::output::width::visible_width(cell));
+        let pad = w.saturating_sub(visible_width(cell));
         line.push(' ');
         line.push_str(cell);
         line.push_str(&" ".repeat(pad));
@@ -528,34 +535,60 @@ mod tests {
         assert_eq!(human_bytes(u64::MAX), "16.0E");
     }
 
-    /// "羊" is one character but three bytes in UTF-8. If column width were
-    /// computed with `str::len()` (bytes) instead of char count, a
-    /// six-character CJK name (18 bytes) would produce a far wider NAME
-    /// column than a six-character ASCII name (6 bytes) — even though
-    /// `{:<w$}` pads both to the same *character* width either way.
+    /// "羊" is one character, three bytes in UTF-8, and **two columns** on a
+    /// terminal. All three numbers differ, and only one of them is the width
+    /// of the column it needs.
+    ///
+    /// This test used to assert the middle one — that two names with equal
+    /// *character* counts render to equal-width rows — and that assertion was
+    /// the bug, pinned. A six-character CJK name draws twice as wide as a
+    /// six-character ASCII one, so a table that gives them the same column
+    /// hangs the CJK name over its own border and shoves every column after
+    /// it left. `docs/specs/deferred.md` recorded the same fault in
+    /// `lookout`'s `fit`; both are measured by
+    /// [`crate::output::width::char_columns`] now.
+    ///
+    /// So the property is stated in columns, and on the HEADER line as well
+    /// as the row. The two fixtures differ only in their name, so both lines
+    /// have to widen by exactly what that name draws wider — and only the
+    /// header line proves the *padding* moved, since the row's own NAME cell
+    /// is that name and would widen whatever the column did. Asserting on
+    /// one line alone would leave [`visible_width`] free to return a
+    /// constant.
+    ///
+    /// Not asserted: that a table's lines are all one width. `write_row`
+    /// leaves the last cell unpadded on purpose so no line carries trailing
+    /// whitespace, so they are not, and the boxed renderer's own
+    /// `every_line_of_a_boxed_table_has_the_same_visible_width` is where
+    /// that property belongs.
     #[test]
-    fn column_widths_count_characters_not_bytes() {
-        let ascii_name = "wwwwww".to_string(); // 6 chars, 6 bytes
-        let cjk_name = "羊".repeat(6); // 6 chars, 18 bytes
+    fn column_widths_count_display_columns_not_characters_or_bytes() {
+        let ascii_name = "wwwwww".to_string(); // 6 chars, 6 bytes, 6 columns
+        let cjk_name = "羊".repeat(6); // 6 chars, 18 bytes, 12 columns
         assert_eq!(ascii_name.chars().count(), cjk_name.chars().count());
 
-        let ascii_line = render_table(&FlockRows(vec![info_with_name(&ascii_name)]))
-            .lines()
-            .nth(1)
-            .unwrap()
-            .chars()
-            .count();
-        let cjk_line = render_table(&FlockRows(vec![info_with_name(&cjk_name)]))
-            .lines()
-            .nth(1)
-            .unwrap()
-            .chars()
-            .count();
+        let lines = |name: &str| -> (usize, usize) {
+            let table = render_table(&FlockRows(vec![info_with_name(name)]));
+            let mut lines = table.lines();
+            let header = visible_width(lines.next().expect("a header line"));
+            let row = visible_width(lines.next().expect("a row line"));
+            (header, row)
+        };
+        let (ascii_header, ascii_row) = lines(&ascii_name);
+        let (cjk_header, cjk_row) = lines(&cjk_name);
 
         assert_eq!(
-            ascii_line, cjk_line,
-            "two names with equal character counts must produce equal-width rendered rows, \
-             regardless of how many UTF-8 bytes either one takes"
+            cjk_header - ascii_header,
+            6,
+            "six `羊` draw six columns wider than six `w`, so the NAME column \
+             is padded six wider — a character count makes this 0 and a byte \
+             count makes it 12"
+        );
+        assert_eq!(
+            cjk_row - ascii_row,
+            6,
+            "and the row moves with its own header, or the two disagree about \
+             where the second column starts"
         );
     }
 
@@ -631,7 +664,7 @@ mod tests {
             let lines = table_lines(&out);
             let widths: Vec<usize> = lines
                 .iter()
-                .map(|l| crate::output::width::visible_width(l))
+                .map(|l| visible_width(l))
                 .collect();
             if let Some(&first) = widths.first() {
                 prop_assert!(
@@ -849,6 +882,13 @@ mod tests {
     /// seven columns without resorting to cryptic abbreviations. That test
     /// widens its own `Presentation` instead -- see its own doc for the
     /// number and the reasoning.
+    ///
+    /// A second exception, the same shape: task 7's `SMIT` column costs
+    /// another seven columns here too (`"SMIT"` is also 4-wide, and none of
+    /// these four sheep carries one, so it reads `-` the same way `EXIT`
+    /// does). `full_narrow_drops_the_status_word_before_a_whole_column`
+    /// moved off 80 for the same reason -- see its own doc for the new
+    /// number.
     fn mixed_flock(butter: ProcStatus) -> FlockRows {
         FlockRows(vec![
             ProcessInfo::builder(0, "web", ProcStatus::Online)
@@ -863,6 +903,17 @@ mod tests {
         ])
     }
 
+    /// Not a behaviour test: a MEASUREMENT, recorded so the two-width tests
+    /// below rest on a number rather than an assumption. `unicode-width`
+    /// classifies these two by East Asian Width, which is ambiguous for
+    /// some symbols and has moved between Unicode revisions, so what shep
+    /// thinks a smit occupies is worth writing down.
+    #[test]
+    fn how_wide_the_real_smits_actually_are() {
+        assert_eq!(visible_width("\u{25b2} main@a1b2c3"), 13);
+        assert_eq!(visible_width("\u{23f8} main@f6e5d4"), 13);
+    }
+
     /// A deep (256-colour) terminal, `xterm-256color` -- the same string
     /// `output/mod.rs`'s own Task 5b tests use to exercise
     /// `output::paint::style_for`'s deep tier rather than the 16-colour
@@ -872,21 +923,39 @@ mod tests {
         Some(OsStr::new("xterm-256color"))
     }
 
+    /// A `Full`, deep-colour `Presentation` at `width`, the shape every test
+    /// below wants and the only thing that varies between them.
+    fn full_at(width: usize) -> Presentation {
+        Presentation::new(StyleLevel::Full, None, deep_terminal(), None, width)
+    }
+
+    /// [`mixed_flock`], with two of its four rows carrying the real smit
+    /// strings a deploy dog paints -- not a hand-built `Some("x")`, since
+    /// the requirement under test is about a real smit at a real terminal
+    /// width. Taken verbatim from `/Users/rin/GitHub/shep-deploy/src/smit.rs`.
+    fn mixed_flock_with_smits() -> FlockRows {
+        let mut flock = mixed_flock(ProcStatus::Starting);
+        flock.0[0].smit = Some("\u{25b2} main@a1b2c3".to_string());
+        flock.0[2].smit = Some("\u{23f8} main@f6e5d4".to_string());
+        flock
+    }
+
     /// `full`, comfortably wide enough: face, word and colour all present,
     /// nothing dropped.
     ///
-    /// Width 90, not this module's usual 80 (`mixed_flock`'s own doc has the
-    /// exception and the arithmetic): task 49's `EXIT` column costs the
-    /// fixture seven columns it had no slack left to give up, so 80 no
-    /// longer fits `Starting`'s word (`"starting"`, the second-longest
-    /// Butter-role word after `WaitingRestart`) alongside it. This test's
-    /// own job was never "prove it fits at exactly the realistic fallback"
-    /// -- that boundary belongs to the narrow snapshot below, which still
-    /// runs at 80 -- it is "prove nothing drops when there is room", and 90
-    /// is still an ordinary terminal width, comfortably proving that.
+    /// Width 97, not this module's usual 80 (`mixed_flock`'s own doc has the
+    /// exception and the arithmetic): task 49's `EXIT` column and task 7's
+    /// `SMIT` column each cost the fixture seven columns they had no slack
+    /// left to give up, so 80 no longer fits `Starting`'s word
+    /// (`"starting"`, the second-longest Butter-role word after
+    /// `WaitingRestart`) alongside them. This test's own job was never
+    /// "prove it fits at exactly the realistic fallback" -- that boundary
+    /// belongs to the narrow snapshot below, which moved off 80 for the
+    /// same reason -- it is "prove nothing drops when there is room", and
+    /// 97 is still an ordinary terminal width, comfortably proving that.
     #[test]
     fn full_wide_pins_face_word_and_colour_for_a_mixed_flock() {
-        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 90);
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 97);
         let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
         assert!(
             !rendered.contains("hidden"),
@@ -907,19 +976,22 @@ mod tests {
     ///
     /// Swapping `mixed_flock`'s Butter row from `Starting` to
     /// `WaitingRestart` grows its STATUS content from `"(o~o) starting"`
-    /// (14 columns) to `"(o~o) waiting-restart"` (21) -- seven columns more,
-    /// which alone pushes the first, word-included pass from 78 to 85 and
-    /// over the 80-column fallback. `render_boxed_ex`'s own priority order
-    /// (`FlockRows::PRIORITIES`) drops FOLD first, landing back at 78 --
-    /// still over budget by nothing, so the retry never has to touch a
-    /// second column. The retry itself asks for every column again with the
-    /// word off; every face is exactly 5 columns regardless of status
-    /// (`vocabulary::face`'s own invariant), so STATUS falls back to its
-    /// 6-column header width and the whole table fits at 70 -- word gone,
-    /// FOLD back, no footer.
+    /// (14 columns) to `"(o~o) waiting-restart"` (21) -- seven columns more.
+    /// Width 87, not the module's usual 80: task 7's `SMIT` column (empty
+    /// here, same as `EXIT`) costs the fixture another seven columns it had
+    /// no slack left to give up, the same arithmetic `mixed_flock`'s own
+    /// doc records. `render_boxed_ex`'s own priority order
+    /// (`FlockRows::PRIORITIES`) drops SMIT first on the word-included
+    /// pass, being the highest priority number, landing back under budget
+    /// without a second column needing to go. The retry itself asks for
+    /// every column again with the word off; every face is exactly 5
+    /// columns regardless of status (`vocabulary::face`'s own invariant),
+    /// so STATUS falls back to its 6-column header width and the whole
+    /// table fits with room for SMIT to return too -- word gone, SMIT and
+    /// FOLD both back, no footer.
     #[test]
     fn full_narrow_drops_the_status_word_before_a_whole_column() {
-        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 80);
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 87);
         let rendered = table_of(&mixed_flock(ProcStatus::WaitingRestart), presentation);
         assert!(
             !rendered.contains("waiting-restart"),
@@ -929,6 +1001,52 @@ mod tests {
             !rendered.contains("hidden"),
             "and no whole column should have needed to: {rendered}"
         );
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// The narrowest terminal that still shows every column, including the
+    /// smit. Asserted rather than assumed: `table.rs`'s own note at :875
+    /// records that adding EXIT cost 7 columns and forced the wide fixture
+    /// from 80 to 90, and a later column will move this too. When it moves,
+    /// that is a decision about Rin's full-width condition, not a number to
+    /// quietly update.
+    const FULL_WIDTH: usize = 93;
+
+    /// fails if a smit is dropped at full width. Rin's permission to drop
+    /// it on a narrow terminal was conditional on it being seen regularly
+    /// at a wide one, so a later column that crowded it out here would
+    /// reopen a decision that was already made. This is the half of that
+    /// condition her permission does not state outright.
+    #[test]
+    fn a_smit_is_never_dropped_at_full_width() {
+        let rendered = table_of(&mixed_flock_with_smits(), full_at(FULL_WIDTH));
+        assert!(
+            rendered.contains("\u{25b2} main@a1b2c3"),
+            "the smit must survive a full-width render: {rendered}"
+        );
+        assert!(
+            !rendered.contains("hidden. Widen the window"),
+            "and nothing else may be dropped either, or FULL_WIDTH is wrong: {rendered}"
+        );
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// fails if a smit stops yielding first on a narrow terminal. It is by
+    /// far the widest column, so giving it up buys back the most room for
+    /// one column lost.
+    #[test]
+    fn a_smit_is_the_first_column_dropped_when_the_window_narrows() {
+        let rendered = table_of(&mixed_flock_with_smits(), full_at(FULL_WIDTH - 1));
+        assert!(
+            !rendered.contains("main@a1b2c3"),
+            "the smit must be gone one column below full width: {rendered}"
+        );
+        assert!(
+            rendered.contains("SMIT hidden.") || rendered.contains("SMIT, "),
+            "and the footer must name it, so an operator knows to widen: {rendered}"
+        );
+        // FOLD outlasts it, which is the placement decision itself.
+        assert!(rendered.contains("FOLD"), "{rendered}");
         insta::assert_snapshot!(rendered);
     }
 

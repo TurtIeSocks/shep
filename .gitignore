@@ -19,3 +19,10 @@
 # were committed by accident when Phase 14 merged.
 .superpowers/
 docs/teach
+
+# examples/polyglot build artifacts: a venv and a compiled Go binary, both
+# built by a setup script the docs page names, neither meant to be
+# committed. .rs/.js/.py/.go SOURCE under examples/polyglot/ is tracked as
+# normal; only what those two setup scripts produce is excluded here.
+/examples/polyglot/venv/
+/examples/polyglot/go-http/go-http
