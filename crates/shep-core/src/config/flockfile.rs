@@ -65,11 +65,12 @@ struct RawFlockfile {
     /// 0.1.8: an operator following shep-deploy's own README could not register
     /// their app at all. `unknown field `build`, expected `$schema` or `app``.
     ///
-    /// shep does not read what is in here, does not validate it, and makes no
-    /// promise about its shape. That is the point: the dog that owns a key
-    /// under this table is the only thing that understands it, and shep
-    /// refusing a document because it does not recognise another program's
-    /// config is a coupling neither side wants.
+    /// It must BE a table. shep does not read what is inside it, does not
+    /// validate it, and makes no promise about it. Those are two different
+    /// claims and only the second one is a promise not to care: the dog that
+    /// owns a key under this table is the only thing that understands it, and
+    /// shep refusing a document because it does not recognise another
+    /// program's config is a coupling neither side wants.
     ///
     /// Nested under one key rather than allowing loose top-level keys, so
     /// exactly one name is reserved and a typo anywhere else still fails.

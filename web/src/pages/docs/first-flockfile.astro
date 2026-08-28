@@ -376,7 +376,10 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
       the key existed, a Flockfile carrying any of it was refused outright, so
       an operator could not register their app at all. shep does not read what
       is under <code>dog</code>, does not validate it, and promises nothing
-      about its shape: the dog that owns a key is the only thing that
+      about it. The table itself is required, though: <code>dog = 5</code> and
+      <code>dog = ["a"]</code> are refused, because otherwise this would be
+      the one key in the document where a typo does not fail loudly. What is
+      inside it is the dog's: the dog that owns a key is the only thing that
       understands it, and shep refusing a document because it does not
       recognise another program's config is a coupling neither side wants.
       Everything else still fails loudly, which is why it is one nested table
