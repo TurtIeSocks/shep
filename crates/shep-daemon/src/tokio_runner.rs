@@ -424,7 +424,13 @@ fn what_exec_will_find(spec: &SpawnSpec) -> Preflight {
         return Preflight::Unknown;
     }
     let program = Path::new(&spec.program);
-    if spec.program.contains('/') {
+    // A `/` is the operator's claim that this is a path rather than a
+    // command name, and Windows spells the same claim with a `\\`. Reading
+    // only `/` there does not break a spawn: the fall-through looks the
+    // program up on PATH, does not find it, and the spawn proceeds and
+    // works. What it costs is the clear refusal this whole function
+    // exists to produce, on the one platform whose paths never match.
+    if spec.program.contains('/') || spec.program.contains(std::path::MAIN_SEPARATOR) {
         let full = if program.is_absolute() {
             program.to_path_buf()
         } else {
@@ -448,8 +454,14 @@ fn what_exec_will_find(spec: &SpawnSpec) -> Preflight {
     // Cheaper to be wrong here than in the arm above -- this one can only
     // reach a log line, never a refusal -- but a misleading message is the
     // same class of fault either way.
-    for dir in path.split(':').filter(|dir| !dir.is_empty()) {
-        match fs::metadata(Path::new(dir).join(program)) {
+    // `split_paths`, not a `split` on a separator of our own: the
+    // separator is `;` on Windows, where a `:` sits INSIDE every entry
+    // rather than between two, and entries there may additionally be
+    // quoted. Getting either wrong makes every entry unreadable, every
+    // lookup a `NotFound`, and the sentence below a lie about a program
+    // that is on the PATH after all.
+    for dir in std::env::split_paths(path).filter(|dir| !dir.as_os_str().is_empty()) {
+        match fs::metadata(dir.join(program)) {
             Ok(_) => return Preflight::Unknown,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Preflight::Unknown,
@@ -477,6 +489,14 @@ fn what_exec_will_find(spec: &SpawnSpec) -> Preflight {
 /// operator's own `PATH`, so it is the one they would go and check anyway.
 const PATH_ENTRIES_IN_MESSAGE: usize = 4;
 
+/// What separates one `PATH` entry from the next.
+///
+/// `:` on unix and `;` on Windows, where every entry starts with a drive
+/// letter and a `:` of its own. Display only: the lookup in
+/// [`what_exec_will_find`] goes through `std::env::split_paths`, which
+/// also understands the quoting a summary line cannot reproduce.
+const PATH_LIST_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
 /// `path` as a message should print it: in full when short, and otherwise its
 /// first [`PATH_ENTRIES_IN_MESSAGE`] entries with a count of the rest.
 ///
@@ -485,13 +505,16 @@ const PATH_ENTRIES_IN_MESSAGE: usize = 4;
 /// shepherd is running under a unit rather than under their shell, which is
 /// the whole diagnosis.
 fn summarise_path(path: &str) -> String {
-    let entries: Vec<&str> = path.split(':').filter(|dir| !dir.is_empty()).collect();
+    let entries: Vec<&str> = path
+        .split(PATH_LIST_SEPARATOR)
+        .filter(|dir| !dir.is_empty())
+        .collect();
     if entries.len() <= PATH_ENTRIES_IN_MESSAGE {
         return path.to_string();
     }
     format!(
         "{} and {} more entries",
-        entries[..PATH_ENTRIES_IN_MESSAGE].join(":"),
+        entries[..PATH_ENTRIES_IN_MESSAGE].join(&PATH_LIST_SEPARATOR.to_string()),
         entries.len() - PATH_ENTRIES_IN_MESSAGE,
     )
 }
@@ -2293,14 +2316,26 @@ mod tests {
                 Some(dir.path().to_path_buf()),
                 None,
             )),
+            // `join`, not a `/` in the format string: the separator shep
+            // resolved this path with is the platform's, and on Windows
+            // that is a backslash.
             Preflight::Impossible(format!(
-                "no such file: {}/./proto-enum-api",
-                dir.path().display()
+                "no such file: {}",
+                dir.path().join("./proto-enum-api").display()
             )),
         );
+        // Absolute, and `/nonexistent/srv` is not absolute on Windows: a
+        // path with no drive letter is relative to the current drive, and
+        // this arm is reached only for a program the daemon can resolve
+        // without a `cwd`.
+        let absent = if cfg!(windows) {
+            r"C:\nonexistent\srv"
+        } else {
+            "/nonexistent/srv"
+        };
         assert_eq!(
-            what_exec_will_find(&preflight_spec("/nonexistent/srv", None, None)),
-            Preflight::Impossible("no such file: /nonexistent/srv".to_string()),
+            what_exec_will_find(&preflight_spec(absent, None, None)),
+            Preflight::Impossible(format!("no such file: {absent}")),
         );
     }
 
@@ -2446,18 +2481,28 @@ mod tests {
     /// and seeing those three IS the diagnosis.
     #[test]
     fn a_long_path_is_summarised_and_a_startup_units_own_path_is_not() {
-        let fallback = "/usr/local/bin:/usr/bin:/bin";
+        // Spelled in the platform's own PATH syntax. A unix PATH handed to
+        // a Windows build is one entry, not six, so every assertion below
+        // would be about a string this function never sees.
+        let sep = PATH_LIST_SEPARATOR;
+        let join = |entries: &[&str]| entries.join(&sep.to_string());
+
+        let fallback = join(&["/usr/local/bin", "/usr/bin", "/bin"]);
         assert_eq!(
-            summarise_path(fallback),
+            summarise_path(&fallback),
             fallback,
             "the PATH a unit actually gets must print in full"
         );
 
-        let long = "/a:/b:/c:/d:/e:/f";
-        assert_eq!(summarise_path(long), "/a:/b:/c:/d and 2 more entries");
+        let long = join(&["/a", "/b", "/c", "/d", "/e", "/f"]);
+        assert_eq!(
+            summarise_path(&long),
+            format!("{} and 2 more entries", join(&["/a", "/b", "/c", "/d"]))
+        );
 
         // Exactly at the cap, which is where an off-by-one would show.
-        assert_eq!(summarise_path("/a:/b:/c:/d"), "/a:/b:/c:/d");
+        let capped = join(&["/a", "/b", "/c", "/d"]);
+        assert_eq!(summarise_path(&capped), capped);
     }
 
     // Everything else in this module needs a real OS child and lives in
