@@ -2645,7 +2645,7 @@ mod tests {
         use shep_client::testing::fake_client_answering;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[]), &[])).await;
 
@@ -2673,7 +2673,7 @@ mod tests {
         use shep_client::testing::fake_client_answering;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0]), &[])).await;
 
@@ -2702,7 +2702,7 @@ mod tests {
         use shep_client::testing::fake_client_answering;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0]), &[])).await;
 
@@ -2732,7 +2732,7 @@ mod tests {
         use shep_client::testing::fake_client_answering;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[]), &[0])).await;
 
@@ -2779,7 +2779,7 @@ mod tests {
             "[[app]]\nname = \"zam\"\nscript = \"./zam\"\ninstances = 3\n",
         )
         .unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) =
             fake_client_answering(&socket, a_daemon_for(a_clustered_flock(&[]), &[])).await;
 

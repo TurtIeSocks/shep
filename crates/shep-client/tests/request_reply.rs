@@ -162,7 +162,7 @@ async fn every_request_carries_an_explicit_deadline_on_the_wire() {
 #[tokio::test]
 async fn a_run_of_requests_is_answered_without_the_receiver_being_read() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, mut envelopes) =
         shep_client::testing::fake_client_answering(&path, |_| Response::Pong).await;
 
