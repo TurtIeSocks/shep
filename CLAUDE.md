@@ -290,14 +290,17 @@ cutover, the dogs subsystem with working metrics and bark dogs, and an
 audit-debt phase.
 
 **That reload is NOT "SO_REUSEPORT reload", which this line said until
-2026-08-28.** shep binds no sockets and never sets `SO_REUSEPORT`. What
-`reload` gives is an unconditional overlap — SpawnNew, AwaitReady, DrainOld,
-ReapOld — and whether that overlap is zero-downtime depends on the app having
+2026-08-28.** shep never binds an app's listening socket and never sets
+`SO_REUSEPORT` on one. The only socket it binds is its own control socket at
+`$SHEP_HOME/run/shep.sock`, which is a different thing entirely and does fail
+loudly when its path exceeds the platform limit. What `reload` gives is an
+unconditional overlap (SpawnNew, AwaitReady, DrainOld, ReapOld), and whether
+that overlap is zero-downtime depends on the app having
 set `SO_REUSEPORT` on its own listener; without it the second instance takes
 `EADDRINUSE`. The `reuse_port` Flockfile key is REFUSED at parse time, not
 ignored: "reuse_port is accepted by the schema but not yet implemented, so
-shep refuses it rather than ignoring it." README.md:137 and
-`web/src/components/landing/Features.astro` both state this correctly; only
+shep refuses it rather than ignoring it." README.md's `## Reloading` section
+and `web/src/components/landing/Features.astro` both state this correctly; only
 this file was wrong, which is worse than it sounds, because this is the file
 every session reads first. It put the false claim into a README draft on
 2026-08-28 before Rin caught it. Phase 11 merged too: the six remaining daemon-surface
