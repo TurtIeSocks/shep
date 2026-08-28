@@ -1834,41 +1834,6 @@ mod tests {
         );
     }
 
-    /// fails if a module that leaves a process on node's stdout is reported
-    /// as a module shep killed. node itself exits here: `detached` plus
-    /// `unref` takes the child off node's event loop, and `stdio: inherit`
-    /// hands it the pipes shep is reading, so the wait ends at once and only
-    /// the reads run out of budget.
-    #[test]
-    fn a_js_flockfile_leaving_a_process_on_the_pipe_says_that_instead() {
-        if !node_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("flock.js");
-        std::fs::write(
-            &path,
-            "require('child_process')\
-             .spawn('sleep', ['5'], { detached: true, stdio: 'inherit' })\
-             .unref(); \
-             module.exports = { app: [] };",
-        )
-        .unwrap();
-
-        let err = evaluate_js_flockfile(&path, Duration::from_millis(200)).unwrap_err();
-
-        assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
-        let message = err.to_string();
-        assert!(
-            message.contains("left behind still holds the output"),
-            "got: {message}"
-        );
-        assert!(
-            !message.contains("killed"),
-            "node exited on its own, so nothing was killed: {message}"
-        );
-    }
-
     /// fails if a pm2 ecosystem file is accepted, or if the refusal stops
     /// naming the key the operator has to change. Decision 2: this feature
     /// reads a Flockfile-shaped .js, and serde's own message is the answer.
@@ -2951,5 +2916,54 @@ mod tests {
             String::from_utf8(err).unwrap().contains("shep delete web"),
             "the daemon's own sentence has to reach the operator"
         );
+    }
+
+    /// Wall-clock tests, skipped by every CI job but the serial `slow` one.
+    ///
+    /// The case below needs a real node to START AND EXIT inside the budget,
+    /// which is a claim about how fast the machine is rather than about shep.
+    /// At 200ms it failed on four CI runners at once (arm, macos, musl and
+    /// the coverage job) while passing every local run: node took longer than
+    /// that to come up, so the run hit the deadline still running and shep
+    /// reported the kill it really had performed. The tier exists for exactly
+    /// this, and the budget here is 5s because a stalled read waits out
+    /// whatever is left of it, so the budget IS what the test costs.
+    mod slow {
+        use super::*;
+
+        /// fails if a module that leaves a process on node's stdout is
+        /// reported as a module shep killed. node itself exits here:
+        /// `detached` plus `unref` takes the child off node's event loop, and
+        /// `stdio: inherit` hands it the pipes shep is reading, so the wait
+        /// ends on its own and only the reads run out of budget.
+        #[test]
+        fn a_js_flockfile_leaving_a_process_on_the_pipe_says_that_instead() {
+            if !node_available() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("flock.js");
+            std::fs::write(
+                &path,
+                "require('child_process')\
+                 .spawn('sleep', ['30'], { detached: true, stdio: 'inherit' })\
+                 .unref(); \
+                 module.exports = { app: [] };",
+            )
+            .unwrap();
+
+            let err = evaluate_js_flockfile(&path, Duration::from_secs(5)).unwrap_err();
+
+            assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
+            let message = err.to_string();
+            assert!(
+                message.contains("left behind still holds the output"),
+                "got: {message}"
+            );
+            assert!(
+                !message.contains("killed"),
+                "node exited on its own, so nothing was killed: {message}"
+            );
+        }
     }
 }
