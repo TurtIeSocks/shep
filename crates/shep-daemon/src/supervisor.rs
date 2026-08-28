@@ -561,14 +561,12 @@ pub(crate) enum Msg {
     ReloadDeadline {
         /// The app whose reload this was armed for.
         name: String,
-        /// What stamped the swap when this was armed — see
-        /// [`ReloadSwap::deadline_stamp`], which is the replacement's id once
-        /// there is one and the drained instance's before that. Ids are never
-        /// reused, so a deadline naming anything other than the app's current
-        /// stamp belongs to a swap that has already ended and is dropped —
-        /// the same staleness rule [`Self::RestartDue`] applies with an
-        /// epoch.
-        id: u32,
+        /// Which arming this is, off [`Actor::next_deadline`]. A job arms
+        /// more than one watchdog over its life and only the newest may end
+        /// it, so a message carrying anything other than the job's current
+        /// [`ReloadJob::deadline`] is dropped — the same staleness rule
+        /// [`Self::RestartDue`] applies with an epoch.
+        stamp: u64,
     },
     /// A replacement answered its own probe, or failed to, with the instance
     /// it replaced already gone.
@@ -1481,6 +1479,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
             tx: tx.clone(),
             sheep: HashMap::new(),
             next_id: 0,
+            next_deadline: 0,
             next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
@@ -1581,6 +1580,24 @@ struct ReloadJob {
     /// The pair mid-swap right now. Exactly one per job — that is what
     /// "one at a time" means.
     swap: ReloadSwap,
+    /// Which of this job's watchdogs is the live one.
+    ///
+    /// A job arms more than one over its life: a serial reload arms at its
+    /// drain and again at its spawn, and an overlapping probed one arms again
+    /// when it enters [`ReloadPhase::Verify`]. Only the newest may end the
+    /// job, so each arming takes a fresh stamp off [`Actor::next_deadline`]
+    /// and writes it here, and [`Actor::handle_reload_deadline`] drops any
+    /// message that does not carry the current one.
+    ///
+    /// A counter of its own rather than the replacement's id, which is what
+    /// this was at first. The id works as a staleness token only while a job
+    /// arms once per replacement, and `Verify` broke that: a second timer
+    /// stamped with the same `new_id` does not invalidate the first, so the
+    /// original watchdog was still free to fire mid-verify, drop the job, and
+    /// take the rest of a clustered app's queue with it. Ids are never reused
+    /// and neither are these, so a stamp from a previous job of the same app
+    /// cannot match either.
+    deadline: u64,
 }
 
 /// Which of two orderings a reload runs, decided from the app's config.
@@ -1674,21 +1691,6 @@ struct ReloadSwap {
     /// How far along this pair is — see [`ReloadPhase`], whose variants name
     /// the steps of both orderings.
     phase: ReloadPhase,
-}
-
-impl ReloadSwap {
-    /// The id a [`Msg::ReloadDeadline`] armed for this swap is stamped with.
-    ///
-    /// The replacement's once there is one, and the instance being drained
-    /// before that — a serial reload arms its watchdog a whole drain before
-    /// its replacement has an id to be stamped with, and that drain is
-    /// precisely the window in which an instance wedged past its own
-    /// `SIGKILL` would leave a job nothing can remove. Ids are never reused,
-    /// so one field carries both stampings without either being able to match
-    /// the other's swap.
-    fn deadline_stamp(&self) -> u32 {
-        self.new_id.unwrap_or(self.old_id)
-    }
 }
 
 /// Where a [`ReloadSwap`] is in the spec's per-instance state machine.
@@ -2241,6 +2243,9 @@ struct Actor<R: ProcessRunner> {
     sheep: HashMap<u32, SheepSlot>,
     /// Monotonic id counter — ids are never reused.
     next_id: u32,
+    /// Stamps the next reload watchdog, so a job's older ones cannot end it.
+    /// Never reused, for the reason [`ReloadJob::deadline`] gives.
+    next_deadline: u64,
     /// Monotonic stamp counter for action waits — see
     /// [`PendingAction::stamp`] for why an action needs one of its own.
     next_action_stamp: u64,
@@ -2290,8 +2295,8 @@ impl<R: ProcessRunner> Actor<R> {
                     self.handle_ready_signal(id);
                     false
                 }
-                Msg::ReloadDeadline { name, id } => {
-                    self.handle_reload_deadline(&name, id);
+                Msg::ReloadDeadline { name, stamp } => {
+                    self.handle_reload_deadline(&name, stamp);
                     false
                 }
                 Msg::ReloadVerified {
@@ -4131,6 +4136,7 @@ impl<R: ProcessRunner> Actor<R> {
                         ReloadJob {
                             queue,
                             mode: ReloadMode::Overlap,
+                            deadline: 0,
                             swap: ReloadSwap {
                                 old_id,
                                 new_id: Some(new_id),
@@ -4196,8 +4202,8 @@ impl<R: ProcessRunner> Actor<R> {
     /// reload that said nothing until its drain was over would look for that
     /// whole window like one that never started.
     ///
-    /// The watchdog is armed on the DRAINEE's id (see
-    /// [`ReloadSwap::deadline_stamp`]). Without one, an instance wedged in
+    /// The watchdog is armed against the DRAINEE's entry, there being no
+    /// replacement to read the app's timings off yet. Without one, an instance wedged in
     /// uninterruptible sleep past its own `SIGKILL` would leave a job in
     /// `self.reloads` that nothing can remove, and every later reload of the
     /// app refused for as long as the daemon runs — the failure
@@ -4222,6 +4228,7 @@ impl<R: ProcessRunner> Actor<R> {
             ReloadJob {
                 queue,
                 mode: ReloadMode::Serial,
+                deadline: 0,
                 swap: ReloadSwap {
                     old_id,
                     new_id: None,
@@ -4650,6 +4657,12 @@ impl<R: ProcessRunner> Actor<R> {
                     ..job
                 },
             );
+            // Armed again, and it has to be: the watchdog running right now
+            // was sized for `AwaitReady` plus the drain, and the probe below
+            // can take another `listen_timeout` on top of both. Left alone it
+            // would be free to end this job while the verdict was still
+            // coming. See `arm_reload_deadline`.
+            self.arm_reload_deadline(name, new_id);
             self.spawn_verify_task(name, new_id, source);
             return;
         }
@@ -4952,20 +4965,23 @@ impl<R: ProcessRunner> Actor<R> {
     /// machinery is the actor's mailbox, which drains unconditionally (the
     /// command path never awaits — CRITICAL-2).
     ///
-    /// A serial reload arms one at each of its two doors, and the second is
-    /// not a re-arming of the first: the drain's is stamped with the drained
-    /// instance's id and the spawn's with the replacement's, and
-    /// [`ReloadSwap::deadline_stamp`] moves from one to the other the moment a
-    /// replacement exists — which is what makes the first stale and drops it.
-    /// The drain needs its own because it is a phase with no replacement to
-    /// stamp, and an instance wedged past its own `SIGKILL` is exactly the
-    /// stall described above.
+    /// A job arms more than one over its life, and each arming REPLACES the
+    /// last rather than joining it: the fresh stamp goes on
+    /// [`ReloadJob::deadline`], and every older timer is dropped when it
+    /// fires. Three sites need that. A serial reload arms at its drain, which
+    /// is a phase with no replacement and exactly where an instance wedged
+    /// past its own `SIGKILL` would strand the job, and again at its spawn.
+    /// An overlapping probed reload arms again on entering
+    /// [`ReloadPhase::Verify`], because the window below does not cover the
+    /// second probe: that probe may take another `listen_timeout`, and the
+    /// original watchdog would otherwise be free to end the job while the
+    /// verdict was still coming, taking the rest of a clustered app's queue
+    /// with it.
     ///
-    /// `id` is whatever stamps the swap right now: a replacement just
-    /// registered, or the instance a serial reload is about to drain. They
-    /// carry the same `ResolvedApp`, so which one it is makes no difference to
-    /// the window below.
-    fn arm_reload_deadline(&self, name: &str, id: u32) {
+    /// `id` names an entry to read the app's timings off, and any entry of
+    /// the app will do: a replacement just registered, or the instance a
+    /// serial reload is about to drain. They carry the same `ResolvedApp`.
+    fn arm_reload_deadline(&mut self, name: &str, id: u32) {
         // Loud rather than silent: a swap that quietly failed to arm one is
         // the exact state this exists to make impossible, and the entry is a
         // line old either way — a replacement `spawn_replacement` returned
@@ -4981,11 +4997,22 @@ impl<R: ProcessRunner> Actor<R> {
             + app.graceful_timeout.as_duration()
             + RELOAD_DEADLINE_SLACK;
 
+        let stamp = self.next_deadline;
+        self.next_deadline += 1;
+        let Some(job) = self.reloads.get_mut(name) else {
+            // Every caller arms with its job already in the map; without one
+            // there is nothing for a watchdog to end, so arming would leak a
+            // timer that could only ever be dropped as stale.
+            debug_assert!(false, "arm_reload_deadline: no job to arm for");
+            return;
+        };
+        job.deadline = stamp;
+
         let tx = self.tx.clone();
         let name = name.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(deadline).await;
-            let _ = tx.send(Msg::ReloadDeadline { name, id }).await;
+            let _ = tx.send(Msg::ReloadDeadline { name, stamp }).await;
         });
     }
 
@@ -5012,11 +5039,11 @@ impl<R: ProcessRunner> Actor<R> {
     /// `decide_on_exit` instead — which either leaves a dead row in an
     /// instance slot the replacement owns, or, for an `autorestart` app,
     /// respawns a second live process into it.
-    fn handle_reload_deadline(&mut self, name: &str, id: u32) {
+    fn handle_reload_deadline(&mut self, name: &str, stamp: u64) {
         let Some(job) = self.reloads.get(name) else {
             return;
         };
-        if job.swap.deadline_stamp() != id {
+        if job.deadline != stamp {
             return;
         }
         let old_id = job.swap.old_id;
@@ -5098,7 +5125,28 @@ impl<R: ProcessRunner> Actor<R> {
     /// deregistration removes, and there is no second copy of any of them.
     fn reap_drainee(&mut self, old_id: u32) -> bool {
         if let Some(name) = self.serial_drain_of(old_id) {
-            self.spawn_serial_replacement(&name, old_id);
+            // An operator's `delete` can reach the instance a serial reload is
+            // draining, and `DrainFirst` is the one phase with no other guard
+            // against it. The overlap is covered: an operator's command
+            // against a drainee lands while the swap is still `AwaitReady`,
+            // which `uncommitted_swap_of` recognises and `abort_reload` ends.
+            // `DrainFirst` deliberately answers `None` there — it has already
+            // asked the instance to go, so there is nothing to go back to —
+            // and `begin_manual` sets `pending_delete` whichever command owns
+            // the `manual` marker. Without this the delete would deregister
+            // the drained instance, answer its caller `Ok`, and leave a
+            // replacement running under a new id for an app nobody has.
+            if self.sheep[&old_id].pending_delete {
+                tracing::warn!(
+                    name,
+                    old_id,
+                    "reload abandoned: the instance being drained was deleted, so no \
+                     replacement was spawned"
+                );
+                self.reloads.remove(&name);
+            } else {
+                self.spawn_serial_replacement(&name, old_id);
+            }
         }
         let terminal = self.deregister_on_exit(old_id);
         let Some(name) = self.reload_of(old_id) else {
@@ -5566,6 +5614,15 @@ impl<R: ProcessRunner> Actor<R> {
         // wait cannot survive into a second process's life by any route.
         slot.actions.abandon_all();
         slot.entry.pid = None;
+        // Cleared here for the reason `pid` is: this is the one place a
+        // process under a registered id stops existing, and the flag is a
+        // verdict about a PROCESS. Leaving it set would make a dead entry
+        // replaceable — `reload_eligible` reads it — so an app whose parked
+        // replacement then exited without a respawn (`autorestart = false`
+        // reaches `Stopped`) would answer a reload by draining a row with no
+        // process behind it, or under an overlap by registering a second live
+        // entry beside it. See `SheepSlot::ready_failed`.
+        slot.ready_failed = false;
         // Set here, before any branch below decides what this exit BECOMES
         // (a respawn, an error, a clean stop, a deregistration): this is the
         // one place a process under a registered id stops existing, so it is
@@ -9269,6 +9326,7 @@ mod tests {
             tx,
             sheep,
             next_id: 1,
+            next_deadline: 0,
             next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
@@ -9645,6 +9703,7 @@ mod tests {
             ReloadJob {
                 queue: VecDeque::new(),
                 mode: ReloadMode::Overlap,
+                deadline: 0,
                 swap: ReloadSwap {
                     // Reaped, which is what puts the swap in `Verify` at all.
                     old_id: 99,
@@ -9704,6 +9763,107 @@ mod tests {
         assert_eq!(
             drained_process_kinds(&mut rx),
             vec![ProcessEventKind::Reloaded]
+        );
+    }
+
+    // fails if the watchdog armed for a swap can still end that swap after it
+    // moved on to `Verify`. Each arming replaces the last, so the stamp the
+    // job carries is the only one that may end it — and the one the earlier
+    // arming sent is dropped.
+    //
+    // The failure this prevents is quiet and expensive: the second probe takes
+    // up to another `listen_timeout`, so a job whose first probe and drain ate
+    // the original window would be abandoned mid-verify, the verdict dropped,
+    // and the rest of a clustered app's queue left on the old code.
+    #[tokio::test(start_paused = true)]
+    async fn a_re_armed_watchdog_retires_the_one_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _mailbox) = actor_awaiting_a_verdict(&dir);
+        // Both armings are made here: the fixture builds its job by hand, so
+        // the stamp it carries is not one this counter ever issued.
+        actor.arm_reload_deadline("web", 0);
+        let first = actor.reloads["web"].deadline;
+
+        actor.arm_reload_deadline("web", 0);
+        let second = actor.reloads["web"].deadline;
+        assert_ne!(first, second, "each arming takes a stamp of its own");
+
+        actor.handle_reload_deadline("web", first);
+        assert!(
+            actor.reloads.contains_key("web"),
+            "the retired watchdog must not end a swap the live one is still watching"
+        );
+
+        actor.handle_reload_deadline("web", second);
+        assert!(actor.reloads.is_empty(), "the live one still ends it");
+    }
+
+    // fails if `shep delete` landing inside a serial drain leaves a
+    // replacement running for an app nobody has. `DrainFirst` is the one phase
+    // an operator's command can reach without `uncommitted_swap_of` seeing it,
+    // by design: the instance has already been asked to go, so there is
+    // nothing to abandon back to. That is what makes the delete the reload's
+    // problem rather than the abandonment machinery's.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_during_a_serial_drain_spawns_no_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        // No scripts: a spawn here would panic on a runner with nothing left,
+        // which is the assertion as much as the count below is.
+        let (mut actor, _mailbox) = actor_with_one_online_sheep_of(&dir, probed_app("web"), vec![]);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+        actor.sheep.get_mut(&0).expect("the fixture's sheep").ctl = Some(ctl_tx);
+
+        actor.advance_reload("web", VecDeque::from([0]));
+        assert_eq!(actor.reloads["web"].swap.phase, ReloadPhase::DrainFirst);
+        // What `begin_manual` leaves behind for a `delete` that matched a
+        // running sheep whose `manual` marker the drain already owns.
+        actor.sheep.get_mut(&0).expect("the drainee").pending_delete = true;
+
+        actor.handle_exited(
+            0,
+            ExitOutcome {
+                code: Some(0),
+                signal: None,
+            },
+        );
+
+        assert!(actor.sheep.is_empty(), "the delete emptied the flock");
+        assert!(actor.reloads.is_empty(), "and the reload ended with it");
+    }
+
+    // fails if the verdict a reload reached about a PROCESS outlives that
+    // process. `ready_failed` makes a parked instance replaceable; left set
+    // after its process exits without a respawn, it makes a `Stopped` row
+    // replaceable, and a reload against one of those either drains a row with
+    // nothing behind it or registers a second live entry beside it. Neither
+    // ends until the swap's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_instances_verdict_does_not_outlive_its_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = probed_app("web");
+        // The arrangement that reaches `Stopped` rather than a respawn.
+        app.autorestart = false;
+        let (mut actor, _mailbox) = actor_with_one_online_sheep_of(&dir, app, vec![]);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+        let slot = actor.sheep.get_mut(&0).expect("the fixture's sheep");
+        slot.ctl = Some(ctl_tx);
+        slot.entry.status = ProcStatus::Starting;
+        slot.ready_failed = true;
+
+        actor.handle_exited(
+            0,
+            ExitOutcome {
+                code: Some(0),
+                signal: None,
+            },
+        );
+
+        let slot = actor.sheep.get(&0).expect("a clean stop keeps the row");
+        assert_ne!(slot.entry.status, ProcStatus::Online);
+        assert!(!slot.ready_failed);
+        assert!(
+            !reload_eligible(slot),
+            "a row with no process behind it is not something a reload may replace"
         );
     }
 
@@ -9803,6 +9963,7 @@ mod tests {
             tx,
             sheep,
             next_id: 1,
+            next_deadline: 0,
             next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
@@ -9865,6 +10026,7 @@ mod tests {
             tx,
             sheep,
             next_id: DOG_ID + 1,
+            next_deadline: 0,
             next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
@@ -10060,6 +10222,7 @@ mod tests {
             tx,
             sheep,
             next_id: instances,
+            next_deadline: 0,
             next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
@@ -10090,6 +10253,7 @@ mod tests {
         ReloadJob {
             queue: VecDeque::new(),
             mode: ReloadMode::Overlap,
+            deadline: 0,
             swap: ReloadSwap {
                 old_id: 0,
                 new_id: Some(1),
@@ -12388,6 +12552,7 @@ mod tests {
             ReloadJob {
                 queue: VecDeque::new(),
                 mode: ReloadMode::Overlap,
+                deadline: 0,
                 swap: ReloadSwap {
                     old_id: 0,
                     new_id: Some(new_id),
@@ -12396,7 +12561,7 @@ mod tests {
             },
         );
 
-        actor.handle_reload_deadline("web", new_id);
+        actor.handle_reload_deadline("web", actor.reloads["web"].deadline);
 
         assert!(
             actor.reloads.is_empty(),
@@ -15451,6 +15616,7 @@ mod tests {
             tx,
             sheep: HashMap::new(),
             next_id: 0,
+            next_deadline: 0,
             next_action_stamp: 0,
             pending: Vec::new(),
             shutting_down: false,
