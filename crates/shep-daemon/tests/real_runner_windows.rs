@@ -132,6 +132,34 @@ fn pid_is_alive(pid: u32) -> bool {
     system.process(Pid::from_u32(pid)).is_some()
 }
 
+/// The pid of a live child of `parent`, or `None`.
+///
+/// Replaces having the sheep print its own child's pid, which needed a
+/// shell that could ask Windows for it, which meant PowerShell, which is
+/// what hung this suite for four CI runs. This asks the same question from
+/// the test process, where an answer of `None` is a visible failure rather
+/// than a wait that never ends.
+///
+/// The concern that led to the sheep naming its own child was that
+/// `sysinfo` might not SEE a grandchild that `Win32_Process` showed, which
+/// would make a containment test pass while finding nothing. That is why
+/// the caller `expect`s this: a grandchild it cannot find fails the test
+/// rather than skipping the assertion.
+fn child_of(parent: u32) -> Option<u32> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    system
+        .processes()
+        .values()
+        .find(|process| process.parent() == Some(Pid::from_u32(parent)))
+        .map(|process| process.pid().as_u32())
+}
+
 /// fails if a real child's stdout never reaches its log file. The most basic
 /// thing the runner does, and the one every other case here depends on.
 #[tokio::test]
@@ -181,59 +209,70 @@ async fn kill_tree_stops_a_long_running_sheep_and_reports_a_recognisable_code() 
 /// fails if a sheep's own child survives `kill_tree` — the whole reason the
 /// runner creates a job object at all.
 ///
-/// The sheep is a PowerShell that launches a background `ping` and prints
-/// its pid, so the grandchild identifies itself through the log pump. That
-/// is deliberately not done by walking the process table: `sysinfo`'s
-/// `parent()` did not reliably report the relationship on this platform
-/// (measured — `Win32_Process` showed the child while `sysinfo` did not), and
-/// a containment test that silently fails to FIND the grandchild proves
-/// nothing while looking like it passed. Having the sheep name its own child
-/// removes the question.
+/// The sheep is a `cmd` batch that launches a background `ping` with
+/// `start /b` and then waits, so there is a grandchild to contain and a
+/// parent for `kill_tree` to address.
+///
+/// The grandchild is found by walking the process table, which this test
+/// used to avoid: `sysinfo`'s `parent()` was measured as not reporting the
+/// relationship while `Win32_Process` did, so the sheep printed its own
+/// child's pid instead. That needed a shell able to ask Windows for a pid,
+/// which meant PowerShell, which is what hung this suite for four CI runs
+/// with both log files present and empty. The trade is now the other way
+/// round, and the risk it was avoiding is handled directly: `child_of` is
+/// `expect`ed, so a grandchild the test cannot see fails it rather than
+/// skipping the assertion and looking green.
 ///
 /// This is the assertion that would go red if `spawn` ever stopped assigning
 /// the child to its job — a change that breaks nothing else, and that every
 /// other test in this file would keep passing through.
-// Ran ignored on Windows for four commits. On the runner this failed with
-// both log files present and ZERO bytes, so the sheep launched and wrote
-// nothing to either stream inside the deadline. The script above now
-// flushes stdout explicitly, which is the one explanation that fits an
-// empty stdout AND an empty stderr from a process that then sleeps for a
-// minute without exiting.
-//
-// If that is wrong, the panic now says how long it waited, which separates
-// a slow start from a line that never comes.
+// Ran ignored on Windows for four commits, and the explanation offered
+// here at the time was wrong: it blamed PowerShell buffering a redirected
+// stdout, and the fix was an explicit flush. The flush changed nothing.
+// An out-of-process probe on the runner then showed the sheep with every
+// thread in `Wait` and 0.28s of CPU between them, all of it startup, so
+// there was no buffered line waiting to be flushed. The process was not
+// running at all. The fixture is `cmd` now, like every other one here.
 #[tokio::test]
 async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     let dir = tempfile::tempdir().unwrap();
     let mut spec = cmd_spec(&dir, &["echo", "placeholder"]);
-    spec.program = "powershell".to_string();
-    spec.args = vec![
-        "-NoProfile".to_string(),
-        "-Command".to_string(),
-        // `[Console]::Out`, not `Write-Output`: this script prints one
-        // line and then sleeps for a minute, so anything PowerShell
-        // buffers on a redirected stdout does not reach the log until
-        // long after the test has given up waiting for it. The explicit
-        // flush is the whole point; the rest is the same script.
-        concat!(
-            "$p = Start-Process ping -ArgumentList '-n','60','127.0.0.1' ",
-            "-PassThru -WindowStyle Hidden; ",
-            "[Console]::Out.WriteLine('LAMB=' + $p.Id); [Console]::Out.Flush(); ",
-            "Start-Sleep -Seconds 60"
-        )
-        .to_string(),
-    ];
+    // `cmd` from a batch file, not `powershell -Command`. PowerShell is
+    // what hung `daemon_e2e`'s gated fixture for four CI runs, and an
+    // out-of-process probe showed why: the sheep sat with every thread in
+    // `Wait` and 0.28s of CPU between them, all of it startup. This case
+    // failed the same way, with both its log files present and empty.
+    //
+    // `start /b` is the grandchild: a process the sheep spawns that
+    // outlives it, which is the whole point of the case. The sheep then
+    // waits, so `kill_tree` has something to kill.
+    const CRLF: &str = "\r\n";
+    let script = dir.path().join("lamb.cmd");
+    std::fs::write(
+        &script,
+        [
+            "@echo off",
+            "start /b ping -n 60 127.0.0.1 >nul",
+            "echo LAMB-STARTED",
+            "ping -n 60 127.0.0.1 >nul",
+            "",
+        ]
+        .join(CRLF),
+    )
+    .expect("the lamb fixture script must be writable");
+    spec.program = "cmd".to_string();
+    spec.args = vec!["/C".to_string(), script.display().to_string()];
     let runner = TokioRunner::new();
 
     let (mut proc, _io) = runner.spawn(&spec).unwrap();
-    let logged = wait_for_log(&spec.out_file, "LAMB=").await;
-    let lamb: u32 = logged
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("LAMB="))
-        .expect("the sheep must report its grandchild")
-        .trim()
-        .parse()
-        .expect("a pid");
+    // The batch says when it has started its grandchild; the pid itself
+    // comes from the process table, since `cmd` cannot report one.
+    wait_for_log(&spec.out_file, "LAMB-STARTED").await;
+    let sheep = proc.pid();
+    let lamb = child_of(sheep).expect(
+        "the sheep's grandchild must be visible in the process table, or this \
+         case proves nothing about containment",
+    );
 
     assert!(
         pid_is_alive(lamb),
