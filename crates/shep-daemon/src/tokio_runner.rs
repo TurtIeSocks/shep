@@ -18,7 +18,9 @@
 //! # Shepherd-channel fd lifecycle
 //!
 //! The child's end of the `UnixStream::pair()` is handed to the child via
-//! [`command_fds::FdMapping`] as fd 3. That mapping captures the fd inside a
+//! `command_fds::FdMapping` as fd 3. Not an intra-doc link: `command-fds`
+//! is a `cfg(unix)` dependency, so the link resolves on unix and fails the
+//! doc build on Windows. That mapping captures the fd inside a
 //! `pre_exec` closure owned by the `Command`, so the parent process's extra
 //! reference to the same fd stays open until the `Command` itself is
 //! dropped — done explicitly, immediately after `spawn()`, so the daemon's
