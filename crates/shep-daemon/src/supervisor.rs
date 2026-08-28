@@ -4700,7 +4700,12 @@ impl<R: ProcessRunner> Actor<R> {
             SpawnIdentity::Resolved(creds) => creds,
             SpawnIdentity::Unresolved => None,
         };
-        let spec = assemble(&slot.entry.spec, slot.entry.instance, &self.paths, credentials);
+        let spec = assemble(
+            &slot.entry.spec,
+            slot.entry.instance,
+            &self.paths,
+            credentials,
+        );
         let prober = spec_prober(&spec);
 
         // `await_ready` wants a channel receiver and its `Probe` arm never
@@ -5102,9 +5107,7 @@ impl<R: ProcessRunner> Actor<R> {
     fn serial_drain_of(&self, old_id: u32) -> Option<String> {
         self.reloads
             .iter()
-            .find(|(_, job)| {
-                job.swap.phase == ReloadPhase::DrainFirst && job.swap.old_id == old_id
-            })
+            .find(|(_, job)| job.swap.phase == ReloadPhase::DrainFirst && job.swap.old_id == old_id)
             .map(|(name, _)| name.clone())
     }
 
@@ -9358,8 +9361,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_probed_reload_drains_before_it_spawns_anything() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut actor, _mailbox) =
-            actor_with_one_online_sheep_of(&dir, probed_app("web"), vec![]);
+        let (mut actor, _mailbox) = actor_with_one_online_sheep_of(&dir, probed_app("web"), vec![]);
         let (ctl_tx, mut ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
         actor.sheep.get_mut(&0).expect("the fixture's sheep").ctl = Some(ctl_tx);
 
@@ -9494,7 +9496,11 @@ mod tests {
             (probed.clone(), ReloadMode::Overlap, true),
             (probed, ReloadMode::Serial, false),
             (channel, ReloadMode::Overlap, false),
-            (AppConfig::minimal("web", "./srv"), ReloadMode::Overlap, false),
+            (
+                AppConfig::minimal("web", "./srv"),
+                ReloadMode::Overlap,
+                false,
+            ),
         ] {
             let (actor, _mailbox) = actor_with_one_online_sheep_of(&dir, app, vec![]);
             assert_eq!(

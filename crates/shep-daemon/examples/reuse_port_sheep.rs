@@ -107,8 +107,8 @@ mod unix {
                 .unwrap_or(40),
         );
         let defiant = std::env::var("SHEEP_DEFIANT").is_ok_and(|raw| raw == "1");
-        let mute = std::env::var("SHEEP_MUTE_FILE")
-            .is_ok_and(|path| std::path::Path::new(&path).exists());
+        let mute =
+            std::env::var("SHEEP_MUTE_FILE").is_ok_and(|path| std::path::Path::new(&path).exists());
 
         // Blocked before any thread exists, so every thread spawned below
         // inherits the mask and none of them can take the signal instead.
