@@ -1,3 +1,5 @@
+# Lexicon table
+
 <!--
   The Terminology page's table, parsed by web/src/data/docsLexicon.ts.
 

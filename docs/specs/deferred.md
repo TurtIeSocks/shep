@@ -418,9 +418,13 @@ on a whole `char` boundary.
 
 `evaluate_js_flockfile` takes a budget now, `JS_EVAL_BUDGET` is 30s, and node
 is killed once it passes. The refusal exits `InvalidConfig` and names the
-cause: *node was still evaluating <path> after 30s, so shep killed it; a
-Flockfile module has to export its config and return, and one that starts a
-server at require time never does.*
+cause: *node was still running <path> after 30s, so shep killed it; a
+Flockfile module has to export its config and let node exit, and one that
+leaves a server listening or a timer armed does not.*
+
+What the budget waits for is node EXITING, not `require` returning. A module
+can assign `module.exports` and return while an armed timer holds the event
+loop open, which is the shape the unit test uses.
 
 **The reason recorded here for not building it was wrong**, which is the part
 worth keeping. A bound needs no reaper thread and no unsafe. `Child::try_wait`
@@ -1090,8 +1094,8 @@ has no `.js` entry in it. The document it reads is Flockfile-shaped (an `app`
 array, sheep-native field names), not a pm2 `ecosystem.config.js` — pointing
 `--flockfile` at a real pm2 ecosystem file gets serde's own `unknown field
 `apps`, expected `app`` refusal, and `shep import` remains the only pm2 path.
-A `.js` module that never returns hangs `shep start` forever; there is no
-timeout, recorded as known debt below.
+A `.js` module that keeps node alive hung `shep start` forever until the 30s
+`JS_EVAL_BUDGET` landed on 2026-08-28; see the entry above.
 
 **schemars JSON-schema export** (spec §5) **shipped**, Phase 14, behind a
 non-default `schema` feature on shep-core that shep turns on. The schema

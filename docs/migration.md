@@ -18,10 +18,11 @@ sheep-native field names — not pm2's. Point it at a real
 `ecosystem.config.js` and shep refuses, naming the key it found and the key
 it wanted.
 
-node gets 30 seconds to hand the config back, then shep kills it and names
-the file. A Flockfile module has to export its config and return; one that
-starts a server at require time never does, so an unattended `shep start`
-ends in a refusal rather than waiting for a terminal nobody is sitting at.
+node gets 30 seconds to hand the config back and exit, then shep kills it and
+names the file. Exporting the config is not enough on its own: a module that
+leaves a server listening or a timer armed keeps node's event loop alive, and
+node then never exits. An unattended `shep start` ends in a refusal rather
+than waiting for a terminal nobody is sitting at.
 
 Without the `--flockfile` flag, `shep start server.js` still means what it
 has always meant: start `server.js`. And if node is not installed, shep

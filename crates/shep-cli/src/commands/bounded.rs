@@ -4,8 +4,9 @@
 //! run, which is the right default nearly everywhere in this crate: the other
 //! commands shep spawns are probes and renderers that exit on their own. The
 //! one place it is wrong is the `.js` Flockfile bridge, where the child is
-//! running a file the operator wrote. A config module that starts a server at
-//! require time never returns, and `output` would wait for it forever.
+//! running a file the operator wrote. A config module that leaves a server or
+//! a timer running keeps node's event loop alive after `require` returned, so
+//! node never exits and `output` waits for it forever.
 //!
 //! [`run_bounded`] is `output` with a deadline: the same captured stdout and
 //! stderr, plus a [`Bounded::TimedOut`] answer once the child outlives its

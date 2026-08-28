@@ -192,12 +192,13 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 /// implementation choice, not a different design.
 ///
 /// **`budget` bounds the whole evaluation**, and node is killed the moment it
-/// runs out. A module that never returns — one that starts a server at
-/// require time instead of exporting config — used to hang here until
-/// somebody pressed Ctrl-C, which is a fair answer at a terminal and no
-/// answer at all for the CI job or provisioning script running `shep start`
-/// with nobody watching. [`run_bounded`] is the mechanism; [`JS_EVAL_BUDGET`]
-/// is what every caller passes.
+/// runs out. What has to happen inside it is node EXITING, not `require`
+/// returning: a module that leaves a server listening or a timer armed can
+/// assign `module.exports` and return while node's event loop stays alive, so
+/// this used to hang until somebody pressed Ctrl-C. That is a fair answer at
+/// a terminal and no answer at all for the CI job or provisioning script
+/// running `shep start` with nobody watching. [`run_bounded`] is the
+/// mechanism; [`JS_EVAL_BUDGET`] is what every caller passes.
 ///
 /// The `node_missing` sentence IS pinned, as of Phase 17, by `cli_e2e`'s
 /// `a_js_flockfile_without_node_says_so_and_says_what_to_do`. This doc used
@@ -233,9 +234,9 @@ fn evaluate_js_flockfile(path: &Path, budget: Duration) -> Result<String, Target
         Ok(Bounded::TimedOut) => {
             return Err(TargetError::Js {
                 detail: format!(
-                    "node was still evaluating {} after {}s, so shep killed it; a Flockfile \
-                     module has to export its config and return, and one that starts a server \
-                     at require time never does",
+                    "node was still running {} after {}s, so shep killed it; a Flockfile \
+                     module has to export its config and let node exit, and one that leaves a \
+                     server listening or a timer armed does not",
                     path.display(),
                     budget.as_secs_f32()
                 ),
@@ -1785,17 +1786,18 @@ mod tests {
         assert!(err.to_string().contains("sheep dip empty"), "got: {err}");
     }
 
-    /// fails if a config module that never returns hangs shep, which is
+    /// fails if a config module that keeps node alive hangs shep, which is
     /// exactly what one did until this budget existed. `setInterval` leaves a
-    /// handle on node's event loop, so node stays alive long after `require`
-    /// returned -- the same mechanism as the server-at-require-time shape
-    /// `docs/specs/deferred.md` named, without binding a port to get it.
+    /// handle on node's event loop, so node stays running long after `require`
+    /// returned and `module.exports` was assigned -- the same mechanism as the
+    /// server-at-require-time shape `docs/specs/deferred.md` named, without
+    /// binding a port to get it.
     ///
     /// The budget is 200ms rather than [`JS_EVAL_BUDGET`] so the test costs a
     /// fifth of a second; what it pins is that the bound is enforced and says
     /// so, not what the shipped bound is.
     #[test]
-    fn a_js_flockfile_that_never_returns_is_killed_and_says_why() {
+    fn a_js_flockfile_that_keeps_node_alive_is_killed_and_says_why() {
         if !node_available() {
             return;
         }
@@ -1811,7 +1813,7 @@ mod tests {
         let err = evaluate_js_flockfile(&path, Duration::from_millis(200)).unwrap_err();
 
         assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
-        assert!(err.to_string().contains("still evaluating"), "got: {err}");
+        assert!(err.to_string().contains("still running"), "got: {err}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "node was waited out rather than killed, in {:?}",
