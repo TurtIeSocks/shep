@@ -47,7 +47,65 @@ on:
 permissions:
   contents: read
 jobs:
+  # Decides which of the jobs below a change actually needs, so a docs-only
+  # pull request stops paying for the full Rust matrix. Everything below
+  # except `typos` is gated on this job's `rust` output; `typos` reads prose,
+  # which is exactly what a docs-only change edits, so it always runs.
+  #
+  # The skip lives at the JOB level (`needs` + `if`) and deliberately NOT at
+  # the workflow level (`on.push.paths`), and the difference is the `main`
+  # ruleset. A job skipped by its `if:` still reports, as "skipped", which
+  # SATISFIES a required status check. A workflow filtered out by `paths:`
+  # never reports at all, so every required check sits at "Expected" forever
+  # and a docs pull request can never merge. Same feature, opposite outcomes.
+  #
+  # `changes` itself is in the ruleset's required checks. That closes the
+  # fail-open corner: if this job errors, its outputs are empty, every gated
+  # job skips, and skipped-counts-as-success would otherwise wave the pull
+  # request through with nothing run. With `changes` required, a filter
+  # failure is a red check instead.
+  #
+  # Three docs paths count as RUST on purpose, because Rust tests pin them:
+  # `docs/whistle/tools.md` is include_str!'d by whistle::catalogue's
+  # `the_checked_in_catalogue_is_current`, and the two `docs/lookout/frames.*`
+  # files are the lookout deliverables whose renderer is snapshot-pinned.
+  # Editing any of them without the suite is how they drift.
+  #
+  # `workflow_dispatch` runs everything regardless: someone pressing the
+  # button by hand is asking for the full matrix, and the paths-filter action
+  # has no pull request to diff there anyway.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      bench: ${{ steps.filter.outputs.bench }}
+    steps:
+      - uses: actions/checkout@v4
+      # Moving tag, like every other action in this file: this workflow holds
+      # no secrets (the header up top has the full argument).
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'examples/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/test.yml'
+              - 'docs/whistle/tools.md'
+              - 'docs/lookout/frames.txt'
+              - 'docs/lookout/frames.ansi'
+            # benches/ is its own workspace, excluded from the root one, so
+            # the main matrix never compiles it and only the bench job below
+            # cares when it changes.
+            bench:
+              - 'benches/**'
   lint:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -61,6 +119,8 @@ jobs:
       # local gate sees.
       - run: cargo +1.93 clippy --workspace --all-targets --all-features -- -D warnings
   docs:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -77,6 +137,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: crate-ci/typos@v1
   test:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
       matrix:
@@ -98,6 +160,8 @@ jobs:
       # `--all-features` mirrors the task gate, as in `lint` above.
       - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   minimal-versions:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     # Resolves a whole second lockfile before it builds anything, so it never
     # gets the cache hit the other Linux jobs do.
@@ -109,6 +173,8 @@ jobs:
       - run: cargo +nightly generate-lockfile -Z minimal-versions
       - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   musl:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     # Builds the whole tree for a second target, from cold, on the first run
     # of a branch.
@@ -143,6 +209,8 @@ jobs:
   # `cargo test` execution on native Windows; this job's only job is the GNU
   # target's compile-time coverage.
   windows-gnu:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     # 39s on the last green run; the floor is doing all the work.
     timeout-minutes: 10
@@ -153,6 +221,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64
       - run: cargo check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu
   features:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
       matrix:
@@ -201,6 +271,8 @@ jobs:
   # Windows the boot half matches nothing, because `boot.rs`'s tests are
   # `cfg(unix)` -- that is the platform split, not a filter typo.
   slow:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
       matrix:
@@ -229,6 +301,8 @@ jobs:
   # stops at the first failing test binary, and the lib tier used to fail
   # first, so this job never reached `daemon_e2e`.
   coverage:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     # Instrumented builds are the slowest thing on Linux here, and this job
     # also installs a tool before it starts.
@@ -246,6 +320,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: coverage, path: lcov.info }
   bench:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.bench == 'true' || github.event_name == 'workflow_dispatch' }}
     # `benches/` is its own `[workspace]` (see benches/Cargo.toml), excluded
     # from the root workspace on purpose so a bench-only dependency can never
     # end up in a shipped binary's tree. That means the `test` job's `1.88`
@@ -268,6 +344,8 @@ jobs:
       # executes, not collecting a timing (see benches/benches/memory_sample.rs).
       - run: cargo +${{ matrix.toolchain }} bench --manifest-path benches/Cargo.toml -- --test
   privileged:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     # The one `#[ignore]`d test that is ignored for want of privilege rather
     # than by design: `real_runner.rs`'s privilege-drop case needs a real uid
     # change and a real supplementary-group clear, which needs root. The other
