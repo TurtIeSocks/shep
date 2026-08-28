@@ -19,14 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it gets a reload that overlaps its two instances, and a probed app that
   leaves it unset gets one that drains before it spawns. See `shep-daemon`'s
   entry for why that distinction exists.
-- No existing configuration can change behaviour because of this. `normalize`
-  refused the field, so no Flockfile that loads today contains it, and `shep
-  import` stopped writing it for cluster-mode pm2 apps before that.
+- Every Flockfile that loads today still loads, and none of them can be
+  setting `reuse_port`: `normalize` refused it, and `shep import` stopped
+  writing it for cluster-mode pm2 apps before that. What DOES change for an
+  existing config is the reload an app already gets. One with a
+  `readiness_probe` moves from an overlapping reload to a serial one, which is
+  the point of the change rather than a side effect of it; `shep-daemon`'s
+  entry has the reasoning.
 
 ### Removals
 
-- `NormalizeError::ReusePortUnimplemented`, with the refusal it reported.
-  Nothing can construct it any more.
+- BREAKING: `NormalizeError::ReusePortUnimplemented`, with the refusal it
+  reported. The enum is `#[non_exhaustive]`, so a downstream `match` already
+  carries a wildcard arm and keeps compiling; a downstream that CONSTRUCTS the
+  variant does not. Nothing in this workspace did, and nothing could construct
+  it meaningfully now that the condition it named is gone.
 
 ## [0.1.8] - 2026-08-28
 

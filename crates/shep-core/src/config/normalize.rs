@@ -833,8 +833,10 @@ mod tests {
     ///
     /// Nothing had to be migrated to get here: `normalize` refused every
     /// config carrying the field, so no Flockfile that loads today can
-    /// contain it, and un-refusing cannot change what any existing
-    /// deployment does.
+    /// contain it, and un-refusing on its own changes nothing about them.
+    /// The reload they get does change, for the apps that configure a
+    /// `readiness_probe`, and that change is the daemon's rather than this
+    /// function's.
     #[test]
     fn reuse_port_loads_now_that_reload_reads_it() {
         let mut app = AppConfig::minimal("web", "./server");
