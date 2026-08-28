@@ -284,10 +284,26 @@ never costs clarity.
 ## Status / workflow
 
 Phases 1–10 merged: shep-core, the daemon supervision engine, log plane, the
-CLI, watch/cron/memory-limit restarts, SO_REUSEPORT reload, custom
+CLI, watch/cron/memory-limit restarts, overlapping reload, custom
 actions over the shepherd channel (now with a correlation id), the pm2
 cutover, the dogs subsystem with working metrics and bark dogs, and an
-audit-debt phase. Phase 11 merged too: the six remaining daemon-surface
+audit-debt phase.
+
+**That reload is NOT "SO_REUSEPORT reload", which this line said until
+2026-08-28.** shep never binds an app's listening socket and never sets
+`SO_REUSEPORT` on one. The only socket it binds is its own control socket at
+`$SHEP_HOME/run/shep.sock`, which is a different thing entirely and does fail
+loudly when its path exceeds the platform limit. What `reload` gives is an
+unconditional overlap (SpawnNew, AwaitReady, DrainOld, ReapOld), and whether
+that overlap is zero-downtime depends on the app having
+set `SO_REUSEPORT` on its own listener; without it the second instance takes
+`EADDRINUSE`. The `reuse_port` Flockfile key is REFUSED at parse time, not
+ignored: "reuse_port is accepted by the schema but not yet implemented, so
+shep refuses it rather than ignoring it." README.md's `## Reloading` section
+and `web/src/components/landing/Features.astro` both state this correctly; only
+this file was wrong, which is worse than it sounds, because this is the file
+every session reads first. It put the false claim into a README draft on
+2026-08-28 before Rin caught it. Phase 11 merged too: the six remaining daemon-surface
 verbs — `shep stock` (alias `scale`), `shep signal`, `shep whisper` (alias
 `sendline`), the KV store's `set`/`get`/`unset`, lambs in `describe`, and
 the `channel.*` bus topic. Phase 12a merged: `shep lookout`'s shell and its
@@ -340,9 +356,13 @@ moments. Then 2026-08-19 added `ProcessInfo::last_exit` and an EXIT column
 Flockfile path, a Flockfile app's `cwd` defaulting to its own directory, and
 `reuse_port` refused rather than silently ignored. `shep init` is in flight.
 
-**Verb count: 40 visible, not 16.** `./web/scripts/generate-cli-reference.sh`
-prints the current number every time it runs, which is the only figure worth
-trusting.
+**Verb count: 40 generated, 41 listed, and the difference is `help`.**
+`./web/scripts/generate-cli-reference.sh` prints its own number every time it
+runs, and its `VERBS` array holds 40 because it does not generate a page for
+`help`. `shep --help`'s grouped listing shows 41 because it does. Both are
+right about different questions, so neither is a bug to fix; check which one is
+being asked before changing either. README.md deliberately quotes the grouping
+without a count, so there is no third number to keep in step.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.
