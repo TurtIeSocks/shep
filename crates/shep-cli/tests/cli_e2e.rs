@@ -6277,17 +6277,21 @@ fn piped_table_output_at_the_default_style_carries_no_box_or_escape() {
 
 // --- Issue 1/2/3: adopt ergonomics and `shep <dogname>` dispatch ---------
 
-/// Spells a path the way `shep adopt` records it, so a comparison is between
-/// two spellings of the same file rather than between two files.
+/// Spells a path the way shep spells it, so a comparison is between two
+/// spellings of the same file rather than between two files.
 ///
-/// `adopt` canonicalizes what it vetted, and canonicalizing does two things a
-/// test cannot spell for itself. It strips Windows' `\\?\` prefix (shep's own
-/// doing, so `shep.toml` stays hand-editable), and it expands 8.3 short
-/// names. The second is what actually bit: `%TEMP%` on a GitHub Windows
-/// runner is `C:\Users\RUNNER~1\...`, which canonicalizes to `runneradmin`,
-/// so the substring check failed on a box whose username is longer than eight
-/// characters and passed on every developer machine whose username is not.
-fn as_adopt_records_it(path: &Path) -> String {
+/// Anywhere shep canonicalizes a path and then prints it, canonicalizing
+/// does two things a test cannot spell for itself. It adds Windows'
+/// `\?\` prefix, which shep strips back off so `shep.toml` stays
+/// hand-editable, and it expands 8.3 short names. The second is what
+/// actually bit: `%TEMP%` on a GitHub Windows runner is `C:\Users\RUNNER~1\...`,
+/// which canonicalizes to `runneradmin`, so the substring check failed on a
+/// box whose username is longer than eight characters and passed on every
+/// developer machine whose username is not.
+///
+/// Two callers, and they are unrelated: what `shep adopt` records in
+/// `shep.toml`, and the `cwd` a failed spawn reports.
+fn as_shep_spells_it(path: &Path) -> String {
     let canonical = std::fs::canonicalize(path).expect("canonicalize the recorded binary");
     shep_core::paths::strip_verbatim_prefix(&canonical)
         .display()
@@ -6319,7 +6323,7 @@ fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
     assert_success(&output);
     let written = std::fs::read_to_string(home.path().join("shep.toml")).unwrap();
     assert!(
-        written.contains(&as_adopt_records_it(&binary)),
+        written.contains(&as_shep_spells_it(&binary)),
         "the $PATH hit must be the recorded binary: {written}"
     );
 }
@@ -6355,7 +6359,7 @@ fn shep_adopt_expands_a_leading_tilde_path() {
     assert_success(&output);
     let written = std::fs::read_to_string(shep_home.path().join("shep.toml")).unwrap();
     assert!(
-        written.contains(&as_adopt_records_it(&binary)),
+        written.contains(&as_shep_spells_it(&binary)),
         "the ~/-expanded binary must be the one recorded: {written}"
     );
 }
@@ -6543,7 +6547,7 @@ fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
     // here too.
     let body = |cwd: &Path, token: &str| {
         format!(
-            "[[app]]\nname = \"edited\"\nscript = \"{}\"\ncwd = \"{}\"\n\
+            "[[app]]\nname = \"edited\"\nscript = '{}'\ncwd = '{}'\n\
              env = {{ API_TOKEN = \"{token}\" }}\n",
             script.display(),
             cwd.display(),
@@ -6610,8 +6614,8 @@ fn one_absent_script_refuses_the_whole_flockfile_and_registers_nothing() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"good\"\nscript = \"{}\"\n\n\
-             [[app]]\nname = \"unbuilt\"\nscript = \"{}/never-built\"\n",
+            "[[app]]\nname = \"good\"\nscript = '{}'\n\n\
+             [[app]]\nname = \"unbuilt\"\nscript = '{}/never-built'\n",
             script.display(),
             dir.path().display(),
         ),
@@ -6683,7 +6687,7 @@ fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() 
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"locked-out\"\nscript = \"{}\"\n",
+            "[[app]]\nname = \"locked-out\"\nscript = '{}'\n",
             unrunnable.display(),
         ),
     );
@@ -6709,9 +6713,9 @@ fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() 
     // Canonicalized: `start` fills an app's absent `cwd` from the
     // Flockfile's own directory through `canonicalize`, and on macOS a
     // tempdir's `/var/...` resolves to `/private/var/...`.
-    let flockfile_dir = std::fs::canonicalize(dir.path()).unwrap();
+    let flockfile_dir = as_shep_spells_it(dir.path());
     assert!(
-        stderr.contains(&format!("in {}", flockfile_dir.display())),
+        stderr.contains(&format!("in {flockfile_dir}")),
         "the error must name the cwd it tried it in: {stderr}"
     );
 
@@ -6751,7 +6755,7 @@ fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"resolvable\"\nscript = \"{}\"\n\n\
+            "[[app]]\nname = \"resolvable\"\nscript = '{}'\n\n\
              [[app]]\nname = \"no-interpreter\"\nscript = \"shep-no-such-interpreter-xyz\"\n",
             script.display(),
         ),

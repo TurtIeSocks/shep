@@ -2295,9 +2295,10 @@ const SMIT: &str = "\u{25b2} main@a1b2c3";
 
 /// Starts one long-lived real sheep under `name` and answers with its id.
 async fn start_sheep(client: &mut Client, name: &str) -> u32 {
-    let mut app = AppConfig::minimal(name, "/bin/sh");
-    app.interpreter = Some("none".to_string());
-    app.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
+    // `forever_app`, not an inline `/bin/sh` fixture: these three cases
+    // are about what a second client sees on the socket, and the shell
+    // that keeps the sheep alive is incidental to every one of them.
+    let app = forever_app(name);
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.expect("the sheep must start") else {
         panic!("expected started")

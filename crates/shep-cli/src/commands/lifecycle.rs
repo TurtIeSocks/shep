@@ -2032,7 +2032,8 @@ mod tests {
         use shep_core::status::ProcStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        let address = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_on(&address).await;
         daemon.reply_to_list(a_flock_with_a_dog());
 
         let mut out = Vec::new();
@@ -2105,7 +2106,8 @@ mod tests {
         use shep_core::status::ProcStatus;
 
         let dir = tempfile::tempdir().unwrap();
-        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        let address = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_on(&address).await;
         daemon.reply_to_list(a_flock_with_a_dog());
 
         let mut out = Vec::new();
@@ -2399,7 +2401,8 @@ mod tests {
         use shep_client::testing::fake_client_on;
 
         let dir = tempfile::tempdir().unwrap();
-        let (client, daemon) = fake_client_on(&dir.path().join("s.sock")).await;
+        let address = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_on(&address).await;
         daemon.reply_to_list(a_foldable_flock());
 
         let mut out = Vec::new();
