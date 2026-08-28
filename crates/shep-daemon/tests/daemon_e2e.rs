@@ -770,42 +770,55 @@ static LAST_STEP: std::sync::Mutex<String> = std::sync::Mutex::new(String::new()
 /// is spinning on frames that never match.
 static FRAMES_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Aborts the test binary `secs` from now, printing what the test was doing,
-/// unless the returned guard is dropped first.
+/// Reports what the test was doing `secs` from now, and ends the process
+/// fifteen seconds after that, unless the returned guard is dropped first.
 ///
-/// **A plain OS thread, and that is the entire point.** Every other deadline
-/// in this file is a `tokio::time::timeout`, and the failure this exists for
-/// is one where those do not fire. `reopen`'s wait for `after` is wrapped in
-/// a `RECV_TIMEOUT` and a `windows-latest` job sat inside it for seventeen
-/// minutes, twice, printing nothing. A timeout that does not fire means the
-/// runtime never polled it, and `#[tokio::test]` builds a CURRENT-THREAD
-/// runtime that this fixture also spawns the daemon onto: one blocking call
-/// anywhere on that thread stops the test, the daemon and the timer wheel
-/// together. A thread the runtime does not own is the only instrument that
-/// survives it.
+/// **Two threads, and the split is the experiment.** The first run of this
+/// apparatus proved something sharper than it was built to find: on
+/// `windows-latest` the reopen case hung for sixteen minutes with the
+/// watchdog armed, and the watchdog never printed and never aborted. A
+/// plain OS thread doing nothing but `sleep`, a write and an `abort` did
+/// not finish in sixteen minutes.
 ///
-/// `abort`, not a panic: a panic on this thread would not fail the test that
-/// is stuck on another one, and the process is not going to recover.
+/// That rules out the obvious reading of the hang. If only the test's task
+/// were stuck, a thread the runtime does not own would still run. Two
+/// independent threads stuck at once means something process-wide, and the
+/// first thing the old watchdog touched was `stderr().lock()`.
+///
+/// So the reporting and the killing are now separate threads. The killer
+/// takes no lock, opens no file and prints nothing. Three outcomes, and
+/// they cannot be confused:
+///
+/// - the dump appears: ordinary, and it says where the test was
+/// - no dump, but the process dies at `secs + 15`: the reporting thread
+///   blocked on a lock or a write, which means something else in this
+///   process holds the console and is not giving it back
+/// - neither: threads are not being scheduled at all, which is a much
+///   larger claim about the runner than about this test
+///
+/// `abort`, not a panic: a panic on this thread would not fail the test
+/// stuck on another one, and the process is not going to recover.
 ///
 /// Scaffolding. Delete it with the `step` calls once the hang is understood.
 fn watchdog(secs: u64, files: Vec<std::path::PathBuf>) -> WatchdogGuard {
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Thread one: the report. Everything it does can block, and on the
+    // runner something apparently did -- see this function's doc.
     let flag = std::sync::Arc::clone(&done);
+    let report_after = secs;
     std::thread::spawn(move || {
         use std::io::Write as _;
         use std::sync::atomic::Ordering;
-        for _ in 0..secs * 5 {
-            if flag.load(Ordering::SeqCst) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(200));
+        if sleep_unless_disarmed(&flag, report_after) {
+            return;
         }
-        let mut err = std::io::stderr().lock();
         let last = LAST_STEP
             .lock()
             .map(|last| last.clone())
             .unwrap_or_else(|_| "<poisoned>".to_string());
-        let _ = writeln!(err, "[watchdog] fired after {secs}s");
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "[watchdog] fired after {report_after}s");
         let _ = writeln!(err, "[watchdog]   last step: {last}");
         let _ = writeln!(
             err,
@@ -822,9 +835,36 @@ fn watchdog(secs: u64, files: Vec<std::path::PathBuf>) -> WatchdogGuard {
             );
         }
         let _ = err.flush();
+    });
+
+    // Thread two: the kill. It takes no lock, opens no file and prints
+    // nothing, so the only way it fails to end the process is if the
+    // thread itself is not being scheduled. That is the whole point of
+    // separating it from the report above.
+    let flag = std::sync::Arc::clone(&done);
+    std::thread::spawn(move || {
+        if sleep_unless_disarmed(&flag, secs + 15) {
+            return;
+        }
         std::process::abort();
     });
+
     WatchdogGuard(done)
+}
+
+/// Sleeps `secs`, answering `true` if the guard was dropped first.
+///
+/// Polls a flag rather than parking on a condvar, deliberately: a condvar
+/// is a lock, and the failure this whole apparatus exists to observe is one
+/// where something process-wide is already stuck.
+fn sleep_unless_disarmed(flag: &std::sync::atomic::AtomicBool, secs: u64) -> bool {
+    for _ in 0..secs * 5 {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 /// Disarms its [`watchdog`] when the test drops it, on any exit path.
