@@ -418,5 +418,3 @@ the crate it is building. They were never in danger of shipping.
 The largest archive is `shep-daemon` at 1.9 MiB uncompressed, 520 KiB
 compressed, which is `supervisor.rs` and `boot.rs` being large source files.
 That is well inside the 10 MiB registry limit.
-
-<!-- canary 2026-08-28: docs-only change against the scoped CI; PR closes unmerged -->
