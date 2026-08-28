@@ -1164,7 +1164,7 @@ pub async fn start(
         // before this it printed the notice and no table at all. A verb that
         // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
         // `assert_json_error` pins crate-wide.
-        if !started.is_empty() || code == ExitCode::Success {
+        if code == ExitCode::Success {
             let wrote = render_outcome(client, streams, "start", FlockRows(started)).await;
             if wrote != ExitCode::Success {
                 return wrote;
@@ -1201,7 +1201,15 @@ pub async fn start(
     // before this it printed the notice and no table at all. A verb that
     // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
     // `assert_json_error` pins crate-wide.
-    if !started.is_empty() || failure.is_none() {
+    //
+    // Keyed on the outcome ALONE, never on `started` being non-empty. The two
+    // agreed while a failure stopped the run, since nothing could follow one
+    // and add a row: now that every row is attempted, a fold whose second app
+    // fails and whose third comes up fine ends non-empty AND failed, and the
+    // old condition printed a table on the error path. Under `--format json`
+    // that is a data envelope beside an error envelope, which is two answers
+    // to one question and what `cli_e2e`'s `assert_json_error` refuses.
+    if failure.is_none() {
         let wrote = render_outcome(client, streams, "start", FlockRows(started)).await;
         if wrote != ExitCode::Success {
             return wrote;
@@ -2584,7 +2592,7 @@ mod tests {
 
     /// Every selector `start` sent inside a `Request::Restart`, in order.
     fn respawns(
-        envelopes: &mut tokio::sync::mpsc::Receiver<shep_core::protocol::Envelope>,
+        envelopes: &mut tokio::sync::mpsc::UnboundedReceiver<shep_core::protocol::Envelope>,
     ) -> Vec<SelectorSpec> {
         let mut sent = Vec::new();
         while let Ok(envelope) = envelopes.try_recv() {
@@ -2595,8 +2603,9 @@ mod tests {
         sent
     }
 
-    /// Runs `start` against `daemon` and hands back the code and stderr.
-    async fn start_against(client: &Client, target: &str) -> (ExitCode, String) {
+    /// Runs `start` against `daemon` and hands back the code, stdout and
+    /// stderr, in that order.
+    async fn start_against(client: &Client, target: &str) -> (ExitCode, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = {
@@ -2615,7 +2624,11 @@ mod tests {
             )
             .await
         };
-        (code, String::from_utf8(err).unwrap())
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
     }
 
     /// fails if `shep start 0` respawns anything but id 0.
@@ -2636,7 +2649,7 @@ mod tests {
         let (client, mut envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[]), &[])).await;
 
-        let (code, _) = start_against(&client, "0").await;
+        let (code, _, _) = start_against(&client, "0").await;
 
         assert_eq!(code, ExitCode::Success);
         assert_eq!(
@@ -2664,9 +2677,10 @@ mod tests {
         let (client, mut envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0]), &[])).await;
 
-        let (code, said) = start_against(&client, "all").await;
+        let (code, printed, said) = start_against(&client, "all").await;
 
         assert_eq!(code, ExitCode::Success);
+        let _ = printed;
         assert_eq!(
             respawns(&mut envelopes),
             vec![SelectorSpec::Id(1), SelectorSpec::Id(2)],
@@ -2692,7 +2706,7 @@ mod tests {
         let (client, _envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0]), &[])).await;
 
-        let (code, said) = start_against(&client, "0").await;
+        let (code, _, said) = start_against(&client, "0").await;
 
         assert_eq!(code, ExitCode::Success);
         assert!(
@@ -2722,7 +2736,7 @@ mod tests {
         let (client, mut envelopes) =
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[]), &[0])).await;
 
-        let (code, said) = start_against(&client, "all").await;
+        let (code, printed, said) = start_against(&client, "all").await;
 
         assert_eq!(code, ExitCode::SpawnFailed, "the first failure is the code");
         assert_eq!(
@@ -2737,6 +2751,12 @@ mod tests {
         assert!(
             said.contains("id 0"),
             "and the failure names the row, not just the app: {said}"
+        );
+        assert!(
+            printed.is_empty(),
+            "a failed verb leaves stdout empty even though rows 1 and 2 came \
+             up, the rule `cli_e2e`'s assert_json_error pins crate-wide: \
+             {printed}"
         );
     }
 
@@ -2763,7 +2783,7 @@ mod tests {
         let (client, mut envelopes) =
             fake_client_answering(&socket, a_daemon_for(a_clustered_flock(&[]), &[])).await;
 
-        let (code, _) = start_against(&client, flockfile.to_str().unwrap()).await;
+        let (code, _, _) = start_against(&client, flockfile.to_str().unwrap()).await;
 
         assert_eq!(code, ExitCode::Success);
         assert_eq!(

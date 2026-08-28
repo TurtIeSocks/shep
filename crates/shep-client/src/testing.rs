@@ -822,21 +822,37 @@ pub async fn fake_client_with_push(path: &Path) -> (Client, FakeDaemon) {
 /// The envelope reaches the channel BEFORE the reply is written, matching
 /// [`fake_client_capturing_envelopes`], so a test that awaits its own request
 /// future finds the envelope already queued.
+///
+/// UNBOUNDED, unlike every other channel in this module, and that is the
+/// difference a multi-request caller makes. A test reads these envelopes after
+/// the call it is testing has returned, so nothing drains the channel while
+/// the exchange is in flight: on a bounded channel of this module's `SCRIPT_CHANNEL_CAPACITY`
+/// the send blocks once the caller's ninth request arrives, the reply to it is
+/// never written, and the test hangs rather than failing. One `shep start` over
+/// a ten-instance app is thirteen requests. Unbounded also keeps the observer
+/// off the reply path entirely, since the send no longer awaits anything.
+///
+/// The read loop ends on a closed or unreadable connection instead of
+/// panicking there. A test drops its `Client` while this task is parked on the
+/// next frame, which is an ordinary end rather than a fault, and
+/// `read_envelope`'s `unwrap` would report it as a panic in a detached task.
 pub async fn fake_client_answering(
     path: &Path,
     answer: impl Fn(&Request) -> Response + Send + 'static,
-) -> (Client, mpsc::Receiver<Envelope>) {
+) -> (Client, mpsc::UnboundedReceiver<Envelope>) {
     let listener = UnixListener::bind(path).unwrap();
-    let (tx, rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         handshake(&mut frames, sample_ack()).await;
-        loop {
-            let envelope = read_envelope(&mut frames).await;
+        while let Some(Ok(frame)) = frames.next().await {
+            let Ok(envelope) = decode_frame::<Envelope>(&frame) else {
+                break;
+            };
             let id = envelope.id;
             let reply = answer(&envelope.body);
-            if tx.send(envelope).await.is_err() {
+            if tx.send(envelope).is_err() {
                 break;
             }
             write_reply(&mut frames, id, reply).await;
