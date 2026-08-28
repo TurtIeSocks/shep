@@ -59,6 +59,17 @@ jobs:
   # never reports at all, so every required check sits at "Expected" forever
   # and a docs pull request can never merge. Same feature, opposite outcomes.
   #
+  # EXCEPT for a matrix job, and the canary run for this gate is what proved
+  # it: a matrix job skipped at the job level never expands its matrix, so it
+  # reports one check run named `test`, and the ruleset's required contexts
+  # are the per-leg names, `test (ubuntu-latest, stable)` and friends. Those
+  # never get created and sit at "Expected" forever, which is the docs-PR
+  # deadlock again through a side door. So the two matrix jobs with required
+  # legs, `test` and `features`, gate every STEP instead of the job: each leg
+  # spins up, skips its steps in seconds, and reports SUCCESS under its own
+  # required name. Every non-matrix job keeps the job-level skip, which the
+  # same canary showed the ruleset accepting.
+  #
   # The fail-open corner is closed in the gate expression itself, not in the
   # ruleset. If this job errors its outputs are empty, and a naive gate would
   # skip every job while skipped-counts-as-success waves the pull request
@@ -145,7 +156,15 @@ jobs:
       - uses: crate-ci/typos@v1
   test:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+    # `!cancelled()` and nothing else. Without it, a FAILED `changes` job
+    # skips this job before matrix expansion, and the per-leg required checks
+    # go missing again through the one path the step gates cannot reach. With
+    # it, the legs always expand, and a failed filter makes every step's
+    # `result != 'success'` term true, so the full suite runs: fail closed,
+    # same as the job-level gates. The steps themselves deliberately do NOT
+    # carry `!cancelled()`; on a step it replaces the implicit `success()`,
+    # which would run `cargo test` after a failed toolchain install.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -162,10 +181,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       # `--all-features` mirrors the task gate, as in `lint` above.
       - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
   minimal-versions:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -229,7 +252,15 @@ jobs:
       - run: cargo check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu
   features:
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+    # `!cancelled()` and nothing else. Without it, a FAILED `changes` job
+    # skips this job before matrix expansion, and the per-leg required checks
+    # go missing again through the one path the step gates cannot reach. With
+    # it, the legs always expand, and a failed filter makes every step's
+    # `result != 'success'` term true, so the full suite runs: fail closed,
+    # same as the job-level gates. The steps themselves deliberately do NOT
+    # carry `!cancelled()`; on a step it replaces the implicit `success()`,
+    # which would run `cargo test` after a failed toolchain install.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -240,10 +271,15 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: rustup toolchain install stable --profile minimal
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
   # Tests that need a quiet machine, run serially in a job of their own.
   #
   # Two groups belong here and neither is a flaky test in the usual sense:
