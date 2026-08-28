@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-08-28
+
+### Fixed
+
+- Read a PATH, and a path claim, the way Windows spells them
+- Drive the gated fixture with cmd, not PowerShell
+- Drive the kill-tree fixture with cmd too
+
+
 ## [0.1.8] - 2026-08-28
 
 
