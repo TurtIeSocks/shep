@@ -353,9 +353,13 @@ moments. Then 2026-08-19 added `ProcessInfo::last_exit` and an EXIT column
 Flockfile path, a Flockfile app's `cwd` defaulting to its own directory, and
 `reuse_port` refused rather than silently ignored. `shep init` is in flight.
 
-**Verb count: 40 visible, not 16.** `./web/scripts/generate-cli-reference.sh`
-prints the current number every time it runs, which is the only figure worth
-trusting.
+**Verb count: 40 generated, 41 listed, and the difference is `help`.**
+`./web/scripts/generate-cli-reference.sh` prints its own number every time it
+runs, and its `VERBS` array holds 40 because it does not generate a page for
+`help`. `shep --help`'s grouped listing shows 41 because it does. Both are
+right about different questions, so neither is a bug to fix; check which one is
+being asked before changing either. README.md deliberately quotes the grouping
+without a count, so there is no third number to keep in step.
 
 What's built vs. deferred to v1.1+: [docs/specs/deferred.md](docs/specs/deferred.md).
 Windows is 0%, not partial — every verb prints "not yet supported" and exits.
