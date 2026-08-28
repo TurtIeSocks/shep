@@ -101,7 +101,7 @@ mod tests {
         tokio::sync::mpsc::Receiver<shep_core::protocol::Envelope>,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -194,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn a_not_found_reply_exits_not_found_rather_than_being_swallowed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) =
             fake_client_replying_err(&path, RpcErrorCode::NotFound, "no sheep matched").await;
         let mut out = Vec::new();

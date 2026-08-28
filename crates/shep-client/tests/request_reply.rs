@@ -13,8 +13,6 @@
 //! and a bare `cargo test -p shep-client` skips this target rather than
 //! failing to build it.
 
-#![cfg(unix)]
-
 use std::time::Duration;
 
 use shep_client::testing::{
@@ -28,7 +26,7 @@ use shep_core::protocol::{Request, Response, RpcErrorCode};
 #[tokio::test]
 async fn two_concurrent_requests_each_get_their_own_reply() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     // Fake daemon replies to id 1 with Pong and id 2 with Flock(vec![]) — DELIBERATELY
     // out of order (2 first) to prove routing is by id, not by arrival order.
     let (client, _served) = fake_client_out_of_order(&path).await;
@@ -43,7 +41,7 @@ async fn two_concurrent_requests_each_get_their_own_reply() {
 #[tokio::test]
 async fn an_event_arriving_before_its_own_reply_does_not_break_the_request() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     // Fake daemon sends BusEvent::Process{..} FIRST, then Reply{id:1}. This is the real
     // supervisor's ordering, not a contrived one — see daemon_e2e.rs:161-174.
     let (client, _served) = fake_client_event_then_reply(&path).await;
@@ -56,7 +54,7 @@ async fn an_event_arriving_before_its_own_reply_does_not_break_the_request() {
 #[tokio::test]
 async fn a_daemon_side_error_reply_becomes_a_typed_rpc_error() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, _served) =
         fake_client_replying_err(&path, RpcErrorCode::NotFound, "no sheep matched").await;
     let RequestError::Rpc(err) = client.request(Request::ListFlock).await.unwrap_err() else {
@@ -68,7 +66,7 @@ async fn a_daemon_side_error_reply_becomes_a_typed_rpc_error() {
 #[tokio::test]
 async fn a_dropped_connection_fails_pending_requests_instead_of_hanging() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, served) = fake_client_that_closes_after_handshake(&path).await;
     served.await.unwrap();
     assert!(matches!(
@@ -85,7 +83,7 @@ async fn a_dropped_connection_fails_pending_requests_instead_of_hanging() {
 #[tokio::test]
 async fn a_connection_dying_mid_request_fails_the_pending_request_instead_of_hanging() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, _served) = fake_client_that_dies_mid_request(&path).await;
     assert!(matches!(
         client.request(Request::Ping).await,
@@ -96,7 +94,7 @@ async fn a_connection_dying_mid_request_fails_the_pending_request_instead_of_han
 #[tokio::test(start_paused = true)]
 async fn a_deadline_expires_client_side_when_the_daemon_never_answers() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, _served) = fake_client_that_never_replies(&path).await;
     let err = client
         .request_with_deadline(Request::Ping, Some(Duration::from_millis(250)))
@@ -114,7 +112,7 @@ async fn a_deadline_expires_client_side_when_the_daemon_never_answers() {
 #[tokio::test]
 async fn a_client_remembers_the_path_it_connected_through() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let (client, _served) = fake_client_on(&path).await;
     assert_eq!(client.socket(), path);
 }
@@ -127,7 +125,7 @@ async fn a_client_remembers_the_path_it_connected_through() {
 #[tokio::test]
 async fn every_request_carries_an_explicit_deadline_on_the_wire() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     // fake_client_capturing_envelopes returns a channel of the decoded
     // `Envelope`s the fake daemon received, in arrival order.
     let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;

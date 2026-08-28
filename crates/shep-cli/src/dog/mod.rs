@@ -412,7 +412,7 @@ mod tests {
     /// plain `#[test]`s — matching `config`, which is sync.
     fn runtime_with_section(section: &str) -> DogRuntime {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (client, _daemon) = fake_client_on(&socket).await;
             DogRuntime {
@@ -450,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn a_dog_asks_for_its_own_section_by_name() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let response = Response::DogSection {
             toml: "webhook = \"https://example.invalid/hook\"\n"
                 .to_string()
@@ -484,7 +484,10 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_dog_name_is_usage_without_touching_the_socket() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(dir.path(), dir.path().join("never-bound.sock"));
+        let paths = test_paths(
+            dir.path(),
+            shep_client::testing::control_address(dir.path()),
+        );
         let code = run_dog("otel", paths).await;
         assert_eq!(code, ExitCode::Usage);
     }
@@ -500,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn run_dog_reaches_bark() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let response = Response::DogSection {
             toml: String::new().into(),
         };
@@ -535,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn run_dog_reaches_metrics() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let response = Response::DogSection {
             toml: "bind = \"127.0.0.1:0\"\n".to_string().into(),
         };
@@ -564,7 +567,10 @@ mod tests {
     #[tokio::test]
     async fn run_dog_reports_daemon_unreachable_with_no_shepherd_running() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = test_paths(dir.path(), dir.path().join("never-bound.sock"));
+        let paths = test_paths(
+            dir.path(),
+            shep_client::testing::control_address(dir.path()),
+        );
         let code = run_dog("metrics", paths).await;
         assert_eq!(code, ExitCode::DaemonUnreachable);
     }

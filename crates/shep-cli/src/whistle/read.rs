@@ -263,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn list_flock_returns_every_registered_entry_including_dogs() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let sheep = shep_client::testing::sample_info();
         let dog = ProcessInfo::builder(2, "metrics", ProcStatus::Online)
             .dog(Some(DogSource::BuiltIn))
@@ -305,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn describe_sheep_never_builds_anything_but_a_name_selector() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let served = shep_client::testing::serve_one_request(
             &socket,
             shep_client::testing::sample_ack(),
@@ -343,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn tail_bleats_caps_its_lines_and_says_when_it_did() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("shep.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let log_path = dir.path().join("web-out.log");
         let content: String = (1..=4000).map(|n| format!("line-{n}\n")).collect();
         std::fs::write(&log_path, content).unwrap();
@@ -420,7 +420,7 @@ mod tests {
 
         // Nothing ever binds this socket — a `Shepherd` that connected would
         // fail loudly rather than pass quietly.
-        let unreachable_socket = dir.path().join("nothing-here.sock");
+        let unreachable_socket = shep_client::testing::control_address(dir.path());
         let whistle = whistle_at(unreachable_socket, barks_path);
 
         let result = tokio::time::timeout(

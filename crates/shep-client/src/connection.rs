@@ -7,18 +7,24 @@
 //! receive a [`HelloAck`]. [`Connection::open`] performs exactly that,
 //! bounded end-to-end by one [`tokio::time::timeout`] so a backlogged
 //! socket times out instead of hanging forever.
+//!
+//! Nothing here names an OS transport type. Which carrier is underneath —
+//! an `AF_UNIX` socket or a Windows named pipe — is
+//! [`shep_core::transport`]'s to decide, and the readiness trap above has
+//! an exact analogue on both: a pipe whose every server instance is busy
+//! completes no connect either, and the same single timeout covers it.
 
 use core::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use shep_core::protocol::{
     Hello, HelloAck, HelloReply, PROTOCOL_VERSION, WireError, codec, decode_frame, encode_frame,
 };
+use shep_core::transport::{self, ClientStream};
 
 /// Budget for one connect-plus-handshake attempt.
 ///
@@ -30,8 +36,12 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The framed transport a [`Connection`] wraps, named so callers past this
 /// module (the actor task that takes ownership of it) don't have to spell
-/// out `Framed<UnixStream, LengthDelimitedCodec>` themselves.
-pub(crate) type Frames = Framed<UnixStream, LengthDelimitedCodec>;
+/// out `Framed<ClientStream, LengthDelimitedCodec>` themselves.
+///
+/// [`ClientStream`] is the per-platform carrier, so this one alias is what
+/// keeps `crate::actor` — which owns a `Frames` for the connection's whole
+/// life — free of any platform gate at all.
+pub(crate) type Frames = Framed<ClientStream, LengthDelimitedCodec>;
 
 /// Why `Connection::open` failed.
 ///
@@ -153,7 +163,7 @@ impl Connection {
     }
 
     async fn open_inner(socket: &Path) -> Result<Self, ConnectError> {
-        let stream = UnixStream::connect(socket)
+        let stream = transport::connect(socket)
             .await
             .map_err(|source| ConnectError::Connect {
                 path: socket.to_path_buf(),
@@ -198,12 +208,12 @@ mod tests {
     use super::*;
     use crate::testing::fake_daemon;
     use shep_core::protocol::{HelloAck, PROTOCOL_VERSION, RpcError, RpcErrorCode};
-    use tokio::net::UnixListener;
+    use shep_core::transport::Listener;
 
     #[tokio::test]
     async fn open_sends_hello_and_returns_the_ack() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = crate::testing::control_address(dir.path());
         let ack = HelloAck {
             daemon_version: "9.9.9".into(),
             protocol: PROTOCOL_VERSION,
@@ -230,7 +240,7 @@ mod tests {
     #[tokio::test]
     async fn a_protocol_refusal_becomes_its_own_error_variant() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = crate::testing::control_address(dir.path());
         let refusal = RpcError {
             code: RpcErrorCode::ProtocolMismatch,
             message: "daemon speaks protocol 2, client speaks 1".into(),
@@ -278,10 +288,10 @@ mod tests {
     #[tokio::test]
     async fn a_daemon_that_closes_without_answering_is_not_a_silent_success() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let path = crate::testing::control_address(dir.path());
+        let mut listener = Listener::bind(&path).unwrap();
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let stream = listener.accept().await.unwrap();
             drop(stream);
         });
 
@@ -298,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn connecting_to_a_missing_socket_names_the_path() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("absent.sock");
+        let path = crate::testing::control_address(dir.path());
         let ConnectError::Connect { path: reported, .. } =
             Connection::open(&path, HANDSHAKE_TIMEOUT)
                 .await
@@ -316,8 +326,15 @@ mod tests {
     #[tokio::test]
     async fn a_socket_bound_but_never_accepted_from_times_out_rather_than_hanging() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
-        let _listener = UnixListener::bind(&path).unwrap(); // bound; never accepted from
+        let path = crate::testing::control_address(dir.path());
+        // Bound; never accepted from. The two platforms reach the same
+        // verdict by different mechanics, which is exactly why this asserts
+        // the verdict: on unix the kernel completes `connect()` into the
+        // backlog, and on Windows the client's open succeeds against an
+        // instance the server has not called `ConnectNamedPipe` on. Either
+        // way the `Hello` goes out and nothing ever answers it, so only the
+        // timeout ends the attempt.
+        let _listener = Listener::bind(&path).unwrap();
 
         let err = Connection::open(&path, Duration::from_millis(150))
             .await

@@ -39,6 +39,13 @@ serde-saphyr.workspace = true
 json5.workspace = true
 regex.workspace = true
 tokio-util.workspace = true
+# `transport` — the control plane's carrier (unix socket / Windows named
+# pipe). shep-core already owned the codec and the protocol types; owning the
+# transport beside them is what keeps `cfg(unix)` out of every layer above,
+# and it is the seam a Windows tier is impossible without. Adds no crate to
+# the workspace tree: shep-daemon, shep-client and shep-cli all already
+# depend on tokio, and `net`/`time` are features two of them already enable.
+tokio = { workspace = true, features = ["net", "time", "io-util", "macros"] }
 bytes.workspace = true
 croner.workspace = true
 chrono.workspace = true

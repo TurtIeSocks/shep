@@ -7511,9 +7511,14 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
     use crate::testing::{
-        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, capture_logs, harness,
-        idle_stats, probe_config, test_paths,
+        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, harness, idle_stats,
+        probe_config, test_paths,
     };
+    // Only `a_restart_that_starts_nothing_says_why_in_the_log` uses this,
+    // and that test is unix-only: its second route drives an unresolvable
+    // `user`, which a Flockfile refuses outright on Windows.
+    #[cfg(unix)]
+    use crate::testing::capture_logs;
     // Test-only: the one case that drives a real `liveness_probe` has to
     // build the lifecycle extras the production wiring builds at boot, and
     // put the daemon's own reporter behind them.

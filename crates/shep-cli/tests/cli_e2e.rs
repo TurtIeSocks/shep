@@ -8,11 +8,12 @@
 //! vs stdout separation, the daemon's own process-group leadership) lives
 //! here.
 //!
-//! `#![cfg(unix)]`: an integration test file is its own compilation unit, so
-//! without this, `--all-targets` plus `cargo test --workspace` would build
-//! it (with its unix-only `nix` dev-dependency and
-//! `std::os::unix::fs::PermissionsExt` usage) on the Windows CI leg too.
-//! Global Constraints names this file explicitly for that reason.
+//! **Runs on Windows too, as of the Windows port.** It was `#![cfg(unix)]`
+//! while every fixture here was a `/bin/sh` script and every cleanup path a
+//! `nix::kill`. The script writers emit a `.cmd` on Windows now (see
+//! `script_header`/`sleep_line`), and the cases that genuinely cannot port —
+//! file modes, symlinks, process-group leadership, signal delivery — carry
+//! their own `#[cfg(unix)]` and say why at the case.
 //!
 //! Cases 14 and 15 are the file's slow ones and the reason it no longer
 //! finishes in about eleven seconds: a cron occurrence and a memory-limit
@@ -29,10 +30,18 @@
 //! `Output` that might have spawned one, before any assertion that could
 //! panic.
 
-#![cfg(unix)]
+// Roughly half of this file's cases are `#[cfg(unix)]` — file modes,
+// symlinks, process-group leadership, signal delivery — and their helpers
+// and constants go with them, so on Windows those items are compiled and
+// unreachable. That is the honest shape of a shared e2e file with a
+// platform-split body, not something to fix by scattering `#[cfg(unix)]`
+// over sixty more items.
+#![cfg_attr(windows, allow(dead_code))]
 
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
@@ -282,7 +291,8 @@ const READINESS_RECORD: &str = "readiness deadline elapsed";
 /// The path of the committed `--format json` fixture named `name`.
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
+        .join("tests")
+        .join("fixtures")
         .join(format!("{name}.json"))
 }
 
@@ -320,8 +330,10 @@ fn write_test_script(dir: &TempDir) -> PathBuf {
         dir,
         "sheep.sh",
         &format!(
-            "#!/bin/sh\n{}sleep {SCRIPT_SLEEP_SECS}\n",
-            record_pid_line(dir)
+            "{}{}{}",
+            script_header(),
+            record_pid_line(dir),
+            sleep_line(SCRIPT_SLEEP_SECS)
         ),
     )
 }
@@ -364,10 +376,25 @@ fn write_forking_script(dir: &TempDir) -> PathBuf {
 /// `bleats --no-follow` byte-for-byte against a committed fixture, and one
 /// extra line on the sheep's own stdout would break it.
 fn record_pid_line(dir: &TempDir) -> String {
-    format!(
-        "echo $$ >> \"{}\"\n",
-        dir.path().join(FIXTURE_PIDS).display()
-    )
+    #[cfg(unix)]
+    {
+        format!(
+            "echo $$ >> \"{}\"\n",
+            dir.path().join(FIXTURE_PIDS).display()
+        )
+    }
+    // Nothing on Windows, and nothing is needed. `cmd.exe` has no `$$`, and
+    // the only consumer of these pids is `sweep_flock`'s panic-path cleanup,
+    // which exists because a unix sheep that outlives its daemon is an
+    // orphan nothing will reap. On Windows every sheep is inside a job
+    // object it cannot leave, so `shep kill` — or the daemon dying — takes
+    // the whole tree with it. The guarantee the pid file is emulating is the
+    // one the OS already makes here.
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        String::new()
+    }
 }
 
 /// [`write_test_script`] with [`SLOW_SCRIPT_SLEEP_SECS`]' sleep instead of
@@ -385,8 +412,10 @@ fn write_slow_script(dir: &TempDir) -> PathBuf {
         dir,
         "slow.sh",
         &format!(
-            "#!/bin/sh\n{}sleep {SLOW_SCRIPT_SLEEP_SECS}\n",
-            record_pid_line(dir)
+            "{}{}{}",
+            script_header(),
+            record_pid_line(dir),
+            sleep_line(SLOW_SCRIPT_SLEEP_SECS)
         ),
     )
 }
@@ -412,15 +441,7 @@ fn write_slow_script(dir: &TempDir) -> PathBuf {
 /// ships. It costs about a quarter of a second, which is well inside the gap
 /// before the enforcer's first sampling tick.
 fn write_ballooning_script(dir: &TempDir) -> PathBuf {
-    write_script(
-        dir,
-        "balloon.sh",
-        &format!(
-            "#!/bin/sh\n{}s=x\nwhile [ ${{#s}} -lt {BALLOON_BYTES} ]; do s=\"$s$s\"; done\n\
-             sleep {SLOW_SCRIPT_SLEEP_SECS}\n",
-            record_pid_line(dir)
-        ),
-    )
+    write_script(dir, "balloon.sh", &balloon_body(dir))
 }
 
 /// Writes a script that emits one marker line on stdout, optionally one on
@@ -436,11 +457,16 @@ fn write_ballooning_script(dir: &TempDir) -> PathBuf {
 /// restarted, and each restart appends another copy of every marker, so a
 /// byte-exact fixture would stop being byte-exact after the first respawn.
 fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str>) -> PathBuf {
-    let mut script = format!("#!/bin/sh\n{}echo '{out_marker}'\n", record_pid_line(dir));
+    let mut script = format!(
+        "{}{}{}",
+        script_header(),
+        record_pid_line(dir),
+        echo_line(out_marker)
+    );
     if let Some(err_marker) = err_marker {
-        script.push_str(&format!("echo '{err_marker}' 1>&2\n"));
+        script.push_str(&echo_err_line(err_marker));
     }
-    script.push_str(&format!("sleep {SCRIPT_SLEEP_SECS}\n"));
+    script.push_str(&sleep_line(SCRIPT_SLEEP_SECS));
     write_script(dir, "logging.sh", &script)
 }
 
@@ -462,11 +488,13 @@ fn write_rotating_script(dir: &TempDir, gate: &Path) -> PathBuf {
         dir,
         "rotating.sh",
         &format!(
-            "#!/bin/sh\n{}echo '{ROTATE_BEFORE}'\n\
-             until [ -e \"{}\" ]; do sleep 0.1; done\n\
-             echo '{ROTATE_AFTER}'\nsleep {SCRIPT_SLEEP_SECS}\n",
+            "{}{}{}{}{}{}",
+            script_header(),
             record_pid_line(dir),
-            gate.display(),
+            echo_line(ROTATE_BEFORE),
+            wait_for_path_lines(gate),
+            echo_line(ROTATE_AFTER),
+            sleep_line(SCRIPT_SLEEP_SECS)
         ),
     )
 }
@@ -495,22 +523,177 @@ fn write_ready_script(dir: &TempDir, sentinel: &Path) -> PathBuf {
         dir,
         "ready.sh",
         &format!(
-            "#!/bin/sh\n{}until [ -e \"{}\" ]; do sleep 0.1; done\n\
-             printf '{{\"kind\":\"ready\"}}\\n' >&3\nsleep {SCRIPT_SLEEP_SECS}\n",
+            "{}{}{}{}{}",
+            script_header(),
             record_pid_line(dir),
-            sentinel.display(),
+            wait_for_path_lines(sentinel),
+            ready_message_line(),
+            sleep_line(SCRIPT_SLEEP_SECS)
         ),
     )
 }
 
 /// Shared write-plus-chmod tail of the script helpers above.
 fn write_script(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
-    let path = dir.path().join(name);
+    let path = dir.path().join(script_name(name));
     std::fs::write(&path, contents).unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
+    // The execute bit is what makes a `#!`-headed file runnable on unix.
+    // Windows has no such bit — `CreateProcess` decides from the extension,
+    // which `script_name` supplied — so there is nothing to set.
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
     path
+}
+
+/// `name` with the extension this platform will actually execute.
+///
+/// The callers all name their scripts `something.sh`, which is a hint to a
+/// reader on unix and a hard requirement on Windows: a file `CreateProcess`
+/// is asked to run must carry an extension `%PATHEXT%` knows, and `.sh` is
+/// not one. `.cmd` is.
+fn script_name(name: &str) -> String {
+    #[cfg(unix)]
+    {
+        name.to_string()
+    }
+    #[cfg(windows)]
+    {
+        format!("{}.cmd", name.trim_end_matches(".sh"))
+    }
+}
+
+/// The first line of a generated script: a `#!` on unix, `@echo off` on
+/// Windows so the interpreter does not echo every line into the sheep's own
+/// stdout and corrupt what the log-reading cases assert.
+fn script_header() -> String {
+    #[cfg(unix)]
+    {
+        "#!/bin/sh\n".to_string()
+    }
+    #[cfg(windows)]
+    {
+        "@echo off\r\n".to_string()
+    }
+}
+
+/// A line that keeps the script alive for roughly `secs` seconds.
+///
+/// `ping` rather than `timeout` on Windows, and the difference is not
+/// cosmetic: `timeout.exe` refuses to run at all when stdin is not a console
+/// ("ERROR: Input redirection is not supported"), and every sheep shep
+/// spawns gets a null stdin. It would exit instantly instead of sleeping,
+/// silently turning a long-lived fixture into one that has already gone.
+/// `ping -n N` sends N packets a second apart, so it needs one more than the
+/// seconds wanted.
+fn sleep_line(secs: u32) -> String {
+    #[cfg(unix)]
+    {
+        format!("sleep {secs}\n")
+    }
+    #[cfg(windows)]
+    {
+        format!("ping -n {} 127.0.0.1 >nul\r\n", secs + 1)
+    }
+}
+
+/// A line writing `text` to stdout.
+fn echo_line(text: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("echo '{text}'\n")
+    }
+    #[cfg(windows)]
+    {
+        format!("echo {text}\r\n")
+    }
+}
+
+/// Lines that block until `path` exists, polling.
+///
+/// `until [ -e ]` on unix; a labelled `if exist`/`goto` loop on Windows,
+/// since `cmd.exe` has no `until`. The batch arm polls with `ping -n 2`
+/// (~1s) rather than `sleep 0.1` — `cmd` has no sub-second sleep, and the
+/// cases using this are gated on a file a test writes, not on a deadline.
+fn wait_for_path_lines(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        format!("until [ -e \"{}\" ]; do sleep 0.1; done\n", path.display())
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            ":wait\r\nif exist \"{}\" goto ready\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:ready\r\n",
+            path.display()
+        )
+    }
+}
+
+/// A line writing one `ready` shepherd-channel message.
+///
+/// **The two platforms reach the channel completely differently, and that is
+/// the point of the cases using this.** On unix it is fd 3, inherited, so a
+/// shell redirect `>&3` is the whole of it — the contract
+/// `docs/shepherd-channel.md` publishes. Windows has no fd-3 inheritance, so
+/// the daemon exports `%SHEP_CHANNEL_PIPE%` and the app opens it by name;
+/// `cmd`'s own `>` redirect does exactly that, which makes this the shortest
+/// possible demonstration that the replacement contract is usable from a
+/// plain script rather than only from a real program.
+fn ready_message_line() -> String {
+    #[cfg(unix)]
+    {
+        "printf '{\"kind\":\"ready\"}\\n' >&3\n".to_string()
+    }
+    #[cfg(windows)]
+    {
+        "echo {\"kind\":\"ready\"}>\"%SHEP_CHANNEL_PIPE%\"\r\n".to_string()
+    }
+}
+
+/// A line writing `text` to stderr.
+fn echo_err_line(text: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("echo '{text}' 1>&2\n")
+    }
+    #[cfg(windows)]
+    {
+        format!("echo {text} 1>&2\r\n")
+    }
+}
+
+/// The body of [`write_ballooning_script`]: hold [`BALLOON_BYTES`] live, then
+/// stay up.
+///
+/// `cmd.exe` cannot do this — its environment variables cap out around 8 KB,
+/// so there is no batch idiom for holding sixteen megabytes. The Windows arm
+/// shells out to PowerShell for the one line that allocates, which is a
+/// legitimate shape for the case: shep samples a sheep's whole process
+/// TREE, so memory held by a child of the `.cmd` counts exactly as the
+/// case intends.
+fn balloon_body(dir: &TempDir) -> String {
+    // Only the unix arm records a pid; the Windows arm holds its bytes in a
+    // PowerShell child and has nothing to write.
+    #[cfg(windows)]
+    let _ = dir;
+    #[cfg(unix)]
+    {
+        format!(
+            "{}{}s=x\nwhile [ ${{#s}} -lt {BALLOON_BYTES} ]; do s=\"$s$s\"; done\nsleep {SLOW_SCRIPT_SLEEP_SECS}\n",
+            script_header(),
+            record_pid_line(dir),
+        )
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "{}powershell -NoProfile -Command \"$s = 'x' * {BALLOON_BYTES}; Start-Sleep -Seconds {SLOW_SCRIPT_SLEEP_SECS}; $s.Length > $null\"\r\n",
+            script_header(),
+        )
+    }
 }
 
 /// Writes a Flockfile whose one app asks for a readiness handshake it never
@@ -534,7 +717,7 @@ fn write_never_ready_flockfile(dir: &TempDir) -> PathBuf {
     write_flockfile(
         dir,
         &format!(
-            "[[app]]\nname = \"gated\"\nscript = \"{}\"\n\
+            "[[app]]\nname = \"gated\"\nscript = '{}'\n\
              wait_ready = true\nlisten_timeout = \"{NEVER_READY_TIMEOUT}\"\n",
             script.display(),
         ),
@@ -593,6 +776,7 @@ fn graceful_kill(home: &Path) {
     let _ = shep(home).arg("kill").output();
 }
 
+#[cfg(unix)]
 /// Boots a daemon on `dir`'s `$SHEP_HOME` with `env` set on the `shep start`
 /// that autostarts it, waits for [`write_never_ready_flockfile`]'s sheep to
 /// give up waiting, and hands back the daemon's own log.
@@ -694,6 +878,11 @@ fn daemon_log_after_a_missed_handshake(dir: &TempDir, env: &[(&str, &str)]) -> S
 #[derive(Debug, Default)]
 struct DaemonGuard {
     homes: Vec<PathBuf>,
+    /// Dogs adopted by pid, reaped individually because they are not in any
+    /// home's flock. Unix only: the Windows arm reaps through `shep kill`,
+    /// which takes each dog's job object with it — see [`DaemonGuard`]'s
+    /// `Drop`.
+    #[cfg(unix)]
     dog_pids: Vec<nix::unistd::Pid>,
 }
 
@@ -713,47 +902,84 @@ impl DaemonGuard {
     /// guard's ordinary `kill_group_of(daemon_pid)` untouched. See this
     /// struct's own doc on `dog_pids` for why. Call it as soon as the pid
     /// is known, same ordering rule [`Self::adopt_home`] gives.
+    #[cfg(unix)]
     fn adopt_dog_pid(&mut self, pid: nix::unistd::Pid) {
         self.dog_pids.push(pid);
     }
 }
 
 impl Drop for DaemonGuard {
+    /// # Windows
+    ///
+    /// The whole sweep collapses into `shep kill`, and that is not a
+    /// weaker cleanup — it is the same guarantee obtained one layer down.
+    /// The unix arm exists because a sheep that outlives its daemon is an
+    /// orphan reparented to init, which only an explicit `kill(-pgid)` will
+    /// reap; that is why the daemon pid is parsed, its group signalled, and
+    /// the recorded fixture pids swept individually.
+    ///
+    /// On Windows every sheep is assigned to a job object it cannot leave
+    /// (`shep_daemon::sys_windows`), so terminating the daemon terminates
+    /// the whole flock with it, transitively. There is no orphan class for
+    /// a sweep to catch, and no pid file to read — which is also why
+    /// `record_pid_line` writes nothing there.
+    ///
+    /// Mutation-checked upstream rather than here: disabling the runner's
+    /// job assignment left orphaned processes behind in
+    /// `real_runner_windows.rs`, which is the assertion this cleanup path
+    /// leans on.
     fn drop(&mut self) {
-        let panicking = std::thread::panicking();
-        for home in &self.homes {
-            match daemon_pid(home) {
-                Some(pid) => kill_group_of(pid),
-                // No parseable pid, and the case succeeded: the daemon's own
-                // graceful shutdown unlinks the pidfile as its last act
-                // (`boot.rs`'s teardown), so this is "already gone" rather
-                // than "never wrote one".
-                None if !panicking => {}
-                // No parseable pid on the panic path: the case may have died
-                // inside the empty-pidfile window GUARD_PID_DEADLINE
-                // documents, so retry before concluding anything.
-                None => match wait_for_daemon_pid(home) {
-                    Some(pid) => kill_group_of(pid),
-                    None => eprintln!(
-                        "DaemonGuard: no parseable daemon pid at {} after {GUARD_PID_DEADLINE:?}; \
-                         if a daemon is still up it was NOT reaped",
-                        home.display()
-                    ),
-                },
+        #[cfg(windows)]
+        {
+            for home in &self.homes {
+                // Best-effort, exactly as the unix arm is: a guard runs on a
+                // panic path where the daemon may already be gone.
+                let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("shep"))
+                    .arg("--home")
+                    .arg(home)
+                    .arg("kill")
+                    .output();
             }
-
-            if !panicking {
-                continue;
-            }
-            sweep_flock(home);
         }
 
-        for pid in &self.dog_pids {
-            kill_group_of(*pid);
+        #[cfg(unix)]
+        {
+            let panicking = std::thread::panicking();
+            for home in &self.homes {
+                match daemon_pid(home) {
+                    Some(pid) => kill_group_of(pid),
+                    // No parseable pid, and the case succeeded: the daemon's own
+                    // graceful shutdown unlinks the pidfile as its last act
+                    // (`boot.rs`'s teardown), so this is "already gone" rather
+                    // than "never wrote one".
+                    None if !panicking => {}
+                    // No parseable pid on the panic path: the case may have died
+                    // inside the empty-pidfile window GUARD_PID_DEADLINE
+                    // documents, so retry before concluding anything.
+                    None => match wait_for_daemon_pid(home) {
+                        Some(pid) => kill_group_of(pid),
+                        None => eprintln!(
+                            "DaemonGuard: no parseable daemon pid at {} after {GUARD_PID_DEADLINE:?}; \
+                         if a daemon is still up it was NOT reaped",
+                            home.display()
+                        ),
+                    },
+                }
+
+                if !panicking {
+                    continue;
+                }
+                sweep_flock(home);
+            }
+
+            for pid in &self.dog_pids {
+                kill_group_of(*pid);
+            }
         }
     }
 }
 
+#[cfg(unix)]
 /// SIGKILLs every process group named in `home`'s [`FIXTURE_PIDS`], resweeping
 /// until [`GUARD_SWEEP_WINDOW`] expires.
 ///
@@ -795,13 +1021,15 @@ fn sweep_flock(home: &Path) {
     }
 }
 
+#[cfg(unix)]
 /// One non-blocking attempt at the daemon pid recorded at `home`.
 fn daemon_pid(home: &Path) -> Option<nix::unistd::Pid> {
-    let text = std::fs::read_to_string(home.join("pids/shepd.pid")).ok()?;
+    let text = std::fs::read_to_string(home.join("pids").join("shepd.pid")).ok()?;
     let raw: i32 = text.trim().parse().ok()?;
     Some(nix::unistd::Pid::from_raw(raw))
 }
 
+#[cfg(unix)]
 /// [`daemon_pid`], retried until it answers or [`GUARD_PID_DEADLINE`]
 /// expires. A daemon still alive populates the pidfile the moment its
 /// `PidfileLock::record` runs; one that never populates it is one that
@@ -819,6 +1047,7 @@ fn wait_for_daemon_pid(home: &Path) -> Option<nix::unistd::Pid> {
     }
 }
 
+#[cfg(unix)]
 /// SIGKILLs `pid`'s process group, or `pid` alone if it does not lead one.
 ///
 /// Group, not leader: the daemon's own children are in its group. But only
@@ -837,6 +1066,7 @@ fn kill_group_of(pid: nix::unistd::Pid) {
     let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL);
 }
 
+#[cfg(unix)]
 /// Every pid a fixture script recorded under `home`, in spawn order.
 ///
 /// A missing file means the case started no sheep — several do not — and an
@@ -853,10 +1083,11 @@ fn recorded_fixture_pids(home: &Path) -> Vec<nix::unistd::Pid> {
         .collect()
 }
 
+#[cfg(unix)]
 /// Reads the daemon pid recorded at `home`'s pidfile — the same path
 /// `shep_daemon::boot::pidfile` builds.
 fn read_daemon_pid(home: &Path) -> nix::unistd::Pid {
-    let path = home.join("pids/shepd.pid");
+    let path = home.join("pids").join("shepd.pid");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("no pidfile at {}: {e}", path.display()));
     let raw: i32 = text
@@ -866,6 +1097,7 @@ fn read_daemon_pid(home: &Path) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(raw)
 }
 
+#[cfg(unix)]
 /// Asserts `pid` is the leader of its own process group — the
 /// `Command::process_group(0)` contract `launch.rs` relies on to detach the
 /// daemon from the parent's group and terminal. `std::process::Command`
@@ -1001,6 +1233,7 @@ fn poll_http_get(
     }
 }
 
+#[cfg(unix)]
 /// Runs `shep --home <home> flock --format json` until it answers a `pid`
 /// for a dog named `name`, or [`FLOCK_DEADLINE`] expires — the same real
 /// gap [`poll_flock`] covers for a sheep: `shep enable` returning success
@@ -1404,6 +1637,7 @@ fn assert_json_error(output: &Output, expected_status: i32, expected_error_code:
 
 // --- Case 1 ----------------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep start <script>` with no daemon running autostarts one, the sheep
 /// reaches Online, and the daemon is its own process-group leader.
 ///
@@ -1446,6 +1680,7 @@ fn starting_with_no_daemon_running_autostarts_one_and_the_sheep_reaches_online()
 
 // --- Case 2 ------------------------------------------------------------
 
+#[cfg(unix)]
 /// A second command reuses the daemon rather than spawning a second daemon.
 ///
 /// What a broken implementation this would catch: a `connect_or_spawn`
@@ -1585,6 +1820,7 @@ fn a_lifecycle_verb_prints_the_whole_flock_and_json_still_prints_what_it_touched
 
 // --- Case 3 --------------------------------------------------------------
 
+#[cfg(unix)]
 /// Two concurrent `shep start` invocations against a cold `$SHEP_HOME`
 /// produce exactly one daemon and no spurious error: this is the race
 /// Phase 2b's `flock(2)` makes safe daemon-side, and `connect_or_spawn`
@@ -1699,6 +1935,7 @@ fn concurrent_cold_starts_produce_exactly_one_daemon() {
 
 // --- Case 4 ----------------------------------------------------------------
 
+#[cfg(unix)]
 /// `--format json` output validates against the committed fixture for
 /// `flock`, `describe`, `start` and `ping` (envelopes, compared structurally
 /// after normalizing the fields a real spawned sheep cannot pin across
@@ -1952,12 +2189,41 @@ fn kill_stops_the_daemon_and_removes_the_socket() {
     guard.adopt_home(home);
     assert_success(&boot);
 
-    let socket = home.join("run/shep.sock");
+    // The BEHAVIOUR under test — `kill` actually tears the daemon down — is
+    // the same on both platforms; only the evidence for it differs, so the
+    // evidence is what carries the `cfg` rather than the case being skipped.
+    //
+    // On unix the control address is a socket FILE, and the daemon unlinks
+    // it as its last teardown step, so its absence is the proof. On Windows
+    // it is a named pipe: there is no directory entry, and the pipe stops
+    // existing when its owner's last handle closes. `Path::exists` on
+    // `\\.\pipe\...` is not merely unhelpful there — it answers about a
+    // filesystem that has no such path, so it would read `false` before the
+    // kill and pass vacuously.
+    #[cfg(unix)]
+    let socket = home.join("run").join("shep.sock");
+    #[cfg(unix)]
     assert!(socket.exists(), "precondition: the daemon is up");
+    #[cfg(windows)]
+    assert_success(&shep(home).arg("flock").output().unwrap());
 
     let kill = shep(home).arg("kill").output().unwrap();
     assert_success(&kill);
+
+    #[cfg(unix)]
     assert!(!socket.exists(), "kill must remove the socket file");
+    #[cfg(windows)]
+    {
+        // `shep flock` against a departed shepherd exits `DaemonUnreachable`
+        // rather than succeeding — the operator-visible form of the same
+        // fact the missing socket file states on unix.
+        let after = shep(home).arg("flock").output().unwrap();
+        assert!(
+            !after.status.success(),
+            "kill must leave nothing answering on the control pipe; stderr={}",
+            String::from_utf8_lossy(&after.stderr)
+        );
+    }
 }
 
 // --- Case 7 --------------------------------------------------------------
@@ -2498,8 +2764,8 @@ fn a_daemon_flush_and_a_flock_flush_never_reach_each_others_files() {
     );
 
     const MARKER: &[u8] = b"a line only the shepherd's own log holds\n";
-    let shepd_out = home.join("logs/shepd.out.log");
-    let shepd_err = home.join("logs/shepd.err.log");
+    let shepd_out = home.join("logs").join("shepd.out.log");
+    let shepd_err = home.join("logs").join("shepd.err.log");
     std::fs::write(&shepd_out, MARKER).unwrap();
     std::fs::write(&shepd_err, MARKER).unwrap();
 
@@ -2607,7 +2873,7 @@ fn a_daemon_flush_needs_no_daemon() {
         0
     );
     assert!(
-        !home.join("run/shep.sock").exists(),
+        !home.join("run").join("shep.sock").exists(),
         "this verb must not autostart a daemon to empty files the CLI owns"
     );
 }
@@ -2632,13 +2898,14 @@ fn flush_without_a_selector_is_a_usage_error() {
         String::from_utf8_lossy(&bare.stdout)
     );
     assert!(
-        !dir.path().join("run/shep.sock").exists(),
+        !dir.path().join("run").join("shep.sock").exists(),
         "a usage error must not have autostarted a daemon"
     );
 }
 
 // --- Case 8 --------------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep --home <tmp> start <script>` autostarts a daemon whose socket is
 /// under `<tmp>` — asserted on the location of the socket file, not on the
 /// command exiting 0, so a child that re-resolved `$SHEP_HOME` from ambient
@@ -2694,7 +2961,7 @@ fn home_reaches_the_spawned_daemon() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let socket = dir.path().join("run/shep.sock");
+    let socket = dir.path().join("run").join("shep.sock");
     assert!(
         socket.exists(),
         "the daemon bound somewhere other than --home"
@@ -2705,6 +2972,7 @@ fn home_reaches_the_spawned_daemon() {
 
 // --- Case 9 --------------------------------------------------------------
 
+#[cfg(unix)]
 /// A write under a `watch = true` sheep's `cwd` restarts it: `restarts` goes
 /// from 0 to 1.
 ///
@@ -2729,7 +2997,7 @@ fn a_write_under_a_watched_tree_restarts_the_sheep() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"watcher\"\nscript = \"{}\"\ncwd = \"{}\"\nwatch = true\n",
+            "[[app]]\nname = \"watcher\"\nscript = '{}'\ncwd = '{}'\nwatch = true\n",
             script.display(),
             watched.path().display(),
         ),
@@ -2756,6 +3024,7 @@ fn a_write_under_a_watched_tree_restarts_the_sheep() {
 
 // --- Case 10 -------------------------------------------------------------
 
+#[cfg(unix)]
 /// A write to a dot-file under the same watched tree restarts nothing — and
 /// the watcher was demonstrably alive the whole time it did not.
 ///
@@ -2781,7 +3050,7 @@ fn a_write_to_a_dot_file_under_a_watched_tree_restarts_nothing() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"watcher\"\nscript = \"{}\"\ncwd = \"{}\"\nwatch = true\n",
+            "[[app]]\nname = \"watcher\"\nscript = '{}'\ncwd = '{}'\nwatch = true\n",
             script.display(),
             watched.path().display(),
         ),
@@ -2817,6 +3086,7 @@ fn a_write_to_a_dot_file_under_a_watched_tree_restarts_nothing() {
 
 // --- Case 11 -------------------------------------------------------------
 
+#[cfg(unix)]
 /// A `wait_ready` sheep stays `starting` until it writes `{"kind":"ready"}`
 /// to the shepherd channel, and only then reads `online`.
 ///
@@ -2847,7 +3117,7 @@ fn a_wait_ready_sheep_goes_online_only_once_it_signals_ready() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"gated\"\nscript = \"{}\"\nwait_ready = true\nlisten_timeout = \"120s\"\n",
+            "[[app]]\nname = \"gated\"\nscript = '{}'\nwait_ready = true\nlisten_timeout = \"120s\"\n",
             script.display(),
         ),
     );
@@ -2882,6 +3152,7 @@ fn a_wait_ready_sheep_goes_online_only_once_it_signals_ready() {
 
 // --- Case 12 -------------------------------------------------------------
 
+#[cfg(unix)]
 /// A `cron_restart` pattern that is not a cron pattern is a config error:
 /// exit `4`, JSON on stderr, and the offending pattern in the message.
 ///
@@ -2910,7 +3181,7 @@ fn a_bad_cron_pattern_is_a_config_error() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"crony\"\nscript = \"{}\"\ncron_restart = \"not a cron\"\n",
+            "[[app]]\nname = \"crony\"\nscript = '{}'\ncron_restart = \"not a cron\"\n",
             script.display(),
         ),
     );
@@ -2938,6 +3209,7 @@ fn a_bad_cron_pattern_is_a_config_error() {
 
 // --- Case 13 -------------------------------------------------------------
 
+#[cfg(unix)]
 /// An `https://` probe target is a config error: exit `4`, JSON on stderr,
 /// and the offending target in the message.
 ///
@@ -2961,7 +3233,7 @@ fn an_https_probe_target_is_a_config_error() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"probed\"\nscript = \"{}\"\n\
+            "[[app]]\nname = \"probed\"\nscript = '{}'\n\
              readiness_probe = {{ kind = \"http\", target = \"https://localhost:8443/health\" }}\n",
             script.display(),
         ),
@@ -2990,6 +3262,7 @@ fn an_https_probe_target_is_a_config_error() {
 
 // --- Case 14 -------------------------------------------------------------
 
+#[cfg(unix)]
 /// A `* * * * *` occurrence restarts a real sheep on the real system clock:
 /// `restarts` goes from 0 to 1 at a wall-clock minute boundary.
 ///
@@ -3036,8 +3309,8 @@ fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"minutely\"\nscript = \"{script}\"\ncron_restart = \"* * * * *\"\n\n\
-             [[app]]\nname = \"unscheduled\"\nscript = \"{script}\"\n",
+            "[[app]]\nname = \"minutely\"\nscript = '{script}'\ncron_restart = \"* * * * *\"\n\n\
+             [[app]]\nname = \"unscheduled\"\nscript = '{script}'\n",
             script = script.display(),
         ),
     );
@@ -3082,6 +3355,7 @@ fn a_cron_occurrence_restarts_a_sheep_on_the_real_clock() {
 
 // --- Case 15 -------------------------------------------------------------
 
+#[cfg(unix)]
 /// A real RSS breach restarts a real sheep: a script that grows its resident
 /// set past its app's `max_memory` is restarted by the real `PollingEnforcer`
 /// sampling the real process table.
@@ -3141,8 +3415,8 @@ fn a_real_memory_breach_restarts_a_sheep() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"greedy\"\nscript = \"{script}\"\nmax_memory = \"{BREACH_LIMIT}\"\n\n\
-             [[app]]\nname = \"unlimited\"\nscript = \"{script}\"\n",
+            "[[app]]\nname = \"greedy\"\nscript = '{script}'\nmax_memory = \"{BREACH_LIMIT}\"\n\n\
+             [[app]]\nname = \"unlimited\"\nscript = '{script}'\n",
             script = script.display(),
         ),
     );
@@ -3218,6 +3492,7 @@ fn a_real_memory_breach_restarts_a_sheep() {
 
 // --- Case 16 -------------------------------------------------------------
 
+#[cfg(unix)]
 /// `SHEP_LOG_JSON=1` renders the daemon's own records as JSON — one object per
 /// line, in the file `launch.rs` redirects the daemon's stderr into.
 ///
@@ -3275,6 +3550,7 @@ fn shep_log_json_makes_the_daemons_own_records_json() {
 
 // --- Case 17 -------------------------------------------------------------
 
+#[cfg(unix)]
 /// The daemon's own records reach `shepd.err.log` with no ANSI escapes in
 /// them.
 ///
@@ -3308,6 +3584,7 @@ fn the_daemons_own_log_carries_no_ansi_escapes() {
     );
 }
 
+#[cfg(unix)]
 /// `SHEP_LOG_LEVEL` decides which of the daemon's records survive: the same
 /// `WARN` is written at the default level and filtered out at `error`.
 ///
@@ -3363,6 +3640,7 @@ fn shep_log_level_decides_which_of_the_daemons_records_survive() {
 
 // --- Interpreter / spawn-failure parity -----------------------------------
 
+#[cfg(unix)]
 /// `shep start <name>` on a sheep that cannot spawn must report the failure
 /// the same way `shep start <path>` against the identical broken script
 /// does, rather than exiting 0 with nothing on either stream.
@@ -3434,6 +3712,7 @@ fn starting_an_errored_sheep_by_name_reports_the_same_failure_as_by_path() {
     graceful_kill(dir.path());
 }
 
+#[cfg(unix)]
 /// `shep restart <name>` must report a respawn that cannot spawn, the same
 /// way `shep start` does in both its forms.
 ///
@@ -3493,6 +3772,7 @@ fn restarting_a_sheep_that_cannot_spawn_reports_it_rather_than_exiting_zero() {
     graceful_kill(dir.path());
 }
 
+#[cfg(unix)]
 /// The missing-node sentence, produced for real rather than quoted.
 ///
 /// `deferred.md` recorded this as untestable: producing it needs a `PATH`
@@ -3595,6 +3875,7 @@ fn shep_init_writes_a_flockfile_where_there_is_none() {
     );
 }
 
+#[cfg(unix)]
 /// What it writes must be loadable, not merely present.
 ///
 /// The unit tests already prove the scaffold parses; this proves the bytes
@@ -3647,6 +3928,7 @@ fn what_shep_init_writes_is_a_flockfile_shep_can_read() {
     graceful_kill(dir.path());
 }
 
+#[cfg(unix)]
 /// Refuse rather than clobber, and prove it by metadata rather than by
 /// content.
 ///
@@ -3747,6 +4029,7 @@ fn shep_init_all_writes_the_full_scaffold() {
 
 // --- Reload ---------------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep reload` reaches the reload verb, and the swap it starts really
 /// finishes against real processes.
 ///
@@ -3819,6 +4102,7 @@ fn reload_swaps_a_sheep_for_a_fresh_instance_under_a_new_id() {
 
 // --- Trigger ---------------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep trigger` reaches the trigger verb and no other, against a real
 /// daemon and a real sheep.
 ///
@@ -3887,6 +4171,7 @@ fn trigger_reaches_the_trigger_verb_and_names_the_missing_channel() {
 
 // --- Signal ------------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep signal` reaches the signal verb and no other, against a real
 /// daemon and a real sheep — the same dispatch-misroute gap `trigger`'s own
 /// case names, for `Commands::Signal` instead.
@@ -3935,6 +4220,7 @@ fn signal_reaches_the_signal_verb_and_delivers() {
 
 // --- Stock -------------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep stock` reaches the stock verb and no other, against a real daemon:
 /// stocking up spawns the new instances, stocking back down drains the extras.
 ///
@@ -4011,6 +4297,7 @@ fn stock_reaches_the_stock_verb_and_settles_the_flock() {
     graceful_kill(dir.path());
 }
 
+#[cfg(unix)]
 /// `shep scale` is `stock`'s visible alias: it must still reach a real
 /// daemon and produce the same primary-command name in its envelope as
 /// `shep stock` does — the alias reaches the same verb, not a shadow of it.
@@ -4050,6 +4337,7 @@ fn scale_alias_reaches_stock_against_a_real_daemon() {
 
 // --- Lambs ---------------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep describe` renders a real sheep's lamb tree: the forked `sleep`
 /// child appears in its own table, captioned with what the parent-pid walk
 /// is and what it is not — the same caveat `output/mod.rs`'s own unit tests
@@ -4117,6 +4405,7 @@ fn describe_renders_a_real_sheeps_lamb_tree() {
 
 // --- Save / Muster ---------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep save` writes the muster roll and `shep muster` reads it back — the
 /// §13.4 flagship "import, muster, save, reboot" shape, minus the reboot: a
 /// muster against the same still-live daemon that just saved exercises the
@@ -4219,6 +4508,7 @@ fn saving_the_roll_then_mustering_reports_the_same_flock() {
 
 // --- Import -----------------------------------------------------------
 
+#[cfg(unix)]
 /// `shep import` reads a pm2 dump and writes a Flockfile shep can read
 /// back, without ever touching a daemon.
 ///
@@ -4264,7 +4554,7 @@ fn import_writes_a_flockfile_shep_can_read_back_and_starts_no_daemon() {
     assert_success(&output);
 
     assert!(
-        !home.join("run/shep.sock").exists(),
+        !home.join("run").join("shep.sock").exists(),
         "`shep import` reads a file and writes a file; it must never \
          autostart a daemon"
     );
@@ -4303,6 +4593,7 @@ fn write_shep_toml(dir: &TempDir, body: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 /// The phase's own success criterion, at the only tier that can check it: a
 /// real binary, a real shepherd, and a real dog PROCESS spawned by that
 /// shepherd. Every tier below this one scripts the runner or fakes the
@@ -4376,6 +4667,7 @@ fn a_real_shepherd_runs_a_real_metrics_dog_that_answers_a_scrape() {
     graceful_kill(home);
 }
 
+#[cfg(unix)]
 /// Fails if `shep dogs` renders the sheep, or `shep flock` renders the dogs
 /// into the sheep table. The two-table split (`FlockRows`/`DogRows`, and
 /// `emit_flock`'s partition between them) has unit coverage of its own;
@@ -4470,7 +4762,7 @@ fn barks_reads_the_history_with_no_shepherd_running() {
     )
     .unwrap();
     assert!(
-        !home.join("run/shep.sock").exists(),
+        !home.join("run").join("shep.sock").exists(),
         "this case never starts a daemon at all"
     );
 
@@ -4482,7 +4774,7 @@ fn barks_reads_the_history_with_no_shepherd_running() {
         .unwrap();
     assert_success(&output);
     assert!(
-        !home.join("run/shep.sock").exists(),
+        !home.join("run").join("shep.sock").exists(),
         "`shep barks` must never autostart a shepherd either"
     );
 
@@ -4499,6 +4791,7 @@ fn barks_reads_the_history_with_no_shepherd_running() {
     assert_eq!(rows[0]["rule"], "watchdog", "{envelope}");
 }
 
+#[cfg(unix)]
 /// The whole store, through the real binary, with no shepherd anywhere. That
 /// last part is the assertion that matters: `shep set` has to work on a
 /// machine where nothing is running, because that is when provisioning
@@ -4529,7 +4822,7 @@ fn the_kv_store_works_with_no_shepherd_running() {
         .unwrap();
     assert_success(&set1);
     assert!(
-        !home.join("run/shep.sock").exists(),
+        !home.join("run").join("shep.sock").exists(),
         "shep set must never autostart a shepherd"
     );
 
@@ -5290,11 +5583,11 @@ fn available_dogs_needs_no_shepherd() {
         .unwrap();
     assert_success(&output);
     assert!(
-        !home.path().join("run/shep.sock").exists(),
+        !home.path().join("run").join("shep.sock").exists(),
         "--available must never bring up a shepherd"
     );
     assert!(
-        !home.path().join("pids/shepd.pid").exists(),
+        !home.path().join("pids").join("shepd.pid").exists(),
         "--available must never bring up a shepherd"
     );
 }
@@ -5359,6 +5652,7 @@ fn available_dogs_reports_a_truncated_body_naming_the_url() {
 
 // --- `shep serve` --------------------------------------------------------
 
+#[cfg(unix)]
 /// fails if `shep serve` does not register a sheep, or registers one that
 /// cannot actually serve. The assertion is an HTTP GET against the port, not
 /// a `shep flock` row — a row says the process is up, and up is not serving.
@@ -5391,6 +5685,7 @@ fn serve_registers_a_sheep_that_answers_on_its_port() {
     graceful_kill(dir.path());
 }
 
+#[cfg(unix)]
 /// fails if a missing docroot registers a crash-looping sheep instead of
 /// failing immediately.
 #[test]
@@ -5421,6 +5716,7 @@ fn serve_refuses_a_docroot_that_is_not_a_directory() {
     );
 }
 
+#[cfg(unix)]
 /// fails if the worker ignores SIGTERM. Step 6.2 copies the metrics dog's
 /// signal handling and states the failure mode — a worker that only handles
 /// SIGINT rides the whole kill ladder to SIGKILL on every `shep stop`, which
@@ -5467,17 +5763,19 @@ fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() {
     graceful_kill(dir.path());
 }
 
+#[cfg(unix)]
 /// Layout shared by the two `--follow-symlinks` cases below:
 /// `<root>/releases/2026-08-15/index.html` and
 /// `<root>/current -> releases/2026-08-15` — the exact deploy shape Rin's
 /// ruling names.
 fn write_deploy_layout(root: &Path) {
-    let release = root.join("releases/2026-08-15");
+    let release = root.join("releases").join("2026-08-15");
     std::fs::create_dir_all(&release).unwrap();
     std::fs::write(release.join("index.html"), "the deploy layout").unwrap();
     std::os::unix::fs::symlink(&release, root.join("current")).unwrap();
 }
 
+#[cfg(unix)]
 /// fails if the per-refusal stderr line (decision 5, Rin's ruling) never
 /// reaches the sheep's own bleats. This is the one claim in the ruling that
 /// Task 3's and Task 6's in-process tests cannot make: they run inside the
@@ -5528,6 +5826,7 @@ fn a_refused_symlink_writes_the_path_and_the_flag_to_the_sheeps_bleats() {
     graceful_kill(dir.path());
 }
 
+#[cfg(unix)]
 /// fails if `--follow-symlinks` does not actually serve the deploy layout
 /// end to end, through registration and a restart, and fails if setting it
 /// stops being loud at startup. Two assertions in one test because they are
@@ -5602,7 +5901,7 @@ fn runtime_exits_when_the_flock_empties_with_a_code_that_says_why() {
     let clean_flockfile = write_flockfile(
         &clean_dir,
         &format!(
-            "[[app]]\nname = \"batch\"\nscript = \"{}\"\nautorestart = false\n",
+            "[[app]]\nname = \"batch\"\nscript = '{}'\nautorestart = false\n",
             clean_script.display(),
         ),
     );
@@ -5624,7 +5923,7 @@ fn runtime_exits_when_the_flock_empties_with_a_code_that_says_why() {
     let failed_flockfile = write_flockfile(
         &failed_dir,
         &format!(
-            "[[app]]\nname = \"batch\"\nscript = \"{}\"\nmax_restarts = 1\n",
+            "[[app]]\nname = \"batch\"\nscript = '{}'\nmax_restarts = 1\n",
             failed_script.display(),
         ),
     );
@@ -5758,7 +6057,7 @@ fn dev_tidies_up_after_itself() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"batch\"\nscript = \"{}\"\nautorestart = false\n",
+            "[[app]]\nname = \"batch\"\nscript = '{}'\nautorestart = false\n",
             script.display(),
         ),
     );
@@ -5766,7 +6065,7 @@ fn dev_tidies_up_after_itself() {
     let output = shep_dev(dev_home.path()).arg(&flockfile).output().unwrap();
     assert_success(&output);
 
-    let socket = dev_home.path().join("run/shep.sock");
+    let socket = dev_home.path().join("run").join("shep.sock");
     assert!(!socket.exists(), "dev must not leave a live socket behind");
 
     let flock_output = shep(dev_home.path()).arg("flock").output().unwrap();
@@ -5776,6 +6075,7 @@ fn dev_tidies_up_after_itself() {
     );
 }
 
+#[cfg(unix)]
 /// fails if Ctrl-C out of `shep dev` leaves a shepherd or a flock behind —
 /// on disk as well as in the process table.
 ///
@@ -5802,7 +6102,7 @@ fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"held\"\nscript = \"{}\"\n",
+            "[[app]]\nname = \"held\"\nscript = '{}'\n",
             script.display()
         ),
     );
@@ -5827,7 +6127,7 @@ fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() {
         "a signalled dev session must still tidy up and exit cleanly: {status:?}"
     );
 
-    let socket = dev_home.path().join("run/shep.sock");
+    let socket = dev_home.path().join("run").join("shep.sock");
     assert!(!socket.exists(), "dev must not leave a live socket behind");
 
     let flock_output = shep(dev_home.path()).arg("flock").output().unwrap();
@@ -5904,6 +6204,7 @@ fn assert_no_box_or_escape_reached_the_pipe(stdout: &str, verb: &str) {
     }
 }
 
+#[cfg(unix)]
 /// The spec's own claim (§5): "The existing e2e suite is the pipe test...
 /// If a border or an escape reaches piped stdout, it fails. No new test
 /// needed." False as this file stood: every table-shaped assertion above is
@@ -5976,6 +6277,27 @@ fn piped_table_output_at_the_default_style_carries_no_box_or_escape() {
 
 // --- Issue 1/2/3: adopt ergonomics and `shep <dogname>` dispatch ---------
 
+/// Spells a path the way shep spells it, so a comparison is between two
+/// spellings of the same file rather than between two files.
+///
+/// Anywhere shep canonicalizes a path and then prints it, canonicalizing
+/// does two things a test cannot spell for itself. It adds Windows'
+/// `\?\` prefix, which shep strips back off so `shep.toml` stays
+/// hand-editable, and it expands 8.3 short names. The second is what
+/// actually bit: `%TEMP%` on a GitHub Windows runner is `C:\Users\RUNNER~1\...`,
+/// which canonicalizes to `runneradmin`, so the substring check failed on a
+/// box whose username is longer than eight characters and passed on every
+/// developer machine whose username is not.
+///
+/// Two callers, and they are unrelated: what `shep adopt` records in
+/// `shep.toml`, and the `cwd` a failed spawn reports.
+fn as_shep_spells_it(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).expect("canonicalize the recorded binary");
+    shep_core::paths::strip_verbatim_prefix(&canonical)
+        .display()
+        .to_string()
+}
+
 /// Issue 1's first repro, verbatim: `cargo install shep-log-rotate` puts
 /// the binary on `$PATH` under its own name, and `shep adopt` used to be
 /// unable to find it there at all.
@@ -6001,18 +6323,19 @@ fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
     assert_success(&output);
     let written = std::fs::read_to_string(home.path().join("shep.toml")).unwrap();
     assert!(
-        written.contains(&binary.display().to_string()),
+        written.contains(&as_shep_spells_it(&binary)),
         "the $PATH hit must be the recorded binary: {written}"
     );
 }
 
+#[cfg(unix)]
 /// Issue 1's second repro, verbatim: a literal `~/` path, which worked in
 /// a Flockfile (2026-08-19) but not at `shep adopt` until now.
 #[test]
 fn shep_adopt_expands_a_leading_tilde_path() {
     let shep_home = TempDir::new().unwrap();
     let fake_user_home = TempDir::new().unwrap();
-    let bin_dir = fake_user_home.path().join(".cargo/bin");
+    let bin_dir = fake_user_home.path().join(".cargo").join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let binary = bin_dir.join("shep-log-rotate");
     std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
@@ -6036,7 +6359,7 @@ fn shep_adopt_expands_a_leading_tilde_path() {
     assert_success(&output);
     let written = std::fs::read_to_string(shep_home.path().join("shep.toml")).unwrap();
     assert!(
-        written.contains(&binary.display().to_string()),
+        written.contains(&as_shep_spells_it(&binary)),
         "the ~/-expanded binary must be the one recorded: {written}"
     );
 }
@@ -6046,14 +6369,26 @@ fn shep_adopt_expands_a_leading_tilde_path() {
 /// and [`a_built_in_verb_always_wins_over_a_same_named_adopted_dog`] both
 /// build on.
 fn write_marker_script(dir: &TempDir, marker: &Path, code: u8) -> PathBuf {
-    write_script(
-        dir,
-        "dog.sh",
-        &format!(
-            "#!/bin/sh\necho \"argv:$*\" > \"{marker}\"\necho \"home:$SHEP_HOME\" >> \"{marker}\"\necho from-the-dog\nexit {code}\n",
-            marker = marker.display(),
-        ),
-    )
+    // `$*`/`$SHEP_HOME` in a shell script, `%*`/`%SHEP_HOME%` in a `.cmd`.
+    // Those two expansions ARE the subject of the case using this — that an
+    // adopted dog receives the argv it was invoked with and the `$SHEP_HOME`
+    // the CLI resolved — so the spelling follows the interpreter rather than
+    // the case being skipped on one platform.
+    //
+    // No space before `>` in the batch arm, deliberately: `echo foo > x`
+    // writes a trailing space in `cmd.exe`, and the assertion is on an exact
+    // line.
+    #[cfg(unix)]
+    let body = format!(
+        "#!/bin/sh\necho \"argv:$*\" > \"{marker}\"\necho \"home:$SHEP_HOME\" >> \"{marker}\"\necho from-the-dog\nexit {code}\n",
+        marker = marker.display(),
+    );
+    #[cfg(windows)]
+    let body = format!(
+        "@echo off\r\necho argv:%*>\"{marker}\"\r\necho home:%SHEP_HOME%>>\"{marker}\"\r\necho from-the-dog\r\nexit /b {code}\r\n",
+        marker = marker.display(),
+    );
+    write_script(dir, "dog.sh", &body)
 }
 
 /// `shep <dogname> [args...]` (issue 3): once a dog is adopted, invoking
@@ -6212,7 +6547,7 @@ fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
     // here too.
     let body = |cwd: &Path, token: &str| {
         format!(
-            "[[app]]\nname = \"edited\"\nscript = \"{}\"\ncwd = \"{}\"\n\
+            "[[app]]\nname = \"edited\"\nscript = '{}'\ncwd = '{}'\n\
              env = {{ API_TOKEN = \"{token}\" }}\n",
             script.display(),
             cwd.display(),
@@ -6279,8 +6614,8 @@ fn one_absent_script_refuses_the_whole_flockfile_and_registers_nothing() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"good\"\nscript = \"{}\"\n\n\
-             [[app]]\nname = \"unbuilt\"\nscript = \"{}/never-built\"\n",
+            "[[app]]\nname = \"good\"\nscript = '{}'\n\n\
+             [[app]]\nname = \"unbuilt\"\nscript = '{}/never-built'\n",
             script.display(),
             dir.path().display(),
         ),
@@ -6345,11 +6680,14 @@ fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() 
     std::fs::write(&unrunnable, "#!/bin/sh\nsleep 60\n").unwrap();
     // Present, so the batch check passes it; no execute bit anywhere, which
     // even a root-owned run cannot exec.
-    std::fs::set_permissions(&unrunnable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&unrunnable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"locked-out\"\nscript = \"{}\"\n",
+            "[[app]]\nname = \"locked-out\"\nscript = '{}'\n",
             unrunnable.display(),
         ),
     );
@@ -6375,9 +6713,9 @@ fn a_spawn_that_no_check_could_have_caught_still_names_the_sheep_and_the_path() 
     // Canonicalized: `start` fills an app's absent `cwd` from the
     // Flockfile's own directory through `canonicalize`, and on macOS a
     // tempdir's `/var/...` resolves to `/private/var/...`.
-    let flockfile_dir = std::fs::canonicalize(dir.path()).unwrap();
+    let flockfile_dir = as_shep_spells_it(dir.path());
     assert!(
-        stderr.contains(&format!("in {}", flockfile_dir.display())),
+        stderr.contains(&format!("in {flockfile_dir}")),
         "the error must name the cwd it tried it in: {stderr}"
     );
 
@@ -6417,7 +6755,7 @@ fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"resolvable\"\nscript = \"{}\"\n\n\
+            "[[app]]\nname = \"resolvable\"\nscript = '{}'\n\n\
              [[app]]\nname = \"no-interpreter\"\nscript = \"shep-no-such-interpreter-xyz\"\n",
             script.display(),
         ),

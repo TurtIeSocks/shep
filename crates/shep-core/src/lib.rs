@@ -28,6 +28,12 @@ pub mod protocol;
 pub mod selector;
 pub mod signals;
 pub mod status;
+// Declared next to `protocol`, deliberately: that module owns what travels
+// over the control plane and this one owns what carries it. Keeping the two
+// in one crate is what lets every layer above them — the client's actor, the
+// daemon's connection state machine, every RPC verb — be written once with
+// no `cfg` in it at all.
+pub mod transport;
 pub mod values;
 
 /// One-import surface for downstream crates

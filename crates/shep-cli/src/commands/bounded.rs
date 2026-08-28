@@ -203,12 +203,26 @@ mod tests {
     /// inherited, so the wait ends at once and only the reads run out of
     /// budget. Nothing is killed on that path, and the two answers exist so
     /// the caller does not have to claim otherwise.
+    ///
+    /// **The budget is the one number here that can be wrong in both
+    /// directions**, which is why it is 2s rather than the 200ms it started
+    /// at. It has to outlast the shell's own startup, or the shell is still
+    /// running at the deadline and the answer is `Killed` for a reason that
+    /// has nothing to do with the case. It has to stay well under the
+    /// backgrounded `sleep 5`, or the reads finish and the answer is
+    /// `Exited`. 200ms cleared the first bar on unix and did not clear it on
+    /// a loaded `windows-latest` runner, where `sh` is Git Bash: green on
+    /// three runs, then `Killed` on the fourth. 2s is roughly ten times a
+    /// normal start and still less than half the sleep.
+    ///
+    /// The sibling case above needs no such widening: it asserts `Killed`,
+    /// and a slow start only makes that more certain.
     #[test]
     fn a_child_whose_output_outlives_it_is_not_reported_as_killed() {
         let started = Instant::now();
         let outcome = run_bounded(
             Command::new("sh").arg("-c").arg("sleep 5 & exit 0"),
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         )
         .expect("sh is on every host this crate compiles for");
 

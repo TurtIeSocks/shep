@@ -446,6 +446,7 @@ pub fn scroll_offset(selected: usize, viewport: usize, total: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::fixtures;
     use super::*;
 
@@ -506,6 +507,21 @@ mod tests {
     /// all -- not the rule itself: `output::rows`'s own
     /// `the_exit_column_shows_the_last_exit_only_for_a_sheep_that_is_not_running`
     /// already pins the code/signal split and the "no honest value" `-`.
+    /// `cfg(unix)` because this case's fixture carries a SIGNALLED exit, and
+    /// `output::rows::signal_label` resolves a signal number against the
+    /// running platform's own table on purpose — its doc argues that a
+    /// `ProcessInfo` is always rendered by a binary on the same OS as the
+    /// daemon that produced it, and `shep_core::signals::OperatorSignal`
+    /// deliberately refuses to map numbers to names at all ("a number means
+    /// different signals on different platforms, and shep will not guess").
+    ///
+    /// So Windows renders `15` where unix renders `SIGTERM`, and that is the
+    /// designed behaviour rather than a gap: a Windows `ExitOutcome` never
+    /// carries a signal in the first place (`tokio_runner`'s `wait` sets it
+    /// `None` unconditionally), so this arm is only ever reached by a
+    /// synthetic fixture like this one. The pinned artifacts under
+    /// `docs/lookout/` are unix renderings for the same reason.
+    #[cfg(unix)]
     #[test]
     fn the_exit_cell_reuses_the_same_rendering_flock_rows_uses() {
         use shep_core::protocol::{ExitInfo, ProcessInfo};

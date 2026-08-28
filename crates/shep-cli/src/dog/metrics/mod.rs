@@ -20,7 +20,6 @@ use shep_client::Client;
 use shep_core::protocol::{ProcessInfo, Request, Response};
 use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, RefreshKind, System};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::signal::unix::{SignalKind, signal};
 
 use super::DogRuntime;
 use crate::exit::ExitCode;
@@ -173,10 +172,10 @@ pub async fn run(runtime: DogRuntime) -> ExitCode {
             return ExitCode::Failure;
         }
     };
-    let mut sigterm = match signal(SignalKind::terminate()) {
+    let mut sigterm = match crate::shutdown::Terminate::install() {
         Ok(sigterm) => sigterm,
         Err(err) => {
-            eprintln!("shep dog metrics: could not install a SIGTERM handler: {err}");
+            eprintln!("shep dog metrics: could not install a shutdown handler: {err}");
             return ExitCode::Failure;
         }
     };
@@ -361,7 +360,7 @@ mod tests {
     #[tokio::test]
     async fn every_scrape_asks_the_shepherd_again() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_on(&socket).await;
         daemon.reply_to_list_sequence(vec![
             vec![sample_info("web")],
@@ -409,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn a_shepherd_that_will_not_answer_produces_a_503() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let (client, _task) = fake_client_that_dies_mid_request(&socket).await;
         let dog = serve_on_free_port(client, MetricsConfig::default_on_port(0)).await;
 
@@ -423,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_metrics_path_serves_metrics() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = shep_client::testing::control_address(dir.path());
         let (client, _daemon) = fake_client_on(&socket).await;
         let dog = serve_on_free_port(client, MetricsConfig::default_on_port(0)).await;
 

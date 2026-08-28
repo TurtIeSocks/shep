@@ -64,7 +64,7 @@ impl Drop for Reaper {
 #[tokio::test]
 async fn an_existing_daemon_is_used_without_launching_anything() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let _served = fake_daemon(&path, Ok(sample_ack())).await; // Task 1's helper
 
     let outcome = connect_or_spawn_with(
@@ -88,7 +88,7 @@ async fn an_existing_daemon_is_used_without_launching_anything() {
 #[tokio::test]
 async fn a_socket_that_accepts_but_never_handshakes_is_not_mistaken_for_ready() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let reaper = Reaper::default();
     // The listener must outlive the closure; park it where the test owns it.
     // `std`'s listener, not tokio's: the launcher is a sync `FnOnce`, and
@@ -130,7 +130,7 @@ async fn a_child_that_dies_fails_fast_instead_of_waiting_out_the_deadline() {
     let dir = tempfile::tempdir().unwrap();
     // Nothing ever binds here, so the first probe fails `Connect` and the
     // launcher runs. `child_exiting_with(3)` returns an already-doomed child.
-    let absent_path = dir.path().join("absent.sock");
+    let absent_path = shep_client::testing::control_address(dir.path());
 
     let started = Instant::now();
     let err = connect_or_spawn(&absent_path, || child_exiting_with(3))
@@ -153,7 +153,7 @@ async fn a_child_that_dies_fails_fast_instead_of_waiting_out_the_deadline() {
 #[tokio::test]
 async fn a_child_exiting_with_the_already_running_code_keeps_probing() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let answer_on = path.clone();
 
     let outcome = connect_or_spawn_with(
@@ -189,7 +189,7 @@ async fn a_child_exiting_with_the_already_running_code_keeps_probing() {
 #[tokio::test]
 async fn a_protocol_mismatch_propagates_instead_of_spawning_a_second_daemon() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let _served = fake_daemon(
         &path,
         Err(RpcError {
@@ -221,7 +221,7 @@ async fn a_protocol_mismatch_propagates_instead_of_spawning_a_second_daemon() {
 #[tokio::test]
 async fn a_protocol_mismatch_on_a_loop_probe_propagates_instead_of_looping_to_the_deadline() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let reaper = Reaper::default();
     let answer_on = path.clone();
 
@@ -267,7 +267,7 @@ async fn a_protocol_mismatch_on_a_loop_probe_propagates_instead_of_looping_to_th
 #[tokio::test]
 async fn a_bound_but_silent_socket_is_probed_not_respawned() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+    let path = shep_client::testing::control_address(dir.path());
     let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
 
     let err = connect_or_spawn_with(

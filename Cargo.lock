@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "shep"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anstyle",
  "assert_cmd",
@@ -2096,11 +2096,11 @@ dependencies = [
 
 [[package]]
 name = "shep-cli"
-version = "0.1.8"
+version = "0.1.9"
 
 [[package]]
 name = "shep-client"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "futures-util",
  "nix 0.29.0",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "shep-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "annotate-snippets",
  "anstyle",
@@ -2143,13 +2143,14 @@ dependencies = [
 
 [[package]]
 name = "shep-daemon"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bytes",
  "chrono",
  "command-fds",
  "fsevent-sys",
  "futures-util",
+ "getrandom 0.4.3",
  "globset",
  "nix 0.29.0",
  "notify",
@@ -2166,11 +2167,12 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "shep-examples"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "nix 0.29.0",
 ]

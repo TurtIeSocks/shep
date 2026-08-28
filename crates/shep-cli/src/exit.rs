@@ -139,7 +139,6 @@ impl From<RpcErrorCode> for ExitCode {
 /// or handshake failed to complete. `ConnectError` is `#[non_exhaustive]`
 /// (IR-20), so a future variant falls to [`ExitCode::Failure`] rather than
 /// being guessed at.
-#[cfg(unix)]
 impl From<&shep_client::ConnectError> for ExitCode {
     fn from(err: &shep_client::ConnectError) -> Self {
         use shep_client::ConnectError::{
@@ -168,7 +167,6 @@ impl From<&shep_client::ConnectError> for ExitCode {
 /// ([`ExitCode::Internal`]). `RequestError` is `#[non_exhaustive]` (IR-20),
 /// so a future variant falls to [`ExitCode::Failure`] rather than being
 /// guessed at.
-#[cfg(unix)]
 impl From<&shep_client::RequestError> for ExitCode {
     fn from(err: &shep_client::RequestError) -> Self {
         use shep_client::RequestError::{Closed, Rpc, Timeout, Wire};
@@ -196,7 +194,6 @@ impl From<&shep_client::RequestError> for ExitCode {
 /// [`ExitCode::DaemonUnreachable`]. `SpawnError` is `#[non_exhaustive]`
 /// (IR-20), so a future variant falls to [`ExitCode::Failure`] rather than
 /// being guessed at.
-#[cfg(unix)]
 impl From<&shep_client::spawn::SpawnError> for ExitCode {
     fn from(err: &shep_client::spawn::SpawnError) -> Self {
         use shep_client::spawn::SpawnError::{Connect, DaemonExited, DeadlineExpired, Launch};

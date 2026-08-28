@@ -318,6 +318,13 @@ struct RingLock {
     /// leading underscore because it is held, never read.
     #[cfg(unix)]
     _flock: nix::fcntl::Flock<std::fs::File>,
+    /// The lock file, opened with `share_mode(0)` so no other handle —
+    /// same-process or not, read or write — can open it while this one is
+    /// live. Released by this handle's `Drop`, the same role `_flock` plays
+    /// on unix. Named with a leading underscore because it is held, never
+    /// read.
+    #[cfg(windows)]
+    _handle: std::fs::File,
 }
 
 impl RingLock {
@@ -347,29 +354,68 @@ impl RingLock {
             .map_err(|(_file, errno)| std::io::Error::from(errno))
     }
 
-    /// Deliberate no-op on Windows: there is no `flock(2)`, shep-core is
-    /// `#![forbid(unsafe_code)]` so `LockFileEx` is not ours to call
-    /// directly, and Windows is shep's 0% tier — every verb prints "not
-    /// yet supported" and exits, so nothing on that platform runs two bark
-    /// writers to serialise. This is a documented gap, not an oversight:
-    /// the day a Windows daemon is real, this is one of the things that
-    /// has to become real with it, and the unique temp name above already
-    /// removes the `ENOENT` half of the race regardless of platform.
+    /// Blocks until this process holds the ring's lock exclusively.
+    ///
+    /// The Windows arm this replaced was a documented no-op, sound only for
+    /// as long as every verb refused on Windows before reaching this code.
+    /// It does not any more, so the lock is real: `share_mode(0)` gives the
+    /// same exclusivity `flock(2)` does through a different door — opening
+    /// the lock file with every share flag cleared means no other handle,
+    /// another process's or this one's, read or write, can be opened on it
+    /// while this handle lives. That is mandatory (enforced by the OS on
+    /// every open) rather than merely advisory, so it is if anything a
+    /// stronger guarantee than the unix arm's.
+    ///
+    /// What it does not give is a blocking wait: a contended open fails at
+    /// once with `ERROR_SHARING_VIOLATION` rather than parking the thread
+    /// the way `FlockArg::LockExclusive` does, so this polls on a short
+    /// sleep until the open succeeds. That is the one real behavioural
+    /// difference between the two arms, and it is why "contention blocks
+    /// rather than failing" stays true here by a retry loop rather than by
+    /// the kernel.
+    ///
+    /// Identical in shape to [`KvLock::acquire`](crate::kv)'s Windows arm,
+    /// deliberately — the two guard the same kind of file in the same
+    /// directory, and a reader who has understood one should not have to
+    /// re-derive the other.
     ///
     /// # Errors
-    /// Never — the signature matches the unix arm so the caller has one
-    /// shape.
-    /// # Non-unix
-    /// There is no lock here — this returns a handle that holds nothing, and
-    /// two concurrent writers can lose each other's edits. That is sound only
-    /// because every verb refuses on Windows before reaching this code
-    /// (`shep-cli`'s entry point). Anyone un-gating Windows must build the
-    /// lock first: `LockFileEx` is mandatory rather than advisory, so the
-    /// unix design does not port directly, but `OpenOptionsExt::share_mode(0)`
-    /// is safe std and needs a retry loop where `flock` blocks.
-    #[cfg(not(unix))]
-    fn acquire(_path: &Path) -> std::io::Result<Self> {
-        Ok(Self {})
+    /// The lock file could not be created beside `path`, or the open failed
+    /// for a reason other than sharing contention (contention retries
+    /// rather than failing).
+    #[cfg(windows)]
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Windows' `ERROR_SHARING_VIOLATION`: another handle already holds
+        /// share access this open's `share_mode(0)` denies. Hardcoded
+        /// rather than pulled from `windows-sys` — this crate has no
+        /// Windows-only dependency today, and one well-known, stable error
+        /// code does not earn it one.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        /// How long a contended retry sleeps before trying again. Short
+        /// enough that a lock held for one `append`'s duration (a read, a
+        /// write, a rename) costs this loop only a few iterations, long
+        /// enough not to spin the CPU while it waits.
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let lock_path = lock_path(path);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&lock_path)
+            {
+                Ok(handle) => return Ok(Self { _handle: handle }),
+                Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -377,9 +423,10 @@ impl RingLock {
 /// so it sits in `$SHEP_HOME` next to the ring and inherits that
 /// directory's `0700`.
 ///
-/// `cfg(unix)` alongside its only caller — [`RingLock::acquire`] is a
-/// documented no-op on Windows, so there is no lock file to name there.
-#[cfg(unix)]
+/// `cfg(any(unix, windows))` alongside its two callers —
+/// [`RingLock::acquire`] names a real lock file on both platforms now, unix
+/// through `flock(2)` and windows through an exclusive `share_mode(0)` open.
+#[cfg(any(unix, windows))]
 fn lock_path(path: &Path) -> std::path::PathBuf {
     let mut name = path
         .file_name()
@@ -493,17 +540,17 @@ mod tests {
 
     /// Env var naming the ring file the re-executed child should append
     /// to. Its presence is also what tells the child it is a child.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const CHILD_PATH_VAR: &str = "SHEP_BARK_RACE_PATH";
     /// Env var carrying the child's tag, which it stamps into every
     /// record's `subject` so the parent can tell the two writers apart.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const CHILD_TAG_VAR: &str = "SHEP_BARK_RACE_TAG";
     /// How many records each of the two writers appends. Large enough that
     /// the two read-modify-rename sequences overlap many times over; the
     /// reviewed reproduction of the lost-update bug used this count and
     /// lost half the records.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const RECORDS_PER_WRITER: u64 = 200;
 
     /// Not a test — the child half of
@@ -512,7 +559,7 @@ mod tests {
     /// `#[ignore]`d so a normal run never picks it up, and it asserts
     /// nothing: its job is to hammer [`append`] from a second OS process,
     /// and the parent does the judging.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     #[ignore = "child process of two_writer_processes_do_not_lose_each_other_s_barks"]
     fn bark_race_child() {
@@ -534,16 +581,19 @@ mod tests {
     /// which is a read-modify-write across a `rename` with no lock between
     /// address spaces.
     ///
-    /// `cfg(unix)` because [`RingLock`] is a documented no-op on Windows —
-    /// shep's 0% tier, where no verb runs and nothing appends twice — so
-    /// asserting this there would assert a guarantee the code openly does
-    /// not make. If a Windows daemon ever becomes real, this gate coming
-    /// off is part of that work.
+    /// Runs on Windows too now, and that gate coming off is the point.
+    /// [`RingLock`] used to be a documented no-op there, so this asserted a
+    /// guarantee the code openly did not make; it makes it now, through an
+    /// exclusive `share_mode(0)` open plus a retry loop, so the test that
+    /// proves the guarantee has to be the same test on both platforms.
+    /// This is what keeps the Windows lock honest — revert `acquire`'s
+    /// Windows arm to `Ok(Self {})` and this reddens rather than passing
+    /// quietly.
     ///
     /// Without the advisory lock this fails hard rather than flakily —
     /// measured at roughly half the records surviving, plus one child
     /// dying outright on `ENOENT` when the writers shared one temp name.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn two_writer_processes_do_not_lose_each_other_s_barks() {
         let dir = tempfile::tempdir().unwrap();

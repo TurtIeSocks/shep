@@ -19,7 +19,7 @@
 //!
 //! **No unsafe in this module.** [`BootOptions::ready_fd`] is
 //! `Option<`[`std::fs::File`]`>`, not a raw descriptor: the CALLER adopts
-//! the inherited readiness pipe (`unsafe fn` [`crate::sys::adopt_fd`],
+//! the inherited readiness pipe (`unsafe fn` `crate::sys::adopt_fd`,
 //! IR-22's sole unsafe surface) before ever constructing a [`BootOptions`],
 //! so [`boot`] only ever receives an already-owned handle and never
 //! constructs one from a bare number itself. Every bind/probe/unlink/
@@ -35,25 +35,28 @@
 //! by the time `boot` is ever called. The fix pushes adoption out to
 //! somewhere that CAN discharge the precondition: the CLI's `main`, as its
 //! literal first fd-touching statement, before a tokio runtime — or
-//! anything else — exists (Phase 3). See [`crate::sys::adopt_fd`]'s own
+//! anything else — exists (Phase 3). See `crate::sys::adopt_fd`'s own
 //! `# Safety` section and rationale essay for the full contract.)
 
 use core::fmt;
 use core::time::Duration;
 use std::ffi::OsString;
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::net::UnixListener;
+use shep_core::transport::Listener;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::BusEvent;
+#[cfg(unix)]
 use shep_core::selector::ProcessSelector;
 
 use crate::bus::new_bus;
@@ -64,7 +67,12 @@ use crate::rpc::RpcContext;
 use crate::runner::ProcessRunner;
 use crate::server::RpcServer;
 use crate::snapshot::{self, FlockRegistry, SnapshotError, SnapshotWriter, spawn_snapshot_writer};
-use crate::supervisor::{SupervisorBuilder, SupervisorError, SupervisorHandle};
+use crate::supervisor::{SupervisorBuilder, SupervisorHandle};
+// Read only by the SIGUSR2 log-reopen handler, which is unix-only — Windows
+// has no user-defined console control event to hang one on. See
+// `install_signals`' Windows arm.
+#[cfg(unix)]
+use crate::supervisor::SupervisorError;
 
 /// Mode for every directory shep creates (spec §10: no other user, at all)
 pub const DIR_MODE: u32 = 0o700;
@@ -94,6 +102,34 @@ const EXTRAS_REPORT_CAPACITY: usize = 64;
 /// Does not touch a directory that already exists (the umask given to
 /// `mkdir` only governs directories this call actually creates) — that
 /// case is [`init_dirs`]'s `set_permissions` pass, not this function's job.
+#[cfg(windows)]
+fn create_dir_at_dir_mode(dir: &Path) -> std::io::Result<()> {
+    // No mode to set. `DIR_MODE` is a POSIX permission word and Windows
+    // access control is an ACL, not a scalar, so there is nothing here to
+    // translate it into: a directory created this way inherits its parent's
+    // ACL, which under a normal user profile means the user and the local
+    // Administrators group.
+    //
+    // **This is a real difference in posture and is recorded rather than
+    // papered over.** On unix the `0700` on `$SHEP_HOME` is the PRIMARY
+    // access control — `server.rs`'s security writeup says so outright, and
+    // the same-uid peer check is explicitly the second layer behind it. On
+    // Windows the primary control moved to the control pipe's own ACL
+    // instead (see `shep_core::transport`), which is what actually refuses a
+    // foreign local user, and it does so before any byte reaches shep. What
+    // this directory does NOT do is hide `flock.json` — which holds an app's
+    // `env` verbatim so a muster restore can reproduce it — from another
+    // account that already has read access to the profile it lives under.
+    //
+    // Closing that would mean building an explicit DACL with
+    // `PROTECTED_DACL_SECURITY_INFORMATION` so it does not inherit, which is
+    // raw FFI in a crate whose only sanctioned unsafe lives in `sys.rs`. It
+    // is deliberately not smuggled in here, and it is named in the operator
+    // docs rather than left for someone to discover.
+    std::fs::DirBuilder::new().recursive(true).create(dir)
+}
+
+#[cfg(unix)]
 fn create_dir_at_dir_mode(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
         .mode(DIR_MODE)
@@ -119,6 +155,11 @@ pub(crate) fn init_dirs(paths: &ShepPaths) -> Result<(), BootError> {
             path: dir.clone(),
             source,
         })?;
+        // Re-tightening an already-existing directory, which is the half
+        // `create_dir_at_dir_mode` cannot do. Unix only, for the reason that
+        // function's Windows arm gives: there is no scalar mode to force a
+        // directory back to.
+        #[cfg(unix)]
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE)).map_err(
             |source| BootError::Io {
                 path: dir.clone(),
@@ -164,6 +205,7 @@ pub fn pidfile(paths: &ShepPaths) -> PathBuf {
 /// # Errors
 /// - [`BootError::Io`] — the pidfile could not be written.
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 fn write_pidfile(paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
     use std::io::Write;
 
@@ -243,8 +285,55 @@ pub(crate) fn read_pidfile(paths: &ShepPaths) -> Result<Option<u32>, BootError> 
 /// exactly the property a pidfile-based "am I the only one" check needs
 /// and a filesystem-existence check (`pidfile` alone) cannot give: a stale
 /// pidfile from a crash still exists, but a stale LOCK on it does not.
+/// # Windows
+///
+/// Every property above survives, by a different mechanism and on a
+/// different file. The lock is an exclusive `share_mode(0)` open — the same
+/// primitive [`shep_core::kv`] and [`shep_core::barks`] use — held on a
+/// SIBLING `shepd.pid.lock` rather than on the pidfile itself.
+///
+/// The sibling is not incidental. `share_mode(0)` denies *every* other
+/// handle, including a read-only one, so locking the pidfile directly would
+/// make it unreadable — and reading it is exactly what the losing daemon
+/// does to name the winner in its [`BootError::AlreadyRunning`]. Unix has no
+/// such problem because `flock` is advisory and does not block an ordinary
+/// `open`. Splitting the lock token from the data file restores the unix
+/// behaviour: the loser is refused, and can still read who won.
+///
+/// The load-bearing crash property holds too, for the same underlying
+/// reason. A `flock` lock is owned by the open file description and the
+/// kernel drops it when the last descriptor closes, process death included;
+/// a Windows share-mode reservation is owned by the HANDLE and the kernel
+/// drops it when the last handle closes, process death included. Neither
+/// needs an unlock call, and neither leaves a stale lock behind after a
+/// `SIGKILL` or a `TerminateProcess`. A stale pidfile still exists on both
+/// platforms; a stale lock does not.
+///
+/// One genuine difference: `LockExclusiveNonblock` fails with `EWOULDBLOCK`
+/// and a contended `share_mode(0)` open fails with
+/// `ERROR_SHARING_VIOLATION`. Both are immediate — this is the one lock in
+/// the workspace that must NOT wait, unlike the kv and bark rings, whose
+/// Windows arms retry precisely because their unix arms block.
 #[derive(Debug)]
-struct PidfileLock(nix::fcntl::Flock<std::fs::File>);
+struct PidfileLock {
+    #[cfg(unix)]
+    flock: nix::fcntl::Flock<std::fs::File>,
+    /// The sibling lock file, held open with every share flag cleared.
+    /// Named with a leading underscore because it is held, never read —
+    /// [`PidfileLock::record`] writes the pidfile itself.
+    #[cfg(windows)]
+    _handle: std::fs::File,
+}
+
+/// The sibling file the Windows arm locks: the pidfile with `.lock` appended.
+///
+/// Never renamed, never read, and left on disk between boots — an inode with
+/// a stable identity whose only job is to be openable exclusively, exactly
+/// as `kv.json.lock` and `barks.jsonl.lock` are.
+#[cfg(windows)]
+fn pidfile_lock_path(paths: &ShepPaths) -> PathBuf {
+    paths.pids.join("shepd.pid.lock")
+}
 
 impl PidfileLock {
     /// Opens (creating if necessary) and takes an exclusive, non-blocking
@@ -260,6 +349,7 @@ impl PidfileLock {
     ///   lock (carries the pid recorded in the file, if any — the file
     ///   itself is left untouched either way).
     /// - [`BootError::Io`] — the pidfile could not be opened.
+    #[cfg(unix)]
     fn acquire(paths: &ShepPaths) -> Result<Self, BootError> {
         let path = pidfile(paths);
         let file = std::fs::OpenOptions::new()
@@ -273,7 +363,7 @@ impl PidfileLock {
                 source,
             })?;
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => Ok(Self(lock)),
+            Ok(flock) => Ok(Self { flock }),
             Err((_file, nix::errno::Errno::EWOULDBLOCK)) => Err(BootError::AlreadyRunning {
                 pid: read_pidfile(paths)?,
             }),
@@ -281,6 +371,43 @@ impl PidfileLock {
                 path,
                 source: errno.into(),
             }),
+        }
+    }
+
+    /// Opens (creating if necessary) the sibling lock file with every share
+    /// flag cleared, which no second process can then open at all.
+    ///
+    /// # Errors
+    /// - [`BootError::AlreadyRunning`] — another process already holds this
+    ///   lock (carries the pid the winner recorded in the pidfile, which
+    ///   stays readable precisely because the lock is on a sibling).
+    /// - [`BootError::Io`] — the lock file could not be opened.
+    #[cfg(windows)]
+    fn acquire(paths: &ShepPaths) -> Result<Self, BootError> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// Another handle already holds share access this open denies.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        let path = pidfile_lock_path(paths);
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path)
+        {
+            Ok(handle) => Ok(Self { _handle: handle }),
+            // Immediate, never retried: unlike the kv and bark rings, whose
+            // unix arms block and whose Windows arms therefore poll, this
+            // lock is non-blocking on unix too. A second daemon must be
+            // refused now, not queued behind the first.
+            Err(err) if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                Err(BootError::AlreadyRunning {
+                    pid: read_pidfile(paths)?,
+                })
+            }
+            Err(source) => Err(BootError::Io { path, source }),
         }
     }
 
@@ -295,11 +422,42 @@ impl PidfileLock {
     ///
     /// # Errors
     /// - [`BootError::Io`] — the write failed.
+    #[cfg(windows)]
+    fn record(&mut self, paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
+        use std::io::Write as _;
+
+        // An ordinary write, because this arm holds its lock on the sibling
+        // `.lock` rather than on this file — so unlike the unix arm there is
+        // no already-locked handle to write through, and nothing is lost by
+        // not having one: holding the lock is itself proof that no second
+        // daemon is writing here. Truncated in place rather than staged and
+        // renamed, for exactly the reason the unix arm gives — a rename would
+        // swap in an inode of its own.
+        let path = pidfile(paths);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|source| BootError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(pid.to_string().as_bytes())
+            .map_err(|source| BootError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.sync_all()
+            .map_err(|source| BootError::Io { path, source })
+    }
+
+    #[cfg(unix)]
     fn record(&mut self, paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
         use std::io::{Seek, SeekFrom, Write};
 
         let path = pidfile(paths);
-        let file = &mut *self.0;
+        let file = &mut *self.flock;
         file.set_len(0).map_err(|source| BootError::Io {
             path: path.clone(),
             source,
@@ -334,6 +492,7 @@ pub(crate) fn socket_path(paths: &ShepPaths, override_path: Option<&Path>) -> Pa
 /// `[daemon].socket` override the operator pointed somewhere looser, which
 /// forfeits the 0700 guarantee the security model otherwise rests on. That
 /// is the operator's call to make, not this function's to block.
+#[cfg(unix)]
 fn warn_if_socket_dir_is_loose(socket: &Path) {
     let Some(parent) = socket.parent() else {
         return;
@@ -355,79 +514,123 @@ fn warn_if_socket_dir_is_loose(socket: &Path) {
 /// # Errors
 /// - [`BootError::AlreadyRunning`] — a live daemon answered on the socket.
 /// - [`BootError::Io`] — bind, probe, or unlink failed.
-pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<UnixListener, BootError> {
-    // Ahead of the bind, because the kernel's own refusal names neither the
-    // limit nor `$SHEP_HOME`. `sun_path` is 104 bytes on macOS and 108 on
-    // Linux, and it holds a NUL terminator, so the usable length is one less.
-    const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
-    let len = socket.as_os_str().as_encoded_bytes().len();
-    if len >= SUN_PATH_CAPACITY {
-        return Err(BootError::SocketPathTooLong {
-            path: socket.to_path_buf(),
-            len,
-            limit: SUN_PATH_CAPACITY - 1,
-        });
-    }
-    warn_if_socket_dir_is_loose(socket);
-    match UnixListener::bind(socket) {
-        Ok(listener) => Ok(listener),
-        Err(err) if err.kind() == ErrorKind::AddrInUse => {
-            // EADDRINUSE only says the path exists. Probe it: a live daemon's
-            // listener accepts at the kernel level even mid-accept, while a
-            // file left behind by a crash (or a reboot) refuses. This is the
-            // load-bearing step for the reboot-resurrect scenario (§13.4).
-            //
-            // Only one direction of that is proof, and the asymmetry is
-            // deliberate. A socket answers for as long as ANY descriptor for
-            // it stays open, and `fork` copies every descriptor a process
-            // holds: a child a dying daemon forked and has not yet exec'd
-            // goes on answering on its behalf until close-on-exec clears the
-            // copy. So a refusal proves staleness, while an answer is only
-            // grounds to refuse this boot — never evidence that a healthy
-            // peer is there. Refusing a boot that could have proceeded costs
-            // an operator one retry; binding over a socket a daemon is still
-            // serving on costs two daemons one flock.
-            match std::os::unix::net::UnixStream::connect(socket) {
-                Ok(_) => Err(BootError::AlreadyRunning {
+// `needless_return` fires on the Windows arm's explicit `return`, which is
+// load-bearing: the `cfg(unix)` block after it is the rest of the function,
+// and the two cannot be an if/else over `cfg!` because the unix arm names
+// types (`nix`'s errno, `std::os::unix::net`) that do not exist to name on
+// Windows at all.
+#[allow(clippy::needless_return)]
+pub(crate) fn bind_socket(paths: &ShepPaths, socket: &Path) -> Result<Listener, BootError> {
+    // Windows takes an entirely different route through this function, and
+    // the reason is worth stating: almost everything below exists to cope
+    // with a socket being a FILE. A named pipe is not one. It has no
+    // `sun_path` length limit, no containing directory whose mode could be
+    // loose, and — decisively — nothing left on disk when its owner dies, so
+    // there is no stale artefact to probe for and no recovery to perform.
+    //
+    // The mutual exclusion the whole probe-and-recover dance is protecting
+    // is instead enforced by the OS: `Listener::bind` passes
+    // `first_pipe_instance`, so a second daemon on the same `$SHEP_HOME` is
+    // refused by the kernel at create time rather than after a race this
+    // code would have to adjudicate. `PidfileLock` still runs ahead of this
+    // on both platforms and is still the primary guard; this is a second,
+    // independent one that unix simply cannot have.
+    #[cfg(windows)]
+    {
+        /// `ERROR_ACCESS_DENIED` — what `first_pipe_instance` reports when
+        /// the pipe name already has an owner. The one error that means
+        /// "another daemon", rather than a genuine I/O failure.
+        const ERROR_ACCESS_DENIED: i32 = 5;
+
+        return match Listener::bind(socket) {
+            Ok(listener) => Ok(listener),
+            Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                Err(BootError::AlreadyRunning {
                     pid: read_pidfile(paths)?,
-                }),
-                Err(probe)
-                    if matches!(
-                        probe.kind(),
-                        ErrorKind::ConnectionRefused | ErrorKind::NotFound
-                    ) =>
-                {
-                    std::fs::remove_file(socket).map_err(|source| BootError::Io {
-                        path: socket.to_path_buf(),
-                        source,
-                    })?;
-                    UnixListener::bind(socket).map_err(|source| BootError::Io {
-                        path: socket.to_path_buf(),
-                        source,
-                    })
-                }
-                Err(source) => Err(BootError::Io {
-                    path: socket.to_path_buf(),
-                    source,
-                }),
+                })
             }
+            Err(source) => Err(BootError::Io {
+                path: socket.to_path_buf(),
+                source,
+            }),
+        };
+    }
+
+    #[cfg(unix)]
+    {
+        // Ahead of the bind, because the kernel's own refusal names neither the
+        // limit nor `$SHEP_HOME`. `sun_path` is 104 bytes on macOS and 108 on
+        // Linux, and it holds a NUL terminator, so the usable length is one less.
+        const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+        let len = socket.as_os_str().as_encoded_bytes().len();
+        if len >= SUN_PATH_CAPACITY {
+            return Err(BootError::SocketPathTooLong {
+                path: socket.to_path_buf(),
+                len,
+                limit: SUN_PATH_CAPACITY - 1,
+            });
         }
-        Err(source) => Err(BootError::Io {
-            path: socket.to_path_buf(),
-            source,
-        }),
+        warn_if_socket_dir_is_loose(socket);
+        match Listener::bind(socket) {
+            Ok(listener) => Ok(listener),
+            Err(err) if err.kind() == ErrorKind::AddrInUse => {
+                // EADDRINUSE only says the path exists. Probe it: a live daemon's
+                // listener accepts at the kernel level even mid-accept, while a
+                // file left behind by a crash (or a reboot) refuses. This is the
+                // load-bearing step for the reboot-resurrect scenario (§13.4).
+                //
+                // Only one direction of that is proof, and the asymmetry is
+                // deliberate. A socket answers for as long as ANY descriptor for
+                // it stays open, and `fork` copies every descriptor a process
+                // holds: a child a dying daemon forked and has not yet exec'd
+                // goes on answering on its behalf until close-on-exec clears the
+                // copy. So a refusal proves staleness, while an answer is only
+                // grounds to refuse this boot — never evidence that a healthy
+                // peer is there. Refusing a boot that could have proceeded costs
+                // an operator one retry; binding over a socket a daemon is still
+                // serving on costs two daemons one flock.
+                match std::os::unix::net::UnixStream::connect(socket) {
+                    Ok(_) => Err(BootError::AlreadyRunning {
+                        pid: read_pidfile(paths)?,
+                    }),
+                    Err(probe)
+                        if matches!(
+                            probe.kind(),
+                            ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                        ) =>
+                    {
+                        std::fs::remove_file(socket).map_err(|source| BootError::Io {
+                            path: socket.to_path_buf(),
+                            source,
+                        })?;
+                        Listener::bind(socket).map_err(|source| BootError::Io {
+                            path: socket.to_path_buf(),
+                            source,
+                        })
+                    }
+                    Err(source) => Err(BootError::Io {
+                        path: socket.to_path_buf(),
+                        source,
+                    }),
+                }
+            }
+            Err(source) => Err(BootError::Io {
+                path: socket.to_path_buf(),
+                source,
+            }),
+        }
     }
 }
 
 /// Environment variable naming the inherited readiness descriptor.
 ///
 /// Set by the CLI on the child it re-execs detached (spec §3); read back and
-/// adopted (`unsafe fn` [`crate::sys::adopt_fd`]) by that same CLI, not by
+/// adopted (`unsafe fn` `crate::sys::adopt_fd`) by that same CLI, not by
 /// anything in this crate — shep-daemon never parses this variable or sees
 /// a raw fd number itself, only the already-adopted [`std::fs::File`] that
 /// lands in [`BootOptions::ready_fd`].
 ///
-/// Public with no caller yet, for the same reason [`crate::sys::adopt_fd`]
+/// Public with no caller yet, for the same reason `crate::sys::adopt_fd`
 /// is: both halves of this handshake belong to `shep-cli` and neither is
 /// written. Crate-private it has no use at all, and "unused constant" is a
 /// worse description of it than this paragraph.
@@ -454,7 +657,7 @@ pub(crate) struct DaemonReady {
 /// signal that there is nothing more to read.
 ///
 /// Takes an already-adopted [`std::fs::File`], never a raw fd: adoption
-/// (`unsafe fn` [`crate::sys::adopt_fd`]) is a fd-inheritance concern
+/// (`unsafe fn` `crate::sys::adopt_fd`) is a fd-inheritance concern
 /// (`sys.rs`'s rationale essay) with a process-wide ordering precondition
 /// that only the CLI's `main` can discharge — this function never touches a
 /// bare descriptor, only the safe `File` handed to it.
@@ -484,7 +687,7 @@ pub struct BootOptions {
     /// [`std::fs::File`] by the CALLER before this struct is ever
     /// constructed.
     ///
-    /// Adoption (`unsafe fn` [`crate::sys::adopt_fd`]) is deliberately not
+    /// Adoption (`unsafe fn` `crate::sys::adopt_fd`) is deliberately not
     /// this crate's job: its ordering precondition ("call this before the
     /// process opens any descriptor of its own") is process-wide, and
     /// [`boot`] — already running inside a tokio runtime with its own live
@@ -512,7 +715,7 @@ pub struct BootOptions {
     /// edition 2024 and this crate is `#![deny(unsafe_code)]`, so a boot
     /// test could not establish an ambient `$NOTIFY_SOCKET` to observe the
     /// ordering against. The CLI reads the variable
-    /// ([`crate::notify::NOTIFY_SOCKET_ENV`]) once, where it already reads
+    /// (`crate::notify::NOTIFY_SOCKET_ENV`) once, where it already reads
     /// every other `SHEP_*` override.
     ///
     /// Distinct from [`Self::ready_fd`], which the two share nothing with
@@ -584,7 +787,7 @@ pub struct BootOptions {
 ///    up, the same reasoning that put the restore itself inside that
 ///    promise;
 /// 5. report readiness to an init system supervising this process directly
-///    ([`BootOptions::notify_socket`], [`crate::notify`]) — last of all,
+///    ([`BootOptions::notify_socket`], `crate::notify`) — last of all,
 ///    which is the opposite of step 3 and deliberately so: that one answers
 ///    a parent shep waiting to exit, this one decides when a unit goes
 ///    green, and a unit that goes green at exec time describes a flock that
@@ -734,6 +937,18 @@ pub async fn boot<R: ProcessRunner>(
     //    and only systemd's knowledge of it is wrong, which systemd's own
     //    `TimeoutStartSec` reports honestly — killing a working daemon over
     //    an undeliverable datagram would be the worse outcome.
+    //
+    //    Unix only, because `$NOTIFY_SOCKET` is systemd's protocol over a
+    //    unix datagram socket and there is nothing on Windows for it to
+    //    address. The field stays on `BootOptions` on both platforms rather
+    //    than being gated out of the struct: `shep-cli` reads the variable
+    //    in one place for every target, and a config type whose SHAPE
+    //    changes per platform makes every caller carry the gate instead of
+    //    one call site doing so. A Windows daemon simply never has anything
+    //    to report readiness to — the equivalent, once a real Windows
+    //    service exists, is `SetServiceStatus`, which is Tier B work and
+    //    deliberately not faked here.
+    #[cfg(unix)]
     if let Some(target) = options.notify_socket.as_deref()
         && let Err(err) = crate::notify::notify(target)
     {
@@ -818,7 +1033,7 @@ async fn restore_flock(
 #[derive(Debug)]
 pub struct RunningDaemon {
     ctx: RpcContext,
-    listener: UnixListener,
+    listener: Listener,
     writer: SnapshotWriter,
     // Parks on a broadcast receiver until this handle aborts it (see
     // `spawn_dog_watch`'s own doc for why holding the handle, not sender
@@ -973,7 +1188,26 @@ impl RunningDaemon {
         // 5. Unlink what boot created — both attempted regardless, the
         // first failure (if any) wins so a socket-unlink error can't hide
         // a pidfile that was never even attempted.
+        //
+        // The SOCKET half is unix-only, and skipping it on Windows is not an
+        // omission: there is no file there to remove. The control address is
+        // a named pipe, which stops existing when this process's last handle
+        // closes — the listener is dropped moments from here — so teardown
+        // has nothing to do that the kernel is not already doing.
+        //
+        // Attempting it anyway is not harmlessly redundant, which is how
+        // this was found: `remove_file` on a `\.\pipe\...` name fails with
+        // `ERROR_INVALID_PARAMETER`, so every Windows daemon shutdown
+        // returned `Err` from `run()` — invisible through `shep kill`, which
+        // does not read that value, and caught by `daemon_e2e`'s fixture,
+        // which unwraps it.
+        #[cfg(unix)]
         let unlink_socket = unlink_if_present(&socket);
+        #[cfg(windows)]
+        let unlink_socket = {
+            let _ = &socket;
+            Ok(())
+        };
         let unlink_pidfile = unlink_if_present(&pidfile(&paths));
         unlink_socket.and(unlink_pidfile)
     }
@@ -1073,6 +1307,88 @@ impl Drop for SignalTasks {
 ///
 /// # Errors
 /// - [`BootError::Io`] — the OS refused to register a signal handler.
+#[cfg(windows)]
+fn install_signals(
+    shutdown: Arc<watch::Sender<bool>>,
+    paths: ShepPaths,
+) -> Result<(SignalTasks, oneshot::Sender<SupervisorHandle>), BootError> {
+    use tokio::signal::windows;
+
+    let mut signals = SignalTasks {
+        tasks: Vec::with_capacity(4),
+    };
+
+    // A macro rather than the unix arm loop because each console control
+    // event is its OWN tokio type (`CtrlC`, `CtrlBreak`, `CtrlClose`,
+    // `CtrlShutdown`) with its own `recv`, where unix has one `Signal` type
+    // parameterised by a `SignalKind` value. There is nothing to iterate.
+    macro_rules! listen {
+        ($ctor:path, $name:literal) => {{
+            let mut stream = $ctor().map_err(|source| BootError::Io {
+                path: paths.home.clone(),
+                source,
+            })?;
+            let shutdown = Arc::clone(&shutdown);
+            signals.tasks.push(tokio::spawn(async move {
+                // Looped for the same reason the unix arm loops — see this
+                // function unix twin doc: a single await leaves a second
+                // event during a slow teardown with nowhere to go.
+                let mut already_shutting_down = false;
+                while stream.recv().await.is_some() {
+                    if already_shutting_down {
+                        tracing::warn!(
+                            signal = $name,
+                            "received a repeat shutdown event while teardown is already \
+                             underway; teardown continues unchanged"
+                        );
+                    } else {
+                        already_shutting_down = true;
+                    }
+                    let _ = shutdown.send(true);
+                }
+            }));
+        }};
+    }
+
+    // CTRL_C and CTRL_BREAK are the console interrupts an operator sends by
+    // hand. CTRL_CLOSE (the console window closing), CTRL_SHUTDOWN (the
+    // machine going down) and their siblings are what a graceful reboot
+    // delivers, and handling them is what keeps a reboot from looking like a
+    // crash to every sheep in the flock.
+    //
+    // **CTRL_CLOSE and CTRL_SHUTDOWN carry a hard OS deadline**, and it is
+    // shorter than the daemon own teardown can promise: Windows terminates
+    // the process about five seconds after the handler returns, regardless
+    // of what shep is still doing. A flock whose apps take longer than that
+    // to stop gracefully will lose the tail of its kill ladder to the OS.
+    // There is no way to extend it from inside the process, and it is the
+    // reason a production Windows deployment wants a real service (which
+    // negotiates its own longer timeout with the SCM) rather than a console
+    // daemon. Recorded here because it is invisible otherwise, and because
+    // it is the sharpest edge in the Windows tier.
+    listen!(windows::ctrl_c, "CTRL_C");
+    listen!(windows::ctrl_break, "CTRL_BREAK");
+    listen!(windows::ctrl_close, "CTRL_CLOSE");
+    listen!(windows::ctrl_shutdown, "CTRL_SHUTDOWN");
+
+    // No SIGUSR2 counterpart, and no Windows mechanism to build one from:
+    // there is no user-defined console control event, and no way to deliver
+    // an arbitrary one to another process. So the signal-driven log reopen
+    // has no trigger on this platform.
+    //
+    // It costs less than it appears to. That signal exists for an external
+    // rotator that has just renamed the log files underneath a running
+    // daemon, and the shape of rotation itself differs here — see
+    // `tokio_runner`'s `open_append`, whose Windows arm opens with
+    // `FILE_SHARE_DELETE` precisely so a rotator can rename an open file at
+    // all. The receiver is created and returned so the caller wiring is one
+    // shape on both platforms; dropping the receiving end simply makes
+    // `boot`'s own `let _ = connect_supervisor.send(..)` a no-op.
+    let (connect_supervisor, _supervisor_rx) = oneshot::channel::<SupervisorHandle>();
+    Ok((signals, connect_supervisor))
+}
+
+#[cfg(unix)]
 fn install_signals(
     shutdown: Arc<watch::Sender<bool>>,
     paths: ShepPaths,
@@ -1219,7 +1535,7 @@ pub enum BootError {
     /// Writing the readiness line to the caller-adopted readiness pipe
     /// failed (carries the OS error)
     ///
-    /// Adoption itself (`unsafe fn` [`crate::sys::adopt_fd`]) is the
+    /// Adoption itself (`unsafe fn` `crate::sys::adopt_fd`) is the
     /// caller's job, not `boot`'s — see [`BootOptions::ready_fd`]'s own
     /// doc — so `boot` has no error variant for a failed adoption; by the
     /// time `options.ready_fd` reaches here it is already a valid, owned
@@ -1271,7 +1587,115 @@ impl From<SnapshotError> for BootError {
     }
 }
 
-#[cfg(test)]
+/// Boot behaviour that is specific to the Windows tier.
+///
+/// The big `mod tests` below is `#[cfg(unix)]` because almost every case in
+/// it asserts something that only exists on unix — a `0700` mode read back
+/// off a directory, a `raise(SIGTERM)`, a socket FILE left behind by a crash
+/// and then probed. Those are not skipped here out of convenience; they
+/// assert guarantees the Windows tier deliberately makes differently, and
+/// each difference is argued at its own call site above.
+///
+/// What survives translation is asserted here instead, on the three
+/// properties that must hold on both platforms or the daemon is unsound.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn paths_in(dir: &Path) -> ShepPaths {
+        ShepPaths::resolve(
+            &|key| (key == "SHEP_HOME").then(|| dir.to_string_lossy().into_owned()),
+            Path::new(""),
+        )
+    }
+
+    /// fails if the layout is not created. No mode to assert — see
+    /// `create_dir_at_dir_mode`'s Windows arm — but the directories
+    /// themselves are what every later step writes into.
+    #[test]
+    fn init_dirs_creates_the_whole_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        init_dirs(&paths).unwrap();
+        for expected in [&paths.home, &paths.logs, &paths.pids, &paths.run] {
+            assert!(expected.is_dir(), "{} was not created", expected.display());
+        }
+    }
+
+    /// fails if two daemons can both claim one `$SHEP_HOME`.
+    ///
+    /// The Windows arm holds its lock on a SIBLING `.lock` file rather than
+    /// on the pidfile, so this also pins the property that motivated that
+    /// split: the loser must still be able to READ the pidfile to name the
+    /// winner. A `share_mode(0)` open of the pidfile itself would make
+    /// `read_pidfile` fail with a sharing violation instead, and the
+    /// `AlreadyRunning` error would lose its pid.
+    #[test]
+    fn a_second_pidfile_lock_is_refused_and_can_still_read_the_winners_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        init_dirs(&paths).unwrap();
+
+        let mut first = PidfileLock::acquire(&paths).expect("the first daemon must win");
+        first.record(&paths, 4242).unwrap();
+
+        let refusal = PidfileLock::acquire(&paths).expect_err("a second daemon must be refused");
+        let BootError::AlreadyRunning { pid } = refusal else {
+            panic!("a contended lock must report AlreadyRunning, got {refusal:?}");
+        };
+        assert_eq!(
+            pid,
+            Some(4242),
+            "the loser must be able to read the winner's pid off the pidfile"
+        );
+    }
+
+    /// fails if the lock outlives the process that held it.
+    ///
+    /// The crash property: a Windows share-mode reservation is owned by the
+    /// HANDLE and released by the kernel when the last one closes, exactly
+    /// as `flock`'s is released with the last descriptor. Dropping stands in
+    /// for the process dying, which is what closes the handle either way.
+    #[test]
+    fn dropping_the_lock_releases_it_for_the_next_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        init_dirs(&paths).unwrap();
+
+        let first = PidfileLock::acquire(&paths).unwrap();
+        drop(first);
+
+        PidfileLock::acquire(&paths)
+            .expect("a released lock must be re-acquirable, or a crash would wedge $SHEP_HOME");
+    }
+
+    /// fails if two daemons can both bind one control address.
+    ///
+    /// `first_pipe_instance` is what refuses the second, and this asserts
+    /// the refusal arrives as `AlreadyRunning` rather than as a raw
+    /// `ERROR_ACCESS_DENIED` an operator could not act on.
+    /// `#[tokio::test]`, unlike its three siblings: creating a named pipe
+    /// instance registers it with the tokio reactor, so `ServerOptions::create`
+    /// panics outside a runtime context. `boot` always has one; a bare
+    /// `#[test]` here does not.
+    #[tokio::test]
+    async fn a_second_bind_on_a_live_control_address_reports_already_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        init_dirs(&paths).unwrap();
+
+        let _live = bind_socket(&paths, &paths.socket).expect("the first bind must succeed");
+
+        let refusal = bind_socket(&paths, &paths.socket)
+            .expect_err("a second daemon must not bind the same pipe");
+        assert!(
+            matches!(refusal, BootError::AlreadyRunning { .. }),
+            "a taken pipe name must read as AlreadyRunning, got {refusal:?}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::dogs::DogSpec;
@@ -1528,7 +1952,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        let live = UnixListener::bind(&paths.socket).unwrap();
+        // `tokio::net::UnixListener` by its full path: this module no longer
+        // imports it, because production code reaches the transport through
+        // `shep_core::transport::Listener` on both platforms now. This case
+        // is `cfg(unix)` and deliberately binds the RAW unix type, so that
+        // what it proves is "a real socket someone else is listening on is
+        // reported as AlreadyRunning" rather than anything about shep's own
+        // wrapper.
+        let live = tokio::net::UnixListener::bind(&paths.socket).unwrap();
         write_pidfile(&paths, 4242).unwrap();
         assert!(matches!(
             bind_socket(&paths, &paths.socket),

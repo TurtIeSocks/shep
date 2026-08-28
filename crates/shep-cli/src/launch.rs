@@ -16,12 +16,16 @@
 
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt as _;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
+#[cfg(unix)]
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use shep_core::paths::ShepPaths;
 
@@ -68,10 +72,15 @@ pub const DAEMON_STDERR_LOG: &str = "shepd.err.log";
 /// `shep_client::spawn::connect_or_spawn` as its launcher — the binary's
 /// only autostart.
 pub fn launch_command(paths: &ShepPaths) -> io::Result<Command> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(shep_daemon::boot::DIR_MODE)
-        .create(&paths.logs)?;
+    let mut log_dir = std::fs::DirBuilder::new();
+    log_dir.recursive(true);
+    // Mode at creation, never a later `chmod` — see this function's doc.
+    // Windows has no scalar mode to set; `shep_daemon::boot`'s
+    // `create_dir_at_dir_mode` carries the argument for what guards the
+    // control plane there instead.
+    #[cfg(unix)]
+    log_dir.mode(shep_daemon::boot::DIR_MODE);
+    log_dir.create(&paths.logs)?;
 
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("daemon")
@@ -86,14 +95,43 @@ pub fn launch_command(paths: &ShepPaths) -> io::Result<Command> {
         // at all, and clearing would also drop the `SHEP_*` overrides
         // `DaemonConfig::load` reads from the child's own environment.
         //
-        // Detaches from the parent's process group so the daemon survives
-        // the parent exiting and its controlling terminal closing — no
-        // double-fork, no unsafe (`process_group` is
-        // `std::os::unix::process::CommandExt`, stable since Rust 1.64).
-        .process_group(0)
         .stdout(emptied_appending(&paths.logs.join(DAEMON_STDOUT_LOG))?)
         .stderr(emptied_appending(&paths.logs.join(DAEMON_STDERR_LOG))?)
         .stdin(Stdio::null());
+
+    // Detaches from the parent's process group so the daemon survives the
+    // parent exiting and its controlling terminal closing — no double-fork,
+    // no unsafe (`process_group` is `std::os::unix::process::CommandExt`,
+    // stable since Rust 1.64).
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    // The same detachment, spelled in Win32 creation flags. All three are
+    // load-bearing and none is the default:
+    //
+    // - `DETACHED_PROCESS` gives the daemon no console at all, so closing
+    //   the terminal that ran `shep start` cannot deliver `CTRL_CLOSE_EVENT`
+    //   to it. This is the direct analogue of leaving the parent's process
+    //   group, and without it the shepherd dies with the window that
+    //   launched it — the exact failure `process_group(0)` exists to prevent.
+    // - `CREATE_NEW_PROCESS_GROUP` additionally roots a group at the daemon,
+    //   so a Ctrl+C in the launching console is not broadcast to it.
+    // - `CREATE_BREAKAWAY_FROM_JOB` matters when shep itself was started
+    //   inside a job object — which is ordinary on Windows: some terminal
+    //   hosts, CI runners and IDE test harnesses put their children in one
+    //   with `KILL_ON_JOB_CLOSE` set. Without breakaway the shepherd would
+    //   inherit that job and be terminated when the harness closed it,
+    //   taking the whole flock with it.
+    //
+    // `CREATE_BREAKAWAY_FROM_JOB` fails the spawn outright if the containing
+    // job forbids breakaway, so it is not set unconditionally — see
+    // `launch_daemon`, which retries without it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+    }
+
     Ok(cmd)
 }
 
@@ -126,8 +164,37 @@ pub fn launch_command(paths: &ShepPaths) -> io::Result<Command> {
 ///
 /// The file could not be opened, or could not be emptied once open.
 fn emptied_appending(path: &Path) -> io::Result<File> {
+    // Windows cannot empty an append handle, and the reason is the same
+    // property that makes it an append handle.
+    //
+    // `OpenOptions::append(true)` maps to `FILE_GENERIC_WRITE &
+    // !FILE_WRITE_DATA` — std removes `FILE_WRITE_DATA` deliberately,
+    // because on Windows "append mode" IS the state of holding
+    // `FILE_APPEND_DATA` while lacking `FILE_WRITE_DATA`. `set_len` needs
+    // exactly the right std removed, so the unix arm's
+    // `open-then-set_len(0)` fails here with `ERROR_ACCESS_DENIED` — which
+    // is not a permissions problem an operator can fix, and which surfaced
+    // as `shep start` refusing to autostart a shepherd at all.
+    //
+    // Granting `FILE_WRITE_DATA` back through `access_mode` would fix the
+    // truncate and silently destroy the append semantics this function
+    // exists to establish, taking the sparse-hole guarantee its doc argues
+    // for with it. So the emptying is done on a SEPARATE, short-lived
+    // handle that has ordinary write access, and the handle actually handed
+    // to the daemon is opened append-only afterwards.
+    //
+    // Two opens rather than one, and a window between them in which another
+    // process could write to a file it has no reason to touch. That is
+    // acceptable where reordering is not: an append handle is what the
+    // daemon holds for its whole life, and it must be a real one.
+    #[cfg(windows)]
+    File::create(path)?;
+
     let file = File::options().create(true).append(true).open(path)?;
+
+    #[cfg(unix)]
     file.set_len(0)?;
+
     Ok(file)
 }
 
@@ -136,12 +203,14 @@ fn emptied_appending(path: &Path) -> io::Result<File> {
 /// process still needs for its own output afterwards — marking those
 /// close-on-exec would change what every OTHER `exec` from this process
 /// sees, to fix nothing the redirects have not already fixed.
+#[cfg(unix)]
 const FIRST_NON_STDIO_FD: RawFd = 3;
 
 /// The directory whose entries name this process's own open descriptors.
 /// `/dev/fd` on macOS (the `fdesc` filesystem), a symlink to
 /// `/proc/self/fd` on Linux; both list exactly the numbers this process
 /// holds.
+#[cfg_attr(windows, allow(dead_code))]
 const FD_DIR: &str = "/dev/fd";
 
 /// Marks every descriptor this process holds above stdio close-on-exec, so
@@ -207,6 +276,7 @@ const FD_DIR: &str = "/dev/fd";
 /// concurrent thread that wanted a descriptor of its own inherited by a
 /// child would be defeated by it. Nothing in this binary spawns anything
 /// but the daemon.
+#[cfg(unix)]
 fn seal_inherited_fds() {
     let Ok(entries) = std::fs::read_dir(FD_DIR) else {
         return;
@@ -246,12 +316,79 @@ fn seal_inherited_fds() {
 /// This is the launcher `main` passes to
 /// `shep_client::spawn::connect_or_spawn`, so a cold `$SHEP_HOME` gets a
 /// daemon on the first command that needs one.
+#[cfg(unix)]
 pub fn launch_daemon(paths: &ShepPaths) -> io::Result<Child> {
     seal_inherited_fds();
     launch_command(paths)?.spawn()
 }
 
-#[cfg(test)]
+/// Windows' `DETACHED_PROCESS`: the child gets no console of its own and
+/// does not inherit the parent's.
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+/// Windows' `CREATE_NEW_PROCESS_GROUP`.
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+/// Windows' `CREATE_BREAKAWAY_FROM_JOB`.
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// Spawns the detached shepherd.
+///
+/// **There IS a `seal_inherited_fds` counterpart here**, and an earlier
+/// version of this doc claimed there was not. The claim was that Windows
+/// inherits only handles explicitly marked inheritable, so `Command`
+/// marking its three stdio handles was already the outcome the unix sweep
+/// works to reach. That is true of what `std` prepares and false of what
+/// actually gets inherited: `CreateProcess` with `bInheritHandles = TRUE`
+/// — which `std` passes whenever stdio is redirected — hands over EVERY
+/// inheritable handle the parent holds.
+///
+/// So a shepherd launched from a shell that gave `shep` a pipe for stdout
+/// inherited that pipe and held it open for its whole life, and the shell
+/// blocked forever waiting for it to close. `shep start | anything` hung;
+/// bare `shep start` did not. `shep_daemon::sys_windows::seal_std_handles`
+/// closes it, and is called below for exactly the reason
+/// [`seal_inherited_fds`] is called on unix.
+///
+/// # The breakaway retry
+///
+/// `CREATE_BREAKAWAY_FROM_JOB` is not merely ignored when the containing job
+/// forbids breakaway — `CreateProcess` FAILS, with `ERROR_ACCESS_DENIED`. So
+/// asking for it unconditionally would make `shep start` fail outright
+/// inside any harness that runs its children in a locked-down job, which is
+/// a common shape rather than an exotic one.
+///
+/// Asking and then retrying without it gets both halves right: a shepherd
+/// launched from an ordinary console breaks away and survives its parent,
+/// and one launched inside a restrictive job still starts — bound to that
+/// job's lifetime, which is the best available answer and strictly better
+/// than refusing to start at all.
+///
+/// # Errors
+/// Whatever [`launch_command`] can fail with, plus the spawn itself.
+#[cfg(windows)]
+pub fn launch_daemon(paths: &ShepPaths) -> io::Result<Child> {
+    use std::os::windows::process::CommandExt as _;
+
+    shep_daemon::sys_windows::seal_std_handles();
+    match launch_command(paths)?.spawn() {
+        Ok(child) => Ok(child),
+        Err(err) if err.raw_os_error() == Some(5) => {
+            let mut cmd = launch_command(paths)?;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            cmd.spawn()
+        }
+        Err(err) => Err(err),
+    }
+}
+
+// The whole module asserts unix specifics — a `0700` mode read back off the
+// log directory, `process_group` on the built `Command`, and the
+// close-on-exec sweep, none of which exists on Windows. What the Windows arm
+// claims instead (detached creation flags, the breakaway retry) is exercised
+// end to end by `tests/cli_e2e.rs`, which starts a real detached shepherd.
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
@@ -396,6 +533,7 @@ mod tests {
     }
 
     /// Whether `fd` is marked close-on-exec right now.
+    #[cfg(unix)]
     fn is_close_on_exec(fd: RawFd) -> bool {
         let flags = fcntl(fd, FcntlArg::F_GETFD).unwrap();
         FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC)

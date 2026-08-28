@@ -302,9 +302,8 @@ Two things worth knowing before doing that:
 ## What is a blocker and what is not
 
 The point of this section is that the decision in the morning is informed. A
-`0.1.0` promises a working thing on macOS and Linux that is not
-finished. It does not promise a stable API, Windows, or a complete v1.0
-surface.
+`0.1.0` promises a working thing on macOS, Linux and Windows that is not
+finished. It does not promise a stable API or a complete v1.0 surface.
 
 ### Blockers
 
@@ -338,11 +337,15 @@ weekly `schedule` row stays off for the same billing reason, since a full
 learn nothing. The gates it runs are the same ones that run locally, and they
 are green.
 
-**Windows is zero.** Every verb prints `shep does not yet support Windows` and
-exits 1. That is a documented state, not a broken build: the workspace
-cross-compiles for the target, and the README, the crate descriptions and the
-`shep-daemon` readme all say plainly that supervision is unix only. An alpha
-is allowed to have an unsupported platform. A `1.0.0` is not.
+**Windows runs.** It was zero when this section was written, and the entry
+survives because what it says about a `1.0.0` still holds: an alpha is
+allowed an unsupported platform and a `1.0.0` is not. The day-to-day tier is
+built now and `windows-latest` runs the suite in CI, so this is no longer the
+thing standing between an alpha and a release. Three refusals are permanent
+and deliberate: no graceful `stop` outside the shepherd channel, no
+`shep startup`, and no `user`/`group`. The smaller gaps that are not
+permanent, among them most `shep signal` names and the unix file modes, are
+in [specs/deferred.md](specs/deferred.md) rather than repeated here.
 
 **One v1.0 spec item is still unbuilt.** `shep serve`, `shep dev` and `shep
 runtime` shipped in Phase 15, and lookout's search/filter, its action keys,

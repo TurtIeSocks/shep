@@ -67,6 +67,13 @@ notify-debouncer-full.workspace = true
 nix = { workspace = true, features = ["fs"] }
 command-fds.workspace = true
 
+# The job object that stands in for a unix process group. Confined to
+# `sys_windows.rs`, which is this crate's only unsafe surface on Windows
+# exactly as `sys.rs` is on unix.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+getrandom.workspace = true
+
 # `cfg(any())` never matches any target, so nothing here is ever compiled into any real
 # build — but Cargo's resolver still walks these entries when computing the dependency
 # graph, including under `-Z minimal-versions`. Used to force a floor pin for a transitive
@@ -84,6 +91,11 @@ fsevent-sys.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+# `tests/real_runner_windows.rs` walks the real process table to prove a
+# sheep's lamb does not outlive `kill_tree`. Already a normal dependency of
+# this crate (`limits::sample`), so this adds no crate to the tree — an
+# integration test is its own crate and cannot reach the lib's own deps.
+sysinfo.workspace = true
 proptest.workspace = true
 # The scoped, per-test subscriber `testing::capture_logs` installs, so a
 # warn-and-continue arm's record is something a test can assert on instead of

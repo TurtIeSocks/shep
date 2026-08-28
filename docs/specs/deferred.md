@@ -43,41 +43,14 @@ of it.
 
 ## Committed to v1.1+ by design (spec §2)
 
-Six deliberate scope cuts, not oversights — spec §2 carries the reasoning:
+Five deliberate scope cuts, not oversights — spec §2 carries the reasoning.
+There were six until 2026-08-26, when the Windows tier stopped being one
+of them: it shipped, and its entry moved to "Not deferred" below.
 
 - HTTP/SSE MCP transport (whistle ships stdio-only first)
 - cgroup v2 enforcement (`enforce = "kernel"`) — `LimitEnforcer`'s polling
   impl is the v1.0 tier
 - `@shep/io` npm shim (built on demand)
-- **The whole Windows tier** (spec §11) — 0%, not partial, and no longer a
-  v1.0 target. The Windows arm of the CLI's entry point prints "shep does not
-  yet support Windows" and exits `Failure` for every verb; `boot`, `sys`,
-  `server` and `tokio_runner` are all `#[cfg(unix)]`. Named-pipe transport and
-  Job Objects: absent.
-
-  Rin ruled it out of v1 on 2026-08-15, once the estimate existed rather than
-  being guessed. [windows-estimate.md](windows-estimate.md) is that estimate:
-  roughly 36-49 tasks over 4-5 phases, and a redesign rather than a port. The
-  145 `cfg(unix)` sites are the cheap part — four module trees are gated at the
-  crate root despite containing no Unix calls at all. The cost is in the
-  handful of places where behaviour must change, not merely the API:
-
-  - **Graceful stop has no analogue.** `CTRL_BREAK_EVENT` reaches only console
-    apps carrying their own handler, so `shep stop` degrades to `shep kill`
-    for anything that did not opt into the shepherd channel.
-  - **The shepherd channel cannot be fd 3.** `cmd.exe` has no fd-3
-    redirection and `command-fds` is Unix-only, so the channel becomes a named
-    pipe named by an environment variable. The wire format survives;
-    [shepherd-channel.md](../shepherd-channel.md) does not.
-  - **`user`/`group` would refuse permanently.** Dropping privilege needs a
-    logon session or a primary-token privilege, which is a different feature
-    rather than a different call.
-
-  Also on the table and not yet decided: whether permanent non-support is the
-  right answer. A tier is not built once, it is maintained forever on a
-  platform no maintainer here runs — and the cheap Windows checks have already
-  rotted twice (see the windows-gnu entry under known debt). WSL2 covers the
-  common case today.
 - vcs metadata (`vcs` feature, off by default)
 - `shep web` JSON status endpoint. Resolved, 2026-08-13: the metrics dog
   does not cover this — it serves Prometheus exposition text for a
@@ -98,10 +71,161 @@ Prometheus exposition only; no `otel` cargo feature exists in
 
 ## Known debt, recorded rather than built
 
-Not scope cuts and not unbuilt spec surface — these are things that exist and
-work, or that are known to be missing, and that Phase 10 decided to write down
-rather than change. Each says what it is, why it was not done, and what would
-force it.
+### The Windows shepherd channel has no DACL, and the random name is not one
+
+`tokio_runner.rs` creates the channel pipe with the DEFAULT security
+descriptor, which on Windows grants read to Everyone and restricts write, and
+the `accept` that follows authenticates nobody. The 128 random bits in the
+name were added against that, and they close less than the comment there
+originally claimed.
+
+**Prediction versus observation.** The nonce means a hostile local account
+cannot park itself on a name it worked out in advance. It does not stop that
+account WATCHING: the pipe namespace enumerates to any unprivileged local
+user. Measured on Windows 10, from a non-elevated PowerShell,
+`[System.IO.Directory]::GetFiles("//./pipe/")` returned 190 names. An account
+polling that in a loop sees `shep-channel-<pid>-<n>-<nonce>` appear in the
+window between `Listener::bind` and the child's own open, and can connect
+first. What it gets is daemon-to-child frames plus a `wait_ready` sheep that
+never goes online, so: disclosure of whatever an app puts on its channel, and
+a local denial of service against startup.
+
+**Why it is not fixed here.** A restrictive descriptor means
+`ServerOptions::create_with_security_attributes_raw`, which takes a raw
+pointer to a `SECURITY_ATTRIBUTES` this code would have to build, and
+`shep-core` is `#![forbid(unsafe_code)]`. The transport seam would have to
+grow a way to pass a descriptor down, and the descriptor itself would have to
+be built behind `shep_daemon::sys_windows`, which is the only place on that
+platform allowed to write `unsafe`. That is a real design change to the seam
+rather than a one-line fix, which is why it is written down rather than
+squeezed into the Windows tier's own pull request.
+
+**Severity, honestly: this is recorded, not queued.** It needs an attacker
+already running code as a DIFFERENT account on the same machine, winning a
+millisecond race, against a Windows install running shep. Rin's read, and it
+is the right one: a shep-on-Windows user who also has a hostile local account
+on the same box is close to a nonexistent population, and the fix costs a
+redesign of the transport seam plus new unsafe FFI. Do not spend that on
+this. It is written down because the docs used to imply a random name was a
+security boundary, and a false claim in published docs is worth correcting
+whatever the exploit likelihood. The claim is fixed. The DACL is a someday.
+
+
+### `cmd /C` cannot carry a quoted script from `std::process::Command` -- and it is not shep's bug
+
+Found 2026-08-26 while porting `daemon_e2e.rs`, first misdiagnosed, then
+measured. Recorded because the wrong diagnosis is the instructive part.
+
+**What it looked like.** A sheep configured `wait_ready = true` that
+announces itself on the shepherd channel went `online` on unix and hung to
+its `listen_timeout` on Windows. The natural reading was that shep's Windows
+channel -- the `SHEP_CHANNEL_PIPE` replacement for fd 3 -- did not work, and
+that is what this entry said for about an hour.
+
+**It was wrong. The channel works.**
+`real_runner_windows.rs::a_child_reaches_the_shepherd_channel_by_pipe_name`
+now proves it directly, below the daemon: a child opens
+`%SHEP_CHANNEL_PIPE%` by name, writes one line, and the runner's pumps
+deliver it on `ProcIo::from_child`.
+
+**The actual cause is a Windows argument-passing rule worth knowing.**
+`std::process::Command` escapes an argument's inner quotes as `\"`, which is
+the MSVC C runtime's convention. **`cmd.exe` does not use that parser** -- it
+takes the backslash literally. So a fixture built as
+`cmd /C (echo {"kind":"ready"}) > "%SHEP_CHANNEL_PIPE%"` arrives at cmd with
+mangled quoting, and the redirect fails with "The filename, directory name,
+or volume label syntax is incorrect". The line never reaches the pipe, and
+the sheep never announces itself.
+
+The tell was there from the first run and I read past it: the fixtures that
+PASSED (`forever_app`, `announce_app`) contain no quotes, and every one that
+failed does.
+
+**The fix, in both e2e files: write a script FILE.** A `.cmd` file's
+contents go through no argument escaping at all. `cli_e2e.rs` already worked
+this way, which is why it never hit this.
+
+**What this means for operators, and it is a real constraint rather than a
+test detail:** a Flockfile app whose `script` is `cmd` and whose `args`
+contain double quotes will hit exactly the same wall. The workaround is the
+same -- put the script in a `.cmd` file and point `script` at it. There is
+nothing shep can do about it short of `CommandExt::raw_arg`, which would
+mean shep guessing at quoting on the app author's behalf.
+
+### Every Windows daemon shutdown returned `Err` from `run()` -- FIXED
+
+Found 2026-08-26 by porting `daemon_e2e.rs` to Windows, and it is the
+clearest argument for doing that port at all: nothing else had noticed.
+
+`RunningDaemon::run`'s teardown unlinks what boot created — the socket and
+the pidfile. On Windows the control address is a named pipe, so
+`std::fs::remove_file("\\.\pipe\shep-...")` is not a harmless no-op: it
+fails with `ERROR_INVALID_PARAMETER` (87), and that error became `run()`'s
+return value on **every** clean shutdown.
+
+**It was invisible from the outside**, which is why it survived a full
+manual verification earlier the same day. `shep kill` does not read that
+`Result` — it reports success from the RPC reply and the address going
+quiet, both of which were correct — so a live flock looked entirely healthy.
+`daemon_e2e`'s fixture unwraps the value, and reddened on the first run.
+
+Fixed by skipping the socket unlink on Windows, where a pipe stops existing
+when its last handle closes and teardown has nothing to do that the kernel
+is not already doing. The pidfile unlink is unchanged on both platforms.
+
+**The general lesson is worth more than the fix.** A no-op-looking cleanup
+call on a path that is not a filesystem path is exactly the shape of bug an
+end-to-end tier catches and a manual run does not, because the manual run
+reads the operator-facing report and the report was fine.
+
+
+### `shep start` hung when its stdout was a PIPE, on Windows -- FIXED
+
+Found 2026-08-26 by a smoke test, minutes after the Windows tier was
+otherwise working, and fixed the same day. Recorded because the WRONG
+reasoning that allowed it is easy to write again.
+
+```
+shep start                 # fine
+shep start | Out-Null      # hung forever, before the fix
+shep flock | Out-Null      # always fine -- spawns nothing
+```
+
+**The mechanism.** The detached shepherd inherited the parent's stdout pipe
+handle. It never wrote to it — its own stdout goes to
+`$SHEP_HOME/logs/shepd.out.log` — but a pipe cannot reach EOF while any
+handle to its write end is open, so the reader waited forever. The decisive
+evidence was that killing `shep` did not release the pipeline: `timeout 45
+shep start | cat` outlived its own timeout, because `cat` was waiting on the
+daemon rather than on `shep`.
+
+**The wrong claim that allowed it**, which is the part worth keeping.
+`launch.rs`'s Windows arm carried a comment saying no `seal_inherited_fds`
+counterpart was needed, because Windows inherits only handles explicitly
+marked inheritable and `Command` marks exactly the three stdio handles it
+sets. Half of that is true and it is the wrong half: `CreateProcess` with
+`bInheritHandles = TRUE` — which `std` passes whenever any stdio is
+redirected — hands over **every** inheritable handle the parent holds, not
+only the ones `std` prepared. "Windows does not have `fork`" is not the same
+statement as "Windows does not over-inherit".
+
+**The fix** is `shep_daemon::sys_windows::seal_std_handles`, called
+immediately before the spawn: it clears `HANDLE_FLAG_INHERIT` on this
+process's three standard handles, which is the exact analogue of what
+`seal_inherited_fds` does with `FD_CLOEXEC` on unix. It changes only the
+inherit flag, so this process goes on using its own stdio unchanged.
+
+**A false negative is also recorded, because it cost real time.** The first
+verification after the fix reported the hang as still present. It had not
+reproduced — a pre-fix daemon from an earlier run was still alive, so
+`shep start` connected to that one instead of spawning a fixed one, and the
+old daemon was still holding an older shell's pipe. The tell was in the
+output and was noticed without being acted on: a just-started daemon
+reporting `uptime 2m 59s`. **Kill every stray `shep` before testing a change
+to the launch path**, or the thing under test is not the thing running.
+
+Verified after a clean kill, twice: with no sheep at all, and with a live
+one. Both completed with exit 0 and the payload arrived through the pipe.
 
 ### Automatic CI, and what it would cost to turn on
 
@@ -987,6 +1111,83 @@ first place.
 
 
 ## Not deferred
+
+**The Windows tier** (spec §11) **shipped**, 2026-08-26, and this entry
+replaces the scope cut that stood in the section above until that day. This
+  entry described a 0% tier and a decision to keep it that way; both are
+  superseded. See [windows-estimate.md](windows-estimate.md), whose own
+  "run the CI leg first" recommendation is what unblocked it — the tree was
+  already compile-green on native MSVC, and a Windows host was available.
+
+  **Tier A is implemented and verified against a live flock**: `start`,
+  `stop`, `restart`, `reload`, `flock`, `describe`, `bleats`, `delete`,
+  `save`/`muster`, `lookout`, `whistle` and the dogs, over a named pipe,
+  with each sheep in a job object. The three predictions the estimate made
+  about *shape* all held; the ones about cost were pessimistic, because the
+  145 `cfg(unix)` sites really were the cheap part — only ten files in
+  `shep-cli` contained a Unix API call at all.
+
+  What the estimate got RIGHT and is now settled:
+
+  - **Graceful stop has no analogue.** `TokioProc::signal`'s Windows arm
+    refuses rather than pretending, so `shep stop` waits the full
+    `kill_timeout` and terminates unless the app opted into the shepherd
+    channel. Measured live: 1625ms against a 1600ms `kill_timeout`.
+  - **The shepherd channel cannot be fd 3.** It is a named pipe named by
+    `$SHEP_CHANNEL_PIPE`; the wire format is untouched, so `shep trigger`'s
+    correlation id survives. `SHEP_CHANNEL_FD` is deliberately NOT set on
+    Windows so an app can branch on which variable is present.
+  - **`user`/`group` refuse permanently.** `privilege::resolve`'s non-unix
+    arm already did this; the runner `debug_assert`s it never sees
+    credentials.
+
+  What the estimate got WRONG, corrected here:
+
+  - **The `forbid(unsafe_code)` blocker was already known not to be real**
+    (the estimate says so itself) and `barks.rs`'s no-op lock is now a real
+    `share_mode(0)` lock with the two-process race test running on Windows.
+  - **`first_pipe_instance` deletes the stale-socket problem rather than
+    solving it.** A pipe has no directory entry, so there is nothing to
+    recover from and the whole probe-and-recover arm is unix-only. It also
+    gives the daemon a second, OS-enforced mutual exclusion that unix
+    cannot have.
+  - **The peer-uid check needed no FFI replacement.** The pipe's own ACL
+    denies a foreign local user the open-for-write that speaking the
+    protocol requires, and does it at `CreateFile` time — earlier than any
+    post-accept check. `shep_core::transport`'s module doc is the writeup.
+
+  **The published `shep-client` blocked every Windows dog author, and that
+  is the sharpest argument for the transport seam.** Measured 2026-08-26 by
+  `cargo install shep-log-rotate` on Windows, which does not fail gracefully
+  — it does not COMPILE:
+
+  ```
+  error[E0432]: unresolved import `shep_client::Client`
+  note: found an item that was configured out
+    --> shep-client-0.1.0/src/lib.rs:45:5
+  43 | #[cfg(unix)]
+  ```
+
+  `shep-client` is the published embedding API, and gating `Client` behind
+  `cfg(unix)` meant no third-party dog — and no downstream embedder at all —
+  could build against it on that platform. Un-gating it is therefore not
+  only about shep's own binary.
+
+  Verified end to end against the real crates.io dog: `shep-log-rotate
+  0.1.1`, source unmodified, builds against the ported `shep-client`, and
+  then `shep adopt` vets it, registers it, starts it, and supervises it —
+  `online`, 0 restarts, empty stderr, talking to the shepherd over the named
+  pipe for its `[dog.log-rotate]` config. The dog ecosystem works on
+  Windows.
+
+  It follows that **`cargo install shep-log-rotate` stays broken on Windows
+  until a shep-client carrying this port is published.** Nothing in this
+  branch can fix that for an operator; it needs a release.
+
+  **Still refused on Windows**, and stated here rather than implied:
+  `shep startup`/`unstartup` (Tier B — an SCM service, not a fifth unit
+  template), `user`/`group`, seven of nine `shep signal` names, and the
+  `$SHEP_HOME` ACL, which inherits its parent rather than being `0700`.
 
 **Dogs** (spec §8) **shipped**: the dog contract (`shep_daemon::dogs`,
 `DogSpec`/`DogSource`) — a dog is an ordinary supervised process marked

@@ -153,7 +153,7 @@ mod tests {
     #[tokio::test]
     async fn save_sends_save_roll_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -178,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_save_exits_non_zero_and_says_why() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, _served) = fake_client_replying_err(
             &path,
             RpcErrorCode::Internal,
@@ -208,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn muster_sends_muster_with_the_start_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -237,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn a_muster_that_restored_nothing_says_so_on_stderr() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.sock");
+        let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_on(&path).await;
         // `queue_reply_then_event` is the one `shep_client::testing` helper
         // that answers an arbitrary `Response` to an arbitrary request —

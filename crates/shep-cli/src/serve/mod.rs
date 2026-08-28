@@ -23,8 +23,7 @@
 
 mod path;
 
-#[cfg(unix)]
-mod fs;
+pub(crate) mod fs;
 
 mod mime;
 
@@ -37,5 +36,4 @@ mod listing;
 // boundary rather than merely being `pub` inside it.
 pub(crate) mod auth;
 
-#[cfg(unix)]
 pub(crate) mod worker;
