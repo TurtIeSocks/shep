@@ -3,19 +3,21 @@
  * meet it / built" grid (docs/shep-design/README.md, "Screens > 2. Docs >
  * Terminology").
  *
- * Source of truth: README.md's own "## The lexicon" table. Unlike the
- * landing page's six hand-curated signposts (web/src/data/lexicon.ts,
- * sourced from docs/terminology.md's prose-heavy table), this one IS
- * mechanically parsed — README.md's table is already a clean four-column
- * grid with the exact "built?" column this page needs, and it's the
- * current, actively-maintained one (docs/terminology.md predates several
- * shipped verbs and has no built column at all). Parsing it means a rename,
- * a new row, or a yes/no/partly flip in README.md shows up here on the next
+ * Source of truth: web/src/data/lexiconTable.md, a four-column grid with the
+ * exact "built?" column this page needs. Unlike the landing page's six
+ * hand-curated signposts (web/src/data/lexicon.ts, sourced from
+ * docs/terminology.md's prose-heavy table), this one IS mechanically parsed,
+ * so a rename, a new row, or a yes/no/partly flip shows up here on the next
  * build with no hand-editing.
+ *
+ * That table lived in README.md until the README was rewritten as a landing
+ * page rather than a reference. docs/terminology.md keeps the design lexicon
+ * and is a different table: keyed on the conventional word, carrying the
+ * ruling behind each choice, and with no built column at all.
  */
 // `?raw` (see web/src/data/lexicon.ts's header comment) inlines the file's
 // text content at build time.
-import readmeSource from "../../../README.md?raw";
+import lexiconSource from "./lexiconTable.md?raw";
 
 export interface LexiconRow {
   /** Plain text — rendered in the term column's own font/color, no markup. */
@@ -46,8 +48,9 @@ function parseLexiconTable(source: string): LexiconRow[] {
   const headingIndex = source.indexOf(HEADING);
   if (headingIndex === -1) {
     throw new Error(
-      `web/src/data/docsLexicon.ts: README.md no longer has a "${HEADING}" ` +
-        `section — the Terminology page's table has nothing to read.`,
+      `web/src/data/docsLexicon.ts: lexiconTable.md no longer has a ` +
+        `"${HEADING}" section — the Terminology page's table has nothing ` +
+        `to read.`,
     );
   }
   const nextHeadingIndex = source.indexOf("\n## ", headingIndex + HEADING.length);
@@ -65,7 +68,7 @@ function parseLexiconTable(source: string): LexiconRow[] {
   if (!headerLine || !dividerLine) {
     throw new Error(
       `web/src/data/docsLexicon.ts: found "${HEADING}" but no markdown ` +
-        `table under it in README.md.`,
+        `table under it in lexiconTable.md.`,
     );
   }
 
@@ -73,7 +76,7 @@ function parseLexiconTable(source: string): LexiconRow[] {
   const headerMatches = expectedHeader.every((col, i) => header[i] === col);
   if (!headerMatches) {
     throw new Error(
-      `web/src/data/docsLexicon.ts: README.md's lexicon table header is ` +
+      `web/src/data/docsLexicon.ts: lexiconTable.md's table header is ` +
         `now [${header.join(", ")}] — expected [${expectedHeader.join(", ")}]. ` +
         `Update the column mapping below to match.`,
     );
@@ -97,19 +100,19 @@ function parseLexiconTable(source: string): LexiconRow[] {
     // silently ship a half-empty table.
     throw new Error(
       `web/src/data/docsLexicon.ts: parsed only ${rows.length} lexicon rows ` +
-        `from README.md, expected at least 15 — check the table didn't ` +
-        `change shape.`,
+        `from lexiconTable.md, expected at least 15 — check the table ` +
+        `didn't change shape.`,
     );
   }
 
   return rows;
 }
 
-export const lexiconTable: LexiconRow[] = parseLexiconTable(readmeSource);
+export const lexiconTable: LexiconRow[] = parseLexiconTable(lexiconSource);
 
 /**
  * Turns `` `code` `` spans into `<code>` tags for use with Astro's
- * `set:html`. README.md's table cells are plain prose plus the occasional
+ * `set:html`. The table's cells are plain prose plus the occasional
  * code span — no other markdown (no links, no emphasis) — so this is
  * deliberately narrow rather than a general markdown-to-HTML pass.
  */
