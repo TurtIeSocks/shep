@@ -685,13 +685,22 @@ impl ProcessRunner for TokioRunner {
             //
             // The nonce is a separate job from that uniqueness: the pipe is
             // created before the child exists, with the default security
-            // descriptor (readable by every local account), and the single
-            // `accept` below authenticates nobody. A guessable name is
-            // therefore pre-openable by a hostile local account, which would
-            // starve a `wait_ready` sheep and read daemon-to-child frames.
-            // 128 bits of name is what closes that; a restrictive descriptor
-            // would need `create_with_security_attributes_raw`, and shep-core
-            // is `#![forbid(unsafe_code)]`.
+            // descriptor (which grants read to Everyone and restricts write),
+            // and the single `accept` below authenticates nobody. So a
+            // hostile local account that reaches the pipe first starves a
+            // `wait_ready` sheep and reads daemon-to-child frames.
+            //
+            // **128 bits closes prediction, not observation, and the
+            // difference matters.** An attacker cannot guess this name. An
+            // attacker CAN enumerate it: the pipe namespace lists to any
+            // unprivileged local user (measured, 190 pipes from a
+            // non-elevated session), so one polling it sees the name appear
+            // and can race the child. Closing that needs a restrictive DACL,
+            // which needs `create_with_security_attributes_raw`, which needs
+            // unsafe -- and shep-core is `#![forbid(unsafe_code)]`, so it
+            // would have to move behind `sys_windows`. Tracked in
+            // `docs/specs/deferred.md`; the nonce is the speed bump until
+            // then.
             let mut nonce = [0_u8; 16];
             getrandom::fill(&mut nonce).map_err(|error| {
                 RunnerError::SpawnFailed(format!("shepherd channel pipe name: {error}"))

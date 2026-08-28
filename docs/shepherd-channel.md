@@ -54,10 +54,23 @@ only that half:
 - The daemon exports **`SHEP_CHANNEL_PIPE`**, whose value is a named-pipe
   path like `\\.\pipe\shep-channel-1234-0-9f3c1a2b4d5e6f708192a3b4c5d6e7f8`.
   **Your app opens it itself**, for reading and writing, exactly as it would
-  open any file. That open is the whole difference. Read the name out of the
-  environment and do not try to reconstruct it: the trailing hex is random
-  per spawn, deliberately, because a named pipe is readable by every local
-  account and a guessable name is one a hostile account could open first.
+  open any file. That open is the whole difference. Read the name out of
+  the environment and do not try to reconstruct it: the trailing hex is
+  random per spawn.
+
+  **What that randomness does and does not buy, stated exactly, because a
+  client author is entitled to the real model.** A named pipe created with
+  the default security descriptor grants read to Everyone and restricts
+  write, so the channel is readable by any local account. shep does not set
+  a restrictive descriptor on it. The random name means the pipe cannot be
+  *predicted*, which closes the attack where a hostile local account parks
+  itself on a name it knew in advance. It does not close *watching*: the
+  pipe namespace is enumerable by any unprivileged local user (measured on
+  Windows 10, 190 pipes listed from a non-elevated session), so an account
+  polling it can see the name appear and race the real app to connect. Treat
+  the channel as carrying nothing you would not show another local account,
+  and see [deferred.md](specs/deferred.md) for the DACL that would close
+  this properly.
 - `SHEP_CHANNEL_VERSION` is exported as before.
 - **`SHEP_CHANNEL_FD` is deliberately NOT set on Windows.** Branch on which
   variable is present rather than on the platform: an app that finds

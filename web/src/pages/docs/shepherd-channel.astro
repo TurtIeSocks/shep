@@ -134,9 +134,13 @@ for line in r:
       newline-delimited JSON, same message kinds, same correlation id.
     </p>
     <p class="fine">
-      Do not reconstruct the name. The trailing hex is random per spawn on
-      purpose: a named pipe is readable by every local account, so a
-      guessable name is one a hostile local account could open first.
+      Do not reconstruct the name, and do not mistake it for a security
+      boundary. The trailing hex is random per spawn so the pipe cannot be
+      predicted, but a named pipe created with the default security
+      descriptor is readable by every local account, and the pipe namespace
+      is enumerable, so an account watching it can still race your app to
+      connect. Do not put on this channel anything you would not show
+      another local account on the same machine.
     </p>
     <CodeBlock label="channel_app.py (both platforms)">{`import os, json, sys
 
