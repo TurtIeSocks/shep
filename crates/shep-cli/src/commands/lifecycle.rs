@@ -2542,7 +2542,8 @@ mod tests {
         );
     }
 
-    /// Ten stopped instances of one clustered app, the shape both respawn
+    /// Three instances of one clustered app, stopped unless named in
+    /// `online`, the shape both respawn
     /// bugs needed and the shape `a_foldable_flock` cannot show: every sheep
     /// in it has a name of its own, so a selector naming a name and a
     /// selector naming a row pick the same set there.
