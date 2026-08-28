@@ -406,7 +406,8 @@ async fn job_object_environment_reports_itself() {
             "-NoProfile",
             "-Command",
             "$p = Start-Process ping -ArgumentList '-n','20','127.0.0.1' -PassThru \
-             -WindowStyle Hidden; Write-Output ('LAMB=' + $p.Id); Start-Sleep -Seconds 20",
+             -WindowStyle Hidden; [Console]::Out.WriteLine('LAMB=' + $p.Id); \
+             [Console]::Out.Flush(); Start-Sleep -Seconds 20",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
