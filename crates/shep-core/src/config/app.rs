@@ -386,7 +386,10 @@ pub struct AppConfig {
     /// probing an address, there is no answer for the wrong instance to give.
     /// So does one using `wait_ready`, because the shepherd channel a
     /// replacement reports on is its own — the instance being replaced has no
-    /// way to answer it.
+    /// way to answer it. Both of those need `SO_REUSEPORT` as much as a
+    /// `reuse_port` app does if they bind an address, since they are overlapped
+    /// too; what this field changes is which apps get overlapped, not what an
+    /// overlap costs.
     ///
     /// Setting this on an app that does NOT set the socket option is the one
     /// way to get it wrong, and shep cannot check it: the option is set
