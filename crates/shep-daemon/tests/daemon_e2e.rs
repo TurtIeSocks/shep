@@ -168,20 +168,46 @@ impl Fixture {
 /// doc) specifically so a group signal also reaches a `sleep 1`
 /// grandchild a leader-only signal would miss.
 impl Drop for Fixture {
-    /// # Windows
+    /// Stops the daemon a panicking test never got to shut down, then
+    /// reaps what a unix sheep leaves behind.
     ///
-    /// Nothing to do, and that is the same guarantee obtained one layer
-    /// down rather than a weaker cleanup. This sweep exists because a unix
-    /// sheep that outlives its daemon is reparented to init, so only an
-    /// explicit `kill(-pgid)` reaps it — which is why the fixture bothers
-    /// to record every pid a reply carried.
+    /// # The shutdown
     ///
-    /// On Windows every sheep is assigned to a job object it cannot leave
-    /// (`shep_daemon::sys_windows`), so the daemon going down takes the
-    /// whole flock with it, transitively. There is no orphan class here for
-    /// a sweep to catch. `real_runner_windows.rs` is where that containment
-    /// is actually asserted, and mutation-checked.
+    /// A test that panics skips its own `fixture.shutdown()`, so the daemon
+    /// task this fixture spawned is still running, still holding its
+    /// listener, when the next test in this binary starts. On Windows that
+    /// listener is a name in a machine-global namespace rather than a path
+    /// under this test's own tempdir, which is the one resource here that a
+    /// later test could contend for.
+    ///
+    /// **This is tidiness, not a fix for anything.** It was written as a fix
+    /// for the seventeen-minute `windows-latest` hang in
+    /// `reopen_moves_a_running_sheeps_log_onto_the_recreated_path`, on the
+    /// theory that dropping a current-thread runtime with a live daemon task
+    /// blocks and swallows the panic. A control run disproved it: with this
+    /// `shutdown()` removed, an injected panic in that same test still
+    /// reports in 1.74s and libtest still prints the message. Whatever hangs
+    /// on the runner is not this.
+    ///
+    /// `shutdown()` on the context alone, not a join: this runs during an
+    /// unwind and must not itself be able to block.
+    ///
+    /// # The pid sweep, on unix only
+    ///
+    /// A unix sheep that outlives its daemon is reparented to init, so only
+    /// an explicit `kill(-pgid)` reaps it, which is why the fixture bothers
+    /// to record every pid a reply carried. On Windows every sheep is
+    /// assigned to a job object it cannot leave
+    /// (`shep_daemon::sys_windows`), so the daemon going down takes the whole
+    /// flock with it, transitively. There is no orphan class there for a
+    /// sweep to catch. `real_runner_windows.rs` is where that containment is
+    /// actually asserted, and mutation-checked.
     fn drop(&mut self) {
+        // `run` is `None` once `shutdown()` has taken it, so this is the
+        // panic path and nothing else.
+        if self.run.is_some() {
+            self.ctx.shutdown();
+        }
         #[cfg(unix)]
         {
             let pids = self
@@ -553,11 +579,18 @@ fn gated_announce_app(name: &str, marker: &std::path::Path) -> AppConfig {
     {
         let mut app = AppConfig::minimal(name, "powershell");
         app.interpreter = Some("none".to_string());
+        // `[Console]::Out` with an explicit flush, not `Write-Output`.
+        // This script prints a line and then sits in a wait loop without
+        // exiting, so anything PowerShell buffers on a redirected stdout
+        // stays buffered: the line the test is waiting for never arrives,
+        // `await_log_line` panics at RECV_TIMEOUT, and the panic is then
+        // swallowed by the hang below. Cost 17 minutes of a CI job before
+        // it was found, twice, in two different fixtures.
         app.args = vec![
             "-NoProfile".to_string(),
             "-Command".to_string(),
             format!(
-                "Write-Output 'before'; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 300 }}; Write-Output 'after'; Start-Sleep -Seconds 5",
+                "[Console]::Out.WriteLine('before'); [Console]::Out.Flush(); while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 300 }}; [Console]::Out.WriteLine('after'); [Console]::Out.Flush(); Start-Sleep -Seconds 5",
                 marker.display()
             ),
         ];
@@ -692,6 +725,27 @@ async fn log_lines_reach_a_log_subscriber() {
     fixture.shutdown().await;
 }
 
+/// Prints how far a test has got, for a test that may never finish.
+///
+/// libtest captures the `print!` family by swapping a thread-local buffer,
+/// and only replays it for a test that FAILS. A test that HANGS neither
+/// fails nor returns, so everything it printed is lost with it: the
+/// `windows-latest` job that ran `reopen` for seventeen minutes reported
+/// one line, `has been running for over 60 seconds`, and nothing about
+/// where it was.
+///
+/// `Stdout` is not part of that machinery, so a direct `write_all` reaches
+/// the real handle either way. Same trick, same reason, as
+/// `real_runner_windows.rs`'s `report`.
+///
+/// Delete these calls once the hang is understood; the helper can stay.
+fn step(what: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "[reopen] {what}");
+    let _ = out.flush();
+}
+
 /// Waits for `path` to hold exactly `expected`, failing at [`RECV_TIMEOUT`].
 ///
 /// Polls rather than sleeping a fixed guess. A line observed on the bus has
@@ -751,6 +805,7 @@ async fn await_file_contents(path: &std::path::Path, expected: &str) {
 #[tokio::test]
 async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
+    step("booted");
     let mut client = fixture.connect().await;
 
     // Subscribe BEFORE starting: a connection gets no forwarder task, and so
@@ -768,6 +823,7 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     // the poll is that coarse.
     let marker = fixture.paths.home.join("go");
     let app = gated_announce_app("rotator", &marker);
+    step("subscribed");
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.unwrap() else {
         panic!("expected started")
@@ -780,13 +836,18 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
             .expect("this daemon reports its own resolved log paths"),
     );
 
+    step("started, awaiting the first line");
     assert_eq!(client.await_log_line(id).await, "before");
+    step("got 'before' on the bus; reading the log file");
     await_file_contents(&out_file, "before\n").await;
 
+    step("log file holds 'before'");
     let archive = out_file.with_extension("log.1");
+    step("renaming the live log file");
     std::fs::rename(&out_file, &archive).unwrap();
     assert!(!out_file.exists(), "sanity: the rename really moved it");
 
+    step("renamed");
     let reopened = client
         .request(Request::Reopen {
             selector: SelectorSpec::All,
@@ -800,11 +861,15 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
 
     // The reply is the barrier: it lands only after the pump has flushed
     // the old handle and opened the path again, so neither of these polls.
+    step("reopen replied; reading the new file");
     assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "");
     assert_eq!(std::fs::read_to_string(&archive).unwrap(), "before\n");
 
+    step("read both files; writing the marker");
     std::fs::write(&marker, "").unwrap();
+    step("marker written, awaiting 'after'");
     assert_eq!(client.await_log_line(id).await, "after");
+    step("got 'after' on the bus; reading the log file");
     await_file_contents(&out_file, "after\n").await;
     assert_eq!(
         std::fs::read_to_string(&archive).unwrap(),
@@ -812,6 +877,7 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
         "the renamed file must stop growing the moment the handle is swapped"
     );
 
+    step("all assertions passed; shutting down");
     fixture.shutdown().await;
 }
 
