@@ -819,17 +819,37 @@ fn is_live(info: &ProcessInfo) -> bool {
 /// resolved to apps the flock already has. The distinction is the difference
 /// between a suggestion that works and one that does not: `shep restart
 /// fold:backed` is a command, and `shep restart ./rotom.sh` is not, because
-/// `restart` takes selectors and a path is not one. So a single sheep is
-/// always named by its own name, and a group falls back to listing the names
-/// when there is no selector to quote.
+/// `restart` takes selectors and a path is not one. So the token is quoted
+/// back whenever there is one, and a path or Flockfile falls back to listing
+/// the names.
 ///
 /// The already-up set gets ONE notice however large it is. `shep start all`
 /// against a healthy thirteen-app flock would otherwise print thirteen
 /// notices saying the same thing.
 ///
-/// Respawns are issued per NAME, not per row: `Request::Restart` with a name
-/// selector reaches every instance of a clustered app, so a fold holding a
-/// four-instance app would otherwise send the same request four times.
+/// # Respawns are issued per ROW, by id
+///
+/// They used to be issued per NAME, deduped, because `Request::Restart` with
+/// a name selector reaches every instance of a clustered app in one request
+/// and a fold holding a four-instance app would otherwise send four. The
+/// saving was real and the widening it bought was not worth it: a name
+/// selector reaches every instance whether or not this function matched them,
+/// so collapsing to names hands the daemon a WIDER set than the one the
+/// operator's own selector picked out. Two ways that bit:
+///
+/// - `shep start 0` against ten instances named `zam` restarted all ten.
+///   `Id` is the only selector form that can name a subset of one name's
+///   rows, so it was the only form the collapse could widen -- which is
+///   exactly the form an operator reaches for to name ONE of a clustered
+///   app's instances.
+/// - Worse, and for every selector form: the `live`/`asleep` partition above
+///   promises not to replace a sheep that is already up, and a name selector
+///   walked straight back over it. One online instance among nine stopped
+///   ones was restarted by the request meant for the other nine.
+///
+/// So the id of each row is what goes on the wire, and no dedup is needed --
+/// a row is one instance and appears once. The cost is the round trip the
+/// old shape was saving, one per instance rather than one per name.
 async fn resume_all(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -860,8 +880,8 @@ async fn resume_all(
         }
     }
 
-    for name in unique_names(&asleep) {
-        let code = resume(client, streams, name, started).await;
+    for sheep in asleep {
+        let code = resume(client, streams, sheep, started).await;
         if code != ExitCode::Success {
             return code;
         }
@@ -871,18 +891,17 @@ async fn resume_all(
 
 /// Every distinct name in `infos`, in the order they first appear.
 ///
-/// Order-INDEPENDENT, and that is the whole of it. This compared each name
-/// against the previous one alone, which drops a duplicate only when the two
-/// are adjacent, and so was correct only for a caller handing over a
-/// name-sorted slice. One caller does not: `start_one`'s Flockfile and path
-/// arm builds its set from the resolved apps in the file's own order, so two
-/// instances of one app listed either side of a third produced a SECOND
-/// `Request::Restart` and restarted that app twice in one invocation.
+/// Feeds the already-running notice and nothing else. It used to pick the
+/// respawn targets too, and twice it was the wrong tool for that: once
+/// because it deduped by adjacency and dropped a repeat only when the two
+/// rows sat next to each other, and once because a name is simply not what
+/// the operator selected -- see [`resume_all`]. A notice reads as a list of
+/// apps, so collapsing to names is right for this and only this.
 ///
-/// The selector arm did hand over sorted rows, but only because the daemon
-/// sorts its listing that way -- a cross-version assumption about a peer,
-/// not an invariant this function can hold itself. Both callers are now safe
-/// regardless.
+/// Order-INDEPENDENT: it compares against every name kept so far, not
+/// against the previous one, so a caller handing over rows in a Flockfile's
+/// own order gets the same answer as one handing over the daemon's sorted
+/// listing.
 ///
 /// A `Vec` scan rather than a `HashSet`: this runs over the sheep one
 /// selector matched, which is tens of rows, and it has to preserve first-seen
@@ -900,13 +919,13 @@ fn unique_names<'a>(infos: &[&'a ProcessInfo]) -> Vec<&'a str> {
 async fn resume(
     client: &Client,
     streams: &mut Streams<'_>,
-    name: &str,
+    sheep: &ProcessInfo,
     started: &mut Vec<shep_core::protocol::ProcessInfo>,
 ) -> ExitCode {
     let (procs, failure) = request_each(
         client,
         streams,
-        &[SelectorSpec::Name(name.to_string())],
+        &[SelectorSpec::Id(sheep.id)],
         None,
         |selector| Request::Restart { selector },
         |response| match response {
@@ -925,8 +944,14 @@ async fn resume(
     // table on a path that is supposed to fail exactly like the by-path one
     // does: an error on stderr and nothing on stdout.
     if any_restart_failed(&procs) {
+        // Named by id as well as by name, because this now reports one ROW:
+        // four instances of one app failing used to be one message and would
+        // otherwise be four identical ones, naming a sheep the operator
+        // cannot tell apart. The id is also what makes the `bleats` suggestion
+        // reach the instance that actually failed.
+        let (name, id) = (&sheep.name, sheep.id);
         let message = format!(
-            "{name} could not be started; see `shep bleats {name}` or its log files for why"
+            "{name} (id {id}) could not be started; see `shep bleats {id}` or its log files for why"
         );
         return streams.fail(ExitCode::SpawnFailed, &message);
     }
@@ -1024,11 +1049,13 @@ async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
 /// `start` over a warning it could not compute would trade a working command
 /// for a defensive one.
 ///
-/// One request for the whole invocation, not one per app.
+/// One request for the whole invocation, not one per app. The rows beside
+/// each app go unread: drift is a comparison between two CONFIGS, and every
+/// instance of a clustered app shares one.
 async fn report_config_drift(
     client: &Client,
     streams: &mut Streams<'_>,
-    resumed: &[(AppConfig, shep_core::protocol::ProcessInfo)],
+    resumed: &[(AppConfig, Vec<shep_core::protocol::ProcessInfo>)],
 ) {
     if resumed.is_empty() {
         return;
@@ -1303,12 +1330,26 @@ async fn start_one(
         Some(flock) => flock,
         None => flock_now(client).await,
     };
-    let mut resumed = Vec::new();
+    // EVERY row the name has, not the first one. A clustered app is several
+    // rows under one name, and taking one of them as the app's stand-in meant
+    // a Flockfile naming a stopped four-instance app started instance 0 and
+    // left the other three down. Worse when instance 0 was the live one: the
+    // "already running" notice fired for the whole app and nothing started at
+    // all. Invisible while respawns went out per name, because a name
+    // selector reached the other three anyway; the moment they go out per
+    // row, the representative is all this arm would act on.
+    let mut resumed: Vec<(AppConfig, Vec<ProcessInfo>)> = Vec::new();
     let mut fresh = Vec::new();
     for app in apps {
-        match flock.iter().find(|info| info.name == app.name) {
-            Some(existing) => resumed.push((app, existing.clone())),
-            None => fresh.push(app),
+        let rows: Vec<ProcessInfo> = flock
+            .iter()
+            .filter(|info| info.name == app.name)
+            .cloned()
+            .collect();
+        if rows.is_empty() {
+            fresh.push(app);
+        } else {
+            resumed.push((app, rows));
         }
     }
     // Before the resumes below, not after: an operator who edited the file
@@ -1320,7 +1361,10 @@ async fn start_one(
         // a Flockfile or a path, so there is no selector to quote back in the
         // "already running" notice. `shep restart ./rotom.sh` is not a
         // command. See `resume_all`'s own doc.
-        let existing: Vec<ProcessInfo> = resumed.iter().map(|(_, info)| info.clone()).collect();
+        let existing: Vec<ProcessInfo> = resumed
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().cloned())
+            .collect();
         let code = resume_all(client, streams, None, &existing, started).await;
         if code != ExitCode::Success {
             return code;
@@ -2477,6 +2521,184 @@ mod tests {
         assert!(
             said.contains("shep restart zeus-auth"),
             "and pointed at the verb that would replace it: {said}"
+        );
+    }
+
+    /// Ten stopped instances of one clustered app, the shape both respawn
+    /// bugs needed and the shape `a_foldable_flock` cannot show: every sheep
+    /// in it has a name of its own, so a selector naming a name and a
+    /// selector naming a row pick the same set there.
+    fn a_clustered_flock(online: &[u32]) -> Vec<ProcessInfo> {
+        use shep_core::status::ProcStatus;
+        (0..3)
+            .map(|id| {
+                let status = if online.contains(&id) {
+                    ProcStatus::Online
+                } else {
+                    ProcStatus::Stopped
+                };
+                ProcessInfo::builder(id, "zam", status).build()
+            })
+            .collect()
+    }
+
+    /// A fake that answers a `start` invocation end to end: the listing it
+    /// begins with, the respawns it decides on, the drift check, and the
+    /// second listing it renders from. `failing` names the ids to answer as
+    /// `errored`, which is how a spawn failure reaches this verb.
+    fn a_daemon_for(
+        flock: Vec<ProcessInfo>,
+        failing: &'static [u32],
+    ) -> impl Fn(&Request) -> Response + Send + 'static {
+        use shep_core::status::ProcStatus;
+        move |request| match request {
+            Request::ListFlock => Response::Flock(flock.clone()),
+            Request::ConfigDrift { .. } => Response::Drifted(Vec::new()),
+            Request::Restart { selector } => {
+                let SelectorSpec::Id(id) = selector else {
+                    // Never reached by a correct build, and asserted on
+                    // directly below -- answered rather than panicked so the
+                    // assertion that names the bug is the one that fails.
+                    return Response::Restarted(Vec::new());
+                };
+                let status = if failing.contains(id) {
+                    ProcStatus::Errored
+                } else {
+                    ProcStatus::Online
+                };
+                Response::Restarted(vec![ProcessInfo::builder(*id, "zam", status).build()])
+            }
+            _ => Response::Pong,
+        }
+    }
+
+    /// Every selector `start` sent inside a `Request::Restart`, in order.
+    fn respawns(
+        envelopes: &mut tokio::sync::mpsc::Receiver<shep_core::protocol::Envelope>,
+    ) -> Vec<SelectorSpec> {
+        let mut sent = Vec::new();
+        while let Ok(envelope) = envelopes.try_recv() {
+            if let Request::Restart { selector } = envelope.body {
+                sent.push(selector);
+            }
+        }
+        sent
+    }
+
+    /// Runs `start` against `daemon` and hands back the code and stderr.
+    async fn start_against(client: &Client, target: &str) -> (ExitCode, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            start(
+                client,
+                &mut streams,
+                &start_args(target),
+                None,
+                &BTreeMap::new(),
+            )
+            .await
+        };
+        (code, String::from_utf8(err).unwrap())
+    }
+
+    /// fails if `shep start 0` respawns anything but id 0.
+    ///
+    /// Rin's own flock: ten instances of `zam`, all stopped, and
+    /// `shep start 0` brought all ten back. `resume_all` collapsed the rows
+    /// it matched to their distinct NAMES before sending, and a name selector
+    /// reaches every instance the name has. `Id` is the only selector form
+    /// that can name a subset of one name's rows, so it was the only form the
+    /// collapse could widen -- and it is exactly the form an operator reaches
+    /// for to name one instance of a clustered app.
+    #[tokio::test]
+    async fn a_start_by_id_respawns_that_row_and_no_other() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[]), &[])).await;
+
+        let (code, _) = start_against(&client, "0").await;
+
+        assert_eq!(code, ExitCode::Success);
+        assert_eq!(
+            respawns(&mut envelopes),
+            vec![SelectorSpec::Id(0)],
+            "one respawn, for the row the operator named"
+        );
+    }
+
+    /// fails if `start` respawns a sheep it has just reported as already up.
+    ///
+    /// The same collapse, and the worse half of it: this one needs no `Id`
+    /// selector at all. `resume_all` partitions the rows it matched into live
+    /// and asleep precisely so that a live one is left alone -- and then sent
+    /// a NAME, which walks straight back over the row it had just set aside.
+    /// `shep start all` against a clustered app with one instance up
+    /// restarted that instance, which is the surprise `start` documents
+    /// itself as refusing to be clever about.
+    #[tokio::test]
+    async fn a_start_never_respawns_a_row_that_was_already_up() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0]), &[])).await;
+
+        let (code, said) = start_against(&client, "all").await;
+
+        assert_eq!(code, ExitCode::Success);
+        assert_eq!(
+            respawns(&mut envelopes),
+            vec![SelectorSpec::Id(1), SelectorSpec::Id(2)],
+            "the two that were down, and not the one that was up"
+        );
+        assert!(said.contains("already"), "the live one is reported: {said}");
+    }
+
+    /// fails if a Flockfile naming a clustered app starts only one instance.
+    ///
+    /// This arm matched an app to the flock with a `find`, which takes the
+    /// FIRST row of a name and calls it the app. Harmless while respawns went
+    /// out per name -- the name reached the other instances anyway -- and a
+    /// silent halving the moment they go out per row. Both halves are here:
+    /// three rows respawned, and none of them skipped because the
+    /// representative happened to be the live one.
+    #[tokio::test]
+    async fn a_flockfile_naming_a_clustered_app_resumes_every_instance() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("flock.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"zam\"\nscript = \"./zam\"\ninstances = 3\n",
+        )
+        .unwrap();
+        let socket = dir.path().join("s.sock");
+        let (client, mut envelopes) =
+            fake_client_answering(&socket, a_daemon_for(a_clustered_flock(&[]), &[])).await;
+
+        let (code, _) = start_against(&client, flockfile.to_str().unwrap()).await;
+
+        assert_eq!(code, ExitCode::Success);
+        assert_eq!(
+            respawns(&mut envelopes),
+            vec![
+                SelectorSpec::Id(0),
+                SelectorSpec::Id(1),
+                SelectorSpec::Id(2)
+            ],
+            "every row the name has, not the first one"
         );
     }
 

@@ -802,6 +802,50 @@ pub async fn fake_client_with_push(path: &Path) -> (Client, FakeDaemon) {
     fake_client_on(path).await
 }
 
+/// As [`fake_client_capturing_envelopes`], but the caller decides what each
+/// request is answered with — for a test asserting on what a MULTI-REQUEST
+/// caller puts on the wire.
+///
+/// The two existing shapes each cover one half and neither covers this.
+/// [`fake_client_capturing_envelopes`] shows the wire but answers everything
+/// `Response::Pong`, so a caller that reads its own reply and decides what to
+/// send next stalls at the first request. [`FakeDaemon`] answers a `ListFlock`
+/// or a `Describe` properly but keeps every envelope to itself, so the
+/// requests that followed cannot be asserted on at all. `shep start <name>`
+/// needs both at once: it lists the flock, decides from the listing which
+/// sheep to respawn, and the whole question is which respawns it then sends.
+/// Two bugs reached an operator's terminal in that gap, both of them a
+/// widened selector no test could see (`shep-cli`'s `resume_all`).
+///
+/// `answer` is called with each decoded [`Request`] in arrival order and may
+/// close over a counter to answer the second call differently from the first.
+/// The envelope reaches the channel BEFORE the reply is written, matching
+/// [`fake_client_capturing_envelopes`], so a test that awaits its own request
+/// future finds the envelope already queued.
+pub async fn fake_client_answering(
+    path: &Path,
+    answer: impl Fn(&Request) -> Response + Send + 'static,
+) -> (Client, mpsc::Receiver<Envelope>) {
+    let listener = UnixListener::bind(path).unwrap();
+    let (tx, rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut frames = Framed::new(stream, codec());
+        handshake(&mut frames, sample_ack()).await;
+        loop {
+            let envelope = read_envelope(&mut frames).await;
+            let id = envelope.id;
+            let reply = answer(&envelope.body);
+            if tx.send(envelope).await.is_err() {
+                break;
+            }
+            write_reply(&mut frames, id, reply).await;
+        }
+    });
+    let client = Client::connect(path).await.unwrap();
+    (client, rx)
+}
+
 /// Binds `path`, handshakes with [`sample_ack`], and answers every request
 /// with `Response::Pong` while forwarding each decoded [`Envelope`] onto
 /// the returned channel — for a test asserting on what a `Client` actually
