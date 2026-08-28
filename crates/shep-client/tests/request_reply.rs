@@ -147,3 +147,35 @@ async fn every_request_carries_an_explicit_deadline_on_the_wire() {
         Some(u64::try_from(START_DEADLINE.as_millis()).unwrap())
     );
 }
+
+/// fails if a caller has to drain the envelope channel to keep getting
+/// replies.
+///
+/// `fake_client_answering` exists for a caller that sends several requests and
+/// reads the record of them afterwards, which is every test of a CLI verb that
+/// lists the flock and then acts on what it found. Nothing drains the channel
+/// while that exchange is in flight, so a bounded one of
+/// `SCRIPT_CHANNEL_CAPACITY` stops the fake at the ninth request: the send
+/// blocks, its reply is never written, and the caller waits for a deadline
+/// that has nothing behind it. Ten requests here against a capacity of eight,
+/// so a bounded channel hangs this test rather than failing it.
+#[tokio::test]
+async fn a_run_of_requests_is_answered_without_the_receiver_being_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = shep_client::testing::control_address(dir.path());
+    let (client, mut envelopes) =
+        shep_client::testing::fake_client_answering(&path, |_| Response::Pong).await;
+
+    for _ in 0..10 {
+        client
+            .request(Request::Ping)
+            .await
+            .expect("every request is answered, however far behind the observer is");
+    }
+
+    let mut seen = 0;
+    while envelopes.try_recv().is_ok() {
+        seen += 1;
+    }
+    assert_eq!(seen, 10, "and every envelope was still recorded");
+}
