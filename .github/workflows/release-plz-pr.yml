@@ -78,7 +78,7 @@ jobs:
       # entry. shep is in exactly that state today, with main at 0.1.7 and the
       # newest tag v0.1.6. Leaving such a PR open and red puts a human in
       # front of the decision instead of guessing which case it is.
-      - name: Refuse to auto-merge a release PR that bumps no version
+      - name: Refuse to auto-merge a release PR with nothing in it
         id: noop-guard
         if: ${{ steps.release-plz.outputs.prs_created == 'true' }}
         env:
@@ -90,6 +90,20 @@ jobs:
             echo "::error::That is the no-op shape that looped on zendriver-rs on 2026-08-08, and also"
             echo "::error::what a hand-edited version leaves behind. Left open for a human: merge it if"
             echo "::error::the changelog entry is wanted, close it if this is a loop."
+            exit 1
+          fi
+          # The other no-op shape, and the one that got through on 2026-08-27.
+          # release-plz bumps the version even when every commit since the last
+          # release was filtered out by release-plz-changelog.toml, which skips
+          # docs, test, ci, chore and style. shep-deploy's release PR #1 was a
+          # lone `ci:` commit and came out as `## [0.1.1]` with nothing under
+          # it: a contentless version header, which is exactly what zendriver's
+          # 44 empty releases looked like. The Cargo.toml test above passed it,
+          # because the version bump is real. The changelog is what is empty.
+          if ! gh pr diff "$PR_NUMBER" | grep -qE '^\+[-*] '; then
+            echo "::error::release PR #$PR_NUMBER bumps a version but adds no changelog entry, so it will not be auto-merged."
+            echo "::error::Every commit since the last release was filtered out by release-plz-changelog.toml."
+            echo "::error::Left open for a human: close it, or land something worth releasing first."
             exit 1
           fi
 
