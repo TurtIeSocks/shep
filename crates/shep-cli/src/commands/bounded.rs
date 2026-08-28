@@ -220,6 +220,19 @@ mod tests {
     #[test]
     fn a_child_whose_output_outlives_it_is_not_reported_as_killed() {
         let started = Instant::now();
+        // Two seconds, not two hundred milliseconds, and the difference is
+        // the whole reason this test was intermittent. The budget bounds BOTH
+        // halves of `run_bounded`: the wait for the child AND the reads after
+        // it. At 200ms a runner slow enough that `sh` had not yet forked its
+        // `sleep` and exited took the `left.is_zero()` branch, killed the
+        // child, and returned `Killed` -- the one answer this test exists to
+        // rule out. Failed twice on musl on 2026-08-28 while every other
+        // platform passed.
+        //
+        // Two seconds is still far inside the `sleep 5` that holds the pipes,
+        // so the outcome under test is unchanged and the elapsed assertion
+        // below still means something. It just stops sharing a budget with
+        // process startup on a contended box.
         let outcome = run_bounded(
             Command::new("sh").arg("-c").arg("sleep 5 & exit 0"),
             Duration::from_secs(2),
