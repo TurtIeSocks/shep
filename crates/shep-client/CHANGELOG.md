@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-08-28
+
+### Added
+
+- `testing::fake_client_answering`, a fake daemon whose reply to each request
+  comes from a caller-supplied closure while every envelope is still forwarded
+  to the caller. The existing fakes each did one half: one shows the wire but
+  answers everything `Pong`, so a caller that reads its own reply and decides
+  what to send next stalls at the first request; the other answers a
+  `ListFlock` properly but keeps its envelopes to itself. A verb that lists,
+  decides from the listing, and then sends needs both at once. Available under
+  the `test-support` feature, like the rest of the module.
+
 ## [0.1.9] - 2026-08-28
 
 

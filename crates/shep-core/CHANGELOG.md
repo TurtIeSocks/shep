@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-08-28
+
+### Added
+
+- A Flockfile app may carry a `dog` table, so a dog can configure the app it
+  manages. The key must BE a table: any other type is refused at parse time
+  rather than quietly ignored, which is the rule every other typed key in a
+  Flockfile already follows.
+
 ### Changed
 
 - `AppConfig::reuse_port` is accepted rather than refused, and now decides how
