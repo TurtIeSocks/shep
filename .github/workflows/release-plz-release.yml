@@ -1,0 +1,58 @@
+name: Release
+# Tags the commit, creates the GitHub release, and uploads to crates.io.
+#
+# Runs on every push to main and does nothing unless a manifest names a
+# version that is not on crates.io. That is what makes merging the release
+# pull request the act that publishes: the merge is the only thing that moves
+# a version.
+#
+# There is no test gate here, and that is deliberate rather than an omission.
+# Until 2026-08-27 this job waited on a `workflow_run` for test.yml's run on
+# the same commit, because nothing else stopped an untested commit reaching
+# main. main now has a ruleset requiring lint, docs, typos, the test matrix,
+# features, musl and minimal-versions, so an untested commit cannot get there
+# in the first place and the gate had nothing left to catch. Removing the
+# ruleset without restoring the gate would leave this publishing whatever
+# lands on main.
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-plz-release
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    # An environment, so a required reviewer can be added here if this ever
+    # wants a human gate between merging and spending a version number.
+    # Inert until one is configured.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release-plz needs the history to know what is already released.
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Same commit pin as release-plz-pr.yml, for the same reason.
+      #
+      # Ordering across the five crates is release-plz's problem, not ours: it
+      # reads the dependency graph and uploads in an order that resolves.
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
