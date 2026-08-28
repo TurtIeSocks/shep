@@ -96,8 +96,19 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr).number }}
         run: |
-          if ! gh pr diff "$PR_NUMBER" --name-only | grep -q 'Cargo\.toml$'; then
-            echo "::error::release PR #$PR_NUMBER bumps no crate version, so it will not be auto-merged."
+          # The version VALUE has to change, not merely appear in a file the
+          # diff happens to touch. release-plz also rewrites intra-workspace
+          # dependency versions inside Cargo.toml, so a path-presence test would
+          # pass a pull request that bumps no package version at all.
+          manifest_version() {
+            gh api "repos/${GITHUB_REPOSITORY}/contents/Cargo.toml?ref=$1" \
+              -H 'Accept: application/vnd.github.raw' \
+              | grep -E '^[[:space:]]*version[[:space:]]*=' | tr -d '[:space:]'
+          }
+          base_sha="$(gh pr view "$PR_NUMBER" --json baseRefOid --jq .baseRefOid)"
+          head_sha="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)"
+          if [ "$(manifest_version "$base_sha")" = "$(manifest_version "$head_sha")" ]; then
+            echo "::error::release PR #$PR_NUMBER changes no version in Cargo.toml, so it will not be auto-merged."
             echo "::error::That is the no-op shape that looped on zendriver-rs on 2026-08-08, and also"
             echo "::error::what a hand-edited version leaves behind. Left open for a human: merge it if"
             echo "::error::the changelog entry is wanted, close it if this is a loop."
@@ -109,8 +120,8 @@ jobs:
           # docs, test, ci, chore and style. shep-deploy's release PR #1 was a
           # lone `ci:` commit and came out as `## [0.1.1]` with nothing under
           # it: a contentless version header, which is exactly what zendriver's
-          # 44 empty releases looked like. The Cargo.toml test above passed it,
-          # because the version bump is real. The changelog is what is empty.
+          # 44 empty releases looked like. The version test above passes it, and
+          # correctly so: the bump is real. The changelog is what is empty.
           if ! gh pr diff "$PR_NUMBER" | grep -qE '^\+[-*] '; then
             echo "::error::release PR #$PR_NUMBER bumps a version but adds no changelog entry, so it will not be auto-merged."
             echo "::error::Every commit since the last release was filtered out by release-plz-changelog.toml."
