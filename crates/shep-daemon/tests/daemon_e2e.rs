@@ -291,7 +291,6 @@ impl Client {
     /// broken kill ladder timed a reload measurement out and left one
     /// `reuse_port_sheep` reparented to init.
     async fn next_frame(&mut self) -> ServerFrame {
-        FRAMES_SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let frame = match self.pending.pop_front() {
             Some(frame) => frame,
             None => self.recv_as().await,
@@ -748,146 +747,6 @@ async fn log_lines_reach_a_log_subscriber() {
     fixture.shutdown().await;
 }
 
-/// Prints how far a test has got, for a test that may never finish.
-///
-/// libtest captures the `print!` family by swapping a thread-local buffer,
-/// and only replays it for a test that FAILS. A test that HANGS neither
-/// fails nor returns, so everything it printed is lost with it: the
-/// `windows-latest` job that ran `reopen` for seventeen minutes reported
-/// one line, `has been running for over 60 seconds`, and nothing about
-/// where it was.
-///
-/// `Stdout` is not part of that machinery, so a direct `write_all` reaches
-/// the real handle either way. Same trick, same reason, as
-/// `real_runner_windows.rs`'s `report`.
-///
-/// Delete these calls once the hang is understood; the helper can stay.
-fn step(what: &str) {
-    use std::io::Write as _;
-    if let Ok(mut last) = LAST_STEP.lock() {
-        *last = what.to_string();
-    }
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "[reopen] {what}");
-    let _ = out.flush();
-}
-
-/// What [`step`] last recorded, for the watchdog to print.
-static LAST_STEP: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-
-/// How many frames `Client::next_frame` has handed out, for the watchdog.
-///
-/// The question it answers: a client blocked with this number frozen is
-/// waiting on a daemon that has gone quiet, and one blocked with it climbing
-/// is spinning on frames that never match.
-static FRAMES_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Reports what the test was doing `secs` from now, and ends the process
-/// fifteen seconds after that, unless the returned guard is dropped first.
-///
-/// **Two threads, and the split is the experiment.** The first run of this
-/// apparatus proved something sharper than it was built to find: on
-/// `windows-latest` the reopen case hung for sixteen minutes with the
-/// watchdog armed, and the watchdog never printed and never aborted. A
-/// plain OS thread doing nothing but `sleep`, a write and an `abort` did
-/// not finish in sixteen minutes.
-///
-/// That rules out the obvious reading of the hang. If only the test's task
-/// were stuck, a thread the runtime does not own would still run. Two
-/// independent threads stuck at once means something process-wide, and the
-/// first thing the old watchdog touched was `stderr().lock()`.
-///
-/// So the reporting and the killing are now separate threads. The killer
-/// takes no lock, opens no file and prints nothing. Three outcomes, and
-/// they cannot be confused:
-///
-/// - the dump appears: ordinary, and it says where the test was
-/// - no dump, but the process dies at `secs + 15`: the reporting thread
-///   blocked on a lock or a write, which means something else in this
-///   process holds the console and is not giving it back
-/// - neither: threads are not being scheduled at all, which is a much
-///   larger claim about the runner than about this test
-///
-/// `abort`, not a panic: a panic on this thread would not fail the test
-/// stuck on another one, and the process is not going to recover.
-///
-/// Scaffolding. Delete it with the `step` calls once the hang is understood.
-fn watchdog(secs: u64, files: Vec<std::path::PathBuf>) -> WatchdogGuard {
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Thread one: the report. Everything it does can block, and on the
-    // runner something apparently did -- see this function's doc.
-    let flag = std::sync::Arc::clone(&done);
-    let report_after = secs;
-    std::thread::spawn(move || {
-        use std::io::Write as _;
-        use std::sync::atomic::Ordering;
-        if sleep_unless_disarmed(&flag, report_after) {
-            return;
-        }
-        let last = LAST_STEP
-            .lock()
-            .map(|last| last.clone())
-            .unwrap_or_else(|_| "<poisoned>".to_string());
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "[watchdog] fired after {report_after}s");
-        let _ = writeln!(err, "[watchdog]   last step: {last}");
-        let _ = writeln!(
-            err,
-            "[watchdog]   frames handed to the client: {}",
-            FRAMES_SEEN.load(Ordering::SeqCst)
-        );
-        for file in &files {
-            let _ = writeln!(
-                err,
-                "[watchdog]   {} exists={} contents={:?}",
-                file.display(),
-                file.exists(),
-                std::fs::read_to_string(file).ok(),
-            );
-        }
-        let _ = err.flush();
-    });
-
-    // Thread two: the kill. It takes no lock, opens no file and prints
-    // nothing, so the only way it fails to end the process is if the
-    // thread itself is not being scheduled. That is the whole point of
-    // separating it from the report above.
-    let flag = std::sync::Arc::clone(&done);
-    std::thread::spawn(move || {
-        if sleep_unless_disarmed(&flag, secs + 15) {
-            return;
-        }
-        std::process::abort();
-    });
-
-    WatchdogGuard(done)
-}
-
-/// Sleeps `secs`, answering `true` if the guard was dropped first.
-///
-/// Polls a flag rather than parking on a condvar, deliberately: a condvar
-/// is a lock, and the failure this whole apparatus exists to observe is one
-/// where something process-wide is already stuck.
-fn sleep_unless_disarmed(flag: &std::sync::atomic::AtomicBool, secs: u64) -> bool {
-    for _ in 0..secs * 5 {
-        if flag.load(std::sync::atomic::Ordering::SeqCst) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
-}
-
-/// Disarms its [`watchdog`] when the test drops it, on any exit path.
-struct WatchdogGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-impl Drop for WatchdogGuard {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 /// Waits for `path` to hold exactly `expected`, failing at [`RECV_TIMEOUT`].
 ///
 /// Polls rather than sleeping a fixed guess. A line observed on the bus has
@@ -930,24 +789,16 @@ async fn await_file_contents(path: &std::path::Path, expected: &str) {
 /// The sheep's own log path is read off the `Started` reply rather than
 /// derived here, so the test cannot disagree with the daemon about which
 /// file it is looking at.
-// Ran ignored on Windows for four commits while the CI hang was chased.
-// What that cost bought: the case passes on the runner ALONE (2.05s) and
-// hung when the binary ran its cases together, and the RECV_TIMEOUT on
-// `Client::request` never fired, so whatever blocked was not a request
-// awaiting a reply.
-//
-// That narrowed it to the two awaits in `Fixture` that had no deadline,
-// `boot` and `connect`, which are now bounded like everything else here.
-// `transport::connect` retries ERROR_PIPE_BUSY forever by design and its
-// doc says so; this fixture was a caller that did not bound it.
-//
-// Un-ignored deliberately rather than once a fix was proven: bounded, the
-// worst case is a named panic naming the step, which is a report. Ignored,
-// the worst case is a silent twelve-minute step, which is not.
+// Ran ignored on Windows for four commits while this hung `windows-latest`
+// for twenty minutes a run, reporting one line and no location. It was
+// never this test: `gated_announce_app` drove a PowerShell sheep, and an
+// out-of-process probe on the runner caught that sheep with every thread
+// in `Wait` and 0.28s of CPU between them, all of it startup. It never ran
+// the loop it was written to run, so the marker this case writes was never
+// seen and `after` was never printed. The fixture is `cmd` now.
 #[tokio::test]
 async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     let fixture = Fixture::boot(tempfile::tempdir().unwrap(), false).await;
-    step("booted");
     let mut client = fixture.connect().await;
 
     // Subscribe BEFORE starting: a connection gets no forwarder task, and so
@@ -965,7 +816,6 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
     // the poll is that coarse.
     let marker = fixture.paths.home.join("go");
     let app = gated_announce_app("rotator", &marker);
-    step("subscribed");
     let started = client.request(Request::Start { apps: vec![app] }).await;
     let Response::Started(infos) = started.result.unwrap() else {
         panic!("expected started")
@@ -978,21 +828,13 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
             .expect("this daemon reports its own resolved log paths"),
     );
 
-    step("started, awaiting the first line");
     assert_eq!(client.await_log_line(id).await, "before");
-    step("got 'before' on the bus; reading the log file");
     await_file_contents(&out_file, "before\n").await;
 
-    step("log file holds 'before'");
     let archive = out_file.with_extension("log.1");
-    // Armed here rather than at the top: these are the paths worth dumping,
-    // and `out_file` is not known until the daemon has answered `Start`.
-    let _watchdog = watchdog(45, vec![out_file.clone(), archive.clone(), marker.clone()]);
-    step("renaming the live log file");
     std::fs::rename(&out_file, &archive).unwrap();
     assert!(!out_file.exists(), "sanity: the rename really moved it");
 
-    step("renamed");
     let reopened = client
         .request(Request::Reopen {
             selector: SelectorSpec::All,
@@ -1006,15 +848,11 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
 
     // The reply is the barrier: it lands only after the pump has flushed
     // the old handle and opened the path again, so neither of these polls.
-    step("reopen replied; reading the new file");
     assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "");
     assert_eq!(std::fs::read_to_string(&archive).unwrap(), "before\n");
 
-    step("read both files; writing the marker");
     std::fs::write(&marker, "").unwrap();
-    step("marker written, awaiting 'after'");
     assert_eq!(client.await_log_line(id).await, "after");
-    step("got 'after' on the bus; reading the log file");
     await_file_contents(&out_file, "after\n").await;
     assert_eq!(
         std::fs::read_to_string(&archive).unwrap(),
@@ -1022,7 +860,6 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
         "the renamed file must stop growing the moment the handle is swapped"
     );
 
-    step("all assertions passed; shutting down");
     fixture.shutdown().await;
 }
 
