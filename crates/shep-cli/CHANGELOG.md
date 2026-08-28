@@ -13,6 +13,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-08-28
+
+### Fixed
+
+- `shep start <selector>` acted on every sheep sharing a name instead of the
+  rows the selector named. It resolved the selector against the listing, then
+  collapsed the matched rows to their distinct NAMES before putting them on
+  the wire, and a name selector reaches every instance that name has. Two ways
+  that bit an operator running a clustered app: `shep start 0` against ten
+  stopped instances started all ten, and `shep start all` with one instance
+  online and nine stopped restarted the online one too, walking back over the
+  row `resume_all` had deliberately set aside. Respawns now go out one per
+  row, by id. Found on a ten-instance app.
+- A sheep that could not spawn no longer abandons the rows after it. `start`
+  returned on the first failure, so an app in a fold that could not start left
+  every app behind it in that fold down and unmentioned. It now attempts every
+  row and returns the first failing code, which is the rule the other
+  selector-taking verbs already state and follow.
+- The already-running notice quotes the target the operator typed. `shep start
+  0` against one live instance of a ten-instance app used to answer "zam is
+  already online; `shep restart zam` replaces it", suggesting a command that
+  acts on all ten. A path or Flockfile target still falls back to names, since
+  `shep restart ./rotom.sh` is not a command.
+- A failed `shep start` prints no flock table. Its output guards keyed on
+  whether any row had come up rather than on the outcome, which agreed with
+  itself only while a failure stopped the run. Once every row is attempted, a
+  fold whose second app fails and whose third succeeds ends both non-empty and
+  failed, and under `--format json` that put a data envelope beside an error
+  envelope: two answers to one question.
+
 ## [0.1.9] - 2026-08-28
 
 
