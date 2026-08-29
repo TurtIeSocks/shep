@@ -2040,7 +2040,7 @@ Closes the docs trigger. Needs every task above.
 
 **Files:**
 - Modify `crates/shep-core/assets/flockfile.schema.json` (generated)
-- Modify `web/src/pages/docs/cli-reference.generated.txt` (generated)
+- Modify `web/src/data/cli-reference.generated.txt` (generated)
 - Modify `web/src/pages/docs/from-pm2.astro`, `first-flockfile.astro`, `output.astro`, `lookout.astro`, `json-output.astro`, `getting-started.astro`, `examples.astro`, `folds.astro`, `cli.astro`
 - Modify `docs/migration.md`, `docs/terminology.md`
 - Modify `CLAUDE.md`: the instances paragraph
