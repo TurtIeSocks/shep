@@ -56,44 +56,51 @@ impl fmt::Display for TemplateError {
 
 impl core::error::Error for TemplateError {}
 
-/// Walks `value`, calling `on_token` for each token and `on_literal` for each
-/// run of ordinary text.
+/// One piece of `value` as [`walk`] sees it: ordinary text, or a token name
+/// with the braces stripped.
+enum Segment<'a> {
+    /// A run of ordinary text, copied through unchanged.
+    Literal(&'a str),
+    /// The name between a `{{` and its `}}`, braces stripped.
+    Token(&'a str),
+}
+
+/// Walks `value`, calling `on_segment` for each literal run and each token.
 ///
-/// One walker so [`validate`] and [`render`] can never disagree about what a
-/// token is.
+/// One walker, one closure, so [`validate`] and [`render`] can never
+/// disagree about what a token is.
 fn walk(
     value: &str,
-    mut on_literal: impl FnMut(&str),
-    mut on_token: impl FnMut(&str) -> Result<(), TemplateError>,
+    mut on_segment: impl FnMut(Segment<'_>) -> Result<(), TemplateError>,
 ) -> Result<(), TemplateError> {
     let bytes = value.as_bytes();
     let mut at = 0;
     let mut literal_from = 0;
     while at < bytes.len() {
         if bytes[at..].starts_with(b"{{{{") {
-            on_literal(&value[literal_from..at]);
-            on_literal("{{");
+            on_segment(Segment::Literal(&value[literal_from..at]))?;
+            on_segment(Segment::Literal("{{"))?;
             at += 4;
             literal_from = at;
         } else if bytes[at..].starts_with(b"}}}}") {
-            on_literal(&value[literal_from..at]);
-            on_literal("}}");
+            on_segment(Segment::Literal(&value[literal_from..at]))?;
+            on_segment(Segment::Literal("}}"))?;
             at += 4;
             literal_from = at;
         } else if bytes[at..].starts_with(b"{{") {
-            on_literal(&value[literal_from..at]);
+            on_segment(Segment::Literal(&value[literal_from..at]))?;
             let rest = &value[at + 2..];
             let Some(end) = rest.find("}}") else {
                 return Err(TemplateError::Unclosed);
             };
-            on_token(&rest[..end])?;
+            on_segment(Segment::Token(&rest[..end]))?;
             at += 2 + end + 2;
             literal_from = at;
         } else {
             at += 1;
         }
     }
-    on_literal(&value[literal_from..]);
+    on_segment(Segment::Literal(&value[literal_from..]))?;
     Ok(())
 }
 
@@ -104,43 +111,37 @@ fn walk(
 /// - [`TemplateError::UnknownToken`]: a token this grammar does not define.
 /// - [`TemplateError::Unclosed`]: a `{{` with no closing `}}`.
 pub fn validate(value: &str) -> Result<(), TemplateError> {
-    walk(
-        value,
-        |_| {},
-        |token| {
-            if TOKENS.contains(&token) {
-                Ok(())
-            } else {
-                Err(TemplateError::UnknownToken {
-                    token: token.to_string(),
-                })
-            }
-        },
-    )
+    walk(value, |segment| match segment {
+        Segment::Literal(_) => Ok(()),
+        Segment::Token(token) if TOKENS.contains(&token) => Ok(()),
+        Segment::Token(token) => Err(TemplateError::UnknownToken {
+            token: token.to_string(),
+        }),
+    })
 }
 
 /// Substitutes the tokens in `value`.
 ///
 /// Call [`validate`] first: an unknown token here renders as nothing, because
 /// `normalize` is the seam that refuses one and a value reaching this
-/// function has already passed it.
+/// function has already passed it. An unclosed `{{` is the other case
+/// `validate` exists to catch before this function ever sees the value: on
+/// one, `walk` stops with an error partway through, so this renders
+/// truncated at that point rather than including the rest of `value`.
 #[must_use]
 pub fn render(value: &str, name: &str, instance: u32) -> String {
-    let out = core::cell::RefCell::new(String::with_capacity(value.len()));
+    let mut out = String::with_capacity(value.len());
     let slot = instance.to_string();
-    let _ = walk(
-        value,
-        |literal| out.borrow_mut().push_str(literal),
-        |token| {
-            match token {
-                "instance" => out.borrow_mut().push_str(&slot),
-                "name" => out.borrow_mut().push_str(name),
-                _ => {}
-            }
-            Ok(())
-        },
-    );
-    out.into_inner()
+    let _ = walk(value, |segment| {
+        match segment {
+            Segment::Literal(literal) => out.push_str(literal),
+            Segment::Token("instance") => out.push_str(&slot),
+            Segment::Token("name") => out.push_str(name),
+            Segment::Token(_) => {}
+        }
+        Ok(())
+    });
+    out
 }
 
 #[cfg(test)]
