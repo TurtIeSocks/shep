@@ -1,0 +1,238 @@
+name: Release artifacts
+# Builds the binaries a package manager can point at, and attaches them to the
+# GitHub release release-plz has already created.
+#
+# Until this file existed, `cargo install shep` was the only way to install
+# shep and no release carried a binary. Homebrew, apt, Scoop, WinGet and
+# Chocolatey are all thin wrappers around a download URL, so every one of them
+# was blocked on this and none of them was blocked on anything else. See
+# docs/distribution.md for the channel-by-channel plan this feeds.
+#
+# ## Two upstream sources of truth
+#
+# Nothing enforces the duplication below, so both are named here on purpose:
+#
+#   * `crates/shep-cli/Cargo.toml`'s [[bin]] stanzas decide the `bin:` list.
+#     Add a fourth binary there and this file does not notice.
+#   * `test.yml`'s matrix is what proves these targets build at all. Six of
+#     the seven legs below appear there; `aarch64-unknown-linux-musl` is the
+#     exception and is built natively, so it needs no cross toolchain.
+#
+# ## Why `release: published` works here
+#
+# GitHub suppresses downstream workflow triggers for events created with the
+# default GITHUB_TOKEN, silently, to stop recursive chains. That would make
+# this file dead code. It fires because `release-plz-release.yml` passes
+# `secrets.RELEASE_PLZ_TOKEN`, a real PAT, with no GITHUB_TOKEN fallback: the
+# releases it creates are ordinary events and this reacts to them.
+#
+# If that token is ever removed, this stops running with no error anywhere.
+# The replacement would be `workflow_run` against the workflow named
+# `Release`, which fires on the workflow rather than on what it created.
+on:
+  release:
+    types: [published]
+  # An escape hatch, so the matrix can be exercised against an existing tag
+  # without waiting for a release. `dry-run` skips the upload, which is what
+  # makes it safe to point at a tag that already has its assets.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build, e.g. shep-v0.1.12
+        required: true
+      dry-run:
+        description: Build and archive, but upload nothing
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  # One publish creates FOUR tags and four releases, because the four crates
+  # share `version_group = "shep"` in release-plz.toml. 0.1.12 produced
+  # shep-v0.1.12, shep-core-v0.1.12, shep-client-v0.1.12 and
+  # shep-daemon-v0.1.12 within 42 seconds of each other. Only the first ships
+  # binaries, so the other three must not start a seven-leg matrix.
+  #
+  # `startsWith(tag, 'shep-v')` is the cheap half and it is NOT sufficient on
+  # its own. It excludes today's siblings only because they happen to be
+  # `shep-c*` and `shep-d*`; a crate named `shep-vault` would tag
+  # `shep-vault-v0.1.0`, which starts with `shep-v` too and would slip
+  # straight through. So the job below also checks that what follows `shep-v`
+  # is exactly the workspace version at that tag, which no sibling can
+  # satisfy.
+  resolve:
+    name: Resolve the tag
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.release.tag_name, 'shep-v')
+    runs-on: ubuntu-latest
+    # The workflow-level default is `{}`, so every job states what it needs.
+    # This one only reads a manifest.
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      go: ${{ steps.check.outputs.go }}
+    steps:
+      # Every action in this file is pinned by commit rather than by tag, the
+      # same rule the two release-plz workflows follow and for the same
+      # reason: the upload job below holds a token that can write release
+      # assets, and a mutable tag in a job like that is a different risk from
+      # one in a job that only runs tests.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+          persist-credentials: false
+      - id: check
+        env:
+          # Through the environment rather than spliced into the script.
+          # GitHub controls both of these, so neither is an injection risk
+          # today, but `run:` blocks that interpolate `${{ }}` directly are
+          # how that class of bug starts.
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$TAG" != "shep-v${version}" ]; then
+            # Not a failure. A sibling crate's release reaching this point is
+            # the system working, and a red run against `shep-core-v0.1.12`
+            # would be a false alarm somebody has to go and read. The jobs
+            # below skip instead.
+            echo "::notice::$TAG is not the shep package's own tag (the workspace at that ref is $version, so its tag would be shep-v${version}). Nothing to build."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "go=true" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+  upload:
+    name: ${{ matrix.target }}
+    needs: resolve
+    if: needs.resolve.outputs.go == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest is arm64, so the Intel leg cross-compiles. Xcode's
+          # clang covers both, which matters because `ring` runs a `cc` build
+          # script on every target in this matrix.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Native on the arm runner rather than cross-compiled from x86_64,
+          # which is what keeps `ring`'s build script pointed at an ordinary
+          # host `cc`.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            packages: musl-tools
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            packages: musl-tools
+          # msvc, deliberately, not gnu. `x86_64-pc-windows-gnu` in this
+          # repository is `cargo check` only, cross-compiled from ubuntu by
+          # test.yml, and has never executed a shep binary anywhere. msvc is
+          # the target test.yml's windows-latest legs run `cargo test`
+          # against.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      # Writing release assets.
+      contents: write
+      # The two the attestation needs: `id-token` to get a Sigstore
+      # certificate, `attestations` to record the result against this
+      # repository.
+      id-token: write
+      attestations: write
+    # A ceiling against a hang, not a performance budget. `[profile.release]`
+    # sets `lto = "thin"` and `codegen-units = 1`, which is the right trade
+    # for a shipped binary and the wrong one for a fast job, so these legs are
+    # slower than anything in test.yml.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - if: matrix.packages != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+      # No `Swatinem/rust-cache` here, unlike every compiling job in test.yml.
+      # Cache scope is per-branch and this runs on a tag, so the cache would
+      # be cold on essentially every release; the seven legs share no
+      # artifacts either, since each builds a different target. It would add
+      # a third-party action to a job holding a write-capable token and buy
+      # close to nothing.
+      - uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+        id: build
+        with:
+          # From `crates/shep-cli/Cargo.toml`'s [[bin]] stanzas. All three,
+          # matching what `cargo install shep` already puts on a machine;
+          # which of them a package exposes is that package's decision.
+          bin: shep,shep-runtime,shep-dev
+          # NOT the default. The default is `$bin-$target`, which for a
+          # three-name `bin:` list emits three archives per target instead of
+          # one. Every downstream manifest embeds this string, so it cannot
+          # be renamed later without breaking published URLs.
+          archive: shep-$target
+          target: ${{ matrix.target }}
+          # `tar` defaults to `unix` and `zip` to `windows`, which is exactly
+          # the split wanted here, so neither is set.
+          #
+          # Shell completions are deliberately absent. Generating them means
+          # running the binary that was just built, which the cross-compiled
+          # Intel macOS leg cannot do. Homebrew generates them from the
+          # installed executable and the .deb will generate them in its own
+          # step; nothing needs them in the archive.
+          include: LICENSE-MIT,LICENSE-APACHE,README.md
+          checksum: sha256
+          locked: true
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      # Sigstore keyless, so there is no key to store and none to rotate.
+      # Chocolatey and Homebrew both verify by checksum rather than by
+      # attestation, so this is not load-bearing for either; it is here
+      # because it costs one step and answers "where did this binary come
+      # from" for anyone who asks later.
+      # `archive` is the base name with no extension, so it would glob the
+      # `.sha256` sidecar too. `tar` and `zip` are the concrete filenames and
+      # exactly one of them is set per platform, so concatenating them names
+      # the single file that was actually built.
+      - if: steps.build.outputs.tar != '' || steps.build.outputs.zip != ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.build.outputs.tar }}${{ steps.build.outputs.zip }}
+
+  # The per-archive `.sha256` sidecars above are what a Homebrew formula or a
+  # Chocolatey nuspec reads, one asset at a time. This adds the combined file
+  # that scripted installers expect to fetch once and grep.
+  checksums:
+    name: SHA256SUMS
+    needs: [resolve, upload]
+    if: needs.resolve.outputs.go == 'true' && github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir sums && cd sums
+          gh release download "$TAG" --pattern '*.sha256'
+          # Each sidecar holds one `<hash>  <filename>` line already, so this
+          # is a concatenation rather than a re-hash. Sorted so the file does
+          # not churn on asset ordering.
+          cat -- *.sha256 | sort -k2 > SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
