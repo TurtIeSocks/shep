@@ -2993,10 +2993,13 @@ mod tests {
     /// defect: the rows came back `web` 0, `api` 1, `web` 2, straight off the
     /// map.
     ///
-    /// The key stays `(name, instance, id)` regardless, because the reason it
-    /// is total does not depend on where the rows came from, and because this
-    /// pane repolls every two seconds -- a key that is not total is what
-    /// would let two rows swap places under the operator's cursor.
+    /// The key this test exercises is `rows()`'s own `(name, id)`, not
+    /// `visible_rows`'s `(name, instance, id)` -- `rows()` is the flat sheep
+    /// list, with no group headers and no slots in it, and nothing here
+    /// calls the sequence the table draws. Both keys are TOTAL, which is the
+    /// property that matters either way: this pane repolls every two
+    /// seconds, and a key that is not total is what would let two rows swap
+    /// places under the operator's cursor between refreshes.
     #[test]
     fn the_table_draws_by_name_then_by_id() {
         let t0 = Instant::now();
