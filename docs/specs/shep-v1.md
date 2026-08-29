@@ -145,20 +145,31 @@ whatever its listener had queued and not yet accepted, on every reload, and
 nothing shep does prevents that. State machine per instance:
 `SpawnNew → AwaitReady → DrainOld → ReapOld`. AwaitReady = readiness signal
 (§7) or `listen_timeout` (default 3000ms). DrainOld = stop ladder with
-`graceful_timeout` (default 8000ms) cap. Socket sharing via SO_REUSEPORT
-(`reuse_port = true` app option) — shep never binds a listen socket itself,
-so the app must set the option before its own `bind()`; shep's role is
-granting the old and new instance permission to overlap, not performing the
-mechanism. An app that does not actually set the option gets `EADDRINUSE`
-at the replacement spawn, on every reload, and shep cannot detect the
-misconfiguration in advance; `SO_REUSEADDR`, which far more frameworks set
-by default, is not sufficient, and a mixed pair (one process with
-`SO_REUSEPORT` set, one without) is refused by the kernel on both tier-1
-platforms. There is no degraded mode without `reuse_port`: nothing in shep
-reads the option, so reload runs exactly the same machine either way and a
-port-binding app's replacement simply fails to bind. Reload proceeds
-instance-by-instance; failure of the new instance aborts the rest and keeps
-old instances running.
+`graceful_timeout` (default 8000ms) cap.
+
+Since 2026-08-28 that machine is one of two, chosen per app by
+`ReloadMode::of`. The state above is the overlapping one, taken by an app
+that asks for no probe, by one using `wait_ready`, and by one carrying
+`reuse_port = true`. A probed app WITHOUT `reuse_port` instead reloads
+serially: `DrainOld → ReapOld → SpawnNew → AwaitReady`. The instance being
+replaced goes first and its replacement is spawned into the empty slot.
+
+The reason is that a probe asks an address, and an address cannot say which
+of two overlapping instances answered it. Serialising costs a gap you can
+see, the drain plus the replacement's start, and buys a success you can
+trust. It also fixes a failure the overlap never worked around: an app that
+does not set `SO_REUSEPORT` cannot have two instances bound to one port, so
+overlapping it spawns a replacement that takes `EADDRINUSE` and crash-loops.
+That includes every Node app on macOS, where the option is `ENOTSUP`.
+
+`reuse_port` is the app's own claim that it sets `SO_REUSEPORT` before its
+own `bind()`. shep never binds a listen socket on an app's behalf and cannot
+check the claim in advance. `SO_REUSEADDR`, which far more frameworks set by
+default, is not sufficient, and a mixed pair — one process with the option,
+one without — is refused by the kernel on both tier-1 platforms.
+
+Reload proceeds instance-by-instance; failure of the new instance aborts the
+rest and keeps old instances running.
 
 > macOS caveat: `SO_REUSEPORT` there is last-binder-wins, not
 > load-balancing — measured cross-process over 40 connections, macOS sent
