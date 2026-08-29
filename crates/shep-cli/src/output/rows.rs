@@ -961,25 +961,6 @@ impl DogActionRow<'_> {
         )
     }
 
-    /// # Panics
-    /// If `header` is not one of [`Self::headers`]'s own values. Every real
-    /// caller only ever passes a value straight from `headers()`, so this is
-    /// unreachable in practice; `caller` is the concrete type's own name so
-    /// the panic still names whichever of the four dog-action rows produced
-    /// it.
-    #[track_caller]
-    fn json_key_for(caller: &'static str, header: &str) -> &'static str {
-        match header {
-            "NAME" => "name",
-            "SOURCE" => "source",
-            "SHEPHERD" => "shepherd_acted",
-            "STATUS" => "status",
-            other => panic!("{caller}::headers() does not include {other:?}"),
-        }
-    }
-
-    const JSON_ONLY: &'static [&'static str] = &[];
-
     // Parallel to `headers()` above: `["NAME", "SOURCE", "SHEPHERD",
     // "STATUS"]`. NAME and STATUS are the floor, the same role they play in
     // `DogRows`. SOURCE and SHEPHERD are the two extras (see
@@ -994,6 +975,25 @@ impl DogActionRow<'_> {
     // test section) pins the length and the floor for every impl, all four
     // dog-action rows included.
     const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
+}
+
+/// One JSON key rule for the four dog-action tables; the panic names the concrete type.
+///
+/// A macro rather than a shared associated fn: the shared rule expands inside
+/// each `Render` impl, because rustc 1.93's dead-code pass cannot see a use
+/// that only occurs in another trait impl's body, and the lint job pins 1.93.
+macro_rules! dog_action_json_key {
+    ($caller:expr, $header:expr) => {{
+        let caller: &'static str = $caller;
+        let header: &str = $header;
+        match header {
+            "NAME" => "name",
+            "SOURCE" => "source",
+            "SHEPHERD" => "shepherd_acted",
+            "STATUS" => "status",
+            other => panic!("{caller}::headers() does not include {other:?}"),
+        }
+    }};
 }
 
 impl Render for DogEnabledRow {
@@ -1019,10 +1019,10 @@ impl Render for DogEnabledRow {
 
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        DogActionRow::json_key_for("DogEnabledRow", header)
+        dog_action_json_key!("DogEnabledRow", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = DogActionRow::JSON_ONLY;
+    const JSON_ONLY: &'static [&'static str] = &[];
 
     const PRIORITIES: &'static [u8] = DogActionRow::PRIORITIES;
 }
@@ -1071,10 +1071,10 @@ impl Render for DogDisabledRow {
 
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        DogActionRow::json_key_for("DogDisabledRow", header)
+        dog_action_json_key!("DogDisabledRow", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = DogActionRow::JSON_ONLY;
+    const JSON_ONLY: &'static [&'static str] = &[];
 
     // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
     // type shares its headers exactly.
@@ -1128,10 +1128,10 @@ impl Render for DogAdoptedRow {
 
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        DogActionRow::json_key_for("DogAdoptedRow", header)
+        dog_action_json_key!("DogAdoptedRow", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = DogActionRow::JSON_ONLY;
+    const JSON_ONLY: &'static [&'static str] = &[];
 
     // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
     // type shares its headers exactly.
@@ -1194,10 +1194,10 @@ impl Render for DogRehomedRow {
 
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        DogActionRow::json_key_for("DogRehomedRow", header)
+        dog_action_json_key!("DogRehomedRow", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = DogActionRow::JSON_ONLY;
+    const JSON_ONLY: &'static [&'static str] = &[];
 
     // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
     // type shares its headers exactly.
@@ -1920,12 +1920,27 @@ impl ReplyRows {
         )
     }
 
-    /// # Panics
-    /// If `header` is not one of [`Self::headers`]'s own values. `caller` is
-    /// the concrete type's own name, so the panic still names whichever of
-    /// the three reply tables produced it.
-    #[track_caller]
-    fn json_key_for(caller: &'static str, header: &str) -> &'static str {
+    // Parallel to `headers()` above: `["ID", "NAME", "OUTCOME", "DETAIL"]`.
+    // ID and NAME are the floor `FlockRows` itself uses for row identity;
+    // OUTCOME joins them for the same STATUS-shaped reason `FlockRows`/
+    // `DogRows` give their own outcome column -- an operator needs to know
+    // whether the trigger succeeded even more than the free-text detail
+    // explaining why. DETAIL, each table's one unbounded free-text column,
+    // is the sole `6`-and-up extra, and `render_boxed`'s floor of three means
+    // dropping it is the only narrowing any of these three tables ever does
+    // -- exactly the three-essential-columns shape `FlockRows` itself has.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
+}
+
+/// One JSON key rule for the three per-sheep reply tables; the panic names the concrete type.
+///
+/// A macro rather than a shared associated fn: the shared rule expands inside
+/// each `Render` impl, because rustc 1.93's dead-code pass cannot see a use
+/// that only occurs in another trait impl's body, and the lint job pins 1.93.
+macro_rules! reply_rows_json_key {
+    ($caller:expr, $header:expr) => {{
+        let caller: &'static str = $caller;
+        let header: &str = $header;
         match header {
             "ID" => "id",
             "NAME" => "name",
@@ -1937,20 +1952,7 @@ impl ReplyRows {
             "OUTCOME" | "DETAIL" => "outcome",
             other => panic!("{caller}::headers() does not include {other:?}"),
         }
-    }
-
-    const JSON_ONLY: &'static [&'static str] = &[];
-
-    // Parallel to `headers()` above: `["ID", "NAME", "OUTCOME", "DETAIL"]`.
-    // ID and NAME are the floor `FlockRows` itself uses for row identity;
-    // OUTCOME joins them for the same STATUS-shaped reason `FlockRows`/
-    // `DogRows` give their own outcome column -- an operator needs to know
-    // whether the trigger succeeded even more than the free-text detail
-    // explaining why. DETAIL, each table's one unbounded free-text column,
-    // is the sole `6`-and-up extra, and `render_boxed`'s floor of three means
-    // dropping it is the only narrowing any of these three tables ever does
-    // -- exactly the three-essential-columns shape `FlockRows` itself has.
-    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
+    }};
 }
 
 impl Render for TriggeredRows {
@@ -2000,10 +2002,10 @@ impl Render for TriggeredRows {
 
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        ReplyRows::json_key_for("TriggeredRows", header)
+        reply_rows_json_key!("TriggeredRows", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = ReplyRows::JSON_ONLY;
+    const JSON_ONLY: &'static [&'static str] = &[];
 
     const PRIORITIES: &'static [u8] = ReplyRows::PRIORITIES;
 }
@@ -2104,10 +2106,10 @@ impl Render for SignalledRows {
 
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        ReplyRows::json_key_for("SignalledRows", header)
+        reply_rows_json_key!("SignalledRows", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = ReplyRows::JSON_ONLY;
+    const JSON_ONLY: &'static [&'static str] = &[];
 
     // Same shape, same reasoning, as `TriggeredRows::PRIORITIES` -- this
     // type shares its headers exactly.
@@ -2168,10 +2170,10 @@ impl Render for SentLineRows {
 
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        ReplyRows::json_key_for("SentLineRows", header)
+        reply_rows_json_key!("SentLineRows", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = ReplyRows::JSON_ONLY;
+    const JSON_ONLY: &'static [&'static str] = &[];
 
     // Same shape, same reasoning, as `TriggeredRows::PRIORITIES` -- this
     // type shares its headers exactly.
