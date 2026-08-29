@@ -254,5 +254,19 @@ expression: requests
       "kind": "config_drift",
       "apps": []
     }
+  },
+  {
+    "id": 23,
+    "deadline_ms": null,
+    "body": {
+      "kind": "restart",
+      "selector": {
+        "kind": "instance",
+        "value": {
+          "name": "web",
+          "slot": 2
+        }
+      }
+    }
   }
 ]

@@ -1984,6 +1984,23 @@ mod tests {
                 deadline_ms: None,
                 body: Request::ConfigDrift { apps: Vec::new() },
             },
+            // The only STRUCT-shaped `SelectorSpec` variant, and the one
+            // whose serialized shape moved `PROTOCOL_VERSION` from 1 to 2.
+            // Every other selector on this wire is a unit or a newtype, both
+            // already pinned by the rows above, so this row is the only place
+            // `"kind":"instance"` and the `slot` key are held to anything.
+            // Without it, renaming the field or flattening the variant turned
+            // nothing red on the exact type the version bump was for.
+            Envelope {
+                id: 23,
+                deadline_ms: None,
+                body: Request::Restart {
+                    selector: SelectorSpec::Instance {
+                        name: "web".to_string(),
+                        slot: 2,
+                    },
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v1", requests);
     }
