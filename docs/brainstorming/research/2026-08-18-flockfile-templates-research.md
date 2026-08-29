@@ -382,7 +382,7 @@ more cautiously to the latter.
 `scaffold`/`template`/`init`/`generate`/`starter`: every hit is unrelated —
 `docs/specs/shep-v1.md:479` and `docs/specs/deferred.md:425-450` are about
 the **systemd/openrc/launchd/rc.d unit generators** for `shep startup`
-(a different kind of "generate a file"), `deferred.md:544-553` is the
+(a different kind of "generate a file"), `deferred-history.md`'s lookout display-width entry is the
 Flockfile **JSON Schema** (already covered in §2), and
 `goals.md:16`/`map.md:875` are about **bark webhook payload templates**, an
 unrelated feature. **This request is not specced, not deferred, and not

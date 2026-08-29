@@ -285,8 +285,8 @@ jobs:
   # (`cargo check --workspace --all-targets --all-features --target
   # x86_64-pc-windows-gnu`) had no workflow behind it, so it only ran when a
   # human remembered -- and it went three phases unrun that way before Phase
-  # 10 caught it (docs/specs/deferred.md, "the windows-gnu cross-check went
-  # three phases unrun"). It is `cargo check`, deliberately, not
+  # 10 caught it (docs/specs/deferred-history.md, "the windows-gnu cross-check
+  # went three phases unrun"). It is `cargo check`, deliberately, not
   # `clippy -- -D warnings`: shep-daemon's `boot`/`sys`/`server`/
   # `tokio_runner` are `cfg(unix)`-gated, so the Windows target reports 51
   # dead-code warnings for code that is not dead on any platform shep ships.
