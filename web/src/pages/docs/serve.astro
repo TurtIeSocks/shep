@@ -12,7 +12,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 import NotBuilt from "../../components/docs/NotBuilt.astro";
 
 const followSymlinksNotice = `$ shep serve ./dist --follow-symlinks --format json
-{"schema_version":1,"notice":{"code":"follow_symlinks","message":"shep serve: --follow-symlinks reopens the check-then-open race (TOCTOU) the default per-component walk closes — a symlink under the docroot can now point anywhere this process can read"}}`;
+{"schema_version":2,"notice":{"code":"follow_symlinks","message":"shep serve: --follow-symlinks reopens the check-then-open race (TOCTOU) the default per-component walk closes — a symlink under the docroot can now point anywhere this process can read"}}`;
 
 const requestCodes = `$ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/
 200
