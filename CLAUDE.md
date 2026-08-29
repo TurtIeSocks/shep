@@ -417,9 +417,13 @@ templates (doubled braces escape a literal brace), `SHEP_INSTANCE` and
 refused unless it carries `{{instance}}` or the app sets `merge_logs`. A
 sheep name can no longer contain a colon, since `name:slot` (for example
 `web:2`) is now a selector that reaches one instance of a multi-instance
-app; `ProcessInfo.instance` carries the slot on the wire, additive, so
-`PROTOCOL_VERSION` and the output envelope's `SCHEMA_VERSION` both moved
-from 1 to 2. `shep flock` groups a multi-instance app under one rollup row
+app. `PROTOCOL_VERSION` moved from 1 to 2, because `SelectorSpec` gained
+an `Instance` variant an older daemon cannot deserialize, so it refuses a
+newer client at the handshake and an operator restarts the daemon after
+upgrading. The output envelope's `SCHEMA_VERSION` did NOT move and is
+still 1: `ProcessInfo.instance` is purely additive, and the envelope's own
+rule is that only a rename, a removal or a retype bumps it. The two
+constants answer different questions and it is easy to move the wrong one. `shep flock` groups a multi-instance app under one rollup row
 (`web ×3`, with `↳ :0` marker rows beneath it) in `full` and `plain` style;
 `bare` and JSON still print one row per instance, with `bare` suffixing the
 name and JSON carrying the slot as its own field. `shep lookout`'s flock
