@@ -347,6 +347,22 @@ mod tests {
     use shep_core::protocol::{BusEvent, ProcessEventKind, ProcessInfo, decode_frame};
     use shep_core::status::ProcStatus;
 
+    /// How long a test waits for a forwarder to produce a frame.
+    ///
+    /// Virtual, not wall clock: every caller runs `start_paused`, so a
+    /// forwarder that never sends leaves the runtime idle, time jumps
+    /// straight here, and the test fails with its own message instead of
+    /// hanging until CI's timeout (IR-33).
+    const FORWARD_DEADLINE: core::time::Duration = core::time::Duration::from_secs(1);
+
+    /// One frame from a forwarder, or a named failure if none arrives.
+    async fn next_frame(out: &mut mpsc::Receiver<Bytes>) -> Bytes {
+        tokio::time::timeout(FORWARD_DEADLINE, out.recv())
+            .await
+            .expect("a forwarder must produce a frame rather than stall")
+            .expect("every subscriber must receive the event")
+    }
+
     fn filter(patterns: &[&str]) -> TopicFilter {
         let owned: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
         TopicFilter::new(&owned).unwrap()
@@ -506,11 +522,7 @@ mod tests {
 
         let mut frames = Vec::new();
         for out in &mut outs {
-            frames.push(
-                out.recv()
-                    .await
-                    .expect("every subscriber must receive the event"),
-            );
+            frames.push(next_frame(out).await);
         }
         for forwarder in forwarders {
             forwarder.await.unwrap();
@@ -567,11 +579,7 @@ mod tests {
 
         let mut frames = Vec::new();
         for out in &mut outs {
-            frames.push(
-                out.recv()
-                    .await
-                    .expect("every subscriber must receive the event"),
-            );
+            frames.push(next_frame(out).await);
         }
         for forwarder in forwarders {
             forwarder.await.unwrap();
