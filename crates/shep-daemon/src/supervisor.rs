@@ -232,7 +232,7 @@ pub(crate) enum BatchPolicy {
     /// error as well.
     ///
     /// An app with no resolvable identity must never run under the daemon's
-    /// own — that outcome is ruled out by the row's
+    /// own identity — that outcome is ruled out by the row's
     /// [`SpawnIdentity::Unresolved`] rather than by leaving no row at all:
     /// a missing row would cost the operator the one trace they had, since
     /// an app missing from `shep flock` reads as one nobody ever configured.

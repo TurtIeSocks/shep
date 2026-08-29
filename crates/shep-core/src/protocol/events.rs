@@ -221,7 +221,8 @@ mod tests {
             BusEvent::Dropped { count: 17 },
         ];
 
-        // Every lifecycle kind a `process.*` subscriber can receive, over one
+        // The lifecycle kinds exercised here (the reload trio has its own
+        // fixture), over one
         // identical `info`, so the snapshot rows differ by their `event` tag
         // and by nothing else. These are the ordinary events a real
         // integration — a dashboard, a bark rule — depends on first, and a

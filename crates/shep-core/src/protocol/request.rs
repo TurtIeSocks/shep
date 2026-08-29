@@ -2051,9 +2051,11 @@ mod tests {
             // it does not prove any of these variants' own `kind` tags, and
             // three of them are not `Vec<ProcessInfo>`-shaped at all
             // (`Deleted` is a `Vec<u32>`, `Subscribed` and `ShuttingDown`
-            // carry nothing). Each row below therefore carries the emptiest
-            // legal body: what is being pinned here is the tag, and a body
-            // repeated eight times would bury it.
+            // carry nothing). Each row below therefore carries the smallest
+            // body that shows its wire shape — empty where empty is legal,
+            // `Deleted`'s two ids where the shape needs elements: what is
+            // being pinned here is the tag, and a body repeated eight times
+            // would bury it.
             Reply {
                 id: 9,
                 result: Ok(Response::Described(vec![])),
