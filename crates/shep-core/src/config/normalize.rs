@@ -226,6 +226,9 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 /// - [`NormalizeError::MissingName`] — `name` is empty.
 /// - [`NormalizeError::InvalidName`] — `name` contains a path separator or a
 ///   colon, or is `.`/`..`.
+/// - [`NormalizeError::ReservedEnvVar`] — `env` sets `SHEP_INSTANCE` or
+///   `SHEP_NAME`, which shep injects itself (carries the app name and the
+///   variable).
 /// - [`NormalizeError::MissingScript`] — `script` is empty.
 /// - [`NormalizeError::ZeroInstances`] — `instances == 0`.
 /// - [`NormalizeError::InvalidCron`] — `cron_restart` is not valid in
@@ -276,6 +279,14 @@ pub fn normalize_with_home(
     }
     if app.name.contains(['/', '\\', ':']) || app.name == "." || app.name == ".." {
         return Err(NormalizeError::InvalidName(app.name));
+    }
+    for var in ["SHEP_INSTANCE", "SHEP_NAME"] {
+        if app.env.contains_key(var) {
+            return Err(NormalizeError::ReservedEnvVar {
+                name: app.name.clone(),
+                var,
+            });
+        }
     }
     if app.script.is_empty() {
         return Err(NormalizeError::MissingScript);
@@ -478,6 +489,14 @@ pub enum NormalizeError {
     /// Windows filename, which a sheep name becomes part of. Carries the
     /// name.
     InvalidName(String),
+    /// An app's `env` sets a variable shep injects itself. Carries the sheep
+    /// name and the variable, so the error names the entry to edit.
+    ReservedEnvVar {
+        /// The sheep name
+        name: String,
+        /// The variable the app tried to set
+        var: &'static str,
+    },
     /// `script` is empty
     MissingScript,
     /// `instances` is zero
@@ -610,6 +629,10 @@ impl fmt::Display for NormalizeError {
                     "sheep name `{n}` may not contain a path separator or a colon, or be `.` or `..`"
                 )
             }
+            Self::ReservedEnvVar { name, var } => write!(
+                f,
+                "sheep `{name}` sets `{var}` in env, but shep injects it: use a different name, or `{{{{instance}}}}` in your own variable"
+            ),
             Self::MissingScript => f.write_str("app config is missing a script"),
             Self::ZeroInstances => f.write_str("instances must be at least 1"),
             Self::InvalidCron { pattern, reason } => {
@@ -860,6 +883,21 @@ mod tests {
         );
 
         assert!(normalize(AppConfig::minimal("web-2", "./srv")).is_ok());
+    }
+
+    #[test]
+    fn the_reserved_env_vars_are_refused_rather_than_overwritten() {
+        for var in ["SHEP_INSTANCE", "SHEP_NAME"] {
+            let mut app = AppConfig::minimal("web", "./srv");
+            app.env.insert(var.to_string(), "mine".to_string());
+            let err = normalize(app).unwrap_err();
+            let rendered = err.to_string();
+            assert!(rendered.contains(var), "names the variable: {rendered}");
+            assert!(
+                !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+                "no em or en dash in copy a user reads: {rendered}"
+            );
+        }
     }
 
     #[test]

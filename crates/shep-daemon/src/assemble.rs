@@ -204,8 +204,11 @@ pub fn assemble(
     // with no PATH is ENOENT, not a slow failure).
     let mut env = base_env();
     env.extend(config.env.clone());
-    let slot_var = config.increment_var.as_deref().unwrap_or("SHEP_INSTANCE");
-    env.insert(slot_var.to_string(), instance.to_string());
+    // Always, and under fixed names. An app that wants the slot under its own
+    // variable writes `MY_VAR = "{{instance}}"` in its env, which is one
+    // mechanism instead of a dedicated config knob for a single value.
+    env.insert("SHEP_INSTANCE".to_string(), instance.to_string());
+    env.insert("SHEP_NAME".to_string(), name.clone());
 
     // Working directory
     let cwd = config.cwd.as_ref().map(PathBuf::from);
@@ -299,6 +302,22 @@ mod tests {
     }
 
     #[test]
+    fn every_child_learns_its_slot_and_its_name() {
+        let app = normalize(AppConfig {
+            name: "worker".to_string(),
+            script: "bin/worker".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let spec = assemble(&app, 3, &test_paths(), None);
+        assert_eq!(spec.env.get("SHEP_INSTANCE").map(String::as_str), Some("3"));
+        assert_eq!(
+            spec.env.get("SHEP_NAME").map(String::as_str),
+            Some("worker")
+        );
+    }
+
+    #[test]
     fn env_custom_increment_var() {
         let mut app_config = AppConfig {
             name: "worker".to_string(),
@@ -313,8 +332,14 @@ mod tests {
 
         let spec = assemble(&app, 5, &paths, None);
 
-        assert!(!spec.env.contains_key("SHEP_INSTANCE"));
-        assert_eq!(spec.env.get("WORKER_ID").map(|s| s.as_str()), Some("5"));
+        // SHEP_INSTANCE and SHEP_NAME are always injected now, regardless of
+        // increment_var: the field is inert here until a later task removes
+        // it.
+        assert_eq!(spec.env.get("SHEP_INSTANCE").map(|s| s.as_str()), Some("5"));
+        assert_eq!(
+            spec.env.get("SHEP_NAME").map(|s| s.as_str()),
+            Some("worker")
+        );
     }
 
     #[test]
