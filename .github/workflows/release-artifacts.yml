@@ -16,7 +16,10 @@ name: Release artifacts
 #     Add a fourth binary there and this file does not notice.
 #   * `test.yml`'s matrix is what proves these targets build at all. Six of
 #     the seven legs below appear there; `aarch64-unknown-linux-musl` is the
-#     exception and is built natively, so it needs no cross toolchain.
+#     exception. It IS built natively, but only because its matrix entry says
+#     `build_tool: cargo`. This comment asserted it as a fact for weeks while
+#     the action was quietly using `cross`, which is how shep-v0.1.13 shipped
+#     with no binaries at all.
 #
 # ## Why `release: published` works here
 #
@@ -142,6 +145,19 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             packages: musl-tools
+            # The one leg that names its build tool, because it is the one
+            # where the action's own choice is wrong. Left to itself it sees
+            # target != host (musl against the runner's gnu) and reaches for
+            # `cross`, and cross 0.2.5 opens by installing
+            # `stable-x86_64-unknown-linux-gnu`, which an arm64 runner refuses:
+            # "toolchain may not be able to run on this system". That is what
+            # failed on shep-v0.1.13 and took the whole downstream packaging
+            # chain with it.
+            #
+            # The arch already matches, so there is nothing to cross-compile.
+            # `musl-tools` above supplies the C toolchain `ring`'s build script
+            # needs, the same as the x86_64 musl leg.
+            build_tool: cargo
           # msvc, deliberately, not gnu. `x86_64-pc-windows-gnu` in this
           # repository is `cargo check` only, cross-compiled from ubuntu by
           # test.yml, and has never executed a shep binary anywhere. msvc is
@@ -190,6 +206,9 @@ jobs:
           # be renamed later without breaking published URLs.
           archive: shep-$target
           target: ${{ matrix.target }}
+          # Empty for every leg that does not set it, which the action reads as
+          # "choose for me" -- its default, and right everywhere else.
+          build-tool: ${{ matrix.build_tool }}
           # `tar` defaults to `unix` and `zip` to `windows`, which is exactly
           # the split wanted here, so neither is set.
           #
