@@ -1201,6 +1201,16 @@ fn the_three_ways_out_of_the_shared_log_refusal_all_work() {
     single.out_file = Some("/var/log/web.log".to_string());
     assert!(normalize(single).is_ok());
 }
+
+#[test]
+fn an_escaped_template_in_a_log_path_does_not_satisfy_the_refusal() {
+    // `{{{{instance}}}}` spells the token but renders to one literal path
+    // for every instance, so a substring check would wave it through.
+    let mut app = AppConfig::minimal("web", "./srv");
+    app.instances = 3;
+    app.out_file = Some("/var/log/web-{{{{instance}}}}.log".to_string());
+    assert!(normalize(app).is_err());
+}
 ```
 
 In `assemble.rs` `mod tests`:
@@ -1259,8 +1269,12 @@ The check, after the template validation from task 6 (so a malformed template is
 ```rust
     if app.instances > 1 && !app.merge_logs {
         for (field, path) in [("out_file", &app.out_file), ("err_file", &app.err_file)] {
+            // Rendered rather than searched for a substring: an escaped
+            // `{{{{instance}}}}` contains the token's spelling but renders to
+            // one literal path for every instance, which is exactly the
+            // collision this refuses. Two slots that render alike collide.
             if let Some(path) = path
-                && !path.contains("{{instance}}")
+                && template::render(path, &app.name, 0) == template::render(path, &app.name, 1)
             {
                 return Err(NormalizeError::SharedLogPath {
                     name: app.name.clone(),
