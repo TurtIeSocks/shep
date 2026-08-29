@@ -8,8 +8,10 @@
 //! that is one of several instances of an app reports which slot it is, so
 //! every listing can group an app's instances and roll their numbers up
 //! rather than showing several rows that share a name and explain nothing.
-//! A single-instance sheep reports `None`, exactly as version 1 had no field
-//! to report at all.
+//! A sheep reports its own slot, counting from 0, so a single-instance app
+//! reports `Some(0)`. `None` means the peer daemon predates the field, and a
+//! reader that finds it should render exactly what it rendered before this
+//! field existed.
 //!
 //! **Two sets of tests carry a version in their name and they assert
 //! opposite things.** The `*_wire_v2` snapshots pin the shape this crate
