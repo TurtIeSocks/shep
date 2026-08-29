@@ -92,8 +92,8 @@ const fieldGroups: FieldGroup[] = [
   {
     title: "Logs",
     fields: [
-      { name: "out_file", type: "string?", default: "logs/<name>-<i>-out.log", does: "Stdout log file path override; supports {{instance}} and {{name}}. With instances > 1, an explicit path needs one of those or merge_logs, or it's refused." },
-      { name: "err_file", type: "string?", default: "logs/<name>-<i>-err.log", does: "Stderr log file path override; supports {{instance}} and {{name}}. With instances > 1, an explicit path needs one of those or merge_logs, or it's refused." },
+      { name: "out_file", type: "string?", default: "logs/<name>-<i>-out.log", does: "Stdout log file path override; supports {{instance}} and {{name}}. With instances > 1, an explicit path needs {{instance}} or merge_logs, or it's refused: {{name}} renders the same for every instance, so a path carrying only that one still collides." },
+      { name: "err_file", type: "string?", default: "logs/<name>-<i>-err.log", does: "Stderr log file path override; supports {{instance}} and {{name}}. With instances > 1, an explicit path needs {{instance}} or merge_logs, or it's refused: {{name}} renders the same for every instance, so a path carrying only that one still collides." },
       { name: "merge_logs", type: "bool", default: "false", does: "Collapse every instance's logs into one file pair." },
     ],
   },
