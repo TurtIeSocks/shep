@@ -24,7 +24,8 @@ Both tools run the *same two shell scripts* the harness writes, under the same
 | Start latency | ten apps, cold daemon and warm |
 | Footprint | shep's binary against the pm2 install tree |
 
-The daemon is what is sampled, never the children.
+The shepherd is what is sampled, never the children. On the pm2 side that
+means its God Daemon.
 
 ## The order is A/B/A on purpose
 

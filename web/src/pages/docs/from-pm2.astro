@@ -608,9 +608,14 @@ cwd = "/srv/migrate"`}</CodeBlock>
     line-height: 1.5;
   }
 
+  .bench-table .row {
+    grid-template-columns: 1.6fr 1fr 1fr 0.6fr;
+  }
+
   @media (max-width: 640px) {
     .field-table .row,
-    .verb-table .row {
+    .verb-table .row,
+    .bench-table .row {
       grid-template-columns: 1fr;
       gap: 4px;
     }
@@ -658,7 +663,4 @@ cwd = "/srv/migrate"`}</CodeBlock>
     color: var(--ink-2);
   }
 
-  .bench-table .row {
-    grid-template-columns: 1.6fr 1fr 1fr 0.6fr;
-  }
 </style>

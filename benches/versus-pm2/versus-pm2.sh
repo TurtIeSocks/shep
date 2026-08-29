@@ -29,6 +29,8 @@ SETTLE_IDLE=10
 SAMPLE_IDLE=60
 SETTLE_LOG=5
 SAMPLE_LOG=30
+START_TIMEOUT=60
+POLL_INTERVAL=0.01
 LINE_BYTES=62   # verified at runtime by check_line_bytes
 
 mkdir -p "$RAW" "$APPS"
@@ -170,6 +172,20 @@ pm2_dpid()  { cat "$PM2_HOME/pm2.pid" 2>/dev/null; }
 
 # --------------------------------------------------- metric 1+2: idle CPU --
 
+# The two workloads every metric runs. Written here rather than assumed on
+# disk: the generated configs name these paths, and a missing script makes a
+# tool report zero online forever.
+write_workloads() {
+  mkdir -p "$APPS"
+  printf '#!/bin/sh\nwhile true; do sleep 5; done\n' > "$APPS/quiet.sh"
+  # 62 bytes per line, fixed, so a byte delta divides into an exact line count.
+  printf '#!/bin/sh\nwhile true; do echo "%s"; done\n' \
+    "shep versus pm2 benchmark line, fixed width payload xxxxx" > "$APPS/loud.sh"
+  chmod +x "$APPS/quiet.sh" "$APPS/loud.sh"
+  [ -x "$APPS/quiet.sh" ] && [ -x "$APPS/loud.sh" ] || {
+    echo "workload scripts missing under $APPS" >&2; return 1; }
+}
+
 m_idle() { # tool tag
   local tool="$1" tag="$2" cfg dpid n kids hrss
   echo "[idle] $tool $tag"
@@ -186,6 +202,14 @@ m_idle() { # tool tag
   fi
   echo "  online=$n dpid=$dpid"
   sleep "$SETTLE_IDLE"
+
+  # Both start commands return before the children are all up, so the counts
+  # taken above are pre-settle. Re-read them here or a late child is counted
+  # as helper RSS and the reported online count is stale.
+  if [ "$tool" = shep ]; then n=$(shep_online); kids=$(shep_pids)
+  else n=$(pm2_online); kids=$(pm2_pids); fi
+  [ "${n:-0}" -eq "$N_APPS" ] || {
+    echo "  only $n/$N_APPS online after settle, refusing to report" >&2; return 1; }
 
   local rss; rss=$(rss_kb "$dpid")
   hrss=$(helper_rss_kb "$dpid" $kids)
@@ -274,6 +298,11 @@ print(json.dumps({k: e.get(k) for k in keys}, indent=1))' \
   local s; s=$(stats_csv "$RAW/log-$tool-$tag.csv")
   local mean max cnt; read -r mean max cnt <<< "$s"
 
+  # A log that stopped growing, or a zero line width, would divide by zero
+  # below and leave the metric record silently absent.
+  [ "${lb:-0}" -gt 0 ] || { echo "  line width is 0, refusing to derive" >&2; return 1; }
+  [ "$b1" -gt "$b0" ] || { echo "  log did not grow during the window" >&2; return 1; }
+
   local res
   res=$(python3 -c "
 b0,b1,c0,c1,t0,t1,lb = $b0,$b1,$c0,$c1,$t0,$t1,$lb
@@ -296,14 +325,26 @@ print(f'{lines:.0f} {lines/el:.1f} {cpu/lines*1e6:.4f} {cpu/el*100:.3f} {el:.2f}
 timed_start() { # tool cfg
   local tool="$1" cfg="$2" t0 t1 n
   t0=$(now)
+  # Deadline and interval both matter. Unbounded, a failed start spins the
+  # list command forever and its own CPU lands in the measurement it is
+  # supposed to be timing.
+  local deadline; deadline=$(python3 -c "print($t0 + $START_TIMEOUT)")
   if [ "$tool" = shep ]; then
-    shepc start "$cfg" >/dev/null 2>&1
+    shepc start "$cfg" >/dev/null 2>&1 || { echo "  shep start failed" >&2; return 1; }
     n=$(shep_online)
-    while [ "${n:-0}" -lt "$N_APPS" ]; do n=$(shep_online); done
+    while [ "${n:-0}" -lt "$N_APPS" ]; do
+      python3 -c "import sys; sys.exit(0 if $(now) < $deadline else 1)" \
+        || { echo "  timed out at $n/$N_APPS" >&2; return 1; }
+      sleep "$POLL_INTERVAL"; n=$(shep_online)
+    done
   else
-    pm2c start "$cfg" >/dev/null 2>&1
+    pm2c start "$cfg" >/dev/null 2>&1 || { echo "  pm2 start failed" >&2; return 1; }
     n=$(pm2_online)
-    while [ "${n:-0}" -lt "$N_APPS" ]; do n=$(pm2_online); done
+    while [ "${n:-0}" -lt "$N_APPS" ]; do
+      python3 -c "import sys; sys.exit(0 if $(now) < $deadline else 1)" \
+        || { echo "  timed out at $n/$N_APPS" >&2; return 1; }
+      sleep "$POLL_INTERVAL"; n=$(pm2_online)
+    done
   fi
   t1=$(now)
   echo "$(python3 -c "print(f'{$t1-$t0:.4f}')") $n"
@@ -369,7 +410,11 @@ m_versions() {
   echo "  shep $sha | pm2 $pv | node $nv"
 }
 
+# Idempotent: the trap and the normal path both call this.
+_cleaned=0
 cleanup_all() {
+  [ "$_cleaned" = 1 ] && return 0
+  _cleaned=1
   echo "[cleanup]"
   shepc delete all >/dev/null 2>&1
   shepc kill       >/dev/null 2>&1
@@ -392,6 +437,10 @@ round() { # tag
   local tag="$1"
   m_idle  shep "$tag"; m_log  shep "$tag"; m_start shep "$tag"
 }
+
+# Installed here, below cleanup_all's definition: a trap set before the
+# function exists fires into an unbound name on an early interrupt.
+trap cleanup_all EXIT INT TERM
 
 main() {
   : > "$METRICS"
