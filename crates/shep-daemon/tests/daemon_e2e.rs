@@ -313,12 +313,9 @@ impl Client {
             body,
         })
         .await;
-        // Bounded like every other wait in this file. It was the one that was
-        // not, and a daemon that never answers turned that into a hang with
-        // no output rather than a failure: on 2026-08-27 the Windows CI legs
-        // sat in `Reopen` here until the job was cancelled, three times, and
-        // the log said only "has been running for over 60 seconds". The
-        // deadline is what makes an unanswered request name itself.
+        // Bounded like every other wait in this file: an unbounded one here
+        // would turn a daemon that never answers into a silent hang with no
+        // diagnostic output, rather than a named failure.
         let mut skipped = Vec::new();
         let reply = tokio::time::timeout(RECV_TIMEOUT, async {
             loop {
@@ -2289,7 +2286,10 @@ async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
 /// # Why the count is asserted on Linux only
 ///
 /// Because the two platforms do not share the mechanism the count is about.
-/// From this test's own runs (2026-08-10, ~95 connections across the reload):
+/// The assertion below only requires more than 20 connection attempts across
+/// the reload -- that is the actual invariant. Below is how one of this
+/// test's own runs split those attempts between the two listeners,
+/// illustrative rather than something enforced:
 ///
 /// - **Linux** load-balances new connections over every listener in the
 ///   `SO_REUSEPORT` group, so the instance being replaced keeps taking a share

@@ -231,12 +231,11 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// `commands::foreground` for `runtime`/`dev` — and the e2e tier reaches it
 /// as a subprocess.
 ///
-/// Split out of what used to be `run_daemon`'s own body for
-/// `commands::foreground`, which needs the booted daemon in hand rather than
-/// a call that blocks until shutdown: it spawns `run()` as a task and then
-/// talks to the same supervisor over its own socket, like any other client.
-/// Nothing about the boot differs between the two callers, and the split is
-/// what keeps that true.
+/// Separate from [`run_daemon`] because `commands::foreground` needs the
+/// booted daemon in hand rather than a call that blocks until shutdown: it
+/// spawns `run()` as a task and then talks to the same supervisor over its
+/// own socket, like any other client. Nothing about the boot differs
+/// between the two callers, and the split is what keeps that true.
 ///
 /// `delete_flock_on_shutdown` becomes [`BootOptions::delete_flock_on_shutdown`]
 /// verbatim — see that field's own doc. `run_daemon` below always passes

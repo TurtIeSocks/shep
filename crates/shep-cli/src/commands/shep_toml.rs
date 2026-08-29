@@ -68,7 +68,7 @@ const CONFIG_FILE_MODE: u32 = 0o600;
 /// `js`/`mjs`/`cjs` cover the three ways a Node script is named; `py` maps
 /// to `python3` rather than bare `python`, which is absent or still points
 /// at Python 2 on plenty of hosts shep runs on; `rb` and `sh` round out the
-/// four families Rin named directly. Two more chosen with judgement:
+/// four families the maintainer named directly. Two more chosen with judgement:
 /// `pl` for Perl and `php` for PHP, both single, unambiguous interpreters
 /// that ship alongside node/python3/ruby/sh on most of the same hosts.
 /// Left out on purpose: `ts` (no single safe default exists; ts-node, tsx
@@ -1092,24 +1092,21 @@ mod tests {
     }
 
     /// fails if `set_style_level` panics instead of reporting when
-    /// `style` already exists as something other than a table -- the
-    /// reviewer's live repro for this task: an operator writing
-    /// `style = "full"` at the top level (legal TOML, and a natural
-    /// guess) used to abort the whole process with an internal
-    /// assertion, exit 101, from inside this setter's old `.expect(..)`.
-    /// A clean [`ShepTomlError::WrongShape`] is required instead.
+    /// `style` already exists as something other than a table: an operator
+    /// writing `style = "full"` at the top level (legal TOML, and a natural
+    /// guess) must get a clean [`ShepTomlError::WrongShape`], not an
+    /// internal assertion aborting the whole process.
     ///
-    /// Also fails if a refused write still replaces the file. The first
-    /// version of this fix routed the setter through [`ShepToml::edit`],
-    /// which always calls `save()` after the closure runs regardless of
-    /// what the closure returned -- so a refused write still staged a
-    /// fresh file and renamed it over the original: identical bytes, but
-    /// a new inode, and the mode forced to [`CONFIG_FILE_MODE`] even
-    /// though the original here is `0644`. Content equality alone hid
-    /// that, which is why this checks the file's metadata rather than
-    /// only what is in it. [`ShepToml::try_edit`] is what actually
-    /// prevents it: it never reaches `save` when the closure returns
-    /// `Err`.
+    /// Also fails if a refused write still replaces the file. Routing the
+    /// setter through [`ShepToml::edit`], which always calls `save()` after
+    /// the closure runs regardless of what the closure returned, would
+    /// still stage a fresh file and rename it over the original on a
+    /// refusal: identical bytes, but a new inode, and the mode forced to
+    /// [`CONFIG_FILE_MODE`] even though the original here is `0644`.
+    /// Content equality alone hides that, which is why this checks the
+    /// file's metadata rather than only what is in it.
+    /// [`ShepToml::try_edit`] is what actually prevents it: it never
+    /// reaches `save` when the closure returns `Err`.
     #[test]
     fn a_style_key_that_is_not_a_table_is_reported_and_the_file_is_never_rewritten() {
         use std::os::unix::fs::MetadataExt as _;
@@ -1211,7 +1208,7 @@ mod tests {
     /// put a webhook token in `{:?}` output.
     #[test]
     fn parse_error_debug_never_prints_the_document() {
-        let path = PathBuf::from("/home/rin/.shep/shep.toml");
+        let path = PathBuf::from("/home/ada/.shep/shep.toml");
         let secret = "https://hooks.example.com/services/T00/B00/super-secret-token";
         let broken = format!("[dog.bark]\nwebhook = \"{secret}\"\n[daemon\n");
         let source = broken.parse::<DocumentMut>().unwrap_err();
@@ -1226,7 +1223,7 @@ mod tests {
         assert!(!debug.contains("hooks.example.com"), "{debug}");
         assert_eq!(
             debug,
-            "Parse { path: \"/home/rin/.shep/shep.toml\", message: \"invalid table header\\n\
+            "Parse { path: \"/home/ada/.shep/shep.toml\", message: \"invalid table header\\n\
              expected `.`, `]`\" }"
         );
 

@@ -119,9 +119,7 @@ async fn a_client_remembers_the_path_it_connected_through() {
 
 /// Nothing else here reads the envelope the client actually sent, so an
 /// implementation that always sends `deadline_ms: None` would pass every test
-/// above while silently inheriting the daemon's default for every verb. This
-/// is the same gap the Phase 2b whole-branch review caught daemon-side; it
-/// does not ship again client-side.
+/// above while silently inheriting the daemon's default for every verb.
 #[tokio::test]
 async fn every_request_carries_an_explicit_deadline_on_the_wire() {
     let dir = tempfile::tempdir().unwrap();

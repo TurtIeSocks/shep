@@ -932,7 +932,7 @@ mod tests {
     /// [`mixed_flock`], with two of its four rows carrying the real smit
     /// strings a deploy dog paints -- not a hand-built `Some("x")`, since
     /// the requirement under test is about a real smit at a real terminal
-    /// width. Taken verbatim from `/Users/rin/GitHub/shep-deploy/src/smit.rs`.
+    /// width. Taken verbatim from `~/GitHub/shep-deploy/src/smit.rs`.
     fn mixed_flock_with_smits() -> FlockRows {
         let mut flock = mixed_flock(ProcStatus::Starting);
         flock.0[0].smit = Some("\u{25b2} main@a1b2c3".to_string());
@@ -944,9 +944,9 @@ mod tests {
     /// nothing dropped.
     ///
     /// Width 97, not this module's usual 80 (`mixed_flock`'s own doc has the
-    /// exception and the arithmetic): task 49's `EXIT` column and task 7's
-    /// `SMIT` column each cost the fixture seven columns they had no slack
-    /// left to give up, so 80 no longer fits `Starting`'s word
+    /// exception and the arithmetic): the `EXIT` and `SMIT` columns each
+    /// cost the fixture seven columns they had no slack left to give up, so
+    /// 80 no longer fits `Starting`'s word
     /// (`"starting"`, the second-longest Butter-role word after
     /// `WaitingRestart`) alongside them. This test's own job was never
     /// "prove it fits at exactly the realistic fallback" -- that boundary
@@ -1008,11 +1008,11 @@ mod tests {
     /// smit. Asserted rather than assumed: `table.rs`'s own note at :875
     /// records that adding EXIT cost 7 columns and forced the wide fixture
     /// from 80 to 90, and a later column will move this too. When it moves,
-    /// that is a decision about Rin's full-width condition, not a number to
+    /// that is a decision about the maintainer's full-width condition, not a number to
     /// quietly update.
     const FULL_WIDTH: usize = 93;
 
-    /// fails if a smit is dropped at full width. Rin's permission to drop
+    /// fails if a smit is dropped at full width. The maintainer's permission to drop
     /// it on a narrow terminal was conditional on it being seen regularly
     /// at a wide one, so a later column that crowded it out here would
     /// reopen a decision that was already made. This is the half of that

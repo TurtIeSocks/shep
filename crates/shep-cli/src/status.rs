@@ -195,8 +195,8 @@ mod tests {
     fn at(online: Option<Online>) -> ShepherdStatus {
         ShepherdStatus {
             online,
-            home: PathBuf::from("/home/rin/.shep"),
-            socket: PathBuf::from("/home/rin/.shep/run/shep.sock"),
+            home: PathBuf::from("/home/ada/.shep"),
+            socket: PathBuf::from("/home/ada/.shep/run/shep.sock"),
         }
     }
 
@@ -206,7 +206,7 @@ mod tests {
     fn the_offline_line_names_the_home_and_the_way_out() {
         let line = one_line(&at(None));
         assert!(line.contains("no shepherd running"), "{line}");
-        assert!(line.contains("/home/rin/.shep"), "{line}");
+        assert!(line.contains("/home/ada/.shep"), "{line}");
         assert!(line.contains("shep start"), "{line}");
     }
 
@@ -220,7 +220,7 @@ mod tests {
         })));
         assert!(line.contains("online"), "{line}");
         assert!(line.contains("4823"), "{line}");
-        assert!(line.contains("/home/rin/.shep"), "{line}");
+        assert!(line.contains("/home/ada/.shep"), "{line}");
     }
 
     /// No em dashes in copy a user reads.

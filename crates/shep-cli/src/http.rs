@@ -3,7 +3,7 @@
 //!
 //! Hand-rolled rather than pulled from a crate, and the reason is the whole
 //! dependency tree: this workspace carries no HTTP server and does not want
-//! one for a loopback endpoint serving one path, and — Rin's 2026-08-15
+//! one for a loopback endpoint serving one path, and — the maintainer's 2026-08-15
 //! ruling on `serve` — no more of one for a genuinely simple static file
 //! server over code this crate already owns. What it needs is a request
 //! line, a header map and a body — under a hundred lines against

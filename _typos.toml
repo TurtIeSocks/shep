@@ -7,8 +7,7 @@
 
 [default.extend-words]
 # The maintainer's name (and its lowercase form, as it appears inside example
-# shell paths like `/Users/rin/GitHub/...`) — not a typo of "ring"/"rain"/etc.
-rin = "rin"
+# shell paths like `~/GitHub/...`) — not a typo of "ring"/"rain"/etc.
 
 # The real TUI crate this project depends on and documents throughout
 # `shep lookout` (crates/shep-cli/src/lookout, docs/lookout). Not "ratatouille".

@@ -1,11 +1,11 @@
 # Reading the dog index from the CLI: design
 
 **Date:** 2026-08-21
-**Status:** delegate-mode design, approved by Rin
+**Status:** delegate-mode design, approved by the maintainer
 **Scope:** `shep dogs --available`. Discovery only. Not `shep install`.
 
 Follows [the community dog index](2026-08-20-community-dog-index-design.md),
-which landed the JSON and the page. This is the shep-side half Rin named when
+which landed the JSON and the page. This is the shep-side half the maintainer named when
 she proposed it: the index is machine-readable, so the CLI can read it.
 
 ## Scope, and why discovery ships alone
@@ -168,7 +168,7 @@ hold in their head at once.
 **Note for whoever implements this:** `Commands::Dogs` is a **unit variant**
 today (`crates/shep-cli/src/lib.rs:1125`), so adding the flag means giving it
 a `DogsArgs`, which touches the `Commands` enum and the wiring test around
-`lib.rs:1696`. `crates/shep-cli/src/cli.rs` also carries **Rin's own
+`lib.rs:1696`. `crates/shep-cli/src/cli.rs` also carries **the maintainer's own
 uncommitted work** near `DevArgs` (`cli.rs:1097`). Different region, so no
 conflict, but stage by name and **never run `git checkout` on that file**.
 
@@ -203,7 +203,7 @@ pointed at it:
 
 ## 6. Assumptions
 
-Judgement calls made on Rin's behalf, per delegate mode. All were presented
+Judgement calls made on the maintainer's behalf, per delegate mode. All were presented
 and approved before this document was written.
 
 1. **Discovery only.** `shep install` is deferred to its own spec.

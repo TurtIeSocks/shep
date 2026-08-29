@@ -4,10 +4,8 @@
 //! crash that leaves raw mode and the alternate screen active is, per
 //! `term.rs`'s own doc, the worst failure a TUI can have.
 //!
-//! Phase 12a Task 7's report describes checking this once, by hand, with a
-//! temporary instrumented binary and `script`, then deleting the harness —
-//! leaving nothing in the suite to catch a future refactor that swaps the
-//! two statements back. This file is the permanent replacement.
+//! This file is the permanent check that catches a future refactor swapping
+//! the two statements back.
 //!
 //! **How the ordering becomes observable without a real terminal or a
 //! pty.** `restore()` writes its `LeaveAlternateScreen`/`Show` escapes to

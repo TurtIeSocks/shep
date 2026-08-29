@@ -691,20 +691,16 @@ mod tests {
     /// Every `bleats(...)`/`bleats_with_signal(...)` call in this module is
     /// bounded by this timeout — a broken implementation that hangs (e.g. a
     /// drain that never terminates, or a follow that never observes an
-    /// interrupt) fails with a named assertion instead of a killed CI job
-    /// (Global Constraints: nine tests have already shipped that fail only
-    /// by hanging).
+    /// interrupt) fails with a named assertion instead of a killed CI job.
     const RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// `daemon.close_after_subscribe()` — not `daemon.close()` — ends the
     /// connection right after the real `Subscribe` this test's `bleats`
     /// call issues has been served and anything queued via `push` has been
-    /// flushed. That is what makes this test scheduler-independent: unlike
-    /// the old `--no-follow` drain arm (retired by the amendment that reads
-    /// log files instead), a follow that runs to end-of-stream observes
-    /// everything pushed before the close, in order, on any executor —
-    /// there is no longer a race between "the events arrived" and "the loop
-    /// decided nothing was buffered".
+    /// flushed. That is what makes this test scheduler-independent: a
+    /// follow that runs to end-of-stream observes everything pushed before
+    /// the close, in order, on any executor — there is no race between "the
+    /// events arrived" and "the loop decided nothing was buffered".
     #[tokio::test]
     async fn ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare() {
         let dir = tempfile::tempdir().unwrap();
@@ -1147,10 +1143,10 @@ mod tests {
         );
     }
 
-    /// Critical fix (item 1): `BusEvent::Dropped` used to fall into
-    /// `handle_event`'s `_ => Ok(())` catch-all and vanish — the daemon's
-    /// own outbound queue overflowing is exactly the "a sheep went quiet"
-    /// failure mode this module's doc warns against swallowing silently.
+    /// fails if `BusEvent::Dropped` falls into `handle_event`'s `_ => Ok(())`
+    /// catch-all and vanishes — the daemon's own outbound queue overflowing
+    /// is exactly the "a sheep went quiet" failure mode this module's doc
+    /// warns against swallowing silently.
     ///
     /// `Dropped` (the daemon's queue) and `Lagged` (this client's own
     /// receiver falling behind) are different causes and must read
@@ -1370,7 +1366,7 @@ mod tests {
         );
     }
 
-    /// The bug Rin hit: a sheep crashes, `shep bleats <name>` is run after
+    /// The bug the maintainer hit: a sheep crashes, `shep bleats <name>` is run after
     /// the fact, and following alone prints an empty screen while the reason
     /// sits in the log file. The backlog is what makes the reason reachable
     /// without having to start the sheep again in a second window.
@@ -1638,10 +1634,9 @@ mod tests {
     /// cache's arbitrary `HashMap` order cannot be what makes the assertion
     /// pass either.
     ///
-    /// It read `a` 1, `b` 2 until this change, which made name order and id
-    /// order the same sequence -- so once `bleats` moved to name order the
-    /// test went on passing while no longer able to tell the two apart, and
-    /// its name still said `id`.
+    /// If id order and name order ever match, the test passes without being
+    /// able to tell the two apart, so the fixture must keep them
+    /// disagreeing.
     #[tokio::test]
     async fn files_are_printed_in_name_order() {
         let dir = tempfile::tempdir().unwrap();

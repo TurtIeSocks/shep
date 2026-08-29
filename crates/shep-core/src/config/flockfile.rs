@@ -24,9 +24,10 @@ pub struct Flockfile {
     pub apps: Vec<AppConfig>,
 }
 
-// Forward-compat decision (Phase 1 final review): the top level is locked to
-// the `app` key on purpose — a typo'd key must fail loudly. A future schema
-// key (e.g. `version`) gets added HERE explicitly; older binaries then
+// Forward-compat decision: application entries are locked to the `app` key
+// on purpose — a typo'd key must fail loudly. `$schema` and `dog` are the
+// two keys explicitly let in beside it (see their own field docs below); a
+// future schema key gets added the same explicit way; older binaries then
 // reject newer Flockfiles by design instead of silently ignoring config.
 #[derive(Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -490,7 +491,7 @@ args = ["job.py"]
         );
     }
 
-    /// fails if a `.js` name is ever added to the discovery order. Rin's
+    /// fails if a `.js` name is ever added to the discovery order. The maintainer's
     /// ruling, 2026-08-15: a `.js` Flockfile is read only when named
     /// explicitly on the command line, because reading one runs node on it,
     /// and `cd` into a cloned repo followed by `shep start` must not execute

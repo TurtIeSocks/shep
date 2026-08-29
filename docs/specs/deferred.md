@@ -10,7 +10,7 @@ Linked from spec §2.
 
 ## Scope decision, 2026-08-12: everything below §2's six cuts ships in v1
 
-Rin's call, after the five v1.1 audits came back: *"we should probably fix
+The maintainer's call, after the five v1.1 audits came back: *"we should probably fix
 everything in v1. We're not in a rush to release this to the public. We want
 a hot looking app right off the bat if we have to compete with well
 established apps like pm2 and other rust attempts."*
@@ -27,7 +27,7 @@ order:
    then the wire and config asymmetries, then the tooling and doc staleness.
 2. **The rest of the v1.0 surface** — serve, dev/runtime, `.js` Flockfile,
    schemars, the daemon-config flags layer, and openrc + BSD rc.d.
-3. ~~**The Windows functional tier — last**~~ (Rin, 2026-08-12). **Superseded
+3. ~~**The Windows functional tier — last**~~ (the maintainer, 2026-08-12). **Superseded
    2026-08-15: Windows is out of v1 entirely** and moved to the v1.1+ section
    below. The estimate that was "mostly guesswork" has since been made, and it
    is what changed the decision — see
@@ -102,7 +102,7 @@ squeezed into the Windows tier's own pull request.
 
 **Severity, honestly: this is recorded, not queued.** It needs an attacker
 already running code as a DIFFERENT account on the same machine, winning a
-millisecond race, against a Windows install running shep. Rin's read, and it
+millisecond race, against a Windows install running shep. The maintainer's read, and it
 is the right one: a shep-on-Windows user who also has a hostile local account
 on the same box is close to a nonexistent population, and the fix costs a
 redesign of the transport seam plus new unsafe FFI. Do not spend that on
@@ -253,7 +253,7 @@ to a branch with a PR open; a `schedule` row adds one run a week regardless.
 Linux job cross-compiling to the GNU target -- it costs nothing extra on the
 multiplier table even though it targets Windows.)
 
-**Superseded 2026-08-16: Rin turned it on.** `push` to `main` and
+**Superseded 2026-08-16: the maintainer turned it on.** `push` to `main` and
 `pull_request` now trigger the file. The weekly `schedule` row is still off,
 because a full 19-job run against an unchanged tree spends the expensive part
 of this file to learn nothing; it is worth adding once the repository is public
@@ -654,7 +654,7 @@ the bad index, which is exactly the debugging cost IR-21 exists to avoid.
 
 ### A Flockfile's relative `script` resolves against the daemon's cwd -- FIXED, Phase 17
 
-Found 2026-08-19 by Rin, asking what `cwd` does while writing `shep init`'s
+Found 2026-08-19 by the maintainer, asking what `cwd` does while writing `shep init`'s
 skeleton. Measured with three distinct directories so nothing could be
 confused for anything else.
 
@@ -695,7 +695,7 @@ also fixes the documentation problem it caused:** `shep init`'s skeleton wants
 to say something true about `cwd`, and today the honest sentence is awkward
 because the answer differs between the ad-hoc and Flockfile paths.
 
-**Fixed in Phase 17.** Rin chose the second option: an app that names no
+**Fixed in Phase 17.** the maintainer chose the second option: an app that names no
 `cwd` gets the Flockfile's own directory, absolutised, so the rule fits in
 one sentence an operator can read. Verified against a real daemon with three
 distinct directories -- shepherd in one, Flockfile in another, invocation in a
@@ -704,7 +704,7 @@ third -- and the child now runs where its Flockfile lives.
 ### `~/` is not expanded in any path a Flockfile carries -- FIXED, Phase 17
 
 Found 2026-08-19, immediately after the cwd finding above and by the same
-route: Rin wrote `cwd = "~/web-server"` as an example in `shep init`'s
+route: the maintainer wrote `cwd = "~/web-server"` as an example in `shep init`'s
 scaffold, and it does not work.
 
 ```
@@ -718,7 +718,7 @@ literally named `~`. This is correct at the layer it sits in -- `~` is a shell
 feature, expanded before a program ever sees an argument -- and a value read
 from a file has no shell between it and the parser.
 
-**Rin's decision: shep should expand it.** In her words: "it does kind of seem
+**the maintainer's decision: shep should expand it.** In her words: "it does kind of seem
 like a daemon should somewhat emulate the jobs of a shell? Since we're
 replacing the functionality for someone to use `bun run index.js --cwd
 '/srv/server'`." A process manager stands in for the interactive shell that
@@ -789,7 +789,7 @@ the thing the ecosystem rule exists to prevent.
   form in `AppConfig`)".
 
 So parse-only is available cheaply and asymmetrically, if it is wanted. Not
-picked here: the grammar is Rin's, it is a wire decision, and the exercise's
+picked here: the grammar is the maintainer's, it is a wire decision, and the exercise's
 job was to find the friction rather than resolve it.
 
 ### `shep adopt`'s vetting runs the candidate against the WRONG `$SHEP_HOME` -- FIXED, 2026-08-25
@@ -858,7 +858,7 @@ Three fixes, cheap, and they compose:
    operator's terminal mid-vet, and a hostile one can imitate shep's own
    output at the exact moment the operator is deciding whether to trust it.
 
-Deferred only because it is Rin's call how far to take it. (1) alone is a
+Deferred only because it is the maintainer's call how far to take it. (1) alone is a
 two-line change and fixes the case that was actually hit.
 
 ### `emit_error`'s table arm prints whatever it is handed, unsanitised -- FIXED, 2026-08-25
@@ -906,7 +906,7 @@ guarantee lives in each error type rather than at the point of printing, so
 adding an error that interpolates untrusted text reintroduces the hole
 silently.
 
-Two ways to close it, and the choice is Rin's:
+Two ways to close it, and the choice is the maintainer's:
 
 1. **Sanitise inside `emit_error`'s table arm.** One place, closes the class
    for good. Costs a pass over every error message shep prints, and would
@@ -966,7 +966,7 @@ and carries that pid is the dog itself, and its `name` is the key.
 `shep-log-rotate` does this. It works, and every dog author would have to
 reinvent it, having first discovered the problem the hard way.
 
-Three ways out, none of them large, and the choice is Rin's:
+Three ways out, none of them large, and the choice is the maintainer's:
 
 1. **Pass the name after all**, as one argument or as `SHEP_DOG_NAME`. It
    contradicts `dog_app`'s comment, but an environment variable is not an argv
@@ -989,7 +989,7 @@ command, and then the operator has an adopted dog with no `[dog.<name>]`
 section and nothing telling them what its knobs are. The README is the only
 answer today.
 
-Rin asked whether a dog's repo could ship a `Flockfile.toml` that `shep adopt`
+The maintainer asked whether a dog's repo could ship a `Flockfile.toml` that `shep adopt`
 reads. It cannot: `RawFlockfile` is `deny_unknown_fields` over exactly
 `$schema` and `app`, so a Flockfile cannot mention a dog. That is a
 file-ownership line rather than an oversight. A Flockfile is the operator's
@@ -1029,7 +1029,7 @@ tarball contents cannot be corrected for a version after it is published.
 
 ### `shep install` does not exist, and a scanner is not what would make it safe
 
-Asked by Rin on 2026-08-26, the day the first external dog published.
+Asked by the maintainer on 2026-08-26, the day the first external dog published.
 
 **What shep offers today is discovery, not installation.** `shep dogs
 --available` reads the community index and prints two copy-pasteable commands
@@ -1409,13 +1409,13 @@ are not; `kill` takes the shepherd itself down, and whistle's own connection
 with it; `signal_sheep` and `whisper` take free-form input whose blast
 radius is not shep's to bound; `scale_flock` takes a count a model can be
 off by an order of magnitude on. That is a judgement about what an agent
-should be trusted with, not a technical limit, and it is Rin's to overrule.
+should be trusted with, not a technical limit, and it is the maintainer's to overrule.
 
 **`shep serve`, `shep dev` and `shep runtime`** (spec §9, §13) **shipped**,
 Phase 15, closing the last three v1.0 verbs and the `[[bin]]` gap this file
 used to name:
 
-- **`serve` is hand-rolled, not axum/tower-http** (Rin's ruling, 2026-08-15).
+- **`serve` is hand-rolled, not axum/tower-http** (the maintainer's ruling, 2026-08-15).
   `crates/shep-cli/src/serve/` is six modules — `path`, `fs`, `mime`,
   `listing`, `auth`, `worker` — over `http.rs`, which moved up out of `dog/`
   to the crate root to serve both.
@@ -1471,7 +1471,7 @@ to lose.
 
 ### Per-sheep build and update scripts
 
-Rin's, 2026-08-26, written down before it got lost:
+The maintainer's, 2026-08-26, written down before it got lost:
 
 > I would really love to add the ability for users to add build scripts to
 > shep for each of their sheep. `shep build koji`,
@@ -1499,7 +1499,7 @@ surface it is still refusing.
 build koji` on its own is a task runner with extra steps, and `just`, `make`
 and npm scripts already exist. What replaces a janky script is pull, then
 build, then restart, with the guarantee that a failed build does not restart
-anything. Rin's own `--restart` flag already gestures at this. The
+anything. The maintainer's own `--restart` flag already gestures at this. The
 failure semantics are the whole value, so a design that ships the verbs
 without deciding them has shipped the thin half.
 
@@ -1541,7 +1541,7 @@ there.
 
 ### Rendering each dog's README as its own docs-site page — rejected
 
-Rin proposed this, 2026-08-26, then agreed to drop it once the reasoning
+The maintainer proposed this, 2026-08-26, then agreed to drop it once the reasoning
 below was laid out. Recorded so the argument does not have to be re-derived
 the next time it sounds like a nice idea.
 
@@ -1658,5 +1658,5 @@ Recommendation is 1, with the doc change from 2 alongside it, because even
 after 1 the pre-drain probe pass remains meaningless and should stop being
 described as verification.
 
-Not built here because it changes what a reload promises, which is Rin's call
+Not built here because it changes what a reload promises, which is the maintainer's call
 rather than a fix to apply on the way past.

@@ -15,7 +15,7 @@
 Every task implicitly includes these; verbatim from the governing docs:
 
 - **Invoke the `shep-idiomatic-rust` skill before writing any Rust** (CLAUDE.md hard trigger). Cite IR rules in review notes.
-- **Clean-room:** never open `/Users/rin/GitHub/pm2` — build from `docs/specs/shep-v1.md` + `docs/systematic-refactor/refactor-workspace/map.md` only. Spec wins over map on conflict.
+- **Clean-room:** never open `~/GitHub/pm2` — build from `docs/specs/shep-v1.md` + `docs/systematic-refactor/refactor-workspace/map.md` only. Spec wins over map on conflict.
 - **No panicking constructors in shep-core** — all fallible constructors return `Result` (IR-21).
 - `impl core::error::Error`, never `std::error::Error` (IR-19). Error enums: per-module, variant docs state the precise condition, manual `Display` via `f.write_str` for fieldless variants (IR-18/19).
 - Every `Result`-returning pub fn documents `# Errors`; `# Panics` ⇔ `#[track_caller]` (IR-28/21).
@@ -741,21 +741,21 @@ mod tests {
 
     #[test]
     fn default_layout_under_home_dir() {
-        let p = ShepPaths::resolve(&no_env, Path::new("/home/rin"));
-        assert_eq!(p.home, Path::new("/home/rin/.shep"));
-        assert_eq!(p.daemon_config, Path::new("/home/rin/.shep/shep.toml"));
-        assert_eq!(p.snapshot, Path::new("/home/rin/.shep/flock.json"));
-        assert_eq!(p.logs, Path::new("/home/rin/.shep/logs"));
-        assert_eq!(p.pids, Path::new("/home/rin/.shep/pids"));
-        assert_eq!(p.run, Path::new("/home/rin/.shep/run"));
-        assert_eq!(p.socket, Path::new("/home/rin/.shep/run/shep.sock"));
-        assert_eq!(p.barks, Path::new("/home/rin/.shep/barks.jsonl"));
+        let p = ShepPaths::resolve(&no_env, Path::new("/home/ada"));
+        assert_eq!(p.home, Path::new("/home/ada/.shep"));
+        assert_eq!(p.daemon_config, Path::new("/home/ada/.shep/shep.toml"));
+        assert_eq!(p.snapshot, Path::new("/home/ada/.shep/flock.json"));
+        assert_eq!(p.logs, Path::new("/home/ada/.shep/logs"));
+        assert_eq!(p.pids, Path::new("/home/ada/.shep/pids"));
+        assert_eq!(p.run, Path::new("/home/ada/.shep/run"));
+        assert_eq!(p.socket, Path::new("/home/ada/.shep/run/shep.sock"));
+        assert_eq!(p.barks, Path::new("/home/ada/.shep/barks.jsonl"));
     }
 
     #[test]
     fn shep_home_env_overrides_root() {
         let env = |key: &str| (key == "SHEP_HOME").then(|| "/srv/shep".to_string());
-        let p = ShepPaths::resolve(&env, Path::new("/home/rin"));
+        let p = ShepPaths::resolve(&env, Path::new("/home/ada"));
         assert_eq!(p.home, Path::new("/srv/shep"));
         assert_eq!(p.socket, Path::new("/srv/shep/run/shep.sock"));
     }
@@ -764,10 +764,10 @@ mod tests {
     fn pipe_name_is_per_home_and_sanitized() {
         // Windows transport identity (spec §6): derived from SHEP_HOME so
         // two homes never share a pipe; non-alphanumerics collapse to '-'.
-        let p = ShepPaths::resolve(&no_env, Path::new("/home/rin"));
-        assert_eq!(p.pipe_name(), r"\\.\pipe\shep-home-rin--shep");
+        let p = ShepPaths::resolve(&no_env, Path::new("/home/ada"));
+        assert_eq!(p.pipe_name(), r"\\.\pipe\shep-home-ada--shep");
         let env = |key: &str| (key == "SHEP_HOME").then(|| "/srv/shep".to_string());
-        let q = ShepPaths::resolve(&env, Path::new("/home/rin"));
+        let q = ShepPaths::resolve(&env, Path::new("/home/ada"));
         assert_eq!(q.pipe_name(), r"\\.\pipe\shep-srv-shep");
     }
 }
@@ -2769,5 +2769,5 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - All 13 tasks committed; four gates green on the workspace.
 - `cargo test -p shep-core` covers: value grammars (strict), config defaults + round-trips, Flockfile formats + discovery, daemon config layering, selector rules, wire snapshots + v1 fixture, framed round-trip.
 - Insta snapshots committed under `crates/shep-core/src/protocol/snapshots/`.
-- CI workflow live (push to see it run — first push to a remote happens whenever Rin wires one).
+- CI workflow live (push to see it run — first push to a remote happens whenever the maintainer wires one).
 - Handoff: Phase 2 plan (daemon core) gets written against these exact interfaces.

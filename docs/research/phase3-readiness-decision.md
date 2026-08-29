@@ -1,6 +1,6 @@
 # Phase 3 readiness decision — where the daemon-boot `unsafe` goes, or whether it goes away
 
-Status: research for Rin's ruling · 2026-08-08 · read-only investigation, no code changed.
+Status: research for the maintainer's ruling · 2026-08-08 · read-only investigation, no code changed.
 Ground truth: `crates/shep-daemon/src/sys.rs` (rationale essay + `adopt_fd`'s `# Safety`),
 `crates/shep-daemon/src/boot.rs` (`BootOptions`, `boot`, `write_ready`, `DaemonReady`,
 `PidfileLock`), IR-7/IR-22/IR-23/IR-24, spec §3/§6/§7/§10/§11/§13.4, SECURITY.md,
@@ -8,7 +8,7 @@ Ground truth: `crates/shep-daemon/src/sys.rs` (rationale essay + `adopt_fd`'s `#
 Phase 2b plan's own Decision-1 corrections.
 
 **Ranking: C > A > B.** Option B is unsound in the form proposed. Option A costs two IR
-rules and re-litigates a call Rin already made. Option C deletes the mechanism.
+rules and re-litigates a call the maintainer already made. Option C deletes the mechanism.
 
 ---
 
@@ -68,7 +68,7 @@ growth (clap surface, TUI, whistle, serve, dogs, import, runtime/dev modes), and
 agent-written code. `forbid` is the thing that makes IR-22 self-policing; `deny` + a
 convention that the allow stays narrow is the thing that erodes.
 
-**It is also the ruling Rin already made, relocated one crate over.** Yesterday a subagent
+**It is also the ruling the maintainer already made, relocated one crate over.** Yesterday a subagent
 proposed rewording IR-22 to permit an `unsafe fn`'s call-site block outside `sys.rs`. She
 rejected the rewording and chose "fix the design instead". Option A is that rewording with
 `boot.rs` swapped for `main.rs`. The fix it replaced (b729ed9) is barely a day old.
@@ -218,13 +218,13 @@ already-mandated connect-with-backoff (spec §6) plus `HelloAck` does not alread
 `HelloAck { daemon_version, protocol, pid }` is a strict superset of
 `DaemonReady { pid, version }`.**
 
-**Does it need Rin's sign-off? Split the answer — and this is the part to act on.**
+**Does it need the maintainer's sign-off? Split the answer — and this is the part to act on.**
 
 *Does not need sign-off, because Phase 3 needs it either way:* the poll-connect +
 `try_wait` + backoff machinery in `shep-client` is required by spec §6 and by the
 systemd-started-daemon case (a daemon shep did not spawn has no pipe to report on). Build it
 now. Doing so makes the pipe provably dead code — which is also the strongest possible
-evidence to hand Rin.
+evidence to hand the maintainer.
 
 *Needs sign-off, because it is a ruling, not a design fix:* deleting `sys.rs`, retiring
 IR-22, widening IR-7, editing spec §3, and removing the `BootOptions::ready_fd` field she
@@ -234,12 +234,12 @@ numbered rules — and doing that to her own day-old commit without asking reads
 overriding a human ruling, even though the *direction* (remove the unsafe rather than widen
 the rule) is precisely the one she chose. Note also that the pipe is **not** in map.md's
 ruled-decision list or goals.md's open questions, so CLAUDE.md's "if a decision is listed
-there, it is Rin's" does not formally reserve it — which is why this is a judgement call and
+there, it is the maintainer's" does not formally reserve it — which is why this is a judgement call and
 not a clear-cut hold.
 
 **Sequencing that needs no permission to start:** build C's machinery (forced), leave
 `sys.rs` and `ready_fd` in place and unreferenced by the CLI, and put the deletion +
-IR amendment behind one yes/no from Rin. If she says no, Option A is the fallback and costs
+IR amendment behind one yes/no from the maintainer. If she says no, Option A is the fallback and costs
 one `#[allow]` plus the IR-7/IR-22 amendments — but at that point the pipe is *demonstrably*
 carrying no weight, which is the argument she should get to weigh.
 

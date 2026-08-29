@@ -88,7 +88,7 @@ Consolidated from 9 trace agents. Full evidence per module: [trace/_all-verdicts
 | Module | Note |
 |---|---|
 | API/Version.js (pm2 pull/backward/forward) | niche; shell-out design ready if demanded |
-| API/Modules/* | redesign around TAR concept; "support Node pm2 modules?" needs Rin's call |
+| API/Modules/* | redesign around TAR concept; "support Node pm2 modules?" needs the maintainer's call |
 | API/Configuration.js CLI | needed only if module system lands |
 | examples/ | future e2e fixtures (interpreter matrix) |
 | Vendored module tests | consult during protocol design, don't port |

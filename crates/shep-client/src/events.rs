@@ -108,7 +108,7 @@ impl core::error::Error for Lagged {}
 mod tests {
     use super::*;
 
-    /// Whole-branch review item 6: `Lagged` is the error half of
+    /// `Lagged` is the error half of
     /// `EventStream`'s `Item` — public API — but implemented neither
     /// `Display` nor `core::error::Error`, the sole exception among this
     /// crate's error types (`ConnectError`, `RequestError`, `SpawnError` all

@@ -1,9 +1,8 @@
 ---
 source: crates/shep-cli/src/lookout/frames.rs
-assertion_line: 1599
 expression: render_text(&buffer)
 ---
-shep lookout   /home/rin/.shep                                                                            6 in the flock
+shep lookout   /home/ada/.shep                                                                            6 in the flock
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 > 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            

@@ -5,7 +5,7 @@ quality bar). Numbered rules — cite as `IR-<n>` in reviews. Full pattern
 citations with file:line evidence live in [idiomatic-rust/lenses/](idiomatic-rust/lenses/)
 (api, docs, testing, rigor). This doc is the contract; the lenses are the proof.
 
-Priority when rules collide: **Readability > KISS > DRY** (Rin's global order).
+Priority when rules collide: **Readability > KISS > DRY** (the maintainer's global order).
 
 ## A. Workspace & Cargo
 

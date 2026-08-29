@@ -20,7 +20,7 @@ edition = "2024"
 # not a future one. Also the floor for ratatui/sysinfo/rmcp in later phases.
 rust-version = "1.88"
 repository = "https://github.com/TurtIeSocks/shep"
-# Clean-room implementation — pm2 is feature-list inspiration only (Rin, 2026-08-07).
+# Clean-room implementation — pm2 is feature-list inspiration only (the maintainer, 2026-08-07).
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -215,7 +215,7 @@ notify-debouncer-full = { version = "0.7.0", default-features = false }
 # but the pin is unconditional because that is where the rehearsal runs.
 fsevent-sys = "4.1.0"
 # Bark's sinks are Discord and Slack webhooks, which are HTTPS, so this is
-# the one thing in the workspace that needs TLS. Rin's ruling (2026-08-12)
+# the one thing in the workspace that needs TLS. The maintainer's ruling (2026-08-12)
 # is a hand-rolled HTTP/1.1 client over tokio-rustls rather than reqwest:
 # reqwest's default rustls feature costs +93 crates over this workspace's
 # existing 196 and pulls aws-lc-sys, which needs BOTH a C compiler and cmake;
@@ -295,7 +295,7 @@ time = { version = "0.3.37", default-features = false }
 # "unsupported item type" on anything it does not recognize; 0.3.4 adds
 # that arm). `-Z minimal-versions` picked 0.3.0 and hit exactly that panic.
 instability = { version = "0.3.4", default-features = false }
-# The MCP SDK, for `shep whistle` (spec §8, §9). Rin's ruling (2026-08-14),
+# The MCP SDK, for `shep whistle` (spec §8, §9). The maintainer's ruling (2026-08-14),
 # taken against a hand-rolled stdio JSON-RPC loop: MCP is an evolving
 # protocol, and tracking an SDK beats owning a parser for something whose
 # wire format is still moving. Deliberately the opposite of the `serve`

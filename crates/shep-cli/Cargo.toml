@@ -103,7 +103,7 @@ clap_complete = { version = "4.6.0", default-features = false }
 # (confirmed: `cargo tree -p shep-cli` prints the same line count before and
 # after — see Task 6's report).
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util", "fs"] }
-# `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks. Rin's ruling
+# `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks. The maintainer's ruling
 # (2026-08-12): a hand-rolled HTTP/1.1 client over `tokio-rustls`, not
 # `reqwest` — see the root `Cargo.toml` entry for the full accounting,
 # including what ring's own `cc` build dependency costs a cross-compile.

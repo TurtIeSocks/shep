@@ -335,7 +335,7 @@ mod tests {
         let app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         let frame = draw_to(&app, 28, 8);
@@ -370,7 +370,7 @@ mod tests {
         let app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         let frame = draw_to(&app, 100, 12);
@@ -424,7 +424,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         app.update(Msg::Snapshot {
@@ -462,14 +462,14 @@ mod tests {
     }
 
     /// fails if a frozen dashboard does not say so where it cannot be
-    /// missed. This is the whole of Rin's ruling made visible: last values
+    /// missed. This is the whole of the maintainer's ruling made visible: last values
     /// on screen, and a sentence admitting they are stale.
     #[test]
     fn a_frozen_link_puts_the_banner_under_the_title() {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         app.update(Msg::Frozen {
@@ -490,7 +490,7 @@ mod tests {
         let read_only = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             now,
         );
         assert!(draw_to(&read_only, 100, 12).contains("read-only"));
@@ -498,7 +498,7 @@ mod tests {
         let allowed = App::new(
             Palette::detect(None, None, None),
             Control::Allowed,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             now,
         );
         let frame = draw_to(&allowed, 100, 12);
@@ -514,7 +514,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         app.update(Msg::Snapshot {
@@ -684,7 +684,7 @@ mod tests {
                          {width}x{height}, row {i}"
                     );
                     assert!(
-                        !line.starts_with("out  /home/rin/.shep/logs/"),
+                        !line.starts_with("out  /home/ada/.shep/logs/"),
                         "the detail pane's out path sits inside the table's \
                          own rows at {width}x{height}, row {i}"
                     );
@@ -752,7 +752,7 @@ mod tests {
                     let positions: Vec<usize> = lines
                         .iter()
                         .enumerate()
-                        .filter(|(_, l)| l.starts_with("out  /home/rin/.shep/logs/"))
+                        .filter(|(_, l)| l.starts_with("out  /home/ada/.shep/logs/"))
                         .map(|(i, _)| i)
                         .collect();
                     assert_eq!(
@@ -770,7 +770,7 @@ mod tests {
         }
     }
 
-    /// fails if the flock table stops being the spine. Rin's ruling in one
+    /// fails if the flock table stops being the spine. The maintainer's ruling in one
     /// test: whatever else is on screen, the table gets the remainder, and at
     /// the tier where all three panes are up it still has room for more than
     /// a couple of rows.

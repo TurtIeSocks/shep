@@ -250,7 +250,7 @@ Verified against the manifests rather than assumed:
 
 Recorded because they were judgement calls, not requirements:
 
-1. `full` is the default. Rin asked for maximum whimsy; someone who wants
+1. `full` is the default. The maintainer asked for maximum whimsy; someone who wants
    less has `shep style` and a one-line config.
 2. The floor is three columns (`ID`, `NAME`, `STATUS`). Below the width even
    that needs, the table renders wider than the terminal rather than

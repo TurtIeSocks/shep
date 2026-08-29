@@ -102,11 +102,10 @@ impl fmt::Display for StyleLevel {
 /// Whether `NO_COLOR` vetoes colour: set and non-empty. An empty `NO_COLOR=`
 /// reads as unset -- the cross-ecosystem convention.
 ///
-/// First implemented inline in `lookout::theme::Palette::detect`, which
-/// shipped before this module had any colour-facing code of its own. Moved
-/// here so [`Presentation::new`] and that method call the one copy instead
-/// of each restating the rule: `mod lookout` is `#[cfg(unix)]` and this
-/// module is not, so here is the one place both a unix-only binding and an
+/// Lives here, not in `lookout::theme::Palette::detect`, so
+/// [`Presentation::new`] and that method call one copy instead of each
+/// restating the rule: `mod lookout` is `#[cfg(unix)]` and this module is
+/// not, so here is the one place both a unix-only binding and an
 /// unconditional one can reach.
 pub(crate) fn no_color_set(no_color: Option<&OsStr>) -> bool {
     no_color.is_some_and(|value| !value.is_empty())
@@ -115,10 +114,9 @@ pub(crate) fn no_color_set(no_color: Option<&OsStr>) -> bool {
 /// Whether the terminal supports the 256-colour tier: `$COLORTERM`
 /// containing `truecolor`/`24bit`, or `$TERM` containing `256color`.
 /// Anything else gets the 16-colour fallback -- erring narrow is the
-/// recoverable direction, the same reasoning `lookout::theme::Palette::detect`
-/// gives for the identical rule it used to restate here on its own.
+/// recoverable direction.
 ///
-/// Moved for the same reason [`no_color_set`] was: `output::paint`'s
+/// Lives here for the same reason [`no_color_set`] does: `output::paint`'s
 /// `anstyle` binding and `lookout::theme`'s `ratatui` binding both need the
 /// same yes/no answer to the same question, and only one of the two modules
 /// that binds it exists off unix.
@@ -149,21 +147,16 @@ pub(crate) fn deep_colour_terminal(term: Option<&OsStr>, colorterm: Option<&OsSt
 /// per-attempt decision local to that function and its one caller
 /// (`FlockRows::rows_for`) -- it is threaded as a plain `bool` parameter on
 /// `Render::rows_for` rather than living here, precisely because it is not
-/// a fact resolved once at the seam the way these four are. A first
-/// revision of this task put `status_word` on this struct; review moved
-/// it, because nothing but `table_of` ever wrote it and nothing but
-/// `FlockRows::status_cell` ever read it -- a field whose only honest
-/// description was "irrelevant here" had leaked out of a function-local
-/// decision onto crate-wide state that ~100 sites construct. `width`
-/// belongs here for the opposite reason: `table_of` used to call
-/// `crossterm::terminal::size()` itself, which reads the process's real
-/// controlling terminal -- including under `cargo test`, since a test
-/// binary launched from an interactive shell has one too. Only a harness
-/// with no controlling terminal ever made those tests pass by accident;
-/// a developer's own shell does not, and `table_of` read it anyway. `width`
-/// fixes that the same way `colour`/`deep_colour` already were fixed: a
-/// fact resolved once here and injected everywhere else, so the function
-/// that renders is pure in its inputs and provable at any width a test
+/// a fact resolved once at the seam the way these four are: nothing but
+/// `table_of` ever writes it and nothing but `FlockRows::status_cell` ever
+/// reads it, so it stays function-local rather than leaking onto
+/// crate-wide state that ~100 sites construct. `width` belongs here
+/// because a live `crossterm::terminal::size()` call reads the process's
+/// real controlling terminal, including under `cargo test` when the test
+/// binary was launched from an interactive shell -- only a harness with no
+/// controlling terminal makes such a test pass by accident. Resolving
+/// `width` once here and injecting it everywhere else keeps the function
+/// that renders pure in its inputs and provable at any width a test
 /// chooses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Presentation {
@@ -342,8 +335,7 @@ mod tests {
         );
     }
 
-    /// The rule `lookout::theme::Palette::detect` used to restate on its
-    /// own: `NO_COLOR` unset or empty is not set. An operator who exports
+    /// `NO_COLOR` unset or empty is not set. An operator who exports
     /// `NO_COLOR=` with no value must not silently lose every colour this
     /// crate draws, in the table or the dashboard alike.
     #[test]

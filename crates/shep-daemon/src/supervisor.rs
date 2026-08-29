@@ -231,13 +231,11 @@ pub(crate) enum BatchPolicy {
     /// spawn for and so no spawn to register it. Both are reported in the
     /// error as well.
     ///
-    /// The second used to leave nothing, on the reasoning that an app with
-    /// no resolvable identity must never run under the daemon's own. That
-    /// outcome is still ruled out, but by the row's
-    /// [`SpawnIdentity::Unresolved`] rather than by its absence, and absence
-    /// was costing the operator the one trace they had: under this policy
-    /// nobody is holding a terminal, so an app missing from `shep flock`
-    /// reads as one nobody ever configured.
+    /// An app with no resolvable identity must never run under the daemon's
+    /// own identity — that outcome is ruled out by the row's
+    /// [`SpawnIdentity::Unresolved`] rather than by leaving no row at all:
+    /// a missing row would cost the operator the one trace they had, since
+    /// an app missing from `shep flock` reads as one nobody ever configured.
     ///
     /// [`AllOrNothing`](Self::AllOrNothing) leaves no row for either cause,
     /// and that is not an inconsistency: it registers nothing at all.
@@ -636,12 +634,9 @@ pub(crate) enum Msg {
 /// `#[non_exhaustive]`: eight variants today cover lookup, spawn, a batch
 /// refused before it was registered, reload overlap, an invalid scale, and
 /// the two log-maintenance failure classes.
-/// The doc here used to forecast "a scale or pause verb" adding its own
-/// failure variant; the scale half of that has now landed as
-/// [`Self::InvalidScale`], and a pause verb, if one is ever built, is the
-/// next candidate for the same treatment rather than a reason to overload an
-/// existing variant. shep-daemon is a published library an out-of-tree
-/// matcher should not break for (IR-20).
+/// A pause verb, if one is ever built, is the next candidate for its own
+/// variant rather than a reason to overload an existing one. shep-daemon is
+/// a published library an out-of-tree matcher should not break for (IR-20).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorError {
@@ -1398,11 +1393,10 @@ impl SupervisorHandle {
     /// Full flock listing, by name and then by id
     /// (`shep_core::protocol::sort_flock`, which `snapshot_all` calls).
     ///
-    /// It used to keep each app's instances in their own instance-slot order
-    /// with reload ties broken by id. That is a finer key and no listing that
-    /// has crossed the wire can reproduce it, since `ProcessInfo` carries no
-    /// instance number, so it was dropped for the one rule every reply now
-    /// shares. See `snapshot_all` for the whole of that reasoning.
+    /// Not sorted by instance-slot order: `ProcessInfo` carries no instance
+    /// number, so no listing that has crossed the wire could reproduce a
+    /// finer key than name-then-id, and every reply shares this one rule
+    /// instead. See `snapshot_all`.
     ///
     /// Convenience over `Self::list_checked` for callers that don't need
     /// to distinguish "actor gone" from "empty flock" — mainly tests.
@@ -1589,14 +1583,14 @@ struct ReloadJob {
     /// and writes it here, and [`Actor::handle_reload_deadline`] drops any
     /// message that does not carry the current one.
     ///
-    /// A counter of its own rather than the replacement's id, which is what
-    /// this was at first. The id works as a staleness token only while a job
-    /// arms once per replacement, and `Verify` broke that: a second timer
-    /// stamped with the same `new_id` does not invalidate the first, so the
-    /// original watchdog was still free to fire mid-verify, drop the job, and
-    /// take the rest of a clustered app's queue with it. Ids are never reused
-    /// and neither are these, so a stamp from a previous job of the same app
-    /// cannot match either.
+    /// A counter of its own rather than the replacement's id: the id would
+    /// work as a staleness token only while a job arms once per replacement,
+    /// but `Verify` arms a second time — a second timer stamped with the
+    /// same `new_id` would not invalidate the first, leaving the original
+    /// watchdog free to fire mid-verify, drop the job, and take the rest of
+    /// a clustered app's queue with it. Ids are never reused and neither are
+    /// these, so a stamp from a previous job of the same app cannot match
+    /// either.
     deadline: u64,
 }
 
@@ -1645,8 +1639,8 @@ enum ReloadMode {
     /// It also fixes a failure the overlap never worked around. An app that
     /// does NOT set `SO_REUSEPORT` cannot have two instances bound to one
     /// port, so an overlapping reload of one spawns a replacement that takes
-    /// `EADDRINUSE` and crash-loops; measured on macOS, where Node cannot set
-    /// the option at all (`ENOTSUP`), at 64 such lines in one app's error log.
+    /// `EADDRINUSE` and crash-loops — including on macOS, where Node cannot
+    /// set the option at all (`ENOTSUP`).
     ///
     /// A single-instance app loses its name-group watch and cron worker for
     /// the width of the gap — they are armed per RUNNING instance, and for
@@ -2058,10 +2052,10 @@ struct SheepSlot {
     /// Delete-racing-Shutdown). `manual` records who owns the next Kill;
     /// `pending_delete` records intent that must survive regardless of who
     /// won that race, so a Delete can never be silently downgraded to a
-    /// Stop (or, worse, a Restart — a Delete racing a Restart the same way
-    /// used to respawn a brand-new live process and still tell the Delete
-    /// caller it succeeded) just because another command's marker got there
-    /// first. `handle_exited` checks this flag on every path that would
+    /// Stop (or, worse, a Restart, which would respawn a brand-new live
+    /// process and still tell the Delete caller it succeeded) just because
+    /// another command's marker got there first. `handle_exited` checks
+    /// this flag on every path that would
     /// otherwise skip `decide_on_exit` (today, just the manual-Restart
     /// early return) as well as on the `CleanStop` branch itself.
     pending_delete: bool,
@@ -2107,8 +2101,7 @@ struct SheepSlot {
     /// would be beyond the reach of the reload that rolls it back: a deploy
     /// tool would swap the release directory, ask for a reload, and be told
     /// `Ok` by a daemon that had quietly skipped the only instance there
-    /// was. Measured on the testbed, 2026-08-28, where it left the app down
-    /// behind an otherwise correct refusal.
+    /// was.
     ///
     /// Cleared wherever the id gets a new process or a new verdict, which is
     /// [`Actor::respawn`]'s success arm and [`Actor::went_online`]. Both are
@@ -2608,11 +2601,11 @@ impl<R: ProcessRunner> Actor<R> {
             let credentials = match privilege::resolve(app.config()) {
                 Ok(resolved) => resolved,
                 Err(err) => {
-                    // One refusal per app, not one per failed check. Both
-                    // arms used to run, so an app failing credentials AND
-                    // carrying an unresolvable path pushed twice and the
-                    // summary below could say "4 of 2 apps cannot start".
-                    // The reasons were each true; the count was not.
+                    // One refusal per app, not one per failed check: running
+                    // both arms would push twice for an app that fails
+                    // credentials AND carries an unresolvable path, and the
+                    // summary below could then say "4 of 2 apps cannot
+                    // start" — each reason true, the count not.
                     //
                     // Asks the policy, like every other stopping point in
                     // this function, and the policy decides what this app
@@ -2741,12 +2734,13 @@ impl<R: ProcessRunner> Actor<R> {
                                 return Err(SupervisorError::SpawnFailed(failure));
                             }
                             // The half `BatchPolicy` gated the pass above
-                            // for and did not reach: a bad entry that is not
-                            // LAST used to take every app after it with it,
-                            // and a muster roll restores in alphabetical
-                            // order, so that is not a race but a certainty
-                            // whenever the broken name sorts first. Every
-                            // remaining app still gets its turn.
+                            // for and did not reach: without this arm, a bad
+                            // entry that is not LAST would take every app
+                            // after it with it, and a muster roll restores
+                            // in alphabetical order, so that is not a race
+                            // but a certainty whenever the broken name sorts
+                            // first. Every remaining app still gets its
+                            // turn.
                             //
                             // `spawn_fresh` has already registered this one
                             // `Errored` before returning, which is the row
@@ -3307,11 +3301,10 @@ impl<R: ProcessRunner> Actor<R> {
     /// no reason, and the deferred aggregation reply has no per-id error
     /// slot, so this log line is the ONLY place an operator can learn why a
     /// restart did not produce a process: a binary replaced mid-deploy, an
-    /// `EAGAIN`, a `cwd` that is gone, a `user` that no longer resolves. One
-    /// of the two callers used to bind the runner's error as `_error` and
-    /// drop it, which left exactly those cases with an `errored` row and
-    /// nothing to read. Taking it as an argument is what stops a third
-    /// caller repeating that: there is no way in without one.
+    /// `EAGAIN`, a `cwd` that is gone, a `user` that no longer resolves.
+    /// Taking `reason` as an argument, rather than letting a caller bind and
+    /// drop it, is what stops that log line going silent: there is no way
+    /// in without one.
     fn respawn_failed(
         &mut self,
         id: u32,
@@ -3367,10 +3360,11 @@ impl<R: ProcessRunner> Actor<R> {
     /// command racing in against the SAME in-flight kill does not overwrite
     /// that marker or send a second Kill. It just rides the same eventual
     /// `Msg::Exited` to whatever terminal state the FIRST command's intent
-    /// produces, so both callers get the SAME honest terminal snapshot instead
-    /// of one of them being lied to (the old last-writer-wins bug handed a
-    /// `stop()` caller back an `Online` `ProcessInfo`). A `stop()` that lands
-    /// first still wins over a racing `restart()`, and vice versa.
+    /// produces, so both callers get the SAME honest terminal snapshot
+    /// instead of one of them being lied to — a naive last-writer-wins rule
+    /// would hand a `stop()` caller back an `Online` `ProcessInfo`. A
+    /// `stop()` that lands first still wins over a racing `restart()`, and
+    /// vice versa.
     ///
     /// With ONE carve-out, and it is not a fairness question: an operator's
     /// command takes the marker off an in-flight AUTOMATIC restart. First
@@ -3687,16 +3681,17 @@ impl<R: ProcessRunner> Actor<R> {
     /// Because the reply does not wait for them, a departing instance stays
     /// REGISTERED — marked [`SheepSlot::pending_delete`], partway through a
     /// kill ladder — until its exit lands. It is still in the map this
-    /// function counts `current` off. So `shep stock web 1 && shep stock web
-    /// 4` against an app that does not die instantly on `SIGTERM` (which is
-    /// every app that drains connections on shutdown) used to find four
-    /// slots, three of them doomed, call the second scale a no-op, answer
-    /// `Ok` with four instances and no shortfall, and let `rpc` record
-    /// `instances = 4` into the muster roll. The three then finished their
-    /// ladders and the flock settled to one. The roll said four. A later
-    /// `shep save` froze the lie, and a reboot brought up a count that had
-    /// never run — the same class the partial-scale write-back below exists
-    /// to close, arriving through a door it does not cover.
+    /// function counts `current` off. So without this refusal, `shep stock
+    /// web 1 && shep stock web 4` against an app that does not die instantly
+    /// on `SIGTERM` (which is every app that drains connections on
+    /// shutdown) would find four slots, three of them doomed, call the
+    /// second scale a no-op, answer `Ok` with four instances and no
+    /// shortfall, and let `rpc` record `instances = 4` into the muster
+    /// roll. The three would then finish their ladders and the flock would
+    /// settle to one — the roll would say four, a later `shep save` would
+    /// freeze the lie, and a reboot would bring up a count that had never
+    /// run — the same class the partial-scale write-back below exists to
+    /// close, arriving through a door it does not cover.
     ///
     /// Refused rather than counted around, and this is the choice worth
     /// arguing. Counting only the slots not marked for deletion would make
@@ -4518,18 +4513,17 @@ impl<R: ProcessRunner> Actor<R> {
             // With nothing to fall back to, the reload ends here instead. The
             // replacement is LEFT ALONE — killing it as well would empty the
             // instance slot outright, no entry, no restart, no report beyond a
-            // log line — but it is not marked `Online`, and that is the half
-            // this used to get wrong.
+            // log line — but it is not marked `Online`.
             //
             // `Online` means "running and, if configured, ready", and this one
             // is not: its probe never answered inside `listen_timeout`.
-            // Reporting it online anyway was the ordinary-start rule (Rin,
-            // 2026-08-08: a slow app must not become a restart loop) applied
-            // to a caller it does not fit. An ordinary start has nobody
-            // waiting on the answer; a reload has a deploy tool reading it as
-            // "the new release is serving", and answering `online` for an
-            // instance that never came up is how a broken release gets
-            // recorded as deployed. Found in production, 2026-08-28.
+            // Reporting it online anyway is the ordinary-start rule (a slow
+            // app must not become a restart loop) applied to a caller it
+            // does not fit. An ordinary start has nobody waiting on the
+            // answer; a reload has a deploy tool reading it as "the new
+            // release is serving", and answering `online` for an instance
+            // that never came up is how a broken release gets recorded as
+            // deployed.
             //
             // `Starting` stays, because it is the one status literally true of
             // the process: spawned, not yet ready. It costs the instance its
@@ -6076,10 +6070,10 @@ impl<R: ProcessRunner> Actor<R> {
             return;
         }
         if readiness == Readiness::TimedOut {
-            // Rin, 2026-08-08: a readiness timeout goes online anyway rather
-            // than erroring — treating it as a spawn failure would turn a
-            // slow-starting app into a restart loop, exactly the failure
-            // mode `max_restarts` exists to contain.
+            // A readiness timeout goes online anyway rather than erroring —
+            // treating it as a spawn failure would turn a slow-starting app
+            // into a restart loop, exactly the failure mode `max_restarts`
+            // exists to contain.
             tracing::warn!(id, "readiness deadline elapsed; marking online anyway");
         }
         let info = self.set_status(id, ProcStatus::Online);
@@ -6357,12 +6351,12 @@ impl<R: ProcessRunner> Actor<R> {
                 // `NotWritten` names, and reporting it here costs no round
                 // trip at all.
                 //
-                // The reason names no duration, and used to name
-                // `STDIN_WRITE_TIMEOUT`. `try_send` measured nothing: it
-                // looked at the queue once, on arrival, and found it full. An
-                // elapsed time in this message is fiction — and the operator
-                // reading it would take it for the bound the timeout path
-                // reports, which is a different fact about a different line.
+                // The reason names no duration, deliberately: `try_send`
+                // measured nothing here, it looked at the queue once, on
+                // arrival, and found it full. An elapsed time in this
+                // message would be fiction — and the operator reading it
+                // would take it for the bound the timeout path reports,
+                // which is a different fact about a different line.
                 Err(mpsc::error::TrySendError::Full(_)) => settled.push(LineReply {
                     id,
                     name,
@@ -6659,14 +6653,14 @@ impl<R: ProcessRunner> Actor<R> {
     ///
     /// # Why not `(name, instance, id)`
     ///
-    /// It used to sort on that, and the extra key was a real refinement:
-    /// `instance` keeps a clustered app's slots in their own order, where
-    /// `id` breaks the tie a reload creates by giving a replacement a fresh
-    /// id at the drainee's slot number.
+    /// The extra key would be a real refinement: `instance` keeps a
+    /// clustered app's slots in their own order, where `id` breaks the tie
+    /// a reload creates by giving a replacement a fresh id at the drainee's
+    /// slot number.
     ///
-    /// It was also a SECOND rule. `ProcessInfo` carries no instance number,
-    /// so no listing that has crossed the wire can reproduce it, and
-    /// `sort_flock` -- which every lifecycle reply now takes -- cannot. The
+    /// It would also be a SECOND rule. `ProcessInfo` carries no instance
+    /// number, so no listing that has crossed the wire can reproduce it,
+    /// and `sort_flock` -- which every lifecycle reply takes -- cannot. The
     /// two agree on any flock whose ids were handed out in instance order and
     /// diverge exactly once a reload has churned one, so `ListFlock` could
     /// order a reloaded app differently from the `Restart` reply printed a
@@ -8294,15 +8288,11 @@ mod tests {
         );
     }
 
-    /// fails if one app can contribute more than one refusal. Both checks in
-    /// the validating pass used to run unconditionally, so an app with an
-    /// unresolvable user AND an unresolvable path pushed twice, and a
+    /// fails if one app can contribute more than one refusal: an app with an
+    /// unresolvable user AND an unresolvable path must not push twice, or a
     /// two-app batch could tell an operator that "4 of 2 apps cannot start".
-    ///
-    /// Every reason in that message was true. Only the arithmetic was wrong,
-    /// which is why this asserts the COUNT rather than the reasons: the
-    /// reasons were never the broken part and a test pinning them would have
-    /// passed throughout.
+    /// Asserts the COUNT rather than the reasons, since the reasons are
+    /// never the part this guards against.
     #[tokio::test(start_paused = true)]
     async fn a_refusal_is_counted_once_per_app_not_once_per_failed_check() {
         let dir = tempfile::tempdir().unwrap();
@@ -8683,13 +8673,11 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Concurrency regression guards (opus review, fix round 2026-08-07).
-    // Promoted from the reviewer's probe suite (probes A, B, H, I, K, L) —
-    // the 9 tests above are structurally incapable of reaching any of these:
-    // every one needs either a second in-flight command racing the first,
-    // or a timer/channel left pending across a state transition, neither of
-    // which the locked 9-test suite's single-command-at-a-time shape
-    // produces.
+    // Concurrency regression guards. The tests above are structurally
+    // incapable of reaching any of these: every one needs either a second
+    // in-flight command racing the first, or a timer/channel left pending
+    // across a state transition, neither of which a single-command-at-a-time
+    // shape produces.
     // ---------------------------------------------------------------
 
     async fn drain_kinds(
@@ -8880,12 +8868,11 @@ mod tests {
         );
     }
 
-    // IMPORTANT-4 (probe I): Stop and Restart racing on the same running
-    // sheep. Chosen semantics (see `claim_manual`'s doc comment): the first
+    // IMPORTANT-4: Stop and Restart racing on the same running sheep.
+    // Chosen semantics (see `claim_manual`'s doc comment): the first
     // command to reach a running sheep owns its `manual` marker and its one
     // live Kill; both callers get back the SAME honest terminal snapshot
-    // once it lands, instead of the old last-writer-wins bug handing the
-    // `stop()` caller an `Online` `ProcessInfo`.
+    // once it lands.
     //
     // This is also the fence around the carve-out that
     // `an_operators_stop_beats_an_automatic_restart_mid_ladder` covers: BOTH
@@ -9015,16 +9002,15 @@ mod tests {
         );
     }
 
-    // Adversarial finding from a whole-branch review: a `Delete` that
-    // lands on an id AFTER `begin_shutdown` already claimed it (set
-    // `manual = Some(Stop)`, first-command-wins per IMPORTANT-4) used to hit
-    // `claim_manual`'s already-claimed path and only join `remaining`
-    // -- it never got a chance to mark its OWN intent anywhere. When the
-    // sheep went terminal, `handle_exited` only deregistered on
-    // `manual == Some(ManualKind::Delete)` (false here: it's `Stop`), so the
-    // sheep stayed registered as `Stopped` while `resolve_pending` still told
-    // the `Delete` caller it succeeded. `pending_delete` fixes this by
-    // recording delete-intent independently of who won the `manual` race.
+    // fails if a `Delete` that lands on an id AFTER `begin_shutdown` already
+    // claimed it (set `manual = Some(Stop)`, first-command-wins per
+    // IMPORTANT-4) hits `claim_manual`'s already-claimed path and only joins
+    // `remaining`, never marking its OWN intent anywhere: `handle_exited`
+    // only deregisters on `manual == Some(ManualKind::Delete)` (false here:
+    // it's `Stop`), so the sheep would stay registered as `Stopped` while
+    // `resolve_pending` still told the `Delete` caller it succeeded.
+    // `pending_delete` records delete-intent independently of who won the
+    // `manual` race.
     //
     // A second "decoy" sheep, given a far longer `kill_timeout` than the
     // target, keeps Shutdown's own aggregation open (its `remaining` set
@@ -9080,22 +9066,21 @@ mod tests {
         drop(shutter);
     }
 
-    // Regression for a reviewer's finding: a Delete racing a
-    // RESTART, not a Shutdown. `handle_exited`'s manual-Restart branch is
-    // the ONE path that resolves an exit without ever consulting
-    // `decide_on_exit` -- every other path reaches the
-    // `Decision::CleanStop if manual == Some(Delete) || pending_delete`
-    // guard, but this one used to `return` straight to `self.respawn(...)`
-    // whenever `manual == Some(Restart)`, ignoring `pending_delete`
-    // entirely. Reachable exactly like the Shutdown race: `Restart(id)`
-    // claims `slot.manual = Some(Restart)` on a running sheep; a racing
-    // `Delete(id)` finds the marker already claimed by another operator
-    // command, correctly sets `pending_delete = true`, but never touches
-    // `manual` -- the carve-out for an AUTOMATIC restart does not apply, and
-    // that is the whole point of keeping this path working. Worse than the
-    // original bug: instead of leaving a stale `Stopped` entry behind, this
-    // one respawned a BRAND-NEW LIVE PROCESS while still telling the
-    // `Delete` caller it succeeded.
+    // fails if a Delete racing a RESTART (not a Shutdown) is mishandled.
+    // `handle_exited`'s manual-Restart branch is the ONE path that resolves
+    // an exit without ever consulting `decide_on_exit` -- every other path
+    // reaches the `Decision::CleanStop if manual == Some(Delete) ||
+    // pending_delete` guard, but this one must not `return` straight to
+    // `self.respawn(...)` whenever `manual == Some(Restart)`, ignoring
+    // `pending_delete`. Reachable exactly like the Shutdown race:
+    // `Restart(id)` claims `slot.manual = Some(Restart)` on a running
+    // sheep; a racing `Delete(id)` finds the marker already claimed by
+    // another operator command, correctly sets `pending_delete = true`,
+    // but never touches `manual` -- the carve-out for an AUTOMATIC restart
+    // does not apply, and that is the whole point of keeping this path
+    // working. A bug here is worse than the Shutdown-race case: instead of
+    // leaving a stale `Stopped` entry behind, it would respawn a BRAND-NEW
+    // LIVE PROCESS while still telling the `Delete` caller it succeeded.
     #[tokio::test(start_paused = true)]
     async fn delete_racing_restart_still_deregisters_the_sheep() {
         let (events, _rx) = tokio::sync::broadcast::channel(1024);
@@ -9237,7 +9222,7 @@ mod tests {
         );
     }
 
-    /// Task 49, Rin's own call on the open question in `handle_exited`'s own
+    /// Task 49, the maintainer's own call on the open question in `handle_exited`'s own
     /// doc: an operator's `shep stop` still ends the process by a real
     /// signal, and `last_exit` must say so rather than going back to `None`
     /// because shep, not a crash, asked for it. `never_exits` obeys the
@@ -9456,9 +9441,8 @@ mod tests {
     }
 
     // fails if the mode stops following the one thing it is supposed to
-    // follow. This is Rin's table from 2026-08-28, in the order she wrote it:
-    // no probe overlaps, `wait_ready` overlaps, a bare probe serialises, and a
-    // probe plus `reuse_port` overlaps again.
+    // follow: no probe overlaps, `wait_ready` overlaps, a bare probe
+    // serialises, and a probe plus `reuse_port` overlaps again.
     //
     // The `wait_ready` row is the one worth stating twice. It has a probe
     // configured AND no `reuse_port`, so a rule reading the config's two
@@ -10805,15 +10789,15 @@ mod tests {
     /// fails if an app's credentials can be paired with a DIFFERENT app.
     ///
     /// The hazard this exists for is not a scheduling bug, and it would not
-    /// announce itself. `do_start` used to resolve credentials into a
-    /// `Vec<Option<Credentials>>` and `zip` it against `apps`, sound only
-    /// while a credential failure returned early. Teaching that failure to
-    /// skip instead -- which is exactly what `PerApp` needs, so that one
-    /// unresolvable `user` cannot cost a muster restore its whole flock --
-    /// leaves `credentials` shorter than `apps` while still in order. `zip`
-    /// then pairs app 2 with app 3's credentials and drops the last app
-    /// silently, so the flock comes up looking correct with processes
-    /// running under identities nobody chose.
+    /// announce itself. Resolving credentials into a `Vec<Option<Credentials>>`
+    /// and `zip`-ping it against `apps` is sound only while a credential
+    /// failure returns early. `PerApp` needs a credential failure to skip
+    /// instead, so that one unresolvable `user` cannot cost a muster
+    /// restore its whole flock -- but skipping leaves `credentials` shorter
+    /// than `apps` while still in order, so a naive `zip` would pair app 2
+    /// with app 3's credentials and drop the last app silently: the flock
+    /// would come up looking correct with processes running under
+    /// identities nobody chose.
     ///
     /// The FIRST of three fails, because that is the ordering where the
     /// drift starts at the very next app rather than somewhere behind it.
@@ -10832,10 +10816,8 @@ mod tests {
     ///
     /// `a-bad` IS registered under `PerApp`, deliberately, and holds
     /// [`SpawnIdentity::Unresolved`] -- which is what this case reads. The
-    /// distinction matters here more than anywhere: absence used to be the
-    /// proof it had not inherited a neighbour's identity, and now the stored
-    /// identity is the proof directly, which is the stronger claim of the
-    /// two.
+    /// stored identity is the direct proof that it has not inherited a
+    /// neighbour's identity -- a stronger claim than absence alone would be.
     ///
     /// `#[cfg(unix)]`: `nix` is a unix-only dependency of this crate, and
     /// `privilege::resolve` refuses any user request off-platform anyway.
@@ -12020,13 +12002,13 @@ mod tests {
     // replacement too empties the slot outright — no entry, no restart, and
     // nothing in `shep flock` to say the app lost an instance.
     //
-    // Also fails if it is reported `Online`, which is what this asserted until
-    // 2026-08-28. Kept and online are different claims, and the second was
-    // false: nothing ever signalled this replacement, so it never proved it
-    // could serve. `Online` there is what let a deploy tool record a release
-    // that never came up — see `reload_ready_result`'s `TimedOut` arm. It
-    // stays `Starting`, which is what it is, and the abandonment on the bus is
-    // what says the reload gave up.
+    // Also fails if it is reported `Online`: kept and online are different
+    // claims, and the second would be false here — nothing ever signalled
+    // this replacement, so it never proved it could serve. Reporting it
+    // `Online` is what lets a deploy tool record a release that never came
+    // up — see `reload_ready_result`'s `TimedOut` arm. It stays `Starting`,
+    // which is what it is, and the abandonment on the bus is what says the
+    // reload gave up.
     #[tokio::test(start_paused = true)]
     async fn a_replacement_is_kept_but_not_online_when_the_deadline_elapses_with_no_drainee() {
         let dir = tempfile::tempdir().unwrap();
@@ -16133,9 +16115,8 @@ mod tests {
     // fails if either route into `respawn_failed` lands a sheep in `Errored`
     // without saying why. The event it emits carries no reason and the
     // deferred reply has no per-id error slot, so this log line is all an
-    // operator has: the spawn-failure route used to bind the runner's error
-    // as `_error` and drop it, leaving a binary replaced mid-deploy or an
-    // `EAGAIN` with an `errored` row and nothing to read.
+    // operator has — see `respawn_failed`'s own doc for why `reason` is a
+    // required argument rather than something a caller can drop.
     //
     // `#[test]` with a `block_on` inside, not `#[tokio::test]`:
     // `capture_logs` scopes its subscriber to one thread and needs a

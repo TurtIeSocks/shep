@@ -89,8 +89,8 @@ Aliases          flock: list, ls   bleats: logs   lookout: dash   stock: scale  
 // `bin_name = "shep"` below is load-bearing, not decoration. Without it, clap
 // renders every `Usage:` line from `argv[0]` rather than from `name` — so
 // `shep-runtime --help` prints `Usage: shep-runtime runtime ...` and
-// `shep-dev --help` prints `Usage: shep-dev dev ...` (verified empirically:
-// both alias binaries built and run with no override, Phase 15 Task 11).
+// `shep-dev --help` prints `Usage: shep-dev dev ...` when both alias
+// binaries are built and run with no override.
 // Pinned so every rendering of a verb's own usage line reads `shep <verb>`
 // regardless of which of the three `[[bin]]` targets produced it — the alias
 // binaries are convenience entrypoints for exactly that invocation, not
@@ -817,7 +817,7 @@ pub struct WhisperArgs {
 /// usage error rather than "both". Three reasons, in order of weight: the two
 /// halves answer with different shapes — sheep against files — and one
 /// invocation renders one payload into one envelope; the daemon's own logs
-/// are the one target Rin asked never to be reached without being named, and
+/// are the one target the maintainer asked never to be reached without being named, and
 /// a flag that rode along with `all` would be reached by every operator who
 /// ever typed `shep flush all --daemon` out of habit; and the shepherd's logs
 /// are not a sheep's, so folding them into a flock answer would mean
@@ -953,7 +953,7 @@ pub struct EnableArgs {
 /// strips `cargo-` from its own external subcommands (`shep-log-rotate`
 /// defaults to `log-rotate`). Previously both were required positionals,
 /// name first (`adopt <name> <path>`) — a breaking CLI change, decision
-/// Rin: `shep adopt <path>` alone now works for a binary whose name is
+/// The maintainer: `shep adopt <path>` alone now works for a binary whose name is
 /// already the name you want, matching `shep start <script>`'s own
 /// optional `--name`.
 #[derive(Debug, clap::Args)]
@@ -1330,12 +1330,10 @@ mod tests {
     }
 
     /// Every visible alias is named in `--help`, and only real ones are.
-    ///
-    /// The grouped listing replaced clap's own `Commands:` block, which used
-    /// to render `[aliases: list, ls]` beside each verb. Nothing carried that
-    /// forward, so for several phases `shep --help` did not mention a single
-    /// alias while all six kept working -- found 2026-08-19 when the docs
-    /// site's generated CLI reference could no longer find any.
+    /// The grouped listing replaces clap's own `Commands:` block, which
+    /// would otherwise render `[aliases: list, ls]` beside each verb, so
+    /// nothing else guarantees an alias stays mentioned while it keeps
+    /// working.
     ///
     /// Derived from clap rather than compared against a second list, so
     /// adding `visible_alias` to a verb fails here until the line says so.
@@ -2104,7 +2102,7 @@ mod tests {
     }
 
     /// fails if the control gate stops being off by default, or stops being
-    /// reachable from the flag. Rin's ruling: acting on a sheep needs a flag or
+    /// reachable from the flag. The maintainer's ruling: acting on a sheep needs a flag or
     /// config, mirroring `whistle.allow_control`.
     #[test]
     fn actions_are_off_unless_the_flag_says_otherwise() {

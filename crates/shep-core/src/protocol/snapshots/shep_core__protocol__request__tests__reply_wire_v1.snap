@@ -25,8 +25,8 @@ expression: replies
             "restarts": 1,
             "uptime_ms": 60000,
             "fold": "backend",
-            "out_file": "/home/rin/.shep/logs/web-0-out.log",
-            "err_file": "/home/rin/.shep/logs/web-0-err.log",
+            "out_file": "/home/ada/.shep/logs/web-0-out.log",
+            "err_file": "/home/ada/.shep/logs/web-0-err.log",
             "cpu_percent": 12.5,
             "memory_bytes": 50331648,
             "dog": null,
@@ -74,7 +74,7 @@ expression: replies
       "Ok": {
         "kind": "roll_saved",
         "data": {
-          "path": "/home/rin/.shep/flock.json",
+          "path": "/home/ada/.shep/flock.json",
           "apps": 2
         }
       }
@@ -94,8 +94,8 @@ expression: replies
             "restarts": 1,
             "uptime_ms": 60000,
             "fold": "backend",
-            "out_file": "/home/rin/.shep/logs/web-0-out.log",
-            "err_file": "/home/rin/.shep/logs/web-0-err.log",
+            "out_file": "/home/ada/.shep/logs/web-0-out.log",
+            "err_file": "/home/ada/.shep/logs/web-0-err.log",
             "cpu_percent": 12.5,
             "memory_bytes": 50331648,
             "dog": {
@@ -137,8 +137,8 @@ expression: replies
           "restarts": 1,
           "uptime_ms": 60000,
           "fold": "backend",
-          "out_file": "/home/rin/.shep/logs/web-0-out.log",
-          "err_file": "/home/rin/.shep/logs/web-0-err.log",
+          "out_file": "/home/ada/.shep/logs/web-0-out.log",
+          "err_file": "/home/ada/.shep/logs/web-0-err.log",
           "cpu_percent": 12.5,
           "memory_bytes": 50331648,
           "dog": {
@@ -300,8 +300,8 @@ expression: replies
             "restarts": 1,
             "uptime_ms": 60000,
             "fold": "backend",
-            "out_file": "/home/rin/.shep/logs/web-0-out.log",
-            "err_file": "/home/rin/.shep/logs/web-0-err.log",
+            "out_file": "/home/ada/.shep/logs/web-0-out.log",
+            "err_file": "/home/ada/.shep/logs/web-0-err.log",
             "cpu_percent": 12.5,
             "memory_bytes": 50331648,
             "dog": null,

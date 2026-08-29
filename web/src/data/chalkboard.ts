@@ -15,7 +15,7 @@
  *
  * Merging the two would be the easy thing and the wrong one. A cut is not a
  * queue item, and a board that showed Windows beside OTLP with no label
- * would promise a tier Rin ruled out of v1 on 2026-08-15.
+ * would promise a tier the maintainer ruled out of v1 on 2026-08-15.
  *
  * Both lists are parsed out of deferred.md rather than hand-copied, and
  * `checkSync` diffs parsed against curated in both directions: an item

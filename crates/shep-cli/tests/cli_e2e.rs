@@ -8,19 +8,16 @@
 //! vs stdout separation, the daemon's own process-group leadership) lives
 //! here.
 //!
-//! **Runs on Windows too, as of the Windows port.** It was `#![cfg(unix)]`
-//! while every fixture here was a `/bin/sh` script and every cleanup path a
-//! `nix::kill`. The script writers emit a `.cmd` on Windows now (see
-//! `script_header`/`sleep_line`), and the cases that genuinely cannot port —
-//! file modes, symlinks, process-group leadership, signal delivery — carry
-//! their own `#[cfg(unix)]` and say why at the case.
+//! **Runs on Windows too.** The script writers emit a `.cmd` on Windows
+//! (see `script_header`/`sleep_line`), and the cases that genuinely cannot
+//! port — file modes, symlinks, process-group leadership, signal delivery —
+//! carry their own `#[cfg(unix)]` and say why at the case.
 //!
-//! Cases 14 and 15 are the file's slow ones and the reason it no longer
-//! finishes in about eleven seconds: a cron occurrence and a memory-limit
-//! breach are both events on *real* wall clock — a minute boundary and a
-//! 15-second sampling tick — with no seam this tier could pause. Each names
-//! its own measured cost; [`CRON_DEADLINE`] carries the argument for spending
-//! it rather than marking them `#[ignore]`.
+//! Cases 14 and 15 are the file's slow ones: a cron occurrence and a
+//! memory-limit breach are both events on *real* wall clock — a minute
+//! boundary and a 15-second sampling tick — with no seam this tier could
+//! pause. Each names its own measured cost; [`CRON_DEADLINE`] carries the
+//! argument for spending it rather than marking them `#[ignore]`.
 //!
 //! Every case's command chain carries `.timeout(CMD_TIMEOUT)` before
 //! `.output()`, so a regression that hangs (case 7's `--no-follow`
@@ -314,15 +311,14 @@ fn load_fixture(name: &str) -> serde_json::Value {
 /// `shep start` fails EACCES and every case that starts a sheep fails
 /// together, for a reason that has nothing to do with the CLI.
 ///
-/// A bare `sleep`, deliberately not `exec sleep`: verified empirically (`ps`
-/// before/after a real `shep kill`) that a bare trailing `sleep` is a
-/// *forked* child of the `/bin/sh` process the daemon actually tracks, in the
-/// shell's own process group — the wrapper-script shape real users write.
-/// This file used to `exec` into it to work around a daemon bug where the
-/// graceful stop signalled only the one recorded pid, killing the shell and
-/// orphaning that untracked `sleep` grandchild. The stop now goes to the
+/// A bare `sleep`, deliberately not `exec sleep`: a bare trailing `sleep`
+/// is a *forked* child of the `/bin/sh` process the daemon actually tracks,
+/// in the shell's own process group — the wrapper-script shape real users
+/// write. `exec`ing into it would hide a daemon bug where the graceful
+/// stop signals only the one recorded pid, killing the shell and orphaning
+/// an untracked `sleep` grandchild: the stop goes to the
 /// whole process group (`shep-daemon/src/tokio_runner.rs`'s `signal_group`),
-/// so the fork is safe to keep — and keeping it means every case in this file
+/// so keeping the fork means every case in this file
 /// exercises the shape that regressed, over the real CLI, rather than the one
 /// shape the bug could not reach.
 fn write_test_script(dir: &TempDir) -> PathBuf {
@@ -1772,9 +1768,9 @@ fn a_second_command_reuses_the_daemon_rather_than_spawning_a_second() {
 
 /// A lifecycle verb prints the whole flock, not only the sheep it touched.
 ///
-/// `shep start koji` used to print a one-row table containing koji, which
-/// cannot answer the question an operator actually has after a lifecycle
-/// command: what does the flock look like now.
+/// A one-row table containing `koji` cannot answer the question an
+/// operator actually has after a lifecycle command: what does the flock
+/// look like now.
 ///
 /// Driven over the real binary against a real daemon, because the unit tests
 /// for this behaviour drive `render_outcome` directly and so cannot say
@@ -1848,7 +1844,7 @@ fn a_lifecycle_verb_prints_the_whole_flock_and_json_still_prints_what_it_touched
 #[cfg(unix)]
 /// Two concurrent `shep start` invocations against a cold `$SHEP_HOME`
 /// produce exactly one daemon and no spurious error: this is the race
-/// Phase 2b's `flock(2)` makes safe daemon-side, and `connect_or_spawn`
+/// `flock(2)` makes safe daemon-side, and `connect_or_spawn`
 /// (`shep-client/src/spawn.rs`) safe client-side — the loser's launched
 /// child exits carrying `DAEMON_ALREADY_RUNNING`, `connect_or_spawn` keeps
 /// probing instead of surfacing that as an error, and both invocations
@@ -2746,7 +2742,7 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
 /// the order that makes both facts stand: the flock half first, while the
 /// shepherd's own logs still hold a marker only this test wrote.
 ///
-/// Rin's requirement was that a flock flush never reach the shepherd's own
+/// The maintainer's requirement was that a flock flush never reach the shepherd's own
 /// logs without being named. That already held by construction — the daemon
 /// inherits those two files as fds 1 and 2 and has no path for a selector to
 /// match — but "by construction" is exactly the kind of claim a later
@@ -2948,9 +2944,9 @@ fn flush_without_a_selector_is_a_usage_error() {
 ///
 /// This case cannot use the [`shep`] helper — it needs `env_remove` and a
 /// hand-built argv — but it takes [`CMD_TIMEOUT`] from it rather than naming
-/// its own bound. It used to carry an inline `Duration::from_secs(30)`, which
-/// is exactly `shep_client::spawn::SPAWN_DEADLINE` and exactly the value
-/// `CMD_TIMEOUT`'s own doc exists to forbid: a bound merely *equal* to the
+/// its own bound. An inline `Duration::from_secs(30)` here would be exactly
+/// `shep_client::spawn::SPAWN_DEADLINE`, exactly the value `CMD_TIMEOUT`'s
+/// own doc exists to forbid: a bound merely *equal* to the
 /// autostart budget races `assert_cmd`'s kill against the autostart path's own
 /// report, and on a loaded machine the kill wins. When it wins, this CLI dies
 /// with a daemon it launched still booting — and that daemon survives, because
@@ -3674,7 +3670,7 @@ fn shep_log_level_decides_which_of_the_daemons_records_survive() {
 /// the same way `shep start <path>` against the identical broken script
 /// does, rather than exiting 0 with nothing on either stream.
 ///
-/// Reproduces the gap Rin found live 2026-08-19: the daemon's
+/// Reproduces the gap the maintainer found live 2026-08-19: the daemon's
 /// `Response::Restarted` (what `shep start <name>` sends once the sheep is
 /// already registered — see `lifecycle::resume`) has no per-id error slot,
 /// so a respawn that fails to spawn still answers `Ok` with an `errored`
@@ -3687,7 +3683,7 @@ fn shep_log_level_decides_which_of_the_daemons_records_survive() {
 ///
 /// The script is valid shell but not executable (`0o644`), so every spawn
 /// of it fails with `EACCES` regardless of which request registered or
-/// restarted it — the same shape Rin's own repro used.
+/// restarted it — the same shape the maintainer's own repro used.
 ///
 /// What a broken implementation would let through: reverting `resume`'s
 /// `any_restart_failed` check (`lifecycle.rs`) makes the second `start`
@@ -5196,7 +5192,7 @@ fn call_tool_request(
 /// never yields a trailing empty entry for a well-formed final newline, so
 /// any empty line left after splitting is a stray blank line the verb
 /// wrote, not framing artefact, and a blank line is not JSON-RPC either —
-/// this used to filter those out and let one through unnoticed.
+/// filtering it out here would let one through unnoticed.
 fn assert_every_stdout_line_is_jsonrpc(stdout: &[u8]) -> Vec<serde_json::Value> {
     let text = String::from_utf8(stdout.to_vec()).expect("whistle's stdout is valid UTF-8");
     text.lines()
@@ -5795,7 +5791,7 @@ fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() {
 #[cfg(unix)]
 /// Layout shared by the two `--follow-symlinks` cases below:
 /// `<root>/releases/2026-08-15/index.html` and
-/// `<root>/current -> releases/2026-08-15` — the exact deploy shape Rin's
+/// `<root>/current -> releases/2026-08-15` — the exact deploy shape the maintainer's
 /// ruling names.
 fn write_deploy_layout(root: &Path) {
     let release = root.join("releases").join("2026-08-15");
@@ -5805,7 +5801,7 @@ fn write_deploy_layout(root: &Path) {
 }
 
 #[cfg(unix)]
-/// fails if the per-refusal stderr line (decision 5, Rin's ruling) never
+/// fails if the per-refusal stderr line (decision 5, the maintainer's ruling) never
 /// reaches the sheep's own bleats. This is the one claim in the ruling that
 /// Task 3's and Task 6's in-process tests cannot make: they run inside the
 /// test binary's own process, sharing its stderr with every other test in
@@ -6118,10 +6114,10 @@ fn dev_tidies_up_after_itself() {
 /// dev` process itself, and asserts the same two things the auto-exit case
 /// does — no live socket, no shepherd left running — plus two only this
 /// case can make: the held sheep did not outlive its supervisor, and
-/// `flock.json` does not still list it as running (Phase 15 review,
-/// Important 2 — a signal reaches `commands::foreground::run`'s own
-/// `RunningDaemon::run` teardown directly, never through the `Stop`/
-/// `Delete` pair `tidy_up` sends over the wire, so only
+/// `flock.json` does not still list it as running: a signal reaches
+/// `commands::foreground::run`'s own `RunningDaemon::run` teardown
+/// directly, never through the `Stop`/`Delete` pair `tidy_up` sends over
+/// the wire, so only
 /// `BootOptions::delete_flock_on_shutdown` closes this half of the gap).
 #[test]
 fn dev_tidies_up_when_it_is_signalled_rather_than_when_the_flock_empties() {
@@ -6327,9 +6323,8 @@ fn as_shep_spells_it(path: &Path) -> String {
         .to_string()
 }
 
-/// Issue 1's first repro, verbatim: `cargo install shep-log-rotate` puts
-/// the binary on `$PATH` under its own name, and `shep adopt` used to be
-/// unable to find it there at all.
+/// fails if `shep adopt` cannot find a binary on `$PATH` by its bare name
+/// — the shape `cargo install shep-log-rotate` puts it there in.
 #[test]
 fn shep_adopt_finds_a_binary_on_path_by_bare_name() {
     let home = TempDir::new().unwrap();

@@ -41,11 +41,10 @@ use crate::Client;
 /// A control address valid on the platform running the test, unique to
 /// `dir`.
 ///
-/// Every fake in this module takes an address as `&Path`, and until the
-/// Windows tier existed a caller could simply write `dir.path().join(
-/// "s.sock")`. That still works on unix and cannot work on Windows, where
-/// the control transport is a named pipe: `\\.\pipe\...` is a name in a
-/// machine-global kernel namespace, not a path under a directory, so a
+/// Every fake in this module takes an address as `&Path`. That works
+/// directly on unix (`dir.path().join("s.sock")`), but cannot on Windows,
+/// where the control transport is a named pipe: `\\.\pipe\...` is a name in
+/// a machine-global kernel namespace, not a path under a directory, so a
 /// tempdir path names nothing a pipe can be created on.
 ///
 /// The uniqueness argument is the reason this takes a `dir` it does not
@@ -211,8 +210,8 @@ pub fn sample_info() -> ProcessInfo {
         .restarts(3)
         .uptime_ms(60_000)
         .fold(Some("backend".to_string()))
-        .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
-        .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+        .out_file(Some("/home/ada/.shep/logs/web-0-out.log".to_string()))
+        .err_file(Some("/home/ada/.shep/logs/web-0-err.log".to_string()))
         .cpu_percent(Some(12.5))
         .memory_bytes(Some(48 * 1024 * 1024))
         .dog(Some(DogSource::BuiltIn))
@@ -327,7 +326,7 @@ enum ScriptCommand {
     /// — see [`FakeDaemon::push`] for why — then written straight to the
     /// wire for as long as the subscription stays live.
     ///
-    /// Boxed (task 49): `BusEvent::Process` carries a `ProcessInfo`, which
+    /// Boxed: `BusEvent::Process` carries a `ProcessInfo`, which
     /// grew past clippy's `large_enum_variant` threshold the moment
     /// `last_exit` landed on it. Every other variant here is a handful of
     /// bytes, so boxing this one rather than allowing the lint keeps the
@@ -404,11 +403,10 @@ impl FakeDaemon {
     /// Arms the answer to the next `Request::ListFlock` this connection
     /// receives.
     ///
-    /// Synchronous, not `async`: every plan call site invokes this without
-    /// `.await` (`docs/writing-plans/plans/2026-08-08-shep-phase3-cli.md`,
-    /// e.g. lines 2425, 2452, 2475), which would trip `unused_must_use`
-    /// under `-D warnings` against an `async fn`. A `Mutex`-backed flag
-    /// lets this stay a plain fn instead.
+    /// Synchronous, not `async`: every call site invokes this without
+    /// `.await`, which would trip `unused_must_use` under `-D warnings`
+    /// against an `async fn`. A `Mutex`-backed flag lets this stay a plain
+    /// fn instead.
     pub fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
         *self.armed_list.lock().unwrap() = Some(flock);
     }
@@ -993,14 +991,12 @@ pub async fn fake_client_that_dies_mid_request(path: &Path) -> (Client, JoinHand
 /// deadline against a daemon that accepted the connection but stopped
 /// answering.
 ///
-/// Returns `(Client, JoinHandle<()>)`, not `(Client, FakeDaemon)`, even
-/// though the phase 3 roster pins the latter
-/// (`docs/writing-plans/plans/2026-08-08-shep-phase3-cli.md:291`).
+/// Returns `(Client, JoinHandle<()>)`, not `(Client, FakeDaemon)`:
 /// `FakeDaemon`'s `serve_scripted` loop always answers SOME request
 /// promptly (`ListFlock` per the armed script, everything else with
 /// `Pong`) — there is no script command that means "never answer," so a
 /// `FakeDaemon`-backed version of this helper could not do what its name
-/// promises. Deliberate divergence from the roster, not an oversight.
+/// promises.
 pub async fn fake_client_that_never_replies(path: &Path) -> (Client, JoinHandle<()>) {
     let mut listener = Listener::bind(path).unwrap();
     let task = tokio::spawn(async move {

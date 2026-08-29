@@ -40,7 +40,7 @@ use super::theme::Palette;
 
 /// Whether this lookout may act on a sheep.
 ///
-/// Default is [`Self::ReadOnly`], per Rin's ruling, mirroring the
+/// Default is [`Self::ReadOnly`], per the maintainer's ruling, mirroring the
 /// `allow_control` precedent spec §9 sets for whistle. Turned on by
 /// `--allow-control` or by `lookout.allow_control` in the KV store.
 ///
@@ -362,7 +362,7 @@ impl fmt::Display for Notice {
 /// What an action key does.
 ///
 /// Three verbs, and deliberately not four: `start` is whistle's and the CLI's,
-/// by Rin's ruling. Delete, scale, signal and whisper stay CLI-only for
+/// by the maintainer's ruling. Delete, scale, signal and whisper stay CLI-only for
 /// whistle's own reasons: each takes a parameter a dashboard has nowhere to
 /// put, or removes an app from the registry, which is the one action no
 /// keypress should be one Enter away from.
@@ -783,10 +783,10 @@ impl App {
                 // VISIBLE sequence `reseat` and `j`/`k` actually walk: a
                 // rename that moves the selected row out of the current
                 // filter leaves its id in `self.flock` while dropping it out
-                // of `visible_ids()`. The old `was_empty`-only guard missed
-                // that case (Phase 16 review Minor #6): the cursor stayed
-                // pinned to an id the table had stopped drawing, and `j`/`k`
-                // did nothing until the next snapshot repaired it. Reading
+                // of `visible_ids()`. A `was_empty`-only guard misses that
+                // case: the cursor stays pinned to an id the table has
+                // stopped drawing, and `j`/`k` do nothing until the next
+                // snapshot repairs it. Reading
                 // `previous` before the insert and always reseating covers
                 // both that case and the empty-to-non-empty one below with
                 // the same call — `reseat` itself is a no-op read when the
@@ -949,11 +949,11 @@ impl App {
         } else if let Link::Retrying { attempt } = self.link {
             // NOT `LINK_GONE` here: that sentence says the shepherd is gone,
             // which is false while it is still being redialled, and a
-            // refusal saying so under a banner that says "reconnecting" was
-            // Phase 16 review Minor #8 — two contradictory claims on one
-            // frame. This is the status bar's own sentence for the state
-            // (`view/status.rs`), so the refusal agrees with the banner
-            // above it instead of overriding it.
+            // refusal saying so under a banner that says "reconnecting"
+            // would be two contradictory claims on one frame. This is the
+            // status bar's own sentence for the state (`view/status.rs`),
+            // so the refusal agrees with the banner above it instead of
+            // overriding it.
             Some(format!(
                 "the shepherd stopped answering — reconnecting (attempt {attempt})"
             ))
@@ -1146,12 +1146,13 @@ impl App {
         // This one line is the difference between a cursor that follows the
         // filter and one that wanders behind it.
         //
-        // It comes FIRST, where the shipped `flock.is_empty()` check used to.
-        // The order is behaviour-preserving (a seated selection implies at
-        // least one visible row), and it is what makes Step 1.6's mutation
-        // able to reach the nothing-matches case: with the emptiness test
-        // above it, reverting this line changes nothing when the query
-        // matches no sheep, because the early return has already fired.
+        // It must come BEFORE the `flock.is_empty()` check below: with the
+        // emptiness test above it instead, reverting this line changes
+        // nothing when the query matches no sheep, because the early
+        // return has already fired -- so this order is what makes the
+        // nothing-matches case reachable at all. The order is otherwise
+        // behaviour-preserving (a seated selection implies at least one
+        // visible row).
         if self.selected_index().is_some() {
             return false;
         }
@@ -1235,15 +1236,11 @@ impl App {
     /// list. The host strip sums it, and a sum does not care what order it
     /// arrives in.
     ///
-    /// The host strip reads this rather than [`Self::rows`]: Phase 16 review
-    /// Important #4 caught `flock cpu`/`flock mem` silently summing the FILTERED
-    /// set while staying labelled `flock`, so a filter that matched nothing
-    /// made the strip print `-` for a running flock the strip had simply
-    /// stopped looking at. `-` is reserved for a genuine unknown reading
-    /// ([`ProcessInfo::cpu_percent`]'s own doc), not for "the table's query
-    /// happens to exclude everything right now", and the title bar already
-    /// carries the filtered-vs-total distinction (`2 of 6 in the flock`) so
-    /// the strip does not have to.
+    /// The host strip reads this rather than [`Self::rows`] so a name filter
+    /// cannot narrow what `flock cpu`/`flock mem` sum while the strip stays
+    /// labelled `flock` -- see `view::host`'s own module doc for why. The
+    /// title bar already carries the filtered-vs-total distinction
+    /// (`2 of 6 in the flock`) so the strip does not have to.
     #[must_use]
     pub fn all_rows(&self) -> Vec<&Row> {
         self.flock.values().collect()
@@ -1475,7 +1472,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -1505,7 +1502,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::Allowed,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -1597,14 +1594,13 @@ mod tests {
     /// built from `self.selected` would then act on a sheep the operator never
     /// pointed at.
     ///
-    /// Task 7's original version of this test armed on id 2 then had a
-    /// snapshot delete id 2's NEIGHBOUR, expecting that to move the cursor.
-    /// It never did: `reseat`'s own rule is "an id that survived is left
-    /// alone, whatever row it now occupies" — id 2 survived every one of
-    /// those snapshots, so `self.selected` stayed 2 right alongside
+    /// Arming on id 2 and having a snapshot delete id 2's NEIGHBOUR does
+    /// NOT exercise this: `reseat`'s own rule is "an id that survived is
+    /// left alone, whatever row it now occupies" — id 2 survives every
+    /// such snapshot, so `self.selected` stays 2 right alongside
     /// `action.id`, and the mutation this test exists to catch (reading
     /// `self.selected` instead of the pinned `action.id`) could not redden
-    /// it. Phase 16 review Minor #7.
+    /// it.
     ///
     /// This version applies a filter before arming, then has the snapshot
     /// RENAME the armed sheep out of that filter while a second sheep enters
@@ -2144,7 +2140,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -2183,7 +2179,7 @@ mod tests {
 
     /// fails if lookout learns to exit on its own. A `DaemonShutdown` is a
     /// notice here, where in `bleats` it precedes a clean exit — the whole
-    /// point of Rin's ruling is that a standing dashboard admits it is stale
+    /// point of the maintainer's ruling is that a standing dashboard admits it is stale
     /// rather than vanishing. Only `q` quits.
     #[test]
     fn nothing_but_a_keypress_quits() {
@@ -2548,7 +2544,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -2594,7 +2590,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -2644,7 +2640,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {

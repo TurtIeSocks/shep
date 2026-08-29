@@ -6,10 +6,9 @@
 //! headlessly. It is also, for exactly the same reason, what lets a reviewer
 //! SEE the dashboard without running it — so this module's output is a
 //! deliverable (`docs/lookout/frames.txt`, `docs/lookout/frames.ansi`) and
-//! not only test scaffolding. That is the whole point of this module: Rin
+//! not only test scaffolding. That is the whole point of this module: the maintainer
 //! decides what a layout looks like from these frames, not from a spec
-//! sentence — the way Phase 12a decided 12b's and a later phase will decide
-//! search/filter's and the actions'.
+//! sentence.
 //!
 //! **Why not `TestBackend`'s own `Display`.** Two reasons, both practical:
 //! its exact framing is an upstream presentation detail that can change
@@ -22,7 +21,7 @@
 //! regenerating the gallery is one command.
 //!
 //! **`#[cfg(test)]` at the `mod` declaration in `super::mod`, not a plain
-//! `pub mod`.** The package (`shep`) has had a `[lib]` target since Phase 14,
+//! `pub mod`.** The package (`shep`) has a `[lib]` target,
 //! but that does not exempt this module from `dead_code`: `mod lookout` in
 //! `lib.rs` is private, and `lib.rs`'s own doc comment states the crate's
 //! whole public API as three entry points — `main`, `main_runtime`,
@@ -242,7 +241,7 @@ impl Scene {
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so Rin does not have to hold twenty-four of them in her head.
+    /// gallery so the maintainer does not have to hold twenty-four of them in her head.
     ///
     /// Every clause here is pinned by an assertion in
     /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
@@ -429,7 +428,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
 
     let palette = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);
     let t0 = Instant::now();
-    let mut app = App::new(palette, which.control(), "/home/rin/.shep".to_string(), t0);
+    let mut app = App::new(palette, which.control(), "/home/ada/.shep".to_string(), t0);
 
     let flock = match which {
         Scene::Empty => Vec::new(),
@@ -564,9 +563,8 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     // pane.
     //
     // Walked by id rather than by a fixed number of `j`s. The table reads by
-    // name, so which row `api` occupies is decided by what the other five
-    // sheep are called; two `SelectDown`s used to land on it only because the
-    // table read by id and `api` held id 2.
+    // name, so which row `api` occupies depends on what the other five
+    // sheep are called, not on its id.
     //
     // The four excluded scenes have either no flock (`Empty`) or no pane
     // below the table to describe (`Narrow`, `TooNarrow`, `TableOnly`), so
@@ -632,7 +630,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     // property that a reading does not age once frozen is pinned in
     // `detail.rs`'s own unit test, where the two ages differ by construction
     // rather than by elapsed time. This frame is a picture, and pictures are
-    // what Rin reads.
+    // what the maintainer reads.
     if matches!(which, Scene::Lambs | Scene::Frozen) {
         app.update(Msg::Replied {
             sent: Sent::Lambs { id: 2 },
@@ -869,8 +867,8 @@ fn sheep(
         .cpu_percent(cpu)
         .memory_bytes(memory)
         .fold(fold.map(str::to_string))
-        .out_file(Some(format!("/home/rin/.shep/logs/{name}-{id}-out.log")))
-        .err_file(Some(format!("/home/rin/.shep/logs/{name}-{id}-err.log")))
+        .out_file(Some(format!("/home/ada/.shep/logs/{name}-{id}-out.log")))
+        .err_file(Some(format!("/home/ada/.shep/logs/{name}-{id}-err.log")))
         // Derived from `status` rather than taken as a ninth parameter, and
         // not just to keep the argument count down: a sheep that is not
         // running always has a reason it stopped, and deriving it means no
@@ -1084,7 +1082,7 @@ mod tests {
     }
 
     /// fails if a scene stops rendering what it is named for. Each
-    /// assertion is the one sentence that scene exists to show Rin — if one
+    /// assertion is the one sentence that scene exists to show the maintainer — if one
     /// of these stops being true, the frame she is looking at is not the
     /// frame this plan promised her.
     ///
@@ -1219,7 +1217,7 @@ mod tests {
         // log-path prefix is the detail pane's alone: the feed's body lines
         // are tagged `out  ` too, but they carry log TEXT, not a path.
         assert!(
-            !no_detail.contains("out  /home/rin/.shep/logs/"),
+            !no_detail.contains("out  /home/ada/.shep/logs/"),
             "the detail pane went"
         );
 
@@ -1242,7 +1240,7 @@ mod tests {
         // any frame at any width, including a blank one. What "nothing
         // overlaps" actually means is that each pane's own marker appears
         // exactly once, which is a claim about this layout.
-        for marker in ["host  ", "bleats  ", "out  /home/rin/.shep/logs/"] {
+        for marker in ["host  ", "bleats  ", "out  /home/ada/.shep/logs/"] {
             assert_eq!(
                 cramped
                     .lines()
@@ -1317,9 +1315,8 @@ mod tests {
         };
         for (name, want) in [
             ("api", "1"),
-            // "billing-r", not the fuller prefix this used before task 7:
-            // the SMIT column added at this frame's width narrows NAME
-            // enough that the truncation lands one syllable earlier.
+            // "billing-r": the SMIT column at this frame's width narrows
+            // NAME enough that the truncation lands one syllable earlier.
             ("billing-r", "1"),
             ("cron", "SIGTERM"),
         ] {
@@ -1576,7 +1573,7 @@ mod tests {
     }
 
     /// fails if a frozen frame keeps counting. This is the one thing the
-    /// frozen scene exists to show Rin, and it is the property design
+    /// frozen scene exists to show the maintainer, and it is the property design
     /// decision 8 is about.
     ///
     /// **Rendered twice at two different clock ages and compared**, rather

@@ -86,9 +86,8 @@ impl ResolvedApp {
 /// `~` is a shell feature. A shell expands it before a program ever sees the
 /// argument, so a value read out of a Flockfile has nothing between it and
 /// the parser and arrives literally: shep would look for a directory named
-/// `~`. Rin's call, 2026-08-19, was that a process manager standing in for
-/// the shell that would otherwise have started the process should inherit
-/// this narrow piece of its job.
+/// `~`. A process manager standing in for the shell that would otherwise
+/// have started the process inherits this narrow piece of its job.
 ///
 /// Deliberately narrow. `~/` only:
 ///
@@ -162,9 +161,7 @@ impl core::error::Error for TildeError {}
 /// Expands a leading `~/` in `value` against `home` — the one piece of
 /// tilde-expansion logic in the workspace, shared by `expand_tilde` above
 /// (Flockfile path fields, private to this module) and `shep-cli`'s own
-/// `shep adopt` (its `<path>` argument). Adopt's own CLI path used to run
-/// without this entirely, which is why `~/.cargo/bin/whatever` worked in
-/// a Flockfile and not at `shep adopt`.
+/// `shep adopt` (its `<path>` argument).
 ///
 /// Deliberately narrow, matching `expand_tilde`'s own doc: `~/` only.
 /// `~user/...` is refused (a passwd lookup, whose answer depends on who
@@ -327,13 +324,12 @@ pub fn normalize_with_home(
         && KillSignal::parse(name).is_none()
     {
         // Rejected rather than clamped, and this one is the sharpest case of
-        // that trade in the file. The daemon's stop ladder used to fall back
-        // to SIGTERM and log a warning, which meant a typo cost the operator
-        // every stop and every reload for the life of the process, with the
-        // only evidence in a detached daemon's log at the moment of a stop.
-        // `max_cron_sleep` and `MIN_LIVENESS_INTERVAL` reject for the same
-        // reason at lower stakes: the user's file is the only place a
-        // silently-substituted value could ever be noticed.
+        // that trade in the file: a typo silently falling back to SIGTERM
+        // would cost the operator every stop and every reload for the life
+        // of the process, with the only evidence in a detached daemon's log
+        // at the moment of a stop. `max_cron_sleep` and `MIN_LIVENESS_INTERVAL`
+        // reject for the same reason at lower stakes: the user's file is the
+        // only place a silently-substituted value could ever be noticed.
         return Err(NormalizeError::InvalidKillSignal {
             name: app.name,
             value: name.clone(),
@@ -357,14 +353,13 @@ pub fn normalize_with_home(
         // `watch` asked for a feature the daemon has no directory to arm:
         // there is no cwd in the Flockfile, and defaulting to the daemon's
         // own cwd risks watching the whole filesystem under a systemd unit
-        // with no `WorkingDirectory=` (Rin, 2026-08-08).
+        // with no `WorkingDirectory=`.
         return Err(NormalizeError::WatchWithoutCwd { name: app.name });
     }
     if app.watch_delay == Some(UpDuration::from_millis(0)) {
         // notify's debouncer derives its own poll tick as `watch_delay / 4`
         // and runs it on a dedicated OS thread, so a zero turns that thread
-        // into `loop { sleep(0); lock(); }`: measured at 5.98s of user CPU
-        // across a three-second watch that costs 0.00s at the 500ms default.
+        // into `loop { sleep(0); lock(); }`, a CPU-spinning busy loop.
         // shep-daemon's watch arming floors this independently too (its
         // `MIN_WATCH_DELAY`), the same belt-and-suspenders shape
         // `validate_probe`'s interval check has opposite the liveness loop's
@@ -375,7 +370,7 @@ pub fn normalize_with_home(
     // will not compile is a typo, and the user wants it named now rather than
     // the day they flip `watch = true` and wonder why saving a file changes
     // nothing — the same reasoning that makes `watch` without `cwd` a config
-    // error above (Rin, 2026-08-09).
+    // error above.
     validate_watch_globs(&app.name, "watch_options", &app.watch_options)?;
     validate_watch_globs(&app.name, "ignore_watch", &app.ignore_watch)?;
     Ok(ResolvedApp { config: app })
@@ -691,7 +686,7 @@ mod tests {
     /// then fails where the operator has no reason to suspect it.
     #[test]
     fn every_path_field_expands_a_leading_tilde() {
-        let home = Path::new("/home/rin");
+        let home = Path::new("/home/ada");
         let mut app = AppConfig::minimal("web", "~/app/server.js");
         app.cwd = Some("~/app".to_string());
         app.out_file = Some("~/logs/out.log".to_string());
@@ -714,7 +709,7 @@ mod tests {
     /// the "all four or none" rule true over time.
     #[test]
     fn the_path_field_list_matches_what_expand_paths_walks() {
-        let home = Path::new("/home/rin");
+        let home = Path::new("/home/ada");
         let mut app = AppConfig::minimal("web", "~/s");
         app.cwd = Some("~/c".to_string());
         app.out_file = Some("~/o".to_string());
@@ -739,7 +734,7 @@ mod tests {
                 "`{field}` is not in PATH_FIELDS"
             );
             assert!(
-                value.is_some_and(|v| v.starts_with("/home/rin")),
+                value.is_some_and(|v| v.starts_with("/home/ada")),
                 "`{field}` was not expanded: {value:?}"
             );
         }
@@ -751,7 +746,7 @@ mod tests {
     fn a_path_without_a_tilde_is_left_exactly_as_written() {
         let app = AppConfig::minimal("web", "./server.js");
         let resolved =
-            normalize_with_home(app, Some(Path::new("/home/rin"))).expect("no tilde, no change");
+            normalize_with_home(app, Some(Path::new("/home/ada"))).expect("no tilde, no change");
         assert_eq!(resolved.config().script, "./server.js");
     }
 
@@ -760,7 +755,7 @@ mod tests {
     #[test]
     fn another_users_home_is_refused_rather_than_resolved() {
         let app = AppConfig::minimal("web", "~deploy/app/server.js");
-        let err = normalize_with_home(app, Some(Path::new("/home/rin")))
+        let err = normalize_with_home(app, Some(Path::new("/home/ada")))
             .expect_err("~user/ must not resolve");
         assert!(
             matches!(err, NormalizeError::TildeUser { field, .. } if field == "script"),
@@ -782,7 +777,7 @@ mod tests {
     #[test]
     fn a_dollar_variable_is_not_expanded() {
         let app = AppConfig::minimal("web", "$HOME/server.js");
-        let resolved = normalize_with_home(app, Some(Path::new("/home/rin"))).expect("left alone");
+        let resolved = normalize_with_home(app, Some(Path::new("/home/ada"))).expect("left alone");
         assert_eq!(resolved.config().script, "$HOME/server.js");
     }
 
@@ -806,7 +801,7 @@ mod tests {
     /// above.
     #[test]
     fn expand_home_tilde_covers_its_four_documented_cases() {
-        let home = Path::new("/home/rin");
+        let home = Path::new("/home/ada");
         assert_eq!(
             expand_home_tilde("~/bin/dog", Some(home)).unwrap(),
             home.join("bin/dog").to_string_lossy()
@@ -826,17 +821,9 @@ mod tests {
         );
     }
 
-    /// Loads, as of the day the daemon started reading it. The refusal that
-    /// stood here from 2026-08-19 was honest while no production code
-    /// consulted the field; now reload's mode is chosen from it, so refusing
-    /// would deny an operator the only way to ask for an overlapping reload.
-    ///
-    /// Nothing had to be migrated to get here: `normalize` refused every
-    /// config carrying the field, so no Flockfile that loads today can
-    /// contain it, and un-refusing on its own changes nothing about them.
-    /// The reload they get does change, for the apps that configure a
-    /// `readiness_probe`, and that change is the daemon's rather than this
-    /// function's.
+    /// `reuse_port` loads because reload's overlap mode is chosen from it —
+    /// refusing it would deny an operator the only way to ask for an
+    /// overlapping reload.
     #[test]
     fn reuse_port_loads_now_that_reload_reads_it() {
         let mut app = AppConfig::minimal("web", "./server");
@@ -896,11 +883,7 @@ mod tests {
 
     #[test]
     fn bad_cron_pattern_rejected_with_pattern_and_reason_carried_through() {
-        // fails if the reason is not carried through from croner. This
-        // input is three tokens, already rejected by the token-count
-        // stopgap that used to sit here, so it guards the pattern/reason
-        // plumbing, not the dialect check itself — see the next test for
-        // the case that actually proves the stopgap is gone.
+        // fails if the reason is not carried through from croner.
         let mut app = AppConfig::minimal("web", "./srv");
         app.cron_restart = Some("not a cron".to_string());
         match normalize(app).unwrap_err() {
@@ -914,9 +897,9 @@ mod tests {
 
     #[test]
     fn five_tokens_of_garbage_cron_pattern_rejected() {
-        // fails if the validator is still a token counter: the stopgap this
-        // replaced accepted exactly this input, since it only counted
-        // whitespace-separated tokens.
+        // fails if the validator only counts whitespace-separated tokens
+        // instead of checking each field's range: five numeric-looking
+        // tokens, all out of range.
         let mut app = AppConfig::minimal("web", "./srv");
         app.cron_restart = Some("99 99 99 99 99".to_string());
         match normalize(app).unwrap_err() {
@@ -1239,9 +1222,8 @@ mod tests {
     fn zero_watch_delay_rejected() {
         // fails if `watch_delay` is never inspected. notify's debouncer
         // derives its poll tick as `watch_delay / 4` and sleeps it on its own
-        // OS thread, so zero is `loop { sleep(0); lock(); }` — measured at
-        // 5.98s of user CPU across a three-second watch that costs 0.00s at
-        // the 500ms default.
+        // OS thread, so zero is `loop { sleep(0); lock(); }`, a CPU-spinning
+        // busy loop.
         let mut app = AppConfig::minimal("web", "./srv");
         app.watch = true;
         app.cwd = Some("/srv/web".to_string());

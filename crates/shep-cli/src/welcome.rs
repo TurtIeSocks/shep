@@ -131,18 +131,18 @@ mod tests {
     /// afford is to look unmaintained.
     #[test]
     fn the_welcome_renders_exactly_this() {
-        let rendered = render(Path::new("/home/rin/.shep"));
+        let rendered = render(Path::new("/home/ada/.shep"));
         let expected = format!(
             "      ,-~-.     ,-~-.     ,-~-.
      ( o.o )   ( o.o )   ( o.o )       shep {version}
-      `-^-'     `-^-'     `-^-'        flock at /home/rin/.shep
+      `-^-'     `-^-'     `-^-'        flock at /home/ada/.shep
        \" \"       \" \"       \" \"
     /\\  /\\
    ( o  o )--,   the shepherd keeps them running
     `--..--'  |
       |  |    '
 
-Set up /home/rin/.shep. Logs, pids and the shepherd's socket live here.
+Set up /home/ada/.shep. Logs, pids and the shepherd's socket live here.
 
 Getting started
   shep start server.js    start it and keep it alive
@@ -178,7 +178,7 @@ Getting started
     /// may not.
     #[test]
     fn the_welcome_copy_has_no_em_dashes() {
-        let rendered = render(Path::new("/home/rin/.shep"));
+        let rendered = render(Path::new("/home/ada/.shep"));
         assert!(
             !rendered.contains('\u{2014}'),
             "em dash in user-facing copy"
@@ -215,7 +215,7 @@ Getting started
     #[test]
     fn the_first_run_welcome_goes_to_stderr() {
         let (out, err) = drain(Format::Table, |s| {
-            on_first_run(s, Path::new("/home/rin/.shep"), true);
+            on_first_run(s, Path::new("/home/ada/.shep"), true);
         });
         assert!(out.is_empty(), "stdout must stay clean: {out}");
         assert!(
@@ -247,7 +247,7 @@ Getting started
     #[test]
     fn the_welcome_verb_prints_to_stdout_even_when_piped() {
         let (out, err) = drain(Format::Table, |s| {
-            welcome(s, Path::new("/home/rin/.shep"));
+            welcome(s, Path::new("/home/ada/.shep"));
         });
         assert!(
             out.contains("Getting started"),
@@ -261,7 +261,7 @@ Getting started
     #[test]
     fn the_welcome_verb_answers_json_with_an_envelope() {
         let (out, _) = drain(Format::Json, |s| {
-            welcome(s, Path::new("/home/rin/.shep"));
+            welcome(s, Path::new("/home/ada/.shep"));
         });
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["command"], "welcome");
@@ -279,7 +279,7 @@ Getting started
     /// wraps looks broken rather than charming.
     #[test]
     fn the_welcome_fits_an_eighty_column_terminal() {
-        let rendered = render(Path::new("/home/rin/.shep"));
+        let rendered = render(Path::new("/home/ada/.shep"));
         for line in rendered.lines() {
             assert!(
                 line.chars().count() <= 80,

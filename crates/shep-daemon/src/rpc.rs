@@ -528,9 +528,8 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
 ///
 /// The sample is taken here rather than inside the supervisor for two
 /// reasons that point the same way: the actor must never block, and the
-/// reading is a syscall walk over the host's whole process table — measured
-/// at 5.77 ms across 883 processes — so it runs on a blocking-pool thread
-/// and not on a runtime worker.
+/// reading is a syscall walk over the host's whole process table, so it
+/// runs on a blocking-pool thread and not on a runtime worker.
 ///
 /// Joined by pid, not by id: [`StatsState`] keys on the root pid it was armed
 /// against, which is the same number [`ProcessInfo::pid`] carries, and a sheep
@@ -715,15 +714,14 @@ where
 /// `ProcessInfo` cannot hold a reply body on. Everything else about the shape
 /// is the same: convert the selector, call the supervisor, map the rows.
 ///
-/// How long each app gets to answer is not decided here any more: it is
-/// `AppConfig::action_timeout`, one value per matched sheep rather than one
-/// for the whole flock, read off each sheep's own config where the wait is
-/// armed (`Actor::begin_action`). What used to be this function's own
-/// `ACTION_TIMEOUT` constant is now that field's problem, including staying
-/// under [`DEFAULT_DEADLINE_MS`] — `shep_core::config::normalize` refuses a
-/// value no caller could ever be given enough deadline to outlast; a value
-/// merely past the *default* budget is accepted; the caller's own deadline is
-/// what decides whether that pays off.
+/// How long each app gets to answer is `AppConfig::action_timeout`, one
+/// value per matched sheep rather than one for the whole flock, read off
+/// each sheep's own config where the wait is armed (`Actor::begin_action`),
+/// including staying under [`DEFAULT_DEADLINE_MS`] —
+/// `shep_core::config::normalize` refuses a value no caller could ever be
+/// given enough deadline to outlast; a value merely past the *default*
+/// budget is accepted; the caller's own deadline is what decides whether
+/// that pays off.
 async fn trigger(
     id: u64,
     spec: SelectorSpec,

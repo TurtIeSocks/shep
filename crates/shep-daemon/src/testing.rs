@@ -33,25 +33,6 @@ use crate::runner::{ProcIo, ProcessRunner, RunnerError, SpawnSpec};
 use crate::snapshot::FlockRegistry;
 use crate::supervisor::SupervisorBuilder;
 
-// `FD_REUSE_LOCK` lived here until 2026-08-08. It serialized the tests
-// that close a real descriptor and then re-probe that same number, to
-// stop them racing the kernel's lowest-available-fd allocation.
-//
-// It was removed because it could not work. A mutex only excludes the
-// tests that TAKE it; every other test in the binary stayed free to open
-// a file and be handed the just-closed number, after which `adopt_fd`'s
-// `F_GETFD` probe legitimately succeeds and the adoption double-closes
-// somebody else's descriptor. That is not hypothetical: it was
-// reproduced WITH the lock in place, as `fatal runtime error: IO Safety
-// violation: owned file descriptor already closed`, once in 25 saturated
-// `--workspace --all-features` runs, taking the whole lib test binary
-// down with SIGABRT.
-//
-// The fix is structural, not exclusive: `sys.rs`'s probe now parks on a
-// high fd number (`F_DUPFD`), which the lowest-free allocation policy
-// will not hand back while lower numbers remain free. See
-// `a_closed_descriptor_is_refused_instead_of_adopted`.
-
 // The daemon's warn-and-continue arms — a watch that could not be armed, a
 // cron pattern that would not parse — leave no trace anywhere but their own
 // `tracing` record. `capture_logs` is what turns that record into something a

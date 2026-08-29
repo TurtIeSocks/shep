@@ -840,14 +840,12 @@ mod tests {
 
     #[test]
     fn tcp_unbracketed_ipv6_rejected_as_invalid_host() {
-        // The odd spelling that happened to resolve before this round of
-        // fixes (splitting on the last colon put "::1" in the host and
-        // "5432" in the port) is now rejected instead: an embedded `:`
-        // outside brackets is exactly what `validate_host` rejects
-        // everywhere else, and the carried prober note only adjudicates the
-        // *bracketed* spelling correct. Closing this loophole means the
-        // ambiguous form now fails loudly at config time instead of
-        // resolving by accident.
+        // An unbracketed IPv6-shaped host is ambiguous: naive splitting on
+        // the last colon would put "::1" in the host and "5432" in the
+        // port, silently accepting a spelling only the bracketed form is
+        // meant to mean. `validate_host` rejects an embedded `:` outside
+        // brackets for exactly this reason, so the ambiguous form fails
+        // loudly at config time instead of resolving by accident.
         assert_eq!(
             ProbeTarget::parse(&probe_config(ProbeKind::Tcp, "::1:5432")).unwrap_err(),
             ProbeTargetError::InvalidHost {

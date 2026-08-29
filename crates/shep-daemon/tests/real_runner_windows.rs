@@ -213,35 +213,22 @@ async fn kill_tree_stops_a_long_running_sheep_and_reports_a_recognisable_code() 
 /// `start /b` and then waits, so there is a grandchild to contain and a
 /// parent for `kill_tree` to address.
 ///
-/// The grandchild is found by walking the process table, which this test
-/// used to avoid: `sysinfo`'s `parent()` was measured as not reporting the
-/// relationship while `Win32_Process` did, so the sheep printed its own
-/// child's pid instead. That needed a shell able to ask Windows for a pid,
-/// which meant PowerShell, which is what hung this suite for four CI runs
-/// with both log files present and empty. The trade is now the other way
-/// round, and the risk it was avoiding is handled directly: `child_of` is
-/// `expect`ed, so a grandchild the test cannot see fails it rather than
-/// skipping the assertion and looking green.
+/// The grandchild is found by walking the process table
+/// (`sysinfo`'s `parent()` reports the relationship reliably; `Win32_Process`
+/// would too, but reaching it needs a shell able to ask Windows for a pid,
+/// which means PowerShell — and PowerShell is what hangs this suite, see
+/// below). `child_of` is `expect`ed, so a grandchild the test cannot see
+/// fails it rather than skipping the assertion and looking green.
 ///
 /// This is the assertion that would go red if `spawn` ever stopped assigning
 /// the child to its job — a change that breaks nothing else, and that every
 /// other test in this file would keep passing through.
-// Ran ignored on Windows for four commits, and the explanation offered
-// here at the time was wrong: it blamed PowerShell buffering a redirected
-// stdout, and the fix was an explicit flush. The flush changed nothing.
-// An out-of-process probe on the runner then showed the sheep with every
-// thread in `Wait` and 0.28s of CPU between them, all of it startup, so
-// there was no buffered line waiting to be flushed. The process was not
-// running at all. The fixture is `cmd` now, like every other one here.
 #[tokio::test]
 async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     let dir = tempfile::tempdir().unwrap();
     let mut spec = cmd_spec(&dir, &["echo", "placeholder"]);
-    // `cmd` from a batch file, not `powershell -Command`. PowerShell is
-    // what hung `daemon_e2e`'s gated fixture for four CI runs, and an
-    // out-of-process probe showed why: the sheep sat with every thread in
-    // `Wait` and 0.28s of CPU between them, all of it startup. This case
-    // failed the same way, with both its log files present and empty.
+    // `cmd` from a batch file, not `powershell -Command`: a PowerShell
+    // fixture here hangs the suite, with both log files present and empty.
     //
     // `start /b` is the grandchild: a process the sheep spawns that
     // outlives it, which is the whole point of the case. The sheep then

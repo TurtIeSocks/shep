@@ -3,7 +3,7 @@
 //! whole argument was building toward.
 //!
 //! `#[cfg(unix)]`: this module binds a real listener and reads real files,
-//! the same reason `serve::fs` is unix-only (Task 3) and `lookout`/`whistle`
+//! the same reason `serve::fs` is unix-only and `lookout`/`whistle`
 //! already are. `path`, `mime`, `listing` and `auth` stay pure; this is the
 //! module that actually calls them.
 //!
@@ -880,7 +880,7 @@ mod tests {
     /// reach `fs::contain` through the worker — Task 3 already pins
     /// `contain`'s own behavior;
     /// this is the wiring between the flag on `ServeConfig` and the
-    /// function call, over a real socket, on the exact deploy layout Rin's
+    /// function call, over a real socket, on the exact deploy layout the maintainer's
     /// ruling names.
     #[tokio::test]
     async fn a_symlinked_deploy_layout_is_served_only_with_follow_symlinks() {

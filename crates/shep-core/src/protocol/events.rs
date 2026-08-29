@@ -63,7 +63,7 @@ pub enum ProcessEventKind {
 /// Uses adjacently tagged serde format with `event` discriminator and `data` wrapper.
 /// Subscription TOPICS are the dotted strings from [`BusEvent::topic`]
 /// (`process.exit`, `log.out`, `daemon.*` — spec §6 grammar).
-/// Phase 2's server-side filter globs against `topic()`.
+/// The daemon's server-side filter globs against `topic()`.
 // wire format: changing existing variants is a breaking change
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // Adjacent tagging chosen because internally-tagged form cannot compile:
@@ -190,8 +190,8 @@ mod tests {
                     restarts: 2,
                     uptime_ms: 500,
                     fold: None,
-                    out_file: Some("/home/rin/.shep/logs/web-0-out.log".to_string()),
-                    err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
+                    out_file: Some("/home/ada/.shep/logs/web-0-out.log".to_string()),
+                    err_file: Some("/home/ada/.shep/logs/web-0-err.log".to_string()),
                     // A bus event is built from the actor's own snapshot,
                     // which never carries a resource reading.
                     cpu_percent: None,
@@ -221,18 +221,18 @@ mod tests {
             BusEvent::Dropped { count: 17 },
         ];
 
-        // Every lifecycle kind a `process.*` subscriber can receive, over one
+        // The lifecycle kinds exercised here (the reload trio has its own
+        // fixture), over one
         // identical `info`, so the snapshot rows differ by their `event` tag
-        // and by nothing else. Only `Exit` and the three reload kinds were
-        // pinned before Phase 10; the six here are the ordinary events a real
+        // and by nothing else. These are the ordinary events a real
         // integration — a dashboard, a bark rule — depends on first, and a
         // Rust-identifier rename on any of them would change the wire string
         // mechanically, compile clean, and break that integration silently.
         let sample = ProcessInfo::builder(3, "web", ProcStatus::WaitingRestart)
             .restarts(2)
             .uptime_ms(500)
-            .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
-            .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+            .out_file(Some("/home/ada/.shep/logs/web-0-out.log".to_string()))
+            .err_file(Some("/home/ada/.shep/logs/web-0-err.log".to_string()))
             // Reused below for `Stop` and `Delete` too — the two operator-
             // caused endings, and proof that a `shep stop`/`shep delete`
             // still carries the exit that produced them rather than losing

@@ -2,7 +2,7 @@
 
 ## Inventory
 
-## Bucket: tests-ci — /Users/rin/GitHub/pm2
+## Bucket: tests-ci — ~/GitHub/pm2
 
 ### Runners & infra
 | File | LOC | Purpose | Tags |

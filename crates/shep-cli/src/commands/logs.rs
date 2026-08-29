@@ -242,10 +242,15 @@ pub async fn flush(client: &Client, streams: &mut Streams<'_>, args: &FlushArgs)
 ///
 /// # Where the next line lands
 ///
-/// At offset 0, because [`launch::launch_command`] opens both files
-/// `O_APPEND` — see `launch`'s own `emptied_appending` for the measurement,
-/// and for why `File::create` (which is what this used to be) would instead
-/// leave the daemon writing past a `NUL` hole the size of everything emptied. A
+/// At offset 0 — not because of how this function truncates, but because of
+/// what the daemon writes with. [`launch::launch_command`] opens both files
+/// `O_APPEND` (see `launch`'s own `emptied_appending`), and an `O_APPEND`
+/// handle always writes at the file's current end, recomputed on every
+/// write; that is what lands the daemon's next line at 0 once this function
+/// has truncated the file to nothing, and it would hold just as true had
+/// this used `File::create` in place of `open().truncate(true)`. What
+/// `File::create` would actually change is the case below: it creates a
+/// file where one is missing, rather than leaving room for `absent`. A
 /// daemon launched by an older `shep` binary, or run in the foreground with
 /// the operator's own shell redirection, keeps whatever descriptor it was
 /// given: this verb still empties the file and still frees the disk blocks,

@@ -4,7 +4,7 @@
 
 ## Bucket: cli-bins (1832 LOC total)
 
-### /Users/rin/GitHub/pm2/lib/binaries/CLI.js — 1072 LOC [HOT 9c/2y] [TODO L248 commander-patch]
+### ~/GitHub/pm2/lib/binaries/CLI.js — 1072 LOC [HOT 9c/2y] [TODO L248 commander-patch]
 Main `pm2` binary entry. Sets `PM2_USAGE='CLI'`, gates Bun < 1.1.25 (throws, cluster support), `Common.determineSilentCLI()` + `printVersion()`, instantiates `PM2` (lib/API.js), wires PM2ioHandler.
 
 **Pre-parse behaviors (part of compat contract):**
@@ -81,29 +81,29 @@ Main `pm2` binary entry. Sets `PM2_USAGE='CLI'`, gates Bun < 1.1.25 (throws, clu
 
 `checkCompletion()` (L157-184): completes long/short flags from commander.options; process names (live `pm2.list()` RPC) after stop|restart|scale|reload|delete|reset|pull|forward|backward|logs|describe|desc|show; command names after bare `pm2`.
 
-### /Users/rin/GitHub/pm2/lib/binaries/DevCLI.js — 183 LOC (3c/2y)
+### ~/GitHub/pm2/lib/binaries/DevCLI.js — 183 LOC (3c/2y)
 `pm2-dev` binary. Isolated daemon at `~/.pm2-dev` (own pm2_home via `PM2.custom`). Env: `PM2_NO_INTERACTION=true`, `PM2_DISCRETE_MODE=true`.
 Options: `--raw --timestamp --node-args <a> --ignore [files] --post-exec [cmd] --silent-exec --test-mode --interpreter <i> --env [name] --auto-exit`. Commands: `*` and `start <file|json_file>` → `run()`.
 `run()`: forces `watch=true, autostart=true, autorestart=true, restart_delay=1000`; `--ignore` → ignore_watch + always appends 'node_modules'; `--timestamp` → 'YYYY-MM-DD-HH:mm:ss'; starts app, prints banner (fmt.title/field), after 1s `launchBus` → on 'process:event' packet.event=='online' runs `--post-exec` via child_process.exec (output piped unless --silent-exec); `Log.devStream` streams all logs; SIGINT → `pm2.delete('all')` → destroy → exit 0. `autoExit()`: 3s poll of pm2.list, two consecutive polls with 0 online/launching apps → exit 1. 0 args → help + kill pm2 if connected.
 
-### /Users/rin/GitHub/pm2/lib/binaries/Runtime.js — 101 LOC [STALE 2018] [UNTESTED] DEAD CODE
+### ~/GitHub/pm2/lib/binaries/Runtime.js — 101 LOC [STALE 2018] [UNTESTED] DEAD CODE
 Old pm2-runtime. NOT referenced by any bin (bin/pm2-runtime → Runtime4Docker.js). pm2_home hardcoded `~/.pm3`. Options `--auto-manage --fast-boot --web [port] --secret --public --machine-name --env --watch -i`. References `commander.json`/`commander.format` that are never defined. Superseded entirely by Runtime4Docker.js.
 
-### /Users/rin/GitHub/pm2/lib/binaries/Runtime4Docker.js — 192 LOC [STALE last commit 2024-03]
+### ~/GitHub/pm2/lib/binaries/Runtime4Docker.js — 192 LOC [STALE last commit 2024-03]
 Real `pm2-runtime` AND `pm2-docker` (both bins require it). "Drop-in replacement Node.js binary for containers" — the no-daemon PID-1 mode.
 Options: `-i --instances <n>` | `--secret/--public/--machine-name` (PM2 Plus) | `--no-autostart` | `--no-autorestart` | `--stop-exit-codes <codes...>` | `--node-args` | `-n --name` | `--max-memory-restart <mem>` | `-c --cron <pat>` | `--interpreter <i>` | `--trace` | `--v8` | `--format` (key=val logs) | `--raw` (default) | `--formatted` (|id|app|log) | `--json` (json log lines) | `--delay <seconds>` (default 0) | `--web [port]` (default 9615, cst.WEB_PORT) | `--only <app>` | `--no-auto-exit` (auto-exit ON by default) | `--env [name]` | `--watch` | `--error <path>` (default `/dev/null`) | `--output <path>` (default `/dev/null`) | `--deep-monitoring` | `.allowUnknownOption()`. Commands: `*` and `start <app.js|json_file>`.
 **Flow (traced):** `Runtime.instanciate(cmd)` → `PM2.custom({pm2_home: $PM2_HOME||~/.pm2, daemon_mode: PM2_RUNTIME_DEBUG||false})` — daemon runs IN-PROCESS foreground → `connect` → install SIGINT/SIGTERM → `Runtime.exit()` = `pm2.kill()` then process.exit → `startLogStreaming()` (json|format|raw stream of 'all' to stdout — container logging convention; passes `commander.timestamp` which is never defined) → `startApp` after `--delay`*1000ms → `pm2.start(cmd, commander)`; err or 0 apps started → error + exit; `--web` → `pm2.web(port)`; auto-exit → after 4s start `autoExitWorker()`: every 2s (unref'd timer) `pm2.list`, count apps that are NOT pmx_module and status online|launching; 0 online → decrement fail_count (DEFAULT_FAIL_COUNT=3), at 0 → `exit(2)`; any app online resets nothing (fail_count only resets by re-entry with undefined). Exit code contract: 0 normal kill, 1 no-pm2/startup error, 2 auto-exit.
 
-### /Users/rin/GitHub/pm2/bin/pm2, pm2-dev, pm2-docker, pm2-runtime — 3 LOC each
+### ~/GitHub/pm2/bin/pm2, pm2-dev, pm2-docker, pm2-runtime — 3 LOC each
 Node shebang shims: pm2→CLI.js, pm2-dev→DevCLI.js, pm2-docker→Runtime4Docker.js, pm2-runtime→Runtime4Docker.js. package.json bin map confirms all four.
 
-### /Users/rin/GitHub/pm2/bin/pm2.ps1 — 3 LOC
+### ~/GitHub/pm2/bin/pm2.ps1 — 3 LOC
 PowerShell wrapper: `node $PSScriptRoot/../lib/binaries/CLI.js $args`. Not in package.json bin map — manual Windows convenience.
 
-### /Users/rin/GitHub/pm2/lib/completion.js — 229 LOC [UNTESTED]
+### ~/GitHub/pm2/lib/completion.js — 229 LOC [UNTESTED]
 Vendored/hacked node-tabtab 0.0.4 (itself derived from npm completion by isaacs). tabtab NOT in package.json deps — fully vendored. Exports: `complete` (main: parses `completion` argv + COMP_CWORD/COMP_POINT/COMP_LINE env; no COMP_* → dump completion.sh to stdout with EPIPE swallow hack for macOS `source <(...)`; `install`/`uninstall` → splice completion.sh between `###-begin-pm2-completion-###`/`###-end-...###` markers into `~/.bashrc`|`~/.zshrc`), `log` (prefix-filtered candidate printer), plus dead exports `isComplete`, `parseOut`, `parseTasks`, and unused private fn `installed`. Shell rc filename derived from `process.env.SHELL.match(/\/bin\/(\w+)/)[1]` — crashes if SHELL unset (Windows), wrong file for fish/nonstandard shells.
 
-### /Users/rin/GitHub/pm2/lib/completion.sh — 40 LOC [STALE 2015] [UNTESTED]
+### ~/GitHub/pm2/lib/completion.sh — 40 LOC [STALE 2015] [UNTESTED]
 Bash/zsh completion template: bash `complete -o default -F _pm2_completion pm2`; zsh legacy `compctl -K`. Strips `=` and `@` from COMP_WORDBREAKS. Re-invokes `pm2 completion -- "${COMP_WORDS[@]}"` with COMP_* env per keystroke — every TAB spawns full Node CLI (slow), and process-name completion additionally connects to daemon.
 
 ## Flags

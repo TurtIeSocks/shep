@@ -49,7 +49,7 @@ marked as such.
 This document exists because `docs/specs/deferred.md` puts the Windows
 functional tier last and says, honestly, that its estimate "is mostly
 guesswork" — a decision brief's +30-40% on the daemon's process-control
-layer. This is the attempt to replace that number with something Rin can
+layer. This is the attempt to replace that number with something the maintainer can
 act on.
 
 ## 1. The headline
@@ -393,7 +393,7 @@ better than a half-tier that silently no-ops its file locks and calls
 So: state the position in the README rather than leaving it as a deferred
 item that implies it is coming. Say "Linux and macOS; Windows via WSL2" as a
 statement of scope, not an apology. Then dispatch `test.yml` once, and if
-Rin still wants the tier after seeing what the compile-only leg reports, the
+The maintainer still wants the tier after seeing what the compile-only leg reports, the
 first phase to build is the transport seam — it is the highest-leverage item
 in the estimate, it unblocks everything else, and it is worth doing on its
 own merits even on Unix, because a `Transport` abstraction is a better shape

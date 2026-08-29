@@ -120,7 +120,7 @@ Options: (a) bump workspace MSRV to 1.88; (b) bump only shep-cli's
 binary, so the effective MSRV is 1.88 either way; a split MSRV is a fiction
 that complicates the CI matrix (IR-44 MSRV row) for zero user benefit. 1.88
 is >1 year old at ship time. One-line change + CI pin bump + idiomatic-rust.md
-edit, done in the PR that introduces rmcp. Flag to Rin in that PR.
+edit, done in the PR that introduces rmcp. Flag to the maintainer in that PR.
 
 **D2 — Control gating: absent vs erroring, and who reads the flag.**
 **Recommend: tools absent from `tools/list` when `allow_control = false`.**

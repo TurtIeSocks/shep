@@ -10,24 +10,24 @@
 
 **Where the requirements come from.** There is no brainstorming spec for this plan. The source is `shep-deploy`'s own two ledgers and its design spec, all outside this repository:
 
-- `/Users/rin/GitHub/shep-deploy/.superpowers/sdd/2026-08-26-deploy-engine/progress.md`
-- `/Users/rin/GitHub/shep-deploy/.superpowers/sdd/2026-08-26-deploy-poll-loop/progress.md`
-- `/Users/rin/GitHub/shep-deploy/docs/brainstorming/specs/2026-08-26-deploy-dog-design.md`, and its Task 12 in `docs/writing-plans/plans/2026-08-26-deploy-poll-loop.md:4185`
+- `~/GitHub/shep-deploy/.superpowers/sdd/2026-08-26-deploy-engine/progress.md`
+- `~/GitHub/shep-deploy/.superpowers/sdd/2026-08-26-deploy-poll-loop/progress.md`
+- `~/GitHub/shep-deploy/docs/brainstorming/specs/2026-08-26-deploy-dog-design.md`, and its Task 12 in `docs/writing-plans/plans/2026-08-26-deploy-poll-loop.md:4185`
 
 Read the poll-loop ledger's tail and the design spec's "Smits" and "Documentation shep owes" sections before Task 1. Everything below was established there, usually by measurement after something went wrong.
 
-**Reading those files is allowed and expected. `/Users/rin/GitHub/pm2` is not.** See the clean-room constraint below.
+**Reading those files is allowed and expected. `~/GitHub/pm2` is not.** See the clean-room constraint below.
 
 ## Global Constraints
 
 - **`docs/idiomatic-rust.md`'s rules (IR-1..IR-45).** Invoke the `shep-idiomatic-rust` skill before writing any Rust here. `core::error::Error`, never `std::error::Error`. `# Errors` sections on fallible public functions. `# Panics` with `#[track_caller]`. A deliberate `Debug` decision on every new public item, redacted for anything carrying env or secrets, with an exact-string test (IR-41).
 - **No new dependencies.**
 - **No em dashes or en dashes** in anything a person reads, `///` comments included, since clap renders those into `--help` and `web/scripts/generate-cli-reference.sh` renders that into the docs site. Existing tests pin this (`crates/shep-cli/src/cli.rs:1415` and its neighbours).
-- **Clean-room rule, non-negotiable:** never open, read or reference `/Users/rin/GitHub/pm2`. Reading `/Users/rin/GitHub/shep-deploy` is fine and is where this plan's requirements live.
+- **Clean-room rule, non-negotiable:** never open, read or reference `~/GitHub/pm2`. Reading `~/GitHub/shep-deploy` is fine and is where this plan's requirements live.
 - **One cargo shape per task.** The workspace shares one target-dir build lock, so concurrent runs block rather than parallelise. Run each gate as its own command with `$?` read directly, never through a pipe: in zsh a pipeline's `$?` is the last command's and `${PIPESTATUS[0]}` is empty.
 - **The inner loop is `cargo test -p shep --lib --all-features`** for CLI work and `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::` for daemon work. Do not run bare `--workspace` while iterating. `shep` is a library with three thin `[[bin]]` targets and every unit test lives in the library, so `--lib` reaches them all; add `--bins` only when a task changes a binary's own `main`.
 - **The docs trigger is live for every task except 2.** Each of the others changes something an operator types or sees: a help string, an exit code, a JSON field, a table column, or a contract a dog author reads. `web/` is published and part of the public surface. Task 9 is the single sweep that discharges it, and no task before it may claim to be finished on the strength of a green Rust gate alone.
-- **`crates/shep-cli/src/cli.rs`, `src/lib.rs`, `src/commands/init.rs`, `src/commands/runtime.rs` and `tests/cli_e2e.rs` carry Rin's own uncommitted work** in the main checkout as of 2026-08-27. This plan runs in a separate worktree, so that work is not present here, but if any task is ever run in the main checkout instead: stage by name, never `git add -A`, and **never run `git checkout` on those files**.
+- **`crates/shep-cli/src/cli.rs`, `src/lib.rs`, `src/commands/init.rs`, `src/commands/runtime.rs` and `tests/cli_e2e.rs` carry the maintainer's own uncommitted work** in the main checkout as of 2026-08-27. This plan runs in a separate worktree, so that work is not present here, but if any task is ever run in the main checkout instead: stage by name, never `git add -A`, and **never run `git checkout` on those files**.
 - **`shep-deploy` appears in this repository as a systemd fixture name**, in `crates/shep-cli/src/commands/startup/` and `src/output/rows.rs`. It is an unrelated coincidence. Grepping for `shep-deploy` to find this work will find those instead.
 
 ## Verified facts, measured rather than assumed
@@ -51,7 +51,7 @@ Established 2026-08-27 by reading this tree at `2ea4226` (v0.1.3). Use these; do
 - **`vet_binary` is the precedent for spawning a dog binary out of band** (`crates/shep-cli/src/commands/dogs.rs:356-429`): `Command::new(&canonical).env("SHEP_HOME", home)` with all three stdio handles set explicitly, then kill and wait. Its own comment says why stdio is null'd there: a candidate that writes on its way up would scribble over the operator's terminal mid-vet.
 - **`macos_deferred_exec_failure` is the precedent for a bounded wait on a spawned dog** (`dogs.rs:534`), a synchronous `try_wait` poll loop with `PROBE_BUDGET = 50ms` (`dogs.rs:506`) and `PROBE_POLL_INTERVAL = 500us` (`dogs.rs:510`).
 - **A dog's stdout and stderr are not read by shep.** They go through the ordinary sheep log pump to `$SHEP_HOME/logs/<name>-<instance>-{out,err}.log`. The hook's output is the first dog output shep itself ever reads.
-- **`shep-log-rotate` refuses an unknown argument** with a usage message on stderr and a nonzero exit (`/Users/rin/GitHub/shep-log-rotate/src/main.rs:114-126`). It is a real adopted dog that implements no hook, and it is the compatibility case Task 2 must not break.
+- **`shep-log-rotate` refuses an unknown argument** with a usage message on stderr and a nonzero exit (`~/GitHub/shep-log-rotate/src/main.rs:114-126`). It is a real adopted dog that implements no hook, and it is the compatibility case Task 2 must not break.
 
 **On notices, sanitising and `--quiet`:**
 
@@ -63,7 +63,7 @@ Established 2026-08-27 by reading this tree at `2ea4226` (v0.1.3). Use these; do
 **On the wire:**
 
 - **`PROTOCOL_VERSION` stays 1 for an additive field.** The precedent is `ProcessInfo::last_exit`, added 2026-08-19 and recorded in `crates/shep-core/CHANGELOG.md:14-32`: "Additive under `Option` on the same terms as every other field this struct has grown since Phase 3 -- `PROTOCOL_VERSION` stays **1**, and a peer that predates the field neither sends nor expects the key."
-- **Wire-additive and Rust-additive are different questions.** A `#[serde(default)]` field keeps the wire compatible; whether the Rust change is breaking depends on the variant's shape. Task 7 turns on this and carries the one decision in this plan that is Rin's.
+- **Wire-additive and Rust-additive are different questions.** A `#[serde(default)]` field keeps the wire compatible; whether the Rust change is breaking depends on the variant's shape. Task 7 turns on this and carries the one decision in this plan that is the maintainer's.
 - **Changelogs are generated** by release-plz from conventional commits, in Keep a Changelog form, one per crate (`release-plz.toml`, `changelog_update = true`, template in `release-plz-changelog.toml`). This flipped on 2026-08-27; it read `changelog_update = false` when this plan was written, so do not hand-write an entry for your own change. Write a conventional commit subject and let the release pull request carry it. All four real crates share one version through `[workspace.package]`.
 - **`shep-deploy` consumes `shep-client` from crates.io.** Nothing here unblocks its Task 12 until this work is released. Task 10 is that step.
 
@@ -102,7 +102,7 @@ Established 2026-08-27 by reading this tree at `2ea4226` (v0.1.3). Use these; do
 - Consumes: nothing.
 - Produces: `ShepToml::rehome_dog` keeps its exact signature, `pub fn rehome_dog(&mut self, name: &str)`. Only its behaviour and its contract change. No other task depends on this one.
 
-**Rin approved this on 2026-08-26.** The settings under `[dog.<name>]` are the operator's, not the dog's. Destroying them makes re-adopting the same dog a from-scratch reconfiguration, which is exactly the argument `disable_dog`'s own doc already makes for `disable` (`shep_toml.rs:274-277`: "an operator who disables a dog to restart it must not lose the configuration they wrote for it"). The change here is extending that sentence to `rehome`, not inventing a new one.
+**the maintainer approved this on 2026-08-26.** The settings under `[dog.<name>]` are the operator's, not the dog's. Destroying them makes re-adopting the same dog a from-scratch reconfiguration, which is exactly the argument `disable_dog`'s own doc already makes for `disable` (`shep_toml.rs:274-277`: "an operator who disables a dog to restart it must not lose the configuration they wrote for it"). The change here is extending that sentence to `rehome`, not inventing a new one.
 
 **The remaining difference between `disable` and `rehome` is still real and still worth the two verbs.** `disable` leaves the dog in `adopted_dogs`, so shep still knows where its binary lives. `rehome` forgets that. After this task, re-adopting means running `shep adopt <path>` again and getting your configuration back, rather than running it again and starting from an empty table.
 
@@ -192,7 +192,7 @@ The doc at `shep_toml.rs:350-354` currently says the table is removed. Replace i
     /// reconfiguration. [`Self::disable_dog`] already makes this argument
     /// for `disable`; the only reason `rehome` did not follow it was that
     /// "forget the dog entirely" was read as covering the operator's own
-    /// file. Changed 2026-08-27, on Rin's approval.
+    /// file. Changed 2026-08-27, on the maintainer's approval.
     ///
     /// What still separates this from [`Self::disable_dog`]: `disable`
     /// leaves the binary's path in `adopted_dogs`, so shep still knows
@@ -308,7 +308,7 @@ the dog lives and the next `enable` brings it straight back. `rehome`
 forgets that, so coming back means `shep adopt <path>` again -- which now
 finds the configuration waiting instead of an empty table.
 
-Approved by Rin 2026-08-26. Surfaced by shep-deploy, whose `[dog.deploy]`
+Approved by the maintainer 2026-08-26. Surfaced by shep-deploy, whose `[dog.deploy]`
 section holds an interval and a retention count an operator chose, and
 which could not survive a rehome-and-re-adopt cycle.
 
@@ -367,7 +367,7 @@ EOF
 
 **Why a new module rather than more of `commands/dogs.rs`.** That file is already 1,926 lines and holds four operator verbs plus `vet_binary`'s whole security argument. The hook is a different responsibility -- shep invoking a dog, bounded, and reading what it wrote -- and it is the only place in the CLI that reads a child's output at all. The precedent for this split is `fetch.rs` next to `http.rs`: a new module whose doc names its sibling and says why they are separate. Do the same here, pointing at `commands/dogs.rs` for the verbs and at `src/dog/mod.rs` for the opposite direction (what a dog uses to talk to shep, not what shep uses to talk to a dog).
 
-**`Refused` is not a failure, and the name says so.** A dog that implements no hook exits nonzero on an argument it does not recognise. `shep-log-rotate` does exactly this today (`/Users/rin/GitHub/shep-log-rotate/src/main.rs:114`), and it is adopted on real machines. Every dog that exists predates this hook, so **the common case for a long time will be `Refused`**, and shep must treat it as ordinary rather than as something gone wrong. There is no registry, no manifest and no capability flag to consult first; running it and reading the answer is the whole of the discovery mechanism.
+**`Refused` is not a failure, and the name says so.** A dog that implements no hook exits nonzero on an argument it does not recognise. `shep-log-rotate` does exactly this today (`~/GitHub/shep-log-rotate/src/main.rs:114`), and it is adopted on real machines. Every dog that exists predates this hook, so **the common case for a long time will be `Refused`**, and shep must treat it as ordinary rather than as something gone wrong. There is no registry, no manifest and no capability flag to consult first; running it and reading the answer is the whole of the discovery mechanism.
 
 **Where a fake would be too kind.** Three places, and all three are why this task ends with a real-binary test rather than a mocked one:
 
@@ -425,10 +425,10 @@ mod tests {
     #[tokio::test]
     async fn a_hook_that_succeeds_reports_done_and_carries_its_output() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let exec = dog(dir.path(), "good", "echo 'web put back at /home/rin/ReactMap'");
+        let exec = dog(dir.path(), "good", "echo 'web put back at /home/ada/ReactMap'");
         let run = run_with_budget(&exec, dir.path(), Duration::from_secs(5)).await;
         assert_eq!(run.outcome, HookOutcome::Done);
-        assert_eq!(run.output.trim(), "web put back at /home/rin/ReactMap");
+        assert_eq!(run.output.trim(), "web put back at /home/ada/ReactMap");
         assert!(!run.truncated);
     }
 
@@ -915,7 +915,7 @@ only thing under test is the hook and its report.
     async fn quiet_silences_the_hook_report_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let paths = ShepPaths::resolve(&|_| None, dir.path());
-        adopt_a_hook(&paths, dir.path(), "echo 'web put back at /home/rin/ReactMap'");
+        adopt_a_hook(&paths, dir.path(), "echo 'web put back at /home/ada/ReactMap'");
 
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1085,7 +1085,7 @@ EOF
 - What is actually at risk is a **collision**, and the collision is real because of the passthrough. `shep <dogname> [args]` propagates the dog's exit code verbatim (`crates/shep-cli/src/lib.rs:397`, `dog_exit_code`), so `shep deploy web` really does exit 12 on an operator's terminal. If shep ever gave 12 its own meaning, those two would be indistinguishable at the only place anybody reads them.
 - So the useful artifact is a **reservation that cannot be taken by accident**: spec §9 records 12 and 13 and says the range belongs to dogs, and `exit.rs` carries a test that goes red the day somebody adds a twelfth shep code.
 
-That is strictly stronger than two unused variants would have been. If Rin wants the variants anyway, it is a five-line change on top and this task is where it goes.
+That is strictly stronger than two unused variants would have been. If the maintainer wants the variants anyway, it is a five-line change on top and this task is where it goes.
 
 **This task also fixes a contradiction inside the spec's own section 9.** `docs/specs/shep-v1.md:451` still reads "(fail-fast exit code 2)" for `runtime`, while `:414` and `:422-426` of the same file give `runtime` code 11 and explain at length why it is not 2. Nobody has noticed because nothing cross-checks the table against anything. Fix it in the same commit; it is the same table.
 
@@ -1227,7 +1227,7 @@ git commit -F- <<'EOF'
 docs(spec): reserve exit codes 12 and up for dogs, and pin the ladder
 
 shep-deploy claims 12 for a deploy that rolled back and 13 for a cutover
-that landed and could not tidy up. Rin chose both, on the reasoning that a
+that landed and could not tidy up. The maintainer chose both, on the reasoning that a
 script has to tell three outcomes apart: it worked, it worked but needs
 tidying, it failed. That matters most to the poll loop, which runs
 unattended and would otherwise treat a landed deploy as a failure and retry
@@ -1273,7 +1273,7 @@ EOF
 
 **Read this section before writing any code. The ledger's premise for this item is wrong, and the correction changes the design.**
 
-`shep-deploy`'s ledger records Rin's decision as: "shep RETURNS the reload deadline on the reload response... Additive field, so no `PROTOCOL_VERSION` bump." The second half does not survive contact with the response's actual shape.
+`shep-deploy`'s ledger records the maintainer's decision as: "shep RETURNS the reload deadline on the reload response... Additive field, so no `PROTOCOL_VERSION` bump." The second half does not survive contact with the response's actual shape.
 
 `Response::Reloading(Vec<ProcessInfo>)` (`crates/shep-core/src/protocol/request.rs:872`) is a **tuple variant**, under `#[serde(tag = "kind", content = "data")]` (`request.rs:841-845`). On the wire it is:
 
@@ -1285,7 +1285,7 @@ pinned at `crates/shep-core/src/protocol/snapshots/shep_core__protocol__request_
 
 > Evolution rule: ADDITIVE optional fields (new serde-defaulted `Option<T>` fields, new variants behind `#[non_exhaustive]`) keep the version. Removing, renaming, or **retyping anything serialized** bumps it.
 
-So the shape Rin was told about is a `PROTOCOL_VERSION` bump, and the handshake compares versions for **equality** (`crates/shep-daemon/src/server.rs:422`, `crates/shep-client/src/connection.rs:166`), so a bump means every published client stops talking to every published daemon. The `last_exit` precedent does not transfer: that was a new `Option` field on an existing struct, which is a different move.
+So the shape the maintainer was told about is a `PROTOCOL_VERSION` bump, and the handshake compares versions for **equality** (`crates/shep-daemon/src/server.rs:422`, `crates/shep-client/src/connection.rs:166`), so a bump means every published client stops talking to every published daemon. The `last_exit` precedent does not transfer: that was a new `Option` field on an existing struct, which is a different move.
 
 **Three ways out. Take (c).**
 
@@ -1315,7 +1315,7 @@ That third row is the one the `shep-deploy` ledger left open after Task 10's clo
 
 **The field is meaningful outside a reload, which is what makes it honest on `ProcessInfo`.** It is not "the deadline of the reload you just asked for". It is "how long a swap of this instance is allowed to take", derivable from its registered spec at any moment. `ListFlock` and `Describe` may as well answer it too, and a dog deciding whether it can afford a reload before asking for one is a real use.
 
-**For Rin.** The decision recorded in the ledger was made against a description of the wire that was wrong. (c) delivers what she asked for without the bump and closes two more inferred inputs; (a) is what she was actually described and costs a protocol break. **This plan implements (c). If she wants (a), the plan needs re-cutting around a `PROTOCOL_VERSION` bump, which is a much larger piece of work than this task.**
+**For the maintainer.** The decision recorded in the ledger was made against a description of the wire that was wrong. (c) delivers what she asked for without the bump and closes two more inferred inputs; (a) is what she was actually described and costs a protocol break. **This plan implements (c). If she wants (a), the plan needs re-cutting around a `PROTOCOL_VERSION` bump, which is a much larger piece of work than this task.**
 
 **Where a fake would be too kind.** A unit test that builds a `ProcessInfo` with a deadline and reads it back proves the field exists and nothing else. The property that matters is that **the number shep hands out equals the number shep armed**, and those are computed in two different functions. A test that hardcodes 16000 on both sides would stay green if `arm_reload_deadline` changed and `to_info` did not, which is the exact drift this field exists to remove and which the dog's own copied formula suffered for five review rounds. Derive both from one function and pin **that**.
 
@@ -1835,7 +1835,7 @@ git add crates/shep-core/src/protocol/ crates/shep-daemon/src/ \
 git commit -F- <<'EOF'
 feat(core,daemon): a dog may paint a smit on a sheep
 
-Rin's requirement was that `shep flock` show which sheep are being watched
+The maintainer's requirement was that `shep flock` show which sheep are being watched
 by a deploy dog. Building that into shep would mean shep's core learning
 what a deployment is. This is the general mechanism instead: a dog attaches
 a short string to a sheep and shep paints it without understanding it.
@@ -1903,7 +1903,7 @@ EOF
 - Consumes: Task 6's `ProcessInfo::smit: Option<String>`.
 - Produces: nothing another task consumes.
 
-**Rin's ruling, and the condition attached to it.** The smit is droppable on a narrow terminal. Her permission was conditional: dropping it is acceptable *because* it is seen regularly at full width. That carries a requirement the permission does not state outright, and this task exists to pin it: **it must never be dropped at full width, and must not be crowded out there by a later change.** Both ends get an exact-string test.
+**the maintainer's ruling, and the condition attached to it.** The smit is droppable on a narrow terminal. Her permission was conditional: dropping it is acceptable *because* it is seen regularly at full width. That carries a requirement the permission does not state outright, and this task exists to pin it: **it must never be dropped at full width, and must not be crowded out there by a later change.** Both ends get an exact-string test.
 
 **Before placing it, a correction: two comments in this repository state the drop order backwards.** The renderer drops the **highest** priority number first (`table.rs:277-283`, `max_by_key` over `priorities`). `FlockRows::PRIORITIES` is `[0, 0, 0, 2, 4, 6, 5, 3, 1, 7]` against `["ID","NAME","STATUS","PID","RESTARTS","EXIT","CPU","MEM","UPTIME","FOLD"]`, so the real give-up order is **FOLD, EXIT, CPU, RESTARTS, MEM, PID, UPTIME**.
 
@@ -1915,7 +1915,7 @@ Three independent things agree with that and disagree with the comments:
 
 What is wrong is only the wording. `rows.rs:137-157` and the test comment at `rows.rs:2866-2871` both introduce a list sorted by ascending priority as "in that dropping order" / "in the order they are given up". It is the reverse: ascending priority is the order they **survive** in, longest-lasting first. The neighbouring sentence at `:2869-2871` ("the ones answering 'is it healthy' outlast the ones answering 'which one is it'") describes the true behaviour correctly, which is presumably how this survived. Fix both wordings in this task; do not change a single number.
 
-**So SMIT gets priority 8 and drops first of all.** "Among the first columns to yield" is Rin's phrase, and 8 is the literal reading of it. The supporting argument worth putting in the code comment: it is by far the widest column, so dropping it buys back the most room for one column lost.
+**So SMIT gets priority 8 and drops first of all.** "Among the first columns to yield" is the maintainer's phrase, and 8 is the literal reading of it. The supporting argument worth putting in the code comment: it is by far the widest column, so dropping it buys back the most room for one column lost.
 
 **Corrected after review.** An earlier draft of this task offered a second argument, that SMIT is the only column whose content another command can recover by asking the deploy dog, where nothing but a wider terminal brings FOLD back. That is false, and `output.astro` disproves it on the same screen: `--format json` carries every field at any width, so every column is recoverable that way and none is special. The priority is unaffected; only the decorative reason goes. Do not reintroduce it.
 
@@ -1925,7 +1925,7 @@ What is wrong is only the wording. `rows.rs:137-157` and the test comment at `ro
 
 **Where a fake would be too kind.** Three specific ways:
 
-1. **A hand-built `ProcessInfo` with `smit: Some("x")` proves nothing about width.** The requirement is about a real smit at a real terminal size, so the fixtures use the real strings the real dog produces: `▲ main@a1b2c3` and `⏸ main@f6e5d4`, taken from `/Users/rin/GitHub/shep-deploy/src/smit.rs`.
+1. **A hand-built `ProcessInfo` with `smit: Some("x")` proves nothing about width.** The requirement is about a real smit at a real terminal size, so the fixtures use the real strings the real dog produces: `▲ main@a1b2c3` and `⏸ main@f6e5d4`, taken from `~/GitHub/shep-deploy/src/smit.rs`.
 2. **Do not assume how wide `▲` is.** `visible_width` measures through `unicode-width` (`output/width.rs:21`), and `▲` (U+25B2) and `⏸` (U+23F8) are exactly the kind of symbol whose East Asian Width is ambiguous or has moved between Unicode revisions. **Measure it in a test rather than reasoning about it**, and if the two marks measure differently, say so in the report: it does not break the column, which pads, but it means the two smit strings are not interchangeable in a width calculation.
 3. **A test at one width cannot fail the way this must.** A single 120-column snapshot passes just as happily if SMIT had priority 1 and never dropped at all. Both ends, or neither.
 
@@ -1951,7 +1951,7 @@ What is wrong is only the wording. `rows.rs:137-157` and the test comment at `ro
 In `crates/shep-cli/src/output/table.rs`'s `mod tests`, beside the existing snapshot tests (`:920`, `:953`) and reusing `mixed_flock` (`:885`) extended to carry smits.
 
 ```rust
-    /// fails if a smit is dropped at full width. Rin's permission to drop
+    /// fails if a smit is dropped at full width. The maintainer's permission to drop
     /// it on a narrow terminal was conditional on it being seen regularly
     /// at a wide one, so a later column that crowded it out here would
     /// reopen a decision that was already made. This is the half of that
@@ -1997,7 +1997,7 @@ In `crates/shep-cli/src/output/table.rs`'s `mod tests`, beside the existing snap
     /// smit. Asserted rather than assumed: `table.rs`'s own note at :875
     /// records that adding EXIT cost 7 columns and forced the wide fixture
     /// from 80 to 90, and a later column will move this too. When it moves,
-    /// that is a decision about Rin's full-width condition, not a number to
+    /// that is a decision about the maintainer's full-width condition, not a number to
     /// quietly update.
     const FULL_WIDTH: usize = 106;
 ```
@@ -2082,7 +2082,7 @@ not know what `A main@a1b2c3` means and never will; it is a string a dog
 attached and a column shep paints.
 
 Priority 8, so it is the first column given up as a terminal narrows, and
-placed last so position and priority agree. Rin ruled it droppable, with a
+placed last so position and priority agree. The maintainer ruled it droppable, with a
 condition her permission did not state outright: dropping it on narrow is
 acceptable BECAUSE it is seen regularly at full width, so it must never be
 dropped at full width and must not be crowded out there later. Both ends
@@ -2159,7 +2159,7 @@ A `request` that silently re-dialled would take a `Delete { selector: Id(7) }` a
 
 **Explicitly NOT in this task:** converging `lookout` onto the spec's schedule, or onto `reconnect`. It works, it is tested (`link.rs:497`, `:587`), and its 5-attempt bound exists to reach a "frozen" UI state that a plain backoff has no concept of. Naming the divergence is this task's job; resolving it is not.
 
-**For Rin, two things.** First, `reconnect(&mut self)` cannot be called through an `Arc<Client>`, and `crates/shep-client/src/client.rs:110-114` explicitly recommends sharing one `Client` behind an `Arc`. That is deliberate: `&mut self` forces a caller to hold exclusive access at the moment the connection's identity changes, which is exactly when a shared handle would be lying to its other users. The alternative is interior mutability, which slides back toward the transparent behaviour argued against above. Second, distinguishing daemons by pid has a residual: pids are reusable. Within a reconnect window it takes wrapping the whole pid space, so it is not a practical worry, and the stronger fix is a boot nonce as an additive `Option<u64>` on `HelloAck` (version stays 1, same terms as `last_exit`). **Not built here**; noted so the choice is visible rather than discovered later.
+**For the maintainer, two things.** First, `reconnect(&mut self)` cannot be called through an `Arc<Client>`, and `crates/shep-client/src/client.rs:110-114` explicitly recommends sharing one `Client` behind an `Arc`. That is deliberate: `&mut self` forces a caller to hold exclusive access at the moment the connection's identity changes, which is exactly when a shared handle would be lying to its other users. The alternative is interior mutability, which slides back toward the transparent behaviour argued against above. Second, distinguishing daemons by pid has a residual: pids are reusable. Within a reconnect window it takes wrapping the whole pid space, so it is not a practical worry, and the stronger fix is a boot nonce as an additive `Option<u64>` on `HelloAck` (version stays 1, same terms as `last_exit`). **Not built here**; noted so the choice is visible rather than discovered later.
 
 **Where a fake would be too kind.** Almost every fake in `crates/shep-client/src/testing.rs` accepts exactly **one** connection (`:43`, `:67`, `:101`, `:501`, `:917`), so a reconnect test written against the obvious fake would pass by connecting once and never proving a re-dial happened at all. `fake_daemon_accepting_repeatedly` (`:117`) is the one to use, and the test has to assert the **second** connection actually served a request, not merely that `reconnect` returned `Ok`.
 
@@ -2398,7 +2398,7 @@ EOF
 | a smit | a short mark a dog paints on a sheep (a badge) | the SMIT column in `shep flock` | yes |
 ```
 
-`docs/terminology.md` is the canonical lexicon and needs the same concept in **its** shape, which is a different table (`| Concept | Conventional | shep says | Where it applies |`), with `badge` recorded as the plain alias. `smit` is the real shepherding term for a paint mark identifying whose flock a sheep belongs to, and unlike a brand it is deliberately temporary, which is what makes it the right word. `badge` was rejected as the primary because the README already carries seven shields.io badges and one word should not mean two things in one project. Rin approved `smit` on the precedent of `muster` and `thatlldo`.
+`docs/terminology.md` is the canonical lexicon and needs the same concept in **its** shape, which is a different table (`| Concept | Conventional | shep says | Where it applies |`), with `badge` recorded as the plain alias. `smit` is the real shepherding term for a paint mark identifying whose flock a sheep belongs to, and unlike a brand it is deliberately temporary, which is what makes it the right word. `badge` was rejected as the primary because the README already carries seven shields.io badges and one word should not mean two things in one project. The maintainer approved `smit` on the precedent of `muster` and `thatlldo`.
 
 While in `docs/terminology.md`, fix its `rehome` row at `:28` per Task 1.
 
@@ -2553,7 +2553,7 @@ Give the second its own `CARGO_TARGET_DIR` so it does not invalidate the host ca
 
 There is no changelog commit to make. If `git status` shows a modified `CHANGELOG.md`, something hand-wrote an entry release-plz is about to generate again; drop it.
 
-The repository has been on pull requests since 0.1.0 was published; the push-to-main window is closed. The PR body is public-facing prose: run `humanizer` then `rin-voice` over it, use bullets, and do not hard-wrap the paragraphs, because GitHub renders comment fields with hard line breaks on and an 80-column wrap becomes a ragged third-width column.
+The repository has been on pull requests since 0.1.0 was published; the push-to-main window is closed. The PR body is public-facing prose: run the humanizer and voice skills over it, use bullets, and do not hard-wrap the paragraphs, because GitHub renders comment fields with hard line breaks on and an 80-column wrap becomes a ragged third-width column.
 
 - [ ] **Step 4: Release, because the dog is waiting on crates.io**
 
@@ -2577,7 +2577,7 @@ Named so that none of them looks like an oversight later.
 - **The spec's Name column keeps its spaces** where `code_str` uses underscores (`not found` against `not_found`). Task 4 deliberately does not smuggle that in.
 - **Windows is untouched**, as everywhere else. Task 2's `tokio::process` call sits in `commands/`, which is already `#[cfg(unix)]`-gated at `main.rs`.
 
-## For Rin
+## For the maintainer
 
 Five things, in the order they would cost most to get wrong.
 
@@ -2596,8 +2596,8 @@ Checked against the six items in the brief.
 | 1. `rehome` stops deleting `[dog.<name>]` | 1 | Nine restatement sites in `crates/`, and the rest in Task 9's table |
 | 2. On-remove lifecycle hook | 2, 3 | The runner and the wiring, split so the process behaviour has its own gate |
 | 3. Smits (blocks `shep-deploy` Task 12) | 6, 7 | Two-width exact-string test in Task 7, Step 2 |
-| 4. Reload response carries the deadline | 5 | Delivered on `ProcessInfo`, not the response. Argued; Rin's call |
-| 5. Exit rows 12 and 13 | 4 | Reserved, not defined. Argued; Rin's call |
+| 4. Reload response carries the deadline | 5 | Delivered on `ProcessInfo`, not the response. Argued; the maintainer's call |
+| 5. Exit rows 12 and 13 | 4 | Reserved, not defined. Argued; the maintainer's call |
 | 6. `shep-client` reconnect | 8 | Ruled: a client change plus a documented contract, not a transparent retry |
 
 **Dependencies.** Task 7 consumes Task 6 and cannot start before it. Task 3 consumes Task 2. Everything else is independent: 1, 2, 4, 5, 6 and 8 can run in parallel, with 5 and 6 both editing `ProcessInfo` and `request.rs` (expect one merge, and re-accept the wire snapshots once rather than twice). Task 9 runs after all of them. Task 10 last.

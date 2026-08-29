@@ -283,8 +283,8 @@ mod tests {
     fn the_pane_adds_the_full_name_and_both_log_paths() {
         let app = with_selection(
             ProcessInfo::builder(7, "payments-reconciliation-worker", ProcStatus::Errored)
-                .out_file(Some("/home/rin/.shep/logs/payments-out.log".to_string()))
-                .err_file(Some("/home/rin/.shep/logs/payments-err.log".to_string()))
+                .out_file(Some("/home/ada/.shep/logs/payments-out.log".to_string()))
+                .err_file(Some("/home/ada/.shep/logs/payments-err.log".to_string()))
                 .build(),
         );
         let rendered = render_all(&detail_lines(&app, 200));
@@ -292,8 +292,8 @@ mod tests {
             rendered.contains("payments-reconciliation-worker"),
             "the whole name"
         );
-        assert!(rendered.contains("out  /home/rin/.shep/logs/payments-out.log"));
-        assert!(rendered.contains("err  /home/rin/.shep/logs/payments-err.log"));
+        assert!(rendered.contains("out  /home/ada/.shep/logs/payments-out.log"));
+        assert!(rendered.contains("err  /home/ada/.shep/logs/payments-err.log"));
     }
 
     /// fails if the STATUS word stops carrying its own colour, or if anything
@@ -326,7 +326,7 @@ mod tests {
         let app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             std::time::Instant::now(),
         );
         let rendered = render_all(&detail_lines(&app, 200));

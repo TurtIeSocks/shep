@@ -62,9 +62,8 @@ pub(crate) const fn face(status: ProcStatus) -> &'static str {
     match status {
         ProcStatus::Online => "(o.o)",
         ProcStatus::Starting => "(o~o)",
-        // A sheep waiting to be picked back up reads differently from one
-        // coming up fresh -- the two used to share `(o~o)` and were
-        // indistinguishable at a glance.
+        // A sheep waiting to be picked back up must read differently from
+        // one coming up fresh at a glance.
         ProcStatus::WaitingRestart => "(>_<)",
         ProcStatus::Stopping | ProcStatus::Stopped => "(-.-)",
         ProcStatus::Errored => "(x.x)",
@@ -114,11 +113,11 @@ mod tests {
         assert_eq!(role_of(ProcStatus::Stopped), Role::Ink3);
     }
 
-    /// A sleeping sheep and a startled one must not look the same at a
-    /// glance, or the face carries nothing the colour did not. `WaitingRestart`
-    /// joins this list now that it has its own face -- it used to share
-    /// `Starting`'s, which this test could not have caught since it never
-    /// looked at the pair.
+    /// Distinct across these five -- `Stopping` is left out on purpose: it
+    /// shares `Stopped`'s `(-.-)` deliberately (quiet is quiet, whichever
+    /// direction it's headed), so testing it here would fail the very thing
+    /// this test exists to catch. Every other pair must still differ, or a
+    /// face carries nothing the colour did not.
     #[test]
     fn the_faces_are_distinct_from_one_another() {
         let faces = [

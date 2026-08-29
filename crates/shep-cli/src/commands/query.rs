@@ -539,18 +539,17 @@ mod tests {
     /// Every `envelopes.recv()` in this module is bounded by this timeout
     /// rather than left to run to completion — the same rule
     /// `commands::lifecycle`'s tests apply
-    /// (`crates/shep-cli/src/commands/lifecycle.rs:613,652`) and this module
-    /// originally skipped: a Task 9 reviewer mutated `ping` to render from
-    /// `client.daemon()` without issuing the request, and the test meant to
-    /// catch that hung past 90 seconds instead of failing. A test that fails
-    /// by hanging gives CI a killed job, not a named assertion.
+    /// (`crates/shep-cli/src/commands/lifecycle.rs:613,652`). Without it, a
+    /// mutation that made `ping` render from `client.daemon()` without
+    /// issuing the request would hang the test meant to catch it past 90
+    /// seconds instead of failing it: a test that fails by hanging gives CI
+    /// a killed job, not a named assertion.
     const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// `flock` must send `Request::ListFlock` and nothing else — the same
-    /// class of guard Task 8's reviewer found missing for `restart` and
-    /// `delete` (mutating either to send `Request::Stop` left every test in
-    /// that module green). An implementation that sent `Request::Describe`
-    /// (e.g. copy-pasted from `describe`) fails this.
+    /// `flock` must send `Request::ListFlock` and nothing else — mutating it
+    /// to send `Request::Stop` must not leave this test green. An
+    /// implementation that sent `Request::Describe` (e.g. copy-pasted from
+    /// `describe`) fails this too.
     #[tokio::test]
     async fn flock_asks_the_daemon_to_list_the_whole_flock() {
         let dir = tempfile::tempdir().unwrap();

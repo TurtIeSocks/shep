@@ -18,7 +18,7 @@
 
 Every task implicitly includes these.
 
-- **Never open, read, or reference `/Users/rin/GitHub/pm2`.** Clean-room. Everything about pm2's dump comes from `docs/brainstorming/specs/2026-08-12-shep-phase8-cutover-design.md`, which a dedicated design phase produced. `/Users/rin/GitHub/rand` is the style reference and may be read freely.
+- **Never open, read, or reference `~/GitHub/pm2`.** Clean-room. Everything about pm2's dump comes from `docs/brainstorming/specs/2026-08-12-shep-phase8-cutover-design.md`, which a dedicated design phase produced. `~/GitHub/rand` is the style reference and may be read freely.
 - MSRV **1.88**, edition **2024**. Workspace lints deny `missing_docs` and `missing_debug_implementations`; `clippy::undocumented_unsafe_blocks` and `clippy::missing_errors_doc` are `deny`.
 - `#![forbid(unsafe_code)]` in shep-core/shep-client/shep-cli; shep-daemon is `#![deny(unsafe_code)]` with the one `#![allow]` in `sys.rs`, where each block needs its own `// SAFETY:` (IR-22/23). **Nothing in this phase needs unsafe** — if a task reaches for it, that is the signal to stop and re-read the task.
 - **Rule 10:** no task-relative phrasing in shipped comments or docs. Name the thing, never "Task 5", "this phase", "the new field".
@@ -82,33 +82,33 @@ Measured at `7b5fd76` (`main`), 2026-08-12, `cargo test --workspace --all-featur
 
 ## Settled decisions
 
-Recorded so no task re-litigates them. Items marked (Rin) come from the approved design spec; the rest follow from it or from existing precedent and are mine — flag any you believe is wrong rather than working around it.
+Recorded so no task re-litigates them. Items marked (the maintainer) come from the approved design spec; the rest follow from it or from existing precedent and are mine — flag any you believe is wrong rather than working around it.
 
 | # | Decision |
 |---|---|
-| 1 | (Rin) **`shep save` replies with the path written and the number of apps recorded.** A save that silently does nothing is the failure mode the verb exists to rule out. |
+| 1 | (the maintainer) **`shep save` replies with the path written and the number of apps recorded.** A save that silently does nothing is the failure mode the verb exists to rule out. |
 | 2 | **`save` against a stopped engine is an RPC error, never a silent success.** `RpcContext::snapshot_now` returns `Ok(())` when `list_checked` fails, which is right for teardown and a lie for an operator. Task 2 splits the two. |
 | 3 | **`Response::Mustered(Vec<ProcessInfo>)` lists every sheep of every app the roll restored**, not only the ones this call spawned. `do_start` is idempotent through `instance_slots`, so a `muster` right after an autostart legitimately spawns nothing — and reporting an empty list there would read as "the roll was empty". |
 | 4 | **An empty `Mustered` gets an explicit stderr notice from the CLI.** Same shape as decision 1, one layer up: a muster that restores nothing must say so rather than print an empty table. |
 | 5 | **One restore path, shared.** `boot::restore_flock` and the `Muster` handler call the same function in `snapshot.rs`. Two copies of "read the roll, re-validate, record, start" drift, and the one that drifts is the one nobody reboots to test. |
-| 6 | (Rin) **`import` reads the dump only**, writes a Flockfile, and **starts nothing**. No `ecosystem.config.js` overlay: reading it faithfully means evaluating JavaScript. |
+| 6 | (the maintainer) **`import` reads the dump only**, writes a Flockfile, and **starts nothing**. No `ecosystem.config.js` overlay: reading it faithfully means evaluating JavaScript. |
 | 7 | **A dump row is flat; fields are read from the row itself.** Measured against a real dump on 2026-08-12, after this plan was drafted: no `pm2_env` key exists, `name`/`pm_exec_path`/`cwd` sit at the row's top level (71 keys), and the `env` dict duplicates the top-level string keys exactly — all 31 of them. The `pm2_env` fallback the plan originally carried is therefore dead code and is removed. A row with no `pm_exec_path` is still a **loud, named failure** carrying the keys it did find, not a skipped row: that guard is what would catch a dump shape this measurement did not cover. |
-| 8 | (Rin) **Declared env only, by construction.** The declared env is the union of the row's `env_<name>` maps — by construction those hold only what the ecosystem file declared. A key in `env` that is neither declared, nor a named session-junk pattern, nor pm2-injected is **named in the output and not written**. The operator decides; the evidence is in front of them. |
+| 8 | (the maintainer) **Declared env only, by construction.** The declared env is the union of the row's `env_<name>` maps — by construction those hold only what the ecosystem file declared. A key in `env` that is neither declared, nor a named session-junk pattern, nor pm2-injected is **named in the output and not written**. The operator decides; the evidence is in front of them. |
 | 9 | **The pm2-injected list being incomplete is safe by construction.** An injected key we do not recognise lands in the "named, not written" bucket — noise, never a silent wrong config. This is why the list may stay short rather than being guessed at length. |
-| 10 | **`NODE_APP_INSTANCE` becomes `increment_var`, never a literal env value.** Copying it verbatim would pin instance 0's value into every instance. Spec §14.8 assigns this mapping to the importer. *Beyond the design spec's field table — flagged for Rin.* |
-| 11 | (Rin) **`exec_mode: cluster_mode` → `instances = N` + `reuse_port = true`, and `import` says so at import time**, naming each affected app and the `reusePort` requirement it carries. shep binds nothing; four processes on one port is `EADDRINUSE`, and it must not surface as a bind failure at first start. |
+| 10 | **`NODE_APP_INSTANCE` becomes `increment_var`, never a literal env value.** Copying it verbatim would pin instance 0's value into every instance. Spec §14.8 assigns this mapping to the importer. *Beyond the design spec's field table — flagged for the maintainer.* |
+| 11 | (the maintainer) **`exec_mode: cluster_mode` → `instances = N` + `reuse_port = true`, and `import` says so at import time**, naming each affected app and the `reusePort` requirement it carries. shep binds nothing; four processes on one port is `EADDRINUSE`, and it must not surface as a bind failure at first start. |
 | 12 | **`import --dry-run` writes the rendered Flockfile to stdout with no envelope.** Precedent: `shep completions`, which prints a raw shell script the same way (`commands/completions.rs`), and `bleats`, whose module doc already records a verb opting out of the envelope with a stated reason. `shep import --dry-run > Flockfile.toml` must produce a byte-exact file. |
 | 13 | **Import notes go to stderr, one line each, in both modes and both formats.** One rule, no conditionals, and the report the design spec requires is present regardless of `--format`. |
-| 14 | (Rin) **`ExecStart` is the daemon, not `shep muster`.** Under `Type=notify` systemd supervises the process it starts. The restore still happens — the daemon already restores the roll at boot — so spec §13.4 describes the effect rather than the literal argv, and Task 16 rewords it. |
-| 15 | (Rin) **`--foreground` is a deliberate second path**, not a flag that quietly changes the existing one. It names the init-supervised path so a generated unit never depends on the private contract of the bare hidden `daemon` verb, and it is what enables the readiness notification. |
-| 16 | (Rin) **`sd_notify` fires after the muster restore completes**, at the end of `boot()`. That is the entire point of `Type=notify`: the unit goes green when the flock exists, and a hung restore becomes a failed start instead of a green unit supervising nothing. |
+| 14 | (the maintainer) **`ExecStart` is the daemon, not `shep muster`.** Under `Type=notify` systemd supervises the process it starts. The restore still happens — the daemon already restores the roll at boot — so spec §13.4 describes the effect rather than the literal argv, and Task 16 rewords it. |
+| 15 | (the maintainer) **`--foreground` is a deliberate second path**, not a flag that quietly changes the existing one. It names the init-supervised path so a generated unit never depends on the private contract of the bare hidden `daemon` verb, and it is what enables the readiness notification. |
+| 16 | (the maintainer) **`sd_notify` fires after the muster restore completes**, at the end of `boot()`. That is the entire point of `Type=notify`: the unit goes green when the flock exists, and a hung restore becomes a failed start instead of a green unit supervising nothing. |
 | 17 | **sd_notify needs no dependency and no unsafe.** `UnixDatagram::unbound()` + `send_to(path)` covers a filesystem `$NOTIFY_SOCKET`; `std::os::linux::net::SocketAddrExt::from_abstract_name` + `UnixDatagram::send_to_addr` covers an `@`-prefixed abstract one. Both stable since 1.70, under the 1.88 floor. |
-| 18 | (Rin) **`startup` installs and enables when privileged; otherwise it prints exactly the command to run and exits non-zero** so a script notices. shep never escalates on its own. |
+| 18 | (the maintainer) **`startup` installs and enables when privileged; otherwise it prints exactly the command to run and exits non-zero** so a script notices. shep never escalates on its own. |
 | 19 | **`startup` refuses when the resolved `$SHEP_HOME` does not exist.** Under `sudo shep startup`, `$HOME` is root's, so the unit would carry `/root/.shep` and restore nothing after a reboot — silently. The target user comes from `--user`, else `$SUDO_USER`, else the invoking user; the home comes from an explicit `--home`/`$SHEP_HOME`, else that user's passwd home. |
-| 20 | **System-level units only** (Rin, design assumptions): a systemd system unit and a launchd `LaunchDaemon`. User units trade one root step for `loginctl enable-linger` plus a failure mode where the flock silently does not return. |
-| 21 | (Rin) **One 15s tick, two consumers.** Sampling splits from enforcement inside the loop that already exists; a second loop would double a measured 5.77ms syscall walk for nothing. |
-| 22 | (Rin) **The CPU baseline is written only by the periodic tick, never by an on-demand read.** Two `flock` calls a moment apart would otherwise divide by a near-zero window. This bounds the window to ≤15s and keeps it away from zero. |
-| 23 | (Rin) **A sheep with no baseline reports `-`.** A process spawned since the last tick has no honest CPU number, and inventing one from a 50ms window is worse than an empty cell. |
+| 20 | **System-level units only** (the maintainer, design assumptions): a systemd system unit and a launchd `LaunchDaemon`. User units trade one root step for `loginctl enable-linger` plus a failure mode where the flock silently does not return. |
+| 21 | (the maintainer) **One 15s tick, two consumers.** Sampling splits from enforcement inside the loop that already exists; a second loop would double a measured 5.77ms syscall walk for nothing. |
+| 22 | (the maintainer) **The CPU baseline is written only by the periodic tick, never by an on-demand read.** Two `flock` calls a moment apart would otherwise divide by a near-zero window. This bounds the window to ≤15s and keeps it away from zero. |
+| 23 | (the maintainer) **A sheep with no baseline reports `-`.** A process spawned since the last tick has no honest CPU number, and inventing one from a 50ms window is worse than an empty cell. |
 | 24 | **The on-demand sample runs in the RPC layer under `spawn_blocking`, never in the actor.** `SysinfoSampler::sample` is a measured 5.77ms blocking syscall walk (`benches/benches/memory_sample.rs`, 883 host processes); the actor must never block, and a tokio worker thread should not either. |
 | 25 | **`ProcessInfo` loses `Eq`.** `cpu_percent: Option<f32>` cannot derive it. Nothing in the workspace requires `Eq` on `ProcessInfo` (verified by grep); `PartialEq` stays, so every `assert_eq!` still compiles. It is a public API change and gets a CHANGELOG entry. |
 
@@ -200,7 +200,7 @@ Cargo shape for this task: `-p shep-core`.
             Reply {
                 id: 5,
                 result: Ok(Response::RollSaved {
-                    path: "/home/rin/.shep/flock.json".to_string(),
+                    path: "/home/ada/.shep/flock.json".to_string(),
                     apps: 2,
                 }),
             },
@@ -443,7 +443,7 @@ In `output/rows.rs`'s `mod tests`, next to the existing anti-drift cases:
     #[test]
     fn saved_roll_row_does_not_drift() {
         let row = SavedRollRow {
-            file: "/home/rin/.shep/flock.json".to_string(),
+            file: "/home/ada/.shep/flock.json".to_string(),
             apps: 9,
         };
         assert_no_drift(&row, |json| json, &[]);
@@ -2361,9 +2361,9 @@ Cargo shape: `-p shep-cli`, tested with `cargo test -p shep-cli --bins`.
     /// while the operator's stayed down — and the unit would look correct.
     #[test]
     fn the_target_user_prefers_an_explicit_name_then_sudo_user() {
-        assert_eq!(target_user(Some("deploy"), Some("rin"), "root"), "deploy");
-        assert_eq!(target_user(None, Some("rin"), "root"), "rin");
-        assert_eq!(target_user(None, None, "rin"), "rin");
+        assert_eq!(target_user(Some("deploy"), Some("ada"), "root"), "deploy");
+        assert_eq!(target_user(None, Some("ada"), "root"), "ada");
+        assert_eq!(target_user(None, None, "ada"), "ada");
     }
 
     /// fails if the home falls back to this process's `$HOME`. `sudo` resets
@@ -2373,11 +2373,11 @@ Cargo shape: `-p shep-cli`, tested with `cargo test -p shep-cli --bins`.
     #[test]
     fn the_target_home_comes_from_the_target_user_not_the_invoker() {
         assert_eq!(
-            target_home(None, Path::new("/home/rin")),
-            Path::new("/home/rin/.shep")
+            target_home(None, Path::new("/home/ada")),
+            Path::new("/home/ada/.shep")
         );
         assert_eq!(
-            target_home(Some(Path::new("/srv/shep")), Path::new("/home/rin")),
+            target_home(Some(Path::new("/srv/shep")), Path::new("/home/ada")),
             Path::new("/srv/shep")
         );
     }
@@ -3120,7 +3120,7 @@ State the two failure signatures explicitly, because they are the ones this desi
 
 - [ ] **Step 6: Reconcile every CHANGELOG** (IR-45). Each entry should describe what an operator or an API consumer sees, not which task produced it (Rule 10). The four user-visible headlines: `save`/`muster`, `import`, `startup`/`unstartup`, and CPU/memory in `flock`.
 
-- [ ] **Step 7: Report to Rin** — every judgement call made on her behalf, anything left unfixed, and specifically:
+- [ ] **Step 7: Report to the maintainer** — every judgement call made on her behalf, anything left unfixed, and specifically:
   - whether `RowMissingScript` fires on a row with no `pm_exec_path`, and whether the fixture stayed synthesised rather than derived from a real dump;
   - decision 10 (`NODE_APP_INSTANCE` → `increment_var`), which is beyond the design spec's field table and rests on spec §14.8;
   - whether `systemd-analyze verify` ran or skipped, and on what;

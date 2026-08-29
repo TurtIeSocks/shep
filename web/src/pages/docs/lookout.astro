@@ -14,7 +14,7 @@ import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 
-const healthy = `shep lookout   /home/rin/.shep                                                                            6 in the flock
+const healthy = `shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h
   ID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -26,8 +26,8 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
   5     metrics                               online           48240    0         0.4%    11.0M     1h 32m    -
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 sheep 2  api   online   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge
-out  /home/rin/.shep/logs/api-2-out.log
-err  /home/rin/.shep/logs/api-2-err.log
+out  /home/ada/.shep/logs/api-2-out.log
+err  /home/ada/.shep/logs/api-2-err.log
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 bleats  api  … 1 earlier line not shown
 out  GET /healthz 200 3ms
@@ -37,7 +37,7 @@ out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
 q quit   j/k select   g/G first/last   r refresh                                                               read-only`;
 
-const narrow = `shep lookout   /home/rin/.shep       6 in the flock
+const narrow = `shep lookout   /home/ada/.shep       6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12…
   ID    NAME      STATUS           CPU     UPTIME
 ───────────────────────────────────────────────────
@@ -52,7 +52,7 @@ q quit   j/k select   g/G first/last   r… read-only`;
 const tooNarrow = `too small
 need 33x6`;
 
-const frozen = `shep lookout   /home/rin/.shep                                                                            6 in the flock
+const frozen = `shep lookout   /home/ada/.shep                                                                            6 in the flock
 the shepherd has died — these values are frozen as of 2026-08-14 14:32:07
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h
   ID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD
@@ -65,8 +65,8 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%  
   5     metrics                               online           48240    0         0.4%    11.0M     1h 22m    -
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 sheep 2  api   errored   pid -   restarts 14   uptime 1h 18m   cpu -   mem -   fold edge
-out  /home/rin/.shep/logs/api-2-out.log
-err  /home/rin/.shep/logs/api-2-err.log
+out  /home/ada/.shep/logs/api-2-out.log
+err  /home/ada/.shep/logs/api-2-err.log
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 bleats  api  … 1 earlier line not shown
 out  GET /healthz 200 3ms
@@ -76,7 +76,7 @@ out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
 q quit   j/k select   g/G first/last   r refresh                                                               read-only`;
 
-const refused = `shep lookout   /home/rin/.shep                                                                            6 in the flock
+const refused = `shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h
   ID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -88,8 +88,8 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
   5     metrics                               online           48240    0         0.4%    11.0M     1h 32m    -
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 sheep 2  api   online   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge
-out  /home/rin/.shep/logs/api-2-out.log
-err  /home/rin/.shep/logs/api-2-err.log
+out  /home/ada/.shep/logs/api-2-out.log
+err  /home/ada/.shep/logs/api-2-err.log
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 bleats  api  … 1 earlier line not shown
 out  GET /healthz 200 3ms
@@ -106,7 +106,7 @@ const feedExcerpt = `bleats  api  … 525 earlier lines not shown, and 3.8M befo
 bleats  api  out then err  from the log files, re-read with each listing
 this sheep has not written a log in this $SHEP_HOME`;
 
-const lambs = `shep lookout   /home/rin/.shep                                                                            6 in the flock
+const lambs = `shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h
   ID    NAME                                  STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -119,8 +119,8 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 sheep 2  api   online   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge
 lambs  3 parent-pid descendants, read 9m 53s ago   48220 node   48221 node   48222 node
-out  /home/rin/.shep/logs/api-2-out.log
-err  /home/rin/.shep/logs/api-2-err.log
+out  /home/ada/.shep/logs/api-2-out.log
+err  /home/ada/.shep/logs/api-2-err.log
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 bleats  api  … 1 earlier line not shown
 out  GET /healthz 200 3ms
@@ -130,7 +130,7 @@ out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
 q quit   j/k select   / filter   x stop   R restart   L reload                                           control enabled`;
 
-const filterActive = `shep lookout   /home/rin/.shep                                                   2 of 6 in the flock
+const filterActive = `shep lookout   /home/ada/.shep                                                   2 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD
 ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -138,7 +138,7 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
 > 1     web               online           48212    0         2.9%    178.0M    1h 26m    edge
 filter "web"   / edit   esc clear                                                          read-only`;
 
-const confirm = `shep lookout   /home/rin/.shep                                                        6 in the flock
+const confirm = `shep lookout   /home/ada/.shep                                                        6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD
 ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
   5     metrics           online           48240    0         0.4%    11.0M     1h 32m    -
 restart api (id 2)? enter confirms, any other key cancels                            control enabled`;
 
-const actionAccepted = `shep lookout   /home/rin/.shep                                                        6 in the flock
+const actionAccepted = `shep lookout   /home/ada/.shep                                                        6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME              STATUS           PID      RESTARTS  CPU     MEM       UPTIME    FOLD
 ────────────────────────────────────────────────────────────────────────────────────────────────────

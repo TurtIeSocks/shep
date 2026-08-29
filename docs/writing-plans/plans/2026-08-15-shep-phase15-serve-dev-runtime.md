@@ -483,9 +483,9 @@ startup`, a clap error), so the unit renderer only ever writes the path of the
 `shep` binary. It is named here anyway, because the doc comment below makes a
 completeness claim and a future `grep -rn current_exe crates` will find it.
 
-### 3. `serve` is hand-rolled on the metrics dog's HTTP surface. Rin's ruling, and what that surface actually is
+### 3. `serve` is hand-rolled on the metrics dog's HTTP surface. The maintainer's ruling, and what that surface actually is
 
-**Rin's ruling, binding (2026-08-15):** `serve` is hand-rolled on the HTTP
+**the maintainer's ruling, binding (2026-08-15):** `serve` is hand-rolled on the HTTP
 surface the metrics dog already has, **not** axum, even though spec §9 names
 axum and tower-http. Her reasoning: serve is genuinely simple over code we
 already own, while an evolving protocol like MCP is worth an SDK — which is why
@@ -765,7 +765,7 @@ beside the listing and dotfile flips — an operator who deploys with a
 `current -> release-N` symlink inside the docroot hits a 404 with no
 explanation otherwise.
 
-**Rin's ruling: the default does not change, and an operator who wants the
+**the maintainer's ruling: the default does not change, and an operator who wants the
 deploy layout gets an explicit opt-out.** Refusing every symlink component
 stays the default because the two ways this can be wrong are not equally
 survivable. A wrong refusal is a 404 on a deploy layout — loud, immediate, one
@@ -1757,7 +1757,7 @@ the six import sites. Update the module doc's opening sentence, which currently
 says "The little HTTP a dog needs" and now has two consumers: it is the little
 HTTP **this binary** needs, for the metrics dog and for `serve`, and the
 paragraph explaining why it is hand-rolled rather than a crate gains one clause
-naming Rin's 2026-08-15 ruling on `serve` alongside the existing reasoning.
+naming the maintainer's 2026-08-15 ruling on `serve` alongside the existing reasoning.
 
 ### Step 2.3 — RED then GREEN: `write_head`
 
@@ -2315,7 +2315,7 @@ tree:
     }
 
     /// fails if `follow_symlinks` does not actually let an in-docroot deploy
-    /// symlink through. This is the exact shape Rin's ruling names:
+    /// symlink through. This is the exact shape the maintainer's ruling names:
     /// `current -> releases/2026-08-15`, a symlink that stays inside the
     /// root the whole way. Default mode refuses it (already covered by
     /// `a_symlinked_intermediate_directory_is_not_contained`'s sibling case);
@@ -3005,7 +3005,7 @@ async fn a_symlink_out_of_the_docroot_is_a_404_and_not_a_body() { … }
 /// fails if `cfg.follow_symlinks` does not actually reach `fs::contain`
 /// through the worker — Task 3 already pins `contain`'s own behavior; this
 /// is the wiring between the flag on `ServeConfig` and the function call,
-/// over a real socket, on the exact deploy layout Rin's ruling names.
+/// over a real socket, on the exact deploy layout the maintainer's ruling names.
 #[tokio::test]
 async fn a_symlinked_deploy_layout_is_served_only_with_follow_symlinks() {
     let outer = tempfile::tempdir().unwrap();
@@ -3538,7 +3538,7 @@ fn serve_refuses_a_docroot_that_is_not_a_directory() {
 #[test]
 fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() { … }
 
-/// fails if the per-refusal stderr line (decision 5, Rin's ruling) never
+/// fails if the per-refusal stderr line (decision 5, the maintainer's ruling) never
 /// reaches the sheep's own bleats. This is the one claim in the ruling that
 /// Task 3's and Task 6's in-process tests cannot make: they run inside the
 /// test binary's own process, sharing its stderr with every other test in
@@ -3549,7 +3549,7 @@ fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() { 
 /// already reads; that is the one place this claim can be checked honestly.
 ///
 /// Layout: `<root>/releases/2026-08-15/index.html` and
-/// `<root>/current -> releases/2026-08-15`, the exact shape Rin's ruling
+/// `<root>/current -> releases/2026-08-15`, the exact shape the maintainer's ruling
 /// names. Registered WITHOUT `--follow-symlinks`.
 #[test]
 fn a_refused_symlink_writes_the_path_and_the_flag_to_the_sheeps_bleats() {
@@ -4512,15 +4512,15 @@ that leaks a supervisor is a dev mode people stop trusting.
             "SHEP_HOME" => Some("/srv/production".to_string()),
             _ => None,
         };
-        let paths = dev_home(&env, Path::new("/home/rin"));
-        assert_eq!(paths.home, Path::new("/home/rin/.shep-dev"));
+        let paths = dev_home(&env, Path::new("/home/ada"));
+        assert_eq!(paths.home, Path::new("/home/ada/.shep-dev"));
 
         let env = |key: &str| match key {
             "SHEP_HOME" => Some("/srv/production".to_string()),
             "SHEP_DEV_HOME" => Some("/tmp/t1".to_string()),
             _ => None,
         };
-        assert_eq!(dev_home(&env, Path::new("/home/rin")).home, Path::new("/tmp/t1"));
+        assert_eq!(dev_home(&env, Path::new("/home/ada")).home, Path::new("/tmp/t1"));
     }
 
     /// fails if watch is not forced, or if it is forced by rebuilding the
@@ -4652,7 +4652,7 @@ grep -rn "axum\|tower-http" Cargo.lock | wc -l                            # 0, b
 
 `grep -c "axum" docs/specs/deferred.md` is replaced because Step 12.3 both
 requires the word `axum` to stay in the file (the divergence note records that
-serve is hand-rolled and not axum, which is Rin's ruling and the thing worth
+serve is hand-rolled and not axum, which is the maintainer's ruling and the thing worth
 recording) and required that count to reach 0. Satisfying one breaks the other,
 and an implementer would silently pick a side. The replacement targets the
 **deferral claim** — the sentence that says serve is not built — which is what
@@ -4684,7 +4684,7 @@ Two edits, both of which the spec asks for by name:
    both "bad flag" and "dead app"). Check: `grep -c "resolves that"` goes
    `1 → 0`.
 
-Also correct §9's **serve** line: it names axum and tower-http, which Rin
+Also correct §9's **serve** line: it names axum and tower-http, which the maintainer
 overruled. Replace with the hand-rolled surface and a pointer to the reasoning,
 and add the four flags the spec did not anticipate (`--listing` default-off,
 `--spa`'s `Accept` gate, `--bind`, `--follow-symlinks` default-off), each in
@@ -4698,7 +4698,7 @@ Delete the three entries this phase closes — **serve**, **dev / runtime**, and
 the `[[bin]]` sentence inside the latter — and move what actually shipped into
 the "Not deferred" section, with the divergences named:
 
-- serve is hand-rolled, not axum/tower-http (Rin's ruling, 2026-08-15);
+- serve is hand-rolled, not axum/tower-http (the maintainer's ruling, 2026-08-15);
 - directory listing is **off** by default, where pm2's is on;
 - **dotfiles are refused by default**, where pm2's serve publishes them, with
   `--hidden` to opt in — the reverse of the listing flip and the same argument;
@@ -4774,7 +4774,7 @@ recording rather than rewriting:
   `fs`, `mime`, `listing`, `auth`, `worker`), hand-rolled on `http.rs` (which
   moved up out of `dog/`), dotfiles refused by default, no env compat, and
   every symlink under the docroot refused by default with `--follow-symlinks`
-  as the (loud, off-by-default) opt-out — Rin's ruling, 2026-08-15.
+  as the (loud, off-by-default) opt-out — the maintainer's ruling, 2026-08-15.
 - `runtime.rs` says "auto-exit fail_count 3 / 2s / code 2" and "subreaper +
   WNOHANG loop". The debounce shipped exactly as written; the code is 11 and the
   reaper is a separate init process. Record both, and record **why** the
@@ -4845,7 +4845,7 @@ for a free port or a free `$SHEP_HOME`, this is the run that says so.
 Collected so the omissions are in one place, each with the reason and where it
 is argued:
 
-- **axum and tower-http.** Rin's ruling, decision 3. `Cargo.lock` still has
+- **axum and tower-http.** the maintainer's ruling, decision 3. `Cargo.lock` still has
   neither after this phase, and that is a check in Task 12.
 - **Range requests, conditional requests, ETags, compression, keep-alive, TLS,
   HTTP/2.** Not in spec §9's sentence about serve; decision 4. The visible cost
@@ -4871,20 +4871,20 @@ is argued:
   spec §9's verb list and is not in this phase; if it is wanted, it is a v1.1
   item and the ledger should say so.
 
-## Open decisions, and which of them are Rin's
+## Open decisions, and which of them are the maintainer's
 
 Everything above is decided. Three things are worth her eye, and none of them
 blocks the phase:
 
 1. **Exit code 11's semantics** (decision 13). The plan makes a clean emptying
    exit 0 and only an `errored` one exit 11; pm2-runtime exits non-zero either
-   way. If Rin wants "the flock emptied at all" to be a failure — for an
+   way. If the maintainer wants "the flock emptied at all" to be a failure — for an
    orchestrator that should restart a container whatever the reason — that is a
    one-line change in Task 9's step 8 and one test. The plan takes the position
    that a one-shot job finishing is not a failure.
 2. **Directory listing off by default** (decision 9). It is a deliberate
    divergence from pm2, argued from shep's own posture on every other exposure
-   knob. If Rin would rather match pm2 for migration reasons, it is one default
+   knob. If the maintainer would rather match pm2 for migration reasons, it is one default
    and one test.
 3. **Dotfiles refused by default** (decision 4). New in this revision, and the
    second deliberate divergence from pm2's serve in the same verb. The argument
@@ -4892,7 +4892,7 @@ blocks the phase:
    information and then serve `.env` and `.git/` by default, and that
    `shep serve .` in a repo checkout is a thing people type. `--hidden` opts
    back in and `.well-known/acme-challenge` is the use case it exists for. If
-   Rin would rather match pm2, it is one default and one test — but she should
+   the maintainer would rather match pm2, it is one default and one test — but she should
    see the flip rather than find it.
 
 `serve`'s TOCTOU **is no longer an open question and is no longer accepted**.
@@ -4902,7 +4902,7 @@ was at risk, and dismissed the fix as needing `openat2(RESOLVE_BENEATH)` when
 and needs no dependency this crate does not already have. Decision 5 closes it
 and states the residue.
 
-The one refinement to that closure is also Rin's ruling, not open: refusing
+The one refinement to that closure is also the maintainer's ruling, not open: refusing
 every symlink component stays the default, and `--follow-symlinks` is the
 explicit, loud, off-by-default opt-out for a deploy layout that needs one
 (`current -> releases/N`). It does not reopen the question of what the

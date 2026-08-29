@@ -13,7 +13,7 @@
 //! about what was lost, so asking the shepherd what things look like now is the
 //! only repair there is.
 //!
-//! **The freeze is Rin's ruling and it is not `bleats`' behaviour.** `bleats`
+//! **The freeze is the maintainer's ruling and it is not `bleats`' behaviour.** `bleats`
 //! prints a notice and exits when its connection ends, which is right for a
 //! follow. A standing dashboard that vanished would take the last known state
 //! of the flock with it, at the moment an operator most wants to read it. So
@@ -117,7 +117,7 @@ pub struct Channels {
 /// `super::lookout`, which makes it before entering raw mode so that a
 /// shepherd which was never running refuses the way every other client verb
 /// refuses — `daemon_unreachable`, exit 5, no alternate screen — instead of
-/// eight seconds of reconnect banner about a death that never happened. Rin's
+/// eight seconds of reconnect banner about a death that never happened. The maintainer's
 /// retry-then-freeze ruling is about a shepherd that dies *underneath* a
 /// running dashboard, and this signature is where the distinction is enforced
 /// rather than described.
@@ -487,7 +487,7 @@ mod tests {
     }
 
     /// fails if the ladder stops being bounded, or stops ending in a freeze.
-    /// Rin's ruling in one test: bounded retry, then a message saying the
+    /// The maintainer's ruling in one test: bounded retry, then a message saying the
     /// shepherd has died, then nothing. Never an exit.
     ///
     /// `start_paused` so the 250/500/1000/2000/4000 ms waits cost no wall

@@ -50,37 +50,32 @@
 //! (b) a stale number for a descriptor closed since exec — refused by the
 //!     `fcntl` probe;
 //! (c) a number that has been *recycled* into another live descriptor
-//!     since exec — this is a REAL hazard, not a theoretical one, and an
-//!     earlier version of this essay was wrong to call it "impossible in
-//!     practice": `F_GETFD` only proves a number is open RIGHT NOW, never
-//!     who opened it, so it cannot distinguish a genuinely inherited
-//!     descriptor from a number the daemon's OWN later steps happened to
-//!     reuse. Concretely: an earlier version of `boot()` called adoption
-//!     *after* `bind_socket`/`write_pidfile` had already opened (and, for
-//!     the pidfile's temp file, closed) descriptors of their own — a stale
-//!     `SHEP_READY_FD` could then land on the freshly-bound listener's own
-//!     fd, and dropping the wrongly-adopted `File` closed that listener out
-//!     from under `tokio`, reproducibly, through nothing more exotic than
-//!     the ordinary `boot()` API (`BootOptions { ready_fd: Some(stale) }`).
-//!     This is exactly why [`adopt_fd`] is `unsafe fn`: the precondition
-//!     that actually closes this hole — call it before this process has
-//!     opened any descriptor of its own — is a CALLER obligation no amount
-//!     of internal checking can verify from inside `adopt_fd` itself, so
-//!     the type system now forces every call site to write down its own
-//!     justification instead of letting the invariant erode silently on a
-//!     future reorder. **Decision 1 (2026-08-08) removed the whole class
-//!     of risk this scenario describes from this crate structurally**,
-//!     rather than merely re-ordering around it again: `boot` no longer
-//!     calls [`adopt_fd`] at all, so it is no longer possible for anything
+//!     since exec — this is a REAL hazard, not a theoretical one:
+//!     `F_GETFD` only proves a number is open RIGHT NOW, never who opened
+//!     it, so it cannot distinguish a genuinely inherited descriptor from a
+//!     number the daemon's OWN later steps happened to reuse. Concretely:
+//!     if adoption ran *after* `bind_socket`/`write_pidfile` had already
+//!     opened (and, for the pidfile's temp file, closed) descriptors of
+//!     their own, a stale `SHEP_READY_FD` could land on the freshly-bound
+//!     listener's own fd, and dropping the wrongly-adopted `File` would
+//!     close that listener out from under `tokio`. This is exactly why
+//!     [`adopt_fd`] is `unsafe fn`: the precondition that actually closes
+//!     this hole — call it before this process has opened any descriptor
+//!     of its own — is a CALLER obligation no amount of internal checking
+//!     can verify from inside `adopt_fd` itself, so the type system forces
+//!     every call site to write down its own justification instead of
+//!     letting the invariant erode silently on a future reorder. `boot`
+//!     never calls [`adopt_fd`] at all, so it is not possible for anything
 //!     `boot` itself does — bind a socket, open a tempfile, install signal
 //!     handlers — to land between adoption and use. The intended
 //!     PRODUCTION caller is the CLI's `main` (Phase 3), which discharges
 //!     the ordering precondition by being the literal first fd-touching
 //!     statement of the whole process, before a tokio runtime — the thing
-//!     that made `boot`'s own attempt at this structurally impossible to
-//!     guarantee, since `boot` is `async` and a runtime with its own live
-//!     poller fds necessarily exists before `boot` is ever called — even
-//!     exists. See [`crate::boot::BootOptions::ready_fd`]'s own doc;
+//!     that would make `boot`'s own attempt at this structurally
+//!     impossible to guarantee, since `boot` is `async` and a runtime with
+//!     its own live poller fds necessarily exists before `boot` is ever
+//!     called — even exists. See [`crate::boot::BootOptions::ready_fd`]'s
+//!     own doc;
 //!
 //! (d) double adoption — a future production caller (the CLI's `main`,
 //!     Phase 3) is expected to call [`adopt_fd`] at most once, consuming
@@ -151,10 +146,13 @@ pub unsafe fn adopt_fd(fd: RawFd) -> Result<File, SysError> {
     // (this fn's `# Safety` section) is what proves that open descriptor is
     // the intended inherited pipe rather than something this process opened
     // itself in the meantime. `adopt_fd` is the only place in this crate
-    // that constructs a `File` from a bare fd, and the daemon's boot path
-    // (its one caller) invokes it at most once per descriptor — so the
-    // `File` returned here becomes the number's sole owner; nothing else
-    // will read, write, or close it again.
+    // that constructs a `File` from a bare fd. `boot` never calls it — see
+    // this fn's own doc above — and this crate has no other production
+    // caller today either; every in-crate call site is one of this file's
+    // own tests, each adopting a fd it just created and each doing so at
+    // most once per descriptor. The `File` returned here becomes that
+    // number's sole owner; nothing else will read, write, or close it
+    // again.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -266,18 +264,20 @@ mod tests {
         // free ones — which is what makes the second adoption a genuine
         // BadFd probe rather than a race.
         //
-        // This test used to re-probe the pair's own low fd under
-        // `FD_REUSE_LOCK`. That lock could not work: it serialized this test
-        // against the one other test that took it, while every OTHER test in
-        // the binary remained free to open a file and be handed the
-        // just-closed number. `adopt_fd`'s `F_GETFD` probe then succeeds
-        // (the number IS open — it belongs to someone else now), the
-        // adoption goes through, and dropping the returned `File`
-        // double-closes another test's descriptor. Reproduced 2026-08-08 as
-        // `fatal runtime error: IO Safety violation: owned file descriptor
-        // already closed` — a SIGABRT that took the whole lib test binary
-        // down, once in 25 saturated `--workspace --all-features` runs. The
-        // high number removes the race structurally, so no lock is needed.
+        // Re-probing the pair's own LOW fd under a lock cannot work: the
+        // lock only excludes tests that take it, while every OTHER test in
+        // the binary remains free to open a file and be handed the
+        // just-closed number. `adopt_fd`'s `F_GETFD` probe would then
+        // succeed (the number IS open — it belongs to someone else now),
+        // the adoption would go through, and dropping the returned `File`
+        // would double-close another test's descriptor. The high number
+        // keeps this closed only as long as this process has fewer than
+        // ~2048 descriptors open at once; it is not a structural
+        // guarantee, just a floor no test in this suite comes close to. If
+        // parallel tests ever pushed descriptor use past it, `parked`
+        // could be reused before the second `adopt_fd` below runs. No lock
+        // is needed for the concurrency this suite actually reaches, not
+        // because the race is impossible at any concurrency.
         const PROBE_FD: RawFd = 2048;
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         let parked = nix::fcntl::fcntl(a.as_raw_fd(), nix::fcntl::FcntlArg::F_DUPFD(PROBE_FD))
@@ -299,14 +299,11 @@ mod tests {
 
     #[test]
     fn a_fd_this_process_never_owned_is_refused() {
-        // Moved here from `boot.rs` by Decision 1 (2026-08-08):
-        // `BootOptions::ready_fd` is `Option<std::fs::File>` now, so there
-        // is no longer any way to drive a bad fd NUMBER through `boot`'s
-        // public API at all — the type itself proves the handle was valid
-        // at construction. The BadFd-refusal behavior this test pins used
-        // to be exercised indirectly through `boot`; it belongs here now,
-        // testing `adopt_fd` directly, which is where the refusal actually
-        // happens.
+        // `BootOptions::ready_fd` is `Option<std::fs::File>`, so there is no
+        // way to drive a bad fd NUMBER through `boot`'s public API at all —
+        // the type itself proves the handle was valid at construction. The
+        // BadFd-refusal behavior this test pins belongs here, testing
+        // `adopt_fd` directly, which is where the refusal actually happens.
         //
         // fd 4096 is a number this process will NEVER own: default
         // fd-table limits sit far below it, and nothing in this crate's

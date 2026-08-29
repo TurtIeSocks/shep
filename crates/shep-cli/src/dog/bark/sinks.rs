@@ -3,14 +3,14 @@
 //!
 //! **The transport is hand-rolled HTTP/1.1 over `tokio-rustls`, not
 //! `reqwest`.** Discord and Slack webhooks are HTTPS-only, so this was
-//! originally the one place in the workspace that needed TLS, and Rin's
+//! originally the one place in the workspace that needed TLS, and the maintainer's
 //! ruling (2026-08-12) was to reach for `tokio-rustls` + `webpki-roots` (+10ish
 //! crates, no C build dependency) directly rather than `reqwest` (+76 to
 //! +93 crates depending on feature set, and a C toolchain — `aws-lc-sys` —
 //! under `reqwest`'s own default `rustls` feature). `rustls` does the part
 //! that must not be gotten wrong — the handshake and record layer; what
 //! this module owns is the same HTTP/1.1 request/response framing
-//! `crate::http`'s server side (Task 13) already hand-rolls, aimed the other
+//! `crate::http`'s server side already hand-rolls, aimed the other
 //! way. See `crates/shep-cli/Cargo.toml` and this workspace's root
 //! `Cargo.toml` for the accounting behind the two new dependencies.
 //!

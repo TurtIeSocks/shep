@@ -465,18 +465,14 @@ mod tests {
 
     // The window `no_batch_arrives_before_delay_has_elapsed` measures against.
     //
-    // This test used to assert coalescing too -- that two writes issued back
-    // to back share one batch -- and that assertion is gone, after failing on
-    // GitHub's windows-latest at a 1s window and again at 4s. Widening was
-    // the wrong instrument. Whether two events land in the same batch depends
-    // on the debouncer merging them inside one `tick_rate` slice
+    // Deliberately does NOT assert coalescing (that two writes issued back to
+    // back share one batch): whether two events land in the same batch
+    // depends on the debouncer merging them inside one `tick_rate` slice
     // (`delay / 4`), which depends in turn on the OS delivering both within
-    // that slice, and a shared two-core runner is under no obligation to. The
-    // number was always a guess at how slow that machine gets, and there is
-    // no guess that is safe.
+    // that slice, and a loaded CI runner is under no obligation to.
     //
     // What is left is the half shep actually owns and load cannot break. The
-    // regression this test was written for is `delay` being ignored -- passed
+    // regression this test is written for is `delay` being ignored -- passed
     // as zero, or flushed on every event regardless -- and either shows up as
     // a batch arriving too EARLY. A stalled machine can only push a batch
     // later, never sooner, so the assertion has no race in it at all.

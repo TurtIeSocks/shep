@@ -84,8 +84,8 @@ use crate::terminal_safe::sanitise;
 
 /// Where the index lives when nothing overrides it: the docs site serves
 /// this file verbatim, and `/dogs.json` is an exact file path that answers
-/// 200 rather than redirecting (measured 2026-08-21), which is what lets
-/// [`crate::fetch::get`] refuse redirects outright.
+/// 200 rather than redirecting, which is what lets [`crate::fetch::get`]
+/// refuse redirects outright.
 pub const DEFAULT_INDEX_URL: &str = "https://shep.turtlesocks.dev/dogs.json";
 
 /// The environment variable that overrides [`DEFAULT_INDEX_URL`], for

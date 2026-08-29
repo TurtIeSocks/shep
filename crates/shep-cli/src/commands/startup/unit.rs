@@ -652,9 +652,8 @@ mod tests {
     }
 
     /// fails if the comment explaining WHY the poll is equivalent to
-    /// READY=1 is deleted. Phase 12a shipped two false captions in a
-    /// generated artefact because only one of them was pinned; generated
-    /// prose that makes a claim gets a test.
+    /// READY=1 is deleted. Generated prose that makes a claim gets a test —
+    /// an unpinned caption in a generated artefact can go false silently.
     #[test]
     fn the_openrc_script_says_why_it_polls() {
         let rendered = openrc_script(&spec());

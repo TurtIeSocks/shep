@@ -6,12 +6,12 @@ still list as open, and together they finish `shep lookout`.
 
 **The design is approved and is the specification for this plan:**
 [docs/brainstorming/specs/2026-08-16-lookout-completion-design.md](../../brainstorming/specs/2026-08-16-lookout-completion-design.md).
-Rin accepted it with no changes, including its twenty numbered assumptions.
+The maintainer accepted it with no changes, including its twenty numbered assumptions.
 Nothing below reopens a design question. Where this plan makes a choice the
 design did not spell out, it says so under "Shapes the design named" and gives
 the reason in the design's own terms.
 
-**Rin's ruling on `start`, recorded so nobody re-derives it.** lookout gets
+**the maintainer's ruling on `start`, recorded so nobody re-derives it.** lookout gets
 stop, restart and reload. It does not get start, even though whistle's control
 surface has `start_sheep` and the design's word "identical" is therefore not
 literally true of the two surfaces. That is a scope decision, it is hers, and
@@ -159,7 +159,7 @@ The design is behaviour. Five of its shapes do not survive contact with the
 code as written: three do not compile or leave a state unanswered, and two
 would ship a defect if implemented literally. This plan fixes each in the
 smallest way that keeps the stated behaviour. **Three of the five are
-deviations from an assumption Rin approved** and are collected again in a table
+deviations from an assumption the maintainer approved** and are collected again in a table
 at the end of this plan so she can reject any one of them on its own; each is
 named here so a reviewer sees it declared rather than discovers it in a diff.
 
@@ -191,7 +191,7 @@ draft, so they are separated here:
 | 5 | the applied filter line | A18. |
 | 6 | the key hint | A18. |
 
-**This is a deviation from A4 and needs Rin's nod.** A4 accepts, as the whole
+**This is a deviation from A4 and needs the maintainer's nod.** A4 accepts, as the whole
 cost of putting the filter in the status bar, that "a transient notice can
 briefly cover the filter line", and justifies it with "while editing, every
 keypress is text, so nothing can raise a notice". **That premise is false.**
@@ -251,7 +251,7 @@ the routing rule, above the cancel. The safety property the rule exists for is
 untouched, because that property is about a cancelling key ALSO doing its
 ordinary job on a target the operator has lost track of, and quitting discards
 the confirm rather than acting on it. **This is a narrow carve-out of A10 and
-it is named here so Rin can reject it**; text mode already makes the same
+it is named here so the maintainer can reject it**; text mode already makes the same
 carve-out and the design writes it into its own key table there.
 
 **5. An armed confirm is cleared when the link leaves `Live`.** A9 refuses
@@ -280,7 +280,7 @@ inside the design's own sentence, not a new decision.
 Each of these is a decision the design already made and wrote down. Every one
 is something a reader of this plan will be tempted to add.
 
-- **No `start` key.** Rin's ruling, above.
+- **No `start` key.** the maintainer's ruling, above.
 - **No delete, scale, signal or whisper.** Whistle drew that boundary for its
   own non-CLI control surface and the reasons transfer: each takes a parameter
   a dashboard has nowhere to put, or removes an app from the registry.
@@ -484,7 +484,7 @@ Add to `app.rs`'s `mod tests`. Every one of these fails to compile first
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -530,7 +530,7 @@ Add to `app.rs`'s `mod tests`. Every one of these fails to compile first
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -1310,7 +1310,7 @@ twice in `frames.rs`. This task fixes all four.
     #[test]
     fn the_title_counts_both_numbers_while_a_filter_is_on() {
         let app = filtered_app("web");
-        let title = rendered(&title_line(&app, "/home/rin/.shep", 120));
+        let title = rendered(&title_line(&app, "/home/ada/.shep", 120));
         assert!(title.contains("2 of 4 in the flock"), "got {title:?}");
     }
 
@@ -1319,7 +1319,7 @@ twice in `frames.rs`. This task fixes all four.
     #[test]
     fn the_unfiltered_title_is_unchanged() {
         let app = filtered_app("");
-        let title = rendered(&title_line(&app, "/home/rin/.shep", 120));
+        let title = rendered(&title_line(&app, "/home/ada/.shep", 120));
         assert!(title.contains("4 in the flock"), "got {title:?}");
         assert!(!title.contains(" of "), "no second number when nothing is hidden");
     }
@@ -1807,7 +1807,7 @@ colour`. Leave the rest of the preamble byte-identical.
 seam rule is that a number stops counting the moment something is added beside
 it. Both are in `frames.rs`:
 
-- `Scene::caption`'s doc, "so Rin does not have to hold fourteen of them in her
+- `Scene::caption`'s doc, "so the maintainer does not have to hold fourteen of them in her
   head" (around `frames.rs:199`).
 - `every_scene_shows_the_thing_it_is_named_for`'s
   `#[allow(clippy::too_many_lines)] // fourteen captions, each pinned clause by
@@ -2988,7 +2988,7 @@ the frozen scene and the reading is taken at the same instant, so the stamp is
 `read 0s ago` in both renders whatever the implementation does. The property
 lives in `the_stamp_ages_on_a_live_dashboard_and_stops_on_a_frozen_one` in
 `detail.rs` (Step 6.3), where the two ages differ by construction. The frozen
-frame is a picture, and pictures are what Rin reads; this one is not also a
+frame is a picture, and pictures are what the maintainer reads; this one is not also a
 test.
 
 Captions, each clause pinned:
@@ -3183,7 +3183,7 @@ assertion can fail in either direction.
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::Allowed,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -3482,7 +3482,7 @@ pair a keymap regression would swap, and refresh sitting next to restart is why
 /// What an action key does.
 ///
 /// Three verbs, and deliberately not four: `start` is whistle's and the CLI's,
-/// by Rin's ruling. Delete, scale, signal and whisper stay CLI-only for
+/// by the maintainer's ruling. Delete, scale, signal and whisper stay CLI-only for
 /// whistle's own reasons: each takes a parameter a dashboard has nowhere to
 /// put, or removes an app from the registry, which is the one action no
 /// keypress should be one Enter away from.
@@ -4537,7 +4537,7 @@ from this plan's first draft and one of them it explicitly promised:
   never rendered. It also pins the reply's rows reaching the table: the frame
   shows `api` as `stopped`, which is the shepherd's own row and not a guess.
 - **`ActionRefusedOffline`** is the frame the closing section of this plan
-  promises Rin will judge from. That section says arming while `Retrying`
+  promises the maintainer will judge from. That section says arming while `Retrying`
   refuses with the sentence `r` gives when the link is GONE, one row under a
   banner saying the shepherd is being reconnected to, and that "if it reads
   wrong in the gallery, the fix is one new sentence". It cannot read wrong in a
@@ -4660,7 +4660,7 @@ violation of:
 
 `ActionRefusedOffline`'s caption deliberately does not say whether the two rows
 reading differently is right. That is the question the frame exists to put in
-front of Rin, and a caption that answered it would be this plan deciding A9 on
+front of the maintainer, and a caption that answered it would be this plan deciding A9 on
 her behalf. See the closing section.
 
 Assertions:
@@ -4939,7 +4939,7 @@ Nothing in this phase touches shep-daemon, and lookout is already
 `#[cfg(unix)]`, so the Windows check is asking its usual question: does the
 tree still compile for a target nobody has implemented yet.
 
-### Step 10.5 - the last look, at the thing Rin actually reads
+### Step 10.5 - the last look, at the thing the maintainer actually reads
 
 ```bash
 less -R docs/lookout/frames.ansi
@@ -4955,7 +4955,7 @@ not show.
 
 ## The frames, and what each one proves
 
-Ten new, twelve changed. Rin decides what this looks like from these, not
+Ten new, twelve changed. The maintainer decides what this looks like from these, not
 from a spec sentence.
 
 Twelve and not fourteen. **`too_narrow` and `narrow` do not change at all in
@@ -4993,7 +4993,7 @@ not Task 3's; `no_detail` and `table_only` are in Task 3's but not Task 6's.
 Arming an action while the link is `Retrying` refuses with the sentence `r`
 gives when the link is **gone**, while the banner one row above says the
 shepherd is being reconnected to. Two rows of the same frame then describe the
-connection differently. That is A9's literal wording and Rin accepted it, so
+connection differently. That is A9's literal wording and the maintainer accepted it, so
 this plan implements it as written rather than relitigating it.
 
 **`action_refused_offline` is that frame**, added in Task 9 for this paragraph
@@ -5033,7 +5033,7 @@ this phase a reviewer should stop on if it arrives unannounced:
 
 ## Three deviations from the approved design, in one place
 
-Rin approved twenty numbered assumptions and this plan implements them. Three
+The maintainer approved twenty numbered assumptions and this plan implements them. Three
 places depart, each because implementing the assumption literally would ship a
 defect. They are named in "Shapes the design named" at the top with their
 reasoning; they are collected here so a reviewer does not have to find them.
@@ -5047,5 +5047,5 @@ phase.**
 | 3 | **A9** | An armed confirm is cleared when the link stops being `Live`, rather than surviving to be refused at Enter. | A9 refuses at ARM time so an operator never answers a question that was never going to be honoured. Leaving the prompt up inverts that, and on a frozen dashboard it would never expire, because the expiry rides a clock that has stopped. |
 
 None of the three changes the action set, the keys, the sentences or the wire.
-If Rin rejects one, the plan reverts to the design's literal reading for that
+If the maintainer rejects one, the plan reverts to the design's literal reading for that
 one item and the corresponding test comes out with it.

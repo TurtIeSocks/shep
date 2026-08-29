@@ -1,12 +1,12 @@
 # The CLI's error plumbing: design
 
 **Date:** 2026-08-23
-**Status:** design approved by Rin, awaiting spec review
+**Status:** design approved by the maintainer, awaiting spec review
 **Scope:** `shep-cli`, plus `shep-core` and `shep-daemon` for Move 3. No behaviour change, no wire change, no new output.
 
 ## The ask
 
-Rin, 2026-08-23, after writing `shep init` by hand:
+The maintainer, 2026-08-23, after writing `shep init` by hand:
 
 > there was a lot of clunky, repeat code, like emit_error/emit_notice and match
 > blocks like `Ok(target) => target, Err(code) => return code`. Maybe we could
@@ -114,7 +114,7 @@ one. The code appears once instead of twice, so the pair cannot drift.
 
 ## Move 3: `From` impls for the conversions that carry nothing else
 
-Raised separately by Rin, 2026-08-23: there are a lot of `map_err` call sites,
+Raised separately by the maintainer, 2026-08-23: there are a lot of `map_err` call sites,
 and would a crate like `thiserror` map them automatically.
 
 Counted across all three crates: **220 `map_err` sites.** They do two
@@ -208,7 +208,7 @@ the noise.
 looked like 38 sites and turned out to be two. Twenty of the thirty-eight are
 `run`'s own dispatch match, one arm per verb, which is the wrapper such a move
 would otherwise add rather than something to convert. The rest sit one per
-function almost everywhere. Rin's call, 2026-08-23, on the measurement.
+function almost everywhere. The maintainer's call, 2026-08-23, on the measurement.
 
 ## Testing
 

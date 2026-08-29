@@ -12,7 +12,7 @@
 
 ## Scope note — what moved out
 
-Research reshaped this phase. **Reload is now Phase 6** and **custom actions is Phase 7** (Rin, 2026-08-09). Reload needs bus-tracked progress, two fixture servers, a load harness and per-platform socket tests; it is the riskiest work this project has attempted and gets undivided review attention. Custom actions carries ten undetermined design questions.
+Research reshaped this phase. **Reload is now Phase 6** and **custom actions is Phase 7** (the maintainer, 2026-08-09). Reload needs bus-tracked progress, two fixture servers, a load harness and per-platform socket tests; it is the riskiest work this project has attempted and gets undivided review attention. Custom actions carries ten undetermined design questions.
 
 Two things from those phases land here anyway, because they are corrections rather than features:
 
@@ -209,7 +209,7 @@ Four in-code sites plus `map.md` currently assert "no `tracing-subscriber` is wi
 
 **Interfaces:** Produces `AppConfig::channel`; consumed by `assemble`.
 
-Today `assemble` sets `channel = config.wait_ready || config.shutdown_with_message`, so fd 3 opens as a **side effect of an unrelated readiness flag**. Rin settled that an explicit field is the answer (2026-08-09), decided alongside custom actions but landing here.
+Today `assemble` sets `channel = config.wait_ready || config.shutdown_with_message`, so fd 3 opens as a **side effect of an unrelated readiness flag**. The maintainer settled that an explicit field is the answer (2026-08-09), decided alongside custom actions but landing here.
 
 - [ ] **Step 1: Add the field, defaulting false**, documented as "open the shepherd channel on fd 3 for this app". Its doc must say what it costs — a socketpair plus two tasks per sheep, against spec §14.11's single-digit-MB idle-RSS goal — so the default is understood as deliberate.
 - [ ] **Step 2: Widen the gate** to `config.channel || config.wait_ready || config.shutdown_with_message`. The two implicit openers stay: an app that sets `wait_ready` still gets its channel without also setting `channel`.
@@ -226,7 +226,7 @@ Today `assemble` sets `channel = config.wait_ready || config.shutdown_with_messa
 
 **This is the trunk. Nothing can reach a log pump's file handle today** — it is a local `let mut file` inside the pump's async block, the pump's `JoinHandle` is discarded, and `ProcIo` carries only `logs`, `from_child` and `to_child`. That absence is the seam the Phase 2b plan deferred.
 
-Rin chose the **push channel** over a generation counter, for the synchronous contract: after the reply returns, every live pump provably holds the new inode — which is what a logrotate `postrotate` stanza actually needs. A counter could only ever promise "before the next write", and **a quiet sheep would never reopen at all**.
+The maintainer chose the **push channel** over a generation counter, for the synchronous contract: after the reply returns, every live pump provably holds the new inode — which is what a logrotate `postrotate` stanza actually needs. A counter could only ever promise "before the next write", and **a quiet sheep would never reopen at all**.
 
 - [ ] **Step 1: Define the control message**
 
@@ -287,7 +287,7 @@ Reopen is cheap for a reason worth stating in the module doc so nobody reaches f
 
 **Files:** Same set as Task 6, plus `crates/shep-daemon/src/entry.rs` (read-only use).
 
-`flush` **truncates, after flushing pending writes** (Rin, 2026-08-09). Flushing first matters because `tokio::fs::File` genuinely holds unwritten bytes: without it, a write already dispatched to the blocking pool can land at offset 0 immediately after the truncate.
+`flush` **truncates, after flushing pending writes** (the maintainer, 2026-08-09). Flushing first matters because `tokio::fs::File` genuinely holds unwritten bytes: without it, a write already dispatched to the blocking pool can land at offset 0 immediately after the truncate.
 
 - [ ] **Step 1: Pin it to the recorded path, never the inode.** Truncate `ProcessEntry::out_file`/`err_file` — the paths the actor already holds for every registered sheep, running or stopped. **If flush chased the pump's current inode, running it after a rotator's rename would truncate the archive instead of the live file.**
 - [ ] **Step 2: Required selector.** `flush` destroys data, so it follows `stop`/`restart`/`delete` (`SelectorArgs`, no `default_value`), not `bleats`. State that reasoning in the verb's doc.
@@ -337,7 +337,7 @@ Doc-only, and it corrects claims that are **measurably false**. Reload itself is
 - [ ] **Step 2: E2E case — flush.** Assert the file is empty afterwards and that the sheep keeps logging into it.
 - [ ] **Step 3: Changelogs** (IR-45). `shep-core` gets `channel` and `log_level`; `shep-daemon` gets the subscriber, the two verbs and the SIGUSR2 behaviour; `shep-client` gets the inherent `next` and the `Stream` re-export. **Reconcile rather than append** — both files already carry substantial `[Unreleased]` sections, and several entries were extended in place rather than duplicated.
 - [ ] **Step 4: map.md.** Add the log-plane entries and the `tracing-subscriber` decision. map.md has twice been synced to what a plan *expected* rather than what shipped — verify each claim against the code before writing it, and cite by symbol, not line number.
-- [ ] **Step 5: Report to Rin** — every third-party API where reality differed from this plan, every judgement call made on her behalf, and the final dependency-count delta.
+- [ ] **Step 5: Report to the maintainer** — every third-party API where reality differed from this plan, every judgement call made on her behalf, and the final dependency-count delta.
 - [ ] **Step 6: Commit** — `docs: record the log plane`
 
 ---

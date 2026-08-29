@@ -356,15 +356,13 @@ impl RingLock {
 
     /// Blocks until this process holds the ring's lock exclusively.
     ///
-    /// The Windows arm this replaced was a documented no-op, sound only for
-    /// as long as every verb refused on Windows before reaching this code.
-    /// It does not any more, so the lock is real: `share_mode(0)` gives the
-    /// same exclusivity `flock(2)` does through a different door — opening
-    /// the lock file with every share flag cleared means no other handle,
-    /// another process's or this one's, read or write, can be opened on it
-    /// while this handle lives. That is mandatory (enforced by the OS on
-    /// every open) rather than merely advisory, so it is if anything a
-    /// stronger guarantee than the unix arm's.
+    /// `share_mode(0)` gives the same exclusivity `flock(2)` does through a
+    /// different door — opening the lock file with every share flag cleared
+    /// means no other handle, another process's or this one's, read or
+    /// write, can be opened on it while this handle lives. That is
+    /// mandatory (enforced by the OS on every open) rather than merely
+    /// advisory, so it is if anything a stronger guarantee than the unix
+    /// arm's.
     ///
     /// What it does not give is a blocking wait: a contended open fails at
     /// once with `ERROR_SHARING_VIOLATION` rather than parking the thread
@@ -581,18 +579,13 @@ mod tests {
     /// which is a read-modify-write across a `rename` with no lock between
     /// address spaces.
     ///
-    /// Runs on Windows too now, and that gate coming off is the point.
-    /// [`RingLock`] used to be a documented no-op there, so this asserted a
-    /// guarantee the code openly did not make; it makes it now, through an
-    /// exclusive `share_mode(0)` open plus a retry loop, so the test that
-    /// proves the guarantee has to be the same test on both platforms.
-    /// This is what keeps the Windows lock honest — revert `acquire`'s
-    /// Windows arm to `Ok(Self {})` and this reddens rather than passing
-    /// quietly.
+    /// Covers Windows too: this is what keeps the Windows lock honest —
+    /// revert `acquire`'s Windows arm to `Ok(Self {})` and this reddens
+    /// rather than passing quietly.
     ///
-    /// Without the advisory lock this fails hard rather than flakily —
-    /// measured at roughly half the records surviving, plus one child
-    /// dying outright on `ENOENT` when the writers shared one temp name.
+    /// Without the lock this exposes the race; nothing synchronises the
+    /// two children into overlap, so a lucky serial schedule can still pass
+    /// one run while failing under load.
     #[cfg(any(unix, windows))]
     #[test]
     fn two_writer_processes_do_not_lose_each_other_s_barks() {

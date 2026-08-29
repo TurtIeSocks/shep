@@ -135,9 +135,9 @@ impl ShepPaths {
     /// so nothing downstream would catch it.
     ///
     /// The appended digest of the full home path is what makes the name
-    /// distinct, and it is why the name is not stable across this change: a
-    /// daemon already bound under the old form is unreachable to a client
-    /// built after it.
+    /// distinct. Changing this derivation is a breaking change for any
+    /// already-running daemon: it stays bound under a name a client built
+    /// afterward would never dial.
     #[must_use]
     pub fn pipe_name(&self) -> String {
         // Bounds the readable half; a pipe name may be 256 characters.
@@ -266,15 +266,15 @@ mod tests {
 
     #[test]
     fn default_layout_under_home_dir() {
-        let p = ShepPaths::resolve(&no_env, Path::new("/home/rin"));
-        assert_eq!(p.home, Path::new("/home/rin/.shep"));
-        assert_eq!(p.daemon_config, Path::new("/home/rin/.shep/shep.toml"));
-        assert_eq!(p.snapshot, Path::new("/home/rin/.shep/flock.json"));
-        assert_eq!(p.logs, Path::new("/home/rin/.shep/logs"));
-        assert_eq!(p.pids, Path::new("/home/rin/.shep/pids"));
-        assert_eq!(p.run, Path::new("/home/rin/.shep/run"));
-        assert_eq!(p.barks, Path::new("/home/rin/.shep/barks.jsonl"));
-        assert_eq!(p.kv, Path::new("/home/rin/.shep/kv.json"));
+        let p = ShepPaths::resolve(&no_env, Path::new("/home/ada"));
+        assert_eq!(p.home, Path::new("/home/ada/.shep"));
+        assert_eq!(p.daemon_config, Path::new("/home/ada/.shep/shep.toml"));
+        assert_eq!(p.snapshot, Path::new("/home/ada/.shep/flock.json"));
+        assert_eq!(p.logs, Path::new("/home/ada/.shep/logs"));
+        assert_eq!(p.pids, Path::new("/home/ada/.shep/pids"));
+        assert_eq!(p.run, Path::new("/home/ada/.shep/run"));
+        assert_eq!(p.barks, Path::new("/home/ada/.shep/barks.jsonl"));
+        assert_eq!(p.kv, Path::new("/home/ada/.shep/kv.json"));
     }
 
     /// The one field that is not the same kind of thing on both platforms —
@@ -285,13 +285,13 @@ mod tests {
     /// client that dials a file that does not exist.
     #[test]
     fn the_control_address_is_a_socket_file_on_unix_and_a_pipe_name_on_windows() {
-        let p = ShepPaths::resolve(&no_env, Path::new("/home/rin"));
+        let p = ShepPaths::resolve(&no_env, Path::new("/home/ada"));
         #[cfg(unix)]
-        assert_eq!(p.socket, Path::new("/home/rin/.shep/run/shep.sock"));
+        assert_eq!(p.socket, Path::new("/home/ada/.shep/run/shep.sock"));
         #[cfg(windows)]
         assert_eq!(
             p.socket,
-            Path::new(r"\\.\pipe\shep-home-rin--shep-3bf53a2f040b1dfb")
+            Path::new(r"\\.\pipe\shep-home-ada--shep-fd394cfc5c93ad12")
         );
         #[cfg(windows)]
         assert_eq!(
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn shep_home_env_overrides_root() {
         let env = |key: &str| (key == "SHEP_HOME").then(|| "/srv/shep".to_string());
-        let p = ShepPaths::resolve(&env, Path::new("/home/rin"));
+        let p = ShepPaths::resolve(&env, Path::new("/home/ada"));
         assert_eq!(p.home, Path::new("/srv/shep"));
         #[cfg(unix)]
         assert_eq!(p.socket, Path::new("/srv/shep/run/shep.sock"));
@@ -322,14 +322,14 @@ mod tests {
         // then a digest of the whole home path. Both homes come from the env
         // rather than the default join, whose separator is the host's and
         // would give the digest a different value per platform.
-        let env = |key: &str| (key == "SHEP_HOME").then(|| "/home/rin/.shep".to_string());
-        let p = ShepPaths::resolve(&env, Path::new("/home/rin"));
+        let env = |key: &str| (key == "SHEP_HOME").then(|| "/home/ada/.shep".to_string());
+        let p = ShepPaths::resolve(&env, Path::new("/home/ada"));
         assert_eq!(
             p.pipe_name(),
-            r"\\.\pipe\shep-home-rin--shep-580896cf7a454a74"
+            r"\\.\pipe\shep-home-ada--shep-626b4d544f86fe95"
         );
         let env = |key: &str| (key == "SHEP_HOME").then(|| "/srv/shep".to_string());
-        let q = ShepPaths::resolve(&env, Path::new("/home/rin"));
+        let q = ShepPaths::resolve(&env, Path::new("/home/ada"));
         assert_eq!(q.pipe_name(), r"\\.\pipe\shep-srv-shep-23b467803966a71a");
     }
 
@@ -341,8 +341,8 @@ mod tests {
     fn two_homes_that_sanitize_alike_get_distinct_pipe_names() {
         let nested = |key: &str| (key == "SHEP_HOME").then(|| r"C:\a\b".to_string());
         let dashed = |key: &str| (key == "SHEP_HOME").then(|| r"C:\a-b".to_string());
-        let n = ShepPaths::resolve(&nested, Path::new("/home/rin"));
-        let d = ShepPaths::resolve(&dashed, Path::new("/home/rin"));
+        let n = ShepPaths::resolve(&nested, Path::new("/home/ada"));
+        let d = ShepPaths::resolve(&dashed, Path::new("/home/ada"));
         assert!(
             n.pipe_name().starts_with(r"\\.\pipe\shep-C--a-b-")
                 && d.pipe_name().starts_with(r"\\.\pipe\shep-C--a-b-"),

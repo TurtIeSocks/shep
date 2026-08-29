@@ -1,6 +1,6 @@
 # shep — name & terminology
 
-Approved by Rin 2026-08-07. **shep** = the project, the binary, the brand. A sheepdog
+Approved by the maintainer 2026-08-07. **shep** = the project, the binary, the brand. A sheepdog
 watching your processes. Playful shepherd/sheep/sheepdog terminology runs through the
 CLI, docs, and type names.
 

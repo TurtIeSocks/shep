@@ -159,12 +159,11 @@ pub struct AppConfig {
     /// Initial backoff delay; grows ×1.5 capped at 15s (spec §4)
     ///
     /// Defaults to 100ms, not unset. An unstable exit (sooner than
-    /// `min_uptime`) with neither this nor `restart_delay` configured used
-    /// to restart with no delay at all, so an app that could never start
-    /// (a missing dependency, a bad config) burned its whole `max_restarts`
-    /// budget inside a second, logging the same failure dozens of times.
-    /// `min_uptime` already existed to name that case as unstable; only the
-    /// default that should have throttled it was missing.
+    /// `min_uptime`) with neither this nor `restart_delay` configured would
+    /// otherwise restart with no delay at all, so an app that can never
+    /// start (a missing dependency, a bad config) would burn its whole
+    /// `max_restarts` budget inside a second, logging the same failure
+    /// dozens of times.
     ///
     /// All of the above assumes `restart_delay` is unset. A fixed
     /// `restart_delay` takes precedence over this field on every exit,
@@ -375,9 +374,8 @@ pub struct AppConfig {
     ///   instances are up, a probe against an address cannot say which of
     ///   them answered, and shep would take the outgoing instance's reply as
     ///   proof the incoming one is ready.
-    /// - **Set**: reload OVERLAPS, which is what every reload did before this
-    ///   field was read. The replacement is spawned alongside the instance it
-    ///   replaces and takes over without a gap — if the app really does set
+    /// - **Set**: reload OVERLAPS. The replacement is spawned alongside the
+    ///   instance it replaces and takes over without a gap — if the app really does set
     ///   `SO_REUSEPORT`. If it does not, the replacement takes `EADDRINUSE`
     ///   and the reload fails, which is the failure this field exists to keep
     ///   opt-in.
@@ -593,12 +591,11 @@ mod tests {
         assert!(!app.channel);
     }
 
-    /// fails if `exp_backoff_restart_delay` reverts to `None`. Defect 2:
-    /// with no restart policy configured, a crash-looping app used to
-    /// restart with no delay at all, burning `max_restarts` in well under a
-    /// second. `restart_delay` (the daemon-side function that reads this
-    /// field) is what actually applies the throttle; this test only pins
-    /// that the default an unconfigured app gets is "on".
+    /// fails if `exp_backoff_restart_delay` reverts to `None` — see this
+    /// field's own doc for why an unset default would burn `max_restarts`
+    /// in well under a second. `restart_delay` (the daemon-side function
+    /// that reads this field) is what actually applies the throttle; this
+    /// test only pins that the default an unconfigured app gets is "on".
     #[test]
     fn unstable_restarts_are_throttled_by_default() {
         let app = AppConfig::minimal("web", "./srv");
@@ -708,7 +705,7 @@ target = "http://127.0.0.1:8080/healthz"
         // that stopped at the first difference fails here.
         let stored = AppConfig::minimal("proto-api", "./proto-enum-api");
         let mut edited = stored.clone();
-        edited.cwd = Some("/Users/rin/GitHub/pogo-proto-api".to_string());
+        edited.cwd = Some("/srv/pogo-proto-api".to_string());
         edited.args = vec!["-config".to_string(), "config.toml".to_string()];
 
         assert_eq!(

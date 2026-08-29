@@ -304,21 +304,17 @@ pub(crate) struct Restorable {
 /// the entries rejected on re-validation.
 ///
 /// **Membership survives everything but `delete`.** A sheep that was stopped
-/// when the roll was written comes back registered and `Stopped`, not gone.
-/// The rule this replaces restored an app only when
-/// `instances_running > 0 && autostart`, which made `shep stop` silently
-/// destructive across a daemon restart: stop a sheep, restart the shepherd,
-/// and the sheep was no longer in the flock at all, with its config sitting
-/// in the roll where only `cat` would find it. Rin hit exactly that and asked
-/// why stopping something should mean forgetting it. It should not.
+/// when the roll was written comes back registered and `Stopped`, not gone —
+/// restoring only `instances_running > 0 && autostart` would make `shep
+/// stop` silently destructive across a daemon restart: the sheep would drop
+/// out of the flock entirely, with its config surviving only in the roll
+/// file itself.
 ///
-/// The old rule was not wrong about what to START -- "was up when we saved"
-/// is still the contract for that, and `autostart = false` is still the
-/// user's opt-out of coming back automatically. It was wrong to conflate
-/// running with belonging. [`FlockRegistry::roll`] never did: it keeps an
-/// app in the roll whenever it appears in the listing, running or not, and
-/// records the count separately. This is the read side finally agreeing with
-/// the write side.
+/// "Was up when we saved" is still the contract for what to START, and
+/// `autostart = false` is still the user's opt-out of coming back
+/// automatically — running and belonging are separate questions.
+/// [`FlockRegistry::roll`] keeps an app in the roll whenever it appears in
+/// the listing, running or not, and records the count separately.
 ///
 /// The roll is a file a human can edit, so every surviving entry is run back
 /// through [`normalize()`] exactly like peer input (spec §6's "the daemon

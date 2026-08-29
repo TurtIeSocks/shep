@@ -220,15 +220,14 @@ pub trait Render: Serialize {
     ///
     /// # Why by name, and never by index
     ///
-    /// This used to be `FlockRows`' own method, painting `row[0]`, `row[4]`,
-    /// `row[9]` and `row[10]` by hardcoded index. An index is a fact about
-    /// one table's column ORDER, so reordering its columns silently
-    /// repoints every one of them: the wrong cells get painted, nothing
+    /// Painting by hardcoded index (`row[0]`, `row[4]`, ...) is a fact about
+    /// one table's column ORDER, so reordering its columns would silently
+    /// repoint every one of them: the wrong cells get painted, nothing
     /// fails to compile, and no test catches it -- a snapshot pins whatever
     /// was accepted into it, and only a human looking at a rendered table
-    /// would notice RESTARTS had started wearing the memory ramp. Reordering
-    /// the dogs table is what made that concrete. Keyed on the name, one
-    /// place says RESTARTS is coloured by `restarts_role`, and every table
+    /// would notice RESTARTS had started wearing the memory ramp. Keyed on
+    /// the name instead, one place says RESTARTS is coloured by
+    /// `restarts_role`, and every table
     /// carrying a RESTARTS column gets it wherever the column sits.
     ///
     /// Only ever called from `table_of`'s
@@ -398,14 +397,9 @@ fn table_of<T: Render>(data: &T, presentation: Presentation) -> String {
 /// `run_argv`, which resolves [`crate::style::Presentation::width`] once,
 /// at the same seam that resolves the style level and forces
 /// [`crate::style::StyleLevel::Bare`] for a pipe -- never [`table_of`]
-/// itself, which used to call this directly and, in doing so, read the
-/// *real* controlling terminal on every render, including under
-/// `cargo test`: a test binary launched from an interactive shell has one
-/// too, so only a harness with none ever made that pass by accident. A
-/// developer's own shell does not, and every `table_of` test failed there.
-/// Injecting the already-resolved value through `Presentation` instead is
-/// what makes `table_of` provable at any width a test chooses, this
-/// module's own tests included.
+/// itself. See [`crate::style::Presentation`]'s own doc for why a live call
+/// here instead would read the real controlling terminal on every render,
+/// including under `cargo test`.
 pub(crate) fn terminal_width() -> usize {
     #[cfg(unix)]
     {
@@ -570,13 +564,10 @@ pub fn emit_error(
     message: &str,
 ) -> io::Result<()> {
     // Sanitised here rather than at each caller, because here is the only
-    // place every caller passes through. shep grew its first error text that
-    // came off the wire when `dogs --available` learned to fetch a community
-    // index, and a hostile `Location:` header cleared an operator's screen
-    // through this very `writeln!`. That instance is fixed at its source, but
-    // the NEXT error carrying somebody else's bytes would get no warning, and
-    // shep emits colour itself, so a reader cannot tell shep's escapes from
-    // an attacker's.
+    // place every caller passes through: a hostile `Location:` header (see
+    // `terminal_safe`'s own doc) is one example of error text that can
+    // carry somebody else's bytes, and shep emits colour itself, so a
+    // reader cannot tell shep's escapes from an attacker's.
     //
     // Both arms, not just the table one. `serde_json` escapes a control byte
     // into `\u001b` so a terminal never renders it, but a script doing

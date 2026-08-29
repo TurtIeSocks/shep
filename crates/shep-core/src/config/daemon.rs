@@ -138,10 +138,9 @@ const MIN_CRON_SLEEP: UpDuration = UpDuration::from_millis(1_000);
 ///
 /// The shepherd itself never reads this key — `shep whistle` reads the file
 /// directly, at startup, in its own process. It is here because this struct is
-/// the grammar of `shep.toml`, and a `[whistle]` section the grammar did not
-/// know about would be an unknown field: `RawDaemonConfig` denies those, so
-/// before this existed a file that turned the gate on stopped the shepherd
-/// from booting at all.
+/// the grammar of `shep.toml`: `RawDaemonConfig` denies unknown fields, so a
+/// `[whistle]` section the grammar does not know about would refuse the whole
+/// file to boot rather than being silently ignored.
 ///
 /// `Debug` is derived rather than redacted (IR-41): one boolean, no secret,
 /// nothing a `{:?}` could leak.
@@ -171,10 +170,10 @@ pub struct StyleSection {
 /// Dog sections stay untyped here: each dog deserializes its own
 /// `[dog.<name>]` table so dog config schemas live with the dog code.
 ///
-/// `#[non_exhaustive]`: this struct has grown a section per phase — `style`
-/// most recently — and each one would otherwise be a breaking change for an
-/// out-of-tree struct literal. That is IR-20's ordinary reasoning applied to
-/// a struct. **It is not a validation gate**, and this type is deliberately
+/// `#[non_exhaustive]`: this struct grows a section over time, and each one
+/// would otherwise be a breaking change for an out-of-tree struct literal.
+/// That is IR-20's ordinary reasoning applied to a struct. **It is not a
+/// validation gate**, and this type is deliberately
 /// not the proof token [`crate::config::ResolvedApp`] is: the attribute blocks
 /// struct literals and functional-update syntax from outside this crate, but
 /// not field mutation, and [`Self::default`] followed by an assignment to
@@ -751,8 +750,7 @@ otel = "/usr/local/bin/shep-otel"
     }
 
     // fails if the env read is placed before the file is folded in, or omitted
-    // entirely — the shape that leaves a knob parsed and never applied, which
-    // is exactly what `log_json` itself was until this level joined it.
+    // entirely — the shape that leaves a knob parsed and never applied.
     #[test]
     fn env_log_level_beats_file_value() {
         let env = |k: &str| (k == "SHEP_LOG_LEVEL").then(|| "debug".to_string());
@@ -830,11 +828,11 @@ otel = "/usr/local/bin/shep-otel"
     }
 
     // fails if `[whistle]` stops being a section the shepherd will start
-    // with. This is not a hypothetical: `RawDaemonConfig` denies unknown
-    // fields, so before this section existed the same input returned
-    // `DaemonConfigError::Toml` and `shep daemon` exited 4 — an operator who
-    // turned whistle's control tools on lost their shepherd on the next
-    // boot.
+    // with: `RawDaemonConfig` denies unknown fields, so a `[whistle]`
+    // section this type did not know about would return
+    // `DaemonConfigError::Toml` and `shep daemon` would exit 4 — an
+    // operator who turned whistle's control tools on would lose their
+    // shepherd on the next boot.
     #[test]
     fn a_whistle_section_parses_and_defaults_to_refusing_control() {
         let cfg = DaemonConfig::load(Some("[whistle]\nallow_control = true\n"), &no_env).unwrap();

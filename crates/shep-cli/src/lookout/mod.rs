@@ -24,13 +24,13 @@
 //! **This verb does not exit when the shepherd dies.** `bleats` does, and that
 //! is right for a follow. A standing dashboard that vanished would take the
 //! last known state of the flock with it, at the moment an operator most wants
-//! to read it — Rin's ruling, and the reason [`link::RECONNECT_ATTEMPTS`]
+//! to read it — the maintainer's ruling, and the reason [`link::RECONNECT_ATTEMPTS`]
 //! exists.
 
 pub mod app;
 // `#[cfg(test)]`: every item in `frames` is read by tests and by the gallery
-// writer, and by nothing else. The package has had a `[lib]` target since
-// Phase 14, but `pub` here still exempts nothing from `dead_code`: `mod
+// writer, and by nothing else. The package has a `[lib]` target, but `pub`
+// here still exempts nothing from `dead_code`: `mod
 // lookout` in `lib.rs` is private, not `pub mod`, and `lib.rs`'s own doc
 // comment states the crate's whole public API as three entry points, every
 // other item private — so `pub mod frames` nested inside a private module is
@@ -93,7 +93,7 @@ pub const MIN_REDRAW: Duration = Duration::from_millis(33);
 /// - [`ExitCode::Usage`] when stdout is not a terminal.
 /// - [`ExitCode::DaemonUnreachable`] (or [`ExitCode::ProtocolMismatch`]) when
 ///   the FIRST connection fails — see [`source::LinkError::exit_code`]. A
-///   shepherd that was never running is not the case Rin's retry-then-freeze
+///   shepherd that was never running is not the case the maintainer's retry-then-freeze
 ///   ruling is about, and lookout refuses it exactly as `shep flock` would.
 /// - [`ExitCode::Failure`] when the terminal could not be put into raw mode.
 ///
@@ -114,7 +114,7 @@ pub async fn lookout(streams: &mut Streams<'_>, paths: &ShepPaths, args: &Lookou
     // The FIRST dial, and it happens HERE — before the palette, before the
     // panic hook, before raw mode, and before anything has been drawn. A
     // shepherd that was never running gets the same refusal `shep flock` gets:
-    // one error envelope on stderr and exit 5. Rin's "lookout never exits on
+    // one error envelope on stderr and exit 5. The maintainer's "lookout never exits on
     // its own" is about a shepherd that dies *underneath* a running dashboard;
     // opening the alternate screen to spend eight seconds reconnecting to
     // something that was never there, announcing a death that never happened
@@ -803,8 +803,7 @@ mod tests {
     /// nothing is read until the clock passes `MIN_REDRAW`, and then it is
     /// read once.
     ///
-    /// **Not `start_paused`, and that is a deviation from the plan's draft
-    /// worth stating rather than silently carrying.** `MIN_REDRAW`'s gate
+    /// **Not `start_paused`.** `MIN_REDRAW`'s gate
     /// reads [`std::time::Instant`] — real wall-clock, deliberately, so
     /// `App`'s clock model stays usable outside a tokio runtime at all
     /// (`App`'s own doc: "No clock. Every `Instant` arrives on the

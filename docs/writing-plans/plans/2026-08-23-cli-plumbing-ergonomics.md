@@ -18,7 +18,7 @@
 - **`docs/idiomatic-rust.md`'s rules (IR-1..IR-45).** Invoke the `shep-idiomatic-rust` skill before writing any Rust here. `# Errors` sections on fallible public functions, `core::error::Error`, and a deliberate `Debug` decision on new public items.
 - **No em dashes or en dashes** in anything a person reads, `///` comments included.
 - **One cargo shape per task.** The workspace shares one target-dir lock. Run gates as their own command with `$?` read directly, never through a pipe: in zsh a pipeline's `$?` is the last command's.
-- **Clean-room rule:** never open, read or reference `/Users/rin/GitHub/pm2`.
+- **Clean-room rule:** never open, read or reference `~/GitHub/pm2`.
 
 ## Verified facts, measured rather than assumed
 

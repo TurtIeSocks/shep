@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 ///
 /// The serialized strings are the wire contract; `waiting-restart` means a
 /// backoff or restart delay is pending.
-// wire format: changing these strings is a breaking change
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProcStatus {
@@ -54,7 +53,6 @@ mod tests {
 
     #[test]
     fn wire_strings_are_stable() {
-        // wire format: these six strings are the protocol contract (spec §4)
         let cases = [
             (ProcStatus::Starting, "\"starting\""),
             (ProcStatus::Online, "\"online\""),

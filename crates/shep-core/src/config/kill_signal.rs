@@ -94,7 +94,7 @@ mod tests {
 
     /// fails if a real signal shep cannot deliver is waved through. `SIGUSR1`
     /// is the exact name that motivated this module: a plausible typo for
-    /// `SIGUSR2`, and one that used to become SIGTERM in silence.
+    /// `SIGUSR2`.
     #[test]
     fn a_signal_the_ladder_cannot_send_does_not_parse() {
         assert_eq!(KillSignal::parse("SIGUSR1"), None);
