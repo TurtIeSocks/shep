@@ -33,6 +33,50 @@ path = "src/bin/shep-runtime.rs"
 name = "shep-dev"
 path = "src/bin/shep-dev.rs"
 
+# The .deb built by `.github/workflows/release-artifacts.yml`, for the
+# download-and-`dpkg -i` path documented in docs/distribution.md. That is not
+# `apt install`, which needs a signed repository nobody hosts yet.
+#
+# Built against musl, never glibc. `depends = "$auto"` writes whatever glibc
+# the builder linked against; ubuntu-latest is 24.04, so a glibc build would
+# demand 2.39 and refuse to install on Debian 12 or Ubuntu 22.04. A static
+# musl binary makes the question disappear, and leaves `$auto` with nothing
+# to find.
+#
+# No systemd unit and no maintainer scripts, deliberately. `shep startup`
+# renders and installs the unit when an operator asks for one, and a
+# `postinst` that did it instead would write to a user's systemd state at
+# `dpkg -i` time, before they have written a Flockfile.
+[package.metadata.deb]
+maintainer = "TurtIeSocks <TurtIeSocks@users.noreply.github.com>"
+copyright = "Copyright (c) TurtIeSocks"
+# cargo-deb takes one license file. Both ship as assets below, since the
+# license is "MIT OR Apache-2.0" and a reader needs to see both to choose.
+license-file = "LICENSE-APACHE"
+section = "admin"
+priority = "optional"
+depends = "$auto"
+extended-description = """shep keeps a flock of long-running processes alive: it restarts them when they die, captures what they print, and says plainly when something is wrong. It also restarts on file changes, on a cron schedule, or over a memory limit, and can alert a webhook when a process misbehaves.
+
+This package installs the binaries only. Run `shep startup` to have systemd supervise the flock from boot; nothing here writes to systemd on your behalf."""
+assets = [
+    # `target/release/` is cargo-deb's own prefix for a built binary. It
+    # rewrites it to the real target directory, so this is correct under
+    # `--target=x86_64-unknown-linux-musl` as well.
+    ["target/release/shep", "usr/bin/", "755"],
+    ["target/release/shep-runtime", "usr/bin/", "755"],
+    ["target/release/shep-dev", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/shep/README.md", "644"],
+    ["LICENSE-MIT", "usr/share/doc/shep/LICENSE-MIT", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/shep/LICENSE-APACHE", "644"],
+    # Written by the release workflow before it calls cargo deb, by running
+    # the binary it just built. Paths are relative to this manifest, which is
+    # why they land in the crate directory rather than under `target/`.
+    ["completions/shep.bash", "usr/share/bash-completion/completions/shep", "644"],
+    ["completions/_shep", "usr/share/zsh/vendor-completions/_shep", "644"],
+    ["completions/shep.fish", "usr/share/fish/vendor_completions.d/shep.fish", "644"],
+]
+
 [dependencies]
 # `features = ["schema"]`: `shep schema` prints `shep_core::config::
 # flockfile_schema_json()`, which only exists behind that feature. This

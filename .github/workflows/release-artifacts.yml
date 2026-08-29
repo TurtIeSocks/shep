@@ -74,6 +74,10 @@ jobs:
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.check.outputs.tag }}
+      # The bare version, `0.1.12` rather than `shep-v0.1.12`. Several jobs
+      # below strip the prefix in shell anyway; the WinGet action needs it as
+      # an input, where there is no shell to do it in.
+      version: ${{ steps.check.outputs.version }}
       go: ${{ steps.check.outputs.go }}
     steps:
       # Every action in this file is pinned by commit rather than by tag, the
@@ -104,8 +108,11 @@ jobs:
             echo "go=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "go=true" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          {
+            echo "go=true"
+            echo "tag=${TAG}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"
 
   upload:
     name: ${{ matrix.target }}
@@ -373,7 +380,6 @@ jobs:
           # 0 and would push last release's formula under this release's tag.
           grep -q "shep-${version}.crate" "$formula"
           grep -q "${checksum}" "$formula"
-          echo "version=${version}" >> "$GITHUB_ENV"
       - name: Push it to the tap
         env:
           TAG: ${{ needs.resolve.outputs.tag }}
@@ -396,3 +402,99 @@ jobs:
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               commit -am "shep ${TAG#shep-v}"
           git push
+
+  # Builds the two .deb packages and attaches them to the release.
+  #
+  # This is `dpkg -i`, not `apt install`: an `apt install shep` needs a signed
+  # repository that nobody hosts, and docs/distribution.md argues for
+  # deferring one. A .deb on the release is still the shortest path onto a
+  # Debian or Ubuntu machine, and it is the only channel here that needs no
+  # organisation, no second repository and no third-party account.
+  #
+  # Does not rebuild. It unpacks the musl archives the matrix above already
+  # uploaded and hands them to `cargo deb --no-build`, which turns a second
+  # twenty-minute release build into a thirty-second repack. musl rather than
+  # gnu is the whole point: `depends = "$auto"` would otherwise record the
+  # builder's glibc, and ubuntu-latest is 24.04, so the package would refuse
+  # to install on Debian 12 or Ubuntu 22.04.
+  #
+  # Inert until the repository variable `PUBLISH_DEB` is `true`.
+  deb:
+    name: deb (${{ matrix.arch }})
+    needs: [resolve, upload]
+    if: >-
+      needs.resolve.outputs.go == 'true' &&
+      github.event_name == 'release' &&
+      vars.PUBLISH_DEB == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          # Native, so the completions step below can run the binary it is
+          # about to package. A cross-built arm64 binary could not be run on
+          # an x86_64 runner, and the completions are generated rather than
+          # checked in.
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: cargo-deb
+      - name: Unpack the archive this release already carries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="shep-${TARGET}.tar.gz"
+          gh release download "$TAG" --pattern "$archive"
+          gh release download "$TAG" --pattern "${archive}.sha256"
+          sha256sum --check "${archive}.sha256"
+          # Where `cargo deb --no-build --target` looks for them.
+          mkdir -p "target/${TARGET}/release"
+          tar -xzf "$archive" -C "target/${TARGET}/release" \
+            shep shep-runtime shep-dev
+          chmod +x "target/${TARGET}/release/"shep*
+      - name: Generate the completions cargo-deb packages
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          shep="target/${TARGET}/release/shep"
+          # Paths are relative to crates/shep-cli/Cargo.toml, which is what
+          # the `assets` entries there expect. Gitignored, so this leaves the
+          # tree clean.
+          out=crates/shep-cli/completions
+          mkdir -p "$out"
+          "$shep" completions bash > "$out/shep.bash"
+          "$shep" completions zsh  > "$out/_shep"
+          "$shep" completions fish > "$out/shep.fish"
+      - name: Build and upload the package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # `--no-strip` because the archives are already stripped, and
+          # stripping a foreign binary needs a matching `strip`.
+          cargo deb --manifest-path crates/shep-cli/Cargo.toml \
+            --target "$TARGET" --no-build --no-strip --output target/debian/
+          deb="$(find target/debian -name '*.deb' -print -quit)"
+          test -n "$deb"
+          gh release upload "$TAG" "$deb" --clobber
