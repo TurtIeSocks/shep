@@ -734,7 +734,7 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (events, rx) = broadcast::channel(64);
+        let (events, rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(scripts);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
         (handle, rx, dir)
@@ -1481,7 +1481,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             runtime.block_on(async move {
                 let kill_timeout = Duration::from_millis(kill_timeout_ms);
-                let (events, mut rx) = broadcast::channel(1024);
+                let (events, mut rx) = crate::bus::test_bus(1024);
                 let runner =
                     ScriptedRunner::new(vec![ProcScript::ignores_signals(); SINGLE_FLIGHT_SCRIPTS]);
                 let handle = spawn_supervisor(runner, test_paths(&dir), events);

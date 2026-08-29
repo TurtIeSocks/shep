@@ -487,7 +487,7 @@ pub(crate) fn harness_with_extras(
 ) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let paths = test_paths(&dir);
-    let (events, events_rx) = broadcast::channel(256);
+    let (events, events_rx) = crate::bus::test_bus(256);
     let (breach_tx, breaches) = mpsc::channel(HARNESS_REPORT_CAPACITY);
     let (live_tx, liveness) = mpsc::channel(HARNESS_REPORT_CAPACITY);
     let extras = build_extras(ExtrasReports {

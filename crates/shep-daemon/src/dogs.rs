@@ -562,7 +562,7 @@ mod tests {
     async fn the_shepherd_records_a_dog_that_gave_up_and_leaves_the_sheep_to_bark() {
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
-        let (events, rx) = broadcast::channel(16);
+        let (events, rx) = crate::bus::test_bus(16);
         let watch = spawn_dog_watch(rx, barks_path.clone());
 
         events.send(errored_event("web", None)).unwrap();
@@ -589,7 +589,7 @@ mod tests {
     async fn a_dog_that_merely_exited_is_not_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
-        let (events, rx) = broadcast::channel(16);
+        let (events, rx) = crate::bus::test_bus(16);
         let watch = spawn_dog_watch(rx, barks_path.clone());
 
         events

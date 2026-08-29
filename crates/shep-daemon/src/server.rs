@@ -447,7 +447,7 @@ async fn read_loop(
                 // A second Subscribe REPLACES the first: spec §6 gives a
                 // connection one topic list, not a growing union.
                 if let Some(old) =
-                    forwarder.replace(spawn_forwarder(ctx.events.subscribe(), filter, out.clone()))
+                    forwarder.replace(spawn_forwarder(&ctx.events, filter, out.clone()))
                 {
                     old.abort();
                 }

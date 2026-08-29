@@ -103,8 +103,8 @@
 //! // Set up temporary paths for this example
 //! let paths = ShepPaths::resolve(&|_| None, Path::new("/tmp/shep-example"));
 //!
-//! // Create a broadcast channel for events
-//! let (events, _rx) = tokio::sync::broadcast::channel(64);
+//! // Create the event bus every subscriber reads
+//! let events = shep_daemon::bus::new_bus();
 //!
 //! // Spawn the supervisor actor
 //! let handle = spawn_supervisor(runner, paths, events);

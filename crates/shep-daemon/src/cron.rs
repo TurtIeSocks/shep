@@ -305,7 +305,7 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (events, rx) = broadcast::channel(64);
+        let (events, rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(scripts);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
         (handle, rx, dir)

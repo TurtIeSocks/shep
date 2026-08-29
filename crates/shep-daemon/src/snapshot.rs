@@ -852,7 +852,7 @@ mod tests {
         };
         write_atomic(&paths.snapshot, &roll).unwrap();
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -921,7 +921,7 @@ mod tests {
         };
         write_atomic(&paths.snapshot, &roll).unwrap();
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             // Two scripts for the two that must come up. `b-bad` consumes
             // none, so a run that let it take one would starve `c-good` and
@@ -1005,7 +1005,7 @@ mod tests {
         };
         write_atomic(&paths.snapshot, &roll).unwrap();
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]).refusing(&["gone"]),
             paths.clone(),
@@ -1055,7 +1055,7 @@ mod tests {
         };
         write_atomic(&paths.snapshot, &roll).unwrap();
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -1088,7 +1088,7 @@ mod tests {
         std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
         assert!(!paths.snapshot.exists());
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -1109,7 +1109,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::create_dir_all(&paths.home).unwrap();
-        let (events, _keep) = tokio::sync::broadcast::channel(64);
+        let (events, _keep) = crate::bus::test_bus(64);
         let supervisor = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -1158,7 +1158,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::create_dir_all(&paths.home).unwrap();
-        let (events, _keep) = tokio::sync::broadcast::channel(64);
+        let (events, _keep) = crate::bus::test_bus(64);
         let supervisor = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),

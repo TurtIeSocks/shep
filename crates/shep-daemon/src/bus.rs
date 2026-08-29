@@ -6,7 +6,6 @@
 //! matching frames into that connection's write queue.
 
 use core::ops::Deref;
-#[cfg(test)]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -37,12 +36,140 @@ pub const MAX_TOPIC_PATTERNS: usize = 32;
 
 /// Creates the daemon's process-wide event bus.
 ///
-/// Every connection subscribes off the returned sender's `.subscribe()`;
-/// the sender itself is held by the daemon so the bus outlives every
-/// individual connection.
+/// Every connection subscribes off the returned [`Bus`]; the bus itself is
+/// held by the daemon so it outlives every individual connection.
 #[must_use]
-pub fn new_bus() -> broadcast::Sender<SharedEvent> {
-    broadcast::channel(BUS_CAPACITY).0
+pub fn new_bus() -> Bus {
+    Bus {
+        tx: broadcast::channel(BUS_CAPACITY).0,
+        log_subscribers: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
+/// The daemon's event channel, plus the one question the channel cannot
+/// answer: whether anything is listening for log lines.
+///
+/// A `broadcast::Sender`'s `receiver_count` is the wrong question here and
+/// would always answer "yes". Two subscribers exist for the daemon's whole
+/// life and neither reads a log line: [`crate::dogs::spawn_dog_watch`] acts
+/// only on a dog's `Errored`, and the snapshot writer only on a lifecycle
+/// change. A sheep's stdout therefore woke both of them, once per line, to
+/// look at an event and drop it — measured at 39% of the daemon's per-line
+/// CPU on a sheep emitting 7,315 lines/s with nothing attached.
+///
+/// So the count kept here is of subscribers whose [`TopicFilter`] actually
+/// matches a log topic, which in practice means a `shep bleats`, a bark dog,
+/// or a `lookout`, and [`Self::publish_log`] skips the whole publish while it
+/// is zero.
+///
+/// # Debug (IR-41)
+///
+/// Derived, unredacted, and carrying nothing to redact: a channel handle and
+/// a counter.
+#[derive(Clone, Debug)]
+pub struct Bus {
+    tx: broadcast::Sender<SharedEvent>,
+    /// Subscribers whose filter matches `log.out` or `log.err`.
+    log_subscribers: Arc<AtomicUsize>,
+}
+
+impl Bus {
+    /// Publishes one log line, unless nothing is subscribed to log topics.
+    ///
+    /// # Why dropping it is not a lost event
+    ///
+    /// A `broadcast` receiver begins at the channel's CURRENT tail
+    /// (`tokio::sync::broadcast`'s `new_receiver` reads `tail.pos` into the
+    /// receiver's cursor), so a subscriber has never been shown an event
+    /// published before it attached. An event skipped while the count is zero
+    /// is therefore one no receiver could have read had it been published:
+    /// the ring would have carried it, every existing subscriber would have
+    /// filtered it out, and the next one to attach would have started past
+    /// it.
+    ///
+    /// What the gate does widen, by the time it takes one atomic store to
+    /// become visible to another core, is a window that is already there:
+    /// [`Self::subscribe_for`] registers a filter's interest BEFORE it takes
+    /// its receiver, so between an operator running `shep bleats` and its
+    /// first line there has always been an interval in which a line goes to
+    /// nobody. Nothing orders a client's `Subscribe` against a sheep's
+    /// stdout, and nothing could.
+    pub fn publish_log(&self, event: BusEvent) {
+        // Relaxed: nothing is published THROUGH this counter, and the only
+        // consequence of reading a stale zero is the race above.
+        if self.log_subscribers.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let _ = self.tx.send(SharedEvent::new(event));
+    }
+
+    /// A receiver for one subscription, plus its registered log interest.
+    ///
+    /// Registered before the receiver exists, so the receiver can only ever
+    /// miss events from before it was created — see [`Self::publish_log`].
+    /// The guard restores the count when it is dropped, which for a
+    /// forwarder is when its task ends OR is aborted, since aborting a task
+    /// drops the future and everything it captured.
+    #[must_use]
+    fn subscribe_for(
+        &self,
+        filter: &TopicFilter,
+    ) -> (broadcast::Receiver<SharedEvent>, LogInterest) {
+        let interest = if filter.wants_logs() {
+            self.log_subscribers.fetch_add(1, Ordering::Relaxed);
+            LogInterest(Some(Arc::clone(&self.log_subscribers)))
+        } else {
+            LogInterest(None)
+        };
+        (self.tx.subscribe(), interest)
+    }
+
+    /// How many subscribers currently want log topics.
+    #[cfg(test)]
+    fn log_subscribers(&self) -> usize {
+        self.log_subscribers.load(Ordering::Relaxed)
+    }
+}
+
+impl Deref for Bus {
+    type Target = broadcast::Sender<SharedEvent>;
+
+    // IR-25: a field return, on the path every non-log publish takes.
+    #[inline]
+    fn deref(&self) -> &broadcast::Sender<SharedEvent> {
+        &self.tx
+    }
+}
+
+/// One subscriber's registered interest in log topics, released on drop.
+///
+/// `None` for a filter that never wanted logs, so a caller holds the same
+/// type either way and nothing branches on the way out.
+#[derive(Debug)]
+pub struct LogInterest(Option<Arc<AtomicUsize>>);
+
+impl Drop for LogInterest {
+    fn drop(&mut self) {
+        if let Some(count) = self.0.take() {
+            count.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A bus of the given ring capacity, plus one plain receiver.
+///
+/// The receiver is not registered for log topics, and cannot be: a bare
+/// `subscribe` has no [`TopicFilter`] for [`Bus::publish_log`] to ask about.
+/// A test that wants log lines takes them through [`spawn_forwarder`], the
+/// way a connection does.
+#[cfg(test)]
+pub(crate) fn test_bus(capacity: usize) -> (Bus, broadcast::Receiver<SharedEvent>) {
+    let (tx, rx) = broadcast::channel(capacity);
+    let bus = Bus {
+        tx,
+        log_subscribers: Arc::new(AtomicUsize::new(0)),
+    };
+    (bus, rx)
 }
 
 /// One published [`BusEvent`], plus the wire frame its subscribers share.
@@ -228,6 +355,20 @@ impl TopicFilter {
         self.set.is_match(event.topic())
     }
 
+    /// True when this filter would match either log topic.
+    ///
+    /// Asked once per subscription, never per event, and the answer is what
+    /// [`Bus::publish_log`] gates on. The two topic strings are duplicated
+    /// from [`BusEvent::topic`] because there is no event to ask — a
+    /// publisher decides whether to BUILD one. `wants_logs_agrees_with_the
+    /// _topics_log_events_carry` is what keeps the two in step.
+    #[must_use]
+    pub fn wants_logs(&self) -> bool {
+        ["log.out", "log.err"]
+            .iter()
+            .any(|topic| self.set.is_match(topic))
+    }
+
     /// The source patterns this filter was compiled from.
     // IR-25: trivial field return, no branch — inline across codegen units.
     // Not per-frame hot like `matches` above (a `GlobSet` call, not a
@@ -318,15 +459,15 @@ fn step(received: Result<SharedEvent, RecvError>, filter: &TopicFilter) -> Forwa
 // reports the exact count as `Lagged(n)`. That is spec §6's requirement
 // implemented by the runtime rather than by a hand-rolled `VecDeque`, and it
 // isolates one slow client from every other connection.
-pub fn spawn_forwarder(
-    mut rx: broadcast::Receiver<SharedEvent>,
-    filter: TopicFilter,
-    out: mpsc::Sender<Bytes>,
-) -> JoinHandle<()> {
+pub fn spawn_forwarder(bus: &Bus, filter: TopicFilter, out: mpsc::Sender<Bytes>) -> JoinHandle<()> {
+    let (mut rx, interest) = bus.subscribe_for(&filter);
     // Cancel-safety: `recv` and `send` are both cancel-safe and are awaited
     // sequentially (no select!), so an aborted forwarder can lose at most the
     // frame in flight — which the subscriber is no longer there to read.
     tokio::spawn(async move {
+        // Captured by the future rather than created inside it, so a
+        // forwarder aborted before its first poll still releases the count.
+        let _interest = interest;
         loop {
             match step(rx.recv().await, &filter) {
                 Forwarded::Frame(bytes) => {
@@ -432,7 +573,7 @@ mod tests {
     async fn lag_becomes_a_dropped_notice_that_bypasses_the_filter() {
         // The count is READ from the runtime, never hand-computed: whatever
         // tokio says was missed is exactly what the subscriber is told.
-        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let (tx, mut rx) = test_bus(4);
         for id in 0..10 {
             tx.send(process_event(id, ProcessEventKind::Start)).unwrap();
         }
@@ -454,9 +595,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn forwarder_delivers_only_matching_frames_then_closes_with_the_bus() {
-        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let (tx, _rx) = test_bus(16);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(16);
-        let handle = spawn_forwarder(rx, filter(&["process.*"]), out_tx);
+        let handle = spawn_forwarder(&tx, filter(&["process.*"]), out_tx);
 
         tx.send(process_event(0, ProcessEventKind::Start)).unwrap();
         tx.send(
@@ -507,12 +648,12 @@ mod tests {
     /// and the rest of the subscribers cloned a refcount.
     #[tokio::test(start_paused = true)]
     async fn every_subscriber_gets_the_same_frame_from_one_encode() {
-        let (tx, _keep) = tokio::sync::broadcast::channel(16);
+        let (tx, _keep) = test_bus(16);
         let mut outs = Vec::new();
         let mut forwarders = Vec::new();
         for _ in 0..3 {
             let (out_tx, out_rx) = tokio::sync::mpsc::channel(16);
-            forwarders.push(spawn_forwarder(tx.subscribe(), filter(&["*"]), out_tx));
+            forwarders.push(spawn_forwarder(&tx, filter(&["*"]), out_tx));
             outs.push(out_rx);
         }
 
@@ -558,12 +699,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn encode_frame_runs_once_per_event_however_many_subscribers() {
         const SUBSCRIBERS: usize = 5;
-        let (tx, _keep) = tokio::sync::broadcast::channel(16);
+        let (tx, _keep) = test_bus(16);
         let mut outs = Vec::new();
         let mut forwarders = Vec::new();
         for _ in 0..SUBSCRIBERS {
             let (out_tx, out_rx) = tokio::sync::mpsc::channel(16);
-            forwarders.push(spawn_forwarder(tx.subscribe(), filter(&["*"]), out_tx));
+            forwarders.push(spawn_forwarder(&tx, filter(&["*"]), out_tx));
             outs.push(out_rx);
         }
 
@@ -623,11 +764,99 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn forwarder_stops_when_the_subscriber_hangs_up() {
-        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let (tx, _rx) = test_bus(16);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(1);
-        let handle = spawn_forwarder(rx, filter(&["*"]), out_tx);
+        let handle = spawn_forwarder(&tx, filter(&["*"]), out_tx);
         drop(out_rx);
         tx.send(BusEvent::DaemonShutdown.into()).unwrap();
         handle.await.unwrap(); // resolves rather than leaking a task
+    }
+
+    fn log_out(line: &str) -> BusEvent {
+        BusEvent::LogOut {
+            id: 1,
+            line: line.to_string(),
+        }
+    }
+
+    /// Fails if [`TopicFilter::wants_logs`]'s two hard-coded topics drift
+    /// from the ones [`BusEvent::topic`] actually returns.
+    ///
+    /// `wants_logs` is asked without an event in hand, so it cannot call
+    /// `topic()`; this is the join that keeps the duplication honest. A
+    /// rename of either topic string fails here rather than silently making
+    /// every `shep bleats` a subscriber to nothing.
+    #[test]
+    fn wants_logs_agrees_with_the_topics_log_events_carry() {
+        let out = log_out("x");
+        let err = BusEvent::LogErr {
+            id: 1,
+            line: "x".to_string(),
+        };
+        for patterns in [vec!["*"], vec!["log.*"], vec!["log.out", "log.err"]] {
+            let f = filter(&patterns);
+            assert!(f.wants_logs(), "{patterns:?} must register log interest");
+            assert!(f.matches(&out) && f.matches(&err), "{patterns:?}");
+        }
+        let f = filter(&["process.*", "channel.*", "daemon.*"]);
+        assert!(!f.wants_logs(), "no pattern here names a log topic");
+        assert!(!f.matches(&out) && !f.matches(&err));
+    }
+
+    /// Fails if a log line is published while nothing wants one.
+    ///
+    /// The count is the assertion rather than a clock, because the cost being
+    /// removed is a fact about how often a publish happens. `receiver_count`
+    /// cannot stand in: the daemon always has two subscribers that read every
+    /// event and act on no log line, and it is exactly their per-line wakeup
+    /// that the gate exists to stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_log_line_is_not_published_while_no_filter_wants_one() {
+        let (bus, mut plain) = test_bus(16);
+        assert_eq!(bus.log_subscribers(), 0);
+
+        // A subscriber that reads everything and asked for nothing — the
+        // shape both of the daemon's own internal subscribers have.
+        bus.publish_log(log_out("dropped"));
+        assert!(
+            plain.try_recv().is_err(),
+            "a log line must not reach the ring while no filter wants one"
+        );
+
+        // A non-log publish still goes out: the gate is about log topics,
+        // not about publishing.
+        bus.send(BusEvent::DaemonShutdown.into()).unwrap();
+        assert_eq!(plain.try_recv().unwrap(), BusEvent::DaemonShutdown);
+    }
+
+    /// Fails if a subscriber that asked for log topics does not get them, or
+    /// if the interest outlives the forwarder that registered it.
+    #[tokio::test(start_paused = true)]
+    async fn a_log_subscriber_opens_the_gate_and_closes_it_again() {
+        let (bus, mut plain) = test_bus(16);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let forwarder = spawn_forwarder(&bus, filter(&["log.*"]), out_tx);
+        assert_eq!(bus.log_subscribers(), 1, "a log.* filter must register");
+
+        bus.publish_log(log_out("delivered"));
+        assert_eq!(
+            decode_frame::<BusEvent>(&next_frame(&mut out_rx).await).unwrap(),
+            log_out("delivered")
+        );
+        assert_eq!(
+            plain.try_recv().unwrap(),
+            log_out("delivered"),
+            "one open gate publishes to every subscriber, not only the asker"
+        );
+
+        forwarder.abort();
+        let _ = forwarder.await;
+        assert_eq!(
+            bus.log_subscribers(),
+            0,
+            "an aborted forwarder must release its interest, not strand it"
+        );
+        bus.publish_log(log_out("dropped again"));
+        assert!(plain.try_recv().is_err());
     }
 }
