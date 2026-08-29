@@ -12,10 +12,16 @@ name: pages
 #
 # The paths filter names two files outside `web/` on purpose: the site parses
 # them at build time (see `web/src/data/*.ts`) rather than restating them, so
-# that a stale claim fails the build instead of shipping. The "not built yet"
-# chalkboard comes from docs/specs/deferred.md, and the terminology page's
-# usage rules from docs/terminology.md. Editing either without redeploying
-# would leave the site asserting something the repo no longer says.
+# that a stale claim fails the build instead of shipping. docs/specs/deferred.md
+# feeds the "not built yet" chalkboard through web/src/data/chalkboard.ts, and
+# docs/terminology.md feeds TWO consumers: the landing page's lexicon through
+# web/src/data/lexicon.ts, and the terminology page's usage rules through
+# web/src/data/docsRules.ts. Editing either file without redeploying would leave
+# the site asserting something the repo no longer says.
+#
+# The terminology page's TABLE is a third thing and is not in this filter,
+# because it comes from web/src/data/lexiconTable.md through
+# web/src/data/docsLexicon.ts, and `web/**` already covers it.
 #
 # README.md was the third until the lexicon table moved to
 # web/src/data/lexiconTable.md, which happened because the README was rewritten

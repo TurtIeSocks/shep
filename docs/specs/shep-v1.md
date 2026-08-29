@@ -169,7 +169,12 @@ default, is not sufficient, and a mixed pair — one process with the option,
 one without — is refused by the kernel on both tier-1 platforms.
 
 Reload proceeds instance-by-instance; failure of the new instance aborts the
-rest and keeps old instances running.
+rest. What that leaves running depends on the mode. Under overlap the
+replaced instance has not been drained yet, so it keeps serving and nothing
+is lost. Under serial it has already been drained and reaped by the time its
+replacement can fail, so only the REMAINING old instances stay up and that
+slot is empty until something starts it. `abort_reload` restores a drainee
+only where one is still there to restore, which under serial is never.
 
 > macOS caveat: `SO_REUSEPORT` there is last-binder-wins, not
 > load-balancing — measured cross-process over 40 connections, macOS sent

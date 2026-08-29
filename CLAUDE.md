@@ -17,8 +17,8 @@ produce our behavior specs — implementation works from the specs alone:
   stock`, `shep signal` or shep-cli-redirect, and it still calls the TUI
   `tui.rs` and the MCP server `mcp.rs`, which are the names those two shipped
   under before Phases 12 and 13 renamed them. For anything after the pm2
-  cutover, the design lives in docs/brainstorming/specs/ and in that phase's
-  own plan. This line said "THE spec: every module's behavior" until an audit
+  cutover, the design lives in docs/brainstorming/specs/ and the reasoning in
+  [docs/decisions.md](docs/decisions.md). This line said "THE spec: every module's behavior" until an audit
   on 2026-08-29 counted the gaps, which is a bad claim to leave in the file
   every session reads first.
 - [docs/systematic-refactor/refactor-workspace/](docs/systematic-refactor/refactor-workspace/) — goals.md (must-haves, constraints, open questions), assessment.md (keep/toss verdicts), trace.md + trace/ (flow inventories, known-bug list — bugs are documented so we do NOT reproduce them)
