@@ -32,7 +32,7 @@ pub fn app_with(flock: Vec<ProcessInfo>, palette: Palette) -> App {
     let mut app = App::new(
         palette,
         Control::ReadOnly,
-        "/home/rin/.shep".to_string(),
+        "/home/ada/.shep".to_string(),
         t0,
     );
     app.update(Msg::Snapshot {
@@ -53,15 +53,15 @@ pub fn flock_of(count: u32, with_readings: u32) -> Vec<ProcessInfo> {
                 .uptime_ms(4_512_000)
                 .cpu_percent(reports.then_some(3.5))
                 .memory_bytes(reports.then_some(182 << 20))
-                .out_file(Some(format!("/home/rin/.shep/logs/sheep-{id}-out.log")))
-                .err_file(Some(format!("/home/rin/.shep/logs/sheep-{id}-err.log")))
+                .out_file(Some(format!("/home/ada/.shep/logs/sheep-{id}-out.log")))
+                .err_file(Some(format!("/home/ada/.shep/logs/sheep-{id}-err.log")))
                 .build()
         })
         .collect()
 }
 
 /// One plausible host reading: the same numbers the gallery's scenes use, so a
-/// failure here and a frame Rin is looking at name the same figures.
+/// failure here and a frame the maintainer is looking at name the same figures.
 pub fn sample() -> HostSample {
     HostSample {
         load: (2.31, 4.10, 3.88),

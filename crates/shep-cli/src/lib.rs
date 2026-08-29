@@ -12,7 +12,7 @@
 //! to own) this one does.
 //!
 //! `serve`, `runtime`, and `dev` (spec `docs/specs/shep-v1.md` §9): a
-//! hand-rolled static file server (no `axum`, no `tower-http`; Rin's ruling
+//! hand-rolled static file server (no `axum`, no `tower-http`; the maintainer's ruling
 //! — the ledger has the reasoning), a foreground no-daemon container mode
 //! with a PID-1 init split for zombie reaping, and an isolated foreground
 //! development flock. Three `[[bin]]` targets sit over this library: `shep`

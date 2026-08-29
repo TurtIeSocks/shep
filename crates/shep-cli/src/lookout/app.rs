@@ -40,7 +40,7 @@ use super::theme::Palette;
 
 /// Whether this lookout may act on a sheep.
 ///
-/// Default is [`Self::ReadOnly`], per Rin's ruling, mirroring the
+/// Default is [`Self::ReadOnly`], per the maintainer's ruling, mirroring the
 /// `allow_control` precedent spec §9 sets for whistle. Turned on by
 /// `--allow-control` or by `lookout.allow_control` in the KV store.
 ///
@@ -362,7 +362,7 @@ impl fmt::Display for Notice {
 /// What an action key does.
 ///
 /// Three verbs, and deliberately not four: `start` is whistle's and the CLI's,
-/// by Rin's ruling. Delete, scale, signal and whisper stay CLI-only for
+/// by the maintainer's ruling. Delete, scale, signal and whisper stay CLI-only for
 /// whistle's own reasons: each takes a parameter a dashboard has nowhere to
 /// put, or removes an app from the registry, which is the one action no
 /// keypress should be one Enter away from.
@@ -1472,7 +1472,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -1502,7 +1502,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::Allowed,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -2140,7 +2140,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -2179,7 +2179,7 @@ mod tests {
 
     /// fails if lookout learns to exit on its own. A `DaemonShutdown` is a
     /// notice here, where in `bleats` it precedes a clean exit — the whole
-    /// point of Rin's ruling is that a standing dashboard admits it is stale
+    /// point of the maintainer's ruling is that a standing dashboard admits it is stale
     /// rather than vanishing. Only `q` quits.
     #[test]
     fn nothing_but_a_keypress_quits() {
@@ -2544,7 +2544,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -2590,7 +2590,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -2640,7 +2640,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {

@@ -1,9 +1,8 @@
 ---
 source: crates/shep-cli/src/lookout/frames.rs
-assertion_line: 1599
 expression: render_text(&buffer)
 ---
-shep lookout   /home/rin/.shep                                                        6 in the flock
+shep lookout   /home/ada/.shep                                                        6 in the flock
 the shepherd stopped answering — reconnecting (attempt 3)                                           
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
   ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  

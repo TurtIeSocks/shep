@@ -1,9 +1,8 @@
 ---
 source: crates/shep-cli/src/lookout/frames.rs
-assertion_line: 1599
 expression: render_text(&buffer)
 ---
-shep lookout   /home/rin/.shep                                                                            6 in the flock
+shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  usage is not available on this platform   flock cpu 14.7%   flock mem 716.0M                                      
   ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -23,8 +22,8 @@ host  usage is not available on this platform   flock cpu 14.7%   flock mem 716.
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 sheep 2  api   online   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241.0M   fold edge                      
 lambs  not read yet                                                                                                     
-out  /home/rin/.shep/logs/api-2-out.log                                                                                 
-err  /home/rin/.shep/logs/api-2-err.log                                                                                 
+out  /home/ada/.shep/logs/api-2-out.log                                                                                 
+err  /home/ada/.shep/logs/api-2-err.log                                                                                 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 bleats  api  … 1 earlier line not shown                                                                                 
 out  GET /healthz 200 3ms                                                                                               

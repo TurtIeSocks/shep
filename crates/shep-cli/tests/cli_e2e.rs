@@ -2742,7 +2742,7 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
 /// the order that makes both facts stand: the flock half first, while the
 /// shepherd's own logs still hold a marker only this test wrote.
 ///
-/// Rin's requirement was that a flock flush never reach the shepherd's own
+/// The maintainer's requirement was that a flock flush never reach the shepherd's own
 /// logs without being named. That already held by construction — the daemon
 /// inherits those two files as fds 1 and 2 and has no path for a selector to
 /// match — but "by construction" is exactly the kind of claim a later
@@ -3670,7 +3670,7 @@ fn shep_log_level_decides_which_of_the_daemons_records_survive() {
 /// the same way `shep start <path>` against the identical broken script
 /// does, rather than exiting 0 with nothing on either stream.
 ///
-/// Reproduces the gap Rin found live 2026-08-19: the daemon's
+/// Reproduces the gap the maintainer found live 2026-08-19: the daemon's
 /// `Response::Restarted` (what `shep start <name>` sends once the sheep is
 /// already registered — see `lifecycle::resume`) has no per-id error slot,
 /// so a respawn that fails to spawn still answers `Ok` with an `errored`
@@ -3683,7 +3683,7 @@ fn shep_log_level_decides_which_of_the_daemons_records_survive() {
 ///
 /// The script is valid shell but not executable (`0o644`), so every spawn
 /// of it fails with `EACCES` regardless of which request registered or
-/// restarted it — the same shape Rin's own repro used.
+/// restarted it — the same shape the maintainer's own repro used.
 ///
 /// What a broken implementation would let through: reverting `resume`'s
 /// `any_restart_failed` check (`lifecycle.rs`) makes the second `start`
@@ -5791,7 +5791,7 @@ fn a_served_sheep_stops_on_sigterm_rather_than_riding_the_ladder_to_sigkill() {
 #[cfg(unix)]
 /// Layout shared by the two `--follow-symlinks` cases below:
 /// `<root>/releases/2026-08-15/index.html` and
-/// `<root>/current -> releases/2026-08-15` — the exact deploy shape Rin's
+/// `<root>/current -> releases/2026-08-15` — the exact deploy shape the maintainer's
 /// ruling names.
 fn write_deploy_layout(root: &Path) {
     let release = root.join("releases").join("2026-08-15");
@@ -5801,7 +5801,7 @@ fn write_deploy_layout(root: &Path) {
 }
 
 #[cfg(unix)]
-/// fails if the per-refusal stderr line (decision 5, Rin's ruling) never
+/// fails if the per-refusal stderr line (decision 5, the maintainer's ruling) never
 /// reaches the sheep's own bleats. This is the one claim in the ruling that
 /// Task 3's and Task 6's in-process tests cannot make: they run inside the
 /// test binary's own process, sharing its stderr with every other test in

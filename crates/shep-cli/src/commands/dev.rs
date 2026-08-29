@@ -178,8 +178,8 @@ mod tests {
             "SHEP_HOME" => Some("/srv/production".to_string()),
             _ => None,
         };
-        let paths = dev_home(&env, Path::new("/home/rin"));
-        assert_eq!(paths.home, Path::new("/home/rin/.shep-dev"));
+        let paths = dev_home(&env, Path::new("/home/ada"));
+        assert_eq!(paths.home, Path::new("/home/ada/.shep-dev"));
 
         let env = |key: &str| match key {
             "SHEP_HOME" => Some("/srv/production".to_string()),
@@ -187,7 +187,7 @@ mod tests {
             _ => None,
         };
         assert_eq!(
-            dev_home(&env, Path::new("/home/rin")).home,
+            dev_home(&env, Path::new("/home/ada")).home,
             Path::new("/tmp/t1")
         );
     }

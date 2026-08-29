@@ -320,7 +320,7 @@ mod tests {
     }
 
     /// fails if `follow_symlinks` does not actually let an in-docroot deploy
-    /// symlink through. This is the exact shape Rin's ruling names:
+    /// symlink through. This is the exact shape the maintainer's ruling names:
     /// `current -> releases/2026-08-15`, a symlink that stays inside the
     /// root the whole way. Default mode refuses it (already covered by
     /// `a_symlinked_intermediate_directory_is_not_contained`'s sibling case);

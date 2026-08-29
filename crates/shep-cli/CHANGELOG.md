@@ -933,7 +933,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Two new workspace dependencies: `tokio-rustls` and `webpki-roots`, named
   directly rather than pulling in `reqwest`. Discord and Slack webhooks
-  are HTTPS-only, so this phase needs a TLS client somewhere, and Rin's
+  are HTTPS-only, so this phase needs a TLS client somewhere, and the maintainer's
   ruling (2026-08-12) was a hand-rolled HTTP/1.1 request/response over
   `tokio-rustls`'s connector — the same call already made for the metrics
   dog's HTTP *server* side, aimed the other way — rather than `reqwest`.

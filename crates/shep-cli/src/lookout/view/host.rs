@@ -137,7 +137,7 @@ mod tests {
     /// the right, so truncating IS the drop order and this is the whole of the
     /// fitting behaviour. An earlier draft built a second mechanism for it and
     /// a test that walked every width from 200 down to 10 recording the order
-    /// things vanished; Rin's ruling for this phase is "as plain as the flock
+    /// things vanished; the maintainer's ruling for this phase is "as plain as the flock
     /// table", and the ellipsis on every other line of the screen is the
     /// precedent. Three widths, not a hundred and ninety.
     #[test]

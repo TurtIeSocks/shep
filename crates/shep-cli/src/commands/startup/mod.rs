@@ -755,9 +755,9 @@ mod tests {
     /// while the operator's stayed down — and the unit would look correct.
     #[test]
     fn the_target_user_prefers_an_explicit_name_then_sudo_user() {
-        assert_eq!(target_user(Some("deploy"), Some("rin"), "root"), "deploy");
-        assert_eq!(target_user(None, Some("rin"), "root"), "rin");
-        assert_eq!(target_user(None, None, "rin"), "rin");
+        assert_eq!(target_user(Some("deploy"), Some("ada"), "root"), "deploy");
+        assert_eq!(target_user(None, Some("ada"), "root"), "ada");
+        assert_eq!(target_user(None, None, "ada"), "ada");
     }
 
     /// fails if the home falls back to this process's `$HOME`. `sudo` resets
@@ -767,11 +767,11 @@ mod tests {
     #[test]
     fn the_target_home_comes_from_the_target_user_not_the_invoker() {
         assert_eq!(
-            target_home(None, Path::new("/home/rin")),
-            Path::new("/home/rin/.shep")
+            target_home(None, Path::new("/home/ada")),
+            Path::new("/home/ada/.shep")
         );
         assert_eq!(
-            target_home(Some(Path::new("/srv/shep")), Path::new("/home/rin")),
+            target_home(Some(Path::new("/srv/shep")), Path::new("/home/ada")),
             Path::new("/srv/shep")
         );
     }
@@ -797,8 +797,8 @@ mod tests {
         );
 
         let message =
-            secure_path_warning(Some("rin"), &spec).expect("$SUDO_USER was set, so this warns");
-        assert!(message.contains("SUDO_USER=rin"), "{message}");
+            secure_path_warning(Some("ada"), &spec).expect("$SUDO_USER was set, so this warns");
+        assert!(message.contains("SUDO_USER=ada"), "{message}");
         assert!(
             message.contains("/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"),
             "the full captured PATH must be readable without a second lookup: {message}"
@@ -850,7 +850,7 @@ mod tests {
         let home = dir.path().join(".shep");
         std::fs::create_dir_all(&home).unwrap();
         let plan = StartupPlan {
-            sudo_user: Some("rin".to_string()),
+            sudo_user: Some("ada".to_string()),
             ..plan_for_test(&home)
         };
         let mut out = Vec::new();
@@ -913,7 +913,7 @@ mod tests {
         let home = dir.path().join(".shep");
         std::fs::create_dir_all(&home).unwrap();
         let plan = StartupPlan {
-            sudo_user: Some("rin".to_string()),
+            sudo_user: Some("ada".to_string()),
             ..plan_for_test(&home)
         };
         std::fs::write(&plan.unit_path, "# hand-edited\n").unwrap();
@@ -1104,9 +1104,9 @@ mod tests {
     /// half the path they meant.
     #[test]
     fn a_printed_command_quotes_what_a_shell_would_split() {
-        assert_eq!(shell_quote("/home/rin/.shep"), "/home/rin/.shep");
+        assert_eq!(shell_quote("/home/ada/.shep"), "/home/ada/.shep");
         assert_eq!(shell_quote("/opt/my shep"), "'/opt/my shep'");
-        assert_eq!(shell_quote("rin's"), r"'rin'\''s'");
+        assert_eq!(shell_quote("ada's"), r"'ada'\''s'");
         assert_eq!(shell_quote(""), "''");
     }
 

@@ -3,7 +3,7 @@
 //!
 //! **The transport is hand-rolled HTTP/1.1 over `tokio-rustls`, not
 //! `reqwest`.** Discord and Slack webhooks are HTTPS-only, so this was
-//! originally the one place in the workspace that needed TLS, and Rin's
+//! originally the one place in the workspace that needed TLS, and the maintainer's
 //! ruling (2026-08-12) was to reach for `tokio-rustls` + `webpki-roots` (+10ish
 //! crates, no C build dependency) directly rather than `reqwest` (+76 to
 //! +93 crates depending on feature set, and a C toolchain — `aws-lc-sys` —

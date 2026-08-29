@@ -169,7 +169,7 @@ impl Render for FlockRows {
     // EXIT and FOLD are the only two columns sharing the "6 and up" tier,
     // and deliberately not tied at the same number (task 49): EXIT is
     // exactly the column an operator needs most when a sheep is dead --
-    // Rin's own boot-loop scenario is "errored, restarts: 15, and nothing
+    // The maintainer's own boot-loop scenario is "errored, restarts: 15, and nothing
     // says why" -- and least when everything is healthy, where it renders
     // `-` for every row. FOLD, an organizational label rather than a
     // diagnostic, keeps its long-standing spot as the single most droppable
@@ -179,7 +179,7 @@ impl Render for FlockRows {
     //
     // SMIT sits above FOLD, at the very top: it is by far the widest
     // column, so dropping it recovers the most space for one column lost.
-    // Rin's ruling is that it belongs among the first columns to yield, and
+    // The maintainer's ruling is that it belongs among the first columns to yield, and
     // 8 is the literal reading of that.
     const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
 }
@@ -191,7 +191,7 @@ impl Render for FlockRows {
 /// It used to be `FlockRows`' own, on the grounds that a dog is not a sheep
 /// and the feature was never about giving one a face. That left seven of the
 /// eight tables in this module plain while one was coloured, so the same dog
-/// read one way under `shep dogs` and another under `shep flock`. Rin's
+/// read one way under `shep dogs` and another under `shep flock`. The maintainer's
 /// ruling is that the treatment extends: a dog is supervised exactly as a
 /// sheep is, and `vocabulary.rs` stays the single source for the faces and
 /// the status-to-role mapping rather than growing a second set for dogs.
@@ -340,7 +340,7 @@ fn process_info_paint(header: &str, p: &ProcessInfo) -> Paint {
 /// client older than its daemon; painting a working dog red is the same
 /// mistake `mem_role`'s own doc refuses when it declines a third tier. Both
 /// non-built-in values answer the question the column exists to answer --
-/// shep's own code, or something else -- and that is the line Rin drew.
+/// shep's own code, or something else -- and that is the line the maintainer drew.
 fn source_role(source: &DogSource) -> Role {
     match source {
         DogSource::BuiltIn => Role::Ink3,
@@ -678,7 +678,7 @@ fn signal_label(raw: i32) -> String {
 ///
 /// `ID` was left out deliberately once, on the grounds that ids reflect
 /// spawn order across the one registry so a dog booted alongside the flock
-/// lands among the sheep's numbers. Rin's ruling is that lining the tables
+/// lands among the sheep's numbers. The maintainer's ruling is that lining the tables
 /// up is worth more: the id is real, it is what `shep stop <id>` takes, and
 /// hiding it made the two tables look like different kinds of thing.
 /// `EXIT` joins for the same reason and needs no wire change either -- a dog
@@ -1553,7 +1553,7 @@ pub struct RolledSheepRows(pub Vec<RolledSheep>);
 /// `stopped` on every row, since nothing in a saved roll is running by
 /// definition. A colour identical on every row of every rendering of this
 /// table distinguishes nothing, and the rule the colour work runs on is that
-/// a colour carries information or the column does not get one. Rin's call,
+/// a colour carries information or the column does not get one. The maintainer's call,
 /// and it is the same call `AvailableDogRows` gets for CATEGORY.
 ///
 /// INSTANCES is a count with no threshold anyone agreed on, and NAME is
@@ -2974,7 +2974,7 @@ pub(crate) mod tests {
     #[test]
     fn saved_roll_row_does_not_drift() {
         let row = SavedRollRow {
-            file: "/home/rin/.shep/flock.json".to_string(),
+            file: "/home/ada/.shep/flock.json".to_string(),
             apps: 9,
         };
         assert_no_drift(&row, |json| json, &[]);
@@ -3779,7 +3779,7 @@ pub(crate) mod tests {
     /// fails if the two tables stop agreeing on their shared columns, in
     /// order.
     ///
-    /// This is the property Rin asked for, and it is checked as a property
+    /// This is the property the maintainer asked for, and it is checked as a property
     /// rather than by pinning two header lists: a list would pass by being
     /// edited to match whatever the code now does, which is exactly how the
     /// two drifted apart in the first place.

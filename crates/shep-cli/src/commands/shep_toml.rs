@@ -68,7 +68,7 @@ const CONFIG_FILE_MODE: u32 = 0o600;
 /// `js`/`mjs`/`cjs` cover the three ways a Node script is named; `py` maps
 /// to `python3` rather than bare `python`, which is absent or still points
 /// at Python 2 on plenty of hosts shep runs on; `rb` and `sh` round out the
-/// four families Rin named directly. Two more chosen with judgement:
+/// four families the maintainer named directly. Two more chosen with judgement:
 /// `pl` for Perl and `php` for PHP, both single, unambiguous interpreters
 /// that ship alongside node/python3/ruby/sh on most of the same hosts.
 /// Left out on purpose: `ts` (no single safe default exists; ts-node, tsx
@@ -1208,7 +1208,7 @@ mod tests {
     /// put a webhook token in `{:?}` output.
     #[test]
     fn parse_error_debug_never_prints_the_document() {
-        let path = PathBuf::from("/home/rin/.shep/shep.toml");
+        let path = PathBuf::from("/home/ada/.shep/shep.toml");
         let secret = "https://hooks.example.com/services/T00/B00/super-secret-token";
         let broken = format!("[dog.bark]\nwebhook = \"{secret}\"\n[daemon\n");
         let source = broken.parse::<DocumentMut>().unwrap_err();
@@ -1223,7 +1223,7 @@ mod tests {
         assert!(!debug.contains("hooks.example.com"), "{debug}");
         assert_eq!(
             debug,
-            "Parse { path: \"/home/rin/.shep/shep.toml\", message: \"invalid table header\\n\
+            "Parse { path: \"/home/ada/.shep/shep.toml\", message: \"invalid table header\\n\
              expected `.`, `]`\" }"
         );
 

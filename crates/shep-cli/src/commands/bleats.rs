@@ -1366,7 +1366,7 @@ mod tests {
         );
     }
 
-    /// The bug Rin hit: a sheep crashes, `shep bleats <name>` is run after
+    /// The bug the maintainer hit: a sheep crashes, `shep bleats <name>` is run after
     /// the fact, and following alone prints an empty screen while the reason
     /// sits in the log file. The backlog is what makes the reason reachable
     /// without having to start the sheep again in a second window.

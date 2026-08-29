@@ -817,7 +817,7 @@ pub struct WhisperArgs {
 /// usage error rather than "both". Three reasons, in order of weight: the two
 /// halves answer with different shapes — sheep against files — and one
 /// invocation renders one payload into one envelope; the daemon's own logs
-/// are the one target Rin asked never to be reached without being named, and
+/// are the one target the maintainer asked never to be reached without being named, and
 /// a flag that rode along with `all` would be reached by every operator who
 /// ever typed `shep flush all --daemon` out of habit; and the shepherd's logs
 /// are not a sheep's, so folding them into a flock answer would mean
@@ -953,7 +953,7 @@ pub struct EnableArgs {
 /// strips `cargo-` from its own external subcommands (`shep-log-rotate`
 /// defaults to `log-rotate`). Previously both were required positionals,
 /// name first (`adopt <name> <path>`) — a breaking CLI change, decision
-/// Rin: `shep adopt <path>` alone now works for a binary whose name is
+/// The maintainer: `shep adopt <path>` alone now works for a binary whose name is
 /// already the name you want, matching `shep start <script>`'s own
 /// optional `--name`.
 #[derive(Debug, clap::Args)]
@@ -2102,7 +2102,7 @@ mod tests {
     }
 
     /// fails if the control gate stops being off by default, or stops being
-    /// reachable from the flag. Rin's ruling: acting on a sheep needs a flag or
+    /// reachable from the flag. The maintainer's ruling: acting on a sheep needs a flag or
     /// config, mirroring `whistle.allow_control`.
     #[test]
     fn actions_are_off_unless_the_flag_says_otherwise() {

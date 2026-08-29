@@ -982,7 +982,7 @@ fn any_restart_failed(procs: &[shep_core::protocol::ProcessInfo]) -> bool {
 /// from -- so the same committed file worked on the machine where that was
 /// right and failed on the next one, with an error naming neither cause.
 /// Measured 2026-08-19 with three distinct directories; `deferred.md` carries
-/// the evidence. Rin's call was to default the cwd rather than resolve the
+/// the evidence. The maintainer's call was to default the cwd rather than resolve the
 /// script alone, because the rule then fits in one sentence an operator can
 /// read.
 ///
@@ -1043,7 +1043,7 @@ async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
 /// longer applied.
 ///
 /// Reports rather than applies. Whether `start` should reconcile by default,
-/// or grow an `--update` flag, is Rin's call and neither is taken here; a
+/// or grow an `--update` flag, is the maintainer's call and neither is taken here; a
 /// running flock changing its cwd or argv underneath an operator would be a
 /// worse surprise than the one being fixed.
 ///
@@ -1097,7 +1097,7 @@ fn mapped_interpreter(script: &str, interpreters: &BTreeMap<String, String>) -> 
 }
 
 /// Folds `shep.toml`'s `[interpreters]` mapping and `--interpreter` onto
-/// `apps`, in the precedence Rin fixed for task 47: shep.toml, then a
+/// `apps`, in the precedence the maintainer fixed for task 47: shep.toml, then a
 /// Flockfile's own `interpreter` field, then the flag -- last one to touch
 /// an app wins.
 ///
@@ -1667,7 +1667,7 @@ mod tests {
 
     /// The CLI answers `exists` from its own cwd and the daemon spawns from
     /// a different one, so a relative script has to be absolutised before it
-    /// crosses. Rin hit this from `~`: `shep start ./GitHub/zeus/...` where
+    /// crosses. The maintainer hit this from `~`: `shep start ./GitHub/zeus/...` where
     /// the file plainly existed, refused with `No such file or directory`
     /// A Flockfile is a file you commit, so an app that names no `cwd` runs
     /// where the Flockfile lives -- not where the daemon happened to be
@@ -2345,7 +2345,7 @@ mod tests {
     /// fails if `shep start fold:typo` reports that no FILE called `fold:typo`
     /// is on disk.
     ///
-    /// That was the error Rin actually hit, and it sent her looking for a file
+    /// That was the error the maintainer actually hit, and it sent her looking for a file
     /// she had never asked about. A token written unmistakably as a selector
     /// is reported as one; a bare name or id carries no marker and may equally
     /// have been meant as a filename, so it keeps the message that names every
@@ -2630,7 +2630,7 @@ mod tests {
 
     /// fails if `shep start 0` respawns anything but id 0.
     ///
-    /// Rin's own flock: ten instances of `zam`, all stopped, and
+    /// The maintainer's own flock: ten instances of `zam`, all stopped, and
     /// `shep start 0` brought all ten back. `resume_all` collapsed the rows
     /// it matched to their distinct NAMES before sending, and a name selector
     /// reaches every instance the name has. `Id` is the only selector form
