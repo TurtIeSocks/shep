@@ -84,9 +84,32 @@ lamb is the neighbouring word.
 
 ### D2. `ProcessInfo` carries the slot
 
-New field, `instance: u32`, set at every construction site, with a builder
-setter. Additive for JSON consumers, and the output envelope's
-`SCHEMA_VERSION` bumps.
+New field, `instance: Option<u32>`, with a builder setter, set wherever the
+daemon builds a row from a `ProcessEntry`.
+
+`Option` rather than a bare `u32`, because that is the house rule for this
+exact situation and five fields already follow it. `None` means the peer
+daemon predates the field, which is how `out_file`, `cpu_percent`, `dog`,
+`last_exit` and `smit` all read their own absence. A bare `u32` would need
+`#[serde(default)]` to survive an old daemon's reply and would then report
+every row as slot 0, which is the silently-wrong zero the `dog` field's doc
+warns against.
+
+Everything downstream degrades to today's behaviour when it sees `None`: no
+grouping, no suffix, no slot in a bleats prefix, and `name:slot` matches
+nothing. Against an old daemon the output is exactly what it is now.
+
+Additive for JSON consumers, and the output envelope's `SCHEMA_VERSION` bumps.
+
+**`sort_flock` becomes `(name, instance, id)`.** Its doc already argues for
+this order and rules it out for one reason: "it is a rule no listing that has
+crossed the wire could reproduce, since `ProcessInfo` carries no instance
+number" (`crates/shep-core/src/protocol/request.rs:713-719`). This field is
+that reason removed. The order it wants is more stable than `(name, id)`
+wherever a reload has given a slot a fresh id, which is precisely when the
+current rule reshuffles rows under an operator watching a two-second poll.
+With `None` on every row the comparison collapses to `(name, id)`, so an old
+daemon sorts exactly as it does today.
 
 ### D3. `name:slot` selects one instance, and names lose the colon
 
@@ -273,6 +296,8 @@ should be an explicit `instances = "cpus"` rather than an overloaded integer.
 - selector: `name:slot` against `fold:`, a digit id, a glob and a bare name,
   and the precedence between them.
 - assemble: substitution in env, args and both log paths, and `{{name}}`.
+- sort_flock: a reloaded slot keeping its position, and a listing of all
+  `None` instances ordering exactly as `(name, id)` did.
 - renderer: exact-string tests for the group row, the suffix in the flat
   styles, and the single-instance case being untouched.
 - lookout: both row kinds, reseat across a poll, and the blast-radius confirm.
