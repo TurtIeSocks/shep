@@ -59,8 +59,11 @@ $ shep bleats talker --no-follow --lines 5000 | wc -l
 ```
 
 Exactly twice the file, and `slot=0 line=1` appears twice in the output
-against once in the file. B is not caused by this design and is fixed
-separately. It is recorded here because the investigation found it.
+against once in the file. B predates this design rather than following from
+it, so D10 fixes it in its own commit ahead of everything else.
+
+The same run showed a third, smaller thing. The prefix is `talker |` for both
+instances, so nothing in the output says which one spoke. D11 covers it.
 
 ## Decisions
 
@@ -219,21 +222,49 @@ The field stays in `AppConfig` for one release purely to be rejected with the
 replacement spelled out. Without it, `deny_unknown_fields` produces a serde
 error that names no fix. Remove in 0.2.
 
-## Out of scope
+### D10. `shep bleats` reads each distinct path once
 
-**Defect B, the bleats duplication.** Confirmed above. It predates this work,
-it reaches any shared log path including every `merge_logs = true` app, and it
-wants a dedup on the path plus a regression test. Its own fix and its own
-commit.
+Defect B. `tail_log_files` iterates matched rows and calls `read_tail` per row
+with no dedup, so a path shared by several instances is read once per
+instance. The fix is to dedup the matched rows by resolved path before
+reading, in the backlog and in the follow watcher alike, since the repro
+duplicated in both.
+
+The notices follow the same key: one `log_path_unknown` or `log_unreadable`
+per distinct path rather than per row.
+
+This lands as its own commit ahead of the rest. It is a live bug against
+`merge_logs`, which is shipped and documented, and it is independent of every
+other decision here.
+
+### D11. Bleats labels a line with its slot
+
+The table prefix is the name alone (`bleats.rs:184`), so two instances are
+indistinguishable even when their files are separate. `id` is already passed
+to `write_line` and used only by the JSON arm.
+
+| case | table prefix | JSON `instance` |
+|---|---|---|
+| single-instance app | `web \|` | the slot |
+| multi-instance, own file | `web:2 \|` | the slot |
+| multi-instance, shared file | `web \|` | null |
+
+A shared file genuinely holds every instance's output interleaved, and
+nothing in the line says which instance wrote it, so shep does not guess. That
+is the honest label and it pairs with D10: one read, one unattributed stream.
+
+The slot appears whenever the app has more than one instance registered, not
+merely more than one matched. A selector should not change how a line is
+labelled, so `shep bleats web:0` still prints `web:0`. This differs on purpose
+from D4's rollup rule, where the count describes the rows actually listed: a
+table row summarises a listing, while a log prefix identifies a process.
+
+## Out of scope
 
 **`instances = 0` meaning "one per CPU".** pm2 expanded `0` and negative
 counts to a CPU count, but shep refuses zero outright
 (`NormalizeError::ZeroInstances`). Not restored here. If it comes back it
 should be an explicit `instances = "cpus"` rather than an overloaded integer.
-
-**Labelling bleats lines by slot.** The current prefix is the name alone, so
-two instances are indistinguishable in the output even when their files are
-separate. Worth doing, and it belongs with defect B's fix rather than here.
 
 ## Testing
 
@@ -246,16 +277,22 @@ separate. Worth doing, and it belongs with defect B's fix rather than here.
   styles, and the single-instance case being untouched.
 - lookout: both row kinds, reseat across a poll, and the blast-radius confirm.
 - import: pm2 `instance_var` converting to an env entry.
+- bleats: a shared path read once rather than once per instance, with the
+  line count pinned against the file's own, one notice per distinct path, and
+  all three labelling cases from D11, including the null in the JSON arm.
 - e2e: a real multi-instance node app, since that is what found defects A
-  and B.
+  and B, and the `merge_logs` case specifically, since that is where B bites
+  hardest.
 
 ## Docs
 
 The docs trigger applies, since this changes what an operator types and sees.
 Regenerate the CLI reference and the Flockfile schema, then read
 `from-pm2.astro`, `first-flockfile.astro`, `migration.md`, `output.astro`,
-`lookout.astro` and `json-output.astro`. Add the `instance` entry to
-`terminology.md`.
+`lookout.astro` and `json-output.astro`. D11 changes the bleats prefix and its
+JSON object, so also check `getting-started.astro`, `examples.astro`,
+`folds.astro` and `cli.astro`, which all show bleats output. Add the
+`instance` entry to `terminology.md`.
 
 ## Migration
 
@@ -266,3 +303,5 @@ Regenerate the CLI reference and the Flockfile schema, then read
 | explicit `out_file` with `instances > 1` | a Flockfile that silently merged | add `{{instance}}` to the path, or `merge_logs = true` |
 | `SelectorSpec` variant added | an old daemon meeting a new CLI | restart the daemon |
 | `ProcessInfo.instance` added | a JSON consumer | additive, `SCHEMA_VERSION` bumps |
+| bleats stops repeating a shared file | anyone parsing its output | they were reading duplicates, so nothing to do |
+| bleats prefix gains `:slot` | a script splitting on `\|` | match the name loosely, or read the JSON arm's `instance` |
