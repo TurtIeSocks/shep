@@ -10,6 +10,15 @@
 //! rather than showing several rows that share a name and explain nothing.
 //! A single-instance sheep reports `None`, exactly as version 1 had no field
 //! to report at all.
+//!
+//! **Two sets of tests carry a version in their name and they assert
+//! opposite things.** The `*_wire_v2` snapshots pin the shape this crate
+//! serializes TODAY, so they follow [`PROTOCOL_VERSION`] and get renamed
+//! whenever it moves. The `v1_*_fixture_still_deserializes` tests pin a
+//! literal payload captured from a version 1 peer and assert it STILL
+//! decodes, so their name records where the bytes came from and never
+//! moves; renaming one would erase the compatibility claim it exists to
+//! make.
 
 pub mod channel;
 pub mod events;

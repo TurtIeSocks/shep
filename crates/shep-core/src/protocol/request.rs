@@ -2002,7 +2002,7 @@ mod tests {
                 },
             },
         ];
-        insta::assert_json_snapshot!("request_wire_v1", requests);
+        insta::assert_json_snapshot!("request_wire_v2", requests);
     }
 
     #[test]
@@ -2263,7 +2263,7 @@ mod tests {
                 ])),
             },
         ];
-        insta::assert_json_snapshot!("reply_wire_v1", replies);
+        insta::assert_json_snapshot!("reply_wire_v2", replies);
     }
 
     /// fails if the new field breaks an older peer, on the same terms as
