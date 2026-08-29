@@ -56,6 +56,7 @@ use shep_core::status::ProcStatus;
 
 use crate::assemble::{assemble, instance_slots};
 use crate::brain::{Decision, decide_on_exit};
+use crate::bus::SharedEvent;
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasRegistry};
@@ -1435,7 +1436,7 @@ impl SupervisorHandle {
 pub(crate) struct SupervisorBuilder<R: ProcessRunner> {
     runner: R,
     paths: ShepPaths,
-    events: broadcast::Sender<BusEvent>,
+    events: broadcast::Sender<SharedEvent>,
     extras: Option<Extras>,
 }
 
@@ -1445,7 +1446,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     ///
     /// `events` receives [`BusEvent::Process`] (+ `LogOut`/`LogErr` forwarded
     /// from each sheep's `ProcIo::logs`).
-    pub(crate) fn new(runner: R, paths: ShepPaths, events: broadcast::Sender<BusEvent>) -> Self {
+    pub(crate) fn new(runner: R, paths: ShepPaths, events: broadcast::Sender<SharedEvent>) -> Self {
         Self {
             runner,
             paths,
@@ -1495,7 +1496,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
 pub fn spawn_supervisor<R: ProcessRunner>(
     runner: R,
     paths: ShepPaths,
-    events: broadcast::Sender<BusEvent>,
+    events: broadcast::Sender<SharedEvent>,
 ) -> SupervisorHandle {
     SupervisorBuilder::new(runner, paths, events).spawn()
 }
@@ -2228,7 +2229,7 @@ struct Actor<R: ProcessRunner> {
     /// `$SHEP_HOME` layout, for assembling spawn specs.
     paths: ShepPaths,
     /// Bus: process lifecycle events + forwarded logs.
-    events: broadcast::Sender<BusEvent>,
+    events: broadcast::Sender<SharedEvent>,
     /// Clone handed to sheep tasks and restart timers so they can report
     /// back into this same actor's mailbox.
     tx: mpsc::Sender<Msg>,
@@ -6688,12 +6689,12 @@ impl<R: ProcessRunner> Actor<R> {
     /// Broadcasts one lifecycle transition. Send failures (no receivers)
     /// are not an error — the bus is fire-and-forget from the actor's side.
     fn emit(&self, event: ProcessEventKind, info: ProcessInfo, manually: bool) {
-        let _ = self.events.send(BusEvent::Process {
+        let _ = self.events.send(SharedEvent::new(BusEvent::Process {
             event,
             info,
             manually,
             at_ms: crate::now_ms(),
-        });
+        }));
     }
 }
 
@@ -7336,7 +7337,7 @@ fn spawn_sheep_task<P: RunningProcess>(
     proc: P,
     io: ProcIo,
     app: ResolvedApp,
-    events: broadcast::Sender<BusEvent>,
+    events: broadcast::Sender<SharedEvent>,
     actor_tx: mpsc::Sender<Msg>,
 ) -> SheepHandles {
     let (ctl_tx, ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
@@ -7386,7 +7387,7 @@ async fn run_sheep<P: RunningProcess>(
     app: ResolvedApp,
     mut ctl_rx: mpsc::Receiver<SheepCtl>,
     mut signal_rx: mpsc::Receiver<SignalRequest>,
-    events: broadcast::Sender<BusEvent>,
+    events: broadcast::Sender<SharedEvent>,
     actor_tx: mpsc::Sender<Msg>,
 ) {
     // `io` is destructured here, in the task's own body, and that placement
@@ -7466,7 +7467,7 @@ async fn run_sheep<P: RunningProcess>(
                         } else {
                             BusEvent::LogOut { id, line: line.line }
                         };
-                        let _ = events.send(event);
+                        let _ = events.send(SharedEvent::new(event));
                     }
                     None => logs_open = false,
                 }
@@ -7481,10 +7482,10 @@ async fn run_sheep<P: RunningProcess>(
                         // is dropped a few lines below, and `deferred.md`
                         // names exactly that message as the traffic the bus
                         // exists to stop losing.
-                        let _ = events.send(BusEvent::Channel {
+                        let _ = events.send(SharedEvent::new(BusEvent::Channel {
                             id,
                             message: message.clone(),
-                        });
+                        }));
                         match message {
                             ChildMessage::Ready => {
                                 let _ = actor_tx.send(Msg::Ready { id }).await;
@@ -7561,22 +7562,23 @@ mod tests {
     /// it not" a question a list can answer where [`await_event`]'s search
     /// cannot.
     fn drained_process_kinds(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
     ) -> Vec<ProcessEventKind> {
         let mut kinds = Vec::new();
-        while let Ok(BusEvent::Process { event, .. }) = rx.try_recv() {
+        while let Ok(BusEvent::Process { event, .. }) = rx.try_recv().map(|event| event.to_event())
+        {
             kinds.push(event);
         }
         kinds
     }
 
     async fn await_event(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
     ) -> bool {
         loop {
-            match rx.recv().await {
+            match rx.recv().await.map(|event| event.to_event()) {
                 Ok(BusEvent::Process {
                     event,
                     info,
@@ -7599,7 +7601,7 @@ mod tests {
     /// queue yet, so a bare `try_recv` would read empty regardless of
     /// whether the code under test is correct.
     async fn assert_no_event_within(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
         window: Duration,
@@ -8681,10 +8683,10 @@ mod tests {
     // ---------------------------------------------------------------
 
     async fn drain_kinds(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
     ) -> Vec<(u32, ProcessEventKind)> {
         let mut out = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
+        while let Ok(ev) = rx.try_recv().map(|event| event.to_event()) {
             if let BusEvent::Process { event, info, .. } = ev {
                 out.push((info.id, event));
             }
@@ -9967,7 +9969,7 @@ mod tests {
     /// Drives virtual time until `kind` arrives for `id`, failing rather than
     /// hanging if it never does.
     async fn expect_event(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
     ) {
@@ -9993,7 +9995,7 @@ mod tests {
     ) -> (
         SupervisorHandle,
         Arc<ScriptedRunner>,
-        tokio::sync::broadcast::Receiver<BusEvent>,
+        tokio::sync::broadcast::Receiver<SharedEvent>,
     ) {
         let (events, rx) = tokio::sync::broadcast::channel(256);
         let runner = Arc::new(ScriptedRunner::new(scripts));
@@ -12325,14 +12327,14 @@ mod tests {
     /// than skipped: a hole in the stream is a hole in every claim read off
     /// it.
     async fn events_through(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
     ) -> Vec<Seen> {
         let collect = async {
             let mut seen = Vec::new();
             loop {
-                match rx.recv().await {
+                match rx.recv().await.map(|event| event.to_event()) {
                     Ok(BusEvent::Process {
                         event,
                         info,
@@ -13286,7 +13288,7 @@ mod tests {
         // than fail it, and there is no other failure mode to give it.
         let seen = tokio::time::timeout(ACTION_WINDOW, async {
             loop {
-                if let BusEvent::Channel { id, message } = events.recv().await.unwrap() {
+                if let BusEvent::Channel { id, message } = events.recv().await.unwrap().to_event() {
                     break (id, message);
                 }
             }
@@ -13324,7 +13326,7 @@ mod tests {
 
         let seen = tokio::time::timeout(ACTION_WINDOW, async {
             loop {
-                if let BusEvent::Channel { id, message } = events.recv().await.unwrap() {
+                if let BusEvent::Channel { id, message } = events.recv().await.unwrap().to_event() {
                     break (id, message);
                 }
             }
@@ -13369,7 +13371,7 @@ mod tests {
 
         let seen = tokio::time::timeout(ACTION_WINDOW, async {
             loop {
-                if let BusEvent::Channel { message, .. } = events.recv().await.unwrap() {
+                if let BusEvent::Channel { message, .. } = events.recv().await.unwrap().to_event() {
                     break message;
                 }
             }
@@ -15988,7 +15990,7 @@ mod tests {
         );
 
         let mut errored = 0;
-        while let Ok(event) = events.try_recv() {
+        while let Ok(event) = events.try_recv().map(|event| event.to_event()) {
             if let BusEvent::Process {
                 event: ProcessEventKind::Errored,
                 info,
@@ -16444,7 +16446,7 @@ mod tests {
                 loop {
                     match tokio::time::timeout(QUIET_WINDOW, rx.recv()).await {
                         Ok(Ok(event)) => {
-                            observed.push(event);
+                            observed.push(event.to_event());
                             proptest::prop_assert!(
                                 observed.len() <= EVENT_BUDGET,
                                 "the flock never reached steady state: {} transitions after \

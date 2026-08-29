@@ -516,6 +516,7 @@ mod tests {
     // clock the runtime auto-advances whenever it goes idle, which can expire
     // HANDSHAKE_TIMEOUT_MS before the peer's bytes are delivered.
     use super::*;
+    use crate::bus::SharedEvent;
     use crate::testing::harness;
     use futures_util::{SinkExt, StreamExt};
     use serde::Serialize;
@@ -676,23 +677,29 @@ mod tests {
         let frame: ServerFrame = client.recv().await;
         assert!(matches!(frame, ServerFrame::Reply(ref r) if r.result == Ok(Response::Subscribed)));
 
-        let event = |kind| BusEvent::Process {
-            event: kind,
-            info: ProcessInfo::builder(0, "web", shep_core::status::ProcStatus::Online)
-                .pid(Some(1000))
-                .out_file(Some("/logs/web-0-out.log".to_string()))
-                .err_file(Some("/logs/web-0-err.log".to_string()))
-                .build(),
-            manually: false,
-            at_ms: 0,
+        let event = |kind| -> SharedEvent {
+            BusEvent::Process {
+                event: kind,
+                info: ProcessInfo::builder(0, "web", shep_core::status::ProcStatus::Online)
+                    .pid(Some(1000))
+                    .out_file(Some("/logs/web-0-out.log".to_string()))
+                    .err_file(Some("/logs/web-0-err.log".to_string()))
+                    .build(),
+                manually: false,
+                at_ms: 0,
+            }
+            .into()
         };
         h.ctx.events.send(event(ProcessEventKind::Start)).unwrap();
         h.ctx
             .events
-            .send(BusEvent::LogOut {
-                id: 0,
-                line: "filtered".to_string(),
-            })
+            .send(
+                BusEvent::LogOut {
+                    id: 0,
+                    line: "filtered".to_string(),
+                }
+                .into(),
+            )
             .unwrap();
         h.ctx.events.send(event(ProcessEventKind::Online)).unwrap();
 
@@ -847,10 +854,13 @@ mod tests {
         for i in 0..flood {
             h.ctx
                 .events
-                .send(BusEvent::LogOut {
-                    id: 0,
-                    line: format!("line-{i}"),
-                })
+                .send(
+                    BusEvent::LogOut {
+                        id: 0,
+                        line: format!("line-{i}"),
+                    }
+                    .into(),
+                )
                 .unwrap();
         }
 

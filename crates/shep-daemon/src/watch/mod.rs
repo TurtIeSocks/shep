@@ -523,6 +523,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::bus::SharedEvent;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::supervisor::spawn_supervisor;
     use crate::testing::test_paths;
@@ -729,7 +730,7 @@ mod tests {
         scripts: Vec<ProcScript>,
     ) -> (
         SupervisorHandle,
-        broadcast::Receiver<BusEvent>,
+        broadcast::Receiver<SharedEvent>,
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
@@ -752,12 +753,15 @@ mod tests {
     /// restarts fails the test instead of hanging it (Global Constraints
     /// rule 11).
     async fn expect_restart(
-        rx: &mut broadcast::Receiver<BusEvent>,
+        rx: &mut broadcast::Receiver<SharedEvent>,
         name: &str,
         deadline: Duration,
     ) -> ProcessInfo {
         loop {
-            match tokio::time::timeout(deadline, rx.recv()).await {
+            match tokio::time::timeout(deadline, rx.recv())
+                .await
+                .map(|received| received.map(|event| event.to_event()))
+            {
                 Ok(Ok(BusEvent::Process {
                     event: ProcessEventKind::Restart,
                     info,
@@ -777,14 +781,17 @@ mod tests {
     /// sheep-task round trip needs the scheduling rounds a bounded `recv`
     /// gives it, which a `try_recv` negative cannot.
     async fn assert_no_restart_within(
-        rx: &mut broadcast::Receiver<BusEvent>,
+        rx: &mut broadcast::Receiver<SharedEvent>,
         name: &str,
         window: Duration,
     ) {
         let deadline = tokio::time::Instant::now() + window;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, rx.recv()).await {
+            match tokio::time::timeout(remaining, rx.recv())
+                .await
+                .map(|received| received.map(|event| event.to_event()))
+            {
                 Err(_) => return, // window elapsed with nothing matching — expected
                 Ok(Ok(BusEvent::Process {
                     event: ProcessEventKind::Restart,
@@ -1509,7 +1516,7 @@ mod tests {
                 let collector = tokio::spawn(async move {
                     let mut observed = Vec::new();
                     loop {
-                        match tokio::time::timeout(EVENT_WAIT, rx.recv()).await {
+                        match tokio::time::timeout(EVENT_WAIT, rx.recv()).await.map(|received| received.map(|event| event.to_event())) {
                             Ok(Ok(BusEvent::Process {
                                 event: ProcessEventKind::Restart,
                                 info,

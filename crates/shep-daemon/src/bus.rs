@@ -1,9 +1,14 @@
 //! The daemon's process-wide event bus.
 //!
-//! One [`tokio::sync::broadcast`] channel carries every [`BusEvent`] to
+//! One [`tokio::sync::broadcast`] channel carries every [`SharedEvent`] to
 //! every subscriber; each connection compiles its `Subscribe` topic patterns
 //! into a [`TopicFilter`] and gets its own [`spawn_forwarder`] task pumping
 //! matching frames into that connection's write queue.
+
+use core::ops::Deref;
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -36,8 +41,122 @@ pub const MAX_TOPIC_PATTERNS: usize = 32;
 /// the sender itself is held by the daemon so the bus outlives every
 /// individual connection.
 #[must_use]
-pub fn new_bus() -> broadcast::Sender<BusEvent> {
+pub fn new_bus() -> broadcast::Sender<SharedEvent> {
     broadcast::channel(BUS_CAPACITY).0
+}
+
+/// One published [`BusEvent`], plus the wire frame its subscribers share.
+///
+/// The bus carries this rather than the event itself because both of the
+/// costs it removes are LINEAR IN SUBSCRIBERS. A `broadcast` channel clones
+/// its item once per receiver, which for a `LogOut` is a fresh copy of the
+/// line; and every forwarder used to encode its own frame from that copy,
+/// so the same bytes were built once per attached client. Measured on a
+/// sheep logging 7,315 lines/s: one attached `shep bleats` took the daemon
+/// from 23.99% of a core to 37.50%, +18.6 us per line. Here a clone is a
+/// refcount bump and the frame is built by whichever forwarder asks first.
+///
+/// The bytes are unchanged — this is how OFTEN [`encode_frame`] runs, never
+/// what it produces.
+#[derive(Clone, Debug)]
+pub struct SharedEvent(Arc<Shared>);
+
+/// [`SharedEvent`]'s payload — one allocation per published event.
+#[derive(Debug)]
+struct Shared {
+    event: BusEvent,
+    /// The wire frame, filled by the first forwarder that needs it.
+    ///
+    /// `Some(None)` once encoding has been TRIED and failed, so an event
+    /// nothing can encode is reported once rather than once per subscriber.
+    frame: OnceLock<Option<Bytes>>,
+    /// How many times [`encode_frame`] has actually run for this event.
+    ///
+    /// Test-only. [`OnceLock`] already makes "at most once" a fact about the
+    /// type; what a test cannot otherwise see is that the encode ran AT ALL
+    /// through this path, and that no future edit reintroduces a
+    /// per-subscriber one beside it.
+    #[cfg(test)]
+    encodes: AtomicUsize,
+}
+
+impl SharedEvent {
+    /// Wraps one event for publication on the bus.
+    #[must_use]
+    pub fn new(event: BusEvent) -> Self {
+        Self(Arc::new(Shared {
+            event,
+            frame: OnceLock::new(),
+            #[cfg(test)]
+            encodes: AtomicUsize::new(0),
+        }))
+    }
+
+    /// How many times this event has been through [`encode_frame`].
+    #[cfg(test)]
+    fn encodes(&self) -> usize {
+        self.0.encodes.load(Ordering::Relaxed)
+    }
+
+    /// A clone of the event this carries, for a caller that needs to own one.
+    ///
+    /// Everything on the daemon's own hot paths reads through [`Deref`]
+    /// instead; this is for a caller that has to destructure a received
+    /// event by value.
+    #[must_use]
+    pub fn to_event(&self) -> BusEvent {
+        self.0.event.clone()
+    }
+
+    /// This event's wire frame, encoded on the first call and shared after.
+    ///
+    /// `None` when the event cannot be encoded at all, which is warned about
+    /// exactly once and leaves every subscriber skipping it alike.
+    fn frame(&self) -> Option<&Bytes> {
+        self.0
+            .frame
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.0.encodes.fetch_add(1, Ordering::Relaxed);
+                match encode_frame(&self.0.event) {
+                    Ok(bytes) => Some(bytes),
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            topic = self.0.event.topic(),
+                            "dropping an unencodable bus event"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+}
+
+impl Deref for SharedEvent {
+    type Target = BusEvent;
+
+    // IR-25: a field return through one pointer hop, on the path every
+    // subscriber takes for every event.
+    #[inline]
+    fn deref(&self) -> &BusEvent {
+        &self.0.event
+    }
+}
+
+impl From<BusEvent> for SharedEvent {
+    fn from(event: BusEvent) -> Self {
+        Self::new(event)
+    }
+}
+
+/// Compares a published event against the event it was published from, so a
+/// caller reading the bus asserts on what it sent rather than on the wrapper.
+impl PartialEq<BusEvent> for SharedEvent {
+    fn eq(&self, other: &BusEvent) -> bool {
+        self.0.event == *other
+    }
 }
 
 /// Compiled server-side topic filter for one subscription
@@ -151,22 +270,22 @@ enum Forwarded {
 
 // Pure: every forwarding decision lives here so the task itself has nothing
 // left to test but plumbing.
-fn step(received: Result<BusEvent, RecvError>, filter: &TopicFilter) -> Forwarded {
+fn step(received: Result<SharedEvent, RecvError>, filter: &TopicFilter) -> Forwarded {
     let event = match received {
         Ok(event) if filter.matches(&event) => event,
         Ok(_) => return Forwarded::Skip,
         // Drop notices BYPASS the filter on purpose: a subscriber to
         // `process.*` still has to learn it lost events, and `daemon.dropped`
         // would otherwise be filtered out exactly when it matters most.
-        Err(RecvError::Lagged(count)) => BusEvent::Dropped { count },
+        //
+        // Wrapped like any other event, but the count is this subscriber's
+        // own, so this is the one frame per lag nothing else can share.
+        Err(RecvError::Lagged(count)) => SharedEvent::new(BusEvent::Dropped { count }),
         Err(RecvError::Closed) => return Forwarded::Stop,
     };
-    match encode_frame(&event) {
-        Ok(bytes) => Forwarded::Frame(bytes),
-        Err(err) => {
-            tracing::warn!(%err, topic = event.topic(), "dropping an unencodable bus event");
-            Forwarded::Skip
-        }
+    match event.frame() {
+        Some(bytes) => Forwarded::Frame(bytes.clone()),
+        None => Forwarded::Skip,
     }
 }
 
@@ -180,7 +299,7 @@ fn step(received: Result<BusEvent, RecvError>, filter: &TopicFilter) -> Forwarde
 // implemented by the runtime rather than by a hand-rolled `VecDeque`, and it
 // isolates one slow client from every other connection.
 pub fn spawn_forwarder(
-    mut rx: broadcast::Receiver<BusEvent>,
+    mut rx: broadcast::Receiver<SharedEvent>,
     filter: TopicFilter,
     out: mpsc::Sender<Bytes>,
 ) -> JoinHandle<()> {
@@ -213,8 +332,8 @@ mod tests {
         TopicFilter::new(&owned).unwrap()
     }
 
-    fn process_event(id: u32, event: ProcessEventKind) -> BusEvent {
-        BusEvent::Process {
+    fn process_event(id: u32, event: ProcessEventKind) -> SharedEvent {
+        SharedEvent::new(BusEvent::Process {
             event,
             info: ProcessInfo::builder(id, format!("sheep-{id}"), ProcStatus::Online)
                 .pid(Some(1000 + id))
@@ -223,7 +342,7 @@ mod tests {
                 .build(),
             manually: false,
             at_ms: 0,
-        }
+        })
     }
 
     #[test]
@@ -304,10 +423,13 @@ mod tests {
         let handle = spawn_forwarder(rx, filter(&["process.*"]), out_tx);
 
         tx.send(process_event(0, ProcessEventKind::Start)).unwrap();
-        tx.send(BusEvent::LogOut {
-            id: 0,
-            line: "noise".to_string(),
-        })
+        tx.send(
+            BusEvent::LogOut {
+                id: 0,
+                line: "noise".to_string(),
+            }
+            .into(),
+        )
         .unwrap();
         tx.send(process_event(0, ProcessEventKind::Online)).unwrap();
         drop(tx);
@@ -337,13 +459,123 @@ mod tests {
         );
     }
 
+    /// Fails if every subscriber encodes its own copy of the same event.
+    ///
+    /// That cost is linear in attached clients, and it is the measured one:
+    /// a sheep logging 7,315 lines/s cost the daemon 23.99% of a core with
+    /// nobody watching and 37.50% with ONE `shep bleats` attached.
+    ///
+    /// Two assertions, and the second is the one that matters here. Byte
+    /// equality is the wire contract, which a per-subscriber encode would
+    /// also satisfy; SAME-BUFFER identity is what says the encode ran once
+    /// and the rest of the subscribers cloned a refcount.
+    #[tokio::test(start_paused = true)]
+    async fn every_subscriber_gets_the_same_frame_from_one_encode() {
+        let (tx, _keep) = tokio::sync::broadcast::channel(16);
+        let mut outs = Vec::new();
+        let mut forwarders = Vec::new();
+        for _ in 0..3 {
+            let (out_tx, out_rx) = tokio::sync::mpsc::channel(16);
+            forwarders.push(spawn_forwarder(tx.subscribe(), filter(&["*"]), out_tx));
+            outs.push(out_rx);
+        }
+
+        let published = process_event(7, ProcessEventKind::Online);
+        tx.send(published.clone()).unwrap();
+        drop(tx); // buffered events are delivered before the close is seen
+
+        let mut frames = Vec::new();
+        for out in &mut outs {
+            frames.push(
+                out.recv()
+                    .await
+                    .expect("every subscriber must receive the event"),
+            );
+        }
+        for forwarder in forwarders {
+            forwarder.await.unwrap();
+        }
+
+        let (first, rest) = frames
+            .split_first()
+            .expect("three subscribers, three frames");
+        assert_eq!(
+            decode_frame::<BusEvent>(first).unwrap(),
+            published.to_event(),
+            "sharing the frame must not change what is on the wire"
+        );
+        for frame in rest {
+            assert_eq!(frame, first, "every subscriber must see identical bytes");
+            assert_eq!(
+                frame.as_ptr(),
+                first.as_ptr(),
+                "identical bytes are not enough: they must be the SAME buffer, \
+                 or the daemon encoded this event once per subscriber"
+            );
+        }
+    }
+
+    /// Fails if [`encode_frame`] runs once per subscriber rather than once
+    /// per event.
+    ///
+    /// A count rather than a clock: the cost is linear in attached clients,
+    /// which is a fact about how many times a function ran and about nothing
+    /// else. Zero before anyone asks is half the claim — a `SharedEvent`
+    /// that eagerly encoded would charge every publisher for subscribers
+    /// that may not exist.
+    #[tokio::test(start_paused = true)]
+    async fn encode_frame_runs_once_per_event_however_many_subscribers() {
+        const SUBSCRIBERS: usize = 5;
+        let (tx, _keep) = tokio::sync::broadcast::channel(16);
+        let mut outs = Vec::new();
+        let mut forwarders = Vec::new();
+        for _ in 0..SUBSCRIBERS {
+            let (out_tx, out_rx) = tokio::sync::mpsc::channel(16);
+            forwarders.push(spawn_forwarder(tx.subscribe(), filter(&["*"]), out_tx));
+            outs.push(out_rx);
+        }
+
+        let published = process_event(11, ProcessEventKind::Start);
+        assert_eq!(
+            published.encodes(),
+            0,
+            "publishing must not encode before a subscriber needs the bytes"
+        );
+
+        tx.send(published.clone()).unwrap();
+        drop(tx);
+
+        let mut frames = Vec::new();
+        for out in &mut outs {
+            frames.push(
+                out.recv()
+                    .await
+                    .expect("every subscriber must receive the event"),
+            );
+        }
+        for forwarder in forwarders {
+            forwarder.await.unwrap();
+        }
+
+        assert_eq!(
+            published.encodes(),
+            1,
+            "{SUBSCRIBERS} subscribers, one encode"
+        );
+        assert_eq!(frames.len(), SUBSCRIBERS);
+        let (first, rest) = frames.split_first().expect("one frame per subscriber");
+        for frame in rest {
+            assert_eq!(frame, first, "every subscriber must see identical bytes");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn forwarder_stops_when_the_subscriber_hangs_up() {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         let (out_tx, out_rx) = tokio::sync::mpsc::channel(1);
         let handle = spawn_forwarder(rx, filter(&["*"]), out_tx);
         drop(out_rx);
-        tx.send(BusEvent::DaemonShutdown).unwrap();
+        tx.send(BusEvent::DaemonShutdown.into()).unwrap();
         handle.await.unwrap(); // resolves rather than leaking a task
     }
 }

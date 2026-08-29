@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::assemble::assemble;
+use crate::bus::SharedEvent;
 use crate::cron::{Clock, DEFAULT_MAX_CRON_SLEEP};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasReports};
@@ -331,7 +332,7 @@ pub(crate) struct Harness {
     _dir: tempfile::TempDir,
     // Kept alive only: dropping the sender's last receiver would turn
     // every future `events.send()` into a silent no-op.
-    _events_rx: broadcast::Receiver<shep_core::protocol::BusEvent>,
+    _events_rx: broadcast::Receiver<SharedEvent>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     /// Breach reports the supervisor's extras produce, for tests that assert
     /// a memory limit fired.

@@ -44,6 +44,7 @@ use shep_core::config::{AppConfig, NormalizeError, ResolvedApp, normalize};
 use shep_core::protocol::{BusEvent, ProcessInfo};
 use shep_core::status::ProcStatus;
 
+use crate::bus::SharedEvent;
 use crate::supervisor::SupervisorHandle;
 
 /// Schema version of `flock.json`
@@ -517,7 +518,7 @@ pub(crate) fn spawn_snapshot_writer(
     path: PathBuf,
     supervisor: SupervisorHandle,
     registry: FlockRegistry,
-    events: broadcast::Receiver<BusEvent>,
+    events: broadcast::Receiver<SharedEvent>,
 ) -> SnapshotWriter {
     let writes = Arc::new(AtomicU64::new(0));
     let task_writes = Arc::clone(&writes);
@@ -532,7 +533,7 @@ async fn run_writer(
     path: PathBuf,
     supervisor: SupervisorHandle,
     registry: FlockRegistry,
-    mut events: broadcast::Receiver<BusEvent>,
+    mut events: broadcast::Receiver<SharedEvent>,
     writes: Arc<AtomicU64>,
 ) {
     let mut deadline: Option<Instant> = None;
@@ -1132,12 +1133,15 @@ mod tests {
             ProcessEventKind::Online,
         ] {
             events
-                .send(BusEvent::Process {
-                    event,
-                    info: info(0, "web", ProcStatus::Online),
-                    manually: false,
-                    at_ms: 0,
-                })
+                .send(
+                    BusEvent::Process {
+                        event,
+                        info: info(0, "web", ProcStatus::Online),
+                        manually: false,
+                        at_ms: 0,
+                    }
+                    .into(),
+                )
                 .unwrap();
         }
         tokio::time::sleep(Duration::from_millis(SNAPSHOT_DEBOUNCE_MS + 1)).await;
@@ -1168,10 +1172,13 @@ mod tests {
         );
         for id in 0..50 {
             events
-                .send(BusEvent::LogOut {
-                    id,
-                    line: "chatty".to_string(),
-                })
+                .send(
+                    BusEvent::LogOut {
+                        id,
+                        line: "chatty".to_string(),
+                    }
+                    .into(),
+                )
                 .unwrap();
         }
         tokio::time::sleep(Duration::from_millis(SNAPSHOT_DEBOUNCE_MS * 4)).await;
