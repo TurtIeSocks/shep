@@ -1220,7 +1220,7 @@ impl App {
                 .position(|entry| entry.0 != name)
                 .map_or(visible.len(), |offset| at + offset);
             let group = &visible[at..end];
-            if group.len() > 1 && group.iter().all(|entry| entry.1.is_some()) {
+            if self.is_grouped(name) {
                 out.push(RowKey::Group(name.to_string()));
             }
             out.extend(group.iter().map(|entry| RowKey::Sheep(entry.2)));
@@ -1445,6 +1445,23 @@ impl App {
             .collect();
         members.sort_by_key(|row| row.info.instance.unwrap_or(u32::MAX));
         members
+    }
+
+    /// Whether `name`'s instances draw under a [`RowKey::Group`] header.
+    ///
+    /// The one condition, stated once: more than one instance of the name,
+    /// every one of them reporting a slot. [`Self::visible_rows`] decides
+    /// whether to emit the header from it and the table decides how to render
+    /// a slot row underneath from the same call, so the header and its rows
+    /// cannot disagree about which shape they are in.
+    ///
+    /// Read over the whole flock rather than over the filtered sequence, and
+    /// that is not a discrepancy: a query narrows by NAME, so it either keeps
+    /// every instance of an app or none of them.
+    #[must_use]
+    pub fn is_grouped(&self, name: &str) -> bool {
+        let members = self.group_members(name);
+        members.len() > 1 && members.iter().all(|row| row.info.instance.is_some())
     }
 
     /// `name`'s rolled-up numbers. See [`GroupTotals`]'s own doc for the

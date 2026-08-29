@@ -371,12 +371,19 @@ pub fn header_line(columns: &[Column], width: u16, style: Style) -> Line<'static
 /// as an `expect`, on the same "no honest value" rule this table already
 /// applies to a missing pid or a missing cpu reading: a caller that manages
 /// to hand this a stale id gets a blank row instead of a dead dashboard.
+///
+/// A `Sheep` row under a group header is drawn as a slot rather than as a
+/// standalone sheep ([`App::is_grouped`] is the one test for which).
+/// Without that, a header reading `web ×3` was followed by three rows each
+/// reading `web` again with the app's FOLD and SMIT repeated down all three,
+/// which is the "several rows sharing one name with nothing tying them
+/// together" this whole feature exists to end, reproduced one level down.
 #[must_use]
 pub fn key_line(app: &App, key: &RowKey, columns: &[Column], width: u16) -> Line<'static> {
     match key {
         RowKey::Sheep(id) => app.row(*id).map_or_else(
             || Line::from(Span::raw(" ".repeat(usize::from(width)))),
-            |row| row_line(app, row, columns, width),
+            |row| row_line(app, row, columns, width, app.is_grouped(&row.info.name)),
         ),
         RowKey::Group(name) => group_line(app, name, columns, width),
     }
@@ -452,8 +459,17 @@ fn group_cell(app: &App, name: &str, column: Column, totals: &GroupTotals) -> St
 /// No row style beyond that: the selected row is shown by the marker in the
 /// gutter column ([`mark`]), not by a REVERSED modifier on the row's own
 /// text — this function has no notion of "selected" to key one off at all.
+///
+/// `grouped` says whether a group header sits above this row, which is the
+/// only thing that changes NAME, FOLD and SMIT. See [`cell`].
 #[must_use]
-pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16) -> Line<'static> {
+pub fn row_line(
+    app: &App,
+    row: &Row,
+    columns: &[Column],
+    width: u16,
+    grouped: bool,
+) -> Line<'static> {
     let palette = app.palette();
     let name = name_width(width, columns);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(columns.len() * 2);
@@ -466,7 +482,7 @@ pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16) -> Line<'s
         } else {
             column.width()
         };
-        let text = fit(&cell(app, row, *column), cell_width);
+        let text = fit(&cell(app, row, *column, grouped), cell_width);
         let style = if *column == Column::Status {
             palette.status(row.info.status)
         } else {
@@ -483,10 +499,21 @@ pub fn row_line(app: &App, row: &Row, columns: &[Column], width: u16) -> Line<'s
 /// `output::rows::FlockRows::rows` does and for the same stated reason: an
 /// empty cell in a padded table is indistinguishable from a rendering bug,
 /// and `0.0%` would claim a measurement the shepherd never made.
-fn cell(app: &App, row: &Row, column: Column) -> String {
+///
+/// `grouped` changes three cells, matching `output::rows::slot_row` cell for
+/// cell so an operator meets one shape for an app whether they typed
+/// `shep flock` or opened the lookout. NAME becomes `↳ :2`, teaching the
+/// `web:2` selector by sitting under the name the header already printed;
+/// FOLD and SMIT go blank rather than `-`, because the group row above
+/// carries both and the daemon keys a smit by name, so repeating either down
+/// every slot is noise about an app-level fact.
+fn cell(app: &App, row: &Row, column: Column, grouped: bool) -> String {
     let info = &row.info;
     match column {
         Column::Id => info.id.to_string(),
+        Column::Name if grouped => info
+            .instance
+            .map_or_else(String::new, |slot| format!(" \u{21b3} :{slot}")),
         Column::Name => info.name.clone(),
         Column::Status => info.status.to_string(),
         Column::Pid => info
@@ -508,6 +535,7 @@ fn cell(app: &App, row: &Row, column: Column) -> String {
         Column::Uptime => app
             .uptime_ms(info.id)
             .map_or_else(|| "-".to_string(), human_duration),
+        Column::Fold | Column::Smit if grouped => String::new(),
         Column::Fold => info.fold.clone().unwrap_or_else(|| "-".to_string()),
         Column::Smit => info.smit.clone().unwrap_or_else(|| "-".to_string()),
     }
@@ -635,7 +663,7 @@ mod tests {
         let rows = app.rows();
         let cell_for = |id: u32| {
             let row = rows.iter().find(|row| row.info.id == id).unwrap();
-            cell(&app, row, Column::Exit)
+            cell(&app, row, Column::Exit, false)
         };
 
         assert_eq!(cell_for(1), "1");
@@ -892,5 +920,86 @@ mod tests {
         .join("  ");
 
         assert_eq!(rendered, expected, "got {rendered:?}");
+    }
+
+    /// fails if a slot row under a group header renders as a standalone
+    /// sheep.
+    ///
+    /// `key_line`'s `Sheep` arm drew every row the same way, so a header
+    /// reading `web x3` was followed by three rows each repeating `web` with
+    /// the app's FOLD and SMIT down all three, and the slot number appeared
+    /// nowhere in the dashboard at all. `shep flock` had shown `↳ :1` since
+    /// task 9, so one app read as two different shapes in two views.
+    ///
+    /// Asserted on the rendered line rather than on `cell`, because the
+    /// defect was in which caller `key_line` picked and a helper-level test
+    /// passes straight over that.
+    #[test]
+    fn a_slot_row_under_a_group_header_renders_as_a_slot() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let member = |id: u32, slot: u32| {
+            ProcessInfo::builder(id, "web", ProcStatus::Online)
+                .instance(Some(slot))
+                .pid(Some(4_000 + id))
+                .fold(Some("edge".to_string()))
+                .smit(Some("web".to_string()))
+                .uptime_ms(30_000)
+                .build()
+        };
+        let app = fixtures::app_with(vec![member(1, 0), member(2, 1)], fixtures::plain());
+
+        let line = key_line(&app, &RowKey::Sheep(2), ALL, 200);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        let name = name_width(200, ALL);
+        let expected = [
+            fit("2", Column::Id.width()),
+            // NAME: the slot alone, indented under the name the header
+            // above already printed.
+            fit(" \u{21b3} :1", name),
+            fit("online", Column::Status.width()),
+            fit("4002", Column::Pid.width()),
+            fit("0", Column::Restarts.width()),
+            fit("-", Column::Exit.width()),
+            fit("-", Column::Cpu.width()),
+            fit("-", Column::Mem.width()),
+            fit("30s", Column::Uptime.width()),
+            // FOLD and SMIT blank, not `-`: the group row carries both.
+            fit("", Column::Fold.width()),
+            fit("", Column::Smit.width()),
+        ]
+        .join("  ");
+
+        assert_eq!(rendered, expected, "got {rendered:?}");
+    }
+
+    /// fails if a single-instance app loses its name to the slot rendering.
+    ///
+    /// The guard on the test above: `is_grouped` is what keeps an ungrouped
+    /// sheep drawing exactly as it did before group rows existed, and an app
+    /// with one instance never gets a header to sit under.
+    #[test]
+    fn an_ungrouped_sheep_still_shows_its_own_name_and_fold() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let app = fixtures::app_with(
+            vec![
+                ProcessInfo::builder(7, "solo", ProcStatus::Online)
+                    .instance(Some(0))
+                    .fold(Some("edge".to_string()))
+                    .build(),
+            ],
+            fixtures::plain(),
+        );
+
+        let line = key_line(&app, &RowKey::Sheep(7), ALL, 200);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert!(rendered.contains("solo"), "got {rendered:?}");
+        assert!(rendered.contains("edge"), "got {rendered:?}");
+        assert!(!rendered.contains('\u{21b3}'), "got {rendered:?}");
     }
 }
