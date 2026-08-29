@@ -1,0 +1,16 @@
+shep is licensed under either of
+
+  Apache License, Version 2.0
+  MIT License
+
+at your option.
+
+The binaries this package installs are built from the shep source tree by the
+project's own release workflow, and the archive they arrive in carries the
+full text of both licenses as LICENSE-APACHE and LICENSE-MIT.
+
+  https://github.com/TurtIeSocks/shep/blob/main/LICENSE-APACHE
+  https://github.com/TurtIeSocks/shep/blob/main/LICENSE-MIT
+
+This package is maintained by the same person who maintains shep, so there is
+no separate redistribution permission to record here.

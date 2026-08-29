@@ -236,3 +236,72 @@ jobs:
           # not churn on asset ordering.
           cat -- *.sha256 | sort -k2 > SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --clobber
+
+  # Packs and pushes the Chocolatey package, whose sources live in
+  # `packaging/chocolatey/`. Here rather than in a file of its own because it
+  # needs two things this workflow already has: the resolved tag, and the
+  # guarantee that the Windows archive it checksums has finished uploading.
+  #
+  # Inert until the repository variable `PUBLISH_CHOCOLATEY` is set to
+  # `true` and the secret `CHOCO_API_KEY` exists. A repository variable
+  # rather than a test on the secret, because the `secrets` context is not
+  # available in a job-level `if:`.
+  #
+  # Chocolatey's community repository puts every version through automated
+  # validation, a VirusTotal scan and human moderation, so the first few
+  # pushes are a conversation rather than a command. docs/distribution.md has
+  # the shape of that, including why this is the last channel rather than the
+  # first.
+  chocolatey:
+    name: Chocolatey
+    needs: [resolve, upload]
+    if: >-
+      needs.resolve.outputs.go == 'true' &&
+      github.event_name == 'release' &&
+      vars.PUBLISH_CHOCOLATEY == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+      - name: Stamp the checksum into the install script
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = 'shep-x86_64-pc-windows-msvc.zip'
+          gh release download $env:TAG --pattern "$archive.sha256" --dir sums
+          if ($LASTEXITCODE -ne 0) { throw "could not download $archive.sha256 from $env:TAG" }
+          # sha256sum format: the hash, then whitespace, then the filename.
+          $checksum = (Get-Content "sums/$archive.sha256" -Raw).Trim().Split()[0]
+          if ($checksum -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "the sidecar for $archive did not start with a sha256: '$checksum'"
+          }
+          $script = 'packaging/chocolatey/tools/chocolateyinstall.ps1'
+          (Get-Content $script -Raw).Replace('__CHECKSUM64__', $checksum) |
+            Set-Content $script -NoNewline
+          # The sentinel is the one thing in this package that silently
+          # produces a broken install if it survives, so fail on it here
+          # rather than letting moderation find it.
+          if (Select-String -Path $script -Pattern '__CHECKSUM64__' -Quiet) {
+            throw "the checksum sentinel survived substitution in $script"
+          }
+      - name: Pack and push
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:TAG -replace '^shep-v', ''
+          choco pack packaging/chocolatey/shep.nuspec --version $version --out packaging/chocolatey
+          if ($LASTEXITCODE -ne 0) { throw 'choco pack failed' }
+          choco push "packaging/chocolatey/shep.$version.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY
+          if ($LASTEXITCODE -ne 0) { throw 'choco push failed' }

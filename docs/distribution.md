@@ -1,18 +1,18 @@
 # Distributing shep
 
 **`cargo install shep` is the only way to install shep, and no GitHub
-release carries a binary.** Every channel below is a thin wrapper around a
-download URL, so none of them can start until that URL exists. That one
+release carries a binary yet.** Every channel below is a thin wrapper around
+a download URL, so none of them can start until that URL exists. That one
 workflow is most of the work; the manifests on top of it are small.
 
-Measured 2026-08-29 against the repository: no `dist-workspace.toml`, no
-`gh release upload`, and no `actions/upload-artifact` outside the coverage
-job in `.github/workflows/test.yml`.
+`.github/workflows/release-artifacts.yml` is that workflow and it now
+exists. It has not run against a real release yet, so the releases already
+published carry nothing; the next one will be the first with assets.
 
 ## The prerequisite: `release-artifacts.yml`
 
-One new workflow that builds a matrix, archives it, checksums it, and
-attaches the result to the release release-plz already creates.
+A workflow that builds a matrix, archives it, checksums it, and attaches the
+result to the release release-plz already creates.
 
 Four decisions get frozen the moment it runs, because each one is copied
 into every downstream manifest afterwards. Getting them wrong means
@@ -198,7 +198,20 @@ WinGet ships with current Windows, its manifests are scriptable through
 `wingetcreate` or the WinGet Releaser action, and its review is lighter
 than Chocolatey's for a well-formed submission.
 
-When Chocolatey's turn comes:
+The Chocolatey package is written and lives in `packaging/chocolatey/`:
+`shep.nuspec`, the two scripts, `LICENSE.txt`, `VERIFICATION.txt` and the two
+`.exe.ignore` files. `release-artifacts.yml`'s `chocolatey` job packs and
+pushes it, and stays inert until the repository variable
+`PUBLISH_CHOCOLATEY` is set to `true` and a `CHOCO_API_KEY` secret exists.
+The parse check on its PowerShell runs in `test.yml`'s `packaging` job.
+
+Two things are still open on it. The first is artwork: `iconUrl` is missing,
+which is validator Guideline CPMR0033 rather than a Requirement, so the
+package is approvable without it, and CPMR0076 forbids linking a raw GitHub
+URL when one exists, so it has to go through a CDN like jsdelivr. The second
+is the moderation queue itself, which cannot be shortened from here.
+
+What the package already settles:
 
 - **Shim `shep.exe` only.** Chocolatey auto-shims every `.exe` in the tools
   directory. `shep-runtime` and `shep-dev` are container entrypoints with
@@ -208,8 +221,12 @@ When Chocolatey's turn comes:
   shimgen scans it afterwards. The filename match is case sensitive.
 - `iconUrl` needs an image this repository does not have. `web/public/`
   carries `favicon.ico` and `favicon.svg` and no PNG.
-- The uninstall script cannot call `shep list --json`. JSON is a global
-  flag: `shep --format json flock`.
+- The uninstall script refuses while a shepherd is running rather than
+  stopping the flock itself. `shep ping` is the probe, since it is the one
+  verb that treats "no shepherd" as information rather than an error.
+  Windows will not delete a running executable either way, so the
+  alternative is not "uninstall quietly" but "uninstall half-fails with a
+  confusing message".
 
 **The package description has to name the Windows gaps.** `shep startup` is
 not built there, because boot-time supervision on Windows means a Service
@@ -224,17 +241,19 @@ of this and is the text to reuse.
 
 ## Order
 
-0. Merge the Windows tier. (Done: PR #16.)
-1. `release-artifacts.yml` plus the license copy.
-2. README and `web/` install docs. One pass, appended to as channels land.
-3. Homebrew tap, source formula.
-4. `.deb` on the release, as two more legs of the same matrix.
-5. Scoop bucket.
-6. WinGet.
-7. Chocolatey.
+0. Merge the Windows tier. Done, PR #16.
+1. `release-artifacts.yml`. Done.
+2. Copy the license files into the published crate directories. Still open.
+3. README and `web/` install docs. One pass, appended to as channels land.
+4. Homebrew tap, source formula.
+5. `.deb` on the release, as two more legs of the same matrix.
+6. Scoop bucket.
+7. WinGet.
+8. Chocolatey. Package written, in `packaging/chocolatey/`. Blocked on
+   artwork and then on moderation.
 
-Steps 1 and 3 do not depend on each other: a source formula pulls the
-crates.io tarball. Everything from 5 on needs the Windows artifact leg.
+Steps 1 and 4 do not depend on each other: a source formula pulls the
+crates.io tarball. Everything from 6 on needs the Windows artifact leg.
 
 Roughly three to four days of engineering across all of it. The dominant
 cost is not engineering, it is Chocolatey's calendar time, which is the
