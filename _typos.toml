@@ -44,6 +44,16 @@ mis = "mis"
 # typo is the point of the test, not an accident in our prose.
 contro = "contro"
 
+# `instnace` is the same shape as `contro` above: a deliberate misspelling that
+# the template grammar's own tests and docs depend on. `{{instnace}}` is the
+# typo'd token used to prove an unknown token is refused BY NAME, so the
+# assertions check the rendered error contains "instnace" and hand it back to
+# the operator. Correcting the spelling would make those tests assert nothing.
+# All 14 sites are that one example: the tests in config/normalize.rs and
+# config/template.rs, the two design documents quoting them, and the sample
+# error on the first-flockfile docs page.
+instnace = "instnace"
+
 # Triggered by "marketing PNGs" (docs/systematic-refactor/.../assessment.md):
 # typos splits the plural acronym into "PN" + "Gs" and flags the first half
 # as a typo of "ON". A real word, not a real word, either way not a mistake
