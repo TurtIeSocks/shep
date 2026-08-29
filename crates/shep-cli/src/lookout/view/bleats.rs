@@ -30,7 +30,7 @@ pub fn feed_lines(app: &App, width: u16, rows: usize) -> Vec<Line<'static>> {
     // bytes. See the phase plan's design decision 1.
     let lost_lines = feed.missed_lines + feed.lines.len().saturating_sub(body);
 
-    out.push(match app.selected() {
+    let header = match app.selected() {
         None => Line::from(Span::styled(
             fit("bleats  no sheep is selected", width),
             palette.muted(),
@@ -39,13 +39,25 @@ pub fn feed_lines(app: &App, width: u16, rows: usize) -> Vec<Line<'static>> {
         // it -- the same reason `view::detail`'s own group pane has no lamb
         // line -- so the header says as much rather than repeating "no
         // sheep is selected" about a row that plainly is.
-        Some(RowKey::Group(name)) => Line::from(Span::styled(
-            fit(
-                &format!("bleats  {name}  follows one instance; select one to see its log"),
-                width,
-            ),
-            palette.muted(),
-        )),
+        //
+        // And it RETURNS rather than falling through to the body, because
+        // `feed` still holds whatever the previously selected sheep wrote.
+        // Live that is invisible: moving onto a group raises a refresh and
+        // the coalesced read applies an empty `Tail` in the same iteration.
+        // Once the link is lost that repair stops -- `Msg::Bleats` returns
+        // early while frozen and the cursor still moves -- so a fall-through
+        // prints one sheep's lines, unattributed, under a header naming
+        // none.
+        Some(RowKey::Group(name)) => {
+            out.push(Line::from(Span::styled(
+                fit(
+                    &format!("bleats  {name}  follows one instance; select one to see its log"),
+                    width,
+                ),
+                palette.muted(),
+            )));
+            return out;
+        }
         Some(RowKey::Sheep(_)) => {
             let row = app
                 .selected_row()
@@ -74,7 +86,8 @@ pub fn feed_lines(app: &App, width: u16, rows: usize) -> Vec<Line<'static>> {
                 )),
             }
         }
-    });
+    };
+    out.push(header);
 
     if feed.lines.is_empty() {
         if let Some(note) = feed.note.as_deref() {
@@ -141,12 +154,68 @@ fn earlier_lines(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use shep_core::protocol::ProcessInfo;
+    use shep_core::status::ProcStatus;
+
+    use super::super::super::app::{KeyPress, Msg, RowKey};
     use super::super::super::tail::{Stream, Tail};
     use super::super::fixtures::{
-        coloured, line, render_all, with_feed, with_feed_and_palette, with_feed_and_selection,
-        with_no_selection,
+        app_with, coloured, line, plain, render_all, with_feed, with_feed_and_palette,
+        with_feed_and_selection, with_no_selection,
     };
     use super::feed_lines;
+
+    /// fails if the pane prints one sheep's log lines underneath a group
+    /// header, attributed to nothing.
+    ///
+    /// Live this never shows: moving onto a group row raises a refresh and
+    /// the coalesced read applies an empty `Tail` in the same iteration.
+    /// Once the link is lost that repair stops -- `Msg::Bleats` returns
+    /// early while frozen -- and the cursor still moves, so the pane would
+    /// read "select one to see its log" with the previous sheep's lines
+    /// under it.
+    #[test]
+    fn a_group_row_prints_no_body_lines_on_a_frozen_dashboard() {
+        let flock: Vec<ProcessInfo> = (0..2)
+            .map(|slot| {
+                ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                    .instance(Some(slot))
+                    .build()
+            })
+            .collect();
+        let mut app = app_with(flock, plain());
+        // Row 0 is the group header, so one `j` lands on `web`'s first slot,
+        // which is the sheep whose lines the feed is about to hold.
+        app.update(Msg::Key(KeyPress::SelectDown));
+        app.update(Msg::Bleats {
+            tail: Tail {
+                lines: vec![line(Stream::Out, "slot-0 wrote this")],
+                missed_lines: 0,
+                missed_bytes: 0,
+                read_bytes: 18,
+                note: None,
+            },
+        });
+        app.update(Msg::Frozen {
+            at_local: "12:00:00".to_string(),
+        });
+        app.update(Msg::Key(KeyPress::SelectUp));
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Group("web".to_string())),
+            "the cursor has to be parked on the group row for this to test anything"
+        );
+
+        let rendered = render_all(&feed_lines(&app, 120, 6));
+        assert!(
+            rendered.contains("select one to see its log"),
+            "got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("slot-0 wrote this"),
+            "a group header with one instance's lines under it: {rendered:?}"
+        );
+    }
 
     /// fails if the BYTE half of the gap notice stops reaching the screen.
     /// Task 5 makes the number exact; this is the half that makes it visible,
