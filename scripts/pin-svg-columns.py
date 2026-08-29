@@ -48,18 +48,25 @@ def _fmt(value: float) -> str:
 def _runs(chars: list[str]) -> list[tuple[int, int]]:
     """Maximal (offset, length) runs of characters that share a font.
 
-    ASCII and the U+2500 box-drawing block are the only two classes these
-    assets contain, and they are exactly the pair that resolves to different
-    fonts when the monospace stack falls through.
+    All ASCII shares one run, and every non-ASCII character gets a run of its
+    own kind. Two different rules for two different problems.
+
+    ASCII is grouped because a proportional fallback spaces the letters inside
+    a cell unevenly and that does not matter: a cell's own edges are the
+    characters either side of it, and those are pinned.
+
+    Non-ASCII is split per character because a run of one repeated glyph is
+    uniform in ANY font, while a mixed run like `\u250c\u2500\u2500\u252c` is uniform only if the
+    fallback happens to give all three the same advance. Comic Sans is a font
+    where it does not, and 3.8px of drift survived splitting on class alone.
+
+    Keying on the character itself rather than on its Unicode block also means
+    the rule needs no inventory of what the assets contain. Today that is the
+    U+2500 box-drawing block plus one U+2026 ellipsis in lookout.svg; tomorrow
+    it is whatever the next capture happens to print.
     """
+
     def key(char: str) -> object:
-        # ASCII shares one run: a proportional fallback spaces the letters
-        # inside a cell unevenly, but the cell's own edges are box characters
-        # and those are pinned. Every box character gets a run of its own kind,
-        # because a run of one repeated glyph is uniform in ANY font, while a
-        # mixed `\u250c\u2500\u2500\u252c` is only uniform if the fallback gives all three the
-        # same advance. Comic Sans is a font where it does not: 3.8px of drift
-        # survived the ASCII split alone.
         return "ascii" if ord(char) < 128 else char
 
     spans: list[tuple[int, int]] = []
