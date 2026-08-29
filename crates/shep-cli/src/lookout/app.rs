@@ -1170,9 +1170,9 @@ impl App {
         }
     }
 
-    /// The rows the table draws, in name-then-id order: the whole flock, or
-    /// whatever the filter leaves of it, as [`RowKey`]s rather than as a flat
-    /// list of ids.
+    /// The rows the table draws, in `(name, instance, id)` order: the whole
+    /// flock, or whatever the filter leaves of it, as [`RowKey`]s rather than
+    /// as a flat list of ids.
     ///
     /// An app earns a [`RowKey::Group`] header, immediately before its own
     /// [`RowKey::Sheep`] entries, under the same condition
@@ -2993,10 +2993,10 @@ mod tests {
     /// defect: the rows came back `web` 0, `api` 1, `web` 2, straight off the
     /// map.
     ///
-    /// The key stays `(name, id)` regardless, because the reason it is total
-    /// does not depend on where the rows came from, and because this pane
-    /// repolls every two seconds -- a key that is not total is what would let
-    /// two rows swap places under the operator's cursor.
+    /// The key stays `(name, instance, id)` regardless, because the reason it
+    /// is total does not depend on where the rows came from, and because this
+    /// pane repolls every two seconds -- a key that is not total is what
+    /// would let two rows swap places under the operator's cursor.
     #[test]
     fn the_table_draws_by_name_then_by_id() {
         let t0 = Instant::now();

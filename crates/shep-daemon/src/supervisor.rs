@@ -1260,9 +1260,8 @@ impl SupervisorHandle {
     /// `selector` and answers with one row per match, carrying what each app
     /// said back or why nothing came.
     ///
-    /// Rows come back in the one order every operator-facing listing takes: by name, then
-    /// by id (`shep_core::protocol::sort_flock`). They were id-sorted until
-    /// that rule was made the only one; this table carries an ID and a NAME
+    /// Rows come back by name, then by id. They were id-sorted until the
+    /// shared listing rule was adopted; this table carries an ID and a NAME
     /// column exactly as a flock listing does, so an operator reading both in
     /// one session should not have to read two orders.
     ///
@@ -1318,8 +1317,9 @@ impl SupervisorHandle {
     }
 
     /// Delivers `sig` to the OWN process of every sheep matching `selector` —
-    /// never its process group — and answers with one row per match, in the one order every operator-facing listing takes: by name, then
-    /// by id (`shep_core::protocol::sort_flock`).
+    /// never its process group — and answers with one row per match, by name
+    /// then by id (`spawn_trigger_task`'s own note says why that is only
+    /// partial parity with `shep_core::protocol::sort_flock`).
     ///
     /// Unlike [`Self::trigger`], there is nothing to wait out: a `kill(2)`
     /// either returns or does not, so this answers as soon as every matched
@@ -1348,8 +1348,9 @@ impl SupervisorHandle {
     }
 
     /// Writes `line` to every matched sheep's stdin, and answers with one row
-    /// per match, in the one order every operator-facing listing takes: by name, then
-    /// by id (`shep_core::protocol::sort_flock`).
+    /// per match, by name then by id (`spawn_trigger_task`'s own note says
+    /// why that is only partial parity with
+    /// `shep_core::protocol::sort_flock`).
     ///
     /// Unlike [`Self::signal`], each write can genuinely wait — a pipe write
     /// blocks until the app reads — so the reply is bounded per sheep at
@@ -1391,13 +1392,11 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)
     }
 
-    /// Full flock listing, by name and then by id
+    /// Full flock listing, by name, then instance slot, then id
     /// (`shep_core::protocol::sort_flock`, which `snapshot_all` calls).
     ///
-    /// Not sorted by instance-slot order: `ProcessInfo` carries no instance
-    /// number, so no listing that has crossed the wire could reproduce a
-    /// finer key than name-then-id, and every reply shares this one rule
-    /// instead. See `snapshot_all`.
+    /// Every reply shares that one rule rather than each restating it. See
+    /// `snapshot_all` for why the slot is in the key.
     ///
     /// Convenience over `Self::list_checked` for callers that don't need
     /// to distinguish "actor gone" from "empty flock" — mainly tests.
@@ -2178,10 +2177,10 @@ enum ReplyKind {
 /// turns on whether the request was fully satisfied.
 #[derive(Debug)]
 pub(crate) struct Scaled {
-    /// The app's surviving instances, by name and then by id
+    /// The app's surviving instances, by name, then instance slot, then id
     /// (`shep_core::protocol::sort_flock`). Every row here shares one name,
-    /// so in practice that is id order -- but it is the shared rule that says
-    /// so, not a rule of this reply's own, which is what stops the two
+    /// so in practice that is slot order -- but it is the shared rule that
+    /// says so, not a rule of this reply's own, which is what stops the two
     /// drifting. On a partial scale-up this is what came up, never the count
     /// asked for.
     pub(crate) instances: Vec<ProcessInfo>,
@@ -6654,28 +6653,28 @@ impl<R: ProcessRunner> Actor<R> {
     /// Full flock listing, grouped by app name.
     ///
     /// Sorted by [`sort_flock`], the one rule every operator-facing listing
-    /// in shep takes: name, then id. Sorting by id alone scatters a clustered
-    /// app's instances across the table, and grouping by name is what makes a
-    /// four-instance app read as one thing at a glance.
+    /// in shep takes: name, then instance slot, then id. Sorting by id alone
+    /// scatters a clustered app's instances across the table, and grouping by
+    /// name is what makes a four-instance app read as one thing at a glance.
     ///
-    /// # Why not `(name, instance, id)`
+    /// # Why the slot is in the key
     ///
-    /// The extra key would be a real refinement: `instance` keeps a
-    /// clustered app's slots in their own order, where `id` breaks the tie
-    /// a reload creates by giving a replacement a fresh id at the drainee's
-    /// slot number.
+    /// `instance` keeps a clustered app's slots in their own order, where
+    /// `id` alone breaks the wrong way on the tie a reload creates: a
+    /// replacement gets a fresh id at the drainee's slot number, so slot 0
+    /// ends up last.
     ///
-    /// It would also be a SECOND rule. `ProcessInfo` carries no instance
-    /// number, so no listing that has crossed the wire can reproduce it,
-    /// and `sort_flock` -- which every lifecycle reply takes -- cannot. The
-    /// two agree on any flock whose ids were handed out in instance order and
-    /// diverge exactly once a reload has churned one, so `ListFlock` could
-    /// order a reloaded app differently from the `Restart` reply printed a
-    /// second earlier. That is the inconsistency this whole change exists to
-    /// end, reintroduced one layer down.
+    /// This block used to argue the opposite, on the ground that
+    /// `ProcessInfo` carried no instance number and so no listing that had
+    /// crossed the wire could reproduce the finer key. It carries one now
+    /// ([`ProcessInfo::instance`], the field that moved `PROTOCOL_VERSION` to
+    /// 2), and `sort_flock` -- which every lifecycle reply takes -- applies
+    /// it, so the finer key IS the shared rule rather than a second one. A
+    /// listing whose rows all report `None` collapses to the `(name, id)`
+    /// order this function took before the field existed.
     ///
-    /// So the finer key goes and the shared one stays, by calling the shared
-    /// function rather than restating it: the two cannot drift.
+    /// The shared function is called rather than restated, as before: the
+    /// two cannot drift.
     ///
     /// Applied here once rather than once per verb: this is the single
     /// function every listing reply is built from — `ListFlock`, `Describe`,
@@ -6981,12 +6980,19 @@ fn spawn_trigger_task(
         // The refusals were collected in id order and the waits were armed in
         // it, but a wait's row is appended when it settles, so this is what
         // the answer's order actually rests on.
-        // Keyed the way every operator-facing table shep prints is keyed
-        // (`sort_flock`'s own doc): by name, with the id breaking the tie
-        // between two instances of one app. This table carries an ID and a
-        // NAME column just as a flock listing does, so an operator who runs
-        // `shep flock` and then `shep trigger` should not have to read two
-        // orders.
+        // Keyed by name, with the id breaking the tie between two instances
+        // of one app. This table carries an ID and a NAME column just as a
+        // flock listing does, so an operator who runs `shep flock` and then
+        // `shep trigger` should not have to read two orders.
+        //
+        // The parity with `sort_flock` is PARTIAL, and cannot be closed from
+        // here. `sort_flock`'s key is `(name, instance, id)`, and
+        // `ActionReply` carries no slot -- it is an id, a name and an
+        // outcome, and adding one would be a wire change on a type that has
+        // no other use for it. The two orders agree on every app whose ids
+        // were handed out in slot order and differ only after a reload has
+        // given slot 0 a fresh high id, which puts that row last here and
+        // first in `shep flock`.
         rows.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
         let _ = reply.send(Ok(rows));
     });
@@ -7024,7 +7030,8 @@ fn spawn_signal_task(
             };
             rows.push(SignalReply { id, name, outcome });
         }
-        // Name then id, per `spawn_trigger_task`'s own note.
+        // Name then id, per `spawn_trigger_task`'s own note, including
+        // why the parity with `sort_flock` is only partial.
         rows.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
         let _ = reply.send(Ok(rows));
     });
@@ -7083,7 +7090,8 @@ fn spawn_send_line_task(
             ))
             .await,
         );
-        // Name then id, per `spawn_trigger_task`'s own note.
+        // Name then id, per `spawn_trigger_task`'s own note, including
+        // why the parity with `sort_flock` is only partial.
         rows.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
         let _ = reply.send(Ok(rows));
     });

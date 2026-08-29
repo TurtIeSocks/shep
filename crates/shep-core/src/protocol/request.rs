@@ -704,7 +704,7 @@ pub struct ProcessInfo {
 }
 
 /// Orders one flock listing the way every operator-facing surface presents
-/// one: by name, then by id.
+/// one: by name, then by instance slot, then by id.
 ///
 /// # Why name first
 ///
