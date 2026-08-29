@@ -338,6 +338,15 @@ what to do about each:
   instance's output into one file, which is `merge_logs` behaviour without
   asking for it. Add `{{instance}}` to the path to keep the files separate,
   or set `merge_logs = true` to keep them merged on purpose.
+- **`shep bleats` labels a multi-instance app's lines with the slot.** The
+  table prefix was the name alone, so two instances of one app were
+  indistinguishable; a line from slot 2 of `web` now reads `web:2 | ...`. A
+  script splitting a bleats line on the pipe therefore sees a changed field.
+  Match the name loosely, or read `--format json`, whose `instance` key
+  carries the slot on its own. A single-instance app is unaffected, and the
+  backlog of an app with `merge_logs = true` still prints the bare name,
+  because a shared file holds every instance's output with nothing in a line
+  saying who wrote it.
 - **The wire protocol version moved from 1 to 2.** A CLI built against this
   release refuses to talk to an older daemon still running from before the
   upgrade, naming both versions at the handshake instead of guessing at a
