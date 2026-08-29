@@ -41,6 +41,11 @@ jobs:
     if: >-
       !startsWith(github.event.head_commit.message, 'chore: release') &&
       !contains(github.event.head_commit.message, '/release-plz-')
+    # A ceiling against a hang, not a budget. Successful runs of this job
+    # measured 0.4 to 1.9 minutes on 2026-08-29, so 30 is roughly 15x the
+    # slowest. It matters more here than in most jobs: this one holds a
+    # write-capable token, and GitHub's default is 360 minutes.
+    timeout-minutes: 30
     steps:
       # Every action in these two files is pinned by commit, unlike test.yml's,
       # which use moving tags. These jobs hold RELEASE_PLZ_TOKEN and

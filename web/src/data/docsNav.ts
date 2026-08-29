@@ -87,7 +87,7 @@ export const docsNav: DocsNavGroup[] = [
   {
     label: "Concepts",
     items: [
-      { slug: "terminology", label: "Terminology", built: true, source: "README.md" },
+      { slug: "terminology", label: "Terminology", built: true, source: "docs/terminology.md" },
       {
         slug: "folds",
         label: "Folds",

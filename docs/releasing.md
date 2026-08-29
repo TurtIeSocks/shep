@@ -383,12 +383,15 @@ warnings" cargo doc --workspace --no-deps --all-features` locally is the best
 available proxy and it passes. Check the docs.rs build status for each crate
 after publishing; a failure there is fixable in the next alpha.
 
-**No LICENSE file ships inside the `.crate` archives.** `LICENSE-MIT` and
-`LICENSE-APACHE` sit at the repository root, outside every package directory,
-and cargo only reaches outside for `readme` and `license-file`. The
-`license = "MIT OR Apache-2.0"` field is what crates.io renders and what
-tooling reads, so this is cosmetic. Copying or symlinking the two files into
-each crate directory would fix it whenever it starts to bother you.
+**The LICENSE files ship inside the `.crate` archives.** They did not until
+Phase 17. `LICENSE-MIT` and `LICENSE-APACHE` live at the repository root, and
+cargo only reaches outside a package directory for `readme` and
+`license-file`, so every archive went out without them. Each crate directory
+now carries a symlink to both, which cargo follows and packages as real files.
+
+The `license = "MIT OR Apache-2.0"` field is still what crates.io renders and
+what tooling reads. The files matter for the people the licences are actually
+addressed to, who get a tarball rather than a web page.
 
 ## The `shep-cli` package was renamed to `shep`
 

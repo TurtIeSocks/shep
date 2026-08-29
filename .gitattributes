@@ -15,8 +15,10 @@ crates/shep-core/assets/flockfile.schema.json text eol=lf
 # diff on every single line — three tests reddening for a reason that has
 # nothing to do with the code under test.
 #
-# `docs/whistle/tools.md` is `include_str!`ed by `whistle::catalogue`'s
-# `the_checked_in_catalogue_is_current`.
+# `docs/whistle/tools.md` is read at test runtime by `whistle::catalogue`'s
+# `the_checked_in_catalogue_is_current`, with `read_to_string` rather than
+# `include_str!` -- so the file must be checked in, with LF endings, for the
+# byte comparison to hold.
 docs/whistle/tools.md text eol=lf
 # `insta` writes its snapshots with `\n` and compares them the same way, so
 # every `.snap` in the workspace needs the same guarantee. `lookout::frames`'

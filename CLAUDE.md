@@ -11,7 +11,16 @@ directory is still named `pm2-rs`, which is expected and not a rename to make.
 implementation.** That repo was read once, by a dedicated trace phase, to
 produce our behavior specs — implementation works from the specs alone:
 
-- [docs/systematic-refactor/refactor-workspace/map.md](docs/systematic-refactor/refactor-workspace/map.md) — THE spec: every module's behavior, actions, notes
+- [docs/systematic-refactor/refactor-workspace/map.md](docs/systematic-refactor/refactor-workspace/map.md) — the spec for the pm2-DERIVED module set, and only that. It is
+  accurate and drift-annotated through roughly Phase 10, with a partial Phase
+  15 pass, and it stops there. It has no mention of lookout, whistle, `shep
+  stock`, `shep signal` or shep-cli-redirect, and it still calls the TUI
+  `tui.rs` and the MCP server `mcp.rs`, which are the names those two shipped
+  under before Phases 12 and 13 renamed them. For anything after the pm2
+  cutover, the design lives in docs/brainstorming/specs/ and the reasoning in
+  [docs/decisions.md](docs/decisions.md). This line said "THE spec: every module's behavior" until an audit
+  on 2026-08-29 counted the gaps, which is a bad claim to leave in the file
+  every session reads first.
 - [docs/systematic-refactor/refactor-workspace/](docs/systematic-refactor/refactor-workspace/) — goals.md (must-haves, constraints, open questions), assessment.md (keep/toss verdicts), trace.md + trace/ (flow inventories, known-bug list — bugs are documented so we do NOT reproduce them)
 
 "Compat"/"contract" language in those docs means fidelity to the spec, not to
@@ -259,7 +268,7 @@ anywhere in this file until now.
 
 **Invoke the `shep-idiomatic-rust` skill before writing or reviewing ANY Rust
 in this repo.** It fronts [docs/idiomatic-rust.md](docs/idiomatic-rust.md) —
-45 numbered rules (IR-1..IR-45) distilled from rand 0.10.2. Cite rules as
+46 numbered rules (IR-1..IR-46) distilled from rand 0.10.2. Cite rules as
 `IR-<n>` in reviews. Evidence with file:line citations:
 [docs/idiomatic-rust/lenses/](docs/idiomatic-rust/lenses/).
 

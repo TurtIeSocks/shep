@@ -10,19 +10,29 @@ name: pages
 # single ubuntu job of a couple of minutes at 1x, so the arithmetic that
 # keeps the Rust CI manual does not reach it.
 #
-# The paths filter names three files outside `web/` on purpose: the site
-# parses them at build time (see `web/src/data/*.ts`) rather than restating
-# them, so that a stale claim fails the build instead of shipping. The
-# lexicon table comes from README.md, the "not built yet" chalkboard from
-# docs/specs/deferred.md, and the terminology page from docs/terminology.md.
-# Editing one of those without redeploying would leave the site asserting
-# something the repo no longer says.
+# The paths filter names two files outside `web/` on purpose: the site parses
+# them at build time (see `web/src/data/*.ts`) rather than restating them, so
+# that a stale claim fails the build instead of shipping. docs/specs/deferred.md
+# feeds the "not built yet" chalkboard through web/src/data/chalkboard.ts, and
+# docs/terminology.md feeds TWO consumers: the landing page's lexicon through
+# web/src/data/lexicon.ts, and the terminology page's usage rules through
+# web/src/data/docsRules.ts. Editing either file without redeploying would leave
+# the site asserting something the repo no longer says.
+#
+# The terminology page's TABLE is a third thing and is not in this filter,
+# because it comes from web/src/data/lexiconTable.md through
+# web/src/data/docsLexicon.ts, and `web/**` already covers it.
+#
+# README.md was the third until the lexicon table moved to
+# web/src/data/lexiconTable.md, which happened because the README was rewritten
+# as a landing page and the parser was left reading a heading that had gone.
+# Nothing imports README.md now -- grep web/src for `?raw` for the real list --
+# so it is no longer a build input and no longer belongs here.
 on:
   push:
     branches: [main]
     paths:
       - "web/**"
-      - "README.md"
       - "docs/specs/deferred.md"
       - "docs/terminology.md"
       - ".github/workflows/pages.yml"
@@ -42,6 +52,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # `npm ci` plus `astro build` is a couple of minutes. 15 is a ceiling
+    # against a hang, not a budget. Both jobs here went without one while
+    # every job in test.yml and release-artifacts.yml had one.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -61,6 +75,9 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # Publishing an already-built artifact. Generous for what it does, and it
+    # can wait on the `pages` concurrency group above.
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

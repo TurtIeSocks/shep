@@ -54,7 +54,7 @@ collapses same-named rows back into one app each, mapped field by field:
 | `merge_logs` | `merge_logs` |
 | `max_memory_restart` (bytes) | `max_memory` |
 | rows sharing a `name` | `instances` = the row count |
-| `exec_mode == "cluster_mode"` | `reuse_port = true`, plus a note (below) |
+| `exec_mode == "cluster_mode"` | `instances`, plus a note (below) |
 | `NODE_APP_INSTANCE` present in a row's env | `increment_var`, plus a note (below) |
 
 A dump row with no `pm_exec_path` is refused by name rather than imported
@@ -82,11 +82,13 @@ it binds nothing on any app's behalf. Running N instances of an app on one
 port only works if the app arranges the socket sharing itself, with
 `SO_REUSEPORT` (Node's `reusePort: true` listen option, which needs
 Node ≥ 22.12). Without that, every instance past the first hits
-`EADDRINUSE` the moment it starts. `shep import` sets `reuse_port = true`
-on every app it found running in pm2 cluster mode and names it on stderr,
-but setting the Flockfile field is not the same as the app doing the work —
-if the app was never written to call `reusePort: true`, cluster mode does
-not work under shep no matter what the Flockfile says. Real fd-passing
+`EADDRINUSE` the moment it starts. `shep import` names every app it found
+in pm2 cluster mode on stderr and sets no `reuse_port` for it, deliberately:
+the field is the app's own claim that it calls `reusePort: true`, and the
+importer cannot know that from a pm2 dump. Setting it for you would assert
+something unverified and, worse, would pick the overlapping reload for an
+app that may not survive it. Read the note, then set the field yourself if
+the app really does share its socket. Real fd-passing
 parity (shep handing out a socket the way pm2's master did, with no
 cooperation needed from the app) is a v1.2 target, not yet built — see
 `docs/specs/shep-v1.md` §2, "Versioned scope".

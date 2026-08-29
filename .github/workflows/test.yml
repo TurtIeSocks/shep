@@ -81,7 +81,7 @@ jobs:
   # their condition.
   #
   # Three docs paths count as RUST on purpose, because Rust tests pin them:
-  # `docs/whistle/tools.md` is include_str!'d by whistle::catalogue's
+  # `docs/whistle/tools.md` is read at test runtime by whistle::catalogue's
   # `the_checked_in_catalogue_is_current`, and the two `docs/lookout/frames.*`
   # files are the lookout deliverables whose renderer is snapshot-pinned.
   # Editing any of them without the suite is how they drift.
