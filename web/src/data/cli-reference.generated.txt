@@ -280,7 +280,7 @@ Usage: shep stop [OPTIONS] <SELECTORS>...
 
 Arguments:
   <SELECTORS>...
-          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          One or more: name, id, `name:slot`, `all`, `zeus-*`, `/regex/`, `fold:<name>`
           
           Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
           still stops `a` and `c`, and the exit code is the first failure.
@@ -338,7 +338,7 @@ Usage: shep restart [OPTIONS] <SELECTORS>...
 
 Arguments:
   <SELECTORS>...
-          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          One or more: name, id, `name:slot`, `all`, `zeus-*`, `/regex/`, `fold:<name>`
           
           Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
           still stops `a` and `c`, and the exit code is the first failure.
@@ -433,7 +433,7 @@ Usage: shep reload [OPTIONS] <SELECTORS>...
 
 Arguments:
   <SELECTORS>...
-          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          One or more: name, id, `name:slot`, `all`, `zeus-*`, `/regex/`, `fold:<name>`
           
           Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
           still stops `a` and `c`, and the exit code is the first failure.
@@ -491,7 +491,7 @@ Usage: shep delete [OPTIONS] <SELECTORS>...
 
 Arguments:
   <SELECTORS>...
-          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          One or more: name, id, `name:slot`, `all`, `zeus-*`, `/regex/`, `fold:<name>`
           
           Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
           still stops `a` and `c`, and the exit code is the first failure.
@@ -950,7 +950,7 @@ Usage: shep describe [OPTIONS] <SELECTORS>...
 
 Arguments:
   <SELECTORS>...
-          One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+          One or more: name, id, `name:slot`, `all`, `zeus-*`, `/regex/`, `fold:<name>`
           
           Several are applied in turn, not atomically: `shep stop a b c` where `b` matches nothing
           still stops `a` and `c`, and the exit code is the first failure.
@@ -1016,7 +1016,7 @@ Usage: shep trigger [OPTIONS] <SELECTOR> <ACTION> [PARAMS]
 
 Arguments:
   <SELECTOR>
-          name, id, `all`, `/regex/`, or `fold:<name>`
+          name, id, `name:slot`, `all`, `/regex/`, or `fold:<name>`
 
   <ACTION>
           Action name — free-form, defined by the app
@@ -1083,7 +1083,7 @@ Usage: shep signal [OPTIONS] <SELECTOR> <SIGNAL>
 
 Arguments:
   <SELECTOR>
-          name, id, `all`, `/regex/`, or `fold:<name>`
+          name, id, `name:slot`, `all`, `/regex/`, or `fold:<name>`
 
   <SIGNAL>
           Signal name, e.g. `SIGHUP` or `hup`
@@ -1147,7 +1147,7 @@ Usage: shep whisper [OPTIONS] <SELECTOR> <LINE>
 
 Arguments:
   <SELECTOR>
-          name, id, `all`, `/regex/`, or `fold:<name>`
+          name, id, `name:slot`, `all`, `/regex/`, or `fold:<name>`
 
   <LINE>
           The line, without a trailing newline — shep adds exactly one
@@ -1503,7 +1503,7 @@ Usage: shep flush [OPTIONS] [SELECTOR]
 
 Arguments:
   [SELECTOR]
-          name, id, `all`, `/regex/`, or `fold:<name>` (required unless --daemon)
+          name, id, `name:slot`, `all`, `/regex/`, `fold:<name>` (required unless --daemon)
 
 Options:
       --daemon
