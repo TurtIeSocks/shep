@@ -25,18 +25,13 @@
 //! constructs one from a bare number itself. Every bind/probe/unlink/
 //! signal-registration step in this module is plain safe std/tokio.
 //!
-//! (An earlier revision had `boot` perform that adoption inline, behind an
-//! `unsafe` block at its own call site — see git history around commits
-//! db02d9f/5c4f29b for that design, and f688ac2/9455d80 for the doc fallout
-//! it caused. It moved here because `adopt_fd`'s ordering precondition is
-//! process-wide — "call before THIS PROCESS opens any descriptor" — and
-//! `boot` cannot discharge that on its own caller's behalf: `boot` is
-//! `async`, so a tokio runtime with its own live poller fds already exists
-//! by the time `boot` is ever called. The fix pushes adoption out to
-//! somewhere that CAN discharge the precondition: the CLI's `main`, as its
-//! literal first fd-touching statement, before a tokio runtime — or
-//! anything else — exists (Phase 3). See `crate::sys::adopt_fd`'s own
-//! `# Safety` section and rationale essay for the full contract.)
+//! (`boot` cannot perform that adoption itself: `adopt_fd`'s ordering
+//! precondition is process-wide — "call before THIS PROCESS opens any
+//! descriptor" — and `boot` is `async`, so a tokio runtime with its own live
+//! poller fds already exists by the time `boot` is ever called. Only the
+//! CLI's `main`, as its literal first fd-touching statement, can discharge
+//! that precondition. See `crate::sys::adopt_fd`'s own `# Safety` section
+//! and rationale essay for the full contract.)
 
 use core::fmt;
 use core::time::Duration;
@@ -1116,11 +1111,10 @@ impl RunningDaemon {
     /// `boot` succeeding is what commits the daemon to owning the flock,
     /// the roll, the socket, and the pidfile, so nothing short of a panic
     /// may return from here without having attempted every step above.
-    /// (`install_signals`'s registration used to run here, in `run`, where
-    /// its own failure could `?`-exit before any of this teardown had a
-    /// chance to run at all; it now happens inside `boot` instead, before
-    /// any of the state teardown depends on is even created — see `boot`'s
-    /// own doc.)
+    /// `install_signals`'s registration runs inside `boot`, before any of
+    /// the state this teardown depends on is even created — a failure there
+    /// can `?`-exit without skipping teardown of state that doesn't exist
+    /// yet. See `boot`'s own doc.
     ///
     /// # Errors
     /// - [`BootError::Io`] — a teardown filesystem step failed.
@@ -1288,11 +1282,10 @@ impl Drop for SignalTasks {
 /// (Decision 3, 2026-08-08).** A signal handler, once installed, is
 /// installed for good — `tokio` never uninstalls the underlying libc
 /// disposition just because the [`tokio::signal::unix::Signal`] stream
-/// polling it happens to stop. An earlier version of this function's
-/// SIGTERM/SIGINT/SIGQUIT loop awaited exactly one signal and returned,
-/// which left a real gap: a SECOND SIGTERM arriving during a slow
+/// polling it happens to stop. A loop that awaited only one signal and
+/// returned would leave a real gap: a SECOND SIGTERM arriving during a slow
 /// [`RunningDaemon::run`] teardown (the kill ladder waiting out
-/// `kill_timeout` on a stuck sheep, say) had nowhere left to go — not
+/// `kill_timeout` on a stuck sheep, say) would have nowhere left to go — not
 /// re-delivered to the now-finished task, and not killing the process
 /// either, since installing ANY handler for a signal already replaced its
 /// default terminate disposition. The daemon would sit there, unresponsive
@@ -1726,26 +1719,13 @@ mod tests {
     /// because `install_signals` moved INTO `boot` (see `boot`'s own doc):
     /// a test whose `boot()` call succeeds has live signal listeners
     /// running from that point on, whether or not it ever calls `run()`.
-    /// Proven concretely, not just reasoned about (Opus review follow-up,
-    /// 2026-08-08): a `boot`-only test with no lock passed 10/10 runs in
-    /// isolation and FAILED 10/10 runs alongside
-    /// `sigterm_triggers_the_same_graceful_shutdown` — the exact same
-    /// process-wide `raise(SIGTERM)` hazard, just reached through `boot`
-    /// alone rather than through `run`. Task 10's e2e `Fixture` is the next
-    /// `boot()` caller this crate will grow, so this is a real, standing
-    /// tripwire, not a one-off.
     ///
-    /// Proven load-bearing on the shutdown-signal front too (Opus review,
-    /// 2026-08-08): reintroducing the fixed watch-receiver bug on purpose
-    /// (dropping the initial `shutdown_rx` again) still made `boot::tests`
-    /// PASS under the default PARALLEL test runner —
-    /// `sigterm_triggers_the_same_graceful_shutdown`'s `raise(SIGTERM)`
-    /// accidentally reached `boot_restores_a_saved_flock_and_tears_down_in_order`'s
-    /// OWN daemon (hung on the reintroduced bug) too, on the SAME signal
-    /// delivery, and rescued it — masking the regression. Only
-    /// `--test-threads=1` (or, now, this lock) exposed it. Every test below
-    /// that calls `boot()` takes this for its own duration so no two such
-    /// tests can ever overlap and one can never rescue (or corrupt) another.
+    /// Without this lock, two overlapping `boot()`-successful tests can
+    /// rescue or corrupt each other: `raise(SIGTERM)` in one test's signal
+    /// path can reach a second test's own hung daemon on the same delivery,
+    /// masking a real regression in that second test. Every test below that
+    /// calls `boot()` takes this for its own duration so no two such tests
+    /// can ever overlap.
     ///
     /// `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is held
     /// across this fn's own `.await` points (`boot`, `run`, ...), and
@@ -1879,10 +1859,9 @@ mod tests {
     /// (until the child's `exec` or exit; measured at up to ~25ms) the socket
     /// object is NOT destroyed, `connect` to the path SUCCEEDS, and any
     /// prober is looking at a live socket. That is not a daemon bug — it is a
-    /// lying fixture, and it is what made
+    /// lying fixture: it can make
     /// [`two_concurrent_boots_on_a_stale_socket_exactly_one_wins`] fail as
-    /// `[AlreadyRunning, AlreadyRunning]`, both racers refused, roughly 1 run
-    /// in 28 of this crate's suite under a saturated machine: the flock's
+    /// `[AlreadyRunning, AlreadyRunning]`, both racers refused — the flock's
     /// loser refused correctly, and the flock's WINNER then found this
     /// leftover answering and refused too, exactly as `bind_socket` should.
     ///
@@ -2148,23 +2127,16 @@ mod tests {
         // — any test whose `boot()` call succeeds has live signal listeners
         // from that point on.
         //
-        // Decision 1 (2026-08-08) replaced `boot_refuses_a_stale_ready_fd_
-        // before_touching_anything_else`, which lived here and drove a bad
-        // fd number straight through `BootOptions` to pin that adoption was
-        // refused before `bind_socket` ran. That guard is no longer
-        // expressible through `boot`'s public API at all: `BootOptions::
-        // ready_fd` is `Option<std::fs::File>` now, and there is no safe
-        // way to hand this test a `File` that names a bad descriptor — the
+        // `BootOptions::ready_fd` is `Option<std::fs::File>`, so there is no
+        // safe way to hand this test a `File` naming a bad descriptor — the
         // type itself is the proof the fd was valid at construction time.
-        // The BadFd-refusal behavior itself still exists and is still
-        // tested, just one layer down: see `sys::tests::
-        // a_fd_this_process_never_owned_is_refused`, which calls
-        // `sys::adopt_fd` directly (that module's own job now). What THIS
-        // test covers instead — real coverage that would otherwise be lost
-        // entirely, since no other test drives a `Some` `ready_fd` through
-        // `boot` at all — is the happy path: a caller-adopted pipe really
-        // does receive the readiness line, and only after the socket is
-        // genuinely bound (spec §3), exactly as `boot`'s own doc claims.
+        // BadFd refusal is tested one layer down instead: see
+        // `sys::tests::a_fd_this_process_never_owned_is_refused`, which
+        // calls `sys::adopt_fd` directly. This test covers the happy path
+        // instead — no other test drives a `Some` `ready_fd` through `boot`
+        // at all — a caller-adopted pipe really does receive the readiness
+        // line, and only after the socket is genuinely bound (spec §3),
+        // exactly as `boot`'s own doc claims.
         use std::io::Read;
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
@@ -2267,8 +2239,7 @@ mod tests {
     }
 
     /// fails if `delete_flock_on_shutdown` leaves anything in the final
-    /// roll — `shep dev`'s own bug (Phase 15 review, Important 2). The
-    /// signal path is what this pins: `ctx.shutdown()` ends `run` the exact
+    /// roll. The signal path is what this pins: `ctx.shutdown()` ends `run` the exact
     /// way a caught `SIGTERM` does, WITHOUT going through any caller-level
     /// `Stop`/`Delete` request first, which is precisely the gap a CLI-side
     /// `tidy_up` flag alone cannot close. If `delete_flock_on_shutdown` is

@@ -161,9 +161,10 @@ pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogErro
     // The name the operator registered this dog under — the `[dog.<name>]`
     // key its own section lives beneath, and so the `name` it has to put in
     // `Request::DogConfig`. A built-in dog reads it out of its argv; an
-    // adopted one has no argv at all and used to have no way to learn it,
-    // so a third-party dog had to hardcode a name and hope the operator
-    // typed the same one. A mismatch is silent on both sides — `dog_section`
+    // adopted one has no argv at all, so it needs another way to learn it —
+    // without this, a third-party dog would have to hardcode a name and
+    // hope the operator typed the same one. A mismatch is silent on both
+    // sides — `dog_section`
     // answers a name nobody adopted with the same empty string a registered
     // dog with no section gets — so the whole of an operator's
     // configuration could be discarded and everything still looked healthy.

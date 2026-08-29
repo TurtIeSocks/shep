@@ -837,10 +837,8 @@ impl Drop for PathGuard {
 
 #[tokio::test]
 async fn a_bare_interpreter_resolves_via_the_seeded_path() {
-    // Originally written to stand in for Task 10's not-yet-created e2e tier
-    // (see task-8-report.md); that tier now exists (`tests/daemon_e2e.rs`,
-    // `a_bare_interpreter_resolves_via_the_inherited_path`) and re-proves
-    // this same regression through the full daemon RPC stack — Start over
+    // `tests/daemon_e2e.rs`'s `a_bare_interpreter_resolves_via_the_inherited_path`
+    // proves the same thing through the full daemon RPC stack — Start over
     // the real socket -> supervisor -> assemble() -> TokioRunner -> OS exec.
     // Kept here too rather than deleted: this test isolates the
     // assemble()+TokioRunner tier specifically (config -> assemble()'s
@@ -854,11 +852,11 @@ async fn a_bare_interpreter_resolves_via_the_seeded_path() {
     // (`_PATH_DEFPATH`, `/usr/bin:/bin` on macOS/BSD) whenever `PATH` is
     // ABSENT from the env it's given — independent of anything assemble()
     // does. Verified empirically: `subprocess.run(["sh", ...], env={})`
-    // (a fully empty env, no PATH key at all) still succeeds. An earlier
-    // version of this test used a bare "sh" and did NOT actually gate the
-    // fix (reverting `base_env()` left it passing). A shim living in a
-    // throwaway tempdir can NEVER be found by that OS-level fallback, so it
-    // can only resolve if assemble()'s seeded PATH genuinely reaches it.
+    // (a fully empty env, no PATH key at all) still succeeds, and a bare
+    // "sh" here does NOT actually gate the fix (reverting `base_env()`
+    // leaves it passing). A shim living in a throwaway tempdir can NEVER be
+    // found by that OS-level fallback, so it can only resolve if
+    // assemble()'s seeded PATH genuinely reaches it.
     use shep_core::config::{AppConfig, normalize};
     use shep_core::paths::ShepPaths;
     use shep_daemon::assemble::assemble;

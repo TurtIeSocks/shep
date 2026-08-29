@@ -10,7 +10,7 @@
 //! under `reqwest`'s own default `rustls` feature). `rustls` does the part
 //! that must not be gotten wrong — the handshake and record layer; what
 //! this module owns is the same HTTP/1.1 request/response framing
-//! `crate::http`'s server side (Task 13) already hand-rolls, aimed the other
+//! `crate::http`'s server side already hand-rolls, aimed the other
 //! way. See `crates/shep-cli/Cargo.toml` and this workspace's root
 //! `Cargo.toml` for the accounting behind the two new dependencies.
 //!

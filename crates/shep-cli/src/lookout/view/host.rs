@@ -10,7 +10,7 @@
 //! flock, never [`super::super::app::App::rows`], the table's current view.
 //! A strip that named itself `flock cpu`/`flock mem` is a claim about the
 //! machine's total load, and a name filter narrowing the table must not
-//! quietly narrow that claim along with it (Phase 16 review Important #4); the
+//! quietly narrow that claim along with it; the
 //! title bar is where the filtered-vs-total split already lives
 //! (`2 of 6 in the flock`), one row above this one.
 //!
@@ -206,11 +206,11 @@ mod tests {
 
     /// fails if the strip's flock totals move when a filter narrows the
     /// table. The strip is a claim about the whole machine, not about
-    /// whatever the table currently shows, and Phase 16 review Important #4
-    /// caught `flock cpu`/`flock mem` silently summing the FILTERED set
-    /// while staying labelled `flock` — a filter matching nothing made a
-    /// running flock's strip print `-`, the same cell this dashboard
-    /// reserves for "no reading arrived yet".
+    /// whatever the table currently shows: `flock cpu`/`flock mem` must
+    /// never silently sum the FILTERED set while staying labelled `flock`
+    /// — a filter matching nothing would make a running flock's strip
+    /// print `-`, the same cell this dashboard reserves for "no reading
+    /// arrived yet".
     #[test]
     fn the_flock_totals_ignore_the_filter() {
         let mut app = with_host(sample(), flock_of(4, 1));

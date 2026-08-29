@@ -1092,24 +1092,21 @@ mod tests {
     }
 
     /// fails if `set_style_level` panics instead of reporting when
-    /// `style` already exists as something other than a table -- the
-    /// reviewer's live repro for this task: an operator writing
-    /// `style = "full"` at the top level (legal TOML, and a natural
-    /// guess) used to abort the whole process with an internal
-    /// assertion, exit 101, from inside this setter's old `.expect(..)`.
-    /// A clean [`ShepTomlError::WrongShape`] is required instead.
+    /// `style` already exists as something other than a table: an operator
+    /// writing `style = "full"` at the top level (legal TOML, and a natural
+    /// guess) must get a clean [`ShepTomlError::WrongShape`], not an
+    /// internal assertion aborting the whole process.
     ///
-    /// Also fails if a refused write still replaces the file. The first
-    /// version of this fix routed the setter through [`ShepToml::edit`],
-    /// which always calls `save()` after the closure runs regardless of
-    /// what the closure returned -- so a refused write still staged a
-    /// fresh file and renamed it over the original: identical bytes, but
-    /// a new inode, and the mode forced to [`CONFIG_FILE_MODE`] even
-    /// though the original here is `0644`. Content equality alone hid
-    /// that, which is why this checks the file's metadata rather than
-    /// only what is in it. [`ShepToml::try_edit`] is what actually
-    /// prevents it: it never reaches `save` when the closure returns
-    /// `Err`.
+    /// Also fails if a refused write still replaces the file. Routing the
+    /// setter through [`ShepToml::edit`], which always calls `save()` after
+    /// the closure runs regardless of what the closure returned, would
+    /// still stage a fresh file and rename it over the original on a
+    /// refusal: identical bytes, but a new inode, and the mode forced to
+    /// [`CONFIG_FILE_MODE`] even though the original here is `0644`.
+    /// Content equality alone hides that, which is why this checks the
+    /// file's metadata rather than only what is in it.
+    /// [`ShepToml::try_edit`] is what actually prevents it: it never
+    /// reaches `save` when the closure returns `Err`.
     #[test]
     fn a_style_key_that_is_not_a_table_is_reported_and_the_file_is_never_rewritten() {
         use std::os::unix::fs::MetadataExt as _;

@@ -494,12 +494,11 @@ mod tests {
 
     /// fails if `"bark"` stops reaching [`DogRuntime::start`] — the same
     /// dispatch-reaches-it proof [`run_dog_reaches_metrics`] gives for its
-    /// own name, and for the same reason this can no longer assert an exit
-    /// code the way it did back when `"bark"` was a stub that returned
-    /// promptly: [`run_bark`] subscribes to the shepherd's bus once its
-    /// config parses, and `serve_one_request`'s fake daemon closes the
-    /// connection right after this one `DogConfig` reply — so this proves
-    /// dispatch reaches the wire, nothing about what `run_bark` does next.
+    /// own name. It cannot assert an exit code: [`run_bark`] subscribes to
+    /// the shepherd's bus once its config parses, and `serve_one_request`'s
+    /// fake daemon closes the connection right after this one `DogConfig`
+    /// reply — so this proves dispatch reaches the wire, nothing about
+    /// what `run_bark` does next.
     #[tokio::test]
     async fn run_dog_reaches_bark() {
         let dir = tempfile::tempdir().unwrap();

@@ -8,12 +8,10 @@
 //! [`rpc::dispatch`](crate::rpc::dispatch) — the portable dispatcher Task 4
 //! built, which never sees a socket or a byte.
 //!
-//! This module used to be the one place that did, and it was `#[cfg(unix)]`
-//! for that reason. It is not any more: the OS transport lives one crate
-//! down in [`shep_core::transport`], so the accept loop, the handshake and
-//! the connection state machine here are one implementation over a unix
-//! socket and a Windows named pipe alike. The single genuine platform
-//! difference left in this file is [`check_peer`].
+//! The OS transport lives one crate down in [`shep_core::transport`], so the
+//! accept loop, the handshake and the connection state machine here are one
+//! implementation over a unix socket and a Windows named pipe alike. The
+//! single genuine platform difference left in this file is [`check_peer`].
 //!
 //! # Security
 //!

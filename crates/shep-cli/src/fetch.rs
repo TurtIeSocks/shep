@@ -13,12 +13,11 @@
 //! client bolted onto a module whose doc comment argues against exactly
 //! that.
 //!
-//! [`tls_connector`], [`Target`] and [`parse_url`] used to live in
-//! `dog::bark::sinks` — bark's own webhook POSTs need the identical
-//! connect-and-TLS setup. They moved here unchanged so a fetch's GET and
-//! bark's POST share one connection path instead of two copies of the same
-//! `rustls` wiring; `sinks.rs` now imports them from here. Everything
-//! downstream of the connection stays separate on purpose: bark writes a
+//! [`tls_connector`], [`Target`] and [`parse_url`] live here rather than in
+//! `dog::bark::sinks`, so a fetch's GET and bark's POST share one
+//! connection path instead of two copies of the same `rustls` wiring;
+//! `sinks.rs` imports them from here. Everything downstream of the
+//! connection stays separate on purpose: bark writes a
 //! POST and reads a status line, this writes a GET and reads a bounded
 //! body, and each has its own error type because forcing those into one
 //! shape would blur both.
@@ -54,9 +53,7 @@
 //! on the body is not a cap on the response.
 //!
 //! No `Accept-Encoding` is ever sent, so there is no `Content-Encoding` to
-//! decode: measured against the real target (a GitHub Pages site), it sends
-//! `Content-Length` and never chunks, and sends no `Content-Encoding`
-//! unless asked for one.
+//! decode.
 
 use core::fmt;
 use std::sync::Arc;
@@ -84,9 +81,7 @@ use crate::terminal_safe;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// A URL, parsed into what [`get`] needs to reach it — a fetch's own
-/// version of what `dog::bark::sinks` calls a sink's target, since that is
-/// exactly what this is: the two used to be one type before this module
-/// split off.
+/// version of what `dog::bark::sinks` calls a sink's target.
 ///
 /// `Debug` is derived, unlike [`crate::dog::bark::sinks::Sink`]'s own
 /// hand-written and redacted one: a fetch target is a public document

@@ -279,9 +279,8 @@ mod tests {
     /// `shep-cli`'s `exit.rs` folds `Io`, `HandshakeClosed`, `Connect`,
     /// `Wire` and `HandshakeTimeout` alike into `DaemonUnreachable`, and
     /// `spawn.rs`'s `connect_or_spawn_with` special-cases only `Connect` and
-    /// `HandshakeTimeout`. Pinning the variant here asserted a platform, not
-    /// a contract, and was red on linux/arm64 for exactly that reason
-    /// (platform.md #1).
+    /// `HandshakeTimeout`. Pinning one variant here would assert a platform,
+    /// not a contract.
     ///
     /// What must NOT happen is a silent success, and that is what this still
     /// guards: an `Ok(Connection)` from a peer that answered nothing.

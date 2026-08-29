@@ -184,13 +184,11 @@ fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     app.instances = instances;
 
     if first.exec_mode.as_deref() == Some("cluster_mode") {
-        // No `reuse_port = true` here any more. It was set for several
-        // phases as though it were the mitigation, while nothing in shep
-        // ever read the field -- so the flag did nothing and the note below
-        // was already carrying the whole truth: shep binds no shared listen
-        // socket, so the APP has to set SO_REUSEPORT itself. `normalize`
-        // refuses the field outright as of 2026-08-19, which would have made
-        // every imported cluster-mode Flockfile fail to load.
+        // No `reuse_port = true` here: shep binds no shared listen socket,
+        // so the APP has to set SO_REUSEPORT itself, and the note below
+        // carries that truth. `normalize` refuses the field outright, so
+        // setting it here would make every imported cluster-mode Flockfile
+        // fail to load.
         notes.push(ImportNote::ClusterMode {
             app: name.to_string(),
             instances,
@@ -298,17 +296,13 @@ mod tests {
     /// fails if a cluster-mode app comes across without the note, or if the
     /// importer starts setting `reuse_port` again.
     ///
-    /// The note is the whole mitigation and always was: shep binds no shared
+    /// The note is the whole mitigation: shep binds no shared
     /// listen socket, so N instances on one port is EADDRINUSE unless the app
     /// sets `SO_REUSEPORT` itself, and the operator has to hear that at
-    /// import time rather than at first start.
-    ///
-    /// This test used to assert `reuse_port == true` on the cluster app, on
-    /// the belief that the field did something. Nothing in shep ever read it
-    /// (`deferred.md`), so it was decoration on top of a note that already
-    /// told the truth. `normalize` refuses the field outright as of
-    /// 2026-08-19, which would have made every imported cluster-mode
-    /// Flockfile fail to load.
+    /// import time rather than at first start. `normalize` refuses a
+    /// `reuse_port` field outright, so setting one on the cluster app would
+    /// make every imported cluster-mode Flockfile fail to load
+    /// (`deferred.md`).
     #[test]
     fn cluster_mode_says_so_without_setting_a_field_nothing_reads() {
         let imported = imported();

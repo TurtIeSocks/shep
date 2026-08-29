@@ -3,27 +3,19 @@
 //!
 //! ## Why this is its own module
 //!
-//! This code used to live inside `crate::dog_index`, next to the only
-//! caller it then had, and that module's doc still explains *why* a string
-//! out of the community index is hostile input. Review found the half it
-//! did not cover: `dog_index` sanitised every string in a response **body**
-//! and no string in a response **header**, while the whole premise of the
-//! feature is that the host serving it is untrusted. A hostile `Location:`
-//! on a 3xx reached an operator's terminal raw — screen cleared, window
+//! Every string an untrusted host can put in front of an operator must go
+//! through this — response bodies AND headers. A hostile `Location:` on a
+//! redirect reaches the terminal raw otherwise — screen cleared, window
 //! title rewritten — because [`crate::fetch::FetchError::Redirect`]
-//! captured the header verbatim and `emit_error`'s table arm is a bare
+//! captures the header verbatim and `emit_error`'s table arm is a bare
 //! `writeln!`.
 //!
-//! Closing that means [`crate::fetch`] — the transport, the layer *below*
-//! `dog_index` — needs this function too. A module cycle
-//! (`fetch` -> `dog_index` -> `fetch`) is the wrong way to get it, so the
-//! sanitiser moved down here to a leaf that depends on nothing and that
-//! both layers can reach.
+//! [`crate::fetch`], the transport layer, sits below `dog_index` and needs
+//! this too; a module cycle (`fetch` -> `dog_index` -> `fetch`) is the wrong
+//! way to share it, so the sanitiser lives here, at a leaf both can reach.
 //!
-//! The property `dog_index`'s own doc claims for itself — that every
-//! security-relevant line sits in one file a reviewer can hold in their
-//! head — is not lost by the move. It is now two files, and this one holds
-//! nothing but the sanitiser.
+//! Every security-relevant line for untrusted-host strings stays in this
+//! one file, small enough for a reviewer to hold in their head.
 //!
 //! ## The rule
 //!

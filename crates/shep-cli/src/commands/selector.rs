@@ -1,11 +1,8 @@
 //! One `parse_selector`, shared by every verb that takes a selector off the
 //! command line.
 //!
-//! This used to be four near-identical private copies, one per verb module
-//! (`lifecycle`, `logs`, `query`, `bleats`) — a `trigger` module would have
-//! made five. Pulled out on its own, as its own commit, so the verb that
-//! needed a fifth copy could land on top of one shared function instead of
-//! adding to the pile.
+//! Every verb that takes a selector (`lifecycle`, `logs`, `query`, `bleats`,
+//! `trigger`) shares this one function rather than each parsing it locally.
 
 use shep_core::selector::ProcessSelector;
 

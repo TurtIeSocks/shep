@@ -33,8 +33,7 @@ impl Reaper {
     /// stdin whose write end is owned by the `Child`. When
     /// `connect_or_spawn_with` drops that `Child`, the pipe closes, `cat` sees
     /// EOF and exits. Lifetime is tied exactly to the call under test — a
-    /// `sleep 60` would leak past it, and Phase 2b already paid for that
-    /// lesson (`daemon_e2e.rs:118-138`).
+    /// `sleep 60` would leak past it.
     fn spawn_long_lived(
         &self,
     ) -> impl FnOnce() -> std::io::Result<std::process::Child> + Send + 'static {
@@ -65,7 +64,7 @@ impl Drop for Reaper {
 async fn an_existing_daemon_is_used_without_launching_anything() {
     let dir = tempfile::tempdir().unwrap();
     let path = shep_client::testing::control_address(dir.path());
-    let _served = fake_daemon(&path, Ok(sample_ack())).await; // Task 1's helper
+    let _served = fake_daemon(&path, Ok(sample_ack())).await;
 
     let outcome = connect_or_spawn_with(
         &path,
@@ -77,7 +76,7 @@ async fn an_existing_daemon_is_used_without_launching_anything() {
     assert!(matches!(outcome, SpawnOutcome::Connected(_)));
 }
 
-/// THE load-bearing test of this task.
+/// THE load-bearing test in this file.
 ///
 /// The launcher does what a real cold start does: it makes a socket appear
 /// that is BOUND but never accepted from — a daemon that has reached
@@ -146,7 +145,7 @@ async fn a_child_that_dies_fails_fast_instead_of_waiting_out_the_deadline() {
     );
 }
 
-/// The losing side of a cold-start race (fix G). The launcher starts a child
+/// The losing side of a cold-start race. The launcher starts a child
 /// that immediately exits 10 AND brings up a daemon that answers — exactly
 /// what happens when another `shep` process won the `flock(2)`. Treating any
 /// non-zero status as fatal fails this test.

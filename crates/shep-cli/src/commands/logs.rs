@@ -243,9 +243,9 @@ pub async fn flush(client: &Client, streams: &mut Streams<'_>, args: &FlushArgs)
 /// # Where the next line lands
 ///
 /// At offset 0, because [`launch::launch_command`] opens both files
-/// `O_APPEND` — see `launch`'s own `emptied_appending` for the measurement,
-/// and for why `File::create` (which is what this used to be) would instead
-/// leave the daemon writing past a `NUL` hole the size of everything emptied. A
+/// `O_APPEND` — see `launch`'s own `emptied_appending` for why
+/// `File::create` would instead leave the daemon writing past a `NUL` hole
+/// the size of everything emptied. A
 /// daemon launched by an older `shep` binary, or run in the foreground with
 /// the operator's own shell redirection, keeps whatever descriptor it was
 /// given: this verb still empties the file and still frees the disk blocks,

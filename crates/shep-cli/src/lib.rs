@@ -11,20 +11,20 @@
 //! tree that is `#[cfg(unix)]` in half its dispatch, an exit code it expects
 //! to own) this one does.
 //!
-//! `serve`, `runtime`, and `dev` (spec `docs/specs/shep-v1.md` §9) shipped in
-//! Phase 15: a hand-rolled static file server (no `axum`, no `tower-http`;
-//! Rin's ruling — the ledger has the reasoning), a foreground no-daemon
-//! container mode with a PID-1 init split for zombie reaping, and an isolated
-//! foreground development flock. Three `[[bin]]` targets sit over this
-//! library: `shep` itself, plus `shep-runtime` and `shep-dev`, the two
-//! container-entrypoint aliases that prepend their verb before parsing (see
-//! `main_runtime`/`main_dev`). The ratatui `lookout` dashboard ships complete
-//! as of Phase 16: all four panes — the flock table and shell (Phase 12a),
-//! plus the bleats feed, the sheep detail pane and the host-usage strip
-//! (Phase 12b) — a name filter that narrows the table in place, lambs in the
-//! detail pane, and the three action keys (`x` stop, `R` restart, `L`
-//! reload) behind the `--allow-control` gate, each arming a confirm rather
-//! than acting on the keypress that pressed it. Remaining workspace debt,
+//! `serve`, `runtime`, and `dev` (spec `docs/specs/shep-v1.md` §9): a
+//! hand-rolled static file server (no `axum`, no `tower-http`; Rin's ruling
+//! — the ledger has the reasoning), a foreground no-daemon container mode
+//! with a PID-1 init split for zombie reaping, and an isolated foreground
+//! development flock. Three `[[bin]]` targets sit over this library: `shep`
+//! itself, plus `shep-runtime` and `shep-dev`, the two container-entrypoint
+//! aliases that prepend their verb before parsing (see
+//! `main_runtime`/`main_dev`). The ratatui `lookout` dashboard has all four
+//! panes — the flock table and shell, the bleats feed, the sheep detail
+//! pane, and the host-usage strip — a name filter that narrows the table in
+//! place, lambs in the detail pane, and the three action keys (`x` stop,
+//! `R` restart, `L` reload) behind the `--allow-control` gate, each arming
+//! a confirm rather than acting on the keypress that pressed it. Remaining
+//! workspace debt,
 //! none of it here: `docs/specs/deferred.md`.
 
 #![forbid(unsafe_code)]
@@ -205,20 +205,13 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
         configured
     };
     // `NO_COLOR`/`$TERM`/`$COLORTERM`/the terminal width read here, once, and
-    // nowhere else -- the same reason `level` itself is resolved here rather
-    // than inside `run`: every `Streams` construction downstream gets a
-    // value, never a call. `must_render_bare`'s hard rule already forced
-    // `level` to `Bare` above when it applies, and `Presentation::new`'s own
-    // `colour` folding (`level.colour() && !no_color_set(..)`) is `false`
-    // for `Bare` regardless of what the environment says, so the hard rule
-    // holds either way. `output::terminal_width()` used to be called from
-    // inside `output::table_of` itself instead of here, which meant every
-    // table render read the process's real controlling terminal -- `cargo
-    // test` included, since a test binary launched from an interactive
-    // shell has one too. Resolving it here, once, and carrying it on
-    // `Presentation` like every other terminal fact, is what makes
-    // `table_of` a pure function of its inputs rather than of whatever
-    // terminal happened to be behind the process that ran it.
+    // nowhere else -- see `style::Presentation`'s own doc for why every
+    // terminal fact is resolved at this seam rather than read again inside
+    // `table_of`. `must_render_bare`'s hard rule already forced `level` to
+    // `Bare` above when it applies, and `Presentation::new`'s own `colour`
+    // folding (`level.colour() && !no_color_set(..)`) is `false` for `Bare`
+    // regardless of what the environment says, so the hard rule holds
+    // either way.
     let style = style::Presentation::new(
         level,
         std::env::var_os("NO_COLOR").as_deref(),
@@ -485,10 +478,9 @@ fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
 ///
 /// Parses the level through [`style::StyleLevel::parse`], the same function
 /// `resolve_style` hands `$SHEP_STYLE` to -- not `clap::ValueEnum::from_str`,
-/// which this used to call directly. The two disagreed on whitespace
-/// (`from_str` does not trim), so `SHEP_STYLE=" full "` resolved while
-/// `level = " full "` silently did not; `style_from_config_trims_the_same_way_shep_style_does`
-/// (below) pins that they now agree.
+/// which does not trim whitespace (see [`style::StyleLevel`]'s own doc);
+/// `style_from_config_trims_the_same_way_shep_style_does` (below) pins that
+/// the two agree.
 /// Parses `shep.toml`'s `[interpreters]` table into shep-cli's own
 /// extension -> interpreter map, for `lifecycle::start` to fold onto every
 /// resolved app whose own `interpreter` is still unset (task 47's
@@ -2415,15 +2407,10 @@ mod tests {
         );
     }
 
-    /// Whole-branch review item 5: `style_from_config` and `resolve_style`'s
-    /// own `$SHEP_STYLE` handling used to go through two different parsers
-    /// for the one grammar -- `clap::ValueEnum::from_str` for the config
-    /// file, `style::StyleLevel::parse` for the env var -- and only the
-    /// latter trimmed whitespace. `SHEP_STYLE=" full "` resolved;
-    /// `level = " full "` silently did not. Both now go through
-    /// `StyleLevel::parse`, so this pins that they agree, padding and all,
-    /// rather than trusting the doc's claim of one shared parser without a
-    /// test that would catch a future regression back to two.
+    /// Pins that `style_from_config` and `resolve_style` agree on
+    /// `$SHEP_STYLE` whitespace, padding and all -- see [`style::StyleLevel`]'s
+    /// own doc for why both must go through `StyleLevel::parse` rather than
+    /// `clap::ValueEnum::from_str`.
     #[test]
     fn style_from_config_trims_the_same_way_shep_style_does() {
         for raw in ["full", " full ", "\tfull\n", "FULL", " FuLl "] {

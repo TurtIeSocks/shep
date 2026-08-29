@@ -944,9 +944,9 @@ mod tests {
     /// nothing dropped.
     ///
     /// Width 97, not this module's usual 80 (`mixed_flock`'s own doc has the
-    /// exception and the arithmetic): task 49's `EXIT` column and task 7's
-    /// `SMIT` column each cost the fixture seven columns they had no slack
-    /// left to give up, so 80 no longer fits `Starting`'s word
+    /// exception and the arithmetic): the `EXIT` and `SMIT` columns each
+    /// cost the fixture seven columns they had no slack left to give up, so
+    /// 80 no longer fits `Starting`'s word
     /// (`"starting"`, the second-longest Butter-role word after
     /// `WaitingRestart`) alongside them. This test's own job was never
     /// "prove it fits at exactly the realistic fallback" -- that boundary

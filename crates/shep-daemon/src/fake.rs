@@ -1,8 +1,7 @@
 //! Deterministic scripted [`ProcessRunner`](crate::runner::ProcessRunner) for engine tests
 //!
 // WHY: deterministic + instant under the paused tokio clock; real OS process
-// behavior is covered only by `tests/real_runner.rs` (added when the real
-// runner lands).
+// behavior is covered only by `tests/real_runner.rs`.
 
 use core::fmt;
 use std::collections::VecDeque;

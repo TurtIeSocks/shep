@@ -505,15 +505,12 @@ mod tests {
     /// delivery task keep running normally on the runtime's own worker
     /// thread, freed by the calling test task moving off it.
     ///
-    /// A deliberate, self-reported deviation from this task's own literal
-    /// test bodies, which spell the wait as a bare `tokio::time::timeout`:
-    /// that spelling is exactly what a minimal, isolated reproduction (two
-    /// tasks, a real `TcpListener`, nothing else — see this task's own
-    /// report) showed losing the race 100% of the time on this machine,
-    /// never intermittently. The property each test asserts — a real
-    /// delivery over a real socket happened — is unchanged; only the
-    /// mechanism used to wait for it without fighting the paused clock is
-    /// different.
+    /// A bare `tokio::time::timeout` loses this race 100% of the time under
+    /// a paused clock, never intermittently: a minimal reproduction (two
+    /// tasks, a real `TcpListener`, nothing else) confirmed it. The
+    /// property each test asserts — a real delivery over a real socket
+    /// happened — is unchanged; only the mechanism used to wait for it
+    /// without fighting the paused clock is different.
     async fn await_real_io<T: Send + 'static>(
         timeout: Duration,
         fut: impl Future<Output = T> + Send + 'static,

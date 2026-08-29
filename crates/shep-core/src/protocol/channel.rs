@@ -162,9 +162,9 @@ mod tests {
         assert_eq!(serde_json::to_string(&msg).unwrap(), fixture);
     }
 
-    /// fails if a reply that carries no `id` stops deserializing — the
-    /// spelling every app written before Phase 10 sends, and the one the
-    /// name-and-order fallback exists for.
+    /// fails if a reply that carries no `id` stops deserializing — apps
+    /// with no correlation id still send this shape, and the
+    /// name-and-order fallback exists for exactly that.
     #[test]
     fn an_action_reply_without_an_id_round_trips() {
         let fixture = r#"{"kind":"action-reply","action":"gc","body":"ok"}"#;

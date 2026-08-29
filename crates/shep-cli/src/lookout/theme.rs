@@ -46,11 +46,10 @@ impl Palette {
     ///
     /// - `no_color` set and **non-empty** flattens everything. An empty
     ///   `NO_COLOR=` is an unset one — the cross-ecosystem convention, and the
-    ///   one already pinned for the shepherd's own log output. This method
-    ///   used to check that inline; it now calls [`crate::style::no_color_set`],
-    ///   the one copy of the rule both this binding and `output::paint`'s
-    ///   share, since `mod lookout` is `#[cfg(unix)]` and `crate::style` is
-    ///   not.
+    ///   one already pinned for the shepherd's own log output. Calls
+    ///   [`crate::style::no_color_set`], the one copy of the rule both this
+    ///   binding and `output::paint`'s share, since `mod lookout` is
+    ///   `#[cfg(unix)]` and `crate::style` is not.
     /// - `colorterm` containing `truecolor` or `24bit`, or `term` containing
     ///   `256color`, gets the 256-colour indices -- also
     ///   [`crate::style::deep_colour_terminal`] now, for the same reason.

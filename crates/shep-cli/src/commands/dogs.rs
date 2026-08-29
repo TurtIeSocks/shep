@@ -394,19 +394,15 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
     // `wait` always runs, on every path out of this match, so no zombie
     // survives a refusal or a success.
     //
-    // `SHEP_HOME` is set to the home this invocation actually resolved, and
-    // that is a fix rather than a detail. It used to be inherited, so
-    // `shep adopt --home /tmp/scratch ./my-dog` vetted `my-dog` against
-    // whatever `SHEP_HOME` the shell had, which is usually nothing, so the
-    // candidate resolved the DEFAULT home instead. A dog reads `SHEP_HOME`
-    // to find its socket, which is the one thing `docs/dogs.md` promises it,
-    // so a rotator or anything else with a job to do connected to the live
-    // daemon and did it, during the command whose entire purpose was
-    // deciding whether to trust the binary at all. Found 2026-08-20 while
-    // building `shep-log-rotate`; nothing was lost only because that dog's
-    // default size threshold happened to be larger than the logs it found.
+    // `SHEP_HOME` is set to the home this invocation actually resolved, not
+    // inherited: an inherited `SHEP_HOME` is usually unset, so the
+    // candidate would resolve the DEFAULT home instead of `--home`'s. A dog
+    // reads `SHEP_HOME` to find its socket, which is the one thing
+    // `docs/dogs.md` promises it, so a rotator or anything else with a job
+    // to do would connect to the LIVE daemon and do it, during the command
+    // whose entire purpose is deciding whether to trust the binary at all.
     //
-    // NOT `env_clear()`, though an earlier note of mine suggested it. A real
+    // NOT `env_clear()`. A real
     // adopted dog runs with a filtered environment the daemon builds
     // (`assemble::base_env`: `PATH`, plus whichever of `HOME`/`USER`/`LANG`/
     // `TZ` the daemon itself has), so clearing here would vet under stricter

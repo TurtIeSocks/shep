@@ -89,8 +89,8 @@ Aliases          flock: list, ls   bleats: logs   lookout: dash   stock: scale  
 // `bin_name = "shep"` below is load-bearing, not decoration. Without it, clap
 // renders every `Usage:` line from `argv[0]` rather than from `name` — so
 // `shep-runtime --help` prints `Usage: shep-runtime runtime ...` and
-// `shep-dev --help` prints `Usage: shep-dev dev ...` (verified empirically:
-// both alias binaries built and run with no override, Phase 15 Task 11).
+// `shep-dev --help` prints `Usage: shep-dev dev ...` when both alias
+// binaries are built and run with no override.
 // Pinned so every rendering of a verb's own usage line reads `shep <verb>`
 // regardless of which of the three `[[bin]]` targets produced it — the alias
 // binaries are convenience entrypoints for exactly that invocation, not
@@ -1330,12 +1330,10 @@ mod tests {
     }
 
     /// Every visible alias is named in `--help`, and only real ones are.
-    ///
-    /// The grouped listing replaced clap's own `Commands:` block, which used
-    /// to render `[aliases: list, ls]` beside each verb. Nothing carried that
-    /// forward, so for several phases `shep --help` did not mention a single
-    /// alias while all six kept working -- found 2026-08-19 when the docs
-    /// site's generated CLI reference could no longer find any.
+    /// The grouped listing replaces clap's own `Commands:` block, which
+    /// would otherwise render `[aliases: list, ls]` beside each verb, so
+    /// nothing else guarantees an alias stays mentioned while it keeps
+    /// working.
     ///
     /// Derived from clap rather than compared against a second list, so
     /// adding `visible_alias` to a verb fails here until the line says so.

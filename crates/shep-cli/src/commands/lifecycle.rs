@@ -244,13 +244,13 @@ const JS_BRIDGE_SCRIPT: &str = "try { \
 /// running `shep start` with nobody watching. [`run_bounded`] is the
 /// mechanism; [`JS_EVAL_BUDGET`] is what every caller passes.
 ///
-/// The `node_missing` sentence IS pinned, as of Phase 17, by `cli_e2e`'s
-/// `a_js_flockfile_without_node_says_so_and_says_what_to_do`. This doc used
-/// to say it could not be, on the grounds that producing it needs a `PATH`
-/// without node and `std::env::set_var` is `unsafe` in edition 2024 inside a
-/// crate that forbids unsafe. That holds for a unit test, which would have to
-/// mutate its own process; the e2e tier runs shep as a subprocess, and
-/// `Command::env` sets the child's environment alone.
+/// The `node_missing` sentence is pinned by `cli_e2e`'s
+/// `a_js_flockfile_without_node_says_so_and_says_what_to_do`, not a unit
+/// test: producing it needs a `PATH` without node, and a unit test would
+/// have to mutate its own process via `std::env::set_var`, which is
+/// `unsafe` in edition 2024 inside a crate that forbids unsafe. The e2e
+/// tier runs shep as a subprocess, and `Command::env` sets the child's
+/// environment alone.
 ///
 /// `docs/migration.md` still quotes this sentence for an operator without
 /// node installed, and that quote is still kept in step by hand, so update it
@@ -700,13 +700,12 @@ fn is_reachable_as_a_name(selector: &ProcessSelector) -> bool {
 ///
 /// # Why the whole flock, and why only in a table
 ///
-/// `shep start koji` used to print a one-row table containing koji. The
-/// question an operator has after starting one app is almost never "did that
-/// one app start" -- the exit code already answered that -- it is "what does
-/// the flock look like now", which is the question `shep flock` exists for
-/// and which a one-row table cannot answer. Every lifecycle verb here now
-/// prints exactly what `shep flock` would print, so the answer is the same
-/// shape whichever verb asked it.
+/// The question an operator has after starting one app is almost never "did
+/// that one app start" -- the exit code already answered that -- it is
+/// "what does the flock look like now", which is the question `shep flock`
+/// exists for and which a one-row table cannot answer. Every lifecycle verb
+/// here prints exactly what `shep flock` would print, so the answer is the
+/// same shape whichever verb asked it.
 ///
 /// `--format json` keeps the narrow payload, deliberately, and this is the
 /// one place the two surfaces diverge on purpose. A script that runs
@@ -730,9 +729,9 @@ fn is_reachable_as_a_name(selector: &ProcessSelector) -> bool {
 ///
 /// Routed through [`emit_flock`], not [`emit`], so a dog renders through the
 /// dogs table with its `SOURCE` column rather than through the sheep table
-/// with an ID, a face, and a `FOLD` and `SMIT` it can never fill.
-/// `shep restart log-rotate` used to draw the same dog in two shapes
-/// depending on which verb asked.
+/// with an ID, a face, and a `FOLD` and `SMIT` it can never fill, and
+/// `shep restart log-rotate` draws the same dog the same way regardless of
+/// which verb asked.
 ///
 /// # Errors
 ///
@@ -901,12 +900,10 @@ async fn resume_all(
 
 /// Every distinct name in `infos`, in the order they first appear.
 ///
-/// Feeds the already-running notice and nothing else. It used to pick the
-/// respawn targets too, and twice it was the wrong tool for that: once
-/// because it deduped by adjacency and dropped a repeat only when the two
-/// rows sat next to each other, and once because a name is simply not what
-/// the operator selected -- see [`resume_all`]. A notice reads as a list of
-/// apps, so collapsing to names is right for this and only this.
+/// Feeds the already-running notice and nothing else -- never the respawn
+/// targets, which must stay per-row and per-id; see [`resume_all`]'s own
+/// doc for why. A notice reads as a list of apps, so collapsing to names is
+/// right for this and only this.
 ///
 /// Order-INDEPENDENT: it compares against every name kept so far, not
 /// against the previous one, so a caller handing over rows in a Flockfile's
@@ -954,10 +951,10 @@ async fn resume(
     // table on a path that is supposed to fail exactly like the by-path one
     // does: an error on stderr and nothing on stdout.
     if any_restart_failed(&procs) {
-        // Named by id as well as by name, because this now reports one ROW:
-        // four instances of one app failing used to be one message and would
-        // otherwise be four identical ones, naming a sheep the operator
-        // cannot tell apart. The id is also what makes the `bleats` suggestion
+        // Named by id as well as by name, because this reports one ROW:
+        // without the id, four instances of one app failing would print
+        // four identical messages, naming a sheep the operator cannot tell
+        // apart. The id is also what makes the `bleats` suggestion
         // reach the instance that actually failed.
         let (name, id) = (&sheep.name, sheep.id);
         let message = format!(
@@ -1262,9 +1259,8 @@ async fn start_one(
         // Parsed client-side, exactly as every selector-taking verb does, so a
         // malformed one is a local usage error rather than a round trip. This
         // is also what makes `shep start fold:backed` and `shep start all`
-        // work at all: `start` used to take a different argument grammar from
-        // every other lifecycle verb, so folds were actionable everywhere
-        // except the verb that creates things.
+        // work at all: `start` takes the same argument grammar as every
+        // other lifecycle verb, so folds are actionable here too.
         let selector = match parse_selector(streams, token) {
             Ok(selector) => selector,
             Err(code) => return code,
@@ -2984,12 +2980,10 @@ mod tests {
     /// returns early with `ExitCode::Usage` whenever `resolve_target` fails
     /// — before any request is built — so a regression that reintroduced
     /// an early return here would otherwise hang this test forever on
-    /// `envelopes.recv()`. The reviewer measured exactly that with the
-    /// fixture missing: the test ran past 60 seconds before SIGALRM killed
-    /// it at 75s (exit 142), reporting a killed CI job rather than a named
+    /// `envelopes.recv()`, reporting a killed CI job rather than a named
     /// assertion. Also asserts `sent.body`, not only `sent.deadline_ms` —
-    /// previously only the deadline was pinned, so a `start` that sent the
-    /// wrong request with the right deadline would still have passed.
+    /// a `start` that sent the wrong request with the right deadline must
+    /// not pass.
     ///
     /// The fixture itself lives in this test's own tempdir rather than a
     /// tracked file at the crate root: a tracked fixture's absence is what

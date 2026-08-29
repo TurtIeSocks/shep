@@ -46,9 +46,8 @@
 //! emits a live minimal document there instead: real values, no guidance.
 //! [`Depth::All`] is refused for JSON rather than fudged, because a JSON
 //! document naming all forty fields would pin every default explicitly,
-//! which is a Flockfile you would tell somebody not to commit. Rin's call,
-//! 2026-08-23. `.json5` is the format with JSON's syntax and comments, and
-//! the refusal says so.
+//! which is a Flockfile you would tell somebody not to commit. `.json5` is
+//! the format with JSON's syntax and comments, and the refusal says so.
 
 use core::fmt;
 
@@ -424,10 +423,10 @@ fn render(syntax: &Syntax, lines: &[Line]) -> String {
 /// they carry em dashes because nothing an operator reads renders them.
 ///
 /// # Panics
-/// If `field` has no `init.blurb`. Falling back to the `///` doc is what
-/// this used to do, and it is worse than failing: the operator gets prose
-/// written for somebody reading the source, in a file that otherwise reads
-/// as documentation, and nothing says so.
+/// If `field` has no `init.blurb`. Falling back to the `///` doc would be
+/// worse than failing: the operator gets prose written for somebody reading
+/// the source, in a file that otherwise reads as documentation, and nothing
+/// says so.
 /// `tests::every_field_carries_a_group_and_a_blurb` makes this unreachable,
 /// so a panic here means that test was removed rather than that a Flockfile
 /// was odd.

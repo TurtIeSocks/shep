@@ -1,8 +1,8 @@
 //! `cron_restart` schedule parsing — the croner-backed cron grammar (spec §4)
 //!
-//! The dialect is five-field standard cron only (Rin, 2026-08-08): widening a
-//! grammar later is backwards-compatible, narrowing one is not, so this
-//! starts narrow rather than inheriting croner's full extension set. croner
+//! The dialect is five-field standard cron only: widening a grammar later is
+//! backwards-compatible, narrowing one is not, so this starts narrow rather
+//! than inheriting croner's full extension set. croner
 //! still accepts `L`, `W`, `#` and `?` natively — rejecting them is this
 //! module's job, done by a token-aware pre-parse scan, because a character
 //! scan alone would reject `JUL` and `WED` (both contain a reserved letter).
@@ -616,8 +616,8 @@ mod tests {
 
     #[test]
     fn five_tokens_of_garbage_are_rejected() {
-        // fails if the validator is still a token counter — this exact
-        // input is what the token-count stopgap accepted
+        // fails if the validator only counts whitespace-separated tokens
+        // instead of checking each field's range
         match CronSchedule::parse("99 99 99 99 99", None) {
             Err(CronParseError::Pattern { pattern, .. }) => assert_eq!(pattern, "99 99 99 99 99"),
             other => panic!("expected Pattern error, got {other:?}"),

@@ -6,8 +6,8 @@
 //! invisible inside the defining crate and this file's `assert`s run in a
 //! separate crate but still only observe what compiles here — nothing in the
 //! repository guards the attribute itself. The only thing that would is a
-//! `trybuild` compile-fail pair asserting E0639, which Phase 10 declined as
-//! a whole new test tier for one attribute.
+//! `trybuild` compile-fail pair asserting E0639, declined as a whole new
+//! test tier for one attribute.
 //!
 //! This file is a deliberate **exception** to IR-38, not an application of
 //! it. IR-38 reads: "`tests/` dir = at most one compile-only file per crate
@@ -45,8 +45,8 @@ fn the_builder_reaches_every_field_from_outside_the_crate() {
         .build();
 
     // Every field, read back across the boundary. `dog` is set to a real
-    // variant rather than `None` for the same reason Step 2.3's second
-    // assertion exists: `None` is the default, so it proves nothing.
+    // variant rather than `None`: `None` is the default, so it proves
+    // nothing.
     assert_eq!(info.id, 1);
     assert_eq!(info.name, "web");
     assert_eq!(info.status, ProcStatus::Online);

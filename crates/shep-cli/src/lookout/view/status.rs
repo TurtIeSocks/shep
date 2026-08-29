@@ -226,11 +226,9 @@ mod tests {
     /// gallery scene happens to be that width, but because that is exactly
     /// where the bug shipped: the default hint is 59 characters, the label
     /// 9, and at this width the hint truncates while the label still fits,
-    /// which is the one combination that makes a missing gap visible. (An
-    /// earlier version of this comment tied the width to the `narrow`
-    /// gallery scene; `narrow` moved to 51 columns in Phase 12b, and this
-    /// test did not need to move with it — 49 is a property of the hint and
-    /// the label, not of any one scene.)
+    /// which is the one combination that makes a missing gap visible. 49
+    /// is a property of the hint and the label, not of any one gallery
+    /// scene.
     #[test]
     fn a_truncated_hint_still_leaves_a_gap_before_the_control_label() {
         let palette = Palette::detect(None, Some(OsStr::new("xterm-256color")), None);

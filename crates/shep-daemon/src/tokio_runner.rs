@@ -2481,9 +2481,9 @@ mod tests {
     ///
     /// This message reaches a terminal now, not only the shepherd's log:
     /// `spawn_fresh` puts a `Doubtful` reason into the reply once that app's
-    /// own spawn has failed. An interactive shell's PATH measured just over
-    /// two kilobytes across thirty-one entries on this machine, and dumping
-    /// that into `error[spawn_failed]:` buries the sentence that matters.
+    /// own spawn has failed. A full interactive shell's PATH is unreadably
+    /// long (see `PATH_ENTRIES_IN_MESSAGE`'s own doc), and dumping that into
+    /// `error[spawn_failed]:` buries the sentence that matters.
     ///
     /// The short case is the one that must survive intact: a `shep startup`
     /// unit with no PATH of its own gets `assemble`'s three-entry fallback,

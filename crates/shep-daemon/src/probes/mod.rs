@@ -364,22 +364,9 @@ mod tests {
         );
     }
 
-    // No separate "a pass resets the counter" test: an earlier version of
-    // this test ran the same `[Fail, Fail, Pass, Fail, Fail]` timeline as
-    // `counter_re_accumulates_after_a_reset_and_trips_on_the_sixth_probe`
-    // below and asserted only "no failure within 5 intervals." That claim
-    // is a strict corollary of the test below's — which pins the failure to
-    // *exactly* interval 6 — not an independent one: `ScriptedProber`
-    // repeats its last scripted outcome (`Fail`) forever, so this timeline
-    // was never going to stay silent past interval 6 either way, and the
-    // 5-interval bound was really just "however far below 6 stays true," a
-    // fact the removed test never stated. Mutation testing already showed
-    // the equivalence directly — removing the counter's reset broke *both*
-    // the old absence check (an unexpected failure arrived early) and this
-    // test's exact-instant assertion (tripped at 4×interval, not 6×) for
-    // the same single-line bug. A test whose failure mode is a strictly
-    // weaker read of a fact this one already pins exactly earns deletion
-    // instead of a documentation-only note in the brief.
+    // No separate "a pass resets the counter" test: that claim is a strict
+    // corollary of the test below's, which pins the failure to *exactly*
+    // interval 6.
     //
     // fails if the counter resets on a pass but then double-counts
     // afterward, or if a reset counter never re-arms and the loop stops
@@ -584,10 +571,10 @@ mod tests {
 
     // fails if a zero (or otherwise sub-floor) `interval` is trusted instead
     // of clamped to `MIN_PROBE_INTERVAL`: an unclamped `Duration::ZERO`
-    // would spin the loop as fast as the runtime allows — measured live at
-    // roughly 380 probes/sec, which for `ProbeKind::Exec` means that many
-    // process spawns per second, per sheep, forever. `shep-core::normalize`
-    // rejects an explicit `interval = "0"` in a Flockfile, but this test
+    // would spin the loop as fast as the runtime allows (see
+    // `MIN_PROBE_INTERVAL`'s own doc for what that costs).
+    // `shep-core::normalize` rejects an explicit `interval = "0"` in a
+    // Flockfile, but this test
     // constructs a `ProbeConfig` directly (as a caller that skipped
     // normalization, or a future boot path with a bug, would) to prove this
     // loop does not simply trust that every caller validated first.

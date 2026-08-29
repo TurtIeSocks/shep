@@ -29,8 +29,8 @@
 
 pub mod app;
 // `#[cfg(test)]`: every item in `frames` is read by tests and by the gallery
-// writer, and by nothing else. The package has had a `[lib]` target since
-// Phase 14, but `pub` here still exempts nothing from `dead_code`: `mod
+// writer, and by nothing else. The package has a `[lib]` target, but `pub`
+// here still exempts nothing from `dead_code`: `mod
 // lookout` in `lib.rs` is private, not `pub mod`, and `lib.rs`'s own doc
 // comment states the crate's whole public API as three entry points, every
 // other item private — so `pub mod frames` nested inside a private module is
@@ -803,8 +803,7 @@ mod tests {
     /// nothing is read until the clock passes `MIN_REDRAW`, and then it is
     /// read once.
     ///
-    /// **Not `start_paused`, and that is a deviation from the plan's draft
-    /// worth stating rather than silently carrying.** `MIN_REDRAW`'s gate
+    /// **Not `start_paused`.** `MIN_REDRAW`'s gate
     /// reads [`std::time::Instant`] — real wall-clock, deliberately, so
     /// `App`'s clock model stays usable outside a tokio runtime at all
     /// (`App`'s own doc: "No clock. Every `Instant` arrives on the

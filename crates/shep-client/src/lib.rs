@@ -17,13 +17,11 @@
 #![doc(test(attr(deny(warnings))))]
 #![forbid(unsafe_code)]
 
-// Portable on both tiers as of the Windows port. These modules used to be
-// `#[cfg(unix)]` because `connection` named `tokio::net::UnixStream`
-// directly; it names `shep_core::transport::ClientStream` now, so the OS
-// choice is made one crate down and nothing here has a platform arm at all.
-// `spawn`'s other half of the old justification — the exit-code contract of
-// a `shep daemon` child — was never Unix-specific: it reads
-// `ExitStatus::code()`, which every platform has.
+// Portable on both tiers: `connection` names `shep_core::transport::ClientStream`
+// rather than `tokio::net::UnixStream` directly, so the OS choice is made one
+// crate down and nothing here has a platform arm at all. `spawn`'s exit-code
+// contract for a `shep daemon` child reads `ExitStatus::code()`, which every
+// platform has.
 mod actor;
 mod client;
 mod connection;

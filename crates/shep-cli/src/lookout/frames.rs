@@ -8,8 +8,7 @@
 //! deliverable (`docs/lookout/frames.txt`, `docs/lookout/frames.ansi`) and
 //! not only test scaffolding. That is the whole point of this module: Rin
 //! decides what a layout looks like from these frames, not from a spec
-//! sentence — the way Phase 12a decided 12b's and a later phase will decide
-//! search/filter's and the actions'.
+//! sentence.
 //!
 //! **Why not `TestBackend`'s own `Display`.** Two reasons, both practical:
 //! its exact framing is an upstream presentation detail that can change
@@ -22,7 +21,7 @@
 //! regenerating the gallery is one command.
 //!
 //! **`#[cfg(test)]` at the `mod` declaration in `super::mod`, not a plain
-//! `pub mod`.** The package (`shep`) has had a `[lib]` target since Phase 14,
+//! `pub mod`.** The package (`shep`) has a `[lib]` target,
 //! but that does not exempt this module from `dead_code`: `mod lookout` in
 //! `lib.rs` is private, and `lib.rs`'s own doc comment states the crate's
 //! whole public API as three entry points — `main`, `main_runtime`,
@@ -564,9 +563,8 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     // pane.
     //
     // Walked by id rather than by a fixed number of `j`s. The table reads by
-    // name, so which row `api` occupies is decided by what the other five
-    // sheep are called; two `SelectDown`s used to land on it only because the
-    // table read by id and `api` held id 2.
+    // name, so which row `api` occupies depends on what the other five
+    // sheep are called, not on its id.
     //
     // The four excluded scenes have either no flock (`Empty`) or no pane
     // below the table to describe (`Narrow`, `TooNarrow`, `TableOnly`), so
@@ -1317,9 +1315,8 @@ mod tests {
         };
         for (name, want) in [
             ("api", "1"),
-            // "billing-r", not the fuller prefix this used before task 7:
-            // the SMIT column added at this frame's width narrows NAME
-            // enough that the truncation lands one syllable earlier.
+            // "billing-r": the SMIT column at this frame's width narrows
+            // NAME enough that the truncation lands one syllable earlier.
             ("billing-r", "1"),
             ("cron", "SIGTERM"),
         ] {

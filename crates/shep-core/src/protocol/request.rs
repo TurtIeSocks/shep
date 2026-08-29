@@ -200,7 +200,7 @@ impl fmt::Display for SmitError {
 
 impl core::error::Error for SmitError {}
 
-/// One RPC request (Phase 1 verb set; later phases extend)
+/// One RPC request
 // wire format: changing existing variants is a breaking change
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -588,19 +588,14 @@ pub struct ExitInfo {
 // compares a `ProcessInfo` for total equality — `assert_eq!` needs only
 // `PartialEq`, and no listing is keyed on, hashed by, or sorted by a whole
 // row.
-/// `#[non_exhaustive]`: this struct has now grown a field in five separate
-/// phases (`out_file`/`err_file`, then `cpu_percent`/`memory_bytes`, then
-/// `dog`, then `lambs`, then `last_exit`) with no hand-edit sweep across the
-/// workspace for any of them — the attribute is paying for itself exactly
-/// as advertised. Corrected from an earlier version of this comment, which
-/// overstated `deferred.md`'s own `ProcessInfo` entry as a warning against
-/// growing this struct at all: what that entry actually defers is
-/// SPLITTING it into several smaller types, and calls this attribute plus
-/// [`ProcessInfo::builder`] "deliberately the opposite of forcing the split
-/// early" — i.e. exactly what makes a field like `last_exit` cheap to add
-/// for a concrete operator need, not a reason to withhold one. Use
-/// [`ProcessInfo::builder`] to construct one; the fields stay `pub`, so
-/// reading them and assigning to them are both unchanged.
+/// `#[non_exhaustive]`: this struct grows fields over time with no hand-edit
+/// sweep needed across the workspace. `deferred.md`'s own `ProcessInfo`
+/// entry defers SPLITTING it into several smaller types, not growing it —
+/// this attribute plus [`ProcessInfo::builder`] is "deliberately the
+/// opposite of forcing the split early," which is what makes a field like
+/// `last_exit` cheap to add for a concrete operator need, not a reason to
+/// withhold one. Use [`ProcessInfo::builder`] to construct one; the fields
+/// stay `pub`, so reading them and assigning to them are both unchanged.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessInfo {
@@ -711,14 +706,13 @@ pub struct ProcessInfo {
 /// being a sort key and stays an addressing key.
 ///
 /// This is the ONLY ordering rule in shep, and the daemon's own
-/// `snapshot_all` calls this function rather than restating it. It used to
-/// sort the richer `(name, instance, id)`, which is strictly more stable
-/// where a reload has given a slot a fresh id -- and which was a second rule
-/// no listing that has crossed the wire could reproduce, since
-/// [`ProcessInfo`] carries no instance number. The two agreed until a reload
-/// churned an id and then disagreed, so `ListFlock` could order a reloaded
-/// app differently from the `Restart` reply printed a second earlier. One
-/// rule everywhere is worth more than a finer one in half the places.
+/// `snapshot_all` calls this function rather than restating it. A richer
+/// `(name, instance, id)` order would be more stable where a reload has
+/// given a slot a fresh id, but it is a rule no listing that has crossed
+/// the wire could reproduce, since [`ProcessInfo`] carries no instance
+/// number — so `ListFlock` could order a reloaded app differently from the
+/// `Restart` reply printed a second earlier. One rule everywhere is worth
+/// more than a finer one in half the places.
 pub fn sort_flock(listing: &mut [ProcessInfo]) {
     listing.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
 }
@@ -1384,8 +1378,8 @@ mod tests {
             restarts: 1,
             uptime_ms: 60_000,
             fold: Some("backend".to_string()),
-            out_file: Some("/home/rin/.shep/logs/web-0-out.log".to_string()),
-            err_file: Some("/home/rin/.shep/logs/web-0-err.log".to_string()),
+            out_file: Some("/home/ada/.shep/logs/web-0-out.log".to_string()),
+            err_file: Some("/home/ada/.shep/logs/web-0-err.log".to_string()),
             // 12.5 rather than a rounder-looking 12.3: an insta JSON
             // snapshot is only stable across platforms for a float the
             // binary representation holds exactly.
@@ -1440,8 +1434,8 @@ mod tests {
             .restarts(1)
             .uptime_ms(60_000)
             .fold(Some("backend".to_string()))
-            .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
-            .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+            .out_file(Some("/home/ada/.shep/logs/web-0-out.log".to_string()))
+            .err_file(Some("/home/ada/.shep/logs/web-0-err.log".to_string()))
             .cpu_percent(Some(12.5))
             .memory_bytes(Some(48 * 1024 * 1024))
             .dog(None)
@@ -1586,8 +1580,8 @@ mod tests {
     /// the same skew rule every other field added after `Hello`/`HelloAck`
     /// were fixed is pinned under.
     ///
-    /// This is also the empirical proof behind task 49's own open question:
-    /// none of `ProcessInfo`'s fields carry `#[serde(default)]`, and there is
+    /// This is also the empirical proof of a subtle point: none of
+    /// `ProcessInfo`'s fields carry `#[serde(default)]`, and there is
     /// no container-level one either, yet the doc comments on `out_file` and
     /// `cpu_percent` both claim "`None` only when the peer daemon predates
     /// this field" as though one existed. Serde's `Deserialize` derive
@@ -1863,7 +1857,6 @@ mod tests {
                     name: "metrics".to_string(),
                 },
             },
-            // The three selector shapes no fixture reached before Phase 10.
             // Grouped and adjacent on purpose: `Id`, `Regex` and `Fold` are
             // three newtypes over three different inner types, and the wire
             // tells them apart only by their own `kind` tag — a `Fold` that
@@ -2007,7 +2000,7 @@ mod tests {
             Reply {
                 id: 5,
                 result: Ok(Response::RollSaved {
-                    path: "/home/rin/.shep/flock.json".to_string(),
+                    path: "/home/ada/.shep/flock.json".to_string(),
                     apps: 2,
                 }),
             },
@@ -2049,8 +2042,7 @@ mod tests {
                     ..sample_info()
                 })),
             },
-            // The eleven variants no fixture reached before Phase 10. The
-            // existing comment on the `Triggered` row is right that pinning
+            // The existing comment on the `Triggered` row is right that pinning
             // `Flock` once already proves the `Vec<ProcessInfo>` SHAPE — but
             // it does not prove any of these variants' own `kind` tags, and
             // three of them are not `Vec<ProcessInfo>`-shaped at all

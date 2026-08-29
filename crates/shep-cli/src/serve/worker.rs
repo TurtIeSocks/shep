@@ -3,7 +3,7 @@
 //! whole argument was building toward.
 //!
 //! `#[cfg(unix)]`: this module binds a real listener and reads real files,
-//! the same reason `serve::fs` is unix-only (Task 3) and `lookout`/`whistle`
+//! the same reason `serve::fs` is unix-only and `lookout`/`whistle`
 //! already are. `path`, `mime`, `listing` and `auth` stay pure; this is the
 //! module that actually calls them.
 //!

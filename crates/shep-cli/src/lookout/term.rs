@@ -71,9 +71,7 @@ pub fn install_panic_hook() {
 /// accident and never appears on the command surface — no clap variant, no
 /// `--help` entry, same reasoning as the hidden `daemon`/`dog` subcommands.
 ///
-/// This is the permanent replacement for the by-hand check Phase 12a's
-/// Task 7 report describes doing once, under `script`, and then deleting:
-/// confirming that [`install_panic_hook`] restores the terminal BEFORE the
+/// Confirms that [`install_panic_hook`] restores the terminal BEFORE the
 /// previous hook prints its backtrace, so a crash lands on a cooked
 /// main-screen terminal rather than a raw alternate one.
 /// `tests/term_panic_order.rs` drives this function through a real

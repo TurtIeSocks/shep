@@ -347,11 +347,10 @@ fn named_flock() -> Vec<ProcessInfo> {
 /// at id 2, which is the sheep every action assertion in this file names.
 ///
 /// The cursor is WALKED to `api` rather than moved a fixed number of rows.
-/// The table reads by name, so which row `api` occupies is decided by what
-/// the other three sheep happen to be called; this used to press `j` once and
-/// land on `api` only because the table read by id and `api` held id 2. A
-/// fixture that silently selects a different sheep than its doc claims is
-/// worse than one that fails, so the walk asserts it arrived.
+/// The table reads by name, so which row `api` occupies depends on what
+/// the other three sheep happen to be called, not on its id. A fixture
+/// that silently selects a different sheep than its doc claims is worse
+/// than one that fails, so the walk asserts it arrived.
 pub fn allowed_app() -> App {
     let mut app = app_with(named_flock(), plain());
     app.set_control_for_tests(Control::Allowed);

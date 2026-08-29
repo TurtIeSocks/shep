@@ -44,9 +44,9 @@ fn symlink_refusal_notice(path: &Path) -> String {
 /// included, unless `follow_symlinks` is set.** A leaf-only check misses the
 /// swapped-directory case, which is the same escape one level up. There is
 /// no `canonicalize` in this branch: it is a blocking syscall on a path this
-/// function is about to walk anyway, and per-request canonicalization is
-/// what an earlier draft used to justify accepting a TOCTOU it did not need
-/// to accept. When the walk refuses a component for being a symlink, it
+/// function is about to walk anyway, and per-request canonicalization
+/// would accept a TOCTOU this design does not need to accept. When the
+/// walk refuses a component for being a symlink, it
 /// writes one line to stderr, via [`symlink_refusal_notice`], naming the
 /// refused path and `--follow-symlinks` — the sheep's own bleats, and the
 /// only place an operator can tell "refused a symlink" apart from

@@ -328,9 +328,7 @@ pub fn tree_rss(table: &[ProcessRss], root: u32) -> u64 {
 mod tests {
     use super::*;
 
-    /// A reading with no CPU time on it, for the memory cases: every one of
-    /// them predates `cpu_ms` and stays byte-for-byte what it was, so a
-    /// regression in one of them still means what it used to mean.
+    /// A reading with no CPU time on it, for the memory cases.
     fn rss(pid: u32, parent: Option<u32>, bytes: u64) -> ProcessRss {
         rss_cpu(pid, parent, bytes, 0)
     }

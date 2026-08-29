@@ -359,7 +359,7 @@ impl ExtrasRegistry {
         }
         // An app whose watch can NEVER arm — a cwd that will never resolve —
         // pays a fresh `canonicalize`, a fresh globset compile and a fresh
-        // `warn!` on every re-arm, where it used to be attempted once and then
+        // `warn!` on every re-arm, rather than being attempted once and then
         // left alone. That is the price of retrying the transient failures
         // (`max_user_watches` exhausted, a cwd not yet created) that the
         // rebuild exists for, and it is bounded by `max_restarts`; permanent
@@ -1163,10 +1163,10 @@ mod tests {
     // the same app's cron worker — the whole reason `arm_watch` reports its
     // failures instead of propagating them.
     //
-    // A mistyped glob used to be this case's trigger. It cannot be any more:
-    // `normalize` compiles both glob lists, so `app_with` would reject such a
-    // config before this test could arm it. An unresolvable cwd is the
-    // config-shaped watch failure that survives normalization.
+    // A mistyped glob cannot trigger this case: `normalize` compiles both
+    // glob lists, so `app_with` would reject such a config before this test
+    // could arm it. An unresolvable cwd is the config-shaped watch failure
+    // that survives normalization.
     #[tokio::test(start_paused = true)]
     async fn a_watch_root_that_will_not_resolve_costs_the_app_its_watch_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
@@ -1731,9 +1731,8 @@ mod tests {
 
     // fails if `arm_watch` hands `watch_delay` to the debouncer as written.
     // `notify-debouncer-full` derives its poll tick as `delay / 4` and sleeps
-    // it on a dedicated OS thread, so a zero makes that thread
-    // `loop { sleep(0); lock(); }` — measured at 5.98s of user CPU across a
-    // three-second watch that costs 0.00s at the 500ms default.
+    // it on a dedicated OS thread, so a zero makes that thread spin (see
+    // `MIN_WATCH_DELAY`'s own doc for what that costs).
     //
     // A direct call rather than an armed registry, and deliberately so:
     // `shep-core`'s `normalize` refuses `watch_delay = "0"`, and a
