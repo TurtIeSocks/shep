@@ -2,4 +2,4 @@
 source: crates/shep-cli/src/output/mod.rs
 expression: "String::from_utf8(out).unwrap()"
 ---
-{"schema_version":2,"notice":{"code":"init","message":"wrote /tmp/x/Flockfile.toml"}}
+{"schema_version":1,"notice":{"code":"init","message":"wrote /tmp/x/Flockfile.toml"}}

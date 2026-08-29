@@ -162,7 +162,7 @@ ID  NAME    OUTCOME  DETAIL
 5   chatty  replied  handled reload-config params=verbose
 
 $ shep trigger chatty ping --format json
-{"schema_version":2,"command":"trigger","data":[{"id":5,"name":"chatty","outcome":{"kind":"replied","body":"handled ping params=None"}}]}`}</CodeBlock>
+{"schema_version":1,"command":"trigger","data":[{"id":5,"name":"chatty","outcome":{"kind":"replied","body":"handled ping params=None"}}]}`}</CodeBlock>
 
     <h2>Custom actions: the part most worth reading closely</h2>
     <VerbSignature verb="trigger" usage="shep trigger <selector> <action> [params]">

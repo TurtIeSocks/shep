@@ -35,7 +35,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       flock:
     </p>
     <CodeBlock label="shep flock --format json">{`{
-  "schema_version": 2,
+  "schema_version": 1,
   "command": "flock",
   "data": [
     {
@@ -93,7 +93,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       result:
     </p>
     <CodeBlock label="shep describe doesnotexist --format json">{`{
-  "schema_version": 2,
+  "schema_version": 1,
   "error": {
     "code": "not_found",
     "message": "the daemon reported NotFound: selector matched no registered sheep"
@@ -111,7 +111,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 
     <h2>What <code>schema_version</code> promises</h2>
     <p>
-      It's at <code>2</code> today, and it moves only for a breaking change
+      It's at <code>1</code> today, and it moves only for a breaking change
       to some command's <code>data</code> shape: a field renamed, removed,
       or given a different type. Adding a new field to an existing payload
       does <strong>not</strong> bump it: a consumer that reads the keys it
@@ -167,7 +167,7 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       it prints one JSON object per line, newline-delimited, with no
       <code>command</code> or <code>data</code> wrapper.
     </Callout>
-    <CodeBlock label="shep bleats web --format json">{`{"schema_version":2,"id":0,"name":"web","stream":"out","instance":null,"line":"…"}`}</CodeBlock>
+    <CodeBlock label="shep bleats web --format json">{`{"schema_version":1,"id":0,"name":"web","stream":"out","instance":null,"line":"…"}`}</CodeBlock>
     <p>
       <code>instance</code> is the sheep's slot within its app, when that
       app has more than one instance registered; <code>null</code>

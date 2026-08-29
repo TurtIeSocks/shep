@@ -101,7 +101,9 @@ Everything downstream degrades to today's behaviour when it sees `None`: no
 grouping, no suffix, no slot in a bleats prefix, and `name:slot` matches
 nothing. Against an old daemon the output is exactly what it is now.
 
-Additive for JSON consumers, and the output envelope's `SCHEMA_VERSION` bumps.
+Additive for JSON consumers, so the output envelope's `SCHEMA_VERSION` stays
+at 1: it moves only for a field renamed, removed, or retyped, which a new
+field is not.
 
 **`sort_flock` becomes `(name, instance, id)`.** Its doc already argues for
 this order and rules it out for one reason: "it is a rule no listing that has
@@ -371,6 +373,6 @@ JSON object, so also check `getting-started.astro`, `examples.astro`,
 | `:` refused in names | a sheep named with one | rename, and note it was already broken on Windows |
 | explicit `out_file` with `instances > 1` | a Flockfile that silently merged | add `{{instance}}` to the path, or `merge_logs = true` |
 | `SelectorSpec` variant added | an old daemon meeting a new CLI | restart the daemon |
-| `ProcessInfo.instance` added | a JSON consumer | additive, `SCHEMA_VERSION` bumps |
+| `ProcessInfo.instance` added | a JSON consumer | additive, `SCHEMA_VERSION` stays 1 |
 | bleats stops repeating a shared file | anyone parsing its output | they were reading duplicates, so nothing to do |
 | bleats prefix gains `:slot` | a script splitting on `\|` | match the name loosely, or read the JSON arm's `instance` |
