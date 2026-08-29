@@ -701,7 +701,7 @@ pub enum NormalizeError {
         name: String,
         /// Which field, for example `env.WORKER` or `args[1]`
         field: String,
-        /// The [`crate::config::template::TemplateError`], rendered, so this
+        /// The template grammar's own error, rendered, so this
         /// variant does not have to restate the grammar's own copy
         reason: String,
     },

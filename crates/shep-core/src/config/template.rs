@@ -25,9 +25,14 @@ use core::fmt;
 const TOKENS: &[&str] = &["instance", "name"];
 
 /// A value that is not a valid template.
+///
+/// `pub(crate)`, like [`validate`] that produces it: `normalize` is the only
+/// caller, and it renders this into its own
+/// [`NormalizeError::BadTemplate`](super::normalize::NormalizeError::BadTemplate)
+/// rather than handing it on. Nothing outside shep-core has ever named it.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TemplateError {
+pub(crate) enum TemplateError {
     /// A `{{...}}` naming something this grammar does not define
     UnknownToken {
         /// The token as the user wrote it, without the braces
@@ -106,11 +111,16 @@ fn walk(
 
 /// Checks that every `{{...}}` in `value` names a token this grammar defines.
 ///
+/// `pub(crate)`: config time is the only moment this question is asked, and
+/// `normalize` is where config time happens. [`render`] stays public because
+/// shep-daemon's `assemble` substitutes on values `normalize` has already
+/// passed.
+///
 /// # Errors
 ///
 /// - [`TemplateError::UnknownToken`]: a token this grammar does not define.
 /// - [`TemplateError::Unclosed`]: a `{{` with no closing `}}`.
-pub fn validate(value: &str) -> Result<(), TemplateError> {
+pub(crate) fn validate(value: &str) -> Result<(), TemplateError> {
     walk(value, |segment| match segment {
         Segment::Literal(_) => Ok(()),
         Segment::Token(token) if TOKENS.contains(&token) => Ok(()),
@@ -122,7 +132,7 @@ pub fn validate(value: &str) -> Result<(), TemplateError> {
 
 /// Substitutes the tokens in `value`.
 ///
-/// Call [`validate`] first: an unknown token here renders as nothing, because
+/// Call `validate` first: an unknown token here renders as nothing, because
 /// `normalize` is the seam that refuses one and a value reaching this
 /// function has already passed it. An unclosed `{{` is the other case
 /// `validate` exists to catch before this function ever sees the value: on
