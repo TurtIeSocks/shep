@@ -1,6 +1,6 @@
 [package]
 name = "shep"
-description = "The shep binary: a process manager that keeps a flock of long-running processes alive on macOS and Linux, with logs, watch and cron restarts, and webhook alerts"
+description = "The shep binary: a process manager that keeps a flock of long-running processes alive on macOS, Linux and Windows, with logs, watch and cron restarts, and webhook alerts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
