@@ -58,7 +58,7 @@
 //! stopped still has a file to read, while it has nothing left to publish
 //! to the bus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -328,6 +328,12 @@ fn tail_log_files(
 
     let mut failure = false;
 
+    // One file, one read. Several instances can resolve to one path: every
+    // `merge_logs` app does, and so does any app that set `out_file`
+    // explicitly. Reading per row printed the file once per instance.
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut seen_notices: HashSet<String> = HashSet::new();
+
     for info in matched {
         let name = &info.name;
         let wanted: [(&'static str, Option<&str>, bool); 2] = [
@@ -339,45 +345,53 @@ fn tail_log_files(
                 continue;
             }
             match path {
-                None => write_notice(
-                    streams,
-                    quiet,
-                    "log_path_unknown",
-                    &format!("{name}: the daemon did not report a {stream_name} log path"),
-                ),
-                Some(path) => match read_tail(Path::new(path), args.lines) {
-                    Ok((lines, _truncated)) => {
-                        for line in lines {
-                            if let Err(write_err) = write_line(
-                                streams.out,
-                                streams.fmt,
-                                info.id,
-                                name,
-                                stream_name,
-                                &line,
-                            ) {
-                                let code = write_outcome(Err(write_err));
-                                let _ = streams.out.flush();
-                                return code;
+                None => {
+                    // No path to key on, since the missing field is why this
+                    // fires. The message already names the pair that varies.
+                    let message =
+                        format!("{name}: the daemon did not report a {stream_name} log path");
+                    if seen_notices.insert(message.clone()) {
+                        write_notice(streams, quiet, "log_path_unknown", &message);
+                    }
+                }
+                Some(path) => {
+                    if !seen_paths.insert(path.to_string()) {
+                        continue;
+                    }
+                    match read_tail(Path::new(path), args.lines) {
+                        Ok((lines, _truncated)) => {
+                            for line in lines {
+                                if let Err(write_err) = write_line(
+                                    streams.out,
+                                    streams.fmt,
+                                    info.id,
+                                    name,
+                                    stream_name,
+                                    &line,
+                                ) {
+                                    let code = write_outcome(Err(write_err));
+                                    let _ = streams.out.flush();
+                                    return code;
+                                }
                             }
                         }
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                            // Silent: the daemon creates both files at spawn,
+                            // so a missing file means this sheep has never
+                            // run in this $SHEP_HOME. A notice per quiet
+                            // sheep would spam stderr on a fresh flock.
+                        }
+                        Err(err) => {
+                            failure = true;
+                            write_notice(
+                                streams,
+                                quiet,
+                                "log_unreadable",
+                                &format!("failed to read {path}: {err}"),
+                            );
+                        }
                     }
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                        // Silent: the daemon creates both files at spawn, so
-                        // a missing file means this sheep has never run in
-                        // this $SHEP_HOME. A notice per quiet sheep would
-                        // spam stderr on a fresh flock.
-                    }
-                    Err(err) => {
-                        failure = true;
-                        write_notice(
-                            streams,
-                            quiet,
-                            "log_unreadable",
-                            &format!("failed to read {path}: {err}"),
-                        );
-                    }
-                },
+                }
             }
         }
     }
@@ -1556,6 +1570,49 @@ mod tests {
     /// than `limit` lines. Before this test, `read_tail` reported `false`
     /// here, and `whistle`'s `tail_bleats` handed a model exactly that
     /// wrong answer.
+    /// Two instances sharing one log file (a `merge_logs` app, or any app
+    /// with an explicit `out_file`) must be read once, not once per
+    /// instance: reading per row printed the whole file once per instance
+    /// pointing at it.
+    #[test]
+    fn instances_sharing_one_log_file_are_read_once_not_once_each() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("talker-out.log");
+        std::fs::write(&shared, "line one\nline two\n").expect("write");
+
+        let shared_path = shared.to_string_lossy().to_string();
+        let mut cache = HashMap::new();
+        for id in 0..2u32 {
+            cache.insert(
+                id,
+                ProcessInfo::builder(id, "talker", ProcStatus::Online)
+                    .out_file(Some(shared_path.clone()))
+                    .err_file(Some(shared_path.clone()))
+                    .build(),
+            );
+        }
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+            style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
+        };
+        let args = no_follow_args_out("talker");
+        let selector = ProcessSelector::parse("talker").expect("selector");
+
+        tail_log_files(&mut streams, false, &cache, &selector, &args);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            printed.matches("line one").count(),
+            1,
+            "one file, one read, however many instances point at it:\n{printed}"
+        );
+    }
+
     #[test]
     fn read_tail_reports_truncated_on_a_byte_window_cut_alone() {
         let dir = tempfile::tempdir().unwrap();
