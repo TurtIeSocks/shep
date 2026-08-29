@@ -952,11 +952,12 @@ mod tests {
     /// which sheep wrote a line -- the daemon emits `BusEvent::LogOut` per
     /// sheep -- so it labels a multi-instance app's lines with their slot
     /// even though `info_with_instance`'s two rows would share a file if
-    /// this went through the backlog path. `resolved_instance` is the only
-    /// thing that can produce this label; dropping its `instance_count`
-    /// gate, or failing to thread `instance` into `handle_event`'s
-    /// `LogOut`/`LogErr` arms, both turn this red without touching a single
-    /// other test in this module (see the fix report for the manual check).
+    /// this went through the backlog path. This test alone only catches a
+    /// `resolved_instance` that drops the label outright; the gate that
+    /// decides WHEN to apply it and the `LogErr` arm's own threading each
+    /// have their own test below
+    /// (`a_single_instance_app_with_a_slot_on_its_row_still_follows_bare`,
+    /// `a_multi_instance_apps_followed_stderr_line_carries_its_slot_too`).
     #[tokio::test]
     async fn a_multi_instance_apps_follow_labels_its_lines_with_the_slot() {
         let dir = tempfile::tempdir().unwrap();
@@ -1053,6 +1054,100 @@ mod tests {
         assert!(
             out.contains("web:0 | from-slot-0"),
             "a selector narrowed to one instance must not strip its label: {out}"
+        );
+    }
+
+    /// Guards the `instance_count(cache, &info.name) > 1` gate in
+    /// `resolved_instance` specifically: `info_with_instance`'s row DOES
+    /// carry `.instance(Some(0))`, so a `resolved_instance` that returned
+    /// `info.instance` unconditionally -- skipping the "more than one
+    /// instance registered" check -- would still print `web:0` here. Only a
+    /// cache with a single row for the app can catch that.
+    #[tokio::test]
+    async fn a_single_instance_app_with_a_slot_on_its_row_still_follows_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info_with_instance(1, "web", 0)]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "hello".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &follow_args("web")),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("web | hello"),
+            "one registered instance means no slot to report, even though this row \
+             carries one: {out}"
+        );
+        assert!(
+            !out.contains("web:0"),
+            "a slot must not leak onto a single-instance app's followed output: {out}"
+        );
+    }
+
+    /// Guards `handle_event`'s `LogErr` arm specifically: it threads
+    /// `instance` on its own, separately from `LogOut`'s. A follow that
+    /// labelled stdout but not stderr passes every other test in this
+    /// module and fails only this one.
+    #[tokio::test]
+    async fn a_multi_instance_apps_followed_stderr_line_carries_its_slot_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![
+            info_with_instance(1, "web", 0),
+            info_with_instance(2, "web", 1),
+        ]);
+        daemon
+            .push(BusEvent::LogErr {
+                id: 2,
+                line: "boom".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &follow_args("web")),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("web:1 | boom"),
+            "a followed stderr line must carry its slot exactly as stdout does: {out}"
         );
     }
 
