@@ -237,8 +237,8 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     // Everything from `y` up to `floor`, exactly as Task 2 left it, save for
     // the viewport now stopping at `floor` rather than at the status bar.
     let viewport = usize::from(floor - y);
-    let rows = app.rows();
-    if rows.is_empty() {
+    let keys = app.visible_rows();
+    if keys.is_empty() {
         // Two sentences, because there are two reasons and an operator cannot
         // tell them apart from a blank table. `the flock is empty` stays for
         // the case it describes and no other.
@@ -250,20 +250,21 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         let line = Line::from(Span::styled(text, palette.muted()));
         buffer.set_line(area.x, y, &line, width);
     } else {
-        let offset = flock::scroll_offset(app.selected_index().unwrap_or(0), viewport, rows.len());
-        for (slot, row) in rows.iter().skip(offset).take(viewport).enumerate() {
+        let offset = flock::scroll_offset(app.selected_index().unwrap_or(0), viewport, keys.len());
+        let selected = app.selected();
+        for (slot, key) in keys.iter().skip(offset).take(viewport).enumerate() {
             let slot = u16::try_from(slot).unwrap_or(0);
-            let selected = app.selected() == Some(row.info.id);
+            let is_selected = selected.as_ref() == Some(key);
             buffer.set_line(
                 area.x,
                 y + slot,
-                &Line::from(Span::raw(flock::mark(selected))),
+                &Line::from(Span::raw(flock::mark(is_selected))),
                 1,
             );
             buffer.set_line(
                 area.x + flock::GUTTER,
                 y + slot,
-                &flock::row_line(app, row, columns, table_width),
+                &flock::key_line(app, key, columns, table_width),
                 table_width,
             );
         }

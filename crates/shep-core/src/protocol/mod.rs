@@ -1,8 +1,26 @@
-//! The client<->daemon wire protocol (version 1)
+//! The client<->daemon wire protocol (version 2)
 //!
 //! Typed request/response enums + bus events. Framing lives in [`wire`];
 //! every type here is snapshot-pinned — changing any serialized shape is a
 //! protocol version bump recorded in the CHANGELOG.
+//!
+//! **What version 2 added:** the instance slot on [`ProcessInfo`]. A sheep
+//! that is one of several instances of an app reports which slot it is, so
+//! every listing can group an app's instances and roll their numbers up
+//! rather than showing several rows that share a name and explain nothing.
+//! A sheep reports its own slot, counting from 0, so a single-instance app
+//! reports `Some(0)`. `None` means the peer daemon predates the field, and a
+//! reader that finds it should render exactly what it rendered before this
+//! field existed.
+//!
+//! **Two sets of tests carry a version in their name and they assert
+//! opposite things.** The `*_wire_v2` snapshots pin the shape this crate
+//! serializes TODAY, so they follow [`PROTOCOL_VERSION`] and get renamed
+//! whenever it moves. The `v1_*_fixture_still_deserializes` tests pin a
+//! literal payload captured from a version 1 peer and assert it STILL
+//! decodes, so their name records where the bytes came from and never
+//! moves; renaming one would erase the compatibility claim it exists to
+//! make.
 
 pub mod channel;
 pub mod events;
@@ -29,4 +47,4 @@ pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 /// Removing, renaming, or retyping anything serialized bumps it, recorded in
 /// the CHANGELOG. Byte fixtures in each protocol module pin the deserialize
 /// direction.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;

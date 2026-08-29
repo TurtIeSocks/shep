@@ -210,6 +210,7 @@ mod tests {
                     // pins the encoding a subscriber reads, and a smit is
                     // the one field on this row a third party writes.
                     smit: Some("\u{25b2} main@a1b2c3".to_string()),
+                    instance: None,
                 },
                 manually: false,
                 at_ms: 1_700_000_000_000,
@@ -219,6 +220,18 @@ mod tests {
                 line: "listening on :8080".to_string(),
             },
             BusEvent::Dropped { count: 17 },
+            // The row above pins `instance`'s absent shape; every lifecycle
+            // row below reuses it via `sample`. This is the only place the
+            // present shape (a live slot on a scaled app) is on the wire.
+            BusEvent::Process {
+                event: ProcessEventKind::Online,
+                info: ProcessInfo::builder(4, "web", ProcStatus::Online)
+                    .pid(Some(5150))
+                    .instance(Some(2))
+                    .build(),
+                manually: false,
+                at_ms: 1_700_000_000_000,
+            },
         ];
 
         // The lifecycle kinds exercised here (the reload trio has its own
@@ -287,7 +300,7 @@ mod tests {
             },
         ]);
 
-        insta::assert_json_snapshot!("bus_event_wire_v1", events);
+        insta::assert_json_snapshot!("bus_event_wire_v2", events);
     }
 
     #[test]
@@ -346,6 +359,7 @@ mod tests {
                     lambs: None,
                     last_exit: None,
                     smit: None,
+                    instance: None,
                 },
                 manually: true,
                 at_ms: 0,

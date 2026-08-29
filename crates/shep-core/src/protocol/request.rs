@@ -45,6 +45,22 @@ pub enum SelectorSpec {
     Regex(String),
     /// By fold name
     Fold(String),
+    // Both field names are part of the wire contract, and the byte shape is
+    // pinned by `request_wire_v2`, so renaming either breaks that snapshot
+    // rather than sliding through unnoticed.
+    /// By app name and instance slot
+    ///
+    /// Added in protocol 2, and the reason that version exists: a daemon
+    /// built against protocol 1 has no such variant and refuses a client
+    /// that sends one at the handshake, rather than failing to decode it
+    /// later. On the wire this is `{"kind":"instance","value":{"name":
+    /// "web","slot":2}}`, following the enum's own `kind`/`value` tagging.
+    Instance {
+        /// The app name
+        name: String,
+        /// The instance slot, counting from 0
+        slot: u32,
+    },
 }
 
 /// A short marker a dog attaches to a sheep for `shep flock` to paint.
@@ -685,10 +701,19 @@ pub struct ProcessInfo {
     /// Every instance of a name shows the same marker: smits are keyed by
     /// sheep name, not by instance id.
     pub smit: Option<String>,
+    /// Which instance slot of its app this sheep occupies, counting from 0.
+    ///
+    /// `None` when the peer daemon predates the field, the same skew rule
+    /// [`Self::out_file`] documents for itself. Deliberately not a bare
+    /// `u32` defaulted to 0: an app stocked to four instances would then
+    /// report four rows all claiming slot 0, which is the silently-wrong
+    /// zero [`Self::dog`] warns against. A reader that finds `None` should
+    /// render exactly what it rendered before this field existed.
+    pub instance: Option<u32>,
 }
 
 /// Orders one flock listing the way every operator-facing surface presents
-/// one: by name, then by id.
+/// one: by name, then by instance slot, then by id.
 ///
 /// # Why name first
 ///
@@ -710,15 +735,17 @@ pub struct ProcessInfo {
 /// being a sort key and stays an addressing key.
 ///
 /// This is the ONLY ordering rule in shep, and the daemon's own
-/// `snapshot_all` calls this function rather than restating it. A richer
-/// `(name, instance, id)` order would be more stable where a reload has
-/// given a slot a fresh id, but it is a rule no listing that has crossed
-/// the wire could reproduce, since [`ProcessInfo`] carries no instance
-/// number — so `ListFlock` could order a reloaded app differently from the
-/// `Restart` reply printed a second earlier. One rule everywhere is worth
-/// more than a finer one in half the places.
+/// `snapshot_all` calls this function rather than restating it. The order is
+/// `(name, instance, id)`: [`ProcessInfo::instance`] now carries the slot a
+/// row occupies, so a reload that hands slot 0 a fresh id no longer moves
+/// that row out of place. A listing whose rows all carry `None` (an older
+/// peer daemon, or a row with no slot to report) collapses to the same
+/// `(name, id)` order this function used before the field existed, because
+/// `None` sorts before every `Some` and every row in that listing shares it.
 pub fn sort_flock(listing: &mut [ProcessInfo]) {
-    listing.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
+    listing.sort_unstable_by(|a, b| {
+        (a.name.as_str(), a.instance, a.id).cmp(&(b.name.as_str(), b.instance, b.id))
+    });
 }
 
 impl ProcessInfo {
@@ -753,6 +780,7 @@ impl ProcessInfo {
                 lambs: None,
                 last_exit: None,
                 smit: None,
+                instance: None,
             },
         }
     }
@@ -849,6 +877,12 @@ impl ProcessInfoBuilder {
     /// Sets the marker a dog has painted on this sheep; `None` when none has.
     pub fn smit(mut self, smit: Option<String>) -> Self {
         self.info.smit = smit;
+        self
+    }
+
+    /// Sets the instance slot; `None` when the peer daemon predates the field.
+    pub fn instance(mut self, instance: Option<u32>) -> Self {
+        self.info.instance = instance;
         self
     }
 
@@ -1172,10 +1206,12 @@ pub enum Response {
     /// listed here as the no-op success it is, so this carries the same
     /// matches `Describe` would.
     Reloading(Vec<ProcessInfo>),
+    // The order is cited as [`sort_flock`]'s shared rule rather than restated
+    // as this reply's own, so the two cannot drift apart.
     /// Answer to `Scale` — the app's instances that will REMAIN, one row
-    /// each, by name and then by id ([`sort_flock`]). Every row shares one
-    /// name here, so that is id order in practice; it is stated as the shared
-    /// rule rather than as this reply's own so the two cannot drift.
+    /// each, by name, then by instance slot, then by id ([`sort_flock`]).
+    /// Every row shares one name here, so in practice that is slot order,
+    /// with the id breaking a tie only where two rows report the same slot.
     ///
     /// Scaling up, these are the instances that exist, the new ones included,
     /// and the answer is complete.
@@ -1399,6 +1435,7 @@ mod tests {
                 signal: None,
             }),
             smit: None,
+            instance: None,
         }
     }
 
@@ -1958,8 +1995,25 @@ mod tests {
                 deadline_ms: None,
                 body: Request::ConfigDrift { apps: Vec::new() },
             },
+            // The only STRUCT-shaped `SelectorSpec` variant, and the one
+            // whose serialized shape moved `PROTOCOL_VERSION` from 1 to 2.
+            // Every other selector on this wire is a unit or a newtype, both
+            // already pinned by the rows above, so this row is the only place
+            // `"kind":"instance"` and the `slot` key are held to anything.
+            // Without it, renaming the field or flattening the variant turned
+            // nothing red on the exact type the version bump was for.
+            Envelope {
+                id: 23,
+                deadline_ms: None,
+                body: Request::Restart {
+                    selector: SelectorSpec::Instance {
+                        name: "web".to_string(),
+                        slot: 2,
+                    },
+                },
+            },
         ];
-        insta::assert_json_snapshot!("request_wire_v1", requests);
+        insta::assert_json_snapshot!("request_wire_v2", requests);
     }
 
     #[test]
@@ -2219,14 +2273,27 @@ mod tests {
                     ),
                 ])),
             },
+            // `sample_info()` pins `instance`'s absent shape (`None`, an old
+            // peer or a single-instance app); every row above reuses it, so
+            // without this row the present shape (`Some(2)`, a live slot on
+            // a scaled app) is never on the wire at all.
+            Reply {
+                id: 27,
+                result: Ok(Response::Flock(vec![
+                    ProcessInfo::builder(9, "web", ProcStatus::Online)
+                        .pid(Some(5150))
+                        .instance(Some(2))
+                        .build(),
+                ])),
+            },
         ];
-        insta::assert_json_snapshot!("reply_wire_v1", replies);
+        insta::assert_json_snapshot!("reply_wire_v2", replies);
     }
 
     /// fails if the new field breaks an older peer, on the same terms as
     /// `last_exit` and `lambs` before it. A daemon that predates smits sends
     /// no `smit` key, and this decoding to `None` rather than erroring is
-    /// what keeps `PROTOCOL_VERSION` at 1.
+    /// what keeps `PROTOCOL_VERSION` at 2 rather than needing another bump.
     #[test]
     fn a_process_info_without_a_smit_key_still_deserializes() {
         let fixture = r#"{"id":1,"name":"web","status":"online","pid":42,"restarts":0,"uptime_ms":10,"fold":null,"out_file":null,"err_file":null,"cpu_percent":null,"memory_bytes":null,"dog":null,"lambs":null,"last_exit":null}"#;
@@ -2315,7 +2382,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&hello).unwrap();
-        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":1}"#);
+        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":2}"#);
     }
 
     #[test]
@@ -2558,6 +2625,65 @@ mod tests {
             seen,
             vec![("api", 2), ("web", 0), ("web", 1)],
             "name first, then id inside a name"
+        );
+    }
+
+    #[test]
+    fn an_instance_slot_survives_a_round_trip_and_defaults_to_absent() {
+        let with = ProcessInfo::builder(1, "web", ProcStatus::Online)
+            .instance(Some(2))
+            .build();
+        assert_eq!(with.instance, Some(2));
+
+        let without = ProcessInfo::builder(1, "web", ProcStatus::Online).build();
+        assert_eq!(
+            without.instance, None,
+            "a row nobody set a slot on says so, rather than claiming slot 0"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_a_daemon_without_the_field_deserializes_as_absent() {
+        // The skew case the Option exists for: an older shepherd's JSON has no
+        // `instance` key at all.
+        let json = r#"{"id":1,"name":"web","status":"online","pid":null,
+            "restarts":0,"uptime_ms":0,"fold":null,"out_file":null,
+            "err_file":null,"cpu_percent":null,"memory_bytes":null,"dog":null,
+            "lambs":null,"last_exit":null,"smit":null}"#;
+        let info: ProcessInfo = serde_json::from_str(json).expect("older reply still parses");
+        assert_eq!(info.instance, None);
+    }
+
+    #[test]
+    fn sort_flock_orders_by_slot_before_id() {
+        // A reload gave slot 0 a fresh, higher id. Slot order must still win.
+        let mut listing = vec![
+            ProcessInfo::builder(9, "web", ProcStatus::Online)
+                .instance(Some(0))
+                .build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Online)
+                .instance(Some(1))
+                .build(),
+        ];
+        sort_flock(&mut listing);
+        assert_eq!(
+            listing.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![9, 2],
+            "slot 0 leads even though its id is higher"
+        );
+    }
+
+    #[test]
+    fn sort_flock_falls_back_to_id_when_no_row_carries_a_slot() {
+        let mut listing = vec![
+            ProcessInfo::builder(5, "web", ProcStatus::Online).build(),
+            ProcessInfo::builder(3, "web", ProcStatus::Online).build(),
+        ];
+        sort_flock(&mut listing);
+        assert_eq!(
+            listing.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![3, 5],
+            "an older daemon's listing sorts exactly as it does today"
         );
     }
 }

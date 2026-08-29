@@ -143,7 +143,7 @@ const verbTable: { pm2: string; shep: string; note?: string }[] = [
     </p>
     <CodeBlock label="$ shep import --from dump.pm2.json --dry-run">{`notice[read]: read 4 instance rows for 3 apps from dump.pm2.json
 notice[cluster_mode]: api ran 2 instances in pm2 cluster mode; shep binds nothing, so api must set SO_REUSEPORT itself (Node's reusePort: true, needing Node >= 22.12) or every instance past the first hits EADDRINUSE at start
-notice[instance_var]: api: reads its instance number from $NODE_APP_INSTANCE; imported as increment_var rather than copied as a value
+notice[instance_var]: api: reads its instance number from $NODE_APP_INSTANCE; imported as NODE_APP_INSTANCE = "{{instance}}" under [app.env] rather than copied as a value
 notice[inherited_env]: api: BUN_INSTALL was running but neither declared nor recognized session junk; decide whether it belongs in the Flockfile, the unit, or nowhere
 notice[inherited_env]: worker: JAVA_HOME was running but neither declared nor recognized session junk; decide whether it belongs in the Flockfile, the unit, or nowhere
 notice[inherited_env]: migrate: DATABASE_URL was running but neither declared nor recognized session junk; decide whether it belongs in the Flockfile, the unit, or nowhere`}</CodeBlock>
@@ -155,9 +155,9 @@ cwd = "/srv/api"
 interpreter = "node"
 instances = 2
 max_memory = "512M"
-increment_var = "NODE_APP_INSTANCE"
 
 [app.env]
+NODE_APP_INSTANCE = "{{instance}}"
 NODE_ENV = "production"
 
 [[app]]
@@ -240,7 +240,7 @@ cwd = "/srv/migrate"`}</CodeBlock>
       </div>
       <div class="row">
         <span><code>NODE_APP_INSTANCE</code> in a row's env</span>
-        <span><code>increment_var</code>, plus a stderr notice</span>
+        <span>an <code>[app.env]</code> entry set to <code>{'"{{instance}}"'}</code>, plus a stderr notice</span>
       </div>
     </div>
 
@@ -271,6 +271,100 @@ cwd = "/srv/migrate"`}</CodeBlock>
       <code>reusePort: true</code>. The work is the app&rsquo;s either way.
       If it was never written to share the socket, cluster mode does not
       work under shep however the Flockfile is written.
+    </p>
+
+    <h3>shep's <code>instances</code> is pm2's fork mode, not its cluster mode</h3>
+    <p>
+      pm2 cluster mode works because Node's <code>cluster</code> module
+      intercepts <code>server.listen()</code>: the pm2 daemon binds the port
+      once and every worker gets handed connections through that one socket,
+      never binding anything itself. That is a Node runtime feature, not
+      something a process supervisor does, and it can't be ported to a
+      supervisor that runs any executable. shep's <code>instances</code> is
+      pm2's other mode, fork, N separate processes with no socket sharing
+      between them. Set <code>instances = 3</code> on an app that hardcodes
+      one port and you get one process holding the port and two crash-looping
+      on <code>EADDRINUSE</code>, whatever language it's written in.
+    </p>
+    <p>There are exactly two ways to get N instances behind one address.</p>
+
+    <h4>Option 1: a port per instance, with a load balancer in front</h4>
+    <p>
+      Give each instance its own port with <code>{'{{instance}}'}</code>, and
+      point something at all of them:
+    </p>
+    <CodeBlock label="Flockfile.toml">{`[[app]]
+name = "web"
+script = "server.js"
+interpreter = "node"
+instances = 3
+args = ["--port", "300{{instance}}"]`}</CodeBlock>
+    <CodeBlock label="nginx.conf">{`upstream shep_web {
+    least_conn;
+    server 127.0.0.1:3000 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:3001 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:3002 max_fails=3 fail_timeout=10s;
+}
+
+server {
+    listen 80;
+    server_name example.com;
+
+    location / {
+        proxy_pass http://shep_web;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}`}</CodeBlock>
+    <p>
+      <code>max_fails</code> and <code>fail_timeout</code> are what pull an
+      instance out of rotation while shep restarts it; without them nginx
+      keeps sending requests at a port nothing is listening on. Open-source
+      nginx only does this passive kind of checking, watching real requests
+      fail, not active probing; that's an nginx Plus feature, so don't expect
+      more from the free build. <code>Upgrade</code> and
+      <code>Connection</code> are there for websockets, and cost nothing if
+      the app doesn't use them.
+    </p>
+    <Callout variant="careful">
+      <code>300{'{{instance}}'}</code> is string concatenation, not
+      arithmetic. Slots 0 through 9 give ports 3000 through 3009, which is
+      the point, but slot 10 gives <code>30010</code>, not 3010. The
+      shorthand only holds up to ten instances.
+    </Callout>
+    <p>
+      Past ten, pass a base and let the app add its own slot, since
+      <code>SHEP_INSTANCE</code> is always injected:
+    </p>
+    <CodeBlock label="Flockfile.toml">{`[[app]]
+name = "web"
+script = "server.js"
+interpreter = "node"
+instances = 24
+
+[app.env]
+PORT_BASE = "3000"`}</CodeBlock>
+    <CodeBlock label="server.js">{`const port = Number(process.env.PORT_BASE) + Number(process.env.SHEP_INSTANCE);`}</CodeBlock>
+
+    <h4>Option 2: one shared port, no load balancer</h4>
+    <p>
+      If the app sets <code>SO_REUSEPORT</code> on its own listener, every
+      instance binds the same port and the kernel spreads connections between
+      them, no proxy required. That's close to what Node's
+      <code>cluster</code> module does with its own shared-socket scheme,
+      except it runs in the OS and works for any language. Set
+      <code>reuse_port = true</code> in the Flockfile to tell shep the app
+      does this, so a reload knows it's safe to overlap the old and new
+      instances rather than draining one before starting the other. shep
+      can't verify the app actually calls the option: it's set inside the
+      child, after the fork, on a socket shep never sees. Claim it without
+      doing it, and the failure shows up as <code>EADDRINUSE</code> at
+      runtime instead of a refusal at config time.
     </p>
 
     <h3>An inherited shell environment</h3>

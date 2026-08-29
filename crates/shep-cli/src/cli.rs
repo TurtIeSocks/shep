@@ -721,7 +721,7 @@ pub struct ServeArgs {
 /// link to it does not resolve under `cargo doc`).
 #[derive(Debug, clap::Args)]
 pub struct SelectorArgs {
-    /// One or more: name, id, `all`, `zeus-*`, `/regex/`, or `fold:<name>`
+    /// One or more: name, id, `name:slot`, `all`, `zeus-*`, `/regex/`, `fold:<name>`
     ///
     /// Several are applied in turn, not atomically: `shep stop a b c` where
     /// `b` matches nothing still stops `a` and `c`, and the exit code is the
@@ -763,7 +763,7 @@ pub struct StockArgs {
 /// trigger one against the whole flock by accident.
 #[derive(Debug, clap::Args)]
 pub struct TriggerArgs {
-    /// name, id, `all`, `/regex/`, or `fold:<name>`
+    /// name, id, `name:slot`, `all`, `/regex/`, or `fold:<name>`
     pub selector: String,
     /// Action name — free-form, defined by the app
     pub action: String,
@@ -779,7 +779,7 @@ pub struct TriggerArgs {
 /// error, never a flock-wide SIGHUP.
 #[derive(Debug, clap::Args)]
 pub struct SignalArgs {
-    /// name, id, `all`, `/regex/`, or `fold:<name>`
+    /// name, id, `name:slot`, `all`, `/regex/`, or `fold:<name>`
     pub selector: String,
     /// Signal name, e.g. `SIGHUP` or `hup`
     pub signal: String,
@@ -793,7 +793,7 @@ pub struct SignalArgs {
 /// should be a usage error, never sent to the whole flock.
 #[derive(Debug, clap::Args)]
 pub struct WhisperArgs {
-    /// name, id, `all`, `/regex/`, or `fold:<name>`
+    /// name, id, `name:slot`, `all`, `/regex/`, or `fold:<name>`
     pub selector: String,
     /// The line, without a trailing newline — shep adds exactly one
     pub line: String,
@@ -828,7 +828,7 @@ pub struct WhisperArgs {
 /// error it has always been, never "empty every log in the flock".
 #[derive(Debug, clap::Args)]
 pub struct FlushArgs {
-    /// name, id, `all`, `/regex/`, or `fold:<name>` (required unless --daemon)
+    /// name, id, `name:slot`, `all`, `/regex/`, `fold:<name>` (required unless --daemon)
     #[arg(required_unless_present = "daemon", conflicts_with = "daemon")]
     pub selector: Option<String>,
     /// Empty the shepherd's own logs instead of any sheep's

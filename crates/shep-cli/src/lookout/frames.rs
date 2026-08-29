@@ -44,7 +44,7 @@ use shep_client::RequestError;
 use shep_core::protocol::{ExitInfo, Lamb, ProcessInfo, Response, RpcError, RpcErrorCode};
 use shep_core::status::ProcStatus;
 
-use super::app::{ActionVerb, App, Control, KeyPress, Msg, Sent};
+use super::app::{ActionVerb, App, Control, KeyPress, Msg, RowKey, Sent};
 use super::source::HostSample;
 use super::tail::{Stream, Tail, TailLine};
 use super::theme::Palette;
@@ -132,6 +132,9 @@ pub enum Scene {
     HealthyWide,
     /// One sheep errored, one waiting to restart, one stopped.
     Errored,
+    /// Three instances of one app under a group header, with the cursor on
+    /// the header.
+    Grouped,
     /// Nothing registered.
     Empty,
     /// A narrow terminal: four columns dropped.
@@ -185,6 +188,7 @@ impl Scene {
     pub const ALL: &'static [Self] = &[
         Self::HealthyWide,
         Self::Errored,
+        Self::Grouped,
         Self::Empty,
         Self::Narrow,
         Self::TooNarrow,
@@ -215,6 +219,7 @@ impl Scene {
         match self {
             Self::HealthyWide => "healthy_wide",
             Self::Errored => "errored",
+            Self::Grouped => "grouped",
             Self::Empty => "empty",
             Self::Narrow => "narrow",
             Self::TooNarrow => "too_narrow",
@@ -241,7 +246,7 @@ impl Scene {
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so the maintainer does not have to hold twenty-four of them in her head.
+    /// gallery so the maintainer does not have to hold twenty-five of them in her head.
     ///
     /// Every clause here is pinned by an assertion in
     /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
@@ -254,6 +259,9 @@ impl Scene {
             }
             Self::Errored => {
                 "One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row, and EXIT carries why each of the three stopped: a code for the two that crashed, a signal name for the one shep stopped itself."
+            }
+            Self::Grouped => {
+                "Three instances of one app under a group header, with the cursor parked on the header. The header sums their restarts, CPU and memory and takes the SHORTEST of their uptimes, so a group reads as time since the app was last disturbed rather than as the age of its luckiest instance. The detail pane repeats that rollup and says lambs are per-instance; the feed will not guess which instance to tail."
             }
             Self::Empty => {
                 "No sheep registered. Each of the three panes says why it is empty, and the three sentences are different because the three reasons are."
@@ -366,7 +374,7 @@ impl Scene {
             | Self::ActionRefused
             | Self::ActionAccepted
             | Self::ActionRefusedOffline => (100, 14),
-            // HealthyWide, Errored, Retrying, Frozen, Refused, FeedGap,
+            // HealthyWide, Errored, Grouped, Retrying, Frozen, Refused, FeedGap,
             // FeedMissing, HostUnknown, Lambs, LambsUnknown: every scene that
             // carries all three optional panes at their ordinary rows.
             _ => (120, 30),
@@ -399,13 +407,41 @@ pub fn scene(which: Scene) -> (&'static str, Buffer) {
 /// assertions name is the failure this exists to make loud.
 #[track_caller]
 fn select_id(app: &mut App, id: u32) {
-    for _ in 0..=app.flock_len() {
-        if app.selected() == Some(id) {
+    select_row(app, &RowKey::Sheep(id));
+}
+
+/// Parks the gallery's cursor on `name`'s group header.
+///
+/// # Panics
+///
+/// If `name` has no group header -- which is the case for every app with
+/// one instance, or with an instance that reports no slot.
+#[track_caller]
+fn select_group(app: &mut App, name: &str) {
+    select_row(app, &RowKey::Group(name.to_string()));
+}
+
+/// Walks the cursor down until it lands on `key`.
+///
+/// The budget is [`App::visible_rows`]'s own length, NOT `flock_len`: a
+/// grouped app draws a header on top of its own slots, so a flock of six
+/// sheep can be seven or more visible rows and a sheep-counted budget runs
+/// out before reaching the last of them.
+///
+/// # Panics
+///
+/// If `key` is not a visible row. Gallery scaffolding: a scene that
+/// silently described a different row than the one its own assertions name
+/// is the failure this exists to make loud.
+#[track_caller]
+fn select_row(app: &mut App, key: &RowKey) {
+    for _ in 0..=app.visible_rows().len() {
+        if app.selected().as_ref() == Some(key) {
             return;
         }
         app.update(Msg::Key(KeyPress::SelectDown));
     }
-    panic!("the gallery cannot park its cursor on id {id}");
+    panic!("the gallery cannot park its cursor on {key:?}");
 }
 
 /// One scene, `age` after its opening snapshot.
@@ -432,6 +468,28 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
 
     let flock = match which {
         Scene::Empty => Vec::new(),
+        // The only flock in the gallery whose rows carry a slot, and so the
+        // only one that draws a group header at all. `api` is here so the
+        // frame shows a grouped app beside an ungrouped one rather than
+        // implying every app gets a header.
+        Scene::Grouped => vec![
+            instance(0, "web", 0, 0, 3.4, 182 << 20, 4_512_000),
+            // The youngest of the three, and the one carrying restarts: the
+            // group row's uptime is a MINIMUM and its restarts are a SUM, so
+            // three identical instances would render the same either way.
+            instance(1, "web", 1, 2, 2.9, 178 << 20, 300_000),
+            instance(2, "web", 2, 1, 3.1, 180 << 20, 9_000_000),
+            sheep(
+                3,
+                "api",
+                ProcStatus::Online,
+                Some(48_219),
+                1,
+                Some(7.1),
+                Some(241 << 20),
+                Some("edge"),
+            ),
+        ],
         Scene::Errored | Scene::Frozen | Scene::LambsUnknown => vec![
             sheep(
                 0,
@@ -569,11 +627,21 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     // The four excluded scenes have either no flock (`Empty`) or no pane
     // below the table to describe (`Narrow`, `TooNarrow`, `TableOnly`), so
     // moving the cursor in them would change a snapshot for no reason.
+    // `Grouped` is excluded for a fifth reason: its cursor belongs on the
+    // group header, which is the whole scene, and it goes there below.
     if !matches!(
         which,
-        Scene::Empty | Scene::Narrow | Scene::TooNarrow | Scene::TableOnly
+        Scene::Empty | Scene::Narrow | Scene::TooNarrow | Scene::TableOnly | Scene::Grouped
     ) {
         select_id(&mut app, 2);
+    }
+
+    // Onto `web`'s group header, which is the one row in the gallery that is
+    // not a sheep. Every pane below the table renders its own group state
+    // from it: the rollup line, the per-instance lamb sentence, and the
+    // feed's refusal to pick an instance to tail.
+    if which == Scene::Grouped {
+        select_group(&mut app, "web");
     }
 
     // `LambsUnknown` wants `cron`, id 4, instead.
@@ -739,7 +807,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 app.update(Msg::Replied {
                     sent: Sent::Action {
                         verb: ActionVerb::Restart,
-                        id: 2,
+                        target: RowKey::Sheep(2),
                         name: "api".to_string(),
                     },
                     result: Ok(Response::Restarted(vec![restarted_api()])),
@@ -755,7 +823,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 app.update(Msg::Replied {
                     sent: Sent::Action {
                         verb: ActionVerb::Restart,
-                        id: 2,
+                        target: RowKey::Sheep(2),
                         name: "api".to_string(),
                     },
                     result: Err(RequestError::Rpc(RpcError {
@@ -894,6 +962,37 @@ fn sheep(
         .build()
 }
 
+/// One instance of a clustered app: the row a shepherd reports for slot
+/// `slot` of `name`.
+///
+/// Its own builder call rather than two more parameters on [`sheep`], which
+/// already carries `#[allow(clippy::too_many_arguments)]` at eight. It takes
+/// an explicit `uptime_ms` because [`sheep`] derives that from the id, and a
+/// group row's uptime is the minimum across its members -- a fixture whose
+/// youngest instance was decided by its id number would tie the assertion to
+/// an arithmetic that has nothing to do with grouping.
+fn instance(
+    id: u32,
+    name: &str,
+    slot: u32,
+    restarts: u32,
+    cpu: f32,
+    memory: u64,
+    uptime_ms: u64,
+) -> ProcessInfo {
+    ProcessInfo::builder(id, name, ProcStatus::Online)
+        .instance(Some(slot))
+        .pid(Some(48_400 + id))
+        .restarts(restarts)
+        .uptime_ms(uptime_ms)
+        .cpu_percent(Some(cpu))
+        .memory_bytes(Some(memory))
+        .fold(Some("edge".to_string()))
+        .out_file(Some(format!("/home/ada/.shep/logs/{name}-{id}-out.log")))
+        .err_file(Some(format!("/home/ada/.shep/logs/{name}-{id}-err.log")))
+        .build()
+}
+
 /// The row `ActionAccepted`'s reply carries: `api` at id 2, restarted.
 ///
 /// **Pid 48299, not the listing's 48219.** A different pid is what makes
@@ -984,7 +1083,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same twenty-four frames with colour; read it with `less -R`.
+frames.ansi is the same twenty-five frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -1110,7 +1209,7 @@ mod tests {
     /// in this module runs on both platforms, and the dashboard itself was
     /// exercised against a live Windows flock.
     #[cfg(unix)]
-    #[allow(clippy::too_many_lines)] // twenty-four captions, each pinned clause by clause
+    #[allow(clippy::too_many_lines)] // twenty-five captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
         // "All three panes at 120x30: the host strip under the title, the
         //  detail pane and the bleats feed under the table. `>` marks the
@@ -1136,6 +1235,65 @@ mod tests {
             wide.lines().filter(|line| line.starts_with('>')).count(),
             1,
             "exactly one selection marker"
+        );
+
+        // "Three instances of one app under a group header, with the cursor
+        //  parked on the header. The header sums their restarts, CPU and
+        //  memory and takes the SHORTEST of their uptimes, so a group reads
+        //  as time since the app was last disturbed rather than as the age
+        //  of its luckiest instance. The detail pane repeats that rollup and
+        //  says lambs are per-instance; the feed will not guess which
+        //  instance to tail."
+        let grouped = render_text(&scene(Scene::Grouped).1);
+        assert!(
+            grouped.contains("web \u{d7}3"),
+            "the group header names the app and how many instances it has: {grouped:?}"
+        );
+        assert_eq!(
+            grouped
+                .lines()
+                .filter(|line| line.contains("web \u{d7}3"))
+                .count(),
+            2,
+            "one in the table, one in the detail pane, and nowhere else"
+        );
+        assert!(
+            grouped
+                .lines()
+                .any(|line| line.starts_with('>') && line.contains("web \u{d7}3")),
+            "the cursor is on the header, not on one of its slots: {grouped:?}"
+        );
+        assert!(
+            row_for(&grouped, "api").is_some(),
+            "an ungrouped app sits beside the grouped one: {grouped:?}"
+        );
+        let rollup = grouped
+            .lines()
+            .find(|line| line.starts_with("app web "))
+            .expect("the detail pane's rollup line");
+        // Every number here is a rollup rather than any one member's: 0+2+1
+        // restarts, 3.4+2.9+3.1 CPU, 182+178+180 MiB. The uptime is the
+        // MINIMUM (300s, plus the 600s this frame is rendered at), which is
+        // why the oldest instance's own 2h 40m must not be what shows.
+        assert!(rollup.contains("restarts 3"), "summed restarts: {rollup:?}");
+        assert!(rollup.contains("cpu 9.4%"), "summed cpu: {rollup:?}");
+        assert!(rollup.contains("mem 540.0M"), "summed memory: {rollup:?}");
+        assert!(rollup.contains("uptime 15m"), "the shortest: {rollup:?}");
+        assert!(
+            !rollup.contains("2h 40m"),
+            "not the longest, which is what a max or a first-member read would show: {rollup:?}"
+        );
+        assert!(
+            grouped.contains("lambs  not shown for a group; select one instance"),
+            "the detail pane says lambs are per-instance: {grouped:?}"
+        );
+        assert!(
+            grouped.contains("bleats  web  follows one instance; select one to see its log"),
+            "and the feed will not guess which instance to tail: {grouped:?}"
+        );
+        assert!(
+            !grouped.contains("GET /healthz 200 3ms"),
+            "with no instance's lines under that sentence: {grouped:?}"
         );
 
         // "No sheep registered. Each of the three panes says why it is empty,
@@ -1520,6 +1678,47 @@ mod tests {
         }
     }
 
+    /// fails if the gallery's cursor walk budgets by SHEEP rather than by
+    /// visible rows.
+    ///
+    /// Two grouped apps, four sheep, six visible rows: the last row sits at
+    /// index 5 and a `0..=flock_len()` budget can only check as far as index
+    /// 4, so the walk runs out and hits its own `panic!` before reaching a
+    /// row that is plainly on screen. One group is not enough to show it --
+    /// a single header lands the budget exactly on the last row -- which is
+    /// why this builds two rather than reusing [`Scene::Grouped`]'s flock.
+    #[test]
+    fn the_cursor_walk_budgets_by_visible_rows_not_by_sheep() {
+        use std::ffi::OsStr;
+
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, Some(OsStr::new("xterm-256color")), None),
+            Control::ReadOnly,
+            "/home/ada/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: vec![
+                instance(0, "web", 0, 0, 3.4, 182 << 20, 4_512_000),
+                instance(1, "web", 1, 0, 2.9, 178 << 20, 4_512_000),
+                instance(2, "api", 0, 0, 7.1, 241 << 20, 4_512_000),
+                instance(3, "api", 1, 0, 6.8, 239 << 20, 4_512_000),
+            ],
+            at: t0,
+        });
+        assert_eq!(
+            app.visible_rows().len(),
+            6,
+            "four sheep and two group headers"
+        );
+
+        // `web`'s second slot: the last visible row, and the one a
+        // sheep-counted budget cannot reach.
+        select_id(&mut app, 1);
+        assert_eq!(app.selected(), Some(RowKey::Sheep(1)));
+    }
+
     /// fails if a scene is added to [`Scene::ALL`] without a caption, or with
     /// a caption nobody pinned. The second half cannot be checked by a
     /// machine — but the first half can, and a scene with no caption is how
@@ -1545,7 +1744,7 @@ mod tests {
         // above already guarantees it, so it would be a line that cannot
         // fail. The literal can — it is what catches a scene added to the
         // enum and not to `ALL`, or the reverse.
-        assert_eq!(Scene::ALL.len(), 24);
+        assert_eq!(Scene::ALL.len(), 25);
     }
 
     /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders

@@ -466,6 +466,42 @@ fn write_logging_script(dir: &TempDir, out_marker: &str, err_marker: Option<&str
     write_script(dir, "logging.sh", &script)
 }
 
+/// [`write_logging_script`] for a multi-instance app: one stdout line
+/// naming the slot the running instance occupies, read out of the
+/// `SHEP_INSTANCE` the daemon injects, then the same trailing sleep.
+///
+/// The slot has to come from the child's own environment rather than from
+/// anything this harness substitutes, because the point is that the daemon
+/// gave each instance a different one. Two instances sharing one log file
+/// under `merge_logs` then write two distinguishable lines, which is what
+/// makes "printed once" a countable claim.
+///
+/// `name` is the script's basename, so several of these can live in one
+/// `$TMPDIR` without overwriting each other.
+fn write_instance_logging_script(dir: &TempDir, name: &str, prefix: &str) -> PathBuf {
+    let echo = {
+        #[cfg(unix)]
+        {
+            format!("echo \"{prefix}-$SHEP_INSTANCE\"\n")
+        }
+        #[cfg(windows)]
+        {
+            format!("echo {prefix}-%SHEP_INSTANCE%\r\n")
+        }
+    };
+    write_script(
+        dir,
+        &format!("{name}.sh"),
+        &format!(
+            "{}{}{}{}",
+            script_header(),
+            record_pid_line(dir),
+            echo,
+            sleep_line(SCRIPT_SLEEP_SECS)
+        ),
+    )
+}
+
 /// Writes a script that prints [`ROTATE_BEFORE`], blocks until `gate`
 /// exists, prints [`ROTATE_AFTER`], and sleeps.
 ///
@@ -6843,6 +6879,147 @@ fn a_bare_command_off_the_path_takes_only_its_own_app_down() {
         log.contains("no-interpreter"),
         "and which sheep wanted it: {log}"
     );
+
+    graceful_kill(home);
+}
+
+/// A real multi-instance flock through the real binary: distinct slots, a
+/// grouped `shep flock` table, and a `merge_logs` app whose backlog prints
+/// each line exactly once.
+///
+/// Spec Testing section, and the only e2e in this branch's instances work.
+/// Every other test the redesign added is a unit test over a fake, and the
+/// design doc says in its own voice that reading code did not find the
+/// original defects: running a two-instance app did. The `merge_logs` case
+/// is named there specifically, because it is where the duplication bug bit
+/// hardest.
+///
+/// # The duplication guard
+///
+/// `merged` runs two instances that share one log file, and each writes a
+/// line naming its own slot from `SHEP_INSTANCE`. So the file holds
+/// `merged-slot-0` and `merged-slot-1`, once each. `shep bleats` matched two
+/// rows and read a file per row, so it printed the whole shared file twice
+/// and every line came out doubled. Counting occurrences is what catches
+/// that; a `contains` check passes either way, which is how the bug survived
+/// to be found by hand.
+///
+/// # Why a shell script rather than node
+///
+/// The spec says "node app", but every fixture in this file is a `sh`/`.cmd`
+/// script written by the helpers above, and those are what make the file run
+/// on Windows as well as unix. What the case actually needs from the child
+/// is a distinct line per slot and a process that stays up, and nothing about
+/// that is node's. Adding a node dependency to one case would make it the
+/// only one in the file that skips where node is absent.
+#[test]
+fn a_multi_instance_flock_gets_distinct_slots_a_grouped_table_and_undoubled_bleats() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let web = write_instance_logging_script(&dir, "web-instances", "web-slot");
+    let merged = write_instance_logging_script(&dir, "merged-instances", "merged-slot");
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"web\"\nscript = '{}'\ninstances = 3\n\n\
+             [[app]]\nname = \"merged\"\nscript = '{}'\ninstances = 2\nmerge_logs = true\n",
+            web.display(),
+            merged.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    // 1. Five processes, and every one of them reports the slot it occupies.
+    let data = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array()
+            .is_some_and(|rows| rows.iter().filter(|row| row["status"] == "online").count() == 5)
+    });
+    let slots_of = |name: &str| {
+        let mut slots: Vec<u64> = data
+            .as_array()
+            .expect("flock data is an array")
+            .iter()
+            .filter(|row| row["name"] == name)
+            .map(|row| {
+                row["instance"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("every instance reports a slot: {data}"))
+            })
+            .collect();
+        slots.sort_unstable();
+        slots
+    };
+    assert_eq!(slots_of("web"), vec![0, 1, 2], "distinct slots: {data}");
+    assert_eq!(slots_of("merged"), vec![0, 1], "distinct slots: {data}");
+
+    // 2. The table names each row by its own slot, so an operator can tell
+    // three rows of one app apart.
+    //
+    // This is the FLAT shape of the grouping rule, not the boxed one, and
+    // that is forced rather than chosen: `lib.rs`'s `must_render_bare` drops
+    // any run whose stdout is not a terminal to `StyleLevel::Bare`, and
+    // `--style plain` does not override it. Every process in this file runs
+    // on a pipe, so no e2e can reach the `web x3` header and its `:2` slot
+    // rows -- `output::rows`'s own unit tests are where those live. What
+    // this tier proves is the half a pipe can see, and it is the half that
+    // was broken: before this branch all three rows read `web`.
+    let table = shep(home).arg("flock").output().unwrap();
+    assert_success(&table);
+    let rendered = String::from_utf8_lossy(&table.stdout);
+    for slot in 0..3 {
+        assert!(
+            rendered.contains(&format!("web:{slot}")),
+            "a row named for slot {slot}: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("merged:0") && rendered.contains("merged:1"),
+        "and the same for the merged app: {rendered}"
+    );
+
+    // 3. The regression guard. First, that `merge_logs` really did collapse
+    // the two instances onto one path -- without that the count below is
+    // vacuous, since two separate files hold one line each whatever `bleats`
+    // does with them.
+    let out_files: Vec<&str> = data
+        .as_array()
+        .expect("flock data is an array")
+        .iter()
+        .filter(|row| row["name"] == "merged")
+        .map(|row| {
+            row["out_file"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a running sheep reports its out file: {data}"))
+        })
+        .collect();
+    assert_eq!(out_files.len(), 2, "{data}");
+    assert_eq!(
+        out_files[0], out_files[1],
+        "merge_logs points both instances at one file: {data}"
+    );
+
+    // Then that the shared file is read once, not once per matched row.
+    let backlog =
+        bleats_no_follow_until_contains(home, &["merged"], &["merged-slot-0", "merged-slot-1"]);
+    assert_eq!(
+        backlog.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&backlog.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&backlog.stdout);
+    for slot in 0..2 {
+        let needle = format!("merged-slot-{slot}");
+        assert_eq!(
+            stdout.matches(&needle).count(),
+            1,
+            "a shared log file is read once, not once per instance: {stdout}"
+        );
+    }
 
     graceful_kill(home);
 }

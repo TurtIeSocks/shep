@@ -58,7 +58,7 @@
 //! stopped still has a file to read, while it has nothing left to publish
 //! to the bus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -88,6 +88,11 @@ struct BleatLine<'a> {
     name: &'a str,
     /// Which of a sheep's two output streams this line came from.
     stream: &'static str,
+    /// The instance slot this line's sheep occupies, when its app has more
+    /// than one instance registered; `null` when the app has only one, or
+    /// when the line's origin cannot be attributed to a single instance (a
+    /// backlog line read from a file several instances share).
+    instance: Option<u32>,
     /// The line itself, no trailing newline.
     line: &'a str,
 }
@@ -142,6 +147,23 @@ fn resolved_name(cache: &HashMap<u32, ProcessInfo>, id: u32) -> String {
         .map_or_else(|| id.to_string(), |info| info.name.clone())
 }
 
+/// The slot a followed line's sheep occupies, or `None` when `id` was not
+/// in the one listing `resolve_names` took, or when its app has only one
+/// instance registered.
+///
+/// A follow always knows which sheep wrote a line -- the daemon emits
+/// [`BusEvent::LogOut`]/[`LogErr`](BusEvent::LogErr) per sheep -- so unlike
+/// the backlog path this labels a line even when several instances share
+/// one log file (module doc, D11).
+fn resolved_instance(cache: &HashMap<u32, ProcessInfo>, id: u32) -> Option<u32> {
+    let info = cache.get(&id)?;
+    if instance_count(cache, &info.name) > 1 {
+        info.instance
+    } else {
+        None
+    }
+}
+
 /// Whether `selector` (parsed client-side) admits `id`, matched against
 /// `cache`'s snapshot of that sheep if it has one.
 ///
@@ -152,8 +174,8 @@ fn resolved_name(cache: &HashMap<u32, ProcessInfo>, id: u32) -> String {
 /// nothing to prove it belongs.
 fn selector_allows(selector: &ProcessSelector, cache: &HashMap<u32, ProcessInfo>, id: u32) -> bool {
     match cache.get(&id) {
-        Some(info) => selector.matches(&info.name, info.id, info.fold.as_deref()),
-        None => selector.matches("", id, None),
+        Some(info) => selector.matches(&info.name, info.id, info.fold.as_deref(), info.instance),
+        None => selector.matches("", id, None, None),
     }
 }
 
@@ -166,6 +188,7 @@ fn write_line(
     fmt: Format,
     id: u32,
     name: &str,
+    instance: Option<u32>,
     stream: &'static str,
     line: &str,
 ) -> io::Result<()> {
@@ -175,14 +198,25 @@ fn write_line(
                 schema_version: output::SCHEMA_VERSION,
                 id,
                 name,
+                instance,
                 stream,
                 line,
             };
             serde_json::to_writer(&mut *out, &payload)?;
             writeln!(out)
         }
-        Format::Table => writeln!(out, "{name} | {line}"),
+        Format::Table => match instance {
+            Some(slot) => writeln!(out, "{name}:{slot} | {line}"),
+            None => writeln!(out, "{name} | {line}"),
+        },
     }
+}
+
+/// How many rows of `cache` carry `name` -- counted over the WHOLE cache,
+/// never a selector's matched subset, so a selector cannot change how a
+/// line is labelled (`shep bleats web:0` still prints `web:0`, not `web`).
+fn instance_count(cache: &HashMap<u32, ProcessInfo>, name: &str) -> usize {
+    cache.values().filter(|info| info.name == name).count()
 }
 
 /// Writes one of this module's own notices — not a sheep's line, and not
@@ -289,16 +323,16 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
     Ok((lines, truncated))
 }
 
-/// Renders the selected files of every sheep the selector admits, in id
+/// Renders the selected files of every sheep the selector admits, in flock
 /// order, and returns the exit code that reports how that went.
 ///
 /// Within one sheep, `out_file` (unless `--err`) prints before `err_file`
 /// (unless `--out`) — this module's own doc states the ordering limitation
 /// that follows from it. The matched sheep are sorted before anything is
 /// read -- `cache` is a `HashMap` and its iteration order is arbitrary -- by
-/// name and then by id, the one order every operator-facing listing takes
-/// (`shep_core::protocol::sort_flock`). It was id order until that rule was
-/// made the only one.
+/// name, then instance slot, then id, the one order every operator-facing
+/// listing takes (`shep_core::protocol::sort_flock`). It was id order until
+/// that rule was made the only one.
 ///
 /// A `None` path means the shepherd predates the field (module doc,
 /// [`shep_core::protocol::ProcessInfo::out_file`]) — one `log_path_unknown`
@@ -318,15 +352,45 @@ fn tail_log_files(
 ) -> ExitCode {
     let mut matched: Vec<&ProcessInfo> = cache
         .values()
-        .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref()))
+        .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref(), info.instance))
         .collect();
-    // Name then id, the one order every operator-facing shep listing takes
-    // (`shep_core::protocol::sort_flock`'s own doc). Not `sort_flock` itself:
-    // this is a `Vec<&ProcessInfo>` borrowed out of the cache, and copying the
-    // rows to reach the helper would buy nothing but a clone per sheep.
-    matched.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
+    // `(name, instance, id)`, the one order every operator-facing shep
+    // listing takes (`shep_core::protocol::sort_flock`'s own doc). Not
+    // `sort_flock` itself: this is a `Vec<&ProcessInfo>` borrowed out of the
+    // cache, and copying the rows to reach the helper would buy nothing but a
+    // clone per sheep -- but the KEY is the shared one, character for
+    // character. Without the slot, `shep bleats web` read the instances of a
+    // reloaded app out of order, because a reload gives slot 0 a fresh high
+    // id and id alone then sorts that instance last.
+    matched.sort_unstable_by(|a, b| {
+        (a.name.as_str(), a.instance, a.id).cmp(&(b.name.as_str(), b.instance, b.id))
+    });
 
     let mut failure = false;
+
+    // One file, one read. Several instances can resolve to one path: every
+    // `merge_logs` app does, and so does any app that set `out_file`
+    // explicitly. Reading per row printed the file once per instance.
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut seen_notices: HashSet<String> = HashSet::new();
+
+    // Whether a path is shared between several rows, over the WHOLE cache
+    // rather than the matched subset -- a selector narrowing to one row
+    // must not hide that the underlying file is still shared, since the
+    // file itself has no idea which lines are whose either way.
+    let mut path_owners: HashMap<(&'static str, String), usize> = HashMap::new();
+    for info in cache.values() {
+        for (stream_name, path) in [
+            ("out", info.out_file.as_deref()),
+            ("err", info.err_file.as_deref()),
+        ] {
+            if let Some(path) = path {
+                *path_owners
+                    .entry((stream_name, path.to_string()))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
 
     for info in matched {
         let name = &info.name;
@@ -339,45 +403,69 @@ fn tail_log_files(
                 continue;
             }
             match path {
-                None => write_notice(
-                    streams,
-                    quiet,
-                    "log_path_unknown",
-                    &format!("{name}: the daemon did not report a {stream_name} log path"),
-                ),
-                Some(path) => match read_tail(Path::new(path), args.lines) {
-                    Ok((lines, _truncated)) => {
-                        for line in lines {
-                            if let Err(write_err) = write_line(
-                                streams.out,
-                                streams.fmt,
-                                info.id,
-                                name,
-                                stream_name,
-                                &line,
-                            ) {
-                                let code = write_outcome(Err(write_err));
-                                let _ = streams.out.flush();
-                                return code;
+                None => {
+                    // No path to key on, since the missing field is why this
+                    // fires. The message already names the pair that varies.
+                    let message =
+                        format!("{name}: the daemon did not report a {stream_name} log path");
+                    if seen_notices.insert(message.clone()) {
+                        write_notice(streams, quiet, "log_path_unknown", &message);
+                    }
+                }
+                Some(path) => {
+                    if !seen_paths.insert(path.to_string()) {
+                        continue;
+                    }
+                    // Only label a backlog line with a slot when this path
+                    // belongs to exactly one row: several instances sharing
+                    // one file (`merge_logs`, or a hand-set `out_file`)
+                    // interleave in it and no line says who wrote it, so
+                    // shep does not guess.
+                    let shared = path_owners
+                        .get(&(stream_name, path.to_string()))
+                        .copied()
+                        .unwrap_or(0)
+                        > 1;
+                    let label_instance = if !shared && instance_count(cache, name) > 1 {
+                        info.instance
+                    } else {
+                        None
+                    };
+                    match read_tail(Path::new(path), args.lines) {
+                        Ok((lines, _truncated)) => {
+                            for line in lines {
+                                if let Err(write_err) = write_line(
+                                    streams.out,
+                                    streams.fmt,
+                                    info.id,
+                                    name,
+                                    label_instance,
+                                    stream_name,
+                                    &line,
+                                ) {
+                                    let code = write_outcome(Err(write_err));
+                                    let _ = streams.out.flush();
+                                    return code;
+                                }
                             }
                         }
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                            // Silent: the daemon creates both files at spawn,
+                            // so a missing file means this sheep has never
+                            // run in this $SHEP_HOME. A notice per quiet
+                            // sheep would spam stderr on a fresh flock.
+                        }
+                        Err(err) => {
+                            failure = true;
+                            write_notice(
+                                streams,
+                                quiet,
+                                "log_unreadable",
+                                &format!("failed to read {path}: {err}"),
+                            );
+                        }
                     }
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                        // Silent: the daemon creates both files at spawn, so
-                        // a missing file means this sheep has never run in
-                        // this $SHEP_HOME. A notice per quiet sheep would
-                        // spam stderr on a fresh flock.
-                    }
-                    Err(err) => {
-                        failure = true;
-                        write_notice(
-                            streams,
-                            quiet,
-                            "log_unreadable",
-                            &format!("failed to read {path}: {err}"),
-                        );
-                    }
-                },
+                }
             }
         }
     }
@@ -410,14 +498,16 @@ fn handle_event(
         BusEvent::LogOut { id, line } => {
             if !args.err && selector_allows(selector, cache, id) {
                 let name = resolved_name(cache, id);
-                write_line(streams.out, streams.fmt, id, &name, "out", &line)?;
+                let instance = resolved_instance(cache, id);
+                write_line(streams.out, streams.fmt, id, &name, instance, "out", &line)?;
             }
             Ok(())
         }
         BusEvent::LogErr { id, line } => {
             if !args.out && selector_allows(selector, cache, id) {
                 let name = resolved_name(cache, id);
-                write_line(streams.out, streams.fmt, id, &name, "err", &line)?;
+                let instance = resolved_instance(cache, id);
+                write_line(streams.out, streams.fmt, id, &name, instance, "err", &line)?;
             }
             Ok(())
         }
@@ -602,6 +692,17 @@ mod tests {
             .pid(Some(1000 + id))
             .out_file(Some(format!("/logs/{name}-0-out.log")))
             .err_file(Some(format!("/logs/{name}-0-err.log")))
+            .build()
+    }
+
+    /// Like [`info`], but with a real instance slot -- `info` never sets
+    /// one, so it cannot express a multi-instance app on its own.
+    fn info_with_instance(id: u32, name: &str, slot: u32) -> ProcessInfo {
+        ProcessInfo::builder(id, name, ProcStatus::Online)
+            .pid(Some(1000 + id))
+            .instance(Some(slot))
+            .out_file(Some(format!("/logs/{name}-{slot}-out.log")))
+            .err_file(Some(format!("/logs/{name}-{slot}-err.log")))
             .build()
     }
 
@@ -850,6 +951,209 @@ mod tests {
         assert!(
             !out.contains("from-worker"),
             "the selector must narrow the resolved id set: {out}"
+        );
+    }
+
+    /// D11's whole asymmetry: unlike the backlog, a follow always knows
+    /// which sheep wrote a line -- the daemon emits `BusEvent::LogOut` per
+    /// sheep -- so it labels a multi-instance app's lines with their slot
+    /// even though `info_with_instance`'s two rows would share a file if
+    /// this went through the backlog path. This test alone only catches a
+    /// `resolved_instance` that drops the label outright; the gate that
+    /// decides WHEN to apply it and the `LogErr` arm's own threading each
+    /// have their own test below
+    /// (`a_single_instance_app_with_a_slot_on_its_row_still_follows_bare`,
+    /// `a_multi_instance_apps_followed_stderr_line_carries_its_slot_too`).
+    #[tokio::test]
+    async fn a_multi_instance_apps_follow_labels_its_lines_with_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![
+            info_with_instance(1, "web", 0),
+            info_with_instance(2, "web", 1),
+        ]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "from-slot-0".into(),
+            })
+            .await;
+        daemon
+            .push(BusEvent::LogOut {
+                id: 2,
+                line: "from-slot-1".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &follow_args("web")),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("web:0 | from-slot-0"),
+            "a followed line must carry its slot: {out}"
+        );
+        assert!(
+            out.contains("web:1 | from-slot-1"),
+            "a followed line must carry its slot: {out}"
+        );
+    }
+
+    /// Minor fix bundle: a selector narrowed to one instance must not change
+    /// how that instance's line is labelled -- `instance_count` counts over
+    /// the WHOLE cache, never the matched subset, so `web:0` still prints
+    /// `web:0` even though the cache holds a `web:1` this selector excludes.
+    /// This deliberately differs from the flock table's own rollup rule,
+    /// where the count describes the rows actually listed -- a table row
+    /// summarises a listing, a log prefix identifies a process.
+    #[tokio::test]
+    async fn a_selector_narrowed_to_one_instance_does_not_change_its_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![
+            info_with_instance(1, "web", 0),
+            info_with_instance(2, "web", 1),
+        ]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "from-slot-0".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &follow_args("web:0")),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("web:0 | from-slot-0"),
+            "a selector narrowed to one instance must not strip its label: {out}"
+        );
+    }
+
+    /// Guards the `instance_count(cache, &info.name) > 1` gate in
+    /// `resolved_instance` specifically: `info_with_instance`'s row DOES
+    /// carry `.instance(Some(0))`, so a `resolved_instance` that returned
+    /// `info.instance` unconditionally -- skipping the "more than one
+    /// instance registered" check -- would still print `web:0` here. Only a
+    /// cache with a single row for the app can catch that.
+    #[tokio::test]
+    async fn a_single_instance_app_with_a_slot_on_its_row_still_follows_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![info_with_instance(1, "web", 0)]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "hello".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &follow_args("web")),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("web | hello"),
+            "one registered instance means no slot to report, even though this row \
+             carries one: {out}"
+        );
+        assert!(
+            !out.contains("web:0"),
+            "a slot must not leak onto a single-instance app's followed output: {out}"
+        );
+    }
+
+    /// Guards `handle_event`'s `LogErr` arm specifically: it threads
+    /// `instance` on its own, separately from `LogOut`'s. A follow that
+    /// labelled stdout but not stderr passes every other test in this
+    /// module and fails only this one.
+    #[tokio::test]
+    async fn a_multi_instance_apps_followed_stderr_line_carries_its_slot_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![
+            info_with_instance(1, "web", 0),
+            info_with_instance(2, "web", 1),
+        ]);
+        daemon
+            .push(BusEvent::LogErr {
+                id: 2,
+                line: "boom".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &follow_args("web")),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("web:1 | boom"),
+            "a followed stderr line must carry its slot exactly as stdout does: {out}"
         );
     }
 
@@ -1207,7 +1511,7 @@ mod tests {
     /// Same `close_after_subscribe` reasoning as
     /// `ids_resolve_to_names_from_one_listing_and_unknown_ids_render_bare`.
     #[tokio::test]
-    async fn json_format_renders_the_pinned_five_key_line_shape() {
+    async fn json_format_renders_the_pinned_six_key_line_shape() {
         let dir = tempfile::tempdir().unwrap();
         let path = shep_client::testing::control_address(dir.path());
         let (client, daemon) = fake_client_with_push(&path).await;
@@ -1244,10 +1548,15 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["id", "line", "name", "schema_version", "stream"],
+            ["id", "instance", "line", "name", "schema_version", "stream"],
             "the bleats JSON line shape is a stability surface: {out}"
         );
         assert_eq!(json["stream"], "err", "the stream this line came from");
+        assert_eq!(
+            json["instance"],
+            serde_json::Value::Null,
+            "one registered instance means no slot to report"
+        );
     }
 
     /// A writer that always fails with `BrokenPipe` — `shep bleats | head`
@@ -1550,6 +1859,114 @@ mod tests {
         );
     }
 
+    /// Two instances sharing one log file (a `merge_logs` app, or any app
+    /// with an explicit `out_file`) must be read once, not once per
+    /// instance: reading per row printed the whole file once per instance
+    /// pointing at it.
+    #[test]
+    fn instances_sharing_one_log_file_are_read_once_not_once_each() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("talker-out.log");
+        std::fs::write(&shared, "line one\nline two\n").expect("write");
+
+        let shared_path = shared.to_string_lossy().to_string();
+        let mut cache = HashMap::new();
+        for id in 0..2u32 {
+            cache.insert(
+                id,
+                ProcessInfo::builder(id, "talker", ProcStatus::Online)
+                    .out_file(Some(shared_path.clone()))
+                    .err_file(Some(shared_path.clone()))
+                    .build(),
+            );
+        }
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+            style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
+        };
+        let args = no_follow_args_out("talker");
+        let selector = ProcessSelector::parse("talker").expect("selector");
+
+        tail_log_files(&mut streams, false, &cache, &selector, &args);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            printed.matches("line one").count(),
+            1,
+            "one file, one read, however many instances point at it:\n{printed}"
+        );
+    }
+
+    /// Builds a cache of `count` rows for one app, and returns it with the
+    /// printed backlog. `shared` puts every instance on one file, the way
+    /// `merge_logs` does.
+    fn backlog_of(dir: &Path, app: &str, count: u32, shared: bool) -> String {
+        let mut cache = HashMap::new();
+        for slot in 0..count {
+            let stem = if shared {
+                format!("{app}-out.log")
+            } else {
+                format!("{app}-{slot}-out.log")
+            };
+            let path = dir.join(&stem);
+            std::fs::write(&path, format!("hello from {slot}\n")).expect("write");
+            cache.insert(
+                slot,
+                ProcessInfo::builder(slot, app, ProcStatus::Online)
+                    .instance(Some(slot))
+                    .out_file(Some(path.to_string_lossy().to_string()))
+                    .build(),
+            );
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = Streams {
+            out: &mut out,
+            err: &mut err,
+            style: crate::style::Presentation::BARE,
+            fmt: Format::Table,
+        };
+        let args = no_follow_args_out(app);
+        let selector = ProcessSelector::parse(app).expect("selector");
+        tail_log_files(&mut streams, false, &cache, &selector, &args);
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn a_multi_instance_app_labels_its_backlog_lines_with_the_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let printed = backlog_of(dir.path(), "web", 2, false);
+        assert!(printed.contains("web:0 |"), "{printed}");
+        assert!(printed.contains("web:1 |"), "{printed}");
+    }
+
+    #[test]
+    fn a_single_instance_app_keeps_the_bare_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let printed = backlog_of(dir.path(), "solo", 1, false);
+        assert!(printed.contains("solo |"), "{printed}");
+        assert!(
+            !printed.contains("solo:0"),
+            "no suffix for one instance: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_shared_backlog_file_is_labelled_with_the_app_not_a_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let printed = backlog_of(dir.path(), "talker", 2, true);
+        assert!(printed.contains("talker |"), "{printed}");
+        assert!(
+            !printed.contains("talker:"),
+            "one file holds both instances, and no line says which wrote it: {printed}"
+        );
+    }
+
     /// `truncated` must report `true` when the byte window is what cut the
     /// tail short, even when the line cap never binds — a sheep logging a
     /// few long, structured lines can fill `TAIL_WINDOW_BYTES` in far fewer
@@ -1675,6 +2092,66 @@ mod tests {
         assert!(
             a_pos < b_pos,
             "name order puts `a` (id 2) before `b` (id 1): {rendered}"
+        );
+    }
+
+    /// fails if one app's instances are tailed in id order rather than in
+    /// slot order.
+    ///
+    /// A reload replaces slot 0 with a fresh process at a fresh high id, so
+    /// after one, id order reads the app's instances 1, 2, 0. The listing
+    /// every other surface prints is `(name, instance, id)`, and this one
+    /// claimed to take it while sorting by `(name, id)`.
+    ///
+    /// The fixture puts slot 0 at the HIGHEST id, so id order and slot order
+    /// disagree, and scripts the listing in slot order so the cache's
+    /// arbitrary `HashMap` order cannot be what makes the assertion pass.
+    #[tokio::test]
+    async fn one_apps_instances_are_printed_in_slot_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = shep_client::testing::control_address(dir.path());
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let mut listing = Vec::new();
+        // Slot 0 reloaded, so it holds id 9 while slots 1 and 2 kept 1 and 2.
+        for (id, slot) in [(9_u32, 0_u32), (1, 1), (2, 2)] {
+            let mut sheep = info(id, "web");
+            sheep.instance = Some(slot);
+            sheep.out_file = Some(write_log(
+                dir.path(),
+                &format!("web-{slot}-out.log"),
+                &format!("line-from-slot-{slot}\n"),
+            ));
+            listing.push(sheep);
+        }
+        daemon.reply_to_list(listing);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own");
+        }
+        let rendered = String::from_utf8(out).unwrap();
+
+        let at = |slot: u32| {
+            rendered
+                .find(&format!("line-from-slot-{slot}"))
+                .unwrap_or_else(|| panic!("slot {slot}'s line is present: {rendered}"))
+        };
+        assert!(
+            at(0) < at(1) && at(1) < at(2),
+            "slot order, not id order (which would read 1, 2, 0): {rendered}"
         );
     }
 
@@ -1816,10 +2293,10 @@ mod tests {
         );
     }
 
-    /// Sits beside `json_format_renders_the_pinned_five_key_line_shape`:
+    /// Sits beside `json_format_renders_the_pinned_six_key_line_shape`:
     /// renaming a field of `BleatLine` must now fail both.
     #[tokio::test]
-    async fn a_file_sourced_json_line_is_the_same_five_key_shape_as_a_bus_sourced_one() {
+    async fn a_file_sourced_json_line_is_the_same_six_key_shape_as_a_bus_sourced_one() {
         let dir = tempfile::tempdir().unwrap();
         let sock = shep_client::testing::control_address(dir.path());
         let out_path = write_log(dir.path(), "web-out.log", "hello-from-disk\n");
@@ -1854,12 +2331,17 @@ mod tests {
 
         assert_eq!(
             keys,
-            ["id", "line", "name", "schema_version", "stream"],
+            ["id", "instance", "line", "name", "schema_version", "stream"],
             "a file-sourced line must be the same shape as a bus-sourced one: {out}"
         );
         assert_eq!(json["id"], 1);
         assert_eq!(json["name"], "web");
         assert_eq!(json["stream"], "out");
+        assert_eq!(
+            json["instance"],
+            serde_json::Value::Null,
+            "one registered instance means no slot to report"
+        );
         assert_eq!(json["line"], "hello-from-disk");
         assert_eq!(json["schema_version"], output::SCHEMA_VERSION);
     }

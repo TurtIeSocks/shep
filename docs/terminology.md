@@ -17,6 +17,7 @@ Free on crates.io (verified 2026-08-07): `shep`, `shepd`, plus reserves `bleat`,
 | one managed process (singular) | process/app | **a sheep** (singular ONLY) / process (precise) | docs may say sheep; API types stay `Process`-clear. RESERVED for managed processes |
 | plugin process (first-party in-binary, or third-party speaking the client protocol) | plugin/module | **dog** (pl. dogs) | `shep enable metrics` (built-in); `shep adopt <name> <path>` (third-party — `enable --exec` is a hidden pm2-spelled alias); `shep dogs` (list), hidden `shep dog <name>` runs one; `dog`-tagged in flock listing. Decided 2026-08-07 |
 | child process of a sheep (process-tree member) | child process | **lamb** (pl. lambs) | `shep describe` tree view ("the sheep and her lambs"), tree-kill docs. Decided 2026-08-07 |
+| one of an app's N running copies (`instances` > 1) | instance/worker | **instance**, plain, not themed, and not a lamb. A lamb is a child process of one sheep; an instance is a sibling copy of a sheep, spawned by the daemon rather than forked by its parent. `web:2` selects instance 2 of `web`; `ProcessInfo.instance` carries the slot on the wire | `shep flock`'s `web ×3` group row, `name:slot` selector, `SHEP_INSTANCE`/`{{instance}}` |
 | namespace / group | namespace | **fold** (also: paddock) | `shep fold <name>`, `Fold` type |
 | app config file | ecosystem.config.js | **Flockfile** (`Flockfile.toml` / `.yaml` / `.json`) | config discovery, docs |
 | logs | logs | **bleats** | `shep bleats [--follow]`; `shep logs` stays as alias |

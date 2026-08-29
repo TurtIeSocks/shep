@@ -58,7 +58,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use shep_core::paths::ShepPaths;
 use tokio::sync::mpsc;
 
-use self::app::{App, Control, Effect, Msg, Sent};
+use self::app::{App, Control, Effect, Msg, RowKey, Sent};
 // The trait, for the opening dial below. `BusEvent` and `KeyPress` are named
 // only from the test module and are imported there, not here: an import used
 // solely by `#[cfg(test)]` code warns in the ordinary build, and `-D warnings`
@@ -356,7 +356,7 @@ where
             // too short, which errs toward asking for nothing.
             let height = terminal.size().map_or(0, |size| size.height);
             if view::panes_for(height).detail
-                && let Some(id) = app.selected()
+                && let Some(RowKey::Sheep(id)) = app.selected()
             {
                 // `try_send`, for `Effect::PollNow`'s reason: a full
                 // channel means a request is already queued, and a

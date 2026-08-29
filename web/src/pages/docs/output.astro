@@ -94,6 +94,50 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       on that same row says it never started at all.
     </p>
 
+    <h2 id="grouped-instances">Multi-instance apps group</h2>
+    <p>
+      An app with <code>instances</code> above 1 gets a header row above its
+      slots, in <code>full</code> or <code>plain</code>: <code>web ×3</code>
+      in <code>NAME</code>, and a <code>↳ :0</code> row beneath it per
+      instance, which is also what <code>web:0</code> selects. A
+      single-instance app is unchanged, no group row and no suffix:
+    </p>
+    <CodeBlock label="shep flock">{`┌────┬────────┬──────────────┬───────┬──────────┬──────┬──────┬──────┬────────┬──────┬──────┐
+│ ID │ NAME   │ STATUS       │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ FOLD │ SMIT │
+├────┼────────┼──────────────┼───────┼──────────┼──────┼──────┼──────┼────────┼──────┼──────┤
+│    │ web ×3 │ (o.o) online │       │ 0        │      │ 0.0% │ 9.1M │ 33s    │ -    │ -    │
+│ 0  │  ↳ :0  │ (o.o) online │ 74802 │ 0        │ -    │ 0.0% │ 3.0M │ 33s    │      │      │
+│ 1  │  ↳ :1  │ (o.o) online │ 74803 │ 0        │ -    │ 0.0% │ 3.0M │ 33s    │      │      │
+│ 2  │  ↳ :2  │ (o.o) online │ 74804 │ 0        │ -    │ 0.0% │ 3.0M │ 33s    │      │      │
+└────┴────────┴──────────────┴───────┴──────────┴──────┴──────┴──────┴────────┴──────┴──────┘`}</CodeBlock>
+    <p>
+      The group row rolls up rather than picking a winner: <code>STATUS</code>
+      is the shared word when every instance agrees, else a count per state
+      like <code>2 up, 1 down</code>. <code>RESTARTS</code>, <code>CPU</code>
+      and <code>MEM</code> sum across the instances, and <code>UPTIME</code>
+      is the minimum, time since the last disruption. <code>ID</code> and
+      <code>PID</code> are blank, since neither has a single answer, and
+      <code>FOLD</code> and <code>SMIT</code> sit only on the group row and
+      stay blank on the instance rows beneath it, since both are per-app
+      already. When a selector or filter matches only some of an app's
+      instances, the count and rollups describe the rows actually listed,
+      not the app's true size.
+    </p>
+    <p>
+      <code>bare</code> and <code>--format json</code> stay one line per
+      instance instead, so they stay greppable. <code>bare</code> suffixes
+      the name, <code>web:2</code>, and only for an app with more than one
+      instance:
+    </p>
+    <CodeBlock label="shep flock --style bare">{`ID  NAME   STATUS  PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
+0   web:0  online  74802  0         -     0.0%  3.0M  38s     -     -
+1   web:1  online  74803  0         -     0.0%  3.0M  38s     -     -
+2   web:2  online  74804  0         -     0.0%  3.0M  38s     -     -`}</CodeBlock>
+    <p>
+      JSON rows carry the slot as its own field, <code>"instance": 0</code>,
+      rather than folding it into the name.
+    </p>
+
     <h2 id="the-dogs-table">The dogs table</h2>
     <p>
       Dogs get their own table, under a <code>Dogs</code> caption, wherever
@@ -356,6 +400,20 @@ api | FATAL: port in use`}</CodeBlock>
     <p>
       <code>--lines</code> says how much, counted per stream, and defaults to
       fifteen. <code>--lines 0</code> follows without replaying anything.
+    </p>
+    <p>
+      A multi-instance app's prefix carries the slot, so lines from two
+      instances stay tellable apart:
+    </p>
+    <CodeBlock label="shep bleats web">{`web:0 | listening
+web:1 | listening
+web:2 | listening`}</CodeBlock>
+    <p class="fine">
+      Shared via <code>merge_logs</code> instead, the backlog read from the
+      one file is printed unattributed, <code>web |</code>, since nothing in
+      the file itself says which instance wrote a line. Lines read live after
+      that come from the daemon's own per-sheep events and carry their slot
+      as normal.
     </p>
   </article>
 </DocsLayout>

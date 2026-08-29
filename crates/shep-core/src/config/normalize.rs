@@ -223,35 +223,53 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 ///
 /// # Errors
 ///
-/// - [`NormalizeError::MissingName`] — `name` is empty.
-/// - [`NormalizeError::InvalidName`] — `name` contains a path separator or is `.`/`..`.
-/// - [`NormalizeError::MissingScript`] — `script` is empty.
-/// - [`NormalizeError::ZeroInstances`] — `instances == 0`.
-/// - [`NormalizeError::InvalidCron`] — `cron_restart` is not valid in
+/// - [`NormalizeError::MissingName`]: `name` is empty.
+/// - [`NormalizeError::InvalidName`]: `name` contains a path separator or a
+///   colon, or is `.`/`..`.
+/// - [`NormalizeError::ReservedEnvVar`]: `env` sets `SHEP_INSTANCE` or
+///   `SHEP_NAME`, which shep injects itself (carries the app name and the
+///   variable).
+/// - [`NormalizeError::IncrementVarRemoved`]: `increment_var` is set. It was
+///   removed in favour of `{{instance}}` templating (carries the app name
+///   and the variable the app named).
+/// - [`NormalizeError::MissingScript`]: `script` is empty.
+/// - [`NormalizeError::ZeroInstances`]: `instances == 0`.
+/// - [`NormalizeError::InvalidCron`]: `cron_restart` is not valid in
 ///   croner's dialect (carries the pattern and the rejection reason).
-/// - [`NormalizeError::InvalidTimezone`] — `cron_timezone` is not a name in
+/// - [`NormalizeError::InvalidTimezone`]: `cron_timezone` is not a name in
 ///   the IANA time-zone database.
-/// - [`NormalizeError::InvalidProbe`] — `readiness_probe` or `liveness_probe`
+/// - [`NormalizeError::InvalidProbe`]: `readiness_probe` or `liveness_probe`
 ///   has a target [`ProbeTarget::parse`] rejects (carries which probe and
 ///   the rendered reason).
-/// - [`NormalizeError::ZeroFailureThreshold`] — a probe's `failure_threshold`
+/// - [`NormalizeError::ZeroFailureThreshold`]: a probe's `failure_threshold`
 ///   is explicitly `0`.
-/// - [`NormalizeError::IntervalBelowMinimum`] — a probe's `interval` is under
+/// - [`NormalizeError::IntervalBelowMinimum`]: a probe's `interval` is under
 ///   the floor its own loop honours: a full second for `liveness_probe`, and
 ///   only "greater than zero" for `readiness_probe` (carries which probe, the
 ///   value and the floor).
-/// - [`NormalizeError::ZeroMaxMemory`] — `max_memory` is `0`.
-/// - [`NormalizeError::ActionTimeoutTooLong`] — `action_timeout` is at or
+/// - [`NormalizeError::ZeroMaxMemory`]: `max_memory` is `0`.
+/// - [`NormalizeError::ActionTimeoutTooLong`]: `action_timeout` is at or
 ///   above the ceiling no RPC caller could ever be given room to wait past
 ///   (carries the app name, the value and the ceiling).
-/// - [`NormalizeError::InvalidKillSignal`] — `kill_signal` names a signal the
+/// - [`NormalizeError::InvalidKillSignal`]: `kill_signal` names a signal the
 ///   daemon's stop ladder cannot send (carries the app name and the value).
-/// - [`NormalizeError::WatchWithoutCwd`] — `watch` is `true` with no `cwd`
+/// - [`NormalizeError::WatchWithoutCwd`]: `watch` is `true` with no `cwd`
 ///   set.
-/// - [`NormalizeError::ZeroWatchDelay`] — `watch_delay` is `0`.
-/// - [`NormalizeError::InvalidWatchGlob`] — a `watch_options` or
+/// - [`NormalizeError::ZeroWatchDelay`]: `watch_delay` is `0`.
+/// - [`NormalizeError::InvalidWatchGlob`]: a `watch_options` or
 ///   `ignore_watch` pattern globset will not compile (carries the app name,
 ///   which of the two lists, the pattern and the reason).
+/// - [`NormalizeError::BadTemplate`]: an `env` value, an `args` entry, or an
+///   `out_file`/`err_file` path carries a `{{...}}` naming something
+///   [`crate::config::template`] does not define, **or a `{{` that is never
+///   closed by a `}}`** (carries the app name, which field, and the
+///   rejection).
+/// - [`NormalizeError::SharedLogPath`]: `out_file` or `err_file` renders to
+///   the SAME path for two different slots, with `instances > 1` and
+///   `merge_logs` off, so every instance would write to one file without
+///   having asked to. Rendered, not searched: a path with no `{{instance}}`
+///   in it collides, and so does one carrying only `{{name}}`, or an escaped
+///   `{{{{instance}}}}`, which spells the token but renders as a literal.
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     normalize_with_home(app, std::env::home_dir().as_deref())
 }
@@ -273,8 +291,33 @@ pub fn normalize_with_home(
     if app.name.is_empty() {
         return Err(NormalizeError::MissingName);
     }
-    if app.name.contains(['/', '\\']) || app.name == "." || app.name == ".." {
+    if app.name.contains(['/', '\\', ':']) || app.name == "." || app.name == ".." {
         return Err(NormalizeError::InvalidName(app.name));
+    }
+    for var in ["SHEP_INSTANCE", "SHEP_NAME"] {
+        if app.env.contains_key(var) {
+            return Err(NormalizeError::ReservedEnvVar {
+                name: app.name.clone(),
+                var,
+            });
+        }
+    }
+    if let Some(var) = app.increment_var.take() {
+        return Err(NormalizeError::IncrementVarRemoved {
+            name: app.name.clone(),
+            var,
+        });
+    }
+    for (key, value) in &app.env {
+        validate_template(&app.name, &format!("env.{key}"), value)?;
+    }
+    for (index, value) in app.args.iter().enumerate() {
+        validate_template(&app.name, &format!("args[{index}]"), value)?;
+    }
+    for (field, value) in [("out_file", &app.out_file), ("err_file", &app.err_file)] {
+        if let Some(value) = value {
+            validate_template(&app.name, field, value)?;
+        }
     }
     if app.script.is_empty() {
         return Err(NormalizeError::MissingScript);
@@ -285,6 +328,25 @@ pub fn normalize_with_home(
     expand_paths(&mut app, home)?;
     if app.instances == 0 {
         return Err(NormalizeError::ZeroInstances);
+    }
+    // After the template validation above, so a malformed `out_file`/`err_file`
+    // is reported as a bad template rather than as a shared path.
+    if app.instances > 1 && !app.merge_logs {
+        for (field, path) in [("out_file", &app.out_file), ("err_file", &app.err_file)] {
+            // Rendered rather than searched for a substring: an escaped
+            // `{{{{instance}}}}` contains the token's spelling but renders to
+            // one literal path for every instance, which is exactly the
+            // collision this refuses. Two slots that render alike collide.
+            if let Some(path) = path
+                && crate::config::template::render(path, &app.name, 0)
+                    == crate::config::template::render(path, &app.name, 1)
+            {
+                return Err(NormalizeError::SharedLogPath {
+                    name: app.name.clone(),
+                    field,
+                });
+            }
+        }
     }
     if let Some(pattern) = &app.cron_restart {
         CronSchedule::parse(pattern, app.cron_timezone.as_deref()).map_err(|e| match e {
@@ -374,6 +436,23 @@ pub fn normalize_with_home(
     validate_watch_globs(&app.name, "watch_options", &app.watch_options)?;
     validate_watch_globs(&app.name, "ignore_watch", &app.ignore_watch)?;
     Ok(ResolvedApp { config: app })
+}
+
+/// Validates one `{{instance}}`/`{{name}}` template value, naming `field` in
+/// any rejection so the user knows which entry to edit.
+///
+/// # Errors
+/// [`NormalizeError::BadTemplate`] if `value` carries a `{{...}}` this
+/// grammar does not define, or a `{{` this value never closes. Both of
+/// [`crate::config::template::validate`]'s own rejections map here, so the
+/// two are told apart by the rendered `reason` the variant carries rather
+/// than by the variant.
+fn validate_template(name: &str, field: &str, value: &str) -> Result<(), NormalizeError> {
+    crate::config::template::validate(value).map_err(|reason| NormalizeError::BadTemplate {
+        name: name.to_string(),
+        field: field.to_string(),
+        reason: reason.to_string(),
+    })
 }
 
 /// Validates one of an app's two watch glob lists, rejecting any pattern
@@ -471,9 +550,29 @@ pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, Normalize
 pub enum NormalizeError {
     /// `name` is empty
     MissingName,
-    /// `name` contains `/` or `\` or is `.`/`..` — it becomes a filesystem
-    /// path stem, so these would escape the shep home (carries the name)
+    /// `name` contains `/`, `\` or `:`, or is `.`/`..`. A path separator
+    /// would escape the shep home, since the name becomes a filesystem path
+    /// stem; a colon is the `name:slot` separator, and is also illegal in a
+    /// Windows filename, which a sheep name becomes part of. Carries the
+    /// name.
     InvalidName(String),
+    /// An app's `env` sets a variable shep injects itself. Carries the sheep
+    /// name and the variable, so the error names the entry to edit.
+    ReservedEnvVar {
+        /// The sheep name
+        name: String,
+        /// The variable the app tried to set
+        var: &'static str,
+    },
+    /// `increment_var` was removed in favour of `{{instance}}` templating.
+    /// Carries the variable the app named, so the error can show the exact
+    /// line to write instead.
+    IncrementVarRemoved {
+        /// The sheep name
+        name: String,
+        /// The variable the app asked for
+        var: String,
+    },
     /// `script` is empty
     MissingScript,
     /// `instances` is zero
@@ -594,6 +693,29 @@ pub enum NormalizeError {
         /// globset's own rendered reason.
         reason: String,
     },
+    /// A value carries a `{{...}}` that is not a template token, or a `{{`
+    /// it never closes. Carries the sheep name, which field held it, and the
+    /// rejection rendered.
+    BadTemplate {
+        /// The sheep name
+        name: String,
+        /// Which field, for example `env.WORKER` or `args[1]`
+        field: String,
+        /// The template grammar's own error, rendered, so this
+        /// variant does not have to restate the grammar's own copy
+        reason: String,
+    },
+    /// An explicit log path renders to the same string for two different
+    /// slots, the app runs more than one instance, and `merge_logs` is off,
+    /// so every instance would write to one file without having asked to.
+    /// A path with no `{{instance}}` is the ordinary case; a `{{name}}`-only
+    /// path and an escaped `{{{{instance}}}}` collide for the same reason.
+    SharedLogPath {
+        /// The sheep name
+        name: String,
+        /// `out_file` or `err_file`
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for NormalizeError {
@@ -603,9 +725,17 @@ impl fmt::Display for NormalizeError {
             Self::InvalidName(n) => {
                 write!(
                     f,
-                    "sheep name `{n}` may not contain a path separator or be `.` or `..`"
+                    "sheep name `{n}` may not contain a path separator or a colon, or be `.` or `..`; use `-` in place of a colon"
                 )
             }
+            Self::ReservedEnvVar { name, var } => write!(
+                f,
+                "sheep `{name}` sets `{var}` in env, but shep injects it: use a different name, or `{{{{instance}}}}` in your own variable"
+            ),
+            Self::IncrementVarRemoved { name, var } => write!(
+                f,
+                "sheep `{name}` sets `increment_var`, which was removed: write `{var} = \"{{{{instance}}}}\"` under `[app.env]` instead"
+            ),
             Self::MissingScript => f.write_str("app config is missing a script"),
             Self::ZeroInstances => f.write_str("instances must be at least 1"),
             Self::InvalidCron { pattern, reason } => {
@@ -670,6 +800,15 @@ impl fmt::Display for NormalizeError {
             } => write!(
                 f,
                 "sheep `{name}` has an invalid {field} pattern `{pattern}`: {reason}"
+            ),
+            Self::BadTemplate {
+                name,
+                field,
+                reason,
+            } => write!(f, "sheep `{name}`, {field}: {reason}"),
+            Self::SharedLogPath { name, field } => write!(
+                f,
+                "sheep `{name}` runs several instances and sets `{field}` to one path: put `{{{{instance}}}}` in it, or set `merge_logs = true` to share it on purpose"
             ),
         }
     }
@@ -842,6 +981,61 @@ mod tests {
         assert!(!resolved.config().reuse_port);
     }
     use crate::config::AppConfig;
+
+    #[test]
+    fn a_colon_in_a_name_is_refused_because_it_is_the_instance_separator() {
+        let err = normalize(AppConfig::minimal("web:2", "./srv")).unwrap_err();
+        assert_eq!(err, NormalizeError::InvalidName("web:2".to_string()));
+
+        let rendered = err.to_string();
+        assert!(rendered.contains(':'), "says which character: {rendered}");
+        // Spec D3: "The error names the character and suggests `-`." It named
+        // the colon and suggested nothing, so migration.md carried the
+        // stand-in and the error an operator actually meets did not.
+        assert!(
+            rendered.contains("`-`"),
+            "suggests the stand-in: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+            "no em or en dash in copy a user reads: {rendered}"
+        );
+
+        assert!(normalize(AppConfig::minimal("web-2", "./srv")).is_ok());
+    }
+
+    #[test]
+    fn increment_var_is_refused_and_says_what_replaced_it() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.increment_var = Some("WORKER_ID".to_string());
+        let err = normalize(app).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("increment_var"), "{rendered}");
+        assert!(
+            rendered.contains("WORKER_ID"),
+            "keeps their name: {rendered}"
+        );
+        assert!(rendered.contains("{{instance}}"), "and the fix: {rendered}");
+        assert!(
+            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+            "no em or en dash in copy a user reads: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_reserved_env_vars_are_refused_rather_than_overwritten() {
+        for var in ["SHEP_INSTANCE", "SHEP_NAME"] {
+            let mut app = AppConfig::minimal("web", "./srv");
+            app.env.insert(var.to_string(), "mine".to_string());
+            let err = normalize(app).unwrap_err();
+            let rendered = err.to_string();
+            assert!(rendered.contains(var), "names the variable: {rendered}");
+            assert!(
+                !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+                "no em or en dash in copy a user reads: {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn valid_minimal_config_normalizes() {
@@ -1394,6 +1588,99 @@ target = "http://127.0.0.1:8080/healthz"
         app.watch_options = vec!["src/**/*.rs".to_string(), "*.[ch]".to_string()];
         app.ignore_watch = vec!["target/**".to_string(), "**/[!.]*.{tmp,swp}".to_string()];
         assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn a_typo_in_an_env_template_is_refused_and_names_the_field() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.env
+            .insert("WORKER".to_string(), "w-{{instnace}}".to_string());
+        let err = normalize(app).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("instnace"), "names the typo: {rendered}");
+        assert!(rendered.contains("WORKER"), "and the field: {rendered}");
+    }
+
+    #[test]
+    fn a_typo_in_an_arg_template_is_refused_too() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.args = vec!["--port".to_string(), "91{{slot}}".to_string()];
+        let err = normalize(app).unwrap_err();
+        assert!(err.to_string().contains("slot"), "{err}");
+    }
+
+    #[test]
+    fn an_explicit_log_path_shared_by_every_instance_is_refused() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 3;
+        app.out_file = Some("/var/log/web.log".to_string());
+        let err = normalize(app).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("out_file"), "names the field: {rendered}");
+        assert!(
+            rendered.contains("{{instance}}") && rendered.contains("merge_logs"),
+            "and both ways out: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+            "no em or en dash in copy a user reads: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_three_ways_out_of_the_shared_log_refusal_all_work() {
+        // A slot in the path.
+        let mut templated = AppConfig::minimal("web", "./srv");
+        templated.instances = 3;
+        templated.out_file = Some("/var/log/web-{{instance}}.log".to_string());
+        assert!(normalize(templated).is_ok());
+
+        // Asking for the merge on purpose.
+        let mut merged = AppConfig::minimal("web", "./srv");
+        merged.instances = 3;
+        merged.out_file = Some("/var/log/web.log".to_string());
+        merged.merge_logs = true;
+        assert!(normalize(merged).is_ok());
+
+        // One instance cannot collide with itself.
+        let mut single = AppConfig::minimal("web", "./srv");
+        single.out_file = Some("/var/log/web.log".to_string());
+        assert!(normalize(single).is_ok());
+    }
+
+    #[test]
+    fn an_escaped_template_in_a_log_path_does_not_satisfy_the_refusal() {
+        // `{{{{instance}}}}` spells the token but renders to one literal path
+        // for every instance, so a substring check would wave it through.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 3;
+        app.out_file = Some("/var/log/web-{{{{instance}}}}.log".to_string());
+        assert!(normalize(app).is_err());
+    }
+
+    #[test]
+    fn a_name_only_template_does_not_resolve_the_collision() {
+        // `{{name}}` is the same for every instance, so a path carrying only it
+        // still puts every instance on one file. Presence of a token is not the
+        // test; rendering differently is.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 3;
+        app.out_file = Some("/var/log/{{name}}.log".to_string());
+        assert!(normalize(app).is_err());
+    }
+
+    #[test]
+    fn a_bad_template_in_a_log_path_is_reported_as_bad_template_not_shared_path() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 3;
+        app.out_file = Some("/var/log/web-{{instnace}}.log".to_string());
+        match normalize(app).unwrap_err() {
+            NormalizeError::BadTemplate { field, reason, .. } => {
+                assert_eq!(field, "out_file");
+                assert!(reason.contains("instnace"), "{reason}");
+            }
+            other => panic!("expected BadTemplate, got {other:?}"),
+        }
     }
 
     #[test]

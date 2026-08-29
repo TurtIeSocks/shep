@@ -13,10 +13,12 @@
 //! shows them a crash), the lamb line, and whichever fields the current width
 //! tier has dropped.
 
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use shep_core::protocol::DogSource;
 
-use super::super::app::{App, LambWalk};
+use super::super::app::{App, LambWalk, RowKey};
+use super::super::theme::Palette;
 use super::flock::fit;
 use crate::output::{human_bytes, human_duration};
 
@@ -24,21 +26,79 @@ use crate::output::{human_bytes, human_duration};
 #[must_use]
 pub fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let palette = app.palette();
+    match app.selected() {
+        None => empty_lines(app, width, palette),
+        Some(RowKey::Group(name)) => group_lines(app, &name, width, palette),
+        Some(RowKey::Sheep(_)) => sheep_lines(app, width, palette),
+    }
+}
+
+/// The pane's four lines when nothing is selected. Names the CAUSE, not the
+/// fact: an operator can see the pane is empty; what they cannot see is
+/// whether that is a broken dashboard or a shepherd with nothing registered.
+fn empty_lines(app: &App, width: u16, palette: Palette) -> Vec<Line<'static>> {
+    let why = if app.flock_len() == 0 {
+        "no sheep selected: the flock is empty".to_string()
+    } else {
+        format!("no sheep selected: no name contains \"{}\"", app.filter())
+    };
+    vec![
+        Line::from(Span::styled(fit(&why, width), palette.muted())),
+        Line::from(Span::raw(String::new())),
+        Line::from(Span::raw(String::new())),
+        Line::from(Span::raw(String::new())),
+    ]
+}
+
+/// An app's four lines when a [`RowKey::Group`] is selected: the rollup
+/// [`App::group_totals`] computes, in place of one sheep's own fields. No
+/// lamb line and no log paths -- a group has no single process to walk or
+/// tail, and reading either for one arbitrarily chosen instance would
+/// describe a sheep the operator did not select.
+fn group_lines(app: &App, name: &str, width: u16, palette: Palette) -> Vec<Line<'static>> {
+    let totals = app.group_totals(name);
+    let head = format!("app {name} \u{d7}{}  ", totals.count);
+    let status = app.group_status_text(name);
+    let rest = format!(
+        "   restarts {}   uptime {}   cpu {}   mem {}",
+        totals.restarts,
+        totals
+            .uptime_ms
+            .map_or_else(|| "-".to_string(), human_duration),
+        totals
+            .cpu
+            .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+        totals.memory.map_or_else(|| "-".to_string(), human_bytes),
+    );
+    let used = head.chars().count() + status.chars().count();
+    let status_style = app
+        .group_uniform_status(name)
+        .map_or(Style::default(), |status| palette.status(status));
+
+    vec![
+        Line::from(vec![
+            Span::raw(head),
+            Span::styled(status, status_style),
+            Span::raw(fit(
+                &rest,
+                width.saturating_sub(u16::try_from(used).unwrap_or(width)),
+            )),
+        ]),
+        Line::from(Span::styled(
+            fit("lambs  not shown for a group; select one instance", width),
+            palette.muted(),
+        )),
+        Line::from(Span::raw(String::new())),
+        Line::from(Span::raw(String::new())),
+    ]
+}
+
+/// A real sheep's four lines. `app.selected_row()` is `None` here only when
+/// the selection has just gone stale between messages; that frame reuses the
+/// empty pane's own sentence rather than inventing a fifth state.
+fn sheep_lines(app: &App, width: u16, palette: Palette) -> Vec<Line<'static>> {
     let Some(row) = app.selected_row() else {
-        // Names the CAUSE, not the fact. An operator can see the pane is
-        // empty; what they cannot see is whether that is a broken
-        // dashboard or a shepherd with nothing registered.
-        let why = if app.flock_len() == 0 {
-            "no sheep selected: the flock is empty".to_string()
-        } else {
-            format!("no sheep selected: no name contains \"{}\"", app.filter())
-        };
-        return vec![
-            Line::from(Span::styled(fit(&why, width), palette.muted())),
-            Line::from(Span::raw(String::new())),
-            Line::from(Span::raw(String::new())),
-            Line::from(Span::raw(String::new())),
-        ];
+        return empty_lines(app, width, palette);
     };
     let info = &row.info;
 
@@ -162,11 +222,12 @@ mod tests {
     use shep_core::status::ProcStatus;
 
     use super::super::fixtures::{
-        app_with_lamb_reading_at, coloured, lamb_line_of, render_all, rendered, sheep_with_lambs,
-        with_lamb_reading, with_lamb_reading_for, with_selection, with_selection_and_palette,
+        app_with, app_with_lamb_reading_at, coloured, lamb_line_of, plain, render_all, rendered,
+        sheep_with_lambs, with_lamb_reading, with_lamb_reading_for, with_selection,
+        with_selection_and_palette,
     };
     use super::*;
-    use crate::lookout::app::{App, Control, LambWalk, Msg};
+    use crate::lookout::app::{App, Control, LambWalk, Msg, RowKey};
     use crate::lookout::theme::Palette;
 
     /// fails if the pane collapses any two of the five states it can be in.
@@ -333,6 +394,60 @@ mod tests {
         assert!(
             rendered.contains("no sheep selected: the flock is empty"),
             "got {rendered:?}"
+        );
+    }
+
+    /// fails if a selected group row falls back to the empty-pane sentence,
+    /// stops showing the app's own rollup, or starts fetching lambs / a log
+    /// path for one arbitrarily chosen instance. Drives `detail_lines`
+    /// through a real `App` built from a real `Msg::Snapshot` (via
+    /// `fixtures::app_with`), the same door the production render loop
+    /// walks through -- not through `group_lines` directly.
+    #[test]
+    fn a_selected_group_row_shows_the_apps_rollup_and_no_lambs_or_paths() {
+        let app = app_with(
+            vec![
+                ProcessInfo::builder(1, "web", ProcStatus::Online)
+                    .instance(Some(0))
+                    .memory_bytes(Some(100 << 20))
+                    .uptime_ms(120_000)
+                    .out_file(Some("/home/ada/.shep/logs/web-0-out.log".to_string()))
+                    .build(),
+                ProcessInfo::builder(2, "web", ProcStatus::Online)
+                    .instance(Some(1))
+                    .memory_bytes(Some(150 << 20))
+                    .uptime_ms(30_000)
+                    .build(),
+            ],
+            plain(),
+        );
+        // Sanity: the group is the whole flock here, so `App::reseat`'s own
+        // rule (first visible row, unseated) lands the default selection on
+        // it with no keypress -- confirming this is what makes the rest of
+        // the assertion mean anything.
+        assert!(
+            matches!(app.selected(), Some(RowKey::Group(ref name)) if name == "web"),
+            "sanity: the group is selected by default, got {:?}",
+            app.selected()
+        );
+
+        let rendered = render_all(&detail_lines(&app, 200));
+        assert!(rendered.contains("app web \u{d7}2"), "got {rendered:?}");
+        assert!(
+            rendered.contains("uptime 30s"),
+            "the MINIMUM uptime (30s), not the first instance's 120s: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("mem 250.0M"),
+            "memory summed (100 + 150 MiB): {rendered:?}"
+        );
+        assert!(
+            rendered.contains("lambs  not shown for a group; select one instance"),
+            "got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("web-0-out.log"),
+            "no arbitrarily-chosen instance's log path: {rendered:?}"
         );
     }
 }

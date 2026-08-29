@@ -1,6 +1,7 @@
 //! Target selection: one parse for every CLI verb and RPC filter
 //!
-//! Precedence: `all` > `fold:<name>` > `/regex/` > all-digits id > name.
+//! Precedence: `all` > `fold:<name>` > `/regex/` > all-digits id > glob >
+//! `name:slot` > name.
 
 use core::fmt;
 
@@ -17,6 +18,13 @@ pub enum ProcessSelector {
     Regex(regex::Regex),
     /// Every sheep in a fold
     Fold(String),
+    /// One instance of one app, written `name:slot` on the CLI
+    Instance {
+        /// The app name, which cannot itself contain a colon
+        name: String,
+        /// The instance slot, counting from 0
+        slot: u32,
+    },
 }
 
 /// Whether `input` carries a glob metacharacter, and so was meant as a
@@ -50,6 +58,11 @@ fn is_glob(input: &str) -> bool {
 /// selector variant of its own: `SelectorSpec` is the wire, and a new variant
 /// there is a protocol change an older daemon could not deserialize. This
 /// way a glob works against a shepherd built before globs existed.
+///
+/// [`ProcessSelector::Instance`] takes the protocol change this trick avoids,
+/// because a slot is not part of a name and cannot be folded into a regex the
+/// way a glob's characters can. That tradeoff is knowing: an older daemon
+/// cannot deserialize `name:slot`, and there is no equivalent way around it.
 ///
 /// # Errors
 ///
@@ -104,6 +117,23 @@ impl ProcessSelector {
                 })
                 .map(Self::Regex);
         }
+        // Last, so every earlier form wins: `fold:` is a prefix test above,
+        // a glob containing a colon was already turned into a regex, and an
+        // all-digit input was already an id. A name cannot contain a colon
+        // (`config::normalize` refuses one), so splitting on the last colon
+        // cannot cut a name in half.
+        if let Some((name, slot)) = input.rsplit_once(':')
+            && !name.is_empty()
+            && !slot.is_empty()
+            && slot.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(slot) = slot.parse()
+        {
+            return Ok(Self::Instance {
+                name: name.to_string(),
+                slot,
+            });
+        }
+
         Ok(Self::Name(input.to_string()))
     }
 
@@ -119,20 +149,25 @@ impl ProcessSelector {
     #[must_use]
     pub const fn is_exact(&self) -> bool {
         match self {
-            Self::Id(_) | Self::Name(_) => true,
+            Self::Id(_) | Self::Name(_) | Self::Instance { .. } => true,
             Self::All | Self::Regex(_) | Self::Fold(_) => false,
         }
     }
 
     /// Tests one sheep against this selector
     #[must_use]
-    pub fn matches(&self, name: &str, id: u32, fold: Option<&str>) -> bool {
+    pub fn matches(&self, name: &str, id: u32, fold: Option<&str>, instance: Option<u32>) -> bool {
         match self {
             Self::All => true,
             Self::Id(want) => *want == id,
             Self::Name(want) => want == name,
             Self::Regex(re) => re.is_match(name),
             Self::Fold(want) => fold == Some(want.as_str()),
+            // `None` means the peer daemon predates the slot field, so this
+            // row cannot be shown to be the one asked for. Refusing to match
+            // is the safe direction: a restart reaches nothing rather than
+            // reaching every instance of the name.
+            Self::Instance { name: want, slot } => want == name && instance == Some(*slot),
         }
     }
 }
@@ -188,6 +223,7 @@ impl std::convert::TryFrom<crate::protocol::SelectorSpec> for ProcessSelector {
             SelectorSpec::Id(id) => Self::Id(id),
             SelectorSpec::Name(name) => Self::Name(name),
             SelectorSpec::Fold(fold) => Self::Fold(fold),
+            SelectorSpec::Instance { name, slot } => Self::Instance { name, slot },
             SelectorSpec::Regex(src) => Self::Regex(
                 // Peer-supplied pattern: bound compiled-program memory.
                 regex::RegexBuilder::new(&src)
@@ -208,6 +244,10 @@ impl From<&ProcessSelector> for crate::protocol::SelectorSpec {
             ProcessSelector::Name(name) => SelectorSpec::Name(name.clone()),
             ProcessSelector::Regex(re) => SelectorSpec::Regex(re.as_str().to_string()),
             ProcessSelector::Fold(fold) => SelectorSpec::Fold(fold.clone()),
+            ProcessSelector::Instance { name, slot } => SelectorSpec::Instance {
+                name: name.clone(),
+                slot: *slot,
+            },
         }
     }
 }
@@ -335,23 +375,27 @@ mod tests {
     #[test]
     fn matching() {
         let by_name = ProcessSelector::parse("web").unwrap();
-        assert!(by_name.matches("web", 0, None));
-        assert!(!by_name.matches("worker", 0, None));
+        assert!(by_name.matches("web", 0, None, None));
+        assert!(!by_name.matches("worker", 0, None, None));
 
         let by_regex = ProcessSelector::parse("/^w/").unwrap();
-        assert!(by_regex.matches("worker", 9, None));
-        assert!(!by_regex.matches("api", 9, None));
+        assert!(by_regex.matches("worker", 9, None, None));
+        assert!(!by_regex.matches("api", 9, None, None));
 
         let by_fold = ProcessSelector::parse("fold:backend").unwrap();
-        assert!(by_fold.matches("anything", 0, Some("backend")));
-        assert!(!by_fold.matches("anything", 0, None));
+        assert!(by_fold.matches("anything", 0, Some("backend"), None));
+        assert!(!by_fold.matches("anything", 0, None, None));
 
         assert!(
             ProcessSelector::parse("all")
                 .unwrap()
-                .matches("x", 42, None)
+                .matches("x", 42, None, None)
         );
-        assert!(ProcessSelector::parse("42").unwrap().matches("x", 42, None));
+        assert!(
+            ProcessSelector::parse("42")
+                .unwrap()
+                .matches("x", 42, None, None)
+        );
     }
 
     /// fails if `Fold` or `Regex` is counted as exact. Either mistake makes
@@ -383,7 +427,7 @@ mod tests {
     fn selector_spec_bridges() {
         use crate::protocol::SelectorSpec;
         let sel: ProcessSelector = SelectorSpec::Regex("^w".to_string()).try_into().unwrap();
-        assert!(sel.matches("web", 1, None));
+        assert!(sel.matches("web", 1, None, None));
         assert_eq!(
             SelectorSpec::from(&sel),
             SelectorSpec::Regex("^w".to_string())
@@ -393,6 +437,10 @@ mod tests {
             SelectorSpec::Id(3),
             SelectorSpec::Name("web".to_string()),
             SelectorSpec::Fold("backend".to_string()),
+            SelectorSpec::Instance {
+                name: "web".to_string(),
+                slot: 2,
+            },
         ] {
             let sel: ProcessSelector = spec.clone().try_into().unwrap();
             assert_eq!(SelectorSpec::from(&sel), spec);
@@ -406,6 +454,75 @@ mod tests {
             ProcessSelector::try_from(SelectorSpec::Regex("((".to_string())).unwrap_err(),
             SelectorError::BadRegex(_)
         ));
+    }
+
+    #[test]
+    fn an_instance_form_parses_and_matches_only_its_slot() {
+        let sel = ProcessSelector::parse("web:2").expect("parses");
+        assert!(matches!(
+            &sel,
+            ProcessSelector::Instance { name, slot } if name == "web" && *slot == 2
+        ));
+        assert!(sel.matches("web", 7, None, Some(2)));
+        assert!(!sel.matches("web", 7, None, Some(1)));
+        assert!(!sel.matches("api", 7, None, Some(2)));
+        assert!(
+            !sel.matches("web", 7, None, None),
+            "an older daemon's row carries no slot, so it cannot be the one asked for"
+        );
+    }
+
+    #[test]
+    fn an_instance_selector_names_one_entry_so_it_is_exact() {
+        // The dog rule: an operator who named it reaches it, a wildcard does not.
+        assert!(
+            ProcessSelector::parse("metrics:0")
+                .expect("parses")
+                .is_exact()
+        );
+    }
+
+    #[test]
+    fn the_colon_forms_do_not_shadow_each_other() {
+        assert!(matches!(
+            ProcessSelector::parse("fold:web").expect("parses"),
+            ProcessSelector::Fold(_)
+        ));
+        assert!(matches!(
+            ProcessSelector::parse("web:2").expect("parses"),
+            ProcessSelector::Instance { .. }
+        ));
+        // A trailing segment that is not a number is not a slot. Names cannot
+        // hold a colon any more, so this is a name that will simply match nothing.
+        assert!(matches!(
+            ProcessSelector::parse("web:two").expect("parses"),
+            ProcessSelector::Name(_)
+        ));
+        // A glob is still a glob: the glob test runs first.
+        assert!(matches!(
+            ProcessSelector::parse("web*:2").expect("parses"),
+            ProcessSelector::Regex(_)
+        ));
+        // An id is still an id.
+        assert!(matches!(
+            ProcessSelector::parse("11").expect("parses"),
+            ProcessSelector::Id(11)
+        ));
+    }
+
+    #[test]
+    fn an_instance_selector_round_trips_through_the_wire_form() {
+        let sel = ProcessSelector::parse("web:2").expect("parses");
+        let spec = crate::protocol::SelectorSpec::from(&sel);
+        assert_eq!(
+            spec,
+            crate::protocol::SelectorSpec::Instance {
+                name: "web".to_string(),
+                slot: 2
+            }
+        );
+        let back = ProcessSelector::try_from(spec).expect("converts back");
+        assert!(matches!(back, ProcessSelector::Instance { .. }));
     }
 
     #[test]

@@ -11,6 +11,8 @@
 //! and none of those three carries a `cfg` of any kind, so this really is
 //! pure tier.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
 use shep_core::protocol::{
@@ -47,32 +49,22 @@ impl Render for FlockRows {
         ]
     }
 
+    /// D4's suffix half: `Format::Table` under `Bare` reaches this method
+    /// directly (`table::render_table`), never [`Self::rows_for`] --
+    /// [`crate::style::StyleLevel::boxes`] is false at `Bare`, so `table_of`
+    /// (`output/mod.rs`) takes the plain path instead of asking `rows_for`
+    /// for anything. So the `web:0`/`web:1` suffix a multi-instance app
+    /// earns at `Bare` has to live here, in [`plain_row`], rather than only
+    /// in `rows_for`'s own grouped branch -- the same rule either way
+    /// (`slotted`: more than one instance, every one of them reporting its
+    /// slot), applied per [`name_groups`] run. `Format::Json` is unaffected:
+    /// the `Serialize` derive on `Self` walks `self.0` directly and never
+    /// calls this method.
     fn rows(&self) -> Vec<Vec<String>> {
-        self.0
-            .iter()
-            .map(|p| {
-                vec![
-                    p.id.to_string(),
-                    p.name.clone(),
-                    p.status.to_string(),
-                    // `-` rather than an empty cell: an empty cell in a
-                    // padded table is indistinguishable from a rendering bug.
-                    p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
-                    p.restarts.to_string(),
-                    exit_cell(p.pid, p.last_exit),
-                    // `-` for the same reason, and for the same stated
-                    // reason PID uses it: a sheep that is not running, or
-                    // has been up for less than one sampling window, has no
-                    // honest number to report, and `0.0%` would claim the
-                    // daemon never made — "this sheep is using no CPU".
-                    p.cpu_percent
-                        .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
-                    p.memory_bytes
-                        .map_or_else(|| "-".to_string(), super::human_bytes),
-                    super::human_duration(p.uptime_ms),
-                    p.fold.clone().unwrap_or_else(|| "-".to_string()),
-                    p.smit.clone().unwrap_or_else(|| "-".to_owned()),
-                ]
+        name_groups(&self.0)
+            .flat_map(|group| {
+                let slotted = group.len() > 1 && group.iter().all(|p| p.instance.is_some());
+                group.iter().map(move |p| plain_row(p, slotted))
             })
             .collect()
     }
@@ -96,22 +88,69 @@ impl Render for FlockRows {
     /// - CPU and MEM: a magnitude ramp -- see [`cpu_role`]/[`mem_role`] for
     ///   the thresholds and the reasoning behind them.
     ///
-    /// Reuses [`Self::rows`] for the cell text itself rather than rebuilding
-    /// it, so this method only ever decides colour, never content.
-    ///
     /// `status_word` is a plain parameter, not part of `Presentation`,
     /// because it is not a fact resolved once at the seam the way `level`/
     /// `colour`/`deep_colour` are -- it is `table_of`'s (`output/mod.rs`)
     /// own per-attempt decision, local to its two calls here, and putting
     /// it on `Presentation` would have made it crate-wide state that ~100
     /// call sites construct for a question only this one method ever asks.
+    ///
+    /// D4: an app running several instances groups under one header row when
+    /// the table is boxed (`Full` and `Plain` both -- [`crate::style::StyleLevel::boxes`]
+    /// treats them as one tier, so grouping does too), so its slots read as
+    /// one app rather than as several identical rows sharing a name -- the
+    /// listing arrives sorted by (name, instance, id) (`sort_flock`), so an
+    /// app's instances are already adjacent and one pass can group them.
+    /// `Bare` never reaches this method at all ([`crate::style::StyleLevel::boxes`] is
+    /// false, so `table_of` in `output/mod.rs` takes [`Self::rows`]'s own
+    /// plain path instead) -- that is where the `web:0`/`web:1` suffix this
+    /// same `slotted` rule produces actually lives; see [`Self::rows`]'s own
+    /// doc. A single instance, or a listing from a daemon that predates
+    /// `instance` (every row's `instance` is `None`), renders exactly as it
+    /// did before this feature either way -- see [`plain_row`]'s own doc.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        /// What painted one output row, so [`paint`] can key its rule off
+        /// the right source: a real sheep for a slot or a plain row, or the
+        /// whole group for the header row above its slots.
+        enum RowSource<'a> {
+            /// A slot row or a plain (ungrouped) row.
+            Sheep(&'a ProcessInfo),
+            /// A group's header row, plus its already-summed totals.
+            Group(&'a [ProcessInfo], GroupTotals),
+        }
+
+        let mut out = Vec::with_capacity(self.0.len());
+        let mut sources: Vec<RowSource<'_>> = Vec::with_capacity(self.0.len());
+        for group in name_groups(&self.0) {
+            // A slot nobody reported cannot be grouped or suffixed: an
+            // older shepherd's listing renders exactly as it did before the
+            // field.
+            let slotted = group.len() > 1 && group.iter().all(|p| p.instance.is_some());
+            if slotted && presentation.level.boxes() {
+                let totals = group_totals(group);
+                out.push(group_row(group, &totals));
+                sources.push(RowSource::Group(group, totals));
+                for p in group {
+                    out.push(slot_row(p));
+                    sources.push(RowSource::Sheep(p));
+                }
+            } else {
+                for p in group {
+                    out.push(plain_row(p, slotted));
+                    sources.push(RowSource::Sheep(p));
+                }
+            }
+        }
+
         paint(
-            self.rows(),
+            out,
             Self::headers(),
             presentation,
             status_word,
-            |header, _cell, index| process_info_paint(header, &self.0[index]),
+            |header, _cell, index| match &sources[index] {
+                RowSource::Sheep(p) => process_info_paint(header, p),
+                RowSource::Group(g, totals) => group_paint(header, g, totals),
+            },
         )
     }
 
@@ -151,6 +190,12 @@ impl Render for FlockRows {
         // in a later task; this list just keeps the shape consistent with
         // every other verb answering `ProcessInfo`.
         "lambs",
+        // No column: the table now groups an app's instances under one
+        // header row (`rows_for`) and labels each slot rather than adding a
+        // column for it, but JSON stays flat -- one object per process,
+        // `instance` riding along -- so a programmatic consumer never has to
+        // learn a nested shape.
+        "instance",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
@@ -182,6 +227,208 @@ impl Render for FlockRows {
     // The maintainer's ruling is that it belongs among the first columns to yield, and
     // 8 is the literal reading of that.
     const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
+}
+
+/// Splits a listing into runs of one app's adjacent rows, keyed on NAME.
+///
+/// The listing arrives sorted by (name, instance, id) (`sort_flock`), so an
+/// app's instances are already adjacent and a single left-to-right pass finds
+/// every run's bounds. Shared by [`FlockRows::rows`] and
+/// [`FlockRows::rows_for`] so the two never derive a group's bounds
+/// differently -- the `slotted` rule each applies to a run still lives with
+/// its own caller, since `rows` and `rows_for` do different things with it.
+fn name_groups(items: &[ProcessInfo]) -> impl Iterator<Item = &[ProcessInfo]> {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        if at >= items.len() {
+            return None;
+        }
+        let name = items[at].name.as_str();
+        let end = items[at..]
+            .iter()
+            .position(|p| p.name != name)
+            .map_or(items.len(), |offset| at + offset);
+        let group = &items[at..end];
+        at = end;
+        Some(group)
+    })
+}
+
+/// An app's summed CPU/MEM/RESTARTS and its earliest UPTIME, computed once
+/// per group and shared by [`group_row`] (the cell text) and [`group_paint`]
+/// (the roles CPU/MEM/RESTARTS wear), so the two never sum the same slice
+/// twice.
+struct GroupTotals {
+    /// Every slot's restarts, added up: how many times this app as a whole
+    /// has needed to come back.
+    restarts: u32,
+    /// Every slot's CPU reading summed, `None` only when not one slot has a
+    /// live reading -- the same "no honest value" rule a single sheep's own
+    /// CPU cell follows.
+    cpu: Option<f32>,
+    /// Every slot's memory reading summed, `None` for the same reason `cpu`
+    /// is: this is what the app costs, not an average of it.
+    memory: Option<u64>,
+    /// The MINIMUM uptime across slots, so this reads as time since the app
+    /// was last disturbed rather than as the age of its luckiest instance.
+    uptime_ms: u64,
+}
+
+/// Sums a group's per-slot numbers into the facts [`group_row`] prints and
+/// [`group_paint`] colours.
+fn group_totals(group: &[ProcessInfo]) -> GroupTotals {
+    GroupTotals {
+        restarts: group.iter().map(|p| p.restarts).sum(),
+        cpu: group
+            .iter()
+            .filter_map(|p| p.cpu_percent)
+            .fold(None, |acc, c| Some(acc.unwrap_or(0.0) + c)),
+        memory: group
+            .iter()
+            .filter_map(|p| p.memory_bytes)
+            .fold(None, |acc, m| Some(acc.unwrap_or(0) + m)),
+        uptime_ms: group.iter().map(|p| p.uptime_ms).min().unwrap_or(0),
+    }
+}
+
+/// The header above an app's instances: what the app costs, and how many of
+/// it there are. Per-app facts live here rather than being repeated down
+/// every slot row, which is what FOLD and SMIT already are.
+///
+/// STATUS is left as [`group_status`]'s plain text -- the word alone, no
+/// face and no colour -- so [`group_paint`] can dress it up through the same
+/// [`Paint::Status`] path a real sheep's STATUS cell takes, rather than
+/// baking a presentation decision into the text itself.
+fn group_row(group: &[ProcessInfo], totals: &GroupTotals) -> Vec<String> {
+    let first = &group[0];
+    vec![
+        String::new(),
+        format!("{} \u{d7}{}", first.name, group.len()),
+        group_status(group),
+        String::new(),
+        totals.restarts.to_string(),
+        String::new(),
+        totals
+            .cpu
+            .map_or_else(|| "-".to_string(), |c| format!("{c:.1}%")),
+        totals
+            .memory
+            .map_or_else(|| "-".to_string(), super::human_bytes),
+        super::human_duration(totals.uptime_ms),
+        first.fold.clone().unwrap_or_else(|| "-".to_string()),
+        first.smit.clone().unwrap_or_else(|| "-".to_owned()),
+    ]
+}
+
+/// One instance under its group header. `\u{21b3} :2` teaches the `web:2`
+/// selector by sitting under the name the header already printed, so NAME
+/// itself carries only the marker rather than repeating a name the header
+/// row already gave.
+///
+/// FOLD and SMIT are blank, not `-`: the group row above carries both, and
+/// repeating a per-app fact down every slot row is noise -- the daemon keys
+/// a smit by name, not by instance, so it is already an app-level fact.
+fn slot_row(p: &ProcessInfo) -> Vec<String> {
+    let slot = p
+        .instance
+        .map_or_else(String::new, |s| format!(" \u{21b3} :{s}"));
+    vec![
+        p.id.to_string(),
+        slot,
+        p.status.to_string(),
+        p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+        p.restarts.to_string(),
+        exit_cell(p.pid, p.last_exit),
+        p.cpu_percent
+            .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+        p.memory_bytes
+            .map_or_else(|| "-".to_string(), super::human_bytes),
+        super::human_duration(p.uptime_ms),
+        String::new(),
+        String::new(),
+    ]
+}
+
+/// One line per process: what every row rendered before this feature, and
+/// still what an app with one instance, a mixed group missing a slot, or a
+/// flat style renders.
+///
+/// `slotted` is true only when this app has more than one instance and every
+/// one of them reported its slot -- the only case that earns a `web:0`
+/// suffix. Anything else (one instance, or a slot nobody reported) leaves
+/// NAME exactly as [`FlockRows::rows`] always has, which is what keeps a
+/// single-instance app and an older daemon's listing byte-identical to
+/// before this feature.
+fn plain_row(p: &ProcessInfo, slotted: bool) -> Vec<String> {
+    let name = match (slotted, p.instance) {
+        (true, Some(slot)) => format!("{}:{slot}", p.name),
+        _ => p.name.clone(),
+    };
+    vec![
+        p.id.to_string(),
+        name,
+        p.status.to_string(),
+        p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+        p.restarts.to_string(),
+        exit_cell(p.pid, p.last_exit),
+        p.cpu_percent
+            .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+        p.memory_bytes
+            .map_or_else(|| "-".to_string(), super::human_bytes),
+        super::human_duration(p.uptime_ms),
+        p.fold.clone().unwrap_or_else(|| "-".to_string()),
+        p.smit.clone().unwrap_or_else(|| "-".to_owned()),
+    ]
+}
+
+/// The group's status: the shared word when every instance agrees, else a
+/// count per state, so a mixed group says what it is rather than picking a
+/// winner an operator would then act on. Plain text either way -- see
+/// [`group_row`]'s own doc for why the face and colour are left to
+/// [`group_paint`].
+fn group_status(group: &[ProcessInfo]) -> String {
+    let first = group[0].status;
+    if group.iter().all(|p| p.status == first) {
+        return first.to_string();
+    }
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for p in group {
+        *counts.entry(p.status.to_string()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(status, n)| format!("{n} {status}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The treatment a group's header row wears, mirroring [`process_info_paint`]
+/// for the columns that carry a rollup: RESTARTS, CPU and MEM read
+/// [`GroupTotals`] rather than one sheep's own fields, and STATUS colours
+/// through [`Paint::Status`] only when every slot agrees -- a mixed group's
+/// plain count text (already the whole cell) wears no colour, the same
+/// "nothing of its own to say" rule chrome and dashes already follow.
+///
+/// ID is left off the chrome list [`process_info_paint`] gives it: a real
+/// sheep's ID is chrome because it is a stable label the eye should skip
+/// past, but a group row's ID cell has no id at all, and colouring an empty
+/// cell has nothing to say either.
+fn group_paint(header: &str, group: &[ProcessInfo], totals: &GroupTotals) -> Paint {
+    match header {
+        "FOLD" => Paint::Role(Role::Ink3),
+        "STATUS" => {
+            let first = group[0].status;
+            if group.iter().all(|p| p.status == first) {
+                Paint::Status(first)
+            } else {
+                Paint::Default
+            }
+        }
+        "RESTARTS" => Paint::Role(restarts_role(totals.restarts)),
+        "CPU" => Paint::Role(cpu_role(totals.cpu)),
+        "MEM" => Paint::Role(mem_role(totals.memory)),
+        _ => Paint::Default,
+    }
 }
 
 /// One STATUS cell, per spec §2 -- the only place in this module a face or a
@@ -794,6 +1041,11 @@ impl Render for DogRows {
         // absent, like `fold` above, and in the JSON for the same
         // shape-consistency reason as the rest of this list.
         "smit",
+        // Always `Some(0)` here: a dog is one process, never stocked to N
+        // instances, so the slot the daemon reports is never meaningful.
+        // Rides in the JSON only for the same shape-consistency reason as
+        // the rest of this list.
+        "instance",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
@@ -1325,6 +1577,9 @@ impl Render for FlushedRows {
         // And the same again for the mark a dog painted: a flush neither
         // reads nor changes it.
         "smit",
+        // Same shape-consistency reason as the rest of this list: a flush
+        // neither reads nor changes which slot a sheep occupies.
+        "instance",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "OUT_FILE",
@@ -2924,6 +3179,343 @@ pub(crate) mod tests {
         let mem = cells[headers.iter().position(|h| *h == "MEM").unwrap()].clone();
         assert_eq!(cpu, "-");
         assert_eq!(mem, "-");
+    }
+
+    /// `Presentation` at [`StyleLevel::Full`] for the group-row tests below:
+    /// boxes on, so `rows_for` takes the grouping branch. `NO_COLOR` set,
+    /// same as `table.rs`'s own `full_under_no_color_pins_sheep_and_boxes_
+    /// without_colour`, so these tests compare literal cell text rather than
+    /// an ANSI-wrapped one.
+    fn full_presentation() -> Presentation {
+        use crate::style::StyleLevel;
+        Presentation::new(
+            StyleLevel::Full,
+            Some(std::ffi::OsStr::new("1")),
+            None,
+            None,
+            200,
+        )
+    }
+
+    /// `Presentation` at [`StyleLevel::Bare`] for the group-row tests below:
+    /// boxes off, so `rows_for` takes the flat, suffixed branch instead.
+    fn bare_presentation() -> Presentation {
+        use crate::style::StyleLevel;
+        Presentation::new(StyleLevel::Bare, None, None, None, 200)
+    }
+
+    #[test]
+    fn a_single_instance_app_is_untouched_by_grouping() {
+        let rows = FlockRows(vec![
+            ProcessInfo::builder(4, "api", ProcStatus::Online)
+                .instance(Some(0))
+                .build(),
+        ]);
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered.len(), 1, "no group row for one instance");
+        assert_eq!(rendered[0][1], "api", "and no suffix");
+    }
+
+    #[test]
+    fn a_multi_instance_app_gets_a_group_row_then_its_slots() {
+        let rows = FlockRows(
+            (0..3)
+                .map(|slot| {
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered.len(), 4, "one group row plus three slots");
+        assert_eq!(rendered[0][0], "", "the group row has no id");
+        assert!(rendered[0][1].contains("web"), "{:?}", rendered[0]);
+        assert!(
+            rendered[0][1].contains('3'),
+            "and the count: {:?}",
+            rendered[0]
+        );
+        assert_eq!(rendered[1][0], "1", "slot rows keep their ids");
+    }
+
+    /// fails if a mixed group's STATUS stops naming every state and its
+    /// count, in a fixed order.
+    ///
+    /// Asserted as the EXACT string, not as "contains a digit": a rollup
+    /// that picked a winner, dropped the counts, or ordered the states by
+    /// first appearance would all contain a digit and all read wrong on
+    /// screen. `BTreeMap` keys the counts by the status word, so the order
+    /// is alphabetical and does not depend on which slot the daemon listed
+    /// first -- which is what makes an exact assertion possible at all.
+    #[test]
+    fn a_mixed_group_says_so_rather_than_picking_a_winner() {
+        let rows = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .instance(Some(0))
+                .build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Stopped)
+                .instance(Some(1))
+                .build(),
+            ProcessInfo::builder(3, "web", ProcStatus::Online)
+                .instance(Some(2))
+                .build(),
+        ]);
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered[0][2], "2 online, 1 stopped");
+    }
+
+    /// fails if a group's UPTIME stops being the MINIMUM across its slots.
+    ///
+    /// The three slots are listed oldest first, so a rollup that took the
+    /// first member, the maximum, or a mean would each show a different
+    /// number here and none of them would be `5m`. That is the whole point
+    /// of the rule: a group reads as time since the app was last disturbed,
+    /// and a restarted instance is a disturbance the header must not hide
+    /// behind its luckiest sibling.
+    #[test]
+    fn a_group_uptime_is_the_shortest_of_its_slots() {
+        let rows = FlockRows(
+            [9_000_000_u64, 4_512_000, 300_000]
+                .into_iter()
+                .enumerate()
+                .map(|(slot, uptime_ms)| {
+                    let slot = u32::try_from(slot).unwrap();
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .uptime_ms(uptime_ms)
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered[0][8], "5m", "300_000ms, the shortest of the three");
+    }
+
+    /// fails if a group with no readings at all reports zero.
+    ///
+    /// A zero is a claim -- "this app is using no CPU" -- and the sum of
+    /// nothing is not that claim, it is no claim. Same rule a single
+    /// sheep's own `-` cell follows, applied to the fold that produces the
+    /// rollup: it starts at `None` rather than at `0`, so an app whose
+    /// every instance is unmeasured stays unmeasured.
+    #[test]
+    fn a_group_with_no_readings_shows_a_dash_not_a_zero() {
+        let rows = FlockRows(
+            (0..2)
+                .map(|slot| {
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .cpu_percent(None)
+                        .memory_bytes(None)
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered[0][6], "-", "cpu");
+        assert_eq!(rendered[0][7], "-", "mem");
+
+        // And one live reading among absent ones IS a claim, about the slot
+        // that made it: the fold leaves `None` only when nothing measured.
+        let mixed = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .instance(Some(0))
+                .cpu_percent(Some(2.5))
+                .memory_bytes(Some(64 << 20))
+                .build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Online)
+                .instance(Some(1))
+                .cpu_percent(None)
+                .memory_bytes(None)
+                .build(),
+        ]);
+        let rendered = mixed.rows_for(full_presentation(), true);
+        assert_eq!(rendered[0][6], "2.5%", "cpu");
+        assert_eq!(rendered[0][7], "64.0M", "mem");
+    }
+
+    /// fails if `shep flock`'s group header and `shep lookout`'s group row
+    /// stop agreeing about what an app's instances add up to.
+    ///
+    /// The two rollups are deliberately NOT shared code: they live in
+    /// different crates' worth of rendering, over different column sets,
+    /// and each is stated once where it is used. That is a readable design
+    /// and a driftable one, and an operator who saw different numbers in
+    /// `shep flock` and `shep lookout` for the same app would be right to
+    /// distrust both. So the input is one `Vec<ProcessInfo>` and every
+    /// rolled-up cell is compared across the two surfaces, rather than each
+    /// side being compared to a literal a reviewer had to check by hand.
+    ///
+    /// The lookout's clock is left where `App::new` put it, and the
+    /// snapshot is anchored at the same instant, so its LIVE uptime is
+    /// exactly the reported one and the two surfaces are being asked the
+    /// same question rather than two questions one millisecond apart.
+    #[test]
+    fn the_flock_table_and_the_lookout_roll_a_group_up_the_same_way() {
+        use std::time::Instant;
+
+        use crate::lookout::app::{App, Control, Msg, RowKey};
+        use crate::lookout::theme::Palette;
+        use crate::lookout::view::flock::{columns_for, key_line};
+
+        // Every slot differs in every summed field, so a rollup that read
+        // one member instead of all of them cannot coincide with the sum.
+        let flock: Vec<ProcessInfo> = [
+            (0_u32, 0_u32, 3.4_f32, 182_u64 << 20, 4_512_000_u64),
+            (1, 2, 2.9, 178 << 20, 300_000),
+            (2, 1, 3.1, 180 << 20, 9_000_000),
+        ]
+        .into_iter()
+        .map(|(slot, restarts, cpu, memory, uptime_ms)| {
+            ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                .instance(Some(slot))
+                .pid(Some(48_400 + slot))
+                .restarts(restarts)
+                .cpu_percent(Some(cpu))
+                .memory_bytes(Some(memory))
+                .uptime_ms(uptime_ms)
+                .build()
+        })
+        .collect();
+
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/ada/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: flock.clone(),
+            at: t0,
+        });
+
+        // The summing rules themselves, ahead of any rendering: this is the
+        // half a presentation choice cannot disturb, and the half that
+        // decides whether the two surfaces mean the same thing.
+        let table_totals = group_totals(&flock);
+        let dashboard_totals = app.group_totals("web");
+        assert_eq!(dashboard_totals.count, flock.len());
+        assert_eq!(dashboard_totals.restarts, table_totals.restarts, "restarts");
+        assert_eq!(dashboard_totals.cpu, table_totals.cpu, "cpu");
+        assert_eq!(dashboard_totals.memory, table_totals.memory, "memory");
+        assert_eq!(
+            dashboard_totals.uptime_ms,
+            Some(table_totals.uptime_ms),
+            "uptime"
+        );
+        assert_eq!(
+            app.group_status_text("web"),
+            group_status(&flock),
+            "a uniform group's status word"
+        );
+
+        // And the mixed case, which is the one with a format to disagree
+        // about rather than a single word.
+        let mut mixed = flock.clone();
+        mixed[1].status = ProcStatus::Stopped;
+        let mut mixed_app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/ada/.shep".to_string(),
+            t0,
+        );
+        mixed_app.update(Msg::Snapshot {
+            rows: mixed.clone(),
+            at: t0,
+        });
+        assert_eq!(
+            mixed_app.group_status_text("web"),
+            group_status(&mixed),
+            "a mixed group's per-state counts"
+        );
+
+        let table = FlockRows(flock).rows_for(full_presentation(), true);
+        let header = &table[0];
+        let dashboard = key_line(
+            &app,
+            &RowKey::Group("web".to_string()),
+            columns_for(200),
+            200,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+        // Then the rendered cells, so a surface that summed correctly and
+        // then printed something else still fails. FOLD and SMIT are left
+        // out on purpose: both are per-app facts read off the first member
+        // rather than summed, so they would pass whatever either surface
+        // did to the rollup. STATUS is left out too, and for a reason worth
+        // stating: `shep flock` at `Full` puts a sheep face in front of the
+        // word and the dashboard never does, so the two cells differ by a
+        // presentation choice rather than by a rollup. The word itself is
+        // compared above, through `group_status`, where the face is not.
+        for column in ["NAME", "RESTARTS", "CPU", "MEM", "UPTIME"] {
+            let at = FlockRows::headers()
+                .iter()
+                .position(|header| *header == column)
+                .expect("the column is in the table");
+            let cell = header[at].trim();
+            assert!(
+                dashboard.contains(cell),
+                "`shep flock` rolls {column} up to {cell:?} and `shep lookout` \
+                 does not agree: {dashboard:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flat_style_suffixes_the_name_instead_of_grouping() {
+        let rows = FlockRows(
+            (0..2)
+                .map(|slot| {
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = rows.rows_for(bare_presentation(), true);
+        assert_eq!(rendered.len(), 2, "one line per process, still greppable");
+        assert_eq!(rendered[0][1], "web:0");
+        assert_eq!(rendered[1][1], "web:1");
+    }
+
+    /// Fix round 1: the same suffix, but through the path `Bare` actually
+    /// takes. `table_of` (`output/mod.rs`) only calls `rows_for` when
+    /// `StyleLevel::boxes` is true, so `Bare` never reaches it -- it prints
+    /// through `render_table`, which calls `Self::rows` directly.
+    /// Asserting on `rows_for` alone (as the test above does) is exactly
+    /// what let that gap through the first time; this one goes through the
+    /// real `Bare` code path instead.
+    #[test]
+    fn the_bare_path_reaches_the_suffix_through_rows_not_rows_for() {
+        let rows = FlockRows(
+            (0..2)
+                .map(|slot| {
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = crate::output::render_table(&rows);
+        assert!(rendered.contains("web:0"), "{rendered}");
+        assert!(rendered.contains("web:1"), "{rendered}");
+    }
+
+    #[test]
+    fn a_row_from_an_older_daemon_renders_exactly_as_it_did_before() {
+        let rows = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online).build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Online).build(),
+        ]);
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered.len(), 2, "no slots, so no grouping");
+        assert_eq!(rendered[0][1], "web", "and no suffix");
     }
 
     /// Fails if a `ProcessInfo` field goes missing from both the columns and

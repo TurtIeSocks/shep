@@ -424,12 +424,12 @@ pub struct AppConfig {
         "blurb": "Which timezone cron_restart is read in, as an IANA name"
     })))]
     pub cron_timezone: Option<String>,
-    /// Env var receiving the instance slot (default `SHEP_INSTANCE`)
-    #[cfg_attr(feature = "schema", schemars(extend("init" = {
-        "example": "INSTANCE_ID",
-        "group": "inputs",
-        "blurb": "The env var each instance finds its own slot number in"
-    })))]
+    /// Removed. Set your own variable to `{{instance}}` in `env` instead.
+    ///
+    /// Kept only so `normalize` can reject it with that instruction: a
+    /// `deny_unknown_fields` serde error would name no replacement. Remove
+    /// in 0.2.
+    #[cfg_attr(feature = "schema", schemars(skip))]
     pub increment_var: Option<String>,
 }
 

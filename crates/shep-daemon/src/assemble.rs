@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use shep_core::config::ResolvedApp;
+use shep_core::config::template;
 use shep_core::paths::ShepPaths;
 
 use crate::privilege::Credentials;
@@ -161,7 +162,10 @@ const INHERITED: &[&str] = &[
 /// Default log paths are `logs/<name>-<instance>-out.log` and `-err.log`.
 /// When `merge_logs = true`, they become `logs/<name>-out.log` and `-err.log`
 /// (shared across all instances). Explicit `out_file`/`err_file` config
-/// always win over defaults.
+/// always win over defaults, and are rendered through the
+/// `{{instance}}`/`{{name}}` grammar the same as `env` and `args`. Normalize
+/// has already refused a path that would render alike for every instance,
+/// unless `merge_logs` asked for that on purpose.
 ///
 /// # Stdin
 ///
@@ -179,20 +183,28 @@ pub fn assemble(
     let config = app.config();
     let name = config.name.clone();
 
+    // Args carry the `{{instance}}`/`{{name}}` grammar too, rendered once
+    // here before the interpreter logic below decides where they land.
+    let rendered_args: Vec<String> = config
+        .args
+        .iter()
+        .map(|value| template::render(value, &name, instance))
+        .collect();
+
     // Interpreter: resolve program and args
     let (program, args) = match &config.interpreter {
         None => {
             // Direct script execution
-            (config.script.clone(), config.args.clone())
+            (config.script.clone(), rendered_args)
         }
         Some(interp) if interp == "none" => {
             // Explicit "none" means direct script execution
-            (config.script.clone(), config.args.clone())
+            (config.script.clone(), rendered_args)
         }
         Some(interp) => {
             // Interpreter with script as first arg
             let mut interp_args = vec![config.script.clone()];
-            interp_args.extend(config.args.iter().cloned());
+            interp_args.extend(rendered_args);
             (interp.clone(), interp_args)
         }
     };
@@ -201,11 +213,21 @@ pub fn assemble(
     // the app's own env on top: env_clear() + envs(&spec.env) in
     // tokio_runner.rs means anything not seeded here is invisible to the
     // child (adversarial finding #1 — a bare interpreter/program spawned
-    // with no PATH is ENOENT, not a slow failure).
+    // with no PATH is ENOENT, not a slow failure). Each value is rendered
+    // through the `{{instance}}`/`{{name}}` grammar as it is inserted, so a
+    // template can produce a value per instance slot.
     let mut env = base_env();
-    env.extend(config.env.clone());
-    let slot_var = config.increment_var.as_deref().unwrap_or("SHEP_INSTANCE");
-    env.insert(slot_var.to_string(), instance.to_string());
+    env.extend(
+        config
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), template::render(value, &name, instance))),
+    );
+    // Always, and under fixed names. An app that wants the slot under its own
+    // variable writes `MY_VAR = "{{instance}}"` in its env, which is one
+    // mechanism instead of a dedicated config knob for a single value.
+    env.insert("SHEP_INSTANCE".to_string(), instance.to_string());
+    env.insert("SHEP_NAME".to_string(), name.clone());
 
     // Working directory
     let cwd = config.cwd.as_ref().map(PathBuf::from);
@@ -218,13 +240,13 @@ pub fn assemble(
     };
 
     let out_file = if let Some(ref explicit) = config.out_file {
-        PathBuf::from(explicit)
+        PathBuf::from(template::render(explicit, &name, instance))
     } else {
         paths.logs.join(format!("{}out.log", log_stem))
     };
 
     let err_file = if let Some(ref explicit) = config.err_file {
-        PathBuf::from(explicit)
+        PathBuf::from(template::render(explicit, &name, instance))
     } else {
         paths.logs.join(format!("{}err.log", log_stem))
     };
@@ -299,22 +321,19 @@ mod tests {
     }
 
     #[test]
-    fn env_custom_increment_var() {
-        let mut app_config = AppConfig {
+    fn every_child_learns_its_slot_and_its_name() {
+        let app = normalize(AppConfig {
             name: "worker".to_string(),
             script: "bin/worker".to_string(),
-            args: vec![],
             ..Default::default()
-        };
-        app_config.increment_var = Some("WORKER_ID".to_string());
-
-        let app = normalize(app_config).unwrap();
-        let paths = test_paths();
-
-        let spec = assemble(&app, 5, &paths, None);
-
-        assert!(!spec.env.contains_key("SHEP_INSTANCE"));
-        assert_eq!(spec.env.get("WORKER_ID").map(|s| s.as_str()), Some("5"));
+        })
+        .unwrap();
+        let spec = assemble(&app, 3, &test_paths(), None);
+        assert_eq!(spec.env.get("SHEP_INSTANCE").map(String::as_str), Some("3"));
+        assert_eq!(
+            spec.env.get("SHEP_NAME").map(String::as_str),
+            Some("worker")
+        );
     }
 
     #[test]
@@ -580,6 +599,48 @@ mod tests {
         app.stdin = true;
         let spec = assemble(&normalize(app).unwrap(), 0, &test_paths(), None);
         assert!(spec.stdin);
+    }
+
+    #[test]
+    fn templates_render_per_instance_in_env_and_args() {
+        let mut config = AppConfig {
+            name: "z-worker".to_string(),
+            script: "bin/worker".to_string(),
+            instances: 4,
+            args: vec!["--metrics-port".to_string(), "91{{instance}}".to_string()],
+            ..Default::default()
+        };
+        config
+            .env
+            .insert("Z_WORKER_ID".to_string(), "z-{{instance}}".to_string());
+        config.env.insert(
+            "Z_DEVICE_ID".to_string(),
+            "{{name}}-{{instance}}d".to_string(),
+        );
+
+        let app = normalize(config).unwrap();
+        let spec = assemble(&app, 2, &test_paths(), None);
+
+        assert_eq!(spec.env.get("Z_WORKER_ID").map(String::as_str), Some("z-2"));
+        assert_eq!(
+            spec.env.get("Z_DEVICE_ID").map(String::as_str),
+            Some("z-worker-2d")
+        );
+        assert!(spec.args.contains(&"912".to_string()), "{:?}", spec.args);
+    }
+
+    #[test]
+    fn a_templated_log_path_renders_per_instance() {
+        let app = normalize(AppConfig {
+            name: "web".to_string(),
+            script: "./srv".to_string(),
+            instances: 3,
+            out_file: Some("/var/log/web-{{instance}}.log".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let spec = assemble(&app, 2, &test_paths(), None);
+        assert_eq!(spec.out_file, PathBuf::from("/var/log/web-2.log"));
     }
 
     /// fails if `stdin` is implied by something. `channel` is implied by

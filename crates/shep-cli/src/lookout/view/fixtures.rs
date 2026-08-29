@@ -9,7 +9,7 @@ use shep_client::RequestError;
 use shep_core::protocol::{BusEvent, Lamb, ProcessInfo, Response};
 use shep_core::status::ProcStatus;
 
-use super::super::app::{ActionVerb, App, Control, KeyPress, LambWalk, Msg, Sent};
+use super::super::app::{ActionVerb, App, Control, KeyPress, LambWalk, Msg, RowKey, Sent};
 use super::super::source::HostSample;
 use super::super::tail::{Stream, Tail, TailLine};
 use super::super::theme::Palette;
@@ -164,7 +164,7 @@ pub fn with_selection_and_palette(info: ProcessInfo, palette: Palette) -> App {
     app.update(Msg::Key(KeyPress::SelectDown));
     assert_eq!(
         app.selected(),
-        Some(wanted),
+        Some(RowKey::Sheep(wanted)),
         "the sheep under test must end up selected, and on row 1: the mutation \
          this fixture exists to catch reads row 0 instead"
     );
@@ -355,12 +355,16 @@ pub fn allowed_app() -> App {
     let mut app = app_with(named_flock(), plain());
     app.set_control_for_tests(Control::Allowed);
     for _ in 0..named_flock().len() {
-        if app.selected() == Some(2) {
+        if app.selected() == Some(RowKey::Sheep(2)) {
             break;
         }
         app.update(Msg::Key(KeyPress::SelectDown));
     }
-    assert_eq!(app.selected(), Some(2), "the cursor must end up on api");
+    assert_eq!(
+        app.selected(),
+        Some(RowKey::Sheep(2)),
+        "the cursor must end up on api"
+    );
     app
 }
 

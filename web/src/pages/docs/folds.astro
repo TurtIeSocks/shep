@@ -88,11 +88,12 @@ error[not_found]: the daemon reported NotFound: selector matched no registered s
     <h2>Selecting one from any verb</h2>
     <p>
       Every verb accepts <code>fold:&lt;name&gt;</code> in place of a name,
-      an id, a <code>/regex/</code>, a glob, or <code>all</code>. That is
-      <code>stop</code>, <code>restart</code>, <code>reload</code>,
-      <code>delete</code>, <code>bleats</code>, <code>trigger</code>,
-      <code>start</code>, and the rest. It reaches every sheep carrying that
-      fold in one call:
+      an id, a <code>/regex/</code>, a glob, <code>name:slot</code>
+      (<code>web:2</code>, one instance of a multi-instance app), or
+      <code>all</code>. That is <code>stop</code>, <code>restart</code>,
+      <code>reload</code>, <code>delete</code>, <code>bleats</code>,
+      <code>trigger</code>, <code>start</code>, and the rest. It reaches
+      every sheep carrying that fold in one call:
     </p>
     <CodeBlock>{`$ shep stop fold:backend
 ID  NAME    STATUS   PID    RESTARTS  EXIT     CPU  MEM    UPTIME  FOLD     SMIT
@@ -151,14 +152,20 @@ error[not_found]: no sheep is in a fold called typo`}</CodeBlock>
       name is ambiguous with something else: the literal word
       <code>all</code>, then a <code>fold:</code> prefix, then
       <code>/regex/</code> slashes, then (if the whole string is ASCII
-      digits) a numeric id. Only after all four fail does it fall back to
-      treating the string as a plain name. A sheep named <code>2</code> is
-      the practical edge of this: typing <code>2</code> as a selector always
-      means "id 2", never "the sheep named 2", even if those aren't the same
-      sheep. <code>fold:</code> names don't collide with any of this: the
-      prefix is checked for before <code>/regex/</code> or a bare number, so
-      a fold can be named anything, including <code>all</code> or a number,
-      and <code>fold:&lt;that name&gt;</code> still reaches it.
+      digits) a numeric id, then a glob, then <code>name:slot</code>. Only
+      after all six fail does it fall back to treating the string as a plain
+      name. A sheep named <code>2</code> is the practical edge of this:
+      typing <code>2</code> as a selector always means "id 2", never "the
+      sheep named 2", even if those aren't the same sheep. <code>fold:</code>
+      names don't collide with any of this: the prefix is checked for before
+      <code>/regex/</code> or a bare number, so a fold can be named anything,
+      including <code>all</code> or a number, and
+      <code>fold:&lt;that name&gt;</code> still reaches it. A glob like
+      <code>web*</code> is checked before <code>name:slot</code>, so it still
+      matches every instance of an app rather than being read as a name with
+      a stray colon; and since a colon is no longer legal in a sheep name at
+      all, <code>web:2</code> can only ever mean slot 2 of <code>web</code>,
+      never a literal name.
     </Callout>
 
     <h2>What a fold is not</h2>

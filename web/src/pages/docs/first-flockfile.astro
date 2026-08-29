@@ -28,14 +28,14 @@ const fieldGroups: FieldGroup[] = [
   {
     title: "Identity & process",
     fields: [
-      { name: "name", type: "string", default: "required", does: "Unique sheep name." },
+      { name: "name", type: "string", default: "required", does: "Unique sheep name. May not contain a path separator or a colon: a colon is the name:slot selector's own separator, and also illegal in a log filename on Windows." },
       { name: "script", type: "string", default: "required", does: "Executable or script path." },
-      { name: "args", type: "string[]", default: "[]", does: "Arguments passed to the script." },
+      { name: "args", type: "string[]", default: "[]", does: "Arguments passed to the script; supports {{instance}} and {{name}}." },
       { name: "cwd", type: "string?", default: "the Flockfile's own directory", does: "Working directory at spawn. Unset, an app in a Flockfile runs where that Flockfile lives, so a relative script resolves the way you would read it." },
       { name: "interpreter", type: "string?", default: "none", does: "Interpreter override; \"none\" runs the script directly." },
-      { name: "env", type: "map<string,string>", default: "{}", does: "Merged over the daemon's filtered environment." },
-      { name: "instances", type: "integer", default: "1", does: "Fork instance count (cluster mode)." },
-      { name: "increment_var", type: "string?", default: "SHEP_INSTANCE", does: "Env var receiving the instance slot number." },
+      { name: "env", type: "map<string,string>", default: "{}", does: "Merged over the daemon's filtered environment; values support {{instance}} and {{name}}. SHEP_INSTANCE and SHEP_NAME are always set and may not be set here." },
+      { name: "instances", type: "integer", default: "1", does: "How many separate copies of this app to run (pm2's fork mode, not its cluster mode: no shared socket). SHEP_INSTANCE and SHEP_NAME are always set on every instance; other env values, args, out_file and err_file may use {{instance}} and {{name}} templates." },
+      { name: "increment_var", type: "string?", default: "removed", does: "Refused at normalize with the replacement named: set env.YOUR_VAR = \"{{instance}}\" instead." },
     ],
   },
   {
@@ -92,8 +92,8 @@ const fieldGroups: FieldGroup[] = [
   {
     title: "Logs",
     fields: [
-      { name: "out_file", type: "string?", default: "logs/<name>-<i>-out.log", does: "Stdout log file path override." },
-      { name: "err_file", type: "string?", default: "logs/<name>-<i>-err.log", does: "Stderr log file path override." },
+      { name: "out_file", type: "string?", default: "logs/<name>-<i>-out.log", does: "Stdout log file path override; supports {{instance}} and {{name}}. With instances > 1, an explicit path needs {{instance}} or merge_logs, or it's refused: {{name}} renders the same for every instance, so a path carrying only that one still collides." },
+      { name: "err_file", type: "string?", default: "logs/<name>-<i>-err.log", does: "Stderr log file path override; supports {{instance}} and {{name}}. With instances > 1, an explicit path needs {{instance}} or merge_logs, or it's refused: {{name}} renders the same for every instance, so a path carrying only that one still collides." },
       { name: "merge_logs", type: "bool", default: "false", does: "Collapse every instance's logs into one file pair." },
     ],
   },
@@ -280,6 +280,46 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
       variables it has to decide whose environment it means, and there is no
       good answer to that.
     </p>
+
+    <h2>Templates: <code>{'{{instance}}'}</code> and <code>{'{{name}}'}</code></h2>
+    <p>
+      <code>env</code> values, <code>args</code>, <code>out_file</code> and
+      <code>err_file</code> all accept two tokens, doubled-brace, filled in
+      at spawn time with the app's own name and the instance's own slot:
+    </p>
+    <CodeBlock label="Flockfile.toml">{`[[app]]
+name = "z-worker"
+instances = 4
+args = ["--metrics-port", "91{{instance}}"]
+
+[app.env]
+Z_WORKER_ID = "z-{{instance}}"
+Z_DEVICE_ID = "z-{{instance}}d"`}</CodeBlock>
+    <p>
+      Any other <code>{'{{...}}'}</code> is refused at <code>shep start</code>,
+      not left to reach the child as a literal string:
+    </p>
+    <CodeBlock label="a typo'd token">{`error[invalid_config]: the daemon reported InvalidConfig: sheep \`z-worker\`, env.WORKER: \`{{instnace}}\` is not a template token: valid tokens are \`{{instance}}\` and \`{{name}}\``}</CodeBlock>
+    <p>
+      An opening <code>{'{{'}</code> that is never closed is refused the same
+      way, rather than passed through as a literal:
+    </p>
+    <CodeBlock label="an unclosed token">{`error[invalid_config]: the daemon reported InvalidConfig: sheep \`z-worker\`, env.WORKER: a \`{{\` in this value is never closed by a \`}}\``}</CodeBlock>
+    <p>
+      Doubling the braces escapes them: <code>{'{{{{'}</code> and
+      <code>{'}}}}'}</code> render as one literal <code>{'{{'}</code> and
+      <code>{'}}'}</code>. Single braces are left alone and never need
+      escaping, so a JSON blob, a regex quantifier like
+      <code>{'{2,3}'}</code>, or a Go or Helm template passed through as an
+      arg all survive untouched.
+    </p>
+    <p>
+      <code>SHEP_INSTANCE</code> and <code>SHEP_NAME</code> are set on every
+      sheep's environment automatically, whether or not the Flockfile uses
+      either template. Setting either one yourself under <code>env</code> is
+      refused rather than silently overwritten:
+    </p>
+    <CodeBlock label="env sets a reserved variable">{`error[invalid_config]: the daemon reported InvalidConfig: sheep \`z-worker\` sets \`SHEP_INSTANCE\` in env, but shep injects it: use a different name, or \`{{instance}}\` in your own variable`}</CodeBlock>
 
     <h2>The full field reference</h2>
     <p>

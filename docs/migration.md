@@ -54,8 +54,8 @@ collapses same-named rows back into one app each, mapped field by field:
 | `merge_logs` | `merge_logs` |
 | `max_memory_restart` (bytes) | `max_memory` |
 | rows sharing a `name` | `instances` = the row count |
-| `exec_mode == "cluster_mode"` | `instances`, plus a note (below) |
-| `NODE_APP_INSTANCE` present in a row's env | `increment_var`, plus a note (below) |
+| `exec_mode == "cluster_mode"` | a stderr note; nothing written to the Flockfile (below) |
+| `NODE_APP_INSTANCE` present in a row's env | an `[app.env]` entry set to `"{{instance}}"`, plus a note (below) |
 
 A dump row with no `pm_exec_path` is refused by name rather than imported
 as a broken app — `shep import` names the row's index and what keys it did
@@ -127,11 +127,12 @@ The rule `shep import` applies:
   section), or nowhere.
 
 `NODE_APP_INSTANCE` is a special case of the same rule: it is not copied
-into `env`, because the dump only ever holds instance 0's value, and
-copying it would tell every instance it is instance 0. It becomes
-`increment_var` instead, which is shep's own mechanism for the same job —
-each instance gets that environment variable set to its own slot number
-at spawn time, the way `SHEP_INSTANCE` already works for shep-native apps.
+into `env` as a value, because the dump only ever holds instance 0's
+number, and copying it would tell every instance it is instance 0. Instead
+`shep import` writes `env.NODE_APP_INSTANCE = "{{instance}}"`, shep's own
+template for the same job: the daemon substitutes each instance's own slot
+at spawn time, the same way `SHEP_INSTANCE` is always set for every app,
+imported or not.
 
 ## 3. `PATH` is the unit's
 
@@ -317,3 +318,39 @@ against pm2's own state. Rolling back `shep startup`/`shep unstartup`
 does not touch pm2 either way; pm2 is either still there because you never
 ran the destructive step, or it is gone because you did, and nothing in
 this guide brings it back.
+
+## 9. Breaking changes for an existing shep Flockfile
+
+shep is 0.1.x and guarantees no API, so a Flockfile that worked under an
+older shep can stop parsing under a newer one. This release's breaks, and
+what to do about each:
+
+- **`increment_var` is removed.** A Flockfile setting it is refused at
+  `shep start`, naming the field and the replacement: set your own key to
+  `"{{instance}}"` under `[app.env]` instead. `SHEP_INSTANCE` is still
+  always set on every instance regardless, so most apps need no field at
+  all.
+- **A colon is refused in a sheep name.** `:` is now the `name:slot`
+  selector's separator, and names also land in log filenames, where a
+  colon is the NTFS alternate-data-stream separator. Rename any sheep
+  using one; `-` is the usual stand-in.
+- **An explicit `out_file` or `err_file` on a multi-instance app is refused
+  unless it carries `{{instance}}` or the app sets `merge_logs = true`.**
+  Previously an explicit path with `instances > 1` silently merged every
+  instance's output into one file, which is `merge_logs` behaviour without
+  asking for it. Add `{{instance}}` to the path to keep the files separate,
+  or set `merge_logs = true` to keep them merged on purpose.
+- **`shep bleats` labels a multi-instance app's lines with the slot.** The
+  table prefix was the name alone, so two instances of one app were
+  indistinguishable; a line from slot 2 of `web` now reads `web:2 | ...`. A
+  script splitting a bleats line on the pipe therefore sees a changed field.
+  Match the name loosely, or read `--format json`, whose `instance` key
+  carries the slot on its own. A single-instance app is unaffected, and the
+  backlog of an app with `merge_logs = true` still prints the bare name,
+  because a shared file holds every instance's output with nothing in a line
+  saying who wrote it.
+- **The wire protocol version moved from 1 to 2.** A CLI built against this
+  release refuses to talk to an older daemon still running from before the
+  upgrade, naming both versions at the handshake instead of guessing at a
+  shape the daemon might not send. The fix is to restart the daemon so it
+  picks up the matching binary; there is nothing to configure.

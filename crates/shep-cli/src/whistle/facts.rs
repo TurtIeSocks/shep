@@ -90,6 +90,9 @@ pub struct SheepRow {
     /// The marker a dog has asked to have painted beside this sheep; absent
     /// when none has. Opaque text the daemon validated but never parsed.
     pub smit: Option<String>,
+    /// Which instance slot of its app this sheep occupies, counting from 0;
+    /// absent when the peer daemon predates the field.
+    pub instance: Option<u32>,
 }
 
 /// Where a dog came from. Mirrors `DogSource`'s tagged wire shape exactly.
@@ -154,6 +157,7 @@ impl From<&ProcessInfo> for SheepRow {
                 .map(|lambs| lambs.iter().map(LambRow::from).collect()),
             last_exit: info.last_exit.as_ref().map(ExitInfoRow::from),
             smit: info.smit.clone(),
+            instance: info.instance,
         }
     }
 }
