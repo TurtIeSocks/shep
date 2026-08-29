@@ -159,7 +159,8 @@ crates/shep-core/assets/flockfile.schema.json` (`flockfile.rs:84-86`,
 `REGENERATE`). The schema describes the **deserializer** shape, not
 `normalize`'s narrower validation (e.g. `kill_signal` is an unconstrained
 string in the schema even though only 4 spellings survive `normalize`) —
-documented at `flockfile.rs:96-100` and `docs/specs/deferred.md:551-553`.
+documented at `flockfile.rs:96-100` and in `deferred-history.md`'s schemars
+entry.
 
 ## 3. Discovery
 
@@ -380,10 +381,11 @@ more cautiously to the latter.
 **Nothing.** Searched `docs/specs/deferred.md`, `docs/specs/shep-v1.md`, and
 `docs/systematic-refactor/refactor-workspace/{map,goals}.md` for
 `scaffold`/`template`/`init`/`generate`/`starter`: every hit is unrelated —
-`docs/specs/shep-v1.md:479` and `docs/specs/deferred.md:425-450` are about
-the **systemd/openrc/launchd/rc.d unit generators** for `shep startup`
-(a different kind of "generate a file"), `deferred.md:544-553` is the
-Flockfile **JSON Schema** (already covered in §2), and
+`docs/specs/shep-v1.md:479` and `deferred-history.md`'s `shep startup` /
+`unstartup` entry are about the **systemd/openrc/launchd/rc.d unit
+generators** (a different kind of "generate a file"),
+`deferred-history.md`'s schemars entry is the Flockfile **JSON Schema**
+(already covered in §2), and
 `goals.md:16`/`map.md:875` are about **bark webhook payload templates**, an
 unrelated feature. **This request is not specced, not deferred, and not
 mentioned anywhere in the design docs** — it is new ground, which is itself
