@@ -9,6 +9,48 @@ workflow is most of the work; the manifests on top of it are small.
 exists. It has not run against a real release yet, so the releases already
 published carry nothing; the next one will be the first with assets.
 
+Everything downstream of it is written too, and every publishing step is
+switched off. Nothing here reaches a package manager, a second repository or
+a third-party account until somebody sets a repository variable. The next
+section is the whole list.
+
+## Turning a channel on
+
+Each publishing job is gated on a repository variable. Setting the variable
+is the act of turning the channel on, and for the three that push somewhere
+else the variable is the destination, so nothing here hardcodes an owner or a
+repository name.
+
+| Channel | Variable | Secret | Also needs |
+|---|---|---|---|
+| `.deb` | `PUBLISH_DEB=true` | none | nothing |
+| Homebrew | `HOMEBREW_TAP_REPO=<owner>/homebrew-shep` | `HOMEBREW_TAP_TOKEN` | the tap repository |
+| Scoop | `SCOOP_BUCKET_REPO=<owner>/scoop-shep` | `SCOOP_BUCKET_TOKEN` | the bucket repository |
+| Chocolatey | `PUBLISH_CHOCOLATEY=true` | `CHOCO_API_KEY` | an icon |
+| WinGet | `WINGET_IDENTIFIER=<Publisher>.shep` | `WINGET_TOKEN` | a fork, one manual submission |
+
+Each token needs contents write on the repository it pushes to. The default
+`GITHUB_TOKEN` cannot reach another repository, which is why the two that do
+carry their own.
+
+**The `.deb` is the cheapest one to turn on** and the only one that needs
+nothing outside this repository. It is `dpkg -i` rather than `apt install`,
+for the reason the apt section below gives.
+
+Three of the five are waiting on decisions rather than on work:
+
+- Homebrew and Scoop both want a repository that does not exist. Naming it is
+  the open question, and `github.com/shep` is taken by a dormant account
+  created in 2008 with no public repositories, so an organisation called
+  `shep` is not available.
+- WinGet's `PackageIdentifier` embeds a publisher name, so it waits on the
+  same decision. Its first version also has to be submitted to
+  microsoft/winget-pkgs by hand: the release action checks that the package
+  already exists and refuses otherwise.
+- Chocolatey wants artwork. `iconUrl` is validator Guideline CPMR0033 rather
+  than a Requirement, so the package is approvable without one, and CPMR0076
+  forbids a raw GitHub URL once there is one.
+
 ## The prerequisite: `release-artifacts.yml`
 
 A workflow that builds a matrix, archives it, checksums it, and attaches the
@@ -129,7 +171,18 @@ two version lines and pushes the result to the tap on each release, and
 needed, all of them outside this repository: create the tap repository, put
 the current formula in it as `Formula/shep.rb`, and give this repository a
 `HOMEBREW_TAP_TOKEN` secret holding a token with contents write on the tap.
-Then set the repository variable `PUBLISH_HOMEBREW` to `true`.
+Then set `HOMEBREW_TAP_REPO` to its `<owner>/<name>`.
+
+A separate repository is not strictly required. The `homebrew-` prefix is
+only hardcoded for the one-argument form of `brew tap`; the two-argument form
+takes any URL, and Homebrew looks for formulae in `Formula/`,
+`HomebrewFormula/` or the tap root. So this repository could be its own tap.
+It should not be, for two measured reasons. `brew tap` does a full clone with
+no `--depth`, so every user would fetch a 9 MB Rust workspace and refetch it
+on every `brew update` to learn whether a 70-line file moved. And this
+repository's `main` ruleset requires a pull request and status checks, with
+bypass only for the Admin role, so the release job would have to open a pull
+request somebody merges every time.
 
 The formula pulls the crate tarball from `static.crates.io` rather than a
 GitHub tag archive. crates.io publishes each version's sha256 as its
@@ -173,11 +226,23 @@ same daemon. Say so in `caveats` instead.
 
 Two layers that get conflated, and only the first is cheap.
 
-**Building the `.deb`** is a `[package.metadata.deb]` block in
-`crates/shep-cli/Cargo.toml`, whose package name is `shep`, plus a step
-that writes the completions to disk before `cargo deb` picks them up. Asset
-paths in that block are relative to the crate directory, which is one more
-reason to land the license copy described above first.
+**Building the `.deb`** is done. `[package.metadata.deb]` lives in
+`crates/shep-cli/Cargo.toml` and `release-artifacts.yml`'s `deb` job builds
+both architectures, gated on `PUBLISH_DEB`.
+
+That job does not compile anything. It downloads the musl archives the matrix
+already uploaded, unpacks them where `cargo deb --no-build` looks, runs the
+binary to generate the completions, and repacks. A second twenty-minute
+release build becomes about thirty seconds. The arm64 leg runs on
+`ubuntu-24.04-arm` for one reason: the completions are generated rather than
+checked in, so the job has to be able to execute the binary it is packaging.
+
+Verified locally against cargo-deb rather than written from the README: a
+real package builds, and its nine assets land at `usr/bin/`,
+`usr/share/doc/shep/` and the three completion directories Debian expects.
+One correction fell out of that, worth recording because the README is wrong
+about it. `license-file` takes a plain string, not the documented
+`["path", lines]` pair, which fails to parse.
 
 Build against **musl**, not glibc. `depends = "$auto"` writes whatever
 glibc the runner linked against, `ubuntu-latest` is 24.04 (glibc 2.39), and
@@ -192,7 +257,7 @@ have a Flockfile, and it contradicts shep's own opt-in model. `shep
 startup` already renders and installs the unit when the operator asks for
 it.
 
-**Hosting is the other 80%, and it should be deferred.** A `.deb` attached
+**Hosting is the other 80%, and it stays deferred.** A `.deb` attached
 to a GitHub release is not `apt install`. That needs a signed repository:
 `Packages` and `Release` and `InRelease`, a GPG key, an HTTP host, and a
 `.sources` file plus a keyring in `/etc/apt/keyrings` on every user's
@@ -213,13 +278,22 @@ VirusTotal scan that unsigned Rust binaries routinely trip, and human
 review, measured in days to weeks on a first submission with no trusted
 status.
 
-Scoop is close to free. A JSON manifest in `TurtIeSocks/scoop-shep`, no
-review, and it is where a lot of the CLI audience on Windows actually
-looks.
+Scoop is close to free. `packaging/scoop/shep.json` is written, and the
+`scoop` job pushes it to whatever `SCOOP_BUCKET_REPO` names. No review, and
+it is where a lot of the CLI audience on Windows actually looks. The manifest
+carries `checkver` and `autoupdate` as well, so a bucket running Scoop's
+excavator workflow could bump itself without this repository's help.
 
-WinGet ships with current Windows, its manifests are scriptable through
-`wingetcreate` or the WinGet Releaser action, and its review is lighter
-than Chocolatey's for a well-formed submission.
+WinGet ships with current Windows and its review is lighter than
+Chocolatey's for a well-formed submission. It is the one channel with nothing
+under `packaging/`, because its manifests are generated per version rather
+than maintained: the `winget` job runs the WinGet Releaser action against
+`WINGET_IDENTIFIER`. Two things have to happen first. The identifier embeds a
+publisher name, so it waits on the naming decision, and the first version has
+to be submitted to microsoft/winget-pkgs by hand, since the action refuses
+when the package is not already there. The action's default
+`installers-regex` matches by installer extension and would find nothing in a
+portable `.zip`, so the job sets its own.
 
 The Chocolatey package is written and lives in `packaging/chocolatey/`:
 `shep.nuspec`, the two scripts, `LICENSE.txt`, `VERIFICATION.txt` and the two
@@ -267,20 +341,21 @@ of this and is the text to reuse.
 0. Merge the Windows tier. Done, PR #16.
 1. `release-artifacts.yml`. Done.
 2. README and `web/` install docs. One pass, appended to as channels land.
-3. Homebrew tap, source formula. Formula written, in
-   `packaging/homebrew/`. Blocked on creating the tap repository.
-4. `.deb` on the release, as two more legs of the same matrix.
-5. Scoop bucket.
-6. WinGet.
+3. `.deb` on the release. Written. Set `PUBLISH_DEB`.
+4. Homebrew tap. Formula written, in `packaging/homebrew/`. Blocked on a
+   repository name.
+5. Scoop bucket. Manifest written, in `packaging/scoop/`. Blocked on the
+   same name.
+6. WinGet. Job written. Blocked on the same name, plus one manual
+   submission.
 7. Chocolatey. Package written, in `packaging/chocolatey/`. Blocked on
-   artwork and then on moderation.
+   artwork, then on moderation.
 
-Steps 1 and 3 do not depend on each other: a source formula pulls the
-crates.io tarball. Everything from 5 on needs the Windows artifact leg.
-
-Roughly three to four days of engineering across all of it. The dominant
-cost is not engineering, it is Chocolatey's calendar time, which is the
-whole argument for its position.
+The engineering is done. What is left is four decisions and some clicking:
+a name for wherever the tap and the bucket live, artwork, a WinGet first
+submission, and the tokens. Chocolatey's moderation queue is the only part
+measured in days rather than minutes, which is the whole argument for its
+position.
 
 ## What each release costs afterwards
 

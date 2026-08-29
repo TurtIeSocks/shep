@@ -313,24 +313,28 @@ jobs:
           choco push "packaging/chocolatey/shep.$version.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY
           if ($LASTEXITCODE -ne 0) { throw 'choco push failed' }
 
-  # Bumps the formula in the tap at TurtIeSocks/homebrew-shep, whose source of
-  # truth is `packaging/homebrew/shep.rb` in this repository.
+  # Bumps the formula in the Homebrew tap, whose source of truth is
+  # `packaging/homebrew/shep.rb` in this repository.
   #
   # `needs: resolve` and not `upload`: the formula builds from the crate
   # tarball, so it depends on crates.io rather than on this workflow's own
   # archives. That also means it can bump while the matrix is still running.
   #
-  # Inert until the repository variable `PUBLISH_HOMEBREW` is `true` and a
-  # `HOMEBREW_TAP_TOKEN` secret exists, holding a token with contents write on
-  # the tap repository. The default GITHUB_TOKEN cannot reach another
+  # Inert until the repository variable `HOMEBREW_TAP_REPO` names the tap
+  # (`<owner>/homebrew-shep`) and a `HOMEBREW_TAP_TOKEN` secret holds a token
+  # with contents write on it. The default GITHUB_TOKEN cannot reach another
   # repository.
+  #
+  # The gate is the variable being set rather than a separate on/off flag,
+  # because naming the tap IS the decision. Nothing here hardcodes an owner:
+  # docs/distribution.md records why that was left open.
   homebrew:
     name: Homebrew tap
     needs: resolve
     if: >-
       needs.resolve.outputs.go == 'true' &&
       github.event_name == 'release' &&
-      vars.PUBLISH_HOMEBREW == 'true'
+      vars.HOMEBREW_TAP_REPO != ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -384,10 +388,11 @@ jobs:
         env:
           TAG: ${{ needs.resolve.outputs.tag }}
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
         run: |
           set -euo pipefail
           git clone --depth 1 \
-            "https://x-access-token:${TAP_TOKEN}@github.com/TurtIeSocks/homebrew-shep.git" tap
+            "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
           mkdir -p tap/Formula
           cp packaging/homebrew/shep.rb tap/Formula/shep.rb
           cd tap
