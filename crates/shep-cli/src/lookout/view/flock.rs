@@ -531,7 +531,6 @@ pub fn scroll_offset(selected: usize, viewport: usize, total: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::super::fixtures;
     use super::*;
 
