@@ -498,3 +498,127 @@ jobs:
           deb="$(find target/debian -name '*.deb' -print -quit)"
           test -n "$deb"
           gh release upload "$TAG" "$deb" --clobber
+
+  # Bumps the manifest in the Scoop bucket, whose source of truth is
+  # `packaging/scoop/shep.json` in this repository.
+  #
+  # Inert until the repository variable `SCOOP_BUCKET_REPO` names the bucket
+  # (`<owner>/scoop-shep`) and a `SCOOP_BUCKET_TOKEN` secret holds a token
+  # with contents write on it. As with the tap, naming the bucket is the
+  # decision, so the variable being set is the gate.
+  scoop:
+    name: Scoop bucket
+    needs: [resolve, upload]
+    if: >-
+      needs.resolve.outputs.go == 'true' &&
+      github.event_name == 'release' &&
+      vars.SCOOP_BUCKET_REPO != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+      - name: Stamp the manifest for this version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#shep-v}"
+          archive=shep-x86_64-pc-windows-msvc.zip
+          gh release download "$TAG" --pattern "${archive}.sha256" --dir sums
+          hash="$(cut -d' ' -f1 < "sums/${archive}.sha256")"
+          case "$hash" in
+            [0-9a-fA-F]*) ;;
+            *) echo "::error::the sidecar for $archive did not start with a sha256"; exit 1 ;;
+          esac
+
+          manifest=packaging/scoop/shep.json
+          # jq rather than sed: this is JSON, and the url appears in the
+          # autoupdate block too, where the literal `$version` must survive.
+          jq --arg v "$version" --arg h "$hash" --arg repo "$GITHUB_REPOSITORY" '
+            .version = $v
+            | .architecture["64bit"].url =
+                "https://github.com/\($repo)/releases/download/shep-v\($v)/shep-x86_64-pc-windows-msvc.zip"
+            | .architecture["64bit"].hash = $h
+          ' "$manifest" > stamped.json
+          mv stamped.json "$manifest"
+
+          # A sentinel that survived means the stamp silently did nothing, and
+          # the bucket would get last release's manifest under this tag.
+          if grep -q '"version": "0.0.0"' "$manifest"; then
+            echo "::error::the version sentinel survived substitution"
+            exit 1
+          fi
+          if grep -q '0000000000000000000000000000000000000000000000000000000000000000' "$manifest"; then
+            echo "::error::the hash sentinel survived substitution"
+            exit 1
+          fi
+      - name: Push it to the bucket
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${BUCKET_TOKEN}@github.com/${BUCKET_REPO}.git" bucket
+          mkdir -p bucket/bucket
+          cp packaging/scoop/shep.json bucket/bucket/shep.json
+          cd bucket
+          if git diff --quiet; then
+            echo "The bucket already carries this manifest. Nothing to push."
+            exit 0
+          fi
+          git -c user.name='shep release' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -am "shep ${TAG#shep-v}"
+          git push
+
+  # Opens the pull request that adds this version to the WinGet community
+  # repository.
+  #
+  # Unlike every other channel here, WinGet manifests are not maintained in
+  # this repository: they are generated per version and submitted to
+  # microsoft/winget-pkgs. So there is nothing under `packaging/` for this,
+  # only the action below.
+  #
+  # Two things have to exist first, and neither can be done from here. The
+  # PackageIdentifier has to be decided (it embeds a publisher name, which is
+  # the organisation question docs/distribution.md leaves open), and the FIRST
+  # version has to be submitted by hand: this action checks that the package
+  # already exists in winget-pkgs and refuses otherwise. A fork of
+  # winget-pkgs under `fork-user` is also required.
+  #
+  # Inert until the repository variable `WINGET_IDENTIFIER` is set.
+  winget:
+    name: WinGet
+    needs: [resolve, upload]
+    if: >-
+      needs.resolve.outputs.go == 'true' &&
+      github.event_name == 'release' &&
+      vars.WINGET_IDENTIFIER != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: ${{ vars.WINGET_IDENTIFIER }}
+          # The bare version. The action's own default strips a leading `v`
+          # from the release tag, which on `shep-v0.1.12` would leave
+          # `shep-v0.1.12` unchanged and submit a nonsense PackageVersion.
+          version: ${{ needs.resolve.outputs.version }}
+          # NOT the action's default, which matches installers by extension
+          # (.exe, .msi, .msix, .appx). shep ships a portable .zip, and the
+          # default would match nothing and submit an empty installer list.
+          installers-regex: '^shep-x86_64-pc-windows-msvc\.zip$'
+          release-tag: ${{ needs.resolve.outputs.tag }}
+          fork-user: ${{ vars.WINGET_FORK_USER || github.repository_owner }}
+          token: ${{ secrets.WINGET_TOKEN }}
