@@ -60,8 +60,11 @@ cargo test -p shep --lib --all-features -- --ignored write_the_gallery
   died` under `--bark`. Nothing here is colour-only, so `NO_COLOR` and a
   16-colour terminal both lose decoration, never information.
 - **Narrow terminals drop columns in a fixed order**, least diagnostic
-  first: FOLD, then RESTARTS and PID, then MEM, then CPU, then UPTIME,
-  leaving `ID NAME STATUS` as the floor. Below 31 columns or 6 rows the pane
+  first, one at a time, at the width in brackets: SMIT (101), FOLD (89),
+  EXIT (78), RESTARTS (68), PID (59), MEM (49), CPU (41), then UPTIME,
+  leaving `ID NAME STATUS` as the floor. SMIT goes first for being much the
+  widest, and EXIT that early because it renders `-` for every sheep that is
+  still running, which is what the pane shows most of the time. Below 31 columns or 6 rows the pane
   refuses outright rather than draw overlapping garbage, with a two-line
   message short enough to survive the narrowest terminal it is warning
   about.

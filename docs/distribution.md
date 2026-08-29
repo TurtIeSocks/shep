@@ -1,13 +1,22 @@
 # Distributing shep
 
-**`cargo install shep` is the only way to install shep, and no GitHub
-release carries a binary yet.** Every channel below is a thin wrapper around
-a download URL, so none of them can start until that URL exists. That one
-workflow is most of the work; the manifests on top of it are small.
+**`cargo install shep` is still the only way to install shep.** Every channel
+below is a thin wrapper around a download URL, so none of them can start until
+that URL exists. That one workflow is most of the work; the manifests on top
+of it are small.
 
-`.github/workflows/release-artifacts.yml` is that workflow and it now
-exists. It has not run against a real release yet, so the releases already
-published carry nothing; the next one will be the first with assets.
+`.github/workflows/release-artifacts.yml` is that workflow, and as of
+2026-08-29 it has run against a real release and FAILED. Seven of its eight
+target legs built. `aarch64-unknown-linux-musl` did not: it runs natively on
+`ubuntu-24.04-arm`, and something asked rustup for
+`stable-x86_64-unknown-linux-gnu`, which an ARM runner refuses with
+"toolchain may not be able to run on this system". Because that leg failed,
+the Homebrew, Scoop, SHA256SUMS, Chocolatey, deb and WinGet jobs downstream of
+it were all skipped.
+
+So shep 0.1.13 is on crates.io carrying no binaries and no package-manager
+artifacts, and the sentence above stays true for a reason nobody intended.
+Fix that leg before reading the rest of this file as a plan.
 
 Everything downstream of it is written too, and every publishing step is
 switched off. Nothing here reaches a package manager, a second repository or
