@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-08-29
+
+### Performance
+
+- Buffer a sheep's log writes instead of one dispatch per line
+- Publish one shared, once-encoded frame to every bus subscriber
+- Publish a log line only when something asked for log topics
+
+
 ## [0.1.11] - 2026-08-29
 
 
