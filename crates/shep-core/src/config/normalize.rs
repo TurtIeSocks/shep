@@ -715,7 +715,7 @@ impl fmt::Display for NormalizeError {
             Self::InvalidName(n) => {
                 write!(
                     f,
-                    "sheep name `{n}` may not contain a path separator or a colon, or be `.` or `..`"
+                    "sheep name `{n}` may not contain a path separator or a colon, or be `.` or `..`; use `-` in place of a colon"
                 )
             }
             Self::ReservedEnvVar { name, var } => write!(
@@ -979,6 +979,13 @@ mod tests {
 
         let rendered = err.to_string();
         assert!(rendered.contains(':'), "says which character: {rendered}");
+        // Spec D3: "The error names the character and suggests `-`." It named
+        // the colon and suggested nothing, so migration.md carried the
+        // stand-in and the error an operator actually meets did not.
+        assert!(
+            rendered.contains("`-`"),
+            "suggests the stand-in: {rendered}"
+        );
         assert!(
             !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
             "no em or en dash in copy a user reads: {rendered}"
