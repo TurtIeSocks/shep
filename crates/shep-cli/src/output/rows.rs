@@ -896,15 +896,15 @@ pub struct DogEnabledRow {
     pub status: String,
 }
 
-/// Shared scaffolding for the four dog-action tables:
-/// [`DogEnabledRow`]/[`DogDisabledRow`]/[`DogAdoptedRow`]/[`DogRehomedRow`].
-/// All four render one row of `["NAME", "SOURCE", "SHEPHERD", "STATUS"]` for
-/// a dog verb's outcome, share the same JSON key mapping, column priorities,
-/// and paint dispatch — the only thing that differs per verb is which
-/// fields it has (three carry a bare `DogSource`, [`DogRehomedRow`] an
-/// `Option<DogSource>`), and each type resolves that down to a source label
-/// before building one of these. Every other [`Render`] method is delegated
-/// straight to the associated functions below.
+// Shared scaffolding for the four dog-action tables:
+// [`DogEnabledRow`]/[`DogDisabledRow`]/[`DogAdoptedRow`]/[`DogRehomedRow`].
+// All four render one row of `["NAME", "SOURCE", "SHEPHERD", "STATUS"]` for
+// a dog verb's outcome, share the same JSON key mapping, column priorities,
+// and paint dispatch — the only thing that differs per verb is which
+// fields it has (three carry a bare `DogSource`, [`DogRehomedRow`] an
+// `Option<DogSource>`), and each type resolves that down to a source label
+// before building one of these. Every other [`Render`] method is delegated
+// straight to the associated functions below.
 struct DogActionRow<'a> {
     name: &'a str,
     source: &'a str,
@@ -929,8 +929,10 @@ impl DogActionRow<'_> {
     /// The dog-action rows' shared treatment, spelled out here once for all
     /// four.
     ///
-    /// SOURCE is muted, the same call `DogRows` makes: it says where the
-    /// binary came from, never whether anything is healthy.
+    /// SOURCE is styled by what it holds, the same call `DogRows` makes:
+    /// `built-in` is muted, a missing source (`-`) stays default, and a path
+    /// source takes `Role::Butter`. None of it says whether anything is
+    /// healthy, only where the binary came from.
     ///
     /// STATUS is coloured only when it NAMES a status. This field holds
     /// either a real `ProcStatus` rendering or a sentence saying why no
@@ -1880,15 +1882,15 @@ pub struct TriggeredRows(pub Vec<ActionReply>);
 /// which `render_table` does not support.
 const TRIGGER_BODY_PREVIEW_CHARS: usize = 80;
 
-/// Shared scaffolding for the three per-sheep reply tables:
-/// [`TriggeredRows`]/[`SignalledRows`]/[`SentLineRows`]. All three render
-/// `["ID", "NAME", "OUTCOME", "DETAIL"]`, share the same JSON key mapping,
-/// column priorities, and paint dispatch ([`reply_paint`]) — the only thing
-/// that differs per verb is which `describe_*_outcome` helper builds a row's
-/// own `(OUTCOME, DETAIL)` pair, so each public type still walks its own
-/// reply list and calls its own describe function, handing the result to
-/// [`Self::row`] to assemble. Every other [`Render`] method is delegated
-/// straight to the associated functions below.
+// Shared scaffolding for the three per-sheep reply tables:
+// [`TriggeredRows`]/[`SignalledRows`]/[`SentLineRows`]. All three render
+// `["ID", "NAME", "OUTCOME", "DETAIL"]`, share the same JSON key mapping,
+// column priorities, and paint dispatch ([`reply_paint`]) — the only thing
+// that differs per verb is which `describe_*_outcome` helper builds a row's
+// own `(OUTCOME, DETAIL)` pair, so each public type still walks its own
+// reply list and calls its own describe function, handing the result to
+// [`Self::row`] to assemble. Every other [`Render`] method is delegated
+// straight to the associated functions below.
 struct ReplyRows;
 
 impl ReplyRows {
