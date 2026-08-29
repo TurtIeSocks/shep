@@ -583,7 +583,9 @@ mod tests {
     /// revert `acquire`'s Windows arm to `Ok(Self {})` and this reddens
     /// rather than passing quietly.
     ///
-    /// Without the lock this fails hard rather than flakily.
+    /// Without the lock this exposes the race; nothing synchronises the
+    /// two children into overlap, so a lucky serial schedule can still pass
+    /// one run while failing under load.
     #[cfg(any(unix, windows))]
     #[test]
     fn two_writer_processes_do_not_lose_each_other_s_barks() {
