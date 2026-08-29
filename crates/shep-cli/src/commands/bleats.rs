@@ -689,6 +689,17 @@ mod tests {
             .build()
     }
 
+    /// Like [`info`], but with a real instance slot -- `info` never sets
+    /// one, so it cannot express a multi-instance app on its own.
+    fn info_with_instance(id: u32, name: &str, slot: u32) -> ProcessInfo {
+        ProcessInfo::builder(id, name, ProcStatus::Online)
+            .pid(Some(1000 + id))
+            .instance(Some(slot))
+            .out_file(Some(format!("/logs/{name}-{slot}-out.log")))
+            .err_file(Some(format!("/logs/{name}-{slot}-err.log")))
+            .build()
+    }
+
     fn bleats_args(selector: &str, no_follow: bool, err: bool, out: bool) -> BleatsArgs {
         BleatsArgs {
             selector: selector.to_string(),
@@ -934,6 +945,114 @@ mod tests {
         assert!(
             !out.contains("from-worker"),
             "the selector must narrow the resolved id set: {out}"
+        );
+    }
+
+    /// D11's whole asymmetry: unlike the backlog, a follow always knows
+    /// which sheep wrote a line -- the daemon emits `BusEvent::LogOut` per
+    /// sheep -- so it labels a multi-instance app's lines with their slot
+    /// even though `info_with_instance`'s two rows would share a file if
+    /// this went through the backlog path. `resolved_instance` is the only
+    /// thing that can produce this label; dropping its `instance_count`
+    /// gate, or failing to thread `instance` into `handle_event`'s
+    /// `LogOut`/`LogErr` arms, both turn this red without touching a single
+    /// other test in this module (see the fix report for the manual check).
+    #[tokio::test]
+    async fn a_multi_instance_apps_follow_labels_its_lines_with_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![
+            info_with_instance(1, "web", 0),
+            info_with_instance(2, "web", 1),
+        ]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "from-slot-0".into(),
+            })
+            .await;
+        daemon
+            .push(BusEvent::LogOut {
+                id: 2,
+                line: "from-slot-1".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &follow_args("web")),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("web:0 | from-slot-0"),
+            "a followed line must carry its slot: {out}"
+        );
+        assert!(
+            out.contains("web:1 | from-slot-1"),
+            "a followed line must carry its slot: {out}"
+        );
+    }
+
+    /// Minor fix bundle: a selector narrowed to one instance must not change
+    /// how that instance's line is labelled -- `instance_count` counts over
+    /// the WHOLE cache, never the matched subset, so `web:0` still prints
+    /// `web:0` even though the cache holds a `web:1` this selector excludes.
+    /// This deliberately differs from the flock table's own rollup rule,
+    /// where the count describes the rows actually listed -- a table row
+    /// summarises a listing, a log prefix identifies a process.
+    #[tokio::test]
+    async fn a_selector_narrowed_to_one_instance_does_not_change_its_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, daemon) = fake_client_with_push(&path).await;
+        daemon.reply_to_list(vec![
+            info_with_instance(1, "web", 0),
+            info_with_instance(2, "web", 1),
+        ]);
+        daemon
+            .push(BusEvent::LogOut {
+                id: 1,
+                line: "from-slot-0".into(),
+            })
+            .await;
+        daemon.close_after_subscribe().await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &follow_args("web:0")),
+            )
+            .await
+            .expect("close_after_subscribe ends the follow deterministically, not by hanging");
+        }
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains("web:0 | from-slot-0"),
+            "a selector narrowed to one instance must not strip its label: {out}"
         );
     }
 
