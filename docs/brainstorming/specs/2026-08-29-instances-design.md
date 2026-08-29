@@ -249,12 +249,18 @@ error that names no fix. Remove in 0.2.
 
 Defect B. `tail_log_files` iterates matched rows and calls `read_tail` per row
 with no dedup, so a path shared by several instances is read once per
-instance. The fix is to dedup the matched rows by resolved path before
-reading, in the backlog and in the follow watcher alike, since the repro
-duplicated in both.
+instance. Dedup the matched rows by resolved path before reading.
 
-The notices follow the same key: one `log_path_unknown` or `log_unreadable`
-per distinct path rather than per row.
+**The backlog only.** Following is not affected and needs no change: it
+subscribes to `log.*` and reads `BusEvent::LogOut { id, line }`, which is
+emitted per sheep, so two instances sharing a file still produce one event
+each. My first reading of the repro said both halves duplicated, and that was
+wrong. The 36 lines printed twice were the backlog running twice; everything
+after it was two live processes each writing its own line.
+
+`log_unreadable` names a path and so dedups with the reads.
+`log_path_unknown` has no path to key on, since the field is missing, so it
+dedups on the name and stream its message already carries.
 
 This lands as its own commit ahead of the rest. It is a live bug against
 `merge_logs`, which is shipped and documented, and it is independent of every
@@ -270,11 +276,16 @@ to `write_line` and used only by the JSON arm.
 |---|---|---|
 | single-instance app | `web \|` | the slot |
 | multi-instance, own file | `web:2 \|` | the slot |
-| multi-instance, shared file | `web \|` | null |
+| multi-instance, shared file, backlog | `web \|` | null |
+| multi-instance, shared file, following | `web:2 \|` | the slot |
 
-A shared file genuinely holds every instance's output interleaved, and
-nothing in the line says which instance wrote it, so shep does not guess. That
-is the honest label and it pairs with D10: one read, one unattributed stream.
+The last two rows differ because the two halves of `bleats` learn about a line
+in different ways. The backlog reads a file, and a shared file holds every
+instance's output interleaved with nothing in a line saying who wrote it, so
+shep declines to guess. Following reads `BusEvent::LogOut { id, line }`, which
+the daemon emits per sheep, so the writer is known even when the file is
+shared. Pairs with D10: one read of the merged file, unattributed, then
+attributed lines from the moment the subscription starts.
 
 The slot appears whenever the app has more than one instance registered, not
 merely more than one matched. A selector should not change how a line is
