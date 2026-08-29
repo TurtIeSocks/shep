@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn env_custom_increment_var() {
+    fn a_custom_increment_var_is_inert_and_injects_nothing() {
         let mut app_config = AppConfig {
             name: "worker".to_string(),
             script: "bin/worker".to_string(),
@@ -333,12 +333,15 @@ mod tests {
         let spec = assemble(&app, 5, &paths, None);
 
         // SHEP_INSTANCE and SHEP_NAME are always injected now, regardless of
-        // increment_var: the field is inert here until a later task removes
-        // it.
+        // increment_var.
         assert_eq!(spec.env.get("SHEP_INSTANCE").map(|s| s.as_str()), Some("5"));
         assert_eq!(
             spec.env.get("SHEP_NAME").map(|s| s.as_str()),
             Some("worker")
+        );
+        assert!(
+            !spec.env.contains_key("WORKER_ID"),
+            "increment_var is inert: assemble stopped reading it, so a custom name is never injected"
         );
     }
 

@@ -223,37 +223,37 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 ///
 /// # Errors
 ///
-/// - [`NormalizeError::MissingName`] — `name` is empty.
-/// - [`NormalizeError::InvalidName`] — `name` contains a path separator or a
+/// - [`NormalizeError::MissingName`]: `name` is empty.
+/// - [`NormalizeError::InvalidName`]: `name` contains a path separator or a
 ///   colon, or is `.`/`..`.
-/// - [`NormalizeError::ReservedEnvVar`] — `env` sets `SHEP_INSTANCE` or
+/// - [`NormalizeError::ReservedEnvVar`]: `env` sets `SHEP_INSTANCE` or
 ///   `SHEP_NAME`, which shep injects itself (carries the app name and the
 ///   variable).
-/// - [`NormalizeError::MissingScript`] — `script` is empty.
-/// - [`NormalizeError::ZeroInstances`] — `instances == 0`.
-/// - [`NormalizeError::InvalidCron`] — `cron_restart` is not valid in
+/// - [`NormalizeError::MissingScript`]: `script` is empty.
+/// - [`NormalizeError::ZeroInstances`]: `instances == 0`.
+/// - [`NormalizeError::InvalidCron`]: `cron_restart` is not valid in
 ///   croner's dialect (carries the pattern and the rejection reason).
-/// - [`NormalizeError::InvalidTimezone`] — `cron_timezone` is not a name in
+/// - [`NormalizeError::InvalidTimezone`]: `cron_timezone` is not a name in
 ///   the IANA time-zone database.
-/// - [`NormalizeError::InvalidProbe`] — `readiness_probe` or `liveness_probe`
+/// - [`NormalizeError::InvalidProbe`]: `readiness_probe` or `liveness_probe`
 ///   has a target [`ProbeTarget::parse`] rejects (carries which probe and
 ///   the rendered reason).
-/// - [`NormalizeError::ZeroFailureThreshold`] — a probe's `failure_threshold`
+/// - [`NormalizeError::ZeroFailureThreshold`]: a probe's `failure_threshold`
 ///   is explicitly `0`.
-/// - [`NormalizeError::IntervalBelowMinimum`] — a probe's `interval` is under
+/// - [`NormalizeError::IntervalBelowMinimum`]: a probe's `interval` is under
 ///   the floor its own loop honours: a full second for `liveness_probe`, and
 ///   only "greater than zero" for `readiness_probe` (carries which probe, the
 ///   value and the floor).
-/// - [`NormalizeError::ZeroMaxMemory`] — `max_memory` is `0`.
-/// - [`NormalizeError::ActionTimeoutTooLong`] — `action_timeout` is at or
+/// - [`NormalizeError::ZeroMaxMemory`]: `max_memory` is `0`.
+/// - [`NormalizeError::ActionTimeoutTooLong`]: `action_timeout` is at or
 ///   above the ceiling no RPC caller could ever be given room to wait past
 ///   (carries the app name, the value and the ceiling).
-/// - [`NormalizeError::InvalidKillSignal`] — `kill_signal` names a signal the
+/// - [`NormalizeError::InvalidKillSignal`]: `kill_signal` names a signal the
 ///   daemon's stop ladder cannot send (carries the app name and the value).
-/// - [`NormalizeError::WatchWithoutCwd`] — `watch` is `true` with no `cwd`
+/// - [`NormalizeError::WatchWithoutCwd`]: `watch` is `true` with no `cwd`
 ///   set.
-/// - [`NormalizeError::ZeroWatchDelay`] — `watch_delay` is `0`.
-/// - [`NormalizeError::InvalidWatchGlob`] — a `watch_options` or
+/// - [`NormalizeError::ZeroWatchDelay`]: `watch_delay` is `0`.
+/// - [`NormalizeError::InvalidWatchGlob`]: a `watch_options` or
 ///   `ignore_watch` pattern globset will not compile (carries the app name,
 ///   which of the two lists, the pattern and the reason).
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
