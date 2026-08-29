@@ -603,12 +603,20 @@ where
 ///
 /// # Dogs
 ///
-/// A wildcard passes a dog by; an exact name or id reaches it. The same rule
+/// A wildcard passes a dog by; an exact selector reaches it. The same rule
 /// [`ProcessSelector::is_exact`] states for the daemon's own matching, and for
 /// the same reason: a dog is a process an operator installed, not a member of
 /// the flock `all` means. The fold fallback counts as a wildcard even though
 /// it came from a `Name` token, because the operator named a group rather than
 /// a process.
+///
+/// The two tiers are keyed off [`ProcessSelector::is_exact`] rather than off a
+/// list of variants written out here. An earlier version enumerated `Name` and
+/// `Id` and sent everything else through the wildcard tier, which silently put
+/// `name:slot` on the wrong side of the rule the moment that form was added:
+/// `shep start metrics:0` filtered the dog out and then reported that no
+/// instance 0 of `metrics` was registered, about a process that was. One
+/// predicate, one place, so the two cannot drift again.
 fn flock_matches(selector: &ProcessSelector, flock: &[ProcessInfo]) -> Vec<ProcessInfo> {
     let sheep_only = |flock: &[ProcessInfo], keep: &dyn Fn(&ProcessInfo) -> bool| {
         flock
@@ -630,13 +638,13 @@ fn flock_matches(selector: &ProcessSelector, flock: &[ProcessInfo]) -> Vec<Proce
             }
             sheep_only(flock, &|info| info.fold.as_deref() == Some(wanted.as_str()))
         }
-        ProcessSelector::Id(wanted) => flock
+        exact if exact.is_exact() => flock
             .iter()
-            .filter(|info| info.id == *wanted)
+            .filter(|info| exact.matches(&info.name, info.id, info.fold.as_deref(), info.instance))
             .cloned()
             .collect(),
-        other => sheep_only(flock, &|info| {
-            other.matches(&info.name, info.id, info.fold.as_deref(), info.instance)
+        wildcard => sheep_only(flock, &|info| {
+            wildcard.matches(&info.name, info.id, info.fold.as_deref(), info.instance)
         }),
     }
 }
@@ -2317,6 +2325,37 @@ mod tests {
             vec!["log-rotate"],
             "but naming it outright reaches it"
         );
+    }
+
+    /// fails if `name:slot` is treated as a wildcard and so passes a dog by.
+    ///
+    /// `ProcessSelector::is_exact` counts `Instance` as exact, and this
+    /// function used to enumerate `Name` and `Id` and send everything else
+    /// through the dog-filtering tier. `shep start metrics:0` therefore
+    /// filtered the dog out, fell through every later tier, and reported that
+    /// no instance 0 of `metrics` was registered about a process that was.
+    /// `shep start metrics` reached it the whole time.
+    #[test]
+    fn an_instance_selector_reaches_a_dog() {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+
+        let flock = vec![
+            ProcessInfo::builder(0, "metrics", ProcStatus::Online)
+                .dog(Some(DogSource::BuiltIn))
+                .instance(Some(0))
+                .build(),
+            ProcessInfo::builder(1, "metrics", ProcStatus::Online)
+                .dog(Some(DogSource::BuiltIn))
+                .instance(Some(1))
+                .build(),
+        ];
+        let selector = ProcessSelector::parse("metrics:0").unwrap();
+        let ids: Vec<u32> = flock_matches(&selector, &flock)
+            .into_iter()
+            .map(|info| info.id)
+            .collect();
+        assert_eq!(ids, vec![0], "the named slot, dog or not");
     }
 
     /// fails if a token carrying a path separator is tried as a sheep or a
