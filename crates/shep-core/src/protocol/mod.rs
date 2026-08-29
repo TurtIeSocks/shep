@@ -3,6 +3,13 @@
 //! Typed request/response enums + bus events. Framing lives in [`wire`];
 //! every type here is snapshot-pinned — changing any serialized shape is a
 //! protocol version bump recorded in the CHANGELOG.
+//!
+//! **What version 2 added:** the instance slot on [`ProcessInfo`]. A sheep
+//! that is one of several instances of an app reports which slot it is, so
+//! every listing can group an app's instances and roll their numbers up
+//! rather than showing several rows that share a name and explain nothing.
+//! A single-instance sheep reports `None`, exactly as version 1 had no field
+//! to report at all.
 
 pub mod channel;
 pub mod events;
