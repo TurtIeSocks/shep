@@ -114,10 +114,20 @@ def pin(svg: str) -> tuple[str, int]:
 def main(paths: list[str]) -> int:
     for name in paths:
         path = Path(name)
-        before = path.read_text()
+        # Both ends pinned to UTF-8. Without it Python uses the host's locale
+        # encoding, and on a Windows shell that is usually cp1252, which cannot
+        # represent a single box-drawing character: the read raises, or worse,
+        # a lossy round-trip writes an asset back with the table gone.
+        before = path.read_text(encoding="utf-8")
         after, split = pin(before)
-        path.write_text(after)
-        print(f"{path}: split {split} mixed runs, {len(before)} -> {len(after)} bytes")
+        path.write_text(after, encoding="utf-8")
+        # Encoded, because these are byte counts and a box-drawing character is
+        # three bytes to Python's one. Reporting `len` of the string understated
+        # hero.svg by 2K and put a wrong figure in this commit's own pull request.
+        print(
+            f"{path}: split {split} mixed runs, "
+            f"{len(before.encode('utf-8'))} -> {len(after.encode('utf-8'))} bytes"
+        )
     return 0
 
 
