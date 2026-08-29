@@ -926,36 +926,36 @@ impl DogActionRow<'_> {
         ]]
     }
 
-    /// The dog-action rows' shared treatment, spelled out here once for all
-    /// four.
-    ///
-    /// SOURCE is styled by what it holds, the same call `DogRows` makes:
-    /// `built-in` is muted, a missing source (`-`) stays default, and a path
-    /// source takes `Role::Butter`. None of it says whether anything is
-    /// healthy, only where the binary came from.
-    ///
-    /// STATUS is coloured only when it NAMES a status. This field holds
-    /// either a real `ProcStatus` rendering or a sentence saying why no
-    /// shepherd answered, and a sentence has no role to wear -- colouring it
-    /// would be decoration, which is the one thing the rule here forbids.
-    /// [`status_named_by`] is what tells the two apart.
-    ///
-    /// SHEPHERD is left plain deliberately, and it was the closest call in
-    /// this table. `false` is worth knowing -- it means the config changed
-    /// and nothing is running yet -- but the STATUS cell beside it already
-    /// says so in a whole sentence, so a colour here would be a second
-    /// decoration saying what the text already says. That is the same
-    /// reasoning `lookout/theme.rs` gives for not putting a face in its own
-    /// flock pane.
-    ///
-    /// NAME stays plain, matching every other table in this module.
+    // The dog-action rows' shared treatment, spelled out here once for all
+    // four.
+    //
+    // SOURCE is styled by what it holds, the same call `DogRows` makes:
+    // `built-in` is muted, a missing source (`-`) stays default, and a path
+    // source takes `Role::Butter`. None of it says whether anything is
+    // healthy, only where the binary came from.
+    //
+    // STATUS is coloured only when it NAMES a status. This field holds
+    // either a real `ProcStatus` rendering or a sentence saying why no
+    // shepherd answered, and a sentence has no role to wear -- colouring it
+    // would be decoration, which is the one thing the rule here forbids.
+    // [`status_named_by`] is what tells the two apart.
+    //
+    // SHEPHERD is left plain deliberately, and it was the closest call in
+    // this table. `false` is worth knowing -- it means the config changed
+    // and nothing is running yet -- but the STATUS cell beside it already
+    // says so in a whole sentence, so a colour here would be a second
+    // decoration saying what the text already says. That is the same
+    // reasoning `lookout/theme.rs` gives for not putting a face in its own
+    // flock pane.
+    //
+    // NAME stays plain, matching every other table in this module.
     fn rows_for(
         rows: Vec<Vec<String>>,
         presentation: Presentation,
         status_word: bool,
     ) -> Vec<Vec<String>> {
         paint(
-            rows.clone(),
+            rows,
             Self::headers(),
             presentation,
             status_word,
@@ -979,11 +979,11 @@ impl DogActionRow<'_> {
     const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
 }
 
-/// One JSON key rule for the four dog-action tables; the panic names the concrete type.
-///
-/// A macro rather than a shared associated fn: the shared rule expands inside
-/// each `Render` impl, because rustc 1.93's dead-code pass cannot see a use
-/// that only occurs in another trait impl's body, and the lint job pins 1.93.
+// One JSON key rule for the four dog-action tables; the panic names the concrete type.
+//
+// A macro rather than a shared associated fn: the shared rule expands inside
+// each `Render` impl, because rustc 1.93's dead-code pass cannot see a use
+// that only occurs in another trait impl's body, and the lint job pins 1.93.
 macro_rules! dog_action_json_key {
     ($caller:expr, $header:expr) => {{
         let caller: &'static str = $caller;
@@ -1391,7 +1391,7 @@ impl Render for EmptiedFiles {
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
         let rows = self.rows();
         paint(
-            rows.clone(),
+            rows,
             Self::headers(),
             presentation,
             status_word,
@@ -1716,7 +1716,7 @@ impl Render for ImportRows {
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
         let rows = self.rows();
         paint(
-            rows.clone(),
+            rows,
             Self::headers(),
             presentation,
             status_word,
@@ -1815,7 +1815,7 @@ impl Render for StartupSteps {
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
         let rows = self.rows();
         paint(
-            rows.clone(),
+            rows,
             Self::headers(),
             presentation,
             status_word,
@@ -1907,14 +1907,14 @@ impl ReplyRows {
         ]
     }
 
-    /// [`reply_paint`], shared across all three per-sheep reply tables.
+    // [`reply_paint`], shared across all three per-sheep reply tables.
     fn rows_for(
         rows: Vec<Vec<String>>,
         presentation: Presentation,
         status_word: bool,
     ) -> Vec<Vec<String>> {
         paint(
-            rows.clone(),
+            rows,
             Self::headers(),
             presentation,
             status_word,
@@ -1934,11 +1934,11 @@ impl ReplyRows {
     const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
 }
 
-/// One JSON key rule for the three per-sheep reply tables; the panic names the concrete type.
-///
-/// A macro rather than a shared associated fn: the shared rule expands inside
-/// each `Render` impl, because rustc 1.93's dead-code pass cannot see a use
-/// that only occurs in another trait impl's body, and the lint job pins 1.93.
+// One JSON key rule for the three per-sheep reply tables; the panic names the concrete type.
+//
+// A macro rather than a shared associated fn: the shared rule expands inside
+// each `Render` impl, because rustc 1.93's dead-code pass cannot see a use
+// that only occurs in another trait impl's body, and the lint job pins 1.93.
 macro_rules! reply_rows_json_key {
     ($caller:expr, $header:expr) => {{
         let caller: &'static str = $caller;
@@ -2251,7 +2251,7 @@ impl Render for BarkRows {
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
         let rows = self.rows();
         paint(
-            rows.clone(),
+            rows,
             Self::headers(),
             presentation,
             status_word,
