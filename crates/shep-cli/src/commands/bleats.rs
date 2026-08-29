@@ -1564,12 +1564,6 @@ mod tests {
         );
     }
 
-    /// `truncated` must report `true` when the byte window is what cut the
-    /// tail short, even when the line cap never binds — a sheep logging a
-    /// few long, structured lines can fill `TAIL_WINDOW_BYTES` in far fewer
-    /// than `limit` lines. Before this test, `read_tail` reported `false`
-    /// here, and `whistle`'s `tail_bleats` handed a model exactly that
-    /// wrong answer.
     /// Two instances sharing one log file (a `merge_logs` app, or any app
     /// with an explicit `out_file`) must be read once, not once per
     /// instance: reading per row printed the whole file once per instance
@@ -1613,6 +1607,12 @@ mod tests {
         );
     }
 
+    /// `truncated` must report `true` when the byte window is what cut the
+    /// tail short, even when the line cap never binds — a sheep logging a
+    /// few long, structured lines can fill `TAIL_WINDOW_BYTES` in far fewer
+    /// than `limit` lines. Before this test, `read_tail` reported `false`
+    /// here, and `whistle`'s `tail_bleats` handed a model exactly that
+    /// wrong answer.
     #[test]
     fn read_tail_reports_truncated_on_a_byte_window_cut_alone() {
         let dir = tempfile::tempdir().unwrap();
