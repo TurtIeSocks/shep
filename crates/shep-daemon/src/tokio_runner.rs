@@ -12,8 +12,9 @@
 //! `shep` can ask of a live log file without restarting the sheep:
 //! [`Reopen`](crate::runner::LogCtl::Reopen) drops both handles and opens the
 //! paths again, which is how an externally rotated file gets picked up, and
-//! [`Flush`](crate::runner::LogCtl::Flush) waits for the writes already in
-//! flight to land, which is the barrier `shep flush` truncates behind.
+//! [`Flush`](crate::runner::LogCtl::Flush) writes out what a stream has
+//! buffered and waits for it to land, which is the barrier `shep flush`
+//! truncates behind.
 //!
 //! # Shepherd-channel fd lifecycle
 //!
@@ -27,6 +28,7 @@
 //! side of the channel sees a clean EOF once the child closes or exits
 //! rather than being kept artificially open by our own leftover reference.
 
+use core::time::Duration;
 use std::fs;
 use std::io;
 #[cfg(unix)]
@@ -44,12 +46,13 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use shep_core::signals::OperatorSignal;
 use tokio::io::{
-    AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, Lines,
+    AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, BufWriter, Lines,
 };
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tokio::time::{Instant, sleep_until};
 
 #[cfg(unix)]
 use crate::boot::DIR_MODE;
@@ -64,6 +67,25 @@ use crate::runner::{
 /// bursty child doesn't back-pressure against a sheep task that's merely
 /// slow to poll, without buffering unboundedly.
 const CHANNEL_CAPACITY: usize = 32;
+
+/// Bytes a log file buffers before the pump writes them through.
+///
+/// `tokio::fs::File` hands every `write` to the blocking pool, and that
+/// dispatch — not the `write(2)` under it — is what a log line costs the
+/// daemon: measured at 32.8 us of daemon CPU per line against 0.99 us for the
+/// same line written unbuffered from a plain loop. Batching amortises one
+/// dispatch over a whole buffer instead of paying it per line.
+const LOG_BUFFER: usize = 8 * 1024;
+
+/// How long a line may sit in that buffer before the pump writes it out
+/// anyway.
+///
+/// Measured from the FIRST unflushed line rather than the most recent, so a
+/// steady trickle cannot push the deadline out indefinitely; a busy stream
+/// fills [`LOG_BUFFER`] and flushes long before this fires. Without it a
+/// sheep that logged one line and went quiet would leave that line in the
+/// buffer until its next one, which for some sheep is never.
+const IDLE_FLUSH: Duration = Duration::from_millis(50);
 
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
 #[derive(Debug, Default)]
@@ -885,15 +907,27 @@ impl ProcessRunner for TokioRunner {
     }
 }
 
-/// One stream's log file: the path the spec named, plus the handle currently
-/// open on it — `None` when the open failed (see [`open_append`]).
+/// One stream's log file: the path the spec named, plus the buffered handle
+/// currently open on it — `None` when the open failed (see [`open_append`]).
+///
+/// Generic over the sink only so a test can count the writes that reach it —
+/// how OFTEN the buffer spills is the whole point of [`LOG_BUFFER`], and it
+/// is observable in neither the bytes on disk nor the wall clock. Production
+/// only ever builds the default.
 #[derive(Debug)]
-struct LogFile {
+struct LogFile<W = tokio::fs::File> {
     path: PathBuf,
-    handle: Option<tokio::fs::File>,
+    handle: Option<BufWriter<W>>,
+    /// When the oldest line the pump has not tried to flush yet was
+    /// appended; the pump reads it as an [`IDLE_FLUSH`] deadline.
+    ///
+    /// Cleared by every flush ATTEMPT, successful or not: a file that cannot
+    /// be written must not turn the idle flush into a twenty-per-second
+    /// retry loop, and the next appended line re-arms it either way.
+    buffered_since: Option<Instant>,
 }
 
-impl LogFile {
+impl LogFile<tokio::fs::File> {
     /// Opens `path` for appending, keeping the path for later reopens.
     ///
     /// A failed open is not fatal here — it is already logged, and the pump
@@ -901,61 +935,27 @@ impl LogFile {
     /// them anywhere. [`LogFile::reopen`] is the one that reports, because
     /// there a caller is waiting to hear.
     async fn open(path: PathBuf) -> Self {
-        let handle = open_append(&path).await.ok();
-        Self { path, handle }
-    }
-
-    /// Appends one line and its newline, logging (never propagating) a write
-    /// failure — a log we cannot write to must not stop the pump draining
-    /// the child's pipes.
-    async fn append(&mut self, line: &str) {
-        let Some(handle) = self.handle.as_mut() else {
-            return;
-        };
-        let mut buf = String::with_capacity(line.len() + 1);
-        buf.push_str(line);
-        buf.push('\n');
-        if let Err(error) = handle.write_all(buf.as_bytes()).await {
-            tracing::error!(path = ?self.path, %error, "log file append failed");
+        let handle = open_append(&path)
+            .await
+            .ok()
+            .map(|file| BufWriter::with_capacity(LOG_BUFFER, file));
+        Self {
+            path,
+            handle,
+            buffered_since: None,
         }
-    }
-
-    /// Waits for every write already handed to the blocking pool to reach
-    /// the file, keeping the handle open.
-    ///
-    /// The whole of [`LogCtl::Flush`], and the reason `shep flush` has two
-    /// halves: `write_all` returns once the real `write(2)` is queued, so
-    /// truncating the path without waiting here can empty the file a moment
-    /// before a line that was already in flight lands at offset 0 of it.
-    ///
-    /// A stream whose open failed has no handle and nothing queued, so it
-    /// has nothing to wait for and answers `Ok`.
-    ///
-    /// # Errors
-    ///
-    /// A write already dispatched failed — a full disk, an unlinked
-    /// filesystem, an IO error the queued `write(2)` hit. Unlike
-    /// [`Self::reopen`]'s own flush this is reported rather than logged:
-    /// there no caller depends on the result (the handle is being replaced
-    /// by a working one), while here the caller is about to truncate this
-    /// exact path and the un-landed bytes are what it is racing.
-    async fn flush(&mut self) -> Result<(), FlushError> {
-        let Some(handle) = self.handle.as_mut() else {
-            return Ok(());
-        };
-        handle.flush().await.map_err(|error| FlushError {
-            message: format!("{}: {error}", self.path.display()),
-        })
     }
 
     /// Flushes and closes the current handle, then opens the path again.
     ///
     /// Flushing first is what makes [`LogCtl::Reopen`]'s acknowledgement
-    /// worth having: `write_all` returning only means the write was queued
-    /// onto the blocking pool, while `flush` waits for the operation in
-    /// flight — so every line read before the reopen has reached the OLD
-    /// file (the renamed one, in the rotation this exists for) by the time
-    /// the caller hears back.
+    /// worth having: an [`Self::append`] only reaches the buffer and a write
+    /// through it only means the `write(2)` was queued, while `flush` empties
+    /// the buffer and waits for the operation in flight — so every line read
+    /// before the reopen has reached the OLD file (the renamed one, in the
+    /// rotation this exists for) by the time the caller hears back. The
+    /// buffer travels with the handle that is being dropped, so a reopen that
+    /// skipped it would DISCARD those lines rather than merely delay them.
     ///
     /// Reopening goes through [`open_append`] rather than opening the path
     /// here, so the new handle is an appending one exactly like the original
@@ -971,6 +971,7 @@ impl LogFile {
     /// error: it is logged, and the handle it belongs to is being replaced
     /// by a working one, so the sheep keeps logging.
     async fn reopen(&mut self) -> Result<(), ReopenError> {
+        self.buffered_since = None;
         if let Some(handle) = self.handle.as_mut()
             && let Err(error) = handle.flush().await
         {
@@ -981,13 +982,67 @@ impl LogFile {
         drop(self.handle.take());
         match open_append(&self.path).await {
             Ok(handle) => {
-                self.handle = Some(handle);
+                self.handle = Some(BufWriter::with_capacity(LOG_BUFFER, handle));
                 Ok(())
             }
             Err(error) => Err(ReopenError {
                 message: format!("{}: {error}", self.path.display()),
             }),
         }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> LogFile<W> {
+    /// Appends one line and its newline to the buffer, logging (never
+    /// propagating) a write failure — a log we cannot write to must not stop
+    /// the pump draining the child's pipes.
+    ///
+    /// The newline is a second write into that same buffer rather than a
+    /// joined copy of the line: the file sees one contiguous run of bytes
+    /// either way, so the copy bought nothing but an allocation per line.
+    async fn append(&mut self, line: &str) {
+        let Some(handle) = self.handle.as_mut() else {
+            return;
+        };
+        let written = async {
+            handle.write_all(line.as_bytes()).await?;
+            handle.write_all(b"\n").await
+        }
+        .await;
+        self.buffered_since.get_or_insert_with(Instant::now);
+        if let Err(error) = written {
+            tracing::error!(path = ?self.path, %error, "log file append failed");
+        }
+    }
+
+    /// Writes out whatever the buffer holds and waits for it to reach the
+    /// file, keeping the handle open.
+    ///
+    /// The whole of [`LogCtl::Flush`], and the reason `shep flush` has two
+    /// halves: an [`Self::append`] only reaches the buffer, and a write
+    /// through the buffer returns once the real `write(2)` is queued — so
+    /// truncating the path without waiting here can empty the file a moment
+    /// before lines it already accepted land at offset 0 of it.
+    ///
+    /// A stream whose open failed has no handle and nothing buffered, so it
+    /// has nothing to wait for and answers `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// A buffered or already-dispatched write failed — a full disk, an
+    /// unlinked filesystem, an IO error the queued `write(2)` hit. Unlike
+    /// [`Self::reopen`]'s own flush this is reported rather than logged:
+    /// there no caller depends on the result (the handle is being replaced
+    /// by a working one), while here the caller is about to truncate this
+    /// exact path and the un-landed bytes are what it is racing.
+    async fn flush(&mut self) -> Result<(), FlushError> {
+        self.buffered_since = None;
+        let Some(handle) = self.handle.as_mut() else {
+            return Ok(());
+        };
+        handle.flush().await.map_err(|error| FlushError {
+            message: format!("{}: {error}", self.path.display()),
+        })
     }
 }
 
@@ -1003,6 +1058,33 @@ impl LogFiles {
     /// The file a line from this stream is appended to (`err` picks stderr).
     fn stream(&mut self, err: bool) -> &mut LogFile {
         if err { &mut self.err } else { &mut self.out }
+    }
+
+    /// When the pump owes the older of the two buffers a flush, or `None`
+    /// when neither holds anything.
+    ///
+    /// Derived rather than stored, so an explicit [`LogCtl::Flush`] or
+    /// [`LogCtl::Reopen`] retires the deadline by the same act that empties
+    /// the buffer; nothing here can be left armed for a buffer that is
+    /// already on disk.
+    fn flush_deadline(&self) -> Option<Instant> {
+        let oldest = match (self.out.buffered_since, self.err.buffered_since) {
+            (Some(out), Some(err)) => out.min(err),
+            (Some(only), None) | (None, Some(only)) => only,
+            (None, None) => return None,
+        };
+        Some(oldest + IDLE_FLUSH)
+    }
+
+    /// Flushes both buffers, logging rather than reporting a failure — no
+    /// caller is waiting on an idle flush, and the pump must go on draining
+    /// the child's pipes whether or not its logs can be written.
+    async fn flush_idle(&mut self) {
+        for file in [&mut self.out, &mut self.err] {
+            if let Err(error) = file.flush().await {
+                tracing::error!(%error, "log file idle flush failed");
+            }
+        }
     }
 
     /// Carries out one control request and then answers it.
@@ -1112,9 +1194,16 @@ async fn deliver_line(
     }
 }
 
-/// Waits for room on `logs_tx`, serving control requests while it waits.
+/// Waits for room on `logs_tx`, serving control requests and idle flushes
+/// while it waits.
 ///
 /// Returns `None` once the `logs` receiver is gone.
+///
+/// The idle flush is here for the same reason the control branch is: a pump
+/// parked on a full `logs` channel is parked for as long as the sheep task
+/// takes, which is unbounded. Without a branch of its own the line just
+/// appended would sit in the buffer for exactly that long, and
+/// [`IDLE_FLUSH`] would bound nothing.
 ///
 /// # Why not a bare `send().await`
 ///
@@ -1133,9 +1222,14 @@ async fn reserve_slot<'tx>(
     ctl_rx: &mut mpsc::Receiver<LogCtl>,
 ) -> Option<mpsc::Permit<'tx, LogLine>> {
     loop {
-        // Both branches are documented cancel-safe, as `select!` requires: a
-        // `reserve` that loses the race has taken no slot, and a `recv` that
-        // loses it has taken no message.
+        // Recomputed every iteration from the STORED mark, so losing the
+        // race never extends the window (`snapshot::run_writer`'s debounce
+        // is the same shape).
+        let flush_at = files.flush_deadline();
+        // Every branch is documented cancel-safe, as `select!` requires: a
+        // `reserve` that loses the race has taken no slot, a `recv` that
+        // loses it has taken no message, and a `sleep_until` that loses it
+        // is rebuilt against the same absolute deadline.
         tokio::select! {
             slot = logs_tx.reserve() => return slot.ok(),
             ctl = ctl_rx.recv() => match ctl {
@@ -1147,6 +1241,9 @@ async fn reserve_slot<'tx>(
                 // loop then sees the same closed channel and ends.
                 None => return logs_tx.reserve().await.ok(),
             },
+            () = sleep_until(flush_at.unwrap_or_else(Instant::now)), if flush_at.is_some() => {
+                files.flush_idle().await;
+            }
         }
     }
 }
@@ -1218,12 +1315,14 @@ where
 ///
 /// # Ordering
 ///
-/// The file write is ISSUED before the line is forwarded, but
-/// `tokio::fs::File::write_all` returning means the write was queued onto
-/// the blocking pool, not that it reached the file. A receiver that observes
-/// a line on `logs_tx` therefore cannot conclude the file already holds it.
-/// The barrier that can be relied on is [`LogCtl::Reopen`]'s
-/// acknowledgement, which flushes before swapping handles.
+/// The file write is ISSUED before the line is forwarded, but it lands in a
+/// [`BufWriter`] rather than in the file, and a write through that buffer
+/// only means the real `write(2)` was queued onto the blocking pool. A
+/// receiver that observes a line on `logs_tx` therefore cannot conclude the
+/// file already holds it. The barriers that can be relied on are
+/// [`LogCtl::Reopen`]'s and [`LogCtl::Flush`]'s acknowledgements, which both
+/// drain the buffer and wait; absent either, [`IDLE_FLUSH`] bounds how long
+/// a line stays buffered.
 ///
 /// # When a pump ends
 ///
@@ -1257,6 +1356,10 @@ fn spawn_log_pump<O, E>(
         let mut err_lines = stderr.map(|reader| BufReader::new(reader).lines());
 
         while out_lines.is_some() || err_lines.is_some() {
+            // Recomputed every iteration from the STORED mark; see
+            // `reserve_slot`, which carries the same branch for the window
+            // this loop cannot see.
+            let flush_at = files.flush_deadline();
             tokio::select! {
                 result = next_line(&mut out_lines) => {
                     match deliver_line(result, false, &mut files, &logs_tx, &mut ctl_rx).await {
@@ -1290,8 +1393,19 @@ fn spawn_log_pump<O, E>(
                 // closed channel stays closed, so losing the race loses
                 // nothing.
                 () = logs_tx.closed() => break,
+
+                // Cancel-safe: rebuilt against the same absolute deadline
+                // every iteration, so losing the race costs nothing.
+                () = sleep_until(flush_at.unwrap_or_else(Instant::now)), if flush_at.is_some() => {
+                    files.flush_idle().await;
+                }
             }
         }
+        // A `BufWriter` cannot flush itself as it drops, and every way out of
+        // the loop above drops both of them: without this, whatever a child
+        // wrote since the last flush would be lost at its exit — the lines an
+        // operator reaches for first.
+        files.flush_idle().await;
     });
 }
 
@@ -1521,10 +1635,14 @@ fn spawn_channel_pumps<S>(
 
 #[cfg(test)]
 mod tests {
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll};
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::io::DuplexStream;
@@ -1669,9 +1787,10 @@ mod tests {
 
     /// Waits for `path` to hold exactly `expected`.
     ///
-    /// A line observed on `logs` has had its file write ISSUED, not
-    /// necessarily completed (see [`spawn_log_pump`]'s ordering note), so
-    /// this polls for the write to land instead of asserting it already has.
+    /// A line observed on `logs` has reached the stream's BUFFER, not
+    /// necessarily the file (see [`spawn_log_pump`]'s ordering note), so this
+    /// polls for [`IDLE_FLUSH`] to write it through instead of asserting it
+    /// already has.
     /// The barrier that would make polling unnecessary — a reopen
     /// acknowledgement — is not usable where the point is what the CURRENT
     /// handle does, since a reopen replaces it.
@@ -1687,6 +1806,211 @@ mod tests {
             "{}: expected {expected:?}, found {:?}",
             path.display(),
             fs::read_to_string(path)
+        );
+    }
+
+    /// A sink standing in for the [`tokio::fs::File`] a real [`LogFile`]
+    /// holds, counting the writes that reach it.
+    ///
+    /// The count is the only place the buffering is visible. Bytes on disk
+    /// come out the same either way, and the timing difference is exactly
+    /// what a contended runner cannot be asked about — so a counter is what
+    /// pins [`LOG_BUFFER`] against a future append that writes straight
+    /// through.
+    #[derive(Clone, Debug, Default)]
+    struct WriteCounter {
+        writes: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+    }
+
+    impl WriteCounter {
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::Relaxed)
+        }
+
+        fn bytes(&self) -> usize {
+            self.bytes.load(Ordering::Relaxed)
+        }
+    }
+
+    impl AsyncWrite for WriteCounter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(buf.len(), Ordering::Relaxed);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Fails if an appended line still costs one write to the file.
+    ///
+    /// That write is the whole cost this change exists to remove:
+    /// `tokio::fs::File` hands each one to the blocking pool, measured at
+    /// 32.8 us of daemon CPU per line against 0.99 us for the `write(2)`
+    /// underneath it. A buffer turns N of them into one per bufferful, and
+    /// the count is the only observable that says so.
+    ///
+    /// Paused clock (IR-33), and that is load-bearing rather than
+    /// conventional: no time passes, so [`IDLE_FLUSH`] never fires and every
+    /// write counted below is the buffer spilling or the explicit flush at
+    /// the end. Nothing here can be made flaky by a contended runner.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_of_lines_costs_one_write_per_bufferful_not_one_per_line() {
+        // 69 characters, so `append`'s newline makes the 70-byte line the
+        // measurement behind `LOG_BUFFER` used.
+        const LINE: &str = "012345678901234567890123456789012345678901234567890123456789012345678";
+        const LINE_BYTES: usize = LINE.len() + 1;
+        let lines = 3 * LOG_BUFFER / LINE_BYTES;
+
+        let sink = WriteCounter::default();
+        let mut log = LogFile {
+            path: PathBuf::from("counted.log"),
+            handle: Some(BufWriter::with_capacity(LOG_BUFFER, sink.clone())),
+            buffered_since: None,
+        };
+        for _ in 0..lines {
+            log.append(LINE).await;
+        }
+        log.flush().await.unwrap();
+
+        let total = lines * LINE_BYTES;
+        let ceiling = total.div_ceil(LOG_BUFFER) + 1; // + the closing flush's partial buffer
+        assert_eq!(
+            sink.bytes(),
+            total,
+            "buffering must not lose or repeat a byte"
+        );
+        assert!(
+            sink.writes() <= ceiling,
+            "{lines} lines cost {} writes; one per bufferful plus the closing flush is {ceiling}",
+            sink.writes()
+        );
+        assert!(
+            sink.writes() < lines,
+            "a write per line is the regression this exists to catch: \
+             {lines} lines, {} writes",
+            sink.writes()
+        );
+    }
+
+    /// Fails if a line only reaches the file when the buffer fills or when
+    /// something asks — that is, if the pump has no idle flush at all.
+    ///
+    /// A sheep that logs once and goes quiet is the whole case: nothing here
+    /// sends a `Flush`, nothing reopens, and no second line arrives to push
+    /// the first one out. `assert_file_settles` is the entire assertion, and
+    /// its own deadline is what fails if nothing ever writes the line
+    /// through. Real clock like every other case in this module (IR-33): the
+    /// wait is on file I/O the blocking pool has to actually do. The window's
+    /// arithmetic is pinned on the paused clock instead, by
+    /// [`the_idle_flush_window_is_measured_from_the_oldest_buffered_line`].
+    #[tokio::test]
+    async fn a_line_from_a_sheep_that_then_goes_quiet_still_reaches_its_file() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "the-only-line").await;
+        assert_file_settles(&pump.out_path, "the-only-line\n").await;
+    }
+
+    /// Fails if the idle-flush window is measured from the NEWEST buffered
+    /// line rather than the oldest: a stream logging just inside the window
+    /// would then keep pushing the deadline out, and "buffered but not on
+    /// disk" would have no bound at all.
+    ///
+    /// Paused clock (IR-33): the question is arithmetic over `Instant`s, and
+    /// an append that fits in the buffer touches no file to wait on.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_flush_window_is_measured_from_the_oldest_buffered_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = LogFiles {
+            out: LogFile::open(dir.path().join("out.log")).await,
+            err: LogFile::open(dir.path().join("err.log")).await,
+        };
+        assert_eq!(
+            files.flush_deadline(),
+            None,
+            "an untouched pair owes no flush"
+        );
+
+        let oldest = Instant::now();
+        files.stream(false).append("out-first").await;
+        assert_eq!(files.flush_deadline(), Some(oldest + IDLE_FLUSH));
+
+        // Both streams, so the deadline is answering for the pair rather
+        // than for whichever one happened to be written last.
+        tokio::time::advance(IDLE_FLUSH / 2).await;
+        files.stream(false).append("out-second").await;
+        files.stream(true).append("err-first").await;
+        assert_eq!(
+            files.flush_deadline(),
+            Some(oldest + IDLE_FLUSH),
+            "a later line must not push the window out"
+        );
+
+        files.flush_idle().await;
+        assert_eq!(
+            files.flush_deadline(),
+            None,
+            "a flush must retire the deadline it satisfied"
+        );
+    }
+
+    /// Fails if a rotation loses or duplicates what the buffers were
+    /// holding.
+    ///
+    /// Every line below fits in [`LOG_BUFFER`], so at the rename the file may
+    /// hold none of them: a reopen that dropped its handle without flushing
+    /// would lose the lot, and one that flushed after swapping handles would
+    /// write them into the FRESH file — an operator reading the archive finds
+    /// a gap, and reading the live log finds lines from before the rotation.
+    /// Exact equality on both paths is what tells those two apart from a
+    /// reopen that got it right.
+    #[tokio::test]
+    async fn a_rotation_lands_every_buffered_line_exactly_once() {
+        let mut pump = PumpHarness::start();
+        let mut before = String::new();
+        for n in 0..40 {
+            let line = format!("before-{n}");
+            pump.feed(false, &line).await;
+            before.push_str(&line);
+            before.push('\n');
+        }
+        assert!(
+            before.len() < LOG_BUFFER,
+            "the case needs lines small enough that the buffer may still hold them"
+        );
+
+        let rotated = pump.dir.path().join("out.log.1");
+        fs::rename(&pump.out_path, &rotated).unwrap();
+        pump.reopen().await;
+
+        assert_eq!(fs::read_to_string(&rotated).unwrap(), before);
+        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), "");
+
+        let mut after = String::new();
+        for n in 0..40 {
+            let line = format!("after-{n}");
+            pump.feed(false, &line).await;
+            after.push_str(&line);
+            after.push('\n');
+        }
+        pump.flush().await;
+
+        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), after);
+        assert_eq!(
+            fs::read_to_string(&rotated).unwrap(),
+            before,
+            "the archive must have stopped growing at the swap"
         );
     }
 
@@ -2069,14 +2393,15 @@ mod tests {
     /// Fails if [`LogFile::flush`] stops asking the file anything — an early
     /// `return Ok(())`, or a `map_err` traded for `.ok()`.
     ///
-    /// A `tokio::fs::File` reports a failed write on the NEXT operation
-    /// rather than the one that failed: `write_all` returns as soon as the
-    /// real `write(2)` is queued on the blocking pool, so that write's error
-    /// is owed to whoever asks next. `flush` is who asks. This is the whole
-    /// reason the flush half of `shep flush` reports where
-    /// [`LogFile::reopen`]'s own flush logs — and a flush that answered
-    /// without asking would swallow the only signal there is that a sheep's
-    /// log went unwritten.
+    /// An append reaches the buffer and nothing else, and even once the
+    /// buffer is written through, a `tokio::fs::File` reports a failed write
+    /// on the NEXT operation rather than the one that failed: `write_all`
+    /// returns as soon as the real `write(2)` is queued on the blocking pool,
+    /// so that write's error is owed to whoever asks next. `flush` is who
+    /// asks, for both layers. This is the whole reason the flush half of
+    /// `shep flush` reports where [`LogFile::reopen`]'s own flush logs — and
+    /// a flush that answered without asking would swallow the only signal
+    /// there is that a sheep's log went unwritten.
     ///
     /// Driven against a [`LogFile`] rather than through [`PumpHarness`]
     /// because the pump opens its own handles: a read-only one is the
@@ -2090,7 +2415,11 @@ mod tests {
         fs::write(&path, "").unwrap();
         let mut log = LogFile {
             path: path.clone(),
-            handle: Some(tokio::fs::File::open(&path).await.unwrap()),
+            handle: Some(BufWriter::with_capacity(
+                LOG_BUFFER,
+                tokio::fs::File::open(&path).await.unwrap(),
+            )),
+            buffered_since: None,
         };
 
         // Swallowed by design — the pump must keep draining a child whose

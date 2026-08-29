@@ -130,12 +130,12 @@ pub enum LogCtl {
         /// moment apart, and neither is a reopen that failed.
         done: oneshot::Sender<Result<(), ReopenError>>,
     },
-    /// Wait for every write already handed to the blocking pool to reach the
-    /// file, keeping the handle, then acknowledge. Sent as the first half of
+    /// Write out whatever the pump has buffered, wait for it to reach the
+    /// file, keep the handle, then acknowledge. Sent as the first half of
     /// `shep flush`, immediately before the recorded paths are truncated.
     Flush {
-        /// Fires once both handles have no write left in flight, carrying
-        /// what came of it.
+        /// Fires once both handles have nothing buffered and no write left
+        /// in flight, carrying what came of it.
         ///
         /// The acknowledgement is the barrier the truncate that follows is
         /// ordered against: `write_all` on a [`tokio::fs::File`] returns as
