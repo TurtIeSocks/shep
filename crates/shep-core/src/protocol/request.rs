@@ -2262,6 +2262,19 @@ mod tests {
                     ),
                 ])),
             },
+            // `sample_info()` pins `instance`'s absent shape (`None`, an old
+            // peer or a single-instance app); every row above reuses it, so
+            // without this row the present shape (`Some(2)`, a live slot on
+            // a scaled app) is never on the wire at all.
+            Reply {
+                id: 27,
+                result: Ok(Response::Flock(vec![
+                    ProcessInfo::builder(9, "web", ProcStatus::Online)
+                        .pid(Some(5150))
+                        .instance(Some(2))
+                        .build(),
+                ])),
+            },
         ];
         insta::assert_json_snapshot!("reply_wire_v2", replies);
     }

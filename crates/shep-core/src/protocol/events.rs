@@ -220,6 +220,18 @@ mod tests {
                 line: "listening on :8080".to_string(),
             },
             BusEvent::Dropped { count: 17 },
+            // The row above pins `instance`'s absent shape; every lifecycle
+            // row below reuses it via `sample`. This is the only place the
+            // present shape (a live slot on a scaled app) is on the wire.
+            BusEvent::Process {
+                event: ProcessEventKind::Online,
+                info: ProcessInfo::builder(4, "web", ProcStatus::Online)
+                    .pid(Some(5150))
+                    .instance(Some(2))
+                    .build(),
+                manually: false,
+                at_ms: 1_700_000_000_000,
+            },
         ];
 
         // The lifecycle kinds exercised here (the reload trio has its own

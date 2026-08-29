@@ -471,5 +471,33 @@ expression: replies
         ]
       }
     }
+  },
+  {
+    "id": 27,
+    "result": {
+      "Ok": {
+        "kind": "flock",
+        "data": [
+          {
+            "id": 9,
+            "name": "web",
+            "status": "online",
+            "pid": 5150,
+            "restarts": 0,
+            "uptime_ms": 0,
+            "fold": null,
+            "out_file": null,
+            "err_file": null,
+            "cpu_percent": null,
+            "memory_bytes": null,
+            "dog": null,
+            "lambs": null,
+            "last_exit": null,
+            "smit": null,
+            "instance": 2
+          }
+        ]
+      }
+    }
   }
 ]
