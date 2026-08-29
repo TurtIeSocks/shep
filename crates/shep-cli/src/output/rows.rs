@@ -49,32 +49,22 @@ impl Render for FlockRows {
         ]
     }
 
+    /// D4's suffix half: `Format::Table` under `Bare` reaches this method
+    /// directly (`table::render_table`), never [`Self::rows_for`] --
+    /// [`crate::style::StyleLevel::boxes`] is false at `Bare`, so `table_of`
+    /// (`output/mod.rs`) takes the plain path instead of asking `rows_for`
+    /// for anything. So the `web:0`/`web:1` suffix a multi-instance app
+    /// earns at `Bare` has to live here, in [`plain_row`], rather than only
+    /// in `rows_for`'s own grouped branch -- the same rule either way
+    /// (`slotted`: more than one instance, every one of them reporting its
+    /// slot), applied per [`name_groups`] run. `Format::Json` is unaffected:
+    /// the `Serialize` derive on `Self` walks `self.0` directly and never
+    /// calls this method.
     fn rows(&self) -> Vec<Vec<String>> {
-        self.0
-            .iter()
-            .map(|p| {
-                vec![
-                    p.id.to_string(),
-                    p.name.clone(),
-                    p.status.to_string(),
-                    // `-` rather than an empty cell: an empty cell in a
-                    // padded table is indistinguishable from a rendering bug.
-                    p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
-                    p.restarts.to_string(),
-                    exit_cell(p.pid, p.last_exit),
-                    // `-` for the same reason, and for the same stated
-                    // reason PID uses it: a sheep that is not running, or
-                    // has been up for less than one sampling window, has no
-                    // honest number to report, and `0.0%` would claim the
-                    // daemon never made — "this sheep is using no CPU".
-                    p.cpu_percent
-                        .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
-                    p.memory_bytes
-                        .map_or_else(|| "-".to_string(), super::human_bytes),
-                    super::human_duration(p.uptime_ms),
-                    p.fold.clone().unwrap_or_else(|| "-".to_string()),
-                    p.smit.clone().unwrap_or_else(|| "-".to_owned()),
-                ]
+        name_groups(&self.0)
+            .flat_map(|group| {
+                let slotted = group.len() > 1 && group.iter().all(|p| p.instance.is_some());
+                group.iter().map(move |p| plain_row(p, slotted))
             })
             .collect()
     }
@@ -106,17 +96,18 @@ impl Render for FlockRows {
     /// call sites construct for a question only this one method ever asks.
     ///
     /// D4: an app running several instances groups under one header row when
-    /// the table is boxed, so its slots read as one app rather than as
-    /// several identical rows sharing a name -- the listing arrives sorted
-    /// by (name, instance, id) (`sort_flock`), so an app's instances are
-    /// already adjacent and one pass can group them. A flat style (`bare`)
-    /// suffixes the name instead (`web:0`, `web:1`), so a single line still
-    /// answers "which instance" for a reader who greps rather than looks. A
-    /// single instance, or a listing from a daemon that predates `instance`
-    /// (every row's `instance` is `None`), renders exactly as it did before
-    /// this feature -- see [`plain_row`]'s own doc. `Self::rows` still
-    /// serves `Format::Json` unmodified: JSON stays one object per process,
-    /// with `instance` riding along, rather than growing a nested shape.
+    /// the table is boxed (`Full` and `Plain` both -- [`crate::style::StyleLevel::boxes`]
+    /// treats them as one tier, so grouping does too), so its slots read as
+    /// one app rather than as several identical rows sharing a name -- the
+    /// listing arrives sorted by (name, instance, id) (`sort_flock`), so an
+    /// app's instances are already adjacent and one pass can group them.
+    /// `Bare` never reaches this method at all ([`crate::style::StyleLevel::boxes`] is
+    /// false, so `table_of` in `output/mod.rs` takes [`Self::rows`]'s own
+    /// plain path instead) -- that is where the `web:0`/`web:1` suffix this
+    /// same `slotted` rule produces actually lives; see [`Self::rows`]'s own
+    /// doc. A single instance, or a listing from a daemon that predates
+    /// `instance` (every row's `instance` is `None`), renders exactly as it
+    /// did before this feature either way -- see [`plain_row`]'s own doc.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
         /// What painted one output row, so [`paint`] can key its rule off
         /// the right source: a real sheep for a slot or a plain row, or the
@@ -130,14 +121,7 @@ impl Render for FlockRows {
 
         let mut out = Vec::with_capacity(self.0.len());
         let mut sources: Vec<RowSource<'_>> = Vec::with_capacity(self.0.len());
-        let mut at = 0;
-        while at < self.0.len() {
-            let name = self.0[at].name.as_str();
-            let end = self.0[at..]
-                .iter()
-                .position(|p| p.name != name)
-                .map_or(self.0.len(), |offset| at + offset);
-            let group = &self.0[at..end];
+        for group in name_groups(&self.0) {
             // A slot nobody reported cannot be grouped or suffixed: an
             // older shepherd's listing renders exactly as it did before the
             // field.
@@ -156,7 +140,6 @@ impl Render for FlockRows {
                     sources.push(RowSource::Sheep(p));
                 }
             }
-            at = end;
         }
 
         paint(
@@ -244,6 +227,31 @@ impl Render for FlockRows {
     // The maintainer's ruling is that it belongs among the first columns to yield, and
     // 8 is the literal reading of that.
     const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
+}
+
+/// Splits a listing into runs of one app's adjacent rows, keyed on NAME.
+///
+/// The listing arrives sorted by (name, instance, id) (`sort_flock`), so an
+/// app's instances are already adjacent and a single left-to-right pass finds
+/// every run's bounds. Shared by [`FlockRows::rows`] and
+/// [`FlockRows::rows_for`] so the two never derive a group's bounds
+/// differently -- the `slotted` rule each applies to a run still lives with
+/// its own caller, since `rows` and `rows_for` do different things with it.
+fn name_groups(items: &[ProcessInfo]) -> impl Iterator<Item = &[ProcessInfo]> {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        if at >= items.len() {
+            return None;
+        }
+        let name = items[at].name.as_str();
+        let end = items[at..]
+            .iter()
+            .position(|p| p.name != name)
+            .map_or(items.len(), |offset| at + offset);
+        let group = &items[at..end];
+        at = end;
+        Some(group)
+    })
 }
 
 /// An app's summed CPU/MEM/RESTARTS and its earliest UPTIME, computed once
@@ -3261,6 +3269,29 @@ pub(crate) mod tests {
         assert_eq!(rendered.len(), 2, "one line per process, still greppable");
         assert_eq!(rendered[0][1], "web:0");
         assert_eq!(rendered[1][1], "web:1");
+    }
+
+    /// Fix round 1: the same suffix, but through the path `Bare` actually
+    /// takes. `table_of` (`output/mod.rs`) only calls `rows_for` when
+    /// `StyleLevel::boxes` is true, so `Bare` never reaches it -- it prints
+    /// through `render_table`, which calls `Self::rows` directly.
+    /// Asserting on `rows_for` alone (as the test above does) is exactly
+    /// what let that gap through the first time; this one goes through the
+    /// real `Bare` code path instead.
+    #[test]
+    fn the_bare_path_reaches_the_suffix_through_rows_not_rows_for() {
+        let rows = FlockRows(
+            (0..2)
+                .map(|slot| {
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = crate::output::render_table(&rows);
+        assert!(rendered.contains("web:0"), "{rendered}");
+        assert!(rendered.contains("web:1"), "{rendered}");
     }
 
     #[test]
