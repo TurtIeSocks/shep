@@ -408,5 +408,25 @@ What that means for anyone editing this workspace:
   `cargo check`, which executes nothing. `.github/workflows/test.yml`'s
   `windows-latest` legs are what actually run this tier. Read the CI result.
 
+The instances redesign merged too: `increment_var` is removed, and refused
+with the replacement named rather than a bare serde error. Env values, args,
+`out_file` and `err_file` can now carry `{{instance}}` and `{{name}}`
+templates (doubled braces escape a literal brace), `SHEP_INSTANCE` and
+`SHEP_NAME` are always injected and can no longer be set by hand in
+`[app.env]`, and an explicit `out_file`/`err_file` on a multi-instance app is
+refused unless it carries `{{instance}}` or the app sets `merge_logs`. A
+sheep name can no longer contain a colon, since `name:slot` (for example
+`web:2`) is now a selector that reaches one instance of a multi-instance
+app; `ProcessInfo.instance` carries the slot on the wire, additive, so
+`PROTOCOL_VERSION` and the output envelope's `SCHEMA_VERSION` both moved
+from 1 to 2. `shep flock` groups a multi-instance app under one rollup row
+(`web ×3`, with `↳ :0` marker rows beneath it) in `full` and `plain` style;
+`bare` and JSON still print one row per instance, with `bare` suffixing the
+name and JSON carrying the slot as its own field. `shep lookout`'s flock
+table gained the same group row, selectable like any other, and an action
+on it reaches every instance behind a confirm naming the count. `shep
+bleats` now reads a log file shared by several instances once instead of
+once per instance, and labels a multi-instance app's lines with their slot.
+
 Project memory (cross-session state) tracks decisions; docs above are the
 source of truth.

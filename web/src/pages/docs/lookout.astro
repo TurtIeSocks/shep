@@ -204,6 +204,30 @@ restart api (id 2): the shepherd restarted it                                   
     </p>
     <CodeBlock label="120×30">{healthy}</CodeBlock>
 
+    <h2>Multi-instance apps</h2>
+    <p>
+      An app with more than one instance gets a group row above its slots,
+      the same rollup <code>shep flock</code> shows: <code>web
+      &times;3</code> in NAME, STATUS as the shared word or a count per state
+      when the instances disagree, RESTARTS/CPU/MEM summed and UPTIME the
+      minimum across them. The group row is selectable with <code>j</code>/
+      <code>k</code> like any other row, and the cursor survives the
+      two-second poll on either kind of row.
+    </p>
+    <p>
+      An action key on a selected group row is the one place in lookout a
+      single keypress reaches more than one process, so the confirm states
+      how many it's about to touch:
+    </p>
+    <CodeBlock>{`stop all 3 instances of web? enter confirms, any other key cancels`}</CodeBlock>
+    <p>
+      <code>Enter</code> sends the action against the whole app by name, not
+      against one pinned id, and the detail pane on a group row shows the
+      app-level summary rather than a single process's fields. The bleats
+      feed can't follow a group, since there's no single log to re-read for
+      it: it names the app and asks you to select one instance instead.
+    </p>
+
     <h2>The three panes underneath</h2>
     <p>
       The host strip is the line above the table: load average, host memory,

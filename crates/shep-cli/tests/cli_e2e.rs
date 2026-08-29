@@ -4916,7 +4916,7 @@ fn the_kv_store_works_with_no_shepherd_running() {
 /// `shep --format json get` on the same shape of store `shep get` renders
 /// as a table above: the envelope's `data` is an array of `{key, value}`
 /// objects (never a JSON map — `KvRows`' own doc gives the reason), and
-/// `schema_version` is `1` — pinned as a literal rather than imported from
+/// `schema_version` is `2` — pinned as a literal rather than imported from
 /// `output::SCHEMA_VERSION`, since `shep-cli` is `[[bin]]`-only and this
 /// file, an external test binary, has no lib target to import it from. Same
 /// envelope shape every other verb in this binary produces. A key that is
