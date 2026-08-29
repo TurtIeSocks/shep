@@ -125,8 +125,8 @@ output and was noticed without being acted on: a just-started daemon
 reporting `uptime 2m 59s`. **Kill every stray `shep` before testing a change
 to the launch path**, or the thing under test is not the thing running.
 
-Verified after a clean kill, twice: with no sheep at all, and with a live
-one. Both completed with exit 0 and the payload arrived through the pipe.
+Verified after a clean kill, twice: with an empty flock, and with a live
+sheep. Both completed with exit 0 and the payload arrived through the pipe.
 
 ### Automatic CI, and what it would cost to turn on
 
@@ -325,9 +325,18 @@ Silencing them would mean `#[allow(dead_code)]` on live code.
 
 **Now closed the other way too, 2026-08-25.** Being in `CLAUDE.md` only ever
 meant a human had to remember to run it, which is exactly the failure mode
-that let it lapse for three phases the first time. The `windows-gnu` job in
-`.github/workflows/test.yml` runs the identical command on every push and
-pull request, cross-compiling from `ubuntu-latest` with `apt-get`'s
+that let it lapse for three phases the first time.
+
+**One correction to the above, made 2026-08-29 while archiving this entry.**
+It said the job runs "on every push and pull request". It does not: it gates
+on `needs.changes.outputs.rust == 'true'`, so a docs-only change skips it.
+That is the right behaviour and it is still a workflow rather than a human
+remembering, which is the point the entry was making. The claim was just
+wider than the truth.
+
+The `windows-gnu` job in
+`.github/workflows/test.yml` runs the identical command, cross-compiling
+from `ubuntu-latest` with `apt-get`'s
 `mingw-w64` rather than a native Windows runner: `ring`'s build script needs
 a real GNU `cc` regardless of host OS, and a cross-compiled Windows binary
 cannot be executed on the Linux host either way, so `check` on Linux costs
@@ -352,12 +361,12 @@ hostile log line through this function — only a truncation marker that can go
 missing.
 
 Not fixed in Phase 12b, deliberately: 12a already carried this limitation for
-sheep names, and 12b is the first phase to feed the same function arbitrary
+the names in the flock table, and 12b is the first phase to feed the same function arbitrary
 log bytes rather than operator-chosen names, which is what makes it worth
 recording rather than what makes it new. Fixing it means measuring display
 width (`unicode-width` or equivalent) instead of `char` count — a new
 dependency this phase's review declined to add for a cosmetic gap. What would
-force it: an operator running `shep lookout` against sheep with CJK names or
+force it: an operator running `shep lookout` against a flock with CJK names or
 logs, where a missing `…` is confusing rather than theoretical.
 
 **Fixed 2026-08-26, and the dependency argument had expired.** `unicode-width`
