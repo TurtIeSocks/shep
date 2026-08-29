@@ -122,6 +122,9 @@ jobs:
             # cares when it changes.
             bench:
               - 'benches/**'
+            # Feeds both the `packaging` job (Chocolatey) and the `formula`
+            # job (Homebrew). Neither compiles Rust, so neither belongs on the
+            # `rust` filter.
             packaging:
               - 'packaging/**'
               - '.github/workflows/test.yml'
@@ -163,6 +166,27 @@ jobs:
             [xml](Get-Content $_.FullName -Raw) | Out-Null
             Write-Host "ok $($_.FullName)"
           }
+  # `brew style` on the Homebrew formula, which is rubocop with Homebrew's own
+  # cops. Same argument as the `packaging` job above: nothing else parses this
+  # file, and the only other thing that reads it is the release-time push to
+  # the tap.
+  #
+  # The formula is copied to a `Formula/` directory first, which is not
+  # ceremony. Homebrew's rubocop config keys several cops off the path, so
+  # linting `packaging/homebrew/shep.rb` in place reports a
+  # `Style/FrozenStringLiteralComment` offense that no formula in a real tap
+  # has or wants.
+  formula:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.packaging == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p tap/Formula
+          cp packaging/homebrew/shep.rb tap/Formula/shep.rb
+          brew style "$PWD/tap/Formula/shep.rb"
   lint:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}

@@ -53,16 +53,16 @@ repository is `cargo check` only, cross-compiled from ubuntu, and has never
 executed a shep binary anywhere. msvc is the target `test.yml`'s
 windows-latest legs run `cargo test` against.
 
-Two smaller things worth doing in the same change:
+The license files are already handled and this document previously said
+otherwise. Each published crate directory carries `LICENSE-MIT` and
+`LICENSE-APACHE` as symlinks to the two at the repository root, added
+2026-08-19 in `1c2fe2f`, and cargo dereferences them into the tarball.
+Verified by unpacking `shep-0.1.12.crate`: both are there. The `.deb` can
+take them from the crate directory like everything else.
 
-- Copy `LICENSE-MIT` and `LICENSE-APACHE` into the published crate
-  directories. They sit at the repository root, so cargo's crates.io
-  tarballs exclude them today. The archive step needs them, the `.deb`
-  needs them in `usr/share/doc/shep/`, and anyone installing from
-  crates.io is currently getting neither.
-- Add `actions/attest-build-provenance`. Sigstore keyless, no key to
-  store, no rotation, and both Homebrew and Chocolatey care about
-  checksums anyway.
+Also in the same change: `actions/attest-build-provenance`. Sigstore
+keyless, no key to store, no rotation, and both Homebrew and Chocolatey
+care about checksums anyway.
 
 Expect these builds to be slower than CI's. `[profile.release]` in the
 workspace manifest sets `lto = "thin"` and `codegen-units = 1`, which is
@@ -122,6 +122,24 @@ command-line applications.
 So: `TurtIeSocks/homebrew-shep`, giving `brew install turtiesocks/shep/shep`,
 with `Formula/shep.rb`.
 
+The formula is written and lives at `packaging/homebrew/shep.rb`, which is
+its source of truth. `release-artifacts.yml`'s `homebrew` job rewrites the
+two version lines and pushes the result to the tap on each release, and
+`test.yml`'s `formula` job runs `brew style` over it. Three things are still
+needed, all of them outside this repository: create the tap repository, put
+the current formula in it as `Formula/shep.rb`, and give this repository a
+`HOMEBREW_TAP_TOKEN` secret holding a token with contents write on the tap.
+Then set the repository variable `PUBLISH_HOMEBREW` to `true`.
+
+The formula pulls the crate tarball from `static.crates.io` rather than a
+GitHub tag archive. crates.io publishes each version's sha256 as its
+`checksum`, so the bump job reads the hash from the API instead of
+downloading anything, and the crate tarball is immutable by contract where a
+GitHub archive is generated on the fly. The bump job polls that API rather
+than reading it once: release-plz creates the GitHub release and uploads to
+crates.io in the same run with no ordering between them, so the version can
+lag the event that starts the job by a few seconds.
+
 **Start with a build-from-source formula** even though the artifacts exist
 by then. Bumping one is a single sha256 recomputation, which
 `dawidd6/action-homebrew-bump-formula` handles cleanly. A binary formula
@@ -134,13 +152,18 @@ seconds.
 
 Formula details that are easy to get wrong:
 
-- `license any_of: ["MIT", "Apache-2.0"]` for `MIT OR Apache-2.0`.
-- No `--bin` flag. `std_cargo_args` installs all three `[[bin]]` targets.
+- `license any_of: ["Apache-2.0", "MIT"]` for `MIT OR Apache-2.0`.
+- No `--bin` flag. `std_cargo_args` installs all three `[[bin]]` targets,
+  and supplies `--locked`, which works because the crate tarball carries
+  `Cargo.lock`.
 - `generate_completions_from_executable(bin/"shep", "completions")`. shep's
-  form is `shep completions <shell>`, which is the default shape, so no
-  `shell_parameter_format` override.
-- A `test do` block can assert on `shep --version`. The clap command sets
-  `name = "shep"` and `version`, so it renders `shep 0.1.12`.
+  form is `shep completions <shell>`, which is the helper's default shape,
+  so no `shell_parameter_format` override. shep writes that verb's status
+  line to stderr, so the generated scripts stay clean.
+- `brew style` has to see the file at a `Formula/` path. Linting it in
+  place reports a `Style/FrozenStringLiteralComment` offence that no
+  formula in a real tap has, because Homebrew's rubocop config keys several
+  cops off the path. The CI job copies before it lints.
 
 **No `service do` block.** shep installs its own launchd plist through
 `shep startup`, and `brew services` would install a competing one for the
@@ -243,17 +266,17 @@ of this and is the text to reuse.
 
 0. Merge the Windows tier. Done, PR #16.
 1. `release-artifacts.yml`. Done.
-2. Copy the license files into the published crate directories. Still open.
-3. README and `web/` install docs. One pass, appended to as channels land.
-4. Homebrew tap, source formula.
-5. `.deb` on the release, as two more legs of the same matrix.
-6. Scoop bucket.
-7. WinGet.
-8. Chocolatey. Package written, in `packaging/chocolatey/`. Blocked on
+2. README and `web/` install docs. One pass, appended to as channels land.
+3. Homebrew tap, source formula. Formula written, in
+   `packaging/homebrew/`. Blocked on creating the tap repository.
+4. `.deb` on the release, as two more legs of the same matrix.
+5. Scoop bucket.
+6. WinGet.
+7. Chocolatey. Package written, in `packaging/chocolatey/`. Blocked on
    artwork and then on moderation.
 
-Steps 1 and 4 do not depend on each other: a source formula pulls the
-crates.io tarball. Everything from 6 on needs the Windows artifact leg.
+Steps 1 and 3 do not depend on each other: a source formula pulls the
+crates.io tarball. Everything from 5 on needs the Windows artifact leg.
 
 Roughly three to four days of engineering across all of it. The dominant
 cost is not engineering, it is Chocolatey's calendar time, which is the

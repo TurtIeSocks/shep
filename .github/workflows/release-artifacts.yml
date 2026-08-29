@@ -305,3 +305,94 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'choco pack failed' }
           choco push "packaging/chocolatey/shep.$version.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY
           if ($LASTEXITCODE -ne 0) { throw 'choco push failed' }
+
+  # Bumps the formula in the tap at TurtIeSocks/homebrew-shep, whose source of
+  # truth is `packaging/homebrew/shep.rb` in this repository.
+  #
+  # `needs: resolve` and not `upload`: the formula builds from the crate
+  # tarball, so it depends on crates.io rather than on this workflow's own
+  # archives. That also means it can bump while the matrix is still running.
+  #
+  # Inert until the repository variable `PUBLISH_HOMEBREW` is `true` and a
+  # `HOMEBREW_TAP_TOKEN` secret exists, holding a token with contents write on
+  # the tap repository. The default GITHUB_TOKEN cannot reach another
+  # repository.
+  homebrew:
+    name: Homebrew tap
+    needs: resolve
+    if: >-
+      needs.resolve.outputs.go == 'true' &&
+      github.event_name == 'release' &&
+      vars.PUBLISH_HOMEBREW == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+      - name: Rewrite the formula for this version
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#shep-v}"
+
+          # crates.io publishes the tarball's sha256 as the version's
+          # `checksum`, so this reads the hash rather than downloading the
+          # tarball and computing one.
+          #
+          # Polled rather than fetched once. release-plz creates the GitHub
+          # release and uploads to crates.io in the same run, with no ordering
+          # between them that this job can rely on, so the version can be a
+          # few seconds behind the event that started this.
+          checksum=''
+          for attempt in $(seq 1 10); do
+            checksum="$(curl -fsSL \
+              -H 'User-Agent: shep-release-workflow (https://github.com/TurtIeSocks/shep)' \
+              "https://crates.io/api/v1/crates/shep/${version}" \
+              | jq -r '.version.checksum // empty')" || checksum=''
+            if [ -n "$checksum" ]; then break; fi
+            echo "shep ${version} is not on crates.io yet (attempt ${attempt}/10), waiting 30s"
+            sleep 30
+          done
+          if [ -z "$checksum" ]; then
+            echo "::error::shep ${version} never appeared on crates.io. The formula was not bumped."
+            exit 1
+          fi
+
+          formula=packaging/homebrew/shep.rb
+          sed -i \
+            -e "s|^  url \".*\"$|  url \"https://static.crates.io/crates/shep/shep-${version}.crate\"|" \
+            -e "s|^  sha256 \".*\"$|  sha256 \"${checksum}\"|" \
+            "$formula"
+
+          # Both lines have to have moved. A `sed` that matched nothing exits
+          # 0 and would push last release's formula under this release's tag.
+          grep -q "shep-${version}.crate" "$formula"
+          grep -q "${checksum}" "$formula"
+          echo "version=${version}" >> "$GITHUB_ENV"
+      - name: Push it to the tap
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/TurtIeSocks/homebrew-shep.git" tap
+          mkdir -p tap/Formula
+          cp packaging/homebrew/shep.rb tap/Formula/shep.rb
+          cd tap
+          if git diff --quiet; then
+            echo "The tap already carries this formula. Nothing to push."
+            exit 0
+          fi
+          # A bot identity rather than the maintainer's: this commit is made
+          # by a workflow, and saying so in the log is more useful than
+          # borrowing a name.
+          git -c user.name='shep release' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -am "shep ${TAG#shep-v}"
+          git push
