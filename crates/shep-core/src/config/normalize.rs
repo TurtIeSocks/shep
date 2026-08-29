@@ -229,6 +229,9 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 /// - [`NormalizeError::ReservedEnvVar`]: `env` sets `SHEP_INSTANCE` or
 ///   `SHEP_NAME`, which shep injects itself (carries the app name and the
 ///   variable).
+/// - [`NormalizeError::IncrementVarRemoved`]: `increment_var` is set. It was
+///   removed in favour of `{{instance}}` templating (carries the app name
+///   and the variable the app named).
 /// - [`NormalizeError::MissingScript`]: `script` is empty.
 /// - [`NormalizeError::ZeroInstances`]: `instances == 0`.
 /// - [`NormalizeError::InvalidCron`]: `cron_restart` is not valid in
@@ -294,6 +297,12 @@ pub fn normalize_with_home(
                 var,
             });
         }
+    }
+    if let Some(var) = app.increment_var.take() {
+        return Err(NormalizeError::IncrementVarRemoved {
+            name: app.name.clone(),
+            var,
+        });
     }
     for (key, value) in &app.env {
         validate_template(&app.name, &format!("env.{key}"), value)?;
@@ -548,6 +557,15 @@ pub enum NormalizeError {
         /// The variable the app tried to set
         var: &'static str,
     },
+    /// `increment_var` was removed in favour of `{{instance}}` templating.
+    /// Carries the variable the app named, so the error can show the exact
+    /// line to write instead.
+    IncrementVarRemoved {
+        /// The sheep name
+        name: String,
+        /// The variable the app asked for
+        var: String,
+    },
     /// `script` is empty
     MissingScript,
     /// `instances` is zero
@@ -703,6 +721,10 @@ impl fmt::Display for NormalizeError {
             Self::ReservedEnvVar { name, var } => write!(
                 f,
                 "sheep `{name}` sets `{var}` in env, but shep injects it: use a different name, or `{{{{instance}}}}` in your own variable"
+            ),
+            Self::IncrementVarRemoved { name, var } => write!(
+                f,
+                "sheep `{name}` sets `increment_var`, which was removed: write `{var} = \"{{{{instance}}}}\"` under `[app.env]` instead"
             ),
             Self::MissingScript => f.write_str("app config is missing a script"),
             Self::ZeroInstances => f.write_str("instances must be at least 1"),
@@ -963,6 +985,24 @@ mod tests {
         );
 
         assert!(normalize(AppConfig::minimal("web-2", "./srv")).is_ok());
+    }
+
+    #[test]
+    fn increment_var_is_refused_and_says_what_replaced_it() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.increment_var = Some("WORKER_ID".to_string());
+        let err = normalize(app).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("increment_var"), "{rendered}");
+        assert!(
+            rendered.contains("WORKER_ID"),
+            "keeps their name: {rendered}"
+        );
+        assert!(rendered.contains("{{instance}}"), "and the fix: {rendered}");
+        assert!(
+            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+            "no em or en dash in copy a user reads: {rendered}"
+        );
     }
 
     #[test]

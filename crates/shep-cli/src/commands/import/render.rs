@@ -38,8 +38,6 @@ struct Rendered {
     merge_logs: bool,
     #[serde(skip_serializing_if = "is_false")]
     reuse_port: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    increment_var: Option<String>,
     // LAST for readability, not correctness: a hand-written `[[app]]` table
     // cannot have a scalar key after a `[app.env]` sub-table header, but
     // `toml` 0.8's `Serializer` does not share that constraint — verified
@@ -84,7 +82,6 @@ impl From<&AppConfig> for Rendered {
             max_memory: app.max_memory,
             merge_logs: app.merge_logs,
             reuse_port: app.reuse_port,
-            increment_var: app.increment_var.clone(),
             env: app.env.clone(),
         }
     }

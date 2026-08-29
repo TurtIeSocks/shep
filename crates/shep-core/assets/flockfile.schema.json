@@ -210,19 +210,6 @@
             "type": "string"
           }
         },
-        "increment_var": {
-          "description": "Env var receiving the instance slot (default `SHEP_INSTANCE`)",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null,
-          "init": {
-            "blurb": "The env var each instance finds its own slot number in",
-            "example": "INSTANCE_ID",
-            "group": "inputs"
-          }
-        },
         "instances": {
           "description": "Instance count (\"cluster\" = N fork instances; spec §4)",
           "type": "integer",

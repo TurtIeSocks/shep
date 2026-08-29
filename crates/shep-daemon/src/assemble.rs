@@ -163,7 +163,7 @@ const INHERITED: &[&str] = &[
 /// When `merge_logs = true`, they become `logs/<name>-out.log` and `-err.log`
 /// (shared across all instances). Explicit `out_file`/`err_file` config
 /// always win over defaults, and are rendered through the
-/// `{{instance}}`/`{{name}}` grammar the same as `env` and `args`. normalize
+/// `{{instance}}`/`{{name}}` grammar the same as `env` and `args`. Normalize
 /// has already refused a path that would render alike for every instance,
 /// unless `merge_logs` asked for that on purpose.
 ///
@@ -333,34 +333,6 @@ mod tests {
         assert_eq!(
             spec.env.get("SHEP_NAME").map(String::as_str),
             Some("worker")
-        );
-    }
-
-    #[test]
-    fn a_custom_increment_var_is_inert_and_injects_nothing() {
-        let mut app_config = AppConfig {
-            name: "worker".to_string(),
-            script: "bin/worker".to_string(),
-            args: vec![],
-            ..Default::default()
-        };
-        app_config.increment_var = Some("WORKER_ID".to_string());
-
-        let app = normalize(app_config).unwrap();
-        let paths = test_paths();
-
-        let spec = assemble(&app, 5, &paths, None);
-
-        // SHEP_INSTANCE and SHEP_NAME are always injected now, regardless of
-        // increment_var.
-        assert_eq!(spec.env.get("SHEP_INSTANCE").map(|s| s.as_str()), Some("5"));
-        assert_eq!(
-            spec.env.get("SHEP_NAME").map(|s| s.as_str()),
-            Some("worker")
-        );
-        assert!(
-            !spec.env.contains_key("WORKER_ID"),
-            "increment_var is inert: assemble stopped reading it, so a custom name is never injected"
         );
     }
 

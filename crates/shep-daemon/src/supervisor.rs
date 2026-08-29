@@ -4256,11 +4256,12 @@ impl<R: ProcessRunner> Actor<R> {
     /// load-bearing rather than incidental:
     ///
     /// - **The same instance slot.** [`assemble`] writes the slot number into
-    ///   the child's environment (`SHEP_INSTANCE`, or the app's own
-    ///   `increment_var`), and an app that derives its port from it would bind
-    ///   a DIFFERENT port under a different slot — no overlap, no handover,
-    ///   nothing for the feature to be about. The slot also fixes the log
-    ///   paths and the prober's environment, so all three follow the drainee.
+    ///   the child's environment as `SHEP_INSTANCE`, or into any of the app's
+    ///   own `env` values templated with `{{instance}}`, and an app that
+    ///   derives its port from it would bind a DIFFERENT port under a
+    ///   different slot: no overlap, no handover, nothing for the feature to
+    ///   be about. The slot also fixes the log paths and the prober's
+    ///   environment, so all three follow the drainee.
     /// - **A new id.** Two live processes for one id is the invariant the
     ///   supervisor's property test asserts over the event stream, and a
     ///   same-id replacement breaks it outright. Same slot, new id is the only
@@ -6796,10 +6797,10 @@ impl From<ExitOutcome> for ExitInfo {
 /// of the three things [`assemble`] folds into the child's environment: an
 /// app that sets no `env` at all — the ordinary case — would probe with
 /// NOTHING, no `PATH`, no `HOME`, no `TZ`. The instance slot var
-/// (`SHEP_INSTANCE`, or the app's `increment_var`) is the sharper half: a
-/// `&ResolvedApp` structurally cannot reach `instance`, so every instance of
-/// a clustered app would probe whatever the unexpanded variable left behind
-/// — the same port, every time.
+/// (`SHEP_INSTANCE`, or any of the app's own `env` values templated with
+/// `{{instance}}`) is the sharper half: a `&ResolvedApp` structurally cannot
+/// reach `instance`, so every instance of a clustered app would probe
+/// whatever the unrendered template left behind: the same port, every time.
 /// Whether this instance's STATUS lets a reload replace it.
 ///
 /// `Online` is the ordinary answer, and `ready_failed` is the one exception:

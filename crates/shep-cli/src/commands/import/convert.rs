@@ -22,7 +22,8 @@
 //!
 //! `env` comes from [`super::env::split`], called on the group's first row:
 //! an app's declared env does not differ per instance, any more than its
-//! script or cwd do. The same call supplies `increment_var` and the
+//! script or cwd do. The same call supplies the pm2 instance variable, which
+//! becomes an `env` entry templated with `{{instance}}`, and the
 //! [`ImportNote::InstanceVar`]/[`ImportNote::InheritedEnv`] notes; the
 //! first row's [`DumpRow::unrepresentable`] becomes
 //! [`ImportNote::UnrepresentableEnv`] notes alongside them.
@@ -74,8 +75,9 @@ pub(crate) enum ImportNote {
         /// The key whose value could not be represented.
         key: String,
     },
-    /// The app read its instance number from a pm2 variable, recorded as
-    /// `increment_var` rather than copied as a value.
+    /// The app read its instance number from a pm2 variable, recorded as an
+    /// `env` entry templated with `{{instance}}` rather than copied as a
+    /// value.
     InstanceVar {
         /// The app's name.
         app: String,
@@ -198,7 +200,9 @@ fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     let app_env = env::split(first);
     app.env = app_env.env;
     if let Some(var) = app_env.instance_var {
-        app.increment_var = Some(var.clone());
+        // The template, not the value: pm2 reported instance 0's number, and
+        // copying it in would tell every worker it is worker 0.
+        app.env.insert(var.clone(), "{{instance}}".to_string());
         notes.push(ImportNote::InstanceVar {
             app: name.to_string(),
             var,
@@ -319,15 +323,16 @@ mod tests {
         }
     }
 
-    /// fails if `NODE_APP_INSTANCE` is copied into the app env as a value.
-    /// Copying it pins instance 0's number into every instance, which is
-    /// worse than dropping it: every worker would believe it is worker 0.
+    /// pm2's instance variable becomes an env entry holding the template, never
+    /// a value. Copying instance 0's number in would pin every worker to 0.
     #[test]
-    fn the_pm2_instance_variable_becomes_increment_var_and_never_a_value() {
+    fn the_pm2_instance_variable_becomes_an_env_template_and_never_a_value() {
         let imported = imported();
         let api = &imported.apps[0];
-        assert_eq!(api.increment_var.as_deref(), Some("NODE_APP_INSTANCE"));
-        assert!(!api.env.contains_key("NODE_APP_INSTANCE"));
+        assert_eq!(
+            api.env.get("NODE_APP_INSTANCE").map(String::as_str),
+            Some("{{instance}}")
+        );
         assert!(imported.notes.contains(&ImportNote::InstanceVar {
             app: "api".to_string(),
             var: "NODE_APP_INSTANCE".to_string(),

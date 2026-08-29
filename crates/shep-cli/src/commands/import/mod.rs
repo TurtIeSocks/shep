@@ -39,13 +39,13 @@ use crate::output::{ImportRow, ImportRows, Streams, emit, write_outcome};
 /// produce a file `shep` can read back.
 ///
 /// # Notes
-/// Every [`ImportNote`] the conversion produced — a clustered app that must
-/// set `SO_REUSEPORT` itself, an ambiguous env key left out, an env value a
-/// Flockfile cannot hold, an instance variable turned into `increment_var`
-/// — is written to stderr, one line each, in both `--dry-run` and normal
-/// runs and both `--format table`/`--format json` (decision 13). The first
-/// line is the read summary: how many instance rows, for how many apps,
-/// from where.
+/// Every [`ImportNote`] the conversion produced is written to stderr, one
+/// line each: a clustered app that must set `SO_REUSEPORT` itself, an
+/// ambiguous env key left out, an env value a Flockfile cannot hold, an
+/// instance variable turned into an `env` entry templated with
+/// `{{instance}}`. Both `--dry-run` and normal runs write them, and both
+/// `--format table`/`--format json` (decision 13). The first line is the
+/// read summary: how many instance rows, for how many apps, from where.
 pub fn import(streams: &mut Streams<'_>, args: &ImportArgs) -> ExitCode {
     let source = match resolve_source(args) {
         Ok(source) => source,
@@ -194,8 +194,8 @@ fn describe_note(note: &ImportNote) -> (&'static str, String) {
         ImportNote::InstanceVar { app, var } => (
             "instance_var",
             format!(
-                "{app}: reads its instance number from ${var}; imported as increment_var \
-                 rather than copied as a value"
+                "{app}: reads its instance number from ${var}; imported as \
+                 {var} = \"{{{{instance}}}}\" under [app.env] rather than copied as a value"
             ),
         ),
     }
