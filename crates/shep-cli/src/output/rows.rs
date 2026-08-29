@@ -3239,6 +3239,15 @@ pub(crate) mod tests {
         assert_eq!(rendered[1][0], "1", "slot rows keep their ids");
     }
 
+    /// fails if a mixed group's STATUS stops naming every state and its
+    /// count, in a fixed order.
+    ///
+    /// Asserted as the EXACT string, not as "contains a digit": a rollup
+    /// that picked a winner, dropped the counts, or ordered the states by
+    /// first appearance would all contain a digit and all read wrong on
+    /// screen. `BTreeMap` keys the counts by the status word, so the order
+    /// is alphabetical and does not depend on which slot the daemon listed
+    /// first -- which is what makes an exact assertion possible at all.
     #[test]
     fn a_mixed_group_says_so_rather_than_picking_a_winner() {
         let rows = FlockRows(vec![
@@ -3248,10 +3257,214 @@ pub(crate) mod tests {
             ProcessInfo::builder(2, "web", ProcStatus::Stopped)
                 .instance(Some(1))
                 .build(),
+            ProcessInfo::builder(3, "web", ProcStatus::Online)
+                .instance(Some(2))
+                .build(),
         ]);
         let rendered = rows.rows_for(full_presentation(), true);
-        let status = &rendered[0][2];
-        assert!(status.contains('1'), "counts each state: {status}");
+        assert_eq!(rendered[0][2], "2 online, 1 stopped");
+    }
+
+    /// fails if a group's UPTIME stops being the MINIMUM across its slots.
+    ///
+    /// The three slots are listed oldest first, so a rollup that took the
+    /// first member, the maximum, or a mean would each show a different
+    /// number here and none of them would be `5m`. That is the whole point
+    /// of the rule: a group reads as time since the app was last disturbed,
+    /// and a restarted instance is a disturbance the header must not hide
+    /// behind its luckiest sibling.
+    #[test]
+    fn a_group_uptime_is_the_shortest_of_its_slots() {
+        let rows = FlockRows(
+            [9_000_000_u64, 4_512_000, 300_000]
+                .into_iter()
+                .enumerate()
+                .map(|(slot, uptime_ms)| {
+                    let slot = u32::try_from(slot).unwrap();
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .uptime_ms(uptime_ms)
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered[0][8], "5m", "300_000ms, the shortest of the three");
+    }
+
+    /// fails if a group with no readings at all reports zero.
+    ///
+    /// A zero is a claim -- "this app is using no CPU" -- and the sum of
+    /// nothing is not that claim, it is no claim. Same rule a single
+    /// sheep's own `-` cell follows, applied to the fold that produces the
+    /// rollup: it starts at `None` rather than at `0`, so an app whose
+    /// every instance is unmeasured stays unmeasured.
+    #[test]
+    fn a_group_with_no_readings_shows_a_dash_not_a_zero() {
+        let rows = FlockRows(
+            (0..2)
+                .map(|slot| {
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .cpu_percent(None)
+                        .memory_bytes(None)
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered[0][6], "-", "cpu");
+        assert_eq!(rendered[0][7], "-", "mem");
+
+        // And one live reading among absent ones IS a claim, about the slot
+        // that made it: the fold leaves `None` only when nothing measured.
+        let mixed = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .instance(Some(0))
+                .cpu_percent(Some(2.5))
+                .memory_bytes(Some(64 << 20))
+                .build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Online)
+                .instance(Some(1))
+                .cpu_percent(None)
+                .memory_bytes(None)
+                .build(),
+        ]);
+        let rendered = mixed.rows_for(full_presentation(), true);
+        assert_eq!(rendered[0][6], "2.5%", "cpu");
+        assert_eq!(rendered[0][7], "64.0M", "mem");
+    }
+
+    /// fails if `shep flock`'s group header and `shep lookout`'s group row
+    /// stop agreeing about what an app's instances add up to.
+    ///
+    /// The two rollups are deliberately NOT shared code: they live in
+    /// different crates' worth of rendering, over different column sets,
+    /// and each is stated once where it is used. That is a readable design
+    /// and a driftable one, and an operator who saw different numbers in
+    /// `shep flock` and `shep lookout` for the same app would be right to
+    /// distrust both. So the input is one `Vec<ProcessInfo>` and every
+    /// rolled-up cell is compared across the two surfaces, rather than each
+    /// side being compared to a literal a reviewer had to check by hand.
+    ///
+    /// The lookout's clock is left where `App::new` put it, and the
+    /// snapshot is anchored at the same instant, so its LIVE uptime is
+    /// exactly the reported one and the two surfaces are being asked the
+    /// same question rather than two questions one millisecond apart.
+    #[test]
+    fn the_flock_table_and_the_lookout_roll_a_group_up_the_same_way() {
+        use std::time::Instant;
+
+        use crate::lookout::app::{App, Control, Msg, RowKey};
+        use crate::lookout::theme::Palette;
+        use crate::lookout::view::flock::{columns_for, key_line};
+
+        // Every slot differs in every summed field, so a rollup that read
+        // one member instead of all of them cannot coincide with the sum.
+        let flock: Vec<ProcessInfo> = [
+            (0_u32, 0_u32, 3.4_f32, 182_u64 << 20, 4_512_000_u64),
+            (1, 2, 2.9, 178 << 20, 300_000),
+            (2, 1, 3.1, 180 << 20, 9_000_000),
+        ]
+        .into_iter()
+        .map(|(slot, restarts, cpu, memory, uptime_ms)| {
+            ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                .instance(Some(slot))
+                .pid(Some(48_400 + slot))
+                .restarts(restarts)
+                .cpu_percent(Some(cpu))
+                .memory_bytes(Some(memory))
+                .uptime_ms(uptime_ms)
+                .build()
+        })
+        .collect();
+
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/ada/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: flock.clone(),
+            at: t0,
+        });
+
+        // The summing rules themselves, ahead of any rendering: this is the
+        // half a presentation choice cannot disturb, and the half that
+        // decides whether the two surfaces mean the same thing.
+        let table_totals = group_totals(&flock);
+        let dashboard_totals = app.group_totals("web");
+        assert_eq!(dashboard_totals.count, flock.len());
+        assert_eq!(dashboard_totals.restarts, table_totals.restarts, "restarts");
+        assert_eq!(dashboard_totals.cpu, table_totals.cpu, "cpu");
+        assert_eq!(dashboard_totals.memory, table_totals.memory, "memory");
+        assert_eq!(
+            dashboard_totals.uptime_ms,
+            Some(table_totals.uptime_ms),
+            "uptime"
+        );
+        assert_eq!(
+            app.group_status_text("web"),
+            group_status(&flock),
+            "a uniform group's status word"
+        );
+
+        // And the mixed case, which is the one with a format to disagree
+        // about rather than a single word.
+        let mut mixed = flock.clone();
+        mixed[1].status = ProcStatus::Stopped;
+        let mut mixed_app = App::new(
+            Palette::detect(None, None, None),
+            Control::ReadOnly,
+            "/home/ada/.shep".to_string(),
+            t0,
+        );
+        mixed_app.update(Msg::Snapshot {
+            rows: mixed.clone(),
+            at: t0,
+        });
+        assert_eq!(
+            mixed_app.group_status_text("web"),
+            group_status(&mixed),
+            "a mixed group's per-state counts"
+        );
+
+        let table = FlockRows(flock).rows_for(full_presentation(), true);
+        let header = &table[0];
+        let dashboard = key_line(
+            &app,
+            &RowKey::Group("web".to_string()),
+            columns_for(200),
+            200,
+        )
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+        // Then the rendered cells, so a surface that summed correctly and
+        // then printed something else still fails. FOLD and SMIT are left
+        // out on purpose: both are per-app facts read off the first member
+        // rather than summed, so they would pass whatever either surface
+        // did to the rollup. STATUS is left out too, and for a reason worth
+        // stating: `shep flock` at `Full` puts a sheep face in front of the
+        // word and the dashboard never does, so the two cells differ by a
+        // presentation choice rather than by a rollup. The word itself is
+        // compared above, through `group_status`, where the face is not.
+        for column in ["NAME", "RESTARTS", "CPU", "MEM", "UPTIME"] {
+            let at = FlockRows::headers()
+                .iter()
+                .position(|header| *header == column)
+                .expect("the column is in the table");
+            let cell = header[at].trim();
+            assert!(
+                dashboard.contains(cell),
+                "`shep flock` rolls {column} up to {cell:?} and `shep lookout` \
+                 does not agree: {dashboard:?}"
+            );
+        }
     }
 
     #[test]
