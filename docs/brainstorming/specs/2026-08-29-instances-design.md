@@ -1,6 +1,8 @@
 # Design: instances, second pass
 
-Status: approved design, not yet planned. Supersedes `increment_var`.
+Status: implemented. Supersedes `increment_var`. The sections below record
+the decisions taken during implementation, and the two amendments that came
+out of it.
 
 shep is 0.1.x and guarantees no API, so this pass breaks the wire, the
 Flockfile grammar and the name grammar where breaking them buys something.
