@@ -57,7 +57,7 @@ pub fn new_bus() -> Bus {
 /// look at an event and drop it — measured at 39% of the daemon's per-line
 /// CPU on a sheep emitting 7,315 lines/s with nothing attached.
 ///
-/// So the count kept here is of subscribers whose [`TopicFilter`] actually
+/// So the count kept here is of subscribers whose `TopicFilter` actually
 /// matches a log topic, which in practice means a `shep bleats`, a bark dog,
 /// or a `lookout`, and [`Self::publish_log`] skips the whole publish while it
 /// is zero.
@@ -89,7 +89,7 @@ impl Bus {
     ///
     /// What the gate does widen, by the time it takes one atomic store to
     /// become visible to another core, is a window that is already there:
-    /// [`Self::subscribe_for`] registers a filter's interest BEFORE it takes
+    /// `Self::subscribe_for` registers a filter's interest BEFORE it takes
     /// its receiver, so between an operator running `shep bleats` and its
     /// first line there has always been an interval in which a line goes to
     /// nobody. Nothing orders a client's `Subscribe` against a sheep's
