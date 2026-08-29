@@ -2341,7 +2341,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&hello).unwrap();
-        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":1}"#);
+        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":2}"#);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The client<->daemon wire protocol (version 1)
+//! The client<->daemon wire protocol (version 2)
 //!
 //! Typed request/response enums + bus events. Framing lives in [`wire`];
 //! every type here is snapshot-pinned — changing any serialized shape is a
@@ -29,4 +29,4 @@ pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 /// Removing, renaming, or retyping anything serialized bumps it, recorded in
 /// the CHANGELOG. Byte fixtures in each protocol module pin the deserialize
 /// direction.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
