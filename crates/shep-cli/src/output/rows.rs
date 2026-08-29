@@ -151,6 +151,10 @@ impl Render for FlockRows {
         // in a later task; this list just keeps the shape consistent with
         // every other verb answering `ProcessInfo`.
         "lambs",
+        // No column yet: a later task grows the table to group rows by app
+        // and label each one's slot. Until then it rides the JSON so a
+        // programmatic consumer can already tell instances apart.
+        "instance",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
@@ -794,6 +798,11 @@ impl Render for DogRows {
         // absent, like `fold` above, and in the JSON for the same
         // shape-consistency reason as the rest of this list.
         "smit",
+        // Always `Some(0)` here: a dog is one process, never stocked to N
+        // instances, so the slot the daemon reports is never meaningful.
+        // Rides in the JSON only for the same shape-consistency reason as
+        // the rest of this list.
+        "instance",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
@@ -1325,6 +1334,9 @@ impl Render for FlushedRows {
         // And the same again for the mark a dog painted: a flush neither
         // reads nor changes it.
         "smit",
+        // Same shape-consistency reason as the rest of this list: a flush
+        // neither reads nor changes which slot a sheep occupies.
+        "instance",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "OUT_FILE",

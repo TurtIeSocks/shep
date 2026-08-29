@@ -6755,6 +6755,7 @@ fn to_info(entry: &ProcessEntry, smits: &Smits) -> ProcessInfo {
                 .get(&entry.spec.config().name)
                 .map(|(_, smit)| smit.clone()),
         )
+        .instance(Some(entry.instance))
         .build()
 }
 

@@ -4945,7 +4945,7 @@ fn kv_json_envelope_is_an_array_with_the_schema_version() {
     let envelope: serde_json::Value = serde_json::from_slice(&get_all.stdout).unwrap();
     assert!(envelope["data"].is_array(), "{envelope}");
     assert_eq!(envelope["data"].as_array().unwrap().len(), 2, "{envelope}");
-    assert_eq!(envelope["schema_version"], 1, "{envelope}");
+    assert_eq!(envelope["schema_version"], 2, "{envelope}");
 
     let missing = shep(home)
         .arg("--format")

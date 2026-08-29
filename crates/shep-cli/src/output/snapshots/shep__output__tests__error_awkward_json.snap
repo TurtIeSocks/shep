@@ -2,4 +2,4 @@
 source: crates/shep-cli/src/output/mod.rs
 expression: "String::from_utf8(out).unwrap()"
 ---
-{"schema_version":1,"error":{"code":"invalid_config","message":"bad \"quoted\" \\path"}}
+{"schema_version":2,"error":{"code":"invalid_config","message":"bad \"quoted\" \\path"}}

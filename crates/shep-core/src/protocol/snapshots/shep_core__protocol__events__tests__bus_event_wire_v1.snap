@@ -25,7 +25,8 @@ expression: events
           "code": 1,
           "signal": null
         },
-        "smit": "▲ main@a1b2c3"
+        "smit": "▲ main@a1b2c3",
+        "instance": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -66,7 +67,8 @@ expression: events
           "code": 1,
           "signal": null
         },
-        "smit": null
+        "smit": null,
+        "instance": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -94,7 +96,8 @@ expression: events
           "code": 1,
           "signal": null
         },
-        "smit": null
+        "smit": null,
+        "instance": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -122,7 +125,8 @@ expression: events
           "code": 1,
           "signal": null
         },
-        "smit": null
+        "smit": null,
+        "instance": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -150,7 +154,8 @@ expression: events
           "code": 1,
           "signal": null
         },
-        "smit": null
+        "smit": null,
+        "instance": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -178,7 +183,8 @@ expression: events
           "code": 1,
           "signal": null
         },
-        "smit": null
+        "smit": null,
+        "instance": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -206,7 +212,8 @@ expression: events
           "code": 1,
           "signal": null
         },
-        "smit": null
+        "smit": null,
+        "instance": null
       },
       "manually": false,
       "at_ms": 1700000000000

@@ -210,6 +210,7 @@ mod tests {
                     // pins the encoding a subscriber reads, and a smit is
                     // the one field on this row a third party writes.
                     smit: Some("\u{25b2} main@a1b2c3".to_string()),
+                    instance: None,
                 },
                 manually: false,
                 at_ms: 1_700_000_000_000,
@@ -346,6 +347,7 @@ mod tests {
                     lambs: None,
                     last_exit: None,
                     smit: None,
+                    instance: None,
                 },
                 manually: true,
                 at_ms: 0,

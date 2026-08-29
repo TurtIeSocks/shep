@@ -65,8 +65,11 @@ use crate::cli::Format;
 use crate::style::Presentation;
 
 /// Bumped only for a breaking change to any command's `data` shape.
-/// Additive fields do not bump it.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Additive fields do not bump it on their own, but a bump can still ride
+/// along beside one: this one moved to 2 the day every flock row grew an
+/// `instance` field, because a client written against the old shape was
+/// about to start reading a row that quietly means more than it used to.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The `--format json` envelope every command renders into, `bleats`
 /// excepted (module docs above).
@@ -896,7 +899,7 @@ mod tests {
         )
         .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["data"].as_array().unwrap().len(), 2);
         assert_eq!(json["data"][0]["dog"], serde_json::Value::Null);
         assert_eq!(json["data"][1]["dog"]["kind"], "built_in");
