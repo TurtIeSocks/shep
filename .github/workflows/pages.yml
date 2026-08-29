@@ -10,19 +10,23 @@ name: pages
 # single ubuntu job of a couple of minutes at 1x, so the arithmetic that
 # keeps the Rust CI manual does not reach it.
 #
-# The paths filter names three files outside `web/` on purpose: the site
-# parses them at build time (see `web/src/data/*.ts`) rather than restating
-# them, so that a stale claim fails the build instead of shipping. The
-# lexicon table comes from README.md, the "not built yet" chalkboard from
-# docs/specs/deferred.md, and the terminology page from docs/terminology.md.
-# Editing one of those without redeploying would leave the site asserting
-# something the repo no longer says.
+# The paths filter names two files outside `web/` on purpose: the site parses
+# them at build time (see `web/src/data/*.ts`) rather than restating them, so
+# that a stale claim fails the build instead of shipping. The "not built yet"
+# chalkboard comes from docs/specs/deferred.md, and the terminology page's
+# usage rules from docs/terminology.md. Editing either without redeploying
+# would leave the site asserting something the repo no longer says.
+#
+# README.md was the third until the lexicon table moved to
+# web/src/data/lexiconTable.md, which happened because the README was rewritten
+# as a landing page and the parser was left reading a heading that had gone.
+# Nothing imports README.md now -- grep web/src for `?raw` for the real list --
+# so it is no longer a build input and no longer belongs here.
 on:
   push:
     branches: [main]
     paths:
       - "web/**"
-      - "README.md"
       - "docs/specs/deferred.md"
       - "docs/terminology.md"
       - ".github/workflows/pages.yml"
