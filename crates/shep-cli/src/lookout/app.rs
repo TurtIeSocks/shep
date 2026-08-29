@@ -261,6 +261,31 @@ pub struct Row {
     pub anchor: Instant,
 }
 
+/// One app's rolled-up numbers, computed from its own instances.
+///
+/// The same fields `output::rows`'s own `GroupTotals` sums for `shep
+/// flock`'s table (task 9), kept here so the two surfaces sum the exact same
+/// fields off the exact same [`ProcessInfo`]s -- an operator seeing
+/// different numbers in `shep flock` and `shep lookout` for the same app
+/// would be right to distrust both. Restarts, cpu and memory are summed;
+/// uptime is the MINIMUM, so a group reads as time since the app was last
+/// disturbed rather than as the age of its luckiest instance.
+#[derive(Debug, Clone)]
+pub struct GroupTotals {
+    /// How many instances make up this group.
+    pub count: usize,
+    /// Every instance's restarts, added up.
+    pub restarts: u32,
+    /// Every instance's CPU reading summed, `None` only when not one
+    /// instance has a live reading.
+    pub cpu: Option<f32>,
+    /// Every instance's memory reading summed, `None` for the same reason.
+    pub memory: Option<u64>,
+    /// The MINIMUM live uptime across instances, `None` only when the group
+    /// has none.
+    pub uptime_ms: Option<u64>,
+}
+
 /// One request the dashboard asked the link task to send, carried back on the
 /// reply so it can be routed.
 ///
@@ -275,13 +300,14 @@ pub enum Sent {
         /// Which sheep was asked about.
         id: u32,
     },
-    /// One action against one sheep. `name` rides along so a reply can be
-    /// reported by name even after the sheep has left the flock.
+    /// One action against a target: one sheep, or every instance of a named
+    /// app. `name` rides along so a reply can be reported by name even after
+    /// the target has left the flock.
     Action {
         /// Which verb.
         verb: ActionVerb,
-        /// The pinned sheep.
-        id: u32,
+        /// The pinned target.
+        target: RowKey,
         /// Its name at arm time.
         name: String,
     },
@@ -295,8 +321,11 @@ impl Sent {
             Self::Lambs { id } => Request::Describe {
                 selector: SelectorSpec::Id(*id),
             },
-            Self::Action { verb, id, .. } => {
-                let selector = SelectorSpec::Id(*id);
+            Self::Action { verb, target, .. } => {
+                let selector = match target {
+                    RowKey::Sheep(id) => SelectorSpec::Id(*id),
+                    RowKey::Group(name) => SelectorSpec::Name(name.clone()),
+                };
                 match verb {
                     ActionVerb::Stop => Request::Stop { selector },
                     ActionVerb::Restart => Request::Restart { selector },
@@ -305,6 +334,22 @@ impl Sent {
             }
         }
     }
+}
+
+/// What the cursor can sit on: one sheep, or the header above an app's
+/// instances.
+///
+/// Grouping is [`App::visible_rows`]'s own call, made the same way
+/// `output::rows::FlockRows`'s own `name_groups`/`slotted` rule makes it
+/// (task 9): more than one instance of a name, every one of them reporting
+/// its slot. An app whose listing carries no slot at all (an older shepherd)
+/// never earns a [`Self::Group`], and renders exactly as it always has.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowKey {
+    /// One app's group header, carrying its name.
+    Group(String),
+    /// One sheep, by id.
+    Sheep(u32),
 }
 
 /// What one lamb fetch came back with.
@@ -399,10 +444,10 @@ enum Stage {
 
 /// The one action this dashboard is in the middle of.
 ///
-/// The target is captured HERE, by id and by name, and never re-read from the
-/// selection: a snapshot can land between the arming keypress and the Enter,
-/// and a confirmation that re-read the cursor could act on a sheep the
-/// operator never pointed at.
+/// The target is captured HERE, by [`RowKey`] and by name, and never re-read
+/// from the selection: a snapshot can land between the arming keypress and
+/// the Enter, and a confirmation that re-read the cursor could act on a
+/// sheep the operator never pointed at.
 ///
 /// One field on [`App`] rather than two `Option`s, so "armed" and "in flight"
 /// cannot both be true. That is the same claim the one-action-at-a-time rule
@@ -410,8 +455,14 @@ enum Stage {
 #[derive(Debug, Clone)]
 struct Action {
     verb: ActionVerb,
-    id: u32,
+    target: RowKey,
     name: String,
+    /// How many processes [`Self::target`] reaches: 1 for a sheep, the
+    /// group's own size for a [`RowKey::Group`]. Captured at arm time, the
+    /// same reason [`Self::name`] is: the confirm prompt states the blast
+    /// radius before the operator commits, and the group could gain or lose
+    /// an instance between arming and the Enter.
+    count: usize,
     /// When it was armed. Only an armed action expires.
     at: Instant,
     stage: Stage,
@@ -422,10 +473,12 @@ struct Action {
 pub struct ActionState<'a> {
     /// Which verb.
     pub verb: ActionVerb,
-    /// The pinned sheep's id.
-    pub id: u32,
-    /// The pinned sheep's name, as it was when the key was pressed.
+    /// The pinned target.
+    pub target: &'a RowKey,
+    /// The pinned target's name, as it was when the key was pressed.
     pub name: &'a str,
+    /// How many processes [`Self::target`] reaches.
+    pub count: usize,
     /// False while it is a question, true once it has gone out.
     pub sent: bool,
 }
@@ -446,10 +499,10 @@ const LINK_GONE: &str = "the shepherd is gone — nothing left to ask";
 #[derive(Debug)]
 pub struct App {
     flock: BTreeMap<u32, Row>,
-    /// Which sheep the detail pane and the bleats feed describe.
+    /// Which row the detail pane and the bleats feed describe.
     ///
-    /// An **id**, not an index. The flock map is replaced wholesale every two
-    /// seconds, so an index survives a `shep delete` of an earlier row by
+    /// A [`RowKey`], not an index. The flock map is replaced wholesale every
+    /// two seconds, so an index survives a `shep delete` of an earlier row by
     /// silently pointing at a different sheep — and every pane below the table
     /// would then describe that different sheep with nothing on screen
     /// changing. `None` only for an empty flock.
@@ -458,7 +511,7 @@ pub struct App {
     /// ([`super::view::flock::scroll_offset`]), which is what makes a
     /// disagreement between a stored offset and a stored cursor impossible
     /// rather than merely unlikely.
-    selected: Option<u32>,
+    selected: Option<RowKey>,
     /// The live substring filter over sheep NAMES, empty when there is none.
     ///
     /// Case-insensitive `contains`, and nothing else: not the CLI's selector
@@ -638,10 +691,12 @@ impl App {
             }
             Msg::Replied { sent, result } => match sent {
                 Sent::Lambs { id } => self.on_lambs(id, result),
-                Sent::Action { verb, id, name } => self.on_action_reply(verb, id, &name, result),
+                Sent::Action { verb, target, name } => {
+                    self.on_action_reply(verb, target, &name, result)
+                }
             },
             Msg::Unsent { sent } => match sent {
-                Sent::Action { verb, id, name } => {
+                Sent::Action { verb, target, name } => {
                     self.action = None;
                     self.notice = Some(Notice {
                         // "it was not sent", and no cause. The reducer does
@@ -651,7 +706,7 @@ impl App {
                         // shepherd is perfectly reachable and merely slow.
                         // Naming a cause nothing observed is the failure the
                         // `-` CPU cell exists to prevent.
-                        text: format!("{} {name} (id {id}): it was not sent", verb.label()),
+                        text: format!("{}: it was not sent", target_prefix(verb, &target, &name)),
                         grave: true,
                     });
                     Effect::None
@@ -705,12 +760,12 @@ impl App {
     fn on_action_reply(
         &mut self,
         verb: ActionVerb,
-        id: u32,
+        target: RowKey,
         name: &str,
         result: Result<Response, RequestError>,
     ) -> Effect {
         self.action = None;
-        let prefix = format!("{} {name} (id {id})", verb.label());
+        let prefix = target_prefix(verb, &target, name);
         // Each verb accepts its own reply and no other. A `Stopped` answering
         // a `Restart` carries rows and would upsert perfectly happily, which
         // is why the guards are on the arms rather than a single
@@ -962,7 +1017,7 @@ impl App {
             // that point the shepherd really is gone, so `LINK_GONE` is
             // literally true rather than merely reused for convenience.
             Some(LINK_GONE.to_string())
-        } else if self.selected_row().is_none() {
+        } else if self.selected.is_none() {
             Some("no sheep is selected".to_string())
         } else if self.action.is_some() {
             Some("one action is already in flight".to_string())
@@ -973,11 +1028,29 @@ impl App {
             self.notice = Some(Notice { text, grave: true });
             return Effect::None;
         }
-        let row = self.selected_row().expect("checked just above");
+        let key = self.selected.clone().expect("checked just above");
+        let (target, name, count) = match &key {
+            RowKey::Sheep(id) => {
+                let row = self
+                    .flock
+                    .get(id)
+                    .expect("a selected sheep is in the flock");
+                (RowKey::Sheep(*id), row.info.name.clone(), 1)
+            }
+            RowKey::Group(group_name) => {
+                let count = self
+                    .flock
+                    .values()
+                    .filter(|row| &row.info.name == group_name)
+                    .count();
+                (RowKey::Group(group_name.clone()), group_name.clone(), count)
+            }
+        };
         self.action = Some(Action {
             verb,
-            id: row.info.id,
-            name: row.info.name.clone(),
+            target,
+            name,
+            count,
             at: self.now,
             stage: Stage::Armed,
         });
@@ -991,13 +1064,11 @@ impl App {
         };
         // The whole flock, not the visible set: a filter typed after arming
         // hides a sheep, it does not remove it.
-        if !self.flock.contains_key(&action.id) {
+        if !self.target_present(&action.target) {
             self.notice = Some(Notice {
                 text: format!(
-                    "{} {} (id {}): it is no longer in the flock",
-                    action.verb.label(),
-                    action.name,
-                    action.id
+                    "{}: it is no longer in the flock",
+                    target_prefix(action.verb, &action.target, &action.name)
                 ),
                 grave: true,
             });
@@ -1005,7 +1076,7 @@ impl App {
         }
         let sent = Sent::Action {
             verb: action.verb,
-            id: action.id,
+            target: action.target.clone(),
             name: action.name.clone(),
         };
         self.action = Some(Action {
@@ -1015,12 +1086,22 @@ impl App {
         Effect::Send(sent)
     }
 
-    /// Takes an armed prompt off the screen once its sheep is gone, rather
+    /// Whether `target` still has at least one process in the flock: a
+    /// single sheep by id, or a group by whether any instance of its name
+    /// remains.
+    fn target_present(&self, target: &RowKey) -> bool {
+        match target {
+            RowKey::Sheep(id) => self.flock.contains_key(id),
+            RowKey::Group(name) => self.flock.values().any(|row| &row.info.name == name),
+        }
+    }
+
+    /// Takes an armed prompt off the screen once its target is gone, rather
     /// than leaving a question about nothing. Called from the `Snapshot` arm
     /// and from the `Delete` arm; an action already in flight keeps its line.
     fn forget_missing_target(&mut self) {
         let gone = self.action.as_ref().is_some_and(|action| {
-            action.stage == Stage::Armed && !self.flock.contains_key(&action.id)
+            action.stage == Stage::Armed && !self.target_present(&action.target)
         });
         if gone {
             self.action = None;
@@ -1089,50 +1170,74 @@ impl App {
         }
     }
 
-    /// The ids the table draws, in name-then-id order: the whole flock, or
-    /// whatever the filter leaves of it.
+    /// The rows the table draws, in name-then-id order: the whole flock, or
+    /// whatever the filter leaves of it, as [`RowKey`]s rather than as a flat
+    /// list of ids.
     ///
-    /// The order is the one every operator-facing shep listing takes
-    /// ([`shep_core::protocol::sort_flock`]'s own doc). `flock` is a
-    /// `BTreeMap<u32, Row>`, so iterating it is id order, which is why the
-    /// sequence is materialised and re-keyed here rather than taken from the
-    /// map. That matters more in this pane than anywhere else: the table
-    /// repolls every two seconds, so a key that is not total would let two
-    /// instances of one app swap places under the operator's cursor between
-    /// refreshes. `(name, id)` is total, since no two sheep share both.
+    /// An app earns a [`RowKey::Group`] header, immediately before its own
+    /// [`RowKey::Sheep`] entries, under the same condition
+    /// `output::rows::FlockRows`'s own `name_groups`/`slotted` rule uses
+    /// (task 9): more than one instance of the name, every one of them
+    /// reporting a slot. The listing is sorted by `(name, instance, id)`
+    /// here for exactly that reason -- `sort_flock`'s own doc is why an
+    /// app's instances arrive adjacent and in slot order upstream, and this
+    /// sequence keeps that ordering rather than the plainer `(name, id)`
+    /// this function used before grouping existed.
     ///
-    /// [`Self::rows`], [`Self::select_at`], [`Self::select_by`],
-    /// [`Self::reseat`] and [`Self::selected_index`] all read this sequence
-    /// and nothing else. That is the whole point of it: a filter that hid rows
-    /// `j` and `k` still stepped over would move the cursor onto a sheep
-    /// nobody can see, and every pane below the table would then describe that
-    /// sheep with nothing on screen saying so.
+    /// The order is otherwise the one every operator-facing shep listing
+    /// takes. `flock` is a `BTreeMap<u32, Row>`, so iterating it is id
+    /// order, which is why the sequence is materialised and re-keyed here
+    /// rather than taken from the map. That matters more in this pane than
+    /// anywhere else: the table repolls every two seconds, so a key that is
+    /// not total would let two instances of one app swap places under the
+    /// operator's cursor between refreshes.
     ///
-    /// One lowercase allocation per call, for the query only. The flock is a
-    /// `BTreeMap` an operator is looking at, so it is tens of rows, not
-    /// thousands, and a cached needle would be a second source of truth for
-    /// [`Self::filter`].
-    fn visible_ids(&self) -> impl Iterator<Item = u32> + '_ {
+    /// [`Self::select_at`], [`Self::select_by`], [`Self::reseat`] and
+    /// [`Self::selected_index`] all read this sequence and nothing else.
+    /// That is the whole point of it: a filter that hid rows `j` and `k`
+    /// still stepped over would move the cursor onto a sheep nobody can see,
+    /// and every pane below the table would then describe that sheep with
+    /// nothing on screen saying so. A query narrows by NAME, so it can never
+    /// split one app's instances across the filter boundary, which is what
+    /// keeps a [`RowKey::Group`] and its own slots always adjacent here too.
+    #[must_use]
+    pub fn visible_rows(&self) -> Vec<RowKey> {
         let needle = self.filter.to_lowercase();
-        let mut visible: Vec<(&str, u32)> = self
+        let mut visible: Vec<(&str, Option<u32>, u32)> = self
             .flock
             .iter()
             .filter(|(_, row)| needle.is_empty() || row.info.name.to_lowercase().contains(&needle))
-            .map(|(id, row)| (row.info.name.as_str(), *id))
+            .map(|(id, row)| (row.info.name.as_str(), row.info.instance, *id))
             .collect();
-        visible.sort_unstable();
-        visible.into_iter().map(|(_name, id)| id)
+        visible.sort_unstable_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+        let mut out = Vec::with_capacity(visible.len());
+        let mut at = 0;
+        while at < visible.len() {
+            let name = visible[at].0;
+            let end = visible[at..]
+                .iter()
+                .position(|entry| entry.0 != name)
+                .map_or(visible.len(), |offset| at + offset);
+            let group = &visible[at..end];
+            if group.len() > 1 && group.iter().all(|entry| entry.1.is_some()) {
+                out.push(RowKey::Group(name.to_string()));
+            }
+            out.extend(group.iter().map(|entry| RowKey::Sheep(entry.2)));
+            at = end;
+        }
+        out
     }
 
     /// How many rows the table draws.
     fn visible_len(&self) -> usize {
-        self.visible_ids().count()
+        self.visible_rows().len()
     }
 
-    /// Puts the selection back on a real sheep after the flock changed.
+    /// Puts the selection back on a real row after the flock changed.
     ///
     /// `previous_index` is where the selection sat **before** the change, read
-    /// while the old map was still in place. A selection whose id survived is
+    /// while the old map was still in place. A selection whose key survived is
     /// left alone, whatever row it now occupies. One that did not falls to
     /// whatever occupies the same position, clamped to the last row — not to
     /// row 0, which would throw an operator back to the top of a
@@ -1156,24 +1261,14 @@ impl App {
         if self.selected_index().is_some() {
             return false;
         }
-        let before = self.selected;
-        let visible = self.visible_len();
-        if visible == 0 {
+        let before = self.selected.clone();
+        let visible = self.visible_rows();
+        if visible.is_empty() {
             self.selected = None;
             return before != self.selected;
         }
-        let index = previous_index.unwrap_or(0).min(visible - 1);
-        // Bound first, then assigned. `self.selected = self.visible_ids()
-        // .nth(index);` does NOT compile: `visible_ids` returns
-        // `impl Iterator<Item = u32> + '_`, whose temporary holds a shared
-        // borrow of ALL of `self` to the end of the statement, so the
-        // assignment overlaps it and rustc raises E0506. The line this
-        // replaces borrowed one FIELD (`self.flock.keys()`), which is why it
-        // was fine. `select_at` below takes the same two-line shape for the
-        // same reason. Verified with rustc on an edition-2024 scaffold, both
-        // ways round.
-        let next = self.visible_ids().nth(index);
-        self.selected = next;
+        let index = previous_index.unwrap_or(0).min(visible.len() - 1);
+        self.selected = Some(visible[index].clone());
         before != self.selected
     }
 
@@ -1197,15 +1292,15 @@ impl App {
     /// files off disk and asks the shepherd for lambs, and a held `k` at the
     /// top of the flock must not do that once per keypress.
     fn select_at(&mut self, index: usize) -> Effect {
-        let visible = self.visible_len();
-        if visible == 0 {
+        let visible = self.visible_rows();
+        if visible.is_empty() {
             return Effect::None;
         }
-        let next = self.visible_ids().nth(index.min(visible - 1));
-        if next == self.selected {
+        let next = visible[index.min(visible.len() - 1)].clone();
+        if Some(&next) == self.selected.as_ref() {
             return Effect::None;
         }
-        self.selected = next;
+        self.selected = Some(next);
         // The cursor moved; whether anything is READ is a separate question.
         // A frozen dashboard re-reading live log files would put content on
         // screen newer than the banner saying the values are frozen, which is
@@ -1218,15 +1313,26 @@ impl App {
         Effect::RefreshSelected
     }
 
-    /// The flock the table draws, in name-then-id order: the whole flock, or
-    /// whatever the filter leaves of it. See [`Self::all_rows`] for the unfiltered
-    /// sequence a pane describing the machine as a whole, not the table's
-    /// current view, needs instead.
+    /// Every sheep the table's rows are drawn from, in name-then-id order:
+    /// the whole flock, or whatever the filter leaves of it. See
+    /// [`Self::all_rows`] for the unfiltered sequence a pane describing the
+    /// machine as a whole, not the table's current view, needs instead.
+    ///
+    /// A flat sheep list, not [`Self::visible_rows`]'s own [`RowKey`]
+    /// sequence: this is what the title bar and the host-strip tests count,
+    /// and a group header is not a sheep to count twice against.
     #[must_use]
     pub fn rows(&self) -> Vec<&Row> {
-        self.visible_ids()
-            .filter_map(|id| self.flock.get(&id))
-            .collect()
+        let needle = self.filter.to_lowercase();
+        let mut visible: Vec<&Row> = self
+            .flock
+            .values()
+            .filter(|row| needle.is_empty() || row.info.name.to_lowercase().contains(&needle))
+            .collect();
+        visible.sort_unstable_by(|a, b| {
+            (a.info.name.as_str(), a.info.id).cmp(&(b.info.name.as_str(), b.info.id))
+        });
+        visible
     }
 
     /// Every sheep the shepherd last reported, in id order, whatever the
@@ -1293,25 +1399,114 @@ impl App {
         self.flock.len()
     }
 
-    /// The selected sheep's id, or `None` for an empty flock.
+    /// The selected row, or `None` for an empty flock.
     #[must_use]
-    pub fn selected(&self) -> Option<u32> {
-        self.selected
+    pub fn selected(&self) -> Option<RowKey> {
+        self.selected.clone()
     }
 
-    /// Which row of [`Self::rows`] the selection sits on.
+    /// Which row of [`Self::visible_rows`] the selection sits on.
     ///
     /// Derived every call rather than stored: see [`Self::selected`].
     #[must_use]
     pub fn selected_index(&self) -> Option<usize> {
-        let id = self.selected?;
-        self.visible_ids().position(|key| key == id)
+        let key = self.selected.clone()?;
+        self.visible_rows().iter().position(|row| *row == key)
     }
 
     /// The selected sheep's row, which the detail pane and the feed read.
+    ///
+    /// `None` for a [`RowKey::Group`] selection as well as for no selection
+    /// at all: a group has no single sheep to describe, and the panes that
+    /// call this read the `None` case as their own "nothing to show" state.
     #[must_use]
     pub fn selected_row(&self) -> Option<&Row> {
-        self.flock.get(&self.selected?)
+        match &self.selected {
+            Some(RowKey::Sheep(id)) => self.flock.get(id),
+            _ => None,
+        }
+    }
+
+    /// One sheep by id, whatever the filter hides -- the lookup a
+    /// [`RowKey::Sheep`] row's own rendering needs.
+    #[must_use]
+    pub fn row(&self, id: u32) -> Option<&Row> {
+        self.flock.get(&id)
+    }
+
+    /// Every instance of `name`, sorted by slot -- the members a
+    /// [`RowKey::Group`] row summarises.
+    #[must_use]
+    pub fn group_members(&self, name: &str) -> Vec<&Row> {
+        let mut members: Vec<&Row> = self
+            .flock
+            .values()
+            .filter(|row| row.info.name == name)
+            .collect();
+        members.sort_by_key(|row| row.info.instance.unwrap_or(u32::MAX));
+        members
+    }
+
+    /// `name`'s rolled-up numbers. See [`GroupTotals`]'s own doc for the
+    /// rule each field follows.
+    #[must_use]
+    pub fn group_totals(&self, name: &str) -> GroupTotals {
+        let members = self.group_members(name);
+        GroupTotals {
+            count: members.len(),
+            restarts: members.iter().map(|row| row.info.restarts).sum(),
+            cpu: members
+                .iter()
+                .filter_map(|row| row.info.cpu_percent)
+                .fold(None, |acc, cpu| Some(acc.unwrap_or(0.0) + cpu)),
+            memory: members
+                .iter()
+                .filter_map(|row| row.info.memory_bytes)
+                .fold(None, |acc, mem| Some(acc.unwrap_or(0) + mem)),
+            uptime_ms: members
+                .iter()
+                .filter_map(|row| self.uptime_ms(row.info.id))
+                .min(),
+        }
+    }
+
+    /// `name`'s STATUS cell: the shared status word when every instance
+    /// agrees, else a count per state -- the same rule
+    /// `output::rows::group_status` applies for `shep flock` (task 9), kept
+    /// here so the two surfaces read a mixed group the same way.
+    #[must_use]
+    pub fn group_status_text(&self, name: &str) -> String {
+        let members = self.group_members(name);
+        let Some(first) = members.first().map(|row| row.info.status) else {
+            return String::new();
+        };
+        if members.iter().all(|row| row.info.status == first) {
+            return first.to_string();
+        }
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for row in &members {
+            *counts.entry(row.info.status.to_string()).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(status, n)| format!("{n} {status}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `name`'s status, when every instance agrees on one -- what
+    /// [`view::flock`](super::view::flock)'s STATUS colouring and
+    /// [`view::detail`](super::view::detail)'s own status word key off,
+    /// mirroring `output::rows::group_paint`'s "a mixed group's plain count
+    /// text wears no colour" rule.
+    #[must_use]
+    pub fn group_uniform_status(&self, name: &str) -> Option<ProcStatus> {
+        let members = self.group_members(name);
+        let first = members.first()?.info.status;
+        members
+            .iter()
+            .all(|row| row.info.status == first)
+            .then_some(first)
     }
 
     /// The link state, as the status bar reports it.
@@ -1409,8 +1604,9 @@ impl App {
         let action = self.action.as_ref()?;
         Some(ActionState {
             verb: action.verb,
-            id: action.id,
+            target: &action.target,
             name: &action.name,
+            count: action.count,
             sent: action.stage == Stage::Sent,
         })
     }
@@ -1432,6 +1628,28 @@ impl App {
     #[cfg(test)]
     pub(crate) fn set_filter_for_tests(&mut self, query: &str) {
         self.filter = query.to_string();
+    }
+
+    /// Selects `key` directly, without walking the cursor. No production
+    /// caller needs this: every real selection change arrives by walking
+    /// (`select_by`/`select_at`) or by a snapshot's own [`Self::reseat`].
+    /// This exists only so a test can point the cursor at a specific group
+    /// or sheep without simulating keypresses.
+    #[cfg(test)]
+    fn select(&mut self, key: RowKey) {
+        self.selected = Some(key);
+    }
+}
+
+/// The prefix every action's notice shares: which verb, and which target.
+///
+/// A single sheep keeps the `(id N)` form unchanged from before this feature;
+/// a group names the app instead of an id, since there is no one id for the
+/// notice to name.
+fn target_prefix(verb: ActionVerb, target: &RowKey, name: &str) -> String {
+    match target {
+        RowKey::Sheep(id) => format!("{} {name} (id {id})", verb.label()),
+        RowKey::Group(_) => format!("{} all instances of {name}", verb.label()),
     }
 }
 
@@ -1518,6 +1736,106 @@ mod tests {
         app
     }
 
+    /// `allowed()`'s shape, but with three instances of one app instead of
+    /// three distinct ones: `web` at slots 0, 1 and 2, ids 1 through 3.
+    /// Nothing is selected here -- which row a `RowKey::Group` occupies is
+    /// exactly what the group tests are checking, so each one calls
+    /// `App::select` itself rather than trusting a walk to land there.
+    fn allowed_with_instances() -> App {
+        let t0 = Instant::now();
+        let mut app = App::new(
+            Palette::detect(None, None, None),
+            Control::Allowed,
+            "/home/ada/.shep".to_string(),
+            t0,
+        );
+        app.update(Msg::Snapshot {
+            rows: instanced_rows(),
+            at: t0,
+        });
+        app
+    }
+
+    /// `web`'s three instances, at slots 0, 1 and 2 and ids 1 through 3.
+    /// Shared by [`allowed_with_instances`] and the reseat test's own second
+    /// `Msg::Snapshot`, so a poll that repeats the same listing is the one
+    /// under test rather than the flock actually changing shape.
+    fn instanced_rows() -> Vec<ProcessInfo> {
+        (0..3)
+            .map(|slot| {
+                ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                    .instance(Some(slot))
+                    .build()
+            })
+            .collect()
+    }
+
+    /// The status bar's own rendered text, for the tests that assert on the
+    /// confirm prompt's wording rather than on the reducer's internal state.
+    fn status_line_text(app: &App) -> String {
+        super::super::view::fixtures::rendered(&super::super::view::status::status_line(app, 200))
+    }
+
+    /// fails if an app with more than one instance does not get a group
+    /// header above its own slots.
+    #[test]
+    fn a_multi_instance_app_shows_a_group_row_above_its_slots() {
+        let app = allowed_with_instances();
+        assert_eq!(
+            app.visible_rows().len(),
+            4,
+            "three slots and the group row above them"
+        );
+        assert!(matches!(app.visible_rows()[0], RowKey::Group(ref n) if n == "web"));
+    }
+
+    /// fails if an action armed on a group row sends against one instance
+    /// instead of the whole app. This is the test that would redden if
+    /// targeting regressed to `SelectorSpec::Id` for a group: the request
+    /// this asserts on can only be built from `RowKey::Group`, never from a
+    /// single pinned id.
+    #[test]
+    fn an_action_on_a_group_row_targets_the_whole_app_by_name() {
+        let mut app = allowed_with_instances();
+        app.select(RowKey::Group("web".to_string()));
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        let Effect::Send(sent) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter sends");
+        };
+        assert_eq!(
+            sent.request(),
+            Request::Stop {
+                selector: SelectorSpec::Name("web".to_string())
+            }
+        );
+    }
+
+    /// fails if the confirm prompt does not say how many processes a group
+    /// action reaches before the operator commits. The one place a keypress
+    /// reaches several processes is the one place the prompt has to say so.
+    #[test]
+    fn a_group_confirm_states_how_many_processes_it_reaches() {
+        let mut app = allowed_with_instances();
+        app.select(RowKey::Group("web".to_string()));
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        let prompt = status_line_text(&app);
+        assert!(prompt.contains('3'), "names the blast radius: {prompt}");
+    }
+
+    /// fails if a group selection does not survive the two-second poll. The
+    /// cursor has to reseat onto the SAME group, not fall back to whatever
+    /// row now occupies its old position.
+    #[test]
+    fn selection_survives_a_poll_on_both_row_kinds() {
+        let mut app = allowed_with_instances();
+        app.select(RowKey::Group("web".to_string()));
+        app.update(Msg::Snapshot {
+            rows: instanced_rows(),
+            at: Instant::now(),
+        });
+        assert_eq!(app.selected(), Some(RowKey::Group("web".to_string())));
+    }
+
     /// fails if an action key acts. It arms, and nothing has been sent: the
     /// whole point of the gate is that one keystroke in a dashboard somebody
     /// is reading does not become an action.
@@ -1530,7 +1848,7 @@ mod tests {
         );
         let armed = app.action().expect("armed");
         assert_eq!(armed.verb, ActionVerb::Stop);
-        assert_eq!(armed.id, 1);
+        assert_eq!(armed.target, &RowKey::Sheep(1));
         assert_eq!(armed.name, "web");
         assert!(!armed.sent, "nothing has gone out");
     }
@@ -1625,7 +1943,7 @@ mod tests {
         });
         assert_eq!(
             app.selected(),
-            Some(9),
+            Some(RowKey::Sheep(9)),
             "sanity: the cursor followed the filter off the armed id"
         );
         let Effect::Send(sent) = app.update(Msg::Key(KeyPress::Confirm)) else {
@@ -1635,7 +1953,7 @@ mod tests {
             sent,
             Sent::Action {
                 verb: ActionVerb::Stop,
-                id: 2,
+                target: RowKey::Sheep(2),
                 name: "api".to_string()
             }
         );
@@ -1867,7 +2185,11 @@ mod tests {
         let (mut app, t0) = started();
         app.update(Msg::Key(KeyPress::SelectDown));
         app.update(Msg::Key(KeyPress::SelectDown));
-        assert_eq!(app.selected(), Some(3), "the third row, worker");
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Sheep(3)),
+            "the third row, worker"
+        );
 
         // Sheep 1 goes away. `worker` is now row 1 rather than row 2 — an
         // index cursor would now be pointing at `api`.
@@ -1878,7 +2200,7 @@ mod tests {
             ],
             at: t0,
         });
-        assert_eq!(app.selected(), Some(3), "still worker");
+        assert_eq!(app.selected(), Some(RowKey::Sheep(3)), "still worker");
         assert_eq!(app.selected_index(), Some(1), "which is now row 1");
     }
 
@@ -1890,7 +2212,11 @@ mod tests {
     fn a_deleted_selection_falls_to_the_row_that_took_its_place() {
         let (mut app, t0) = started();
         app.update(Msg::Key(KeyPress::SelectDown));
-        assert_eq!(app.selected(), Some(1), "web, at index 1 by name");
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Sheep(1)),
+            "web, at index 1 by name"
+        );
 
         // web dies; api and worker remain. Index 1 is now worker.
         app.update(Msg::Snapshot {
@@ -1900,16 +2226,20 @@ mod tests {
             ],
             at: t0,
         });
-        assert_eq!(app.selected(), Some(3), "the row that took index 1");
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Sheep(3)),
+            "the row that took index 1"
+        );
 
         // The LAST row dying clamps rather than leaving the cursor past the end.
         app.update(Msg::Key(KeyPress::SelectLast));
-        assert_eq!(app.selected(), Some(3));
+        assert_eq!(app.selected(), Some(RowKey::Sheep(3)));
         app.update(Msg::Snapshot {
             rows: vec![sheep(2, "api", ProcStatus::Online)],
             at: t0,
         });
-        assert_eq!(app.selected(), Some(2));
+        assert_eq!(app.selected(), Some(RowKey::Sheep(2)));
 
         // An empty flock selects nothing at all, rather than an id that is gone.
         app.update(Msg::Snapshot {
@@ -2046,9 +2376,13 @@ mod tests {
             Effect::None,
             "no file is read once the link is lost"
         );
-        assert_eq!(app.selected(), Some(1), "but the cursor moved anyway");
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Sheep(1)),
+            "but the cursor moved anyway"
+        );
         assert_eq!(app.update(Msg::Key(KeyPress::SelectLast)), Effect::None);
-        assert_eq!(app.selected(), Some(3));
+        assert_eq!(app.selected(), Some(RowKey::Sheep(3)));
     }
 
     /// fails if a dropped or lagged frame stops triggering an immediate poll.
@@ -2663,17 +2997,25 @@ mod tests {
     #[test]
     fn j_and_k_step_only_over_visible_rows() {
         let mut app = filtered("web");
-        assert_eq!(app.selected(), Some(1), "api-web, the first visible sheep");
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Sheep(1)),
+            "api-web, the first visible sheep"
+        );
         app.update(Msg::Key(KeyPress::SelectDown));
         assert_eq!(
             app.selected(),
-            Some(4),
+            Some(RowKey::Sheep(4)),
             "web-worker, skipping the hidden cron and queue"
         );
         app.update(Msg::Key(KeyPress::SelectDown));
-        assert_eq!(app.selected(), Some(4), "clamped at the last visible row");
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Sheep(4)),
+            "clamped at the last visible row"
+        );
         app.update(Msg::Key(KeyPress::SelectUp));
-        assert_eq!(app.selected(), Some(1));
+        assert_eq!(app.selected(), Some(RowKey::Sheep(1)));
     }
 
     /// fails if `SelectLast` measures the flock rather than the visible set.
@@ -2681,7 +3023,11 @@ mod tests {
     fn select_last_lands_on_the_last_visible_row() {
         let mut app = filtered("web");
         app.update(Msg::Key(KeyPress::SelectLast));
-        assert_eq!(app.selected(), Some(4), "web-worker, not queue at id 3");
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Sheep(4)),
+            "web-worker, not queue at id 3"
+        );
     }
 
     /// fails if a filter that hides the selection snaps to row 0, or drops the
@@ -2693,11 +3039,15 @@ mod tests {
     fn a_filter_that_hides_the_selection_clamps_to_the_nearest_visible_row() {
         let mut app = filtered("");
         app.update(Msg::Key(KeyPress::SelectLast));
-        assert_eq!(app.selected(), Some(4), "web-worker, position 3 of 4");
+        assert_eq!(
+            app.selected(),
+            Some(RowKey::Sheep(4)),
+            "web-worker, position 3 of 4"
+        );
         app.set_filter("web".to_string());
         assert_eq!(
             app.selected(),
-            Some(4),
+            Some(RowKey::Sheep(4)),
             "position 3 clamps to the last visible row, which is web-worker"
         );
     }
@@ -2748,7 +3098,7 @@ mod tests {
         let mut app = filtered("zzz");
         app.set_filter(String::new());
         assert_eq!(app.rows().len(), 4);
-        assert_eq!(app.selected(), Some(1), "seated again");
+        assert_eq!(app.selected(), Some(RowKey::Sheep(1)), "seated again");
     }
 
     /// fails if the three states `ProcessInfo::lambs` distinguishes get
@@ -2869,7 +3219,7 @@ mod tests {
         app.update(Msg::Replied {
             sent: Sent::Action {
                 verb: ActionVerb::Stop,
-                id: 2,
+                target: RowKey::Sheep(2),
                 name: "api".to_string(),
             },
             result: Ok(Response::Stopped(vec![sheep(
@@ -2907,7 +3257,7 @@ mod tests {
         app.update(Msg::Replied {
             sent: Sent::Action {
                 verb: ActionVerb::Reload,
-                id: 2,
+                target: RowKey::Sheep(2),
                 name: "api".to_string(),
             },
             result: Ok(Response::Reloading(vec![sheep(
@@ -2936,7 +3286,7 @@ mod tests {
         app.update(Msg::Replied {
             sent: Sent::Action {
                 verb: ActionVerb::Restart,
-                id: 2,
+                target: RowKey::Sheep(2),
                 name: "api".to_string(),
             },
             result: Err(RequestError::Rpc(RpcError {
@@ -2962,7 +3312,7 @@ mod tests {
         app.update(Msg::Replied {
             sent: Sent::Action {
                 verb: ActionVerb::Stop,
-                id: 2,
+                target: RowKey::Sheep(2),
                 name: "api".to_string(),
             },
             result: Err(RequestError::Closed),
@@ -2993,7 +3343,7 @@ mod tests {
             app.update(Msg::Replied {
                 sent: Sent::Action {
                     verb: ActionVerb::Restart,
-                    id: 2,
+                    target: RowKey::Sheep(2),
                     name: "api".to_string(),
                 },
                 result: Ok(reply),

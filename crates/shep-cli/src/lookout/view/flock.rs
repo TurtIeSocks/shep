@@ -16,7 +16,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::super::app::{App, Row};
+use super::super::app::{App, GroupTotals, Row, RowKey};
 use crate::output::width::char_columns;
 use crate::output::{exit_cell, human_bytes, human_duration};
 
@@ -360,6 +360,84 @@ pub fn header_line(columns: &[Column], width: u16, style: Style) -> Line<'static
         text.push_str(&fit(column.header(), cell_width));
     }
     Line::from(Span::styled(text, style))
+}
+
+/// One line for a row the table draws: a real sheep, or the header above an
+/// app's grouped instances.
+#[must_use]
+pub fn key_line(app: &App, key: &RowKey, columns: &[Column], width: u16) -> Line<'static> {
+    match key {
+        RowKey::Sheep(id) => {
+            let row = app.row(*id).expect("a visible sheep is in the flock");
+            row_line(app, row, columns, width)
+        }
+        RowKey::Group(name) => group_line(app, name, columns, width),
+    }
+}
+
+/// An app's group header row: [`App::group_totals`]'s own rollup, in the
+/// same columns [`row_line`] uses for a real sheep. Mirrors
+/// `output::rows::FlockRows`'s own group row (task 9) so the two surfaces
+/// never disagree about what an app's instances add up to.
+///
+/// No row style beyond STATUS, the same rule [`row_line`] follows: the
+/// selected row is shown by the marker in the gutter column ([`mark`]).
+fn group_line(app: &App, name: &str, columns: &[Column], width: u16) -> Line<'static> {
+    let palette = app.palette();
+    let totals = app.group_totals(name);
+    let name_width = self::name_width(width, columns);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(columns.len() * 2);
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let cell_width = if *column == Column::Name {
+            name_width
+        } else {
+            column.width()
+        };
+        let text = fit(&group_cell(app, name, *column, &totals), cell_width);
+        let style = if *column == Column::Status {
+            app.group_uniform_status(name)
+                .map_or(Style::default(), |status| palette.status(status))
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// One cell of an app's group header row.
+///
+/// ID, PID and EXIT are blank -- not `-`: there is no single id, pid or
+/// exit for a group row to have "no honest value" about, the way a real
+/// sheep's absent pid does. FOLD and SMIT read the first member's, since
+/// both are per-app facts every instance shares.
+fn group_cell(app: &App, name: &str, column: Column, totals: &GroupTotals) -> String {
+    match column {
+        Column::Id | Column::Pid | Column::Exit => String::new(),
+        Column::Name => format!("{name} \u{d7}{}", totals.count),
+        Column::Status => app.group_status_text(name),
+        Column::Restarts => totals.restarts.to_string(),
+        Column::Cpu => totals
+            .cpu
+            .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+        Column::Mem => totals.memory.map_or_else(|| "-".to_string(), human_bytes),
+        Column::Uptime => totals
+            .uptime_ms
+            .map_or_else(|| "-".to_string(), human_duration),
+        Column::Fold => app
+            .group_members(name)
+            .first()
+            .and_then(|row| row.info.fold.clone())
+            .unwrap_or_else(|| "-".to_string()),
+        Column::Smit => app
+            .group_members(name)
+            .first()
+            .and_then(|row| row.info.smit.clone())
+            .unwrap_or_else(|| "-".to_string()),
+    }
 }
 
 /// One sheep's line. The STATUS cell is the only one that carries colour.

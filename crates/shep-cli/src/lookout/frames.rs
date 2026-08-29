@@ -44,7 +44,7 @@ use shep_client::RequestError;
 use shep_core::protocol::{ExitInfo, Lamb, ProcessInfo, Response, RpcError, RpcErrorCode};
 use shep_core::status::ProcStatus;
 
-use super::app::{ActionVerb, App, Control, KeyPress, Msg, Sent};
+use super::app::{ActionVerb, App, Control, KeyPress, Msg, RowKey, Sent};
 use super::source::HostSample;
 use super::tail::{Stream, Tail, TailLine};
 use super::theme::Palette;
@@ -400,7 +400,7 @@ pub fn scene(which: Scene) -> (&'static str, Buffer) {
 #[track_caller]
 fn select_id(app: &mut App, id: u32) {
     for _ in 0..=app.flock_len() {
-        if app.selected() == Some(id) {
+        if app.selected() == Some(RowKey::Sheep(id)) {
             return;
         }
         app.update(Msg::Key(KeyPress::SelectDown));
@@ -739,7 +739,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 app.update(Msg::Replied {
                     sent: Sent::Action {
                         verb: ActionVerb::Restart,
-                        id: 2,
+                        target: RowKey::Sheep(2),
                         name: "api".to_string(),
                     },
                     result: Ok(Response::Restarted(vec![restarted_api()])),
@@ -755,7 +755,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 app.update(Msg::Replied {
                     sent: Sent::Action {
                         verb: ActionVerb::Restart,
-                        id: 2,
+                        target: RowKey::Sheep(2),
                         name: "api".to_string(),
                     },
                     result: Err(RequestError::Rpc(RpcError {

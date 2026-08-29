@@ -8,7 +8,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::super::app::{App, Control, InputMode, Link};
+use super::super::app::{ActionState, App, Control, InputMode, Link, RowKey};
 use super::flock::fit;
 
 /// The title: what this is, where it points, and how big the flock is.
@@ -74,15 +74,7 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // Slot 1. A18: a question awaiting an answer outranks everything,
         // including the filter box, which it cannot coexist with anyway
         // because `/` cancels a confirm before it opens the box.
-        (
-            format!(
-                "{} {} (id {})? enter confirms, any other key cancels",
-                action.verb.label(),
-                action.name,
-                action.id
-            ),
-            palette.attention(),
-        )
+        (confirm_prompt(&action), palette.attention())
     } else if app.mode() == InputMode::Text {
         // ABOVE the notice, not below it. `Msg::BusLagged`,
         // `BusEvent::Dropped` and `BusEvent::DaemonShutdown` all raise notices
@@ -129,12 +121,7 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // cannot wipe it, and that is a property of the reducer, not of this
         // order: the next keypress clears the notice and this line comes
         // back.
-        let text = format!(
-            "{} {} (id {}): sent, waiting for the shepherd",
-            action.verb.label(),
-            action.name,
-            action.id
-        );
+        let text = in_flight_text(&action);
         // `attention`, the same butter the non-grave notice uses. Not a
         // modal, not a box, not a `ratatui::widgets::Clear`: there is no
         // overlay anywhere in this module, and one rule under the header
@@ -170,6 +157,46 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         Span::styled(fit(&left, left_width), left_style),
         Span::styled(format!(" {right}"), palette.muted()),
     ])
+}
+
+/// The confirm prompt's own sentence: which verb, which target, and how to
+/// answer.
+///
+/// A group row is the one place a keypress reaches several processes, so
+/// the prompt says how many before the operator commits. A single sheep
+/// keeps the `(id N)` form unchanged from before this feature.
+fn confirm_prompt(action: &ActionState<'_>) -> String {
+    match action.target {
+        RowKey::Sheep(id) => format!(
+            "{} {} (id {id})? enter confirms, any other key cancels",
+            action.verb.label(),
+            action.name
+        ),
+        RowKey::Group(name) => {
+            let count = action.count;
+            format!(
+                "{} all {count} instances of {name}? enter confirms, any other key cancels",
+                action.verb.label()
+            )
+        }
+    }
+}
+
+/// The in-flight line: the same verb-and-target naming [`confirm_prompt`]
+/// uses, once the request has already gone out.
+fn in_flight_text(action: &ActionState<'_>) -> String {
+    match action.target {
+        RowKey::Sheep(id) => format!(
+            "{} {} (id {id}): sent, waiting for the shepherd",
+            action.verb.label(),
+            action.name
+        ),
+        RowKey::Group(name) => format!(
+            "{} all {} instances of {name}: sent, waiting for the shepherd",
+            action.verb.label(),
+            action.count
+        ),
+    }
 }
 
 /// The key hint.
