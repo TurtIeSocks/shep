@@ -1602,6 +1602,31 @@ target = "http://127.0.0.1:8080/healthz"
     }
 
     #[test]
+    fn a_name_only_template_does_not_resolve_the_collision() {
+        // `{{name}}` is the same for every instance, so a path carrying only it
+        // still puts every instance on one file. Presence of a token is not the
+        // test; rendering differently is.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 3;
+        app.out_file = Some("/var/log/{{name}}.log".to_string());
+        assert!(normalize(app).is_err());
+    }
+
+    #[test]
+    fn a_bad_template_in_a_log_path_is_reported_as_bad_template_not_shared_path() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 3;
+        app.out_file = Some("/var/log/web-{{instnace}}.log".to_string());
+        match normalize(app).unwrap_err() {
+            NormalizeError::BadTemplate { field, reason, .. } => {
+                assert_eq!(field, "out_file");
+                assert!(reason.contains("instnace"), "{reason}");
+            }
+            other => panic!("expected BadTemplate, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn watch_options_without_watch_or_cwd_accepted() {
         // fails if the check is keyed on `watch_options` being non-empty
         // rather than on `watch` being true — that would reject a Flockfile

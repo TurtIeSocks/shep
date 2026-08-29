@@ -163,7 +163,7 @@ const INHERITED: &[&str] = &[
 /// When `merge_logs = true`, they become `logs/<name>-out.log` and `-err.log`
 /// (shared across all instances). Explicit `out_file`/`err_file` config
 /// always win over defaults, and are rendered through the
-/// `{{instance}}`/`{{name}}` grammar the same as `env` and `args` — normalize
+/// `{{instance}}`/`{{name}}` grammar the same as `env` and `args`. normalize
 /// has already refused a path that would render alike for every instance,
 /// unless `merge_logs` asked for that on purpose.
 ///
