@@ -323,16 +323,16 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
     Ok((lines, truncated))
 }
 
-/// Renders the selected files of every sheep the selector admits, in id
+/// Renders the selected files of every sheep the selector admits, in flock
 /// order, and returns the exit code that reports how that went.
 ///
 /// Within one sheep, `out_file` (unless `--err`) prints before `err_file`
 /// (unless `--out`) — this module's own doc states the ordering limitation
 /// that follows from it. The matched sheep are sorted before anything is
 /// read -- `cache` is a `HashMap` and its iteration order is arbitrary -- by
-/// name and then by id, the one order every operator-facing listing takes
-/// (`shep_core::protocol::sort_flock`). It was id order until that rule was
-/// made the only one.
+/// name, then instance slot, then id, the one order every operator-facing
+/// listing takes (`shep_core::protocol::sort_flock`). It was id order until
+/// that rule was made the only one.
 ///
 /// A `None` path means the shepherd predates the field (module doc,
 /// [`shep_core::protocol::ProcessInfo::out_file`]) — one `log_path_unknown`
@@ -354,11 +354,17 @@ fn tail_log_files(
         .values()
         .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref(), info.instance))
         .collect();
-    // Name then id, the one order every operator-facing shep listing takes
-    // (`shep_core::protocol::sort_flock`'s own doc). Not `sort_flock` itself:
-    // this is a `Vec<&ProcessInfo>` borrowed out of the cache, and copying the
-    // rows to reach the helper would buy nothing but a clone per sheep.
-    matched.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
+    // `(name, instance, id)`, the one order every operator-facing shep
+    // listing takes (`shep_core::protocol::sort_flock`'s own doc). Not
+    // `sort_flock` itself: this is a `Vec<&ProcessInfo>` borrowed out of the
+    // cache, and copying the rows to reach the helper would buy nothing but a
+    // clone per sheep -- but the KEY is the shared one, character for
+    // character. Without the slot, `shep bleats web` read the instances of a
+    // reloaded app out of order, because a reload gives slot 0 a fresh high
+    // id and id alone then sorts that instance last.
+    matched.sort_unstable_by(|a, b| {
+        (a.name.as_str(), a.instance, a.id).cmp(&(b.name.as_str(), b.instance, b.id))
+    });
 
     let mut failure = false;
 
@@ -2086,6 +2092,66 @@ mod tests {
         assert!(
             a_pos < b_pos,
             "name order puts `a` (id 2) before `b` (id 1): {rendered}"
+        );
+    }
+
+    /// fails if one app's instances are tailed in id order rather than in
+    /// slot order.
+    ///
+    /// A reload replaces slot 0 with a fresh process at a fresh high id, so
+    /// after one, id order reads the app's instances 1, 2, 0. The listing
+    /// every other surface prints is `(name, instance, id)`, and this one
+    /// claimed to take it while sorting by `(name, id)`.
+    ///
+    /// The fixture puts slot 0 at the HIGHEST id, so id order and slot order
+    /// disagree, and scripts the listing in slot order so the cache's
+    /// arbitrary `HashMap` order cannot be what makes the assertion pass.
+    #[tokio::test]
+    async fn one_apps_instances_are_printed_in_slot_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = shep_client::testing::control_address(dir.path());
+
+        let (client, daemon) = fake_client_with_push(&sock).await;
+        let mut listing = Vec::new();
+        // Slot 0 reloaded, so it holds id 9 while slots 1 and 2 kept 1 and 2.
+        for (id, slot) in [(9_u32, 0_u32), (1, 1), (2, 2)] {
+            let mut sheep = info(id, "web");
+            sheep.instance = Some(slot);
+            sheep.out_file = Some(write_log(
+                dir.path(),
+                &format!("web-{slot}-out.log"),
+                &format!("line-from-slot-{slot}\n"),
+            ));
+            listing.push(sheep);
+        }
+        daemon.reply_to_list(listing);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            tokio::time::timeout(
+                RUN_TIMEOUT,
+                bleats(&client, &mut streams, false, &no_follow_args_out("all")),
+            )
+            .await
+            .expect("--no-follow never subscribes, so it must terminate on its own");
+        }
+        let rendered = String::from_utf8(out).unwrap();
+
+        let at = |slot: u32| {
+            rendered
+                .find(&format!("line-from-slot-{slot}"))
+                .unwrap_or_else(|| panic!("slot {slot}'s line is present: {rendered}"))
+        };
+        assert!(
+            at(0) < at(1) && at(1) < at(2),
+            "slot order, not id order (which would read 1, 2, 0): {rendered}"
         );
     }
 
