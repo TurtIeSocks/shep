@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-08-29
+
+### Changed
+
+- Unify dog-action and reply-row Render impls in rows.rs
+- Expand the shared JSON-key rule as a macro, for 1.93's sake
+
+### Performance
+
+- Hand paint the rows it consumes, and demote the last rustdoc rationale
+
+
 ## [0.1.10] - 2026-08-28
 
 ### Fixed
