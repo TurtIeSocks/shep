@@ -11,6 +11,8 @@
 //! and none of those three carries a `cfg` of any kind, so this really is
 //! pure tier.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use shep_core::barks::{Bark, SinkOutcome};
 use shep_core::protocol::{
@@ -96,22 +98,76 @@ impl Render for FlockRows {
     /// - CPU and MEM: a magnitude ramp -- see [`cpu_role`]/[`mem_role`] for
     ///   the thresholds and the reasoning behind them.
     ///
-    /// Reuses [`Self::rows`] for the cell text itself rather than rebuilding
-    /// it, so this method only ever decides colour, never content.
-    ///
     /// `status_word` is a plain parameter, not part of `Presentation`,
     /// because it is not a fact resolved once at the seam the way `level`/
     /// `colour`/`deep_colour` are -- it is `table_of`'s (`output/mod.rs`)
     /// own per-attempt decision, local to its two calls here, and putting
     /// it on `Presentation` would have made it crate-wide state that ~100
     /// call sites construct for a question only this one method ever asks.
+    ///
+    /// D4: an app running several instances groups under one header row when
+    /// the table is boxed, so its slots read as one app rather than as
+    /// several identical rows sharing a name -- the listing arrives sorted
+    /// by (name, instance, id) (`sort_flock`), so an app's instances are
+    /// already adjacent and one pass can group them. A flat style (`bare`)
+    /// suffixes the name instead (`web:0`, `web:1`), so a single line still
+    /// answers "which instance" for a reader who greps rather than looks. A
+    /// single instance, or a listing from a daemon that predates `instance`
+    /// (every row's `instance` is `None`), renders exactly as it did before
+    /// this feature -- see [`plain_row`]'s own doc. `Self::rows` still
+    /// serves `Format::Json` unmodified: JSON stays one object per process,
+    /// with `instance` riding along, rather than growing a nested shape.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        /// What painted one output row, so [`paint`] can key its rule off
+        /// the right source: a real sheep for a slot or a plain row, or the
+        /// whole group for the header row above its slots.
+        enum RowSource<'a> {
+            /// A slot row or a plain (ungrouped) row.
+            Sheep(&'a ProcessInfo),
+            /// A group's header row, plus its already-summed totals.
+            Group(&'a [ProcessInfo], GroupTotals),
+        }
+
+        let mut out = Vec::with_capacity(self.0.len());
+        let mut sources: Vec<RowSource<'_>> = Vec::with_capacity(self.0.len());
+        let mut at = 0;
+        while at < self.0.len() {
+            let name = self.0[at].name.as_str();
+            let end = self.0[at..]
+                .iter()
+                .position(|p| p.name != name)
+                .map_or(self.0.len(), |offset| at + offset);
+            let group = &self.0[at..end];
+            // A slot nobody reported cannot be grouped or suffixed: an
+            // older shepherd's listing renders exactly as it did before the
+            // field.
+            let slotted = group.len() > 1 && group.iter().all(|p| p.instance.is_some());
+            if slotted && presentation.level.boxes() {
+                let totals = group_totals(group);
+                out.push(group_row(group, &totals));
+                sources.push(RowSource::Group(group, totals));
+                for p in group {
+                    out.push(slot_row(p));
+                    sources.push(RowSource::Sheep(p));
+                }
+            } else {
+                for p in group {
+                    out.push(plain_row(p, slotted));
+                    sources.push(RowSource::Sheep(p));
+                }
+            }
+            at = end;
+        }
+
         paint(
-            self.rows(),
+            out,
             Self::headers(),
             presentation,
             status_word,
-            |header, _cell, index| process_info_paint(header, &self.0[index]),
+            |header, _cell, index| match &sources[index] {
+                RowSource::Sheep(p) => process_info_paint(header, p),
+                RowSource::Group(g, totals) => group_paint(header, g, totals),
+            },
         )
     }
 
@@ -151,9 +207,11 @@ impl Render for FlockRows {
         // in a later task; this list just keeps the shape consistent with
         // every other verb answering `ProcessInfo`.
         "lambs",
-        // No column yet: a later task grows the table to group rows by app
-        // and label each one's slot. Until then it rides the JSON so a
-        // programmatic consumer can already tell instances apart.
+        // No column: the table now groups an app's instances under one
+        // header row (`rows_for`) and labels each slot rather than adding a
+        // column for it, but JSON stays flat -- one object per process,
+        // `instance` riding along -- so a programmatic consumer never has to
+        // learn a nested shape.
         "instance",
     ];
 
@@ -186,6 +244,183 @@ impl Render for FlockRows {
     // The maintainer's ruling is that it belongs among the first columns to yield, and
     // 8 is the literal reading of that.
     const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
+}
+
+/// An app's summed CPU/MEM/RESTARTS and its earliest UPTIME, computed once
+/// per group and shared by [`group_row`] (the cell text) and [`group_paint`]
+/// (the roles CPU/MEM/RESTARTS wear), so the two never sum the same slice
+/// twice.
+struct GroupTotals {
+    /// Every slot's restarts, added up: how many times this app as a whole
+    /// has needed to come back.
+    restarts: u32,
+    /// Every slot's CPU reading summed, `None` only when not one slot has a
+    /// live reading -- the same "no honest value" rule a single sheep's own
+    /// CPU cell follows.
+    cpu: Option<f32>,
+    /// Every slot's memory reading summed, `None` for the same reason `cpu`
+    /// is: this is what the app costs, not an average of it.
+    memory: Option<u64>,
+    /// The MINIMUM uptime across slots, so this reads as time since the app
+    /// was last disturbed rather than as the age of its luckiest instance.
+    uptime_ms: u64,
+}
+
+/// Sums a group's per-slot numbers into the facts [`group_row`] prints and
+/// [`group_paint`] colours.
+fn group_totals(group: &[ProcessInfo]) -> GroupTotals {
+    GroupTotals {
+        restarts: group.iter().map(|p| p.restarts).sum(),
+        cpu: group
+            .iter()
+            .filter_map(|p| p.cpu_percent)
+            .fold(None, |acc, c| Some(acc.unwrap_or(0.0) + c)),
+        memory: group
+            .iter()
+            .filter_map(|p| p.memory_bytes)
+            .fold(None, |acc, m| Some(acc.unwrap_or(0) + m)),
+        uptime_ms: group.iter().map(|p| p.uptime_ms).min().unwrap_or(0),
+    }
+}
+
+/// The header above an app's instances: what the app costs, and how many of
+/// it there are. Per-app facts live here rather than being repeated down
+/// every slot row, which is what FOLD and SMIT already are.
+///
+/// STATUS is left as [`group_status`]'s plain text -- the word alone, no
+/// face and no colour -- so [`group_paint`] can dress it up through the same
+/// [`Paint::Status`] path a real sheep's STATUS cell takes, rather than
+/// baking a presentation decision into the text itself.
+fn group_row(group: &[ProcessInfo], totals: &GroupTotals) -> Vec<String> {
+    let first = &group[0];
+    vec![
+        String::new(),
+        format!("{} \u{d7}{}", first.name, group.len()),
+        group_status(group),
+        String::new(),
+        totals.restarts.to_string(),
+        String::new(),
+        totals
+            .cpu
+            .map_or_else(|| "-".to_string(), |c| format!("{c:.1}%")),
+        totals
+            .memory
+            .map_or_else(|| "-".to_string(), super::human_bytes),
+        super::human_duration(totals.uptime_ms),
+        first.fold.clone().unwrap_or_else(|| "-".to_string()),
+        first.smit.clone().unwrap_or_else(|| "-".to_owned()),
+    ]
+}
+
+/// One instance under its group header. `\u{21b3} :2` teaches the `web:2`
+/// selector by sitting under the name the header already printed, so NAME
+/// itself carries only the marker rather than repeating a name the header
+/// row already gave.
+///
+/// FOLD and SMIT are blank, not `-`: the group row above carries both, and
+/// repeating a per-app fact down every slot row is noise -- the daemon keys
+/// a smit by name, not by instance, so it is already an app-level fact.
+fn slot_row(p: &ProcessInfo) -> Vec<String> {
+    let slot = p
+        .instance
+        .map_or_else(String::new, |s| format!(" \u{21b3} :{s}"));
+    vec![
+        p.id.to_string(),
+        slot,
+        p.status.to_string(),
+        p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+        p.restarts.to_string(),
+        exit_cell(p.pid, p.last_exit),
+        p.cpu_percent
+            .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+        p.memory_bytes
+            .map_or_else(|| "-".to_string(), super::human_bytes),
+        super::human_duration(p.uptime_ms),
+        String::new(),
+        String::new(),
+    ]
+}
+
+/// One line per process: what every row rendered before this feature, and
+/// still what an app with one instance, a mixed group missing a slot, or a
+/// flat style renders.
+///
+/// `slotted` is true only when this app has more than one instance and every
+/// one of them reported its slot -- the only case that earns a `web:0`
+/// suffix. Anything else (one instance, or a slot nobody reported) leaves
+/// NAME exactly as [`FlockRows::rows`] always has, which is what keeps a
+/// single-instance app and an older daemon's listing byte-identical to
+/// before this feature.
+fn plain_row(p: &ProcessInfo, slotted: bool) -> Vec<String> {
+    let name = match (slotted, p.instance) {
+        (true, Some(slot)) => format!("{}:{slot}", p.name),
+        _ => p.name.clone(),
+    };
+    vec![
+        p.id.to_string(),
+        name,
+        p.status.to_string(),
+        p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+        p.restarts.to_string(),
+        exit_cell(p.pid, p.last_exit),
+        p.cpu_percent
+            .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
+        p.memory_bytes
+            .map_or_else(|| "-".to_string(), super::human_bytes),
+        super::human_duration(p.uptime_ms),
+        p.fold.clone().unwrap_or_else(|| "-".to_string()),
+        p.smit.clone().unwrap_or_else(|| "-".to_owned()),
+    ]
+}
+
+/// The group's status: the shared word when every instance agrees, else a
+/// count per state, so a mixed group says what it is rather than picking a
+/// winner an operator would then act on. Plain text either way -- see
+/// [`group_row`]'s own doc for why the face and colour are left to
+/// [`group_paint`].
+fn group_status(group: &[ProcessInfo]) -> String {
+    let first = group[0].status;
+    if group.iter().all(|p| p.status == first) {
+        return first.to_string();
+    }
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for p in group {
+        *counts.entry(p.status.to_string()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(status, n)| format!("{n} {status}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The treatment a group's header row wears, mirroring [`process_info_paint`]
+/// for the columns that carry a rollup: RESTARTS, CPU and MEM read
+/// [`GroupTotals`] rather than one sheep's own fields, and STATUS colours
+/// through [`Paint::Status`] only when every slot agrees -- a mixed group's
+/// plain count text (already the whole cell) wears no colour, the same
+/// "nothing of its own to say" rule chrome and dashes already follow.
+///
+/// ID is left off the chrome list [`process_info_paint`] gives it: a real
+/// sheep's ID is chrome because it is a stable label the eye should skip
+/// past, but a group row's ID cell has no id at all, and colouring an empty
+/// cell has nothing to say either.
+fn group_paint(header: &str, group: &[ProcessInfo], totals: &GroupTotals) -> Paint {
+    match header {
+        "FOLD" => Paint::Role(Role::Ink3),
+        "STATUS" => {
+            let first = group[0].status;
+            if group.iter().all(|p| p.status == first) {
+                Paint::Status(first)
+            } else {
+                Paint::Default
+            }
+        }
+        "RESTARTS" => Paint::Role(restarts_role(totals.restarts)),
+        "CPU" => Paint::Role(cpu_role(totals.cpu)),
+        "MEM" => Paint::Role(mem_role(totals.memory)),
+        _ => Paint::Default,
+    }
 }
 
 /// One STATUS cell, per spec §2 -- the only place in this module a face or a
@@ -2936,6 +3171,107 @@ pub(crate) mod tests {
         let mem = cells[headers.iter().position(|h| *h == "MEM").unwrap()].clone();
         assert_eq!(cpu, "-");
         assert_eq!(mem, "-");
+    }
+
+    /// `Presentation` at [`StyleLevel::Full`] for the group-row tests below:
+    /// boxes on, so `rows_for` takes the grouping branch. `NO_COLOR` set,
+    /// same as `table.rs`'s own `full_under_no_color_pins_sheep_and_boxes_
+    /// without_colour`, so these tests compare literal cell text rather than
+    /// an ANSI-wrapped one.
+    fn full_presentation() -> Presentation {
+        use crate::style::StyleLevel;
+        Presentation::new(
+            StyleLevel::Full,
+            Some(std::ffi::OsStr::new("1")),
+            None,
+            None,
+            200,
+        )
+    }
+
+    /// `Presentation` at [`StyleLevel::Bare`] for the group-row tests below:
+    /// boxes off, so `rows_for` takes the flat, suffixed branch instead.
+    fn bare_presentation() -> Presentation {
+        use crate::style::StyleLevel;
+        Presentation::new(StyleLevel::Bare, None, None, None, 200)
+    }
+
+    #[test]
+    fn a_single_instance_app_is_untouched_by_grouping() {
+        let rows = FlockRows(vec![
+            ProcessInfo::builder(4, "api", ProcStatus::Online)
+                .instance(Some(0))
+                .build(),
+        ]);
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered.len(), 1, "no group row for one instance");
+        assert_eq!(rendered[0][1], "api", "and no suffix");
+    }
+
+    #[test]
+    fn a_multi_instance_app_gets_a_group_row_then_its_slots() {
+        let rows = FlockRows(
+            (0..3)
+                .map(|slot| {
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered.len(), 4, "one group row plus three slots");
+        assert_eq!(rendered[0][0], "", "the group row has no id");
+        assert!(rendered[0][1].contains("web"), "{:?}", rendered[0]);
+        assert!(
+            rendered[0][1].contains('3'),
+            "and the count: {:?}",
+            rendered[0]
+        );
+        assert_eq!(rendered[1][0], "1", "slot rows keep their ids");
+    }
+
+    #[test]
+    fn a_mixed_group_says_so_rather_than_picking_a_winner() {
+        let rows = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .instance(Some(0))
+                .build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Stopped)
+                .instance(Some(1))
+                .build(),
+        ]);
+        let rendered = rows.rows_for(full_presentation(), true);
+        let status = &rendered[0][2];
+        assert!(status.contains('1'), "counts each state: {status}");
+    }
+
+    #[test]
+    fn a_flat_style_suffixes_the_name_instead_of_grouping() {
+        let rows = FlockRows(
+            (0..2)
+                .map(|slot| {
+                    ProcessInfo::builder(slot + 1, "web", ProcStatus::Online)
+                        .instance(Some(slot))
+                        .build()
+                })
+                .collect(),
+        );
+        let rendered = rows.rows_for(bare_presentation(), true);
+        assert_eq!(rendered.len(), 2, "one line per process, still greppable");
+        assert_eq!(rendered[0][1], "web:0");
+        assert_eq!(rendered[1][1], "web:1");
+    }
+
+    #[test]
+    fn a_row_from_an_older_daemon_renders_exactly_as_it_did_before() {
+        let rows = FlockRows(vec![
+            ProcessInfo::builder(1, "web", ProcStatus::Online).build(),
+            ProcessInfo::builder(2, "web", ProcStatus::Online).build(),
+        ]);
+        let rendered = rows.rows_for(full_presentation(), true);
+        assert_eq!(rendered.len(), 2, "no slots, so no grouping");
+        assert_eq!(rendered[0][1], "web", "and no suffix");
     }
 
     /// Fails if a `ProcessInfo` field goes missing from both the columns and
