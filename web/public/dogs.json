@@ -13,6 +13,18 @@
       "source": {
         "kind": "cargo"
       }
+    },
+    {
+      "name": "Moon",
+      "package": "shep-deploy",
+      "adopt_as": "deploy",
+      "description": "Watches a git branch, builds a release in an isolated directory, swaps to it, and rolls back on its own if the new release does not come up.",
+      "repo": "https://github.com/TurtIeSocks/shep-deploy",
+      "license": "MIT OR Apache-2.0",
+      "category": "deploy",
+      "source": {
+        "kind": "cargo"
+      }
     }
   ]
 }
