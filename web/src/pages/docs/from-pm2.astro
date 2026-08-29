@@ -28,6 +28,15 @@ const meta = {
     "shep import reads a real dump.pm2 and writes a Flockfile. It starts nothing, and names on stderr everything that could not survive the trip unchanged.",
 };
 
+const benchTable: { metric: string; shep: string; pm2: string; ratio: string }[] = [
+  { metric: "Idle daemon RSS, ten apps", shep: "13.90 MiB", pm2: "71.16 MiB", ratio: "5.1x" },
+  { metric: "Log-plane CPU per line", shep: "2.10 us", pm2: "4.03 us", ratio: "1.9x" },
+  { metric: "Start ten apps, cold daemon", shep: "0.158 s", pm2: "0.374 s", ratio: "2.4x" },
+  { metric: "Start ten apps, warm daemon", shep: "0.056 s", pm2: "0.197 s", ratio: "3.5x" },
+  { metric: "Install footprint", shep: "14.23 MiB", pm2: "23.10 MiB", ratio: "1.6x" },
+  { metric: "Idle daemon CPU", shep: "0.045%", pm2: "0.020%", ratio: "a tie" },
+];
+
 const verbTable: { pm2: string; shep: string; note?: string }[] = [
   { pm2: "pm2 start <script>", shep: "shep start <script>" },
   {
@@ -302,6 +311,55 @@ cwd = "/srv/migrate"`}</CodeBlock>
       at all.
     </p>
 
+    <h2>What it costs to run</h2>
+    <p>
+      Measured on one machine on 2026-08-29: shep 0.1.12 against pm2 7.0.4 on
+      node v26.5.0. Both tools ran the same two shell scripts under the same
+      <code>/bin/sh</code>, with logs going to each tool's own default file
+      capture, and the daemon is what was sampled rather than the children.
+    </p>
+    <div class="verb-table bench-table">
+      <div class="row header">
+        <span>metric</span>
+        <span>shep</span>
+        <span>pm2</span>
+        <span>ratio</span>
+      </div>
+      {
+        benchTable.map((row) => (
+          <div class="row">
+            <span class="note-cell">{row.metric}</span>
+            <span class="shep-cell"><code>{row.shep}</code></span>
+            <span class="pm2-cell"><code>{row.pm2}</code></span>
+            <span class="note-cell">{row.ratio}</span>
+          </div>
+        ))
+      }
+    </div>
+    <Callout variant="careful">
+      Read the ratios, not the absolute figures. The box was not idle, and it
+      changed power state partway through the run. The order is shep, pm2,
+      shep, so a shift like that shows up as disagreement between the two
+      shep rounds: they agreed within 2.6%, which is why these numbers stand.
+      Idle CPU is printed as the instrument read it, and both figures are
+      hundredths of one percent of one core, so the difference there is not a
+      result.
+    </Callout>
+    <p>
+      The log-plane figure has only just gone this way. shep cost 32.8 us per
+      line until an audit on 2026-08-28 buffered the writes and stopped
+      encoding one bus event once per subscriber, so pm2 was ahead by 8x on
+      that measure the day before this was taken.
+    </p>
+    <p>
+      The RSS gap is structural rather than clever: pm2's daemon is a node
+      process and pays that runtime's floor whatever it does. Everything here
+      is reproducible from
+      <code>benches/versus-pm2/versus-pm2.sh</code> in the repository, which
+      drives the published npm package as a black box and keeps its raw
+      samples.
+    </p>
+
     <h2>The verb-by-verb table</h2>
     <div class="verb-table">
       <div class="row header">
@@ -550,9 +608,14 @@ cwd = "/srv/migrate"`}</CodeBlock>
     line-height: 1.5;
   }
 
+  .bench-table .row {
+    grid-template-columns: 1.6fr 1fr 1fr 0.6fr;
+  }
+
   @media (max-width: 640px) {
     .field-table .row,
-    .verb-table .row {
+    .verb-table .row,
+    .bench-table .row {
       grid-template-columns: 1fr;
       gap: 4px;
     }
@@ -599,4 +662,5 @@ cwd = "/srv/migrate"`}</CodeBlock>
     line-height: 1.5;
     color: var(--ink-2);
   }
+
 </style>
