@@ -396,7 +396,13 @@ jobs:
           mkdir -p tap/Formula
           cp packaging/homebrew/shep.rb tap/Formula/shep.rb
           cd tap
-          if git diff --quiet; then
+          # `git add` before the comparison, and `--cached` in it. On the
+          # FIRST release into a fresh tap the formula is untracked, and an
+          # untracked file is invisible to both `git diff` and `commit -am`:
+          # the job would report "nothing to push", exit 0, and publish
+          # nothing while looking green.
+          git add Formula/shep.rb
+          if git diff --cached --quiet; then
             echo "The tap already carries this formula. Nothing to push."
             exit 0
           fi
@@ -405,7 +411,7 @@ jobs:
           # borrowing a name.
           git -c user.name='shep release' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -am "shep ${TAG#shep-v}"
+              commit -m "shep ${TAG#shep-v}"
           git push
 
   # Builds the two .deb packages and attaches them to the release.
@@ -538,10 +544,14 @@ jobs:
           archive=shep-x86_64-pc-windows-msvc.zip
           gh release download "$TAG" --pattern "${archive}.sha256" --dir sums
           hash="$(cut -d' ' -f1 < "sums/${archive}.sha256")"
-          case "$hash" in
-            [0-9a-fA-F]*) ;;
-            *) echo "::error::the sidecar for $archive did not start with a sha256"; exit 1 ;;
-          esac
+          # All 64 characters, anchored. A `case` glob is a prefix match, so
+          # `[0-9a-fA-F]*` accepted a truncated sidecar and would have put a
+          # one-character hash in the bucket, where every install of that
+          # version then fails. Matches the Chocolatey job's check.
+          if ! printf '%s' "$hash" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+            echo "::error::the sidecar for $archive did not hold a sha256: '$hash'"
+            exit 1
+          fi
 
           manifest=packaging/scoop/shep.json
           # jq rather than sed: this is JSON, and the url appears in the
@@ -576,13 +586,16 @@ jobs:
           mkdir -p bucket/bucket
           cp packaging/scoop/shep.json bucket/bucket/shep.json
           cd bucket
-          if git diff --quiet; then
+          # As in the tap push above: staged first, compared with `--cached`,
+          # so a first release into a fresh bucket is not a silent no-op.
+          git add bucket/shep.json
+          if git diff --cached --quiet; then
             echo "The bucket already carries this manifest. Nothing to push."
             exit 0
           fi
           git -c user.name='shep release' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -am "shep ${TAG#shep-v}"
+              commit -m "shep ${TAG#shep-v}"
           git push
 
   # Opens the pull request that adds this version to the WinGet community
