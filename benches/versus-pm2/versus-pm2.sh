@@ -347,6 +347,10 @@ timed_start() { # tool cfg
     done
   fi
   t1=$(now)
+  # Exactly the configured count. A surplus means a stale process survived a
+  # previous round, and the time it took to see it is not this run's number.
+  [ "${n:-0}" -eq "$N_APPS" ] || {
+    echo "  saw $n online, expected exactly $N_APPS" >&2; return 1; }
   echo "$(python3 -c "print(f'{$t1-$t0:.4f}')") $n"
 }
 
@@ -440,7 +444,13 @@ round() { # tag
 
 # Installed here, below cleanup_all's definition: a trap set before the
 # function exists fires into an unbound name on an early interrupt.
-trap cleanup_all EXIT INT TERM
+#
+# INT and TERM get their own handler because EXIT alone would clean up and
+# then let the next round restart everything the operator just interrupted.
+# 128+signal is the shell's own convention for a signal death.
+trap cleanup_all EXIT
+trap 'cleanup_all; exit 130' INT
+trap 'cleanup_all; exit 143' TERM
 
 main() {
   : > "$METRICS"
