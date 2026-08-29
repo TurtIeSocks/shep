@@ -9,6 +9,10 @@ about publish order and version choice still holds.
 opens it, and merging it tags the commit, creates the GitHub release, and
 uploads. There is no tag to push by hand and no local `cargo publish`.
 
+That covers crates.io. Shipping to Homebrew, apt and the Windows package
+managers is a separate question, and none of it works until a release
+carries a binary: [distribution.md](distribution.md).
+
 ## Publish order
 
 Four of the five crates form a chain, so they go up in dependency order. Read
