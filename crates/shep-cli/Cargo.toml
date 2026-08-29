@@ -52,7 +52,7 @@ maintainer = "TurtIeSocks <TurtIeSocks@users.noreply.github.com>"
 copyright = "Copyright (c) TurtIeSocks"
 # cargo-deb takes one license file. Both ship as assets below, since the
 # license is "MIT OR Apache-2.0" and a reader needs to see both to choose.
-license-file = "LICENSE-APACHE"
+license-file = ["LICENSE-APACHE", "0"]
 section = "admin"
 priority = "optional"
 depends = "$auto"
