@@ -60,9 +60,9 @@ pub async fn save(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
 /// daemon, boot has already restored the roll before this request is even
 /// sent, so the `Muster` that follows spawns nothing new — `do_start` is
 /// idempotent through `instance_slots` — and simply reports the flock that
-/// restore produced. That is decision 3 (`docs/writing-plans/plans/
-/// 2026-08-12-shep-phase8-cutover.md`) doing its job, not a wasted round
-/// trip: `Response::Mustered` always names every sheep of every app the
+/// restore produced. That is the cutover design doing its job, not a wasted
+/// round trip (`docs/decisions.md`, "The pm2 cutover"):
+/// `Response::Mustered` always names every sheep of every app the
 /// roll restored, not only the ones this particular call spawned, which is
 /// what makes the verb safe to run more than once — an init system that
 /// calls it twice gets the same honest answer both times.

@@ -188,9 +188,15 @@ fn convert_group(name: &str, rows: &[DumpRow]) -> (AppConfig, Vec<ImportNote>) {
     if first.exec_mode.as_deref() == Some("cluster_mode") {
         // No `reuse_port = true` here: shep binds no shared listen socket,
         // so the APP has to set SO_REUSEPORT itself, and the note below
-        // carries that truth. `normalize` refuses the field outright, so
-        // setting it here would make every imported cluster-mode Flockfile
-        // fail to load.
+        // carries that truth.
+        //
+        // The reason used to be that `normalize` refused the field outright.
+        // It does not any more (see `reuse_port_loads_now_that_reload_reads_it`),
+        // and the remaining reason is stronger: the field now picks reload's
+        // mode, so setting it from a pm2 dump would silently choose the
+        // OVERLAPPING reload for an app nobody has confirmed sets the socket
+        // option. That app takes `EADDRINUSE` on its first reload instead of
+        // a visible gap.
         notes.push(ImportNote::ClusterMode {
             app: name.to_string(),
             instances,

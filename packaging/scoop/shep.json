@@ -1,0 +1,58 @@
+{
+    "##": [
+        "The manifest published to the Scoop bucket, where it lives as bucket/shep.json.",
+        "This copy is the source of truth; the `scoop` job in",
+        ".github/workflows/release-artifacts.yml stamps the version, url and hash and",
+        "pushes the result on each release.",
+        "",
+        "NOT INSTALLABLE AS COMMITTED. The version below is 0.0.0 and the hash is a",
+        "sentinel, because release-artifacts.yml has never run against a real release",
+        "and the archive it names does not exist yet. The push job fails loudly if",
+        "either sentinel survives substitution.",
+        "",
+        "checkver and autoupdate are here so the bucket can bump itself if it ever runs",
+        "Scoop's excavator workflow. They are not what the release job uses.",
+        "",
+        "One architecture. shep publishes x86_64-pc-windows-msvc and nothing else on",
+        "Windows: no 32-bit build, and no arm64 one yet.",
+        "",
+        "No extract_dir. The release archives put the binaries at the archive root",
+        "rather than under a version-named directory.",
+        "",
+        "bin lists shep.exe only. shep-runtime and shep-dev are container entrypoint",
+        "aliases with no desktop use case, the same call the Chocolatey package makes."
+    ],
+    "version": "0.0.0",
+    "description": "Process manager that keeps a flock of long-running processes alive, with logs, watch and cron restarts, and webhook alerts",
+    "homepage": "https://shep.turtlesocks.dev",
+    "license": "MIT|Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/TurtIeSocks/shep/releases/download/shep-v0.0.0/shep-x86_64-pc-windows-msvc.zip",
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+    },
+    "bin": "shep.exe",
+    "checkver": {
+        "github": "https://github.com/TurtIeSocks/shep",
+        "regex": "shep-v([\\d.]+)"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/TurtIeSocks/shep/releases/download/shep-v$version/shep-x86_64-pc-windows-msvc.zip"
+            }
+        },
+        "hash": {
+            "url": "$url.sha256"
+        }
+    },
+    "notes": [
+        "shep startup is not built on Windows: boot-time supervision there needs a",
+        "Service Control Manager service. Run shep start in your own session, or wrap",
+        "shep runtime in NSSM or WinSW.",
+        "shep stop has no SIGTERM equivalent to send, so it waits out the app's whole",
+        "kill_timeout unless the app opts into the shepherd channel.",
+        "The user and group Flockfile fields refuse permanently on Windows."
+    ]
+}
