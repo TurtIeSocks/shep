@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use shep_core::config::ResolvedApp;
+use shep_core::config::template;
 use shep_core::paths::ShepPaths;
 
 use crate::privilege::Credentials;
@@ -179,20 +180,28 @@ pub fn assemble(
     let config = app.config();
     let name = config.name.clone();
 
+    // Args carry the `{{instance}}`/`{{name}}` grammar too, rendered once
+    // here before the interpreter logic below decides where they land.
+    let rendered_args: Vec<String> = config
+        .args
+        .iter()
+        .map(|value| template::render(value, &name, instance))
+        .collect();
+
     // Interpreter: resolve program and args
     let (program, args) = match &config.interpreter {
         None => {
             // Direct script execution
-            (config.script.clone(), config.args.clone())
+            (config.script.clone(), rendered_args)
         }
         Some(interp) if interp == "none" => {
             // Explicit "none" means direct script execution
-            (config.script.clone(), config.args.clone())
+            (config.script.clone(), rendered_args)
         }
         Some(interp) => {
             // Interpreter with script as first arg
             let mut interp_args = vec![config.script.clone()];
-            interp_args.extend(config.args.iter().cloned());
+            interp_args.extend(rendered_args);
             (interp.clone(), interp_args)
         }
     };
@@ -201,9 +210,16 @@ pub fn assemble(
     // the app's own env on top: env_clear() + envs(&spec.env) in
     // tokio_runner.rs means anything not seeded here is invisible to the
     // child (adversarial finding #1 — a bare interpreter/program spawned
-    // with no PATH is ENOENT, not a slow failure).
+    // with no PATH is ENOENT, not a slow failure). Each value is rendered
+    // through the `{{instance}}`/`{{name}}` grammar as it is inserted, so a
+    // template can produce a value per instance slot.
     let mut env = base_env();
-    env.extend(config.env.clone());
+    env.extend(
+        config
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), template::render(value, &name, instance))),
+    );
     // Always, and under fixed names. An app that wants the slot under its own
     // variable writes `MY_VAR = "{{instance}}"` in its env, which is one
     // mechanism instead of a dedicated config knob for a single value.
@@ -608,6 +624,34 @@ mod tests {
         app.stdin = true;
         let spec = assemble(&normalize(app).unwrap(), 0, &test_paths(), None);
         assert!(spec.stdin);
+    }
+
+    #[test]
+    fn templates_render_per_instance_in_env_and_args() {
+        let mut config = AppConfig {
+            name: "z-worker".to_string(),
+            script: "bin/worker".to_string(),
+            instances: 4,
+            args: vec!["--metrics-port".to_string(), "91{{instance}}".to_string()],
+            ..Default::default()
+        };
+        config
+            .env
+            .insert("Z_WORKER_ID".to_string(), "z-{{instance}}".to_string());
+        config.env.insert(
+            "Z_DEVICE_ID".to_string(),
+            "{{name}}-{{instance}}d".to_string(),
+        );
+
+        let app = normalize(config).unwrap();
+        let spec = assemble(&app, 2, &test_paths(), None);
+
+        assert_eq!(spec.env.get("Z_WORKER_ID").map(String::as_str), Some("z-2"));
+        assert_eq!(
+            spec.env.get("Z_DEVICE_ID").map(String::as_str),
+            Some("z-worker-2d")
+        );
+        assert!(spec.args.contains(&"912".to_string()), "{:?}", spec.args);
     }
 
     /// fails if `stdin` is implied by something. `channel` is implied by

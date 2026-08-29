@@ -10,6 +10,7 @@ pub mod normalize;
 pub mod probe;
 #[cfg(feature = "schema")]
 pub mod scaffold;
+pub mod template;
 
 pub use app::{AppConfig, ProbeConfig, ProbeKind};
 pub use cron::{CronParseError, CronSchedule, CronScheduleError};
@@ -24,3 +25,4 @@ pub use normalize::{
 pub use probe::{ProbeTarget, ProbeTargetError};
 #[cfg(feature = "schema")]
 pub use scaffold::{CURATED, Depth, Scaffold, ScaffoldError};
+pub use template::TemplateError;

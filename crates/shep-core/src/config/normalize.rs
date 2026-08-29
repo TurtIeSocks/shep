@@ -256,6 +256,9 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 /// - [`NormalizeError::InvalidWatchGlob`]: a `watch_options` or
 ///   `ignore_watch` pattern globset will not compile (carries the app name,
 ///   which of the two lists, the pattern and the reason).
+/// - [`NormalizeError::BadTemplate`]: an `env` value or an `args` entry
+///   carries a `{{...}}` naming something [`crate::config::template`] does
+///   not define (carries the app name, which field, and the rejection).
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     normalize_with_home(app, std::env::home_dir().as_deref())
 }
@@ -287,6 +290,12 @@ pub fn normalize_with_home(
                 var,
             });
         }
+    }
+    for (key, value) in &app.env {
+        validate_template(&app.name, &format!("env.{key}"), value)?;
+    }
+    for (index, value) in app.args.iter().enumerate() {
+        validate_template(&app.name, &format!("args[{index}]"), value)?;
     }
     if app.script.is_empty() {
         return Err(NormalizeError::MissingScript);
@@ -386,6 +395,20 @@ pub fn normalize_with_home(
     validate_watch_globs(&app.name, "watch_options", &app.watch_options)?;
     validate_watch_globs(&app.name, "ignore_watch", &app.ignore_watch)?;
     Ok(ResolvedApp { config: app })
+}
+
+/// Validates one `{{instance}}`/`{{name}}` template value, naming `field` in
+/// any rejection so the user knows which entry to edit.
+///
+/// # Errors
+/// [`NormalizeError::BadTemplate`] if `value` carries a `{{...}}` this
+/// grammar does not define.
+fn validate_template(name: &str, field: &str, value: &str) -> Result<(), NormalizeError> {
+    crate::config::template::validate(value).map_err(|reason| NormalizeError::BadTemplate {
+        name: name.to_string(),
+        field: field.to_string(),
+        reason: reason.to_string(),
+    })
 }
 
 /// Validates one of an app's two watch glob lists, rejecting any pattern
@@ -617,6 +640,17 @@ pub enum NormalizeError {
         /// globset's own rendered reason.
         reason: String,
     },
+    /// A value carries a `{{...}}` that is not a template token. Carries the
+    /// sheep name, which field held it, and the rejection rendered.
+    BadTemplate {
+        /// The sheep name
+        name: String,
+        /// Which field, for example `env.WORKER` or `args[1]`
+        field: String,
+        /// The [`crate::config::template::TemplateError`], rendered, so this
+        /// variant does not have to restate the grammar's own copy
+        reason: String,
+    },
 }
 
 impl fmt::Display for NormalizeError {
@@ -698,6 +732,11 @@ impl fmt::Display for NormalizeError {
                 f,
                 "sheep `{name}` has an invalid {field} pattern `{pattern}`: {reason}"
             ),
+            Self::BadTemplate {
+                name,
+                field,
+                reason,
+            } => write!(f, "sheep `{name}`, {field}: {reason}"),
         }
     }
 }
@@ -1451,6 +1490,25 @@ target = "http://127.0.0.1:8080/healthz"
         app.watch_options = vec!["src/**/*.rs".to_string(), "*.[ch]".to_string()];
         app.ignore_watch = vec!["target/**".to_string(), "**/[!.]*.{tmp,swp}".to_string()];
         assert!(normalize(app).is_ok());
+    }
+
+    #[test]
+    fn a_typo_in_an_env_template_is_refused_and_names_the_field() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.env
+            .insert("WORKER".to_string(), "w-{{instnace}}".to_string());
+        let err = normalize(app).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("instnace"), "names the typo: {rendered}");
+        assert!(rendered.contains("WORKER"), "and the field: {rendered}");
+    }
+
+    #[test]
+    fn a_typo_in_an_arg_template_is_refused_too() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.args = vec!["--port".to_string(), "91{{slot}}".to_string()];
+        let err = normalize(app).unwrap_err();
+        assert!(err.to_string().contains("slot"), "{err}");
     }
 
     #[test]
