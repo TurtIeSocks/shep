@@ -224,7 +224,8 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 /// # Errors
 ///
 /// - [`NormalizeError::MissingName`] — `name` is empty.
-/// - [`NormalizeError::InvalidName`] — `name` contains a path separator or is `.`/`..`.
+/// - [`NormalizeError::InvalidName`] — `name` contains a path separator or a
+///   colon, or is `.`/`..`.
 /// - [`NormalizeError::MissingScript`] — `script` is empty.
 /// - [`NormalizeError::ZeroInstances`] — `instances == 0`.
 /// - [`NormalizeError::InvalidCron`] — `cron_restart` is not valid in
@@ -273,7 +274,7 @@ pub fn normalize_with_home(
     if app.name.is_empty() {
         return Err(NormalizeError::MissingName);
     }
-    if app.name.contains(['/', '\\']) || app.name == "." || app.name == ".." {
+    if app.name.contains(['/', '\\', ':']) || app.name == "." || app.name == ".." {
         return Err(NormalizeError::InvalidName(app.name));
     }
     if app.script.is_empty() {
@@ -471,8 +472,11 @@ pub fn normalize_all(apps: Vec<AppConfig>) -> Result<Vec<ResolvedApp>, Normalize
 pub enum NormalizeError {
     /// `name` is empty
     MissingName,
-    /// `name` contains `/` or `\` or is `.`/`..` — it becomes a filesystem
-    /// path stem, so these would escape the shep home (carries the name)
+    /// `name` contains `/`, `\` or `:`, or is `.`/`..`. A path separator
+    /// would escape the shep home, since the name becomes a filesystem path
+    /// stem; a colon is the `name:slot` separator, and is also illegal in a
+    /// Windows filename, which a sheep name becomes part of. Carries the
+    /// name.
     InvalidName(String),
     /// `script` is empty
     MissingScript,
@@ -603,7 +607,7 @@ impl fmt::Display for NormalizeError {
             Self::InvalidName(n) => {
                 write!(
                     f,
-                    "sheep name `{n}` may not contain a path separator or be `.` or `..`"
+                    "sheep name `{n}` may not contain a path separator or a colon, or be `.` or `..`"
                 )
             }
             Self::MissingScript => f.write_str("app config is missing a script"),
@@ -842,6 +846,21 @@ mod tests {
         assert!(!resolved.config().reuse_port);
     }
     use crate::config::AppConfig;
+
+    #[test]
+    fn a_colon_in_a_name_is_refused_because_it_is_the_instance_separator() {
+        let err = normalize(AppConfig::minimal("web:2", "./srv")).unwrap_err();
+        assert_eq!(err, NormalizeError::InvalidName("web:2".to_string()));
+
+        let rendered = err.to_string();
+        assert!(rendered.contains(':'), "says which character: {rendered}");
+        assert!(
+            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+            "no em or en dash in copy a user reads: {rendered}"
+        );
+
+        assert!(normalize(AppConfig::minimal("web-2", "./srv")).is_ok());
+    }
 
     #[test]
     fn valid_minimal_config_normalizes() {
