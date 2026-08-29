@@ -42,7 +42,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use shep_core::config::{AppConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
@@ -56,6 +56,7 @@ use shep_core::status::ProcStatus;
 
 use crate::assemble::{assemble, instance_slots};
 use crate::brain::{Decision, decide_on_exit};
+use crate::bus::{Bus, SharedEvent};
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasRegistry};
@@ -1435,7 +1436,7 @@ impl SupervisorHandle {
 pub(crate) struct SupervisorBuilder<R: ProcessRunner> {
     runner: R,
     paths: ShepPaths,
-    events: broadcast::Sender<BusEvent>,
+    events: Bus,
     extras: Option<Extras>,
 }
 
@@ -1445,7 +1446,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     ///
     /// `events` receives [`BusEvent::Process`] (+ `LogOut`/`LogErr` forwarded
     /// from each sheep's `ProcIo::logs`).
-    pub(crate) fn new(runner: R, paths: ShepPaths, events: broadcast::Sender<BusEvent>) -> Self {
+    pub(crate) fn new(runner: R, paths: ShepPaths, events: Bus) -> Self {
         Self {
             runner,
             paths,
@@ -1495,7 +1496,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
 pub fn spawn_supervisor<R: ProcessRunner>(
     runner: R,
     paths: ShepPaths,
-    events: broadcast::Sender<BusEvent>,
+    events: Bus,
 ) -> SupervisorHandle {
     SupervisorBuilder::new(runner, paths, events).spawn()
 }
@@ -2228,7 +2229,7 @@ struct Actor<R: ProcessRunner> {
     /// `$SHEP_HOME` layout, for assembling spawn specs.
     paths: ShepPaths,
     /// Bus: process lifecycle events + forwarded logs.
-    events: broadcast::Sender<BusEvent>,
+    events: Bus,
     /// Clone handed to sheep tasks and restart timers so they can report
     /// back into this same actor's mailbox.
     tx: mpsc::Sender<Msg>,
@@ -6688,12 +6689,12 @@ impl<R: ProcessRunner> Actor<R> {
     /// Broadcasts one lifecycle transition. Send failures (no receivers)
     /// are not an error — the bus is fire-and-forget from the actor's side.
     fn emit(&self, event: ProcessEventKind, info: ProcessInfo, manually: bool) {
-        let _ = self.events.send(BusEvent::Process {
+        let _ = self.events.send(SharedEvent::new(BusEvent::Process {
             event,
             info,
             manually,
             at_ms: crate::now_ms(),
-        });
+        }));
     }
 }
 
@@ -7336,7 +7337,7 @@ fn spawn_sheep_task<P: RunningProcess>(
     proc: P,
     io: ProcIo,
     app: ResolvedApp,
-    events: broadcast::Sender<BusEvent>,
+    events: Bus,
     actor_tx: mpsc::Sender<Msg>,
 ) -> SheepHandles {
     let (ctl_tx, ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
@@ -7386,7 +7387,7 @@ async fn run_sheep<P: RunningProcess>(
     app: ResolvedApp,
     mut ctl_rx: mpsc::Receiver<SheepCtl>,
     mut signal_rx: mpsc::Receiver<SignalRequest>,
-    events: broadcast::Sender<BusEvent>,
+    events: Bus,
     actor_tx: mpsc::Sender<Msg>,
 ) {
     // `io` is destructured here, in the task's own body, and that placement
@@ -7461,12 +7462,16 @@ async fn run_sheep<P: RunningProcess>(
             maybe_line = logs.recv(), if logs_open => {
                 match maybe_line {
                     Some(line) => {
-                        let event = if line.err {
+                        // Through the bus's own gate rather than `send`: with
+                        // nobody subscribed to a log topic this costs one
+                        // relaxed load, where a publish costs an allocation,
+                        // the ring's mutex, and a wakeup for each of the two
+                        // subscribers the daemon always has.
+                        events.publish_log(if line.err {
                             BusEvent::LogErr { id, line: line.line }
                         } else {
                             BusEvent::LogOut { id, line: line.line }
-                        };
-                        let _ = events.send(event);
+                        });
                     }
                     None => logs_open = false,
                 }
@@ -7481,10 +7486,10 @@ async fn run_sheep<P: RunningProcess>(
                         // is dropped a few lines below, and `deferred.md`
                         // names exactly that message as the traffic the bus
                         // exists to stop losing.
-                        let _ = events.send(BusEvent::Channel {
+                        let _ = events.send(SharedEvent::new(BusEvent::Channel {
                             id,
                             message: message.clone(),
-                        });
+                        }));
                         match message {
                             ChildMessage::Ready => {
                                 let _ = actor_tx.send(Msg::Ready { id }).await;
@@ -7561,22 +7566,23 @@ mod tests {
     /// it not" a question a list can answer where [`await_event`]'s search
     /// cannot.
     fn drained_process_kinds(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
     ) -> Vec<ProcessEventKind> {
         let mut kinds = Vec::new();
-        while let Ok(BusEvent::Process { event, .. }) = rx.try_recv() {
+        while let Ok(BusEvent::Process { event, .. }) = rx.try_recv().map(|event| event.to_event())
+        {
             kinds.push(event);
         }
         kinds
     }
 
     async fn await_event(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
     ) -> bool {
         loop {
-            match rx.recv().await {
+            match rx.recv().await.map(|event| event.to_event()) {
                 Ok(BusEvent::Process {
                     event,
                     info,
@@ -7599,7 +7605,7 @@ mod tests {
     /// queue yet, so a bare `try_recv` would read empty regardless of
     /// whether the code under test is correct.
     async fn assert_no_event_within(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
         window: Duration,
@@ -7616,7 +7622,7 @@ mod tests {
     // on the shepherd channel's ready signal
     #[tokio::test(start_paused = true)]
     async fn wait_ready_app_stays_starting_until_the_channel_signals() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -7668,7 +7674,7 @@ mod tests {
         let addr = reserved.local_addr().unwrap();
         drop(reserved);
 
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -7722,7 +7728,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_exec_readiness_probe_sees_the_assembled_env_not_the_apps_own() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         // Instance 0 is the only slot a single-instance app gets, so this is
@@ -7773,7 +7779,7 @@ mod tests {
     // through the readiness wait.
     #[tokio::test(start_paused = true)]
     async fn a_gated_apps_online_carries_the_same_manually_flag_an_ungated_one_does() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![
             ProcScript::never_exits(), // id 0: gated
             ProcScript::never_exits(), // id 1: ungated
@@ -7846,7 +7852,7 @@ mod tests {
     // stops reading the origin at all and reports every restart as automatic.
     #[tokio::test(start_paused = true)]
     async fn an_operators_restart_is_reported_as_a_user_action() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         // Two: the sheep, and the respawn the restart performs. One would
         // leave that respawn `SpawnFailed("script exhausted")`, which emits
         // `Errored` instead of `Restart` — and `await_event` would then wait
@@ -7879,7 +7885,7 @@ mod tests {
     // restart loop, exactly what max_restarts exists to contain
     #[tokio::test(start_paused = true)]
     async fn a_gated_app_whose_deadline_elapses_goes_online_anyway() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -7908,7 +7914,7 @@ mod tests {
     // respawn path.
     #[tokio::test(start_paused = true)]
     async fn a_gated_app_that_exits_while_starting_never_reaches_online_from_the_old_wait() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![
             ProcScript::stable_then_exit(500, 1), // unstable exit while Starting
             ProcScript::never_exits(),            // the automatic respawn
@@ -7971,7 +7977,7 @@ mod tests {
     // specifically (the epoch check alone would let this one through).
     #[tokio::test(start_paused = true)]
     async fn a_gated_app_stopped_while_starting_ignores_the_old_wait() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::stable_then_exit(500, 1)]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -8002,7 +8008,7 @@ mod tests {
     // RESPAWNED process online instead of being dropped by the epoch guard
     #[tokio::test(start_paused = true)]
     async fn a_gated_app_restarted_while_starting_ignores_the_old_wait() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
@@ -8054,7 +8060,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn start_lists_online_instances() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
@@ -8071,7 +8077,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn listed_log_paths_are_the_derived_defaults() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
@@ -8102,7 +8108,7 @@ mod tests {
         // the same app on purpose — the two resolve independently, and
         // pinning both here proves reporting one explicitly does not drag
         // the other off its default.
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
@@ -8123,7 +8129,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn crash_loop_erroreds_after_budget_with_pinned_delays() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let (events, mut rx) = crate::bus::test_bus(1024);
         // 16 spawns: initial + 15 restarts; every exit instant (unstable).
         let runner = ScriptedRunner::new((0..16).map(|_| ProcScript::const_exit(1)).collect());
         let dir = tempfile::tempdir().unwrap();
@@ -8166,7 +8172,7 @@ mod tests {
         // a still-buggy `>` check would consume a 17th spawn and report
         // restarts==16 instead. Real shipped default max_restarts (16, no
         // override) throughout.
-        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let (events, mut rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new((0..20).map(|_| ProcScript::const_exit(1)).collect());
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -8183,7 +8189,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stable_run_resets_budget() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(256);
+        let (events, mut rx) = crate::bus::test_bus(256);
         let mut script = vec![
             ProcScript::const_exit(1),
             ProcScript::const_exit(1),
@@ -8207,7 +8213,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn manual_stop_prevents_restart() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript {
             delay_ms: u64::MAX,
             outcome: ExitOutcome {
@@ -8236,7 +8242,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stop_exit_codes_mean_clean_stop() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::const_exit(0)]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -8249,7 +8255,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn spawn_failure_surfaces_and_erroreds() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![]); // exhausted immediately
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -8265,7 +8271,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_unresolvable_user_fails_the_start() {
         let dir = tempfile::tempdir().unwrap();
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             test_paths(&dir),
@@ -8296,7 +8302,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_refusal_is_counted_once_per_app_not_once_per_failed_check() {
         let dir = tempfile::tempdir().unwrap();
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             // `refusing` is what makes this test able to fail. Without it
             // the fake answers `Preflight::Unknown` for everything, only the
@@ -8329,7 +8335,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn delete_and_selectors_route() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
@@ -8386,7 +8392,7 @@ mod tests {
     // three restarts instead of carrying it to a fourth.
     #[tokio::test(start_paused = true)]
     async fn manual_restart_resets_budget_and_respawns() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Five procs, sized against the mutation rather than against a correct
         // run: two unstable crashes, the long-lived proc they land on, the
         // respawn the manual restart performs (unstable again, to spend the
@@ -8476,7 +8482,7 @@ mod tests {
     // restarting it.
     #[tokio::test(start_paused = true)]
     async fn an_automatic_restart_resets_the_budget_like_an_operators_does() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Five procs, which is the most this test can demand: two unstable
         // crashes, the long-lived proc they land on, the respawn the
         // automatic restart performs (unstable again, to spend the budget the
@@ -8564,7 +8570,7 @@ mod tests {
     // fourth.
     #[tokio::test(start_paused = true)]
     async fn restarting_a_stopped_sheep_resets_the_budget() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Five procs, sized against the mutation rather than against a correct
         // run: two unstable crashes, the long-lived proc they land on and the
         // stop below ends, the respawn the restart performs (unstable again,
@@ -8659,7 +8665,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_kills_all_and_stops_the_engine() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
@@ -8681,10 +8687,10 @@ mod tests {
     // ---------------------------------------------------------------
 
     async fn drain_kinds(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
     ) -> Vec<(u32, ProcessEventKind)> {
         let mut out = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
+        while let Ok(ev) = rx.try_recv().map(|event| event.to_event()) {
             if let BusEvent::Process { event, info, .. } = ev {
                 out.push((info.id, event));
             }
@@ -8698,7 +8704,7 @@ mod tests {
     // never be killed.
     #[tokio::test(start_paused = true)]
     async fn shutdown_ignores_a_pending_restart_timer() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let (events, mut rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new(vec![
             ProcScript::const_exit(1),     // crash: instant exit -> waiting-restart
             ProcScript::ignores_signals(), // web: full 1600ms kill ladder
@@ -8758,7 +8764,7 @@ mod tests {
     // fails if `handle_ready_result` stops guarding on `shutting_down`.
     #[tokio::test(start_paused = true)]
     async fn shutdown_ignores_a_pending_readiness_wait() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let (events, mut rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new(vec![ProcScript::ignores_signals()]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -8792,7 +8798,7 @@ mod tests {
     // `online` snapshot, computed afterward, catches it).
     #[tokio::test(start_paused = true)]
     async fn late_start_racing_shutdown_never_orphans() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let (events, mut rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new(vec![
             ProcScript::ignores_signals(), // web: 1600ms ladder
             ProcScript::never_exits(),     // the late Start, if it lands before Shutdown
@@ -8831,7 +8837,7 @@ mod tests {
     // schedules.
     #[tokio::test(start_paused = true)]
     async fn stale_restart_timer_never_short_circuits_a_newer_backoff() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let (events, mut rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new(vec![
             ProcScript::const_exit(1),             // t=0 exit -> T1 @ 2000
             ProcScript::stable_then_exit(1500, 1), // manual respawn, dies @1500 -> T2 @ 3500
@@ -8884,7 +8890,7 @@ mod tests {
     // the sheep, and hand the `stop()` caller an `Online` snapshot again.
     #[tokio::test(start_paused = true)]
     async fn overlapping_stop_and_restart_agree_on_one_outcome() {
-        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let (events, _rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new(vec![
             ProcScript::ignores_signals(), // 1600ms ladder: a wide race window
             ProcScript::never_exits(),
@@ -8921,7 +8927,7 @@ mod tests {
     // not delay processing an unrelated sheep's own, unrelated exit.
     #[tokio::test(start_paused = true)]
     async fn actor_never_blocks_behind_a_busy_kill_ladder() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(1024);
+        let (events, mut rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new(vec![
             ProcScript::ignores_signals(),        // sheep a: 1600ms ladder
             ProcScript::stable_then_exit(800, 0), // sheep b: exits at t=800
@@ -8962,7 +8968,7 @@ mod tests {
     // (mailbox full) used to mean neither could ever make progress again.
     #[tokio::test(start_paused = true)]
     async fn mailbox_flood_during_a_kill_never_deadlocks() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(4096);
+        let (events, mut rx) = crate::bus::test_bus(4096);
         let runner = ScriptedRunner::new(vec![ProcScript::ignores_signals()]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -9025,7 +9031,7 @@ mod tests {
     // hit `EngineStopped`, whether or not the fix was applied.
     #[tokio::test(start_paused = true)]
     async fn delete_racing_shutdown_still_deregisters_the_sheep() {
-        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let (events, _rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new(vec![
             ProcScript::ignores_signals(), // target: default 1600ms kill_timeout ladder
             ProcScript::ignores_signals(), // decoy: kept alive far longer, see comment above
@@ -9083,7 +9089,7 @@ mod tests {
     // LIVE PROCESS while still telling the `Delete` caller it succeeded.
     #[tokio::test(start_paused = true)]
     async fn delete_racing_restart_still_deregisters_the_sheep() {
-        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let (events, _rx) = crate::bus::test_bus(1024);
         let runner = ScriptedRunner::new(vec![
             ProcScript::ignores_signals(), // wide kill-ladder window
             // A second script so the pre-fix bug's illegitimate respawn
@@ -9143,7 +9149,7 @@ mod tests {
     // snapshot of a sheep that is genuinely back up with `restarts: 1`.
     #[tokio::test(start_paused = true)]
     async fn an_operators_stop_beats_an_automatic_restart_mid_ladder() {
-        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let (events, _rx) = crate::bus::test_bus(1024);
         // Two scripts is the most this test can demand: the sheep itself, plus
         // the one respawn a broken implementation performs. Sized for that
         // second spawn on purpose -- a pool of one would answer it
@@ -9194,7 +9200,7 @@ mod tests {
     // the `delete()` caller is told it was deleted.
     #[tokio::test(start_paused = true)]
     async fn an_operators_delete_beats_an_automatic_restart_mid_ladder() {
-        let (events, _rx) = tokio::sync::broadcast::channel(1024);
+        let (events, _rx) = crate::bus::test_bus(1024);
         // Two, for the same reason as above: the sheep, plus the respawn a
         // broken implementation performs behind the delete's back.
         let runner = ScriptedRunner::new(vec![
@@ -9231,7 +9237,7 @@ mod tests {
     /// pins is 15, the same constant `ExitOutcome`'s own doc names.
     #[tokio::test(start_paused = true)]
     async fn an_operators_stop_still_shows_its_signal_as_the_last_exit() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -9263,7 +9269,7 @@ mod tests {
     /// a real exit that records a code, then a respawn that fails to spawn.
     #[tokio::test(start_paused = true)]
     async fn a_respawn_that_fails_to_spawn_clears_the_previous_exit_code() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::const_exit(1)]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -9332,7 +9338,7 @@ mod tests {
         };
         let mut sheep = HashMap::new();
         sheep.insert(0, slot);
-        let (events, _events_rx) = broadcast::channel(16);
+        let (events, _events_rx) = crate::bus::test_bus(16);
         let (tx, _rx) = mpsc::channel(16);
         let actor = Actor {
             runner: ScriptedRunner::new(vec![]),
@@ -9967,7 +9973,7 @@ mod tests {
     /// Drives virtual time until `kind` arrives for `id`, failing rather than
     /// hanging if it never does.
     async fn expect_event(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
     ) {
@@ -9993,9 +9999,9 @@ mod tests {
     ) -> (
         SupervisorHandle,
         Arc<ScriptedRunner>,
-        tokio::sync::broadcast::Receiver<BusEvent>,
+        tokio::sync::broadcast::Receiver<SharedEvent>,
     ) {
-        let (events, rx) = tokio::sync::broadcast::channel(256);
+        let (events, rx) = crate::bus::test_bus(256);
         let runner = Arc::new(ScriptedRunner::new(scripts));
         let handle = spawn_supervisor(SharedRunner(Arc::clone(&runner)), test_paths(dir), events);
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
@@ -10043,7 +10049,7 @@ mod tests {
                 ready_failed: false,
             },
         );
-        let (events, _events_rx) = broadcast::channel(64);
+        let (events, _events_rx) = crate::bus::test_bus(64);
         let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
         let actor = Actor {
             runner: ScriptedRunner::new(scripts),
@@ -10106,7 +10112,7 @@ mod tests {
                 },
             );
         }
-        let (events, _events_rx) = broadcast::channel(64);
+        let (events, _events_rx) = crate::bus::test_bus(64);
         let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
         let actor = Actor {
             runner: ScriptedRunner::new(Vec::new()),
@@ -10302,7 +10308,7 @@ mod tests {
                 },
             );
         }
-        let (events, _events_rx) = broadcast::channel(64);
+        let (events, _events_rx) = crate::bus::test_bus(64);
         let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
         Actor {
             runner: ScriptedRunner::new(scripts),
@@ -10735,7 +10741,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dog_that_restarts_is_still_a_dog() {
         let dir = tempfile::tempdir().unwrap();
-        let (events, mut rx) = broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::const_exit(1), ProcScript::never_exits()]);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -10771,7 +10777,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dog_that_cannot_be_spawned_is_still_a_dog() {
         let dir = tempfile::tempdir().unwrap();
-        let (events, _rx) = broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(ScriptedRunner::new(Vec::new()), test_paths(&dir), events);
 
         let failed = handle
@@ -10910,7 +10916,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_all_or_nothing_start_stops_at_the_first_failed_spawn() {
         let dir = tempfile::tempdir().unwrap();
-        let (events, _rx) = broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             // A script for the second app, which must NOT get as far as
             // using it: an exhausted pool would fail it for a reason of its
@@ -10967,7 +10973,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dog_that_cannot_spawn_is_registered_errored_rather_than_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let (events, _rx) = broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Empty scripts, so the spawn this now reaches fails on its own too:
         // the point is that it is REACHED, and that the wreck is registered.
         let runner = ScriptedRunner::new(Vec::new()).refusing(&["bark"]);
@@ -11009,7 +11015,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_reloaded_dog_is_still_a_dog() {
         let dir = tempfile::tempdir().unwrap();
-        let (events, mut rx) = broadcast::channel(256);
+        let (events, mut rx) = crate::bus::test_bus(256);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 3]);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
 
@@ -11081,7 +11087,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn enabling_a_dog_twice_starts_one_process() {
         let dir = tempfile::tempdir().unwrap();
-        let (events, _rx) = broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 2]);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
 
@@ -11541,7 +11547,7 @@ mod tests {
             refuse: 2,
             attempts: Arc::clone(&attempts),
         };
-        let (events, mut rx) = tokio::sync::broadcast::channel(256);
+        let (events, mut rx) = crate::bus::test_bus(256);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
         handle.start(vec![normalize(app).unwrap()]).await.unwrap();
 
@@ -11838,7 +11844,7 @@ mod tests {
         // that respawn `Errored` rather than the live process the bug really
         // produces, and `Errored` is a state this case could mistake for the
         // failure it is looking for.
-        let (events, mut rx) = tokio::sync::broadcast::channel(256);
+        let (events, mut rx) = crate::bus::test_bus(256);
         let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 4]));
         // Capacity past anything this case raises: one liveness failure per
         // armed instance, and no breaches at all.
@@ -12325,14 +12331,14 @@ mod tests {
     /// than skipped: a hole in the stream is a hole in every claim read off
     /// it.
     async fn events_through(
-        rx: &mut tokio::sync::broadcast::Receiver<BusEvent>,
+        rx: &mut tokio::sync::broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
     ) -> Vec<Seen> {
         let collect = async {
             let mut seen = Vec::new();
             loop {
-                match rx.recv().await {
+                match rx.recv().await.map(|event| event.to_event()) {
                     Ok(BusEvent::Process {
                         event,
                         info,
@@ -12782,7 +12788,7 @@ mod tests {
         let (proc, io) = runner.spawn(&log_ctl_spec()).unwrap();
         assert!(runner.log_ctl_live(0), "sanity: the fake starts it live");
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let (_ctl_tx, ctl_rx) = mpsc::channel(8);
         let (_signal_tx, signal_rx) = mpsc::channel(8);
         let (actor_tx, _actor_rx) = mpsc::channel(8);
@@ -12822,7 +12828,7 @@ mod tests {
     /// second copy of "is the pump still there".
     #[tokio::test(start_paused = true)]
     async fn a_pump_is_reaped_when_its_sheep_ends_even_with_a_lamb_on_the_pipe() {
-        let (events, mut rx) = tokio::sync::broadcast::channel(64);
+        let (events, mut rx) = crate::bus::test_bus(64);
         // One script for one spawn: `autorestart = false` below means the
         // supervisor never asks for a second.
         let runner = Arc::new(ScriptedRunner::new(vec![
@@ -13286,7 +13292,7 @@ mod tests {
         // than fail it, and there is no other failure mode to give it.
         let seen = tokio::time::timeout(ACTION_WINDOW, async {
             loop {
-                if let BusEvent::Channel { id, message } = events.recv().await.unwrap() {
+                if let BusEvent::Channel { id, message } = events.recv().await.unwrap().to_event() {
                     break (id, message);
                 }
             }
@@ -13324,7 +13330,7 @@ mod tests {
 
         let seen = tokio::time::timeout(ACTION_WINDOW, async {
             loop {
-                if let BusEvent::Channel { id, message } = events.recv().await.unwrap() {
+                if let BusEvent::Channel { id, message } = events.recv().await.unwrap().to_event() {
                     break (id, message);
                 }
             }
@@ -13369,7 +13375,7 @@ mod tests {
 
         let seen = tokio::time::timeout(ACTION_WINDOW, async {
             loop {
-                if let BusEvent::Channel { message, .. } = events.recv().await.unwrap() {
+                if let BusEvent::Channel { message, .. } = events.recv().await.unwrap().to_event() {
                     break message;
                 }
             }
@@ -14196,7 +14202,7 @@ mod tests {
     /// exactly that mutation.
     #[tokio::test(start_paused = true)]
     async fn the_actor_keeps_answering_while_a_reopen_waits_on_a_silent_pump() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let (runner, mut requests) = SilentPumpRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -14237,7 +14243,7 @@ mod tests {
     /// smallest shape that catches both halves — too narrow and too wide.
     #[tokio::test(start_paused = true)]
     async fn a_reopen_reaches_every_matched_sheep_and_no_others() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Three scripts for three instances, counted: a fourth spawn would
         // answer `SpawnFailed("script exhausted")` and land that sheep in
         // `Errored` with no pump at all — a state this case could not tell
@@ -14298,7 +14304,7 @@ mod tests {
     /// reads exactly like the pump that was never reached.
     #[tokio::test(start_paused = true)]
     async fn a_reopen_after_a_restart_reaches_the_pump_the_restart_spawned() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = Arc::new(ScriptedRunner::new(vec![
             ProcScript::never_exits(),
             ProcScript::never_exits(),
@@ -14349,7 +14355,7 @@ mod tests {
     /// and silence would look exactly like a rotation that worked.
     #[tokio::test(start_paused = true)]
     async fn a_reopen_matching_nothing_is_not_found() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -14370,7 +14376,7 @@ mod tests {
     /// is issued rather than merely notionally so.
     #[tokio::test(start_paused = true)]
     async fn a_stopped_sheep_is_a_no_op_success() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // One script, one spawn: `autorestart = false` below means the
         // supervisor never asks for a second.
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
@@ -14551,7 +14557,7 @@ mod tests {
     /// nothing here would say so — except that count.
     #[tokio::test(start_paused = true)]
     async fn a_pump_that_could_not_reopen_fails_the_request_and_names_its_sheep() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Two scripts for two instances, counted: a third spawn would answer
         // `SpawnFailed("script exhausted")` and land that sheep in `Errored`
         // with no pump at all.
@@ -14909,7 +14915,7 @@ mod tests {
     /// that catches both halves.
     #[tokio::test(start_paused = true)]
     async fn a_flush_reaches_every_matched_sheep_and_no_others() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Three scripts for three instances, counted, for the reason the
         // reopen case gives: a fourth spawn would fail and land that sheep
         // pumpless, which reads the same as the skip being looked for.
@@ -14966,7 +14972,7 @@ mod tests {
     /// measurement behind that.
     #[tokio::test(start_paused = true)]
     async fn the_actor_keeps_answering_while_a_flush_waits_on_a_silent_pump() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let (runner, mut requests) = SilentPumpRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
@@ -15106,7 +15112,7 @@ mod tests {
     /// second.
     #[tokio::test(start_paused = true)]
     async fn a_flush_truncates_only_after_its_pump_has_answered() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(
             LateWritingPumpRunner::new(ScriptedRunner::new(vec![ProcScript::never_exits()])),
@@ -15157,7 +15163,7 @@ mod tests {
     /// so, and the truncate is reached through the no-pump leg.
     #[tokio::test(start_paused = true)]
     async fn a_stopped_sheeps_log_file_is_truncated_too() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // One script, one spawn: `autorestart = false` means no second.
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
@@ -15207,7 +15213,7 @@ mod tests {
     /// this case testing two ordinary sheep and proving nothing.
     #[tokio::test(start_paused = true)]
     async fn instances_sharing_one_log_path_answer_one_row_each() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
@@ -15258,7 +15264,7 @@ mod tests {
     /// acknowledgement.
     #[tokio::test(start_paused = true)]
     async fn a_sibling_sharing_a_path_is_flushed_even_when_the_selector_skips_it() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Two scripts for two apps of one instance each, counted: a third
         // spawn would answer `SpawnFailed("script exhausted")` and land that
         // sheep pumpless, which reads exactly like the skipped pump this case
@@ -15334,7 +15340,7 @@ mod tests {
     /// that count.
     #[tokio::test(start_paused = true)]
     async fn a_pump_that_could_not_flush_fails_the_request() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         // Two scripts for two instances, counted: a third spawn would answer
         // `SpawnFailed("script exhausted")` and land that sheep pumpless.
         let scripted = Arc::new(ScriptedRunner::new(vec![
@@ -15381,7 +15387,7 @@ mod tests {
     /// touched at all.
     #[tokio::test(start_paused = true)]
     async fn a_flush_matching_nothing_is_not_found() {
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let dir = tempfile::tempdir().unwrap();
         let handle = spawn_supervisor(ScriptedRunner::new(vec![]), test_paths(&dir), events);
 
@@ -15694,7 +15700,7 @@ mod tests {
         dir: &tempfile::TempDir,
         scripts: Vec<ProcScript>,
     ) -> Actor<ScriptedRunner> {
-        let (events, _events_rx) = broadcast::channel(64);
+        let (events, _events_rx) = crate::bus::test_bus(64);
         let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
         Actor {
             runner: ScriptedRunner::new(scripts),
@@ -15988,7 +15994,7 @@ mod tests {
         );
 
         let mut errored = 0;
-        while let Ok(event) = events.try_recv() {
+        while let Ok(event) = events.try_recv().map(|event| event.to_event()) {
             if let BusEvent::Process {
                 event: ProcessEventKind::Errored,
                 info,
@@ -16337,7 +16343,7 @@ mod tests {
                 // Capacity above `EVENT_BUDGET`: the drain below treats a
                 // `Lagged` as a failure rather than skipping past it, since a
                 // hole in the stream is a hole in every claim read off it.
-                let (events, mut rx) = tokio::sync::broadcast::channel(8192);
+                let (events, mut rx) = crate::bus::test_bus(8192);
                 let handle = spawn_supervisor(
                     ScriptedRunner::new(scripts),
                     test_paths(&dir),
@@ -16444,7 +16450,7 @@ mod tests {
                 loop {
                     match tokio::time::timeout(QUIET_WINDOW, rx.recv()).await {
                         Ok(Ok(event)) => {
-                            observed.push(event);
+                            observed.push(event.to_event());
                             proptest::prop_assert!(
                                 observed.len() <= EVENT_BUDGET,
                                 "the flock never reached steady state: {} transitions after \

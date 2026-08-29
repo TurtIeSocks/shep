@@ -374,6 +374,39 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Cargo's default release profile optimizes each crate on its own, and the
+# daemon's hot paths cross crate boundaries on every log line: the pump is in
+# shep-daemon, the codec and `BusEvent` in shep-core, the channels and the
+# timer wheel in tokio.
+#
+# Measured 2026-08-28, clean `cargo build --release -p shep`, and the runtime
+# column against a sheep emitting 7,315 lines/s of 70 bytes with nothing
+# subscribed (two 30 s windows per binary, run round-robin so they share one
+# machine state):
+#
+#   default          28.8 s   18.60 MiB   1.62 us/line
+#   thin + cgu=1     68.3 s   14.23 MiB   1.57 us/line
+#   fat  + cgu=1     94.2 s   13.21 MiB   1.53 us/line
+#
+# The size column is the reason to set this at all: a quarter off the shipped
+# binary. The runtime column is nearly flat because this workload is bound by
+# syscalls and task wakeups rather than by inlinable code, and the gap between
+# thin and fat is inside the noise -- an earlier round had them equal. So
+# `lto = "thin"`, which leaves 26 s of build time on the table for 1.0 MiB
+# nobody has asked for.
+#
+# Not `panic = "abort"`, and that is a correctness limit rather than a
+# preference: `shep-client`'s `spawn.rs` calls `JoinError::is_panic` and
+# `resume_unwind` to re-raise a panicked task in its caller, which needs a
+# runtime that unwinds.
+#
+# Not `strip`: symbols are what let `sample(1)` name a frame, and the fix that
+# took 1.57 us/line down to 0.82 was found by profiling a binary built with
+# exactly this profile. 1.4 MiB is not worth giving that up.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.lints.rust]
 missing_docs = "deny"
 missing_debug_implementations = "deny"

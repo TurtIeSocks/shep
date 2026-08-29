@@ -54,7 +54,7 @@ use shep_core::protocol::BusEvent;
 #[cfg(unix)]
 use shep_core::selector::ProcessSelector;
 
-use crate::bus::new_bus;
+use crate::bus::{SharedEvent, new_bus};
 use crate::cron::DEFAULT_MAX_CRON_SLEEP;
 use crate::dogs::{DogSpec, spawn_dog_watch};
 use crate::extras::{Extras, ExtrasReports, spawn_extras_reporter};
@@ -1174,7 +1174,7 @@ impl RunningDaemon {
         }
 
         // 3. Tell subscribers before their sockets close underneath them.
-        let _ = ctx.events.send(BusEvent::DaemonShutdown);
+        let _ = ctx.events.send(SharedEvent::new(BusEvent::DaemonShutdown));
 
         // 4. Kill ladder on every online sheep.
         ctx.supervisor.shutdown().await;
@@ -2824,7 +2824,7 @@ mod tests {
 
         let restarted = async {
             loop {
-                match events.recv().await {
+                match events.recv().await.map(|event| event.to_event()) {
                     Ok(BusEvent::Process {
                         event: ProcessEventKind::Restart,
                         info,

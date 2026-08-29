@@ -22,18 +22,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 
 use shep_core::config::normalize_all;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
-    BusEvent, Envelope, Lamb, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode,
-    SelectorSpec,
+    Envelope, Lamb, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, SelectorSpec,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
 
-use crate::bus::TopicFilter;
+use crate::bus::{Bus, TopicFilter};
 use crate::dogs::DogSpec;
 use crate::limits::stats::StatsState;
 use crate::snapshot::{FlockRegistry, SnapshotError, write_atomic};
@@ -61,7 +60,7 @@ pub struct RpcContext {
     /// The daemon-wide event bus; `Subscribe` compiles a [`TopicFilter`] the
     /// connection layer hands to [`crate::bus::spawn_forwarder`] alongside a
     /// receiver off this sender.
-    pub(crate) events: broadcast::Sender<BusEvent>,
+    pub(crate) events: Bus,
     /// The muster roll's in-memory app registry — `Start` records into it.
     pub(crate) registry: FlockRegistry,
     /// Where [`Self::snapshot_now`] writes the muster roll.

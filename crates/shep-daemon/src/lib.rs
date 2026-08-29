@@ -103,8 +103,8 @@
 //! // Set up temporary paths for this example
 //! let paths = ShepPaths::resolve(&|_| None, Path::new("/tmp/shep-example"));
 //!
-//! // Create a broadcast channel for events
-//! let (events, _rx) = tokio::sync::broadcast::channel(64);
+//! // Create the event bus every subscriber reads
+//! let events = shep_daemon::new_bus();
 //!
 //! // Spawn the supervisor actor
 //! let handle = spawn_supervisor(runner, paths, events);
@@ -220,6 +220,10 @@
 pub(crate) mod backoff;
 pub(crate) mod brain;
 pub(crate) mod bus;
+// The bus surface a caller of [`supervisor::spawn_supervisor`] needs, and no
+// more: the module stays crate-private so its internals (forwarders, topic
+// bookkeeping) never become API by accident.
+pub use bus::{Bus, SharedEvent, new_bus};
 pub(crate) mod cron;
 pub(crate) mod entry;
 pub(crate) mod extras;

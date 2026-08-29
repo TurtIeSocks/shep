@@ -258,6 +258,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::bus::SharedEvent;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::supervisor::spawn_supervisor;
     use crate::testing::{TestClock, test_paths};
@@ -287,7 +288,7 @@ mod tests {
     /// cron-triggered restarts in any single test below.
     fn spawn_test_fixture() -> (
         SupervisorHandle,
-        broadcast::Receiver<BusEvent>,
+        broadcast::Receiver<SharedEvent>,
         tempfile::TempDir,
     ) {
         spawn_test_fixture_with(vec![ProcScript::never_exits(); 8])
@@ -300,11 +301,11 @@ mod tests {
         scripts: Vec<ProcScript>,
     ) -> (
         SupervisorHandle,
-        broadcast::Receiver<BusEvent>,
+        broadcast::Receiver<SharedEvent>,
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (events, rx) = broadcast::channel(64);
+        let (events, rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(scripts);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
         (handle, rx, dir)
@@ -342,9 +343,12 @@ mod tests {
     /// Waits for the next `BusEvent::Process { event: Restart, .. }` for
     /// `name`, wrapped in a timeout so a worker that never restarts fails
     /// the test instead of hanging it (rule 4).
-    async fn expect_restart(rx: &mut broadcast::Receiver<BusEvent>, name: &str) -> ProcessInfo {
+    async fn expect_restart(rx: &mut broadcast::Receiver<SharedEvent>, name: &str) -> ProcessInfo {
         loop {
-            match tokio::time::timeout(EVENT_WAIT, rx.recv()).await {
+            match tokio::time::timeout(EVENT_WAIT, rx.recv())
+                .await
+                .map(|received| received.map(|event| event.to_event()))
+            {
                 Ok(Ok(BusEvent::Process {
                     event: ProcessEventKind::Restart,
                     info,
@@ -361,9 +365,9 @@ mod tests {
     /// Drains every already-queued event, panicking if any of them is a
     /// `Restart` for `name` — a claim that nothing happened, so it reads
     /// with `try_recv` rather than waiting on the (paused) clock to move.
-    fn assert_no_restart_pending(rx: &mut broadcast::Receiver<BusEvent>, name: &str) {
+    fn assert_no_restart_pending(rx: &mut broadcast::Receiver<SharedEvent>, name: &str) {
         loop {
-            match rx.try_recv() {
+            match rx.try_recv().map(|event| event.to_event()) {
                 Ok(BusEvent::Process {
                     event: ProcessEventKind::Restart,
                     info,
@@ -386,14 +390,17 @@ mod tests {
     /// swap for the `try_recv` form when the caller already forced that
     /// round trip to settle (e.g. a prior [`expect_restart`]).
     async fn assert_no_restart_within(
-        rx: &mut broadcast::Receiver<BusEvent>,
+        rx: &mut broadcast::Receiver<SharedEvent>,
         name: &str,
         window: Duration,
     ) {
         let deadline = tokio::time::Instant::now() + window;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, rx.recv()).await {
+            match tokio::time::timeout(remaining, rx.recv())
+                .await
+                .map(|received| received.map(|event| event.to_event()))
+            {
                 Err(_) => return, // window elapsed with nothing matching — expected
                 Ok(Ok(BusEvent::Process {
                     event: ProcessEventKind::Restart,

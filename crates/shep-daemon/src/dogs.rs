@@ -41,6 +41,7 @@ use shep_core::paths::ShepPaths;
 use shep_core::protocol::{BusEvent, DogSource, ProcessEventKind};
 use tokio::sync::broadcast::{self, error::RecvError};
 
+use crate::bus::SharedEvent;
 use crate::supervisor::SupervisorHandle;
 
 /// One dog the daemon knows about: its name, and where its binary comes from.
@@ -279,7 +280,7 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
 /// drops, and holding the handle is what makes the end deterministic rather
 /// than dependent on sender count.
 pub fn spawn_dog_watch(
-    mut events: broadcast::Receiver<BusEvent>,
+    mut events: broadcast::Receiver<SharedEvent>,
     barks: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -292,14 +293,17 @@ pub fn spawn_dog_watch(
                 // is excluded too: it fires on every restart a dog survives,
                 // and a `barks.jsonl` full of those is one an operator stops
                 // reading.
-                Ok(BusEvent::Process {
-                    event: ProcessEventKind::Errored,
-                    info,
-                    ..
-                }) if info.dog.is_some() => {
-                    record_dog_errored(&barks, &info.name, info.restarts);
+                Ok(event) => {
+                    if let BusEvent::Process {
+                        event: ProcessEventKind::Errored,
+                        info,
+                        ..
+                    } = &*event
+                        && info.dog.is_some()
+                    {
+                        record_dog_errored(&barks, &info.name, info.restarts);
+                    }
                 }
-                Ok(_) => {}
                 // The bus DROPS events for a lagging subscriber rather than
                 // queuing them (`tokio::sync::broadcast`'s own contract), so
                 // a dog's death notice may be among what this receiver just
@@ -515,8 +519,8 @@ mod tests {
 
     /// A minimal `Process` bus event, `name` carrying either a sheep's or a
     /// dog's entry depending on `dog`.
-    fn process_event(name: &str, kind: ProcessEventKind, dog: Option<DogSource>) -> BusEvent {
-        BusEvent::Process {
+    fn process_event(name: &str, kind: ProcessEventKind, dog: Option<DogSource>) -> SharedEvent {
+        SharedEvent::new(BusEvent::Process {
             event: kind,
             info: ProcessInfo::builder(1, name, ProcStatus::Errored)
                 .restarts(16)
@@ -524,10 +528,10 @@ mod tests {
                 .build(),
             manually: false,
             at_ms: 1_700_000_000_000,
-        }
+        })
     }
 
-    fn errored_event(name: &str, dog: Option<DogSource>) -> BusEvent {
+    fn errored_event(name: &str, dog: Option<DogSource>) -> SharedEvent {
         process_event(name, ProcessEventKind::Errored, dog)
     }
 
@@ -558,7 +562,7 @@ mod tests {
     async fn the_shepherd_records_a_dog_that_gave_up_and_leaves_the_sheep_to_bark() {
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
-        let (events, rx) = broadcast::channel(16);
+        let (events, rx) = crate::bus::test_bus(16);
         let watch = spawn_dog_watch(rx, barks_path.clone());
 
         events.send(errored_event("web", None)).unwrap();
@@ -585,7 +589,7 @@ mod tests {
     async fn a_dog_that_merely_exited_is_not_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
-        let (events, rx) = broadcast::channel(16);
+        let (events, rx) = crate::bus::test_bus(16);
         let watch = spawn_dog_watch(rx, barks_path.clone());
 
         events

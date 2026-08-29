@@ -44,6 +44,7 @@ use shep_core::config::{AppConfig, NormalizeError, ResolvedApp, normalize};
 use shep_core::protocol::{BusEvent, ProcessInfo};
 use shep_core::status::ProcStatus;
 
+use crate::bus::SharedEvent;
 use crate::supervisor::SupervisorHandle;
 
 /// Schema version of `flock.json`
@@ -517,7 +518,7 @@ pub(crate) fn spawn_snapshot_writer(
     path: PathBuf,
     supervisor: SupervisorHandle,
     registry: FlockRegistry,
-    events: broadcast::Receiver<BusEvent>,
+    events: broadcast::Receiver<SharedEvent>,
 ) -> SnapshotWriter {
     let writes = Arc::new(AtomicU64::new(0));
     let task_writes = Arc::clone(&writes);
@@ -532,7 +533,7 @@ async fn run_writer(
     path: PathBuf,
     supervisor: SupervisorHandle,
     registry: FlockRegistry,
-    mut events: broadcast::Receiver<BusEvent>,
+    mut events: broadcast::Receiver<SharedEvent>,
     writes: Arc<AtomicU64>,
 ) {
     let mut deadline: Option<Instant> = None;
@@ -851,7 +852,7 @@ mod tests {
         };
         write_atomic(&paths.snapshot, &roll).unwrap();
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -920,7 +921,7 @@ mod tests {
         };
         write_atomic(&paths.snapshot, &roll).unwrap();
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             // Two scripts for the two that must come up. `b-bad` consumes
             // none, so a run that let it take one would starve `c-good` and
@@ -1004,7 +1005,7 @@ mod tests {
         };
         write_atomic(&paths.snapshot, &roll).unwrap();
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]).refusing(&["gone"]),
             paths.clone(),
@@ -1054,7 +1055,7 @@ mod tests {
         };
         write_atomic(&paths.snapshot, &roll).unwrap();
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -1087,7 +1088,7 @@ mod tests {
         std::fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
         assert!(!paths.snapshot.exists());
 
-        let (events, _rx) = tokio::sync::broadcast::channel(64);
+        let (events, _rx) = crate::bus::test_bus(64);
         let handle = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -1108,7 +1109,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::create_dir_all(&paths.home).unwrap();
-        let (events, _keep) = tokio::sync::broadcast::channel(64);
+        let (events, _keep) = crate::bus::test_bus(64);
         let supervisor = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -1132,12 +1133,15 @@ mod tests {
             ProcessEventKind::Online,
         ] {
             events
-                .send(BusEvent::Process {
-                    event,
-                    info: info(0, "web", ProcStatus::Online),
-                    manually: false,
-                    at_ms: 0,
-                })
+                .send(
+                    BusEvent::Process {
+                        event,
+                        info: info(0, "web", ProcStatus::Online),
+                        manually: false,
+                        at_ms: 0,
+                    }
+                    .into(),
+                )
                 .unwrap();
         }
         tokio::time::sleep(Duration::from_millis(SNAPSHOT_DEBOUNCE_MS + 1)).await;
@@ -1154,7 +1158,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::create_dir_all(&paths.home).unwrap();
-        let (events, _keep) = tokio::sync::broadcast::channel(64);
+        let (events, _keep) = crate::bus::test_bus(64);
         let supervisor = spawn_supervisor(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
@@ -1168,10 +1172,13 @@ mod tests {
         );
         for id in 0..50 {
             events
-                .send(BusEvent::LogOut {
-                    id,
-                    line: "chatty".to_string(),
-                })
+                .send(
+                    BusEvent::LogOut {
+                        id,
+                        line: "chatty".to_string(),
+                    }
+                    .into(),
+                )
                 .unwrap();
         }
         tokio::time::sleep(Duration::from_millis(SNAPSHOT_DEBOUNCE_MS * 4)).await;

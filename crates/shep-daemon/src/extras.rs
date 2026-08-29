@@ -653,6 +653,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::bus::SharedEvent;
     use crate::cron::DEFAULT_MAX_CRON_SLEEP;
     use crate::fake::{ProcScript, ScriptedRunner};
     use crate::limits::PollingEnforcer;
@@ -740,11 +741,11 @@ mod tests {
     /// the supervisor emit `Errored`, not `Restart`).
     fn spawn_test_fixture() -> (
         SupervisorHandle,
-        broadcast::Receiver<BusEvent>,
+        broadcast::Receiver<SharedEvent>,
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (events, rx) = broadcast::channel(64);
+        let (events, rx) = crate::bus::test_bus(64);
         let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 12]);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
         (handle, rx, dir)
@@ -779,7 +780,7 @@ mod tests {
     /// Waits up to `window` for a `Restart` naming `name`, panicking if none
     /// arrives.
     async fn expect_restart(
-        rx: &mut broadcast::Receiver<BusEvent>,
+        rx: &mut broadcast::Receiver<SharedEvent>,
         name: &str,
         window: Duration,
     ) -> ProcessInfo {
@@ -794,13 +795,13 @@ mod tests {
     /// because only the handful of cases below read the flag, and every other
     /// caller wants the snapshot alone.
     async fn expect_restart_event(
-        rx: &mut broadcast::Receiver<BusEvent>,
+        rx: &mut broadcast::Receiver<SharedEvent>,
         name: &str,
         window: Duration,
     ) -> (ProcessInfo, bool) {
         let restart = async {
             loop {
-                match rx.recv().await {
+                match rx.recv().await.map(|event| event.to_event()) {
                     Ok(BusEvent::Process {
                         event: ProcessEventKind::Restart,
                         info,
@@ -827,14 +828,17 @@ mod tests {
     /// the occurrence the abort was supposed to stop, so the same call both
     /// crosses it and makes the claim.
     async fn assert_no_restart_within(
-        rx: &mut broadcast::Receiver<BusEvent>,
+        rx: &mut broadcast::Receiver<SharedEvent>,
         name: &str,
         window: Duration,
     ) {
         let deadline = tokio::time::Instant::now() + window;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, rx.recv()).await {
+            match tokio::time::timeout(remaining, rx.recv())
+                .await
+                .map(|received| received.map(|event| event.to_event()))
+            {
                 Err(_) => return, // window elapsed with nothing matching — expected
                 Ok(Ok(BusEvent::Process {
                     event: ProcessEventKind::Restart,
@@ -2014,14 +2018,14 @@ mod tests {
     /// swap puts two entries under ONE name, so a name alone cannot say which
     /// half of it an event is about.
     async fn expect_process_event(
-        rx: &mut broadcast::Receiver<BusEvent>,
+        rx: &mut broadcast::Receiver<SharedEvent>,
         id: u32,
         kind: ProcessEventKind,
         window: Duration,
     ) {
         let wanted = async {
             loop {
-                match rx.recv().await {
+                match rx.recv().await.map(|event| event.to_event()) {
                     Ok(BusEvent::Process { event, info, .. }) if event == kind && info.id == id => {
                         return;
                     }
