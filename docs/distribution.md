@@ -29,9 +29,13 @@ repository name.
 | Chocolatey | `PUBLISH_CHOCOLATEY=true` | `CHOCO_API_KEY` | an icon |
 | WinGet | `WINGET_IDENTIFIER=<Publisher>.shep` | `WINGET_TOKEN` | a fork, one manual submission |
 
-Each token needs contents write on the repository it pushes to. The default
-`GITHUB_TOKEN` cannot reach another repository, which is why the two that do
-carry their own.
+The secrets are not all the same kind of thing. `HOMEBREW_TAP_TOKEN` and
+`SCOOP_BUCKET_TOKEN` are GitHub tokens with contents write on the repository
+they push to, and they exist because the default `GITHUB_TOKEN` cannot reach
+another repository. `WINGET_TOKEN` is a GitHub token too, but scoped
+`public_repo` against a fork of microsoft/winget-pkgs, since that channel
+opens a pull request rather than pushing. `CHOCO_API_KEY` is not a GitHub
+credential at all: it is an API key from a chocolatey.org account.
 
 **The `.deb` is the cheapest one to turn on** and the only one that needs
 nothing outside this repository. It is `dpkg -i` rather than `apt install`,
@@ -359,10 +363,13 @@ position.
 
 ## What each release costs afterwards
 
-Merging the release pull request stays the only manual act. release-plz
-tags and publishes, the artifact workflow builds and uploads, the `.deb`
-rides the same matrix, and the tap, Scoop and WinGet bumps hang off the
-release event.
+Merging the release pull request stays the only thing that triggers a
+release. release-plz tags and publishes, the artifact workflow builds and
+uploads, the `.deb` rides the same matrix, and the tap, Scoop and WinGet
+bumps hang off the release event.
+
+It is not the only manual act, though, because of the first of the two costs
+below.
 
 Two recurring costs are real:
 

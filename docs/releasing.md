@@ -10,8 +10,9 @@ opens it, and merging it tags the commit, creates the GitHub release, and
 uploads. There is no tag to push by hand and no local `cargo publish`.
 
 That covers crates.io. Shipping to Homebrew, apt and the Windows package
-managers is a separate question, and none of it works until a release
-carries a binary: [distribution.md](distribution.md).
+managers is a separate question: [distribution.md](distribution.md). The
+Homebrew formula builds from the crates.io tarball and needs nothing else,
+but apt and both Windows channels wait on a release carrying a binary.
 
 ## Publish order
 
