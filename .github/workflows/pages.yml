@@ -52,6 +52,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # `npm ci` plus `astro build` is a couple of minutes. 15 is a ceiling
+    # against a hang, not a budget. Both jobs here went without one while
+    # every job in test.yml and release-artifacts.yml had one.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -71,6 +75,9 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # Publishing an already-built artifact. Generous for what it does, and it
+    # can wait on the `pages` concurrency group above.
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
