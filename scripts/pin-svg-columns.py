@@ -41,8 +41,17 @@ X_ATTR = re.compile(r'\sx="(?P<x>[-\d.]+)"')
 
 
 def _fmt(value: float) -> str:
-    """Trim a coordinate to the shortest form that still round-trips."""
-    return f"{value:.2f}".rstrip("0").rstrip(".") or "0"
+    """Trim a coordinate to the shortest form that does not lose it.
+
+    Six decimals rather than two. Today's assets are all multiples of an 8.4px
+    cell, so the extra four never appear and this emits "16" and "24.4" either
+    way. They matter for an asset this script has not seen: the parser accepts
+    any precision, and at two decimals a run whose share of a small
+    `textLength` falls under 0.005 formats to "0" and renders as a zero-width
+    run. Six decimals is well under a pixel at any plausible font size, so
+    nothing is gained by trimming harder.
+    """
+    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
 
 
 def _runs(chars: list[str]) -> list[tuple[int, int]]:
