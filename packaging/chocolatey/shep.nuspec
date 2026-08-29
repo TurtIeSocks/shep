@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>shep</id>
+    <!-- Not the same string as <id>, per the package validator's CPMR0050. -->
+    <title>shep Process Manager</title>
+    <!-- Replaced at pack time: the workflow passes the version off the
+         release tag to `choco pack`. The literal here never ships. -->
+    <version>0.0.0</version>
+    <authors>TurtIeSocks</authors>
+    <owners>TurtIeSocks</owners>
+    <projectUrl>https://shep.turtlesocks.dev</projectUrl>
+    <projectSourceUrl>https://github.com/TurtIeSocks/shep</projectSourceUrl>
+    <packageSourceUrl>https://github.com/TurtIeSocks/shep/tree/main/packaging/chocolatey</packageSourceUrl>
+    <docsUrl>https://shep.turtlesocks.dev/docs/getting-started</docsUrl>
+    <bugTrackerUrl>https://github.com/TurtIeSocks/shep/issues</bugTrackerUrl>
+    <licenseUrl>https://github.com/TurtIeSocks/shep#license</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <!-- No iconUrl yet. It is a validator Guideline (CPMR0033) rather than a
+         Requirement, so the package is approvable without one, and shep has
+         no artwork to point at: web/public/ carries favicon.ico and
+         favicon.svg, neither of which is a PNG. When artwork exists, CPMR0076
+         forbids linking a raw GitHub URL, so it has to go through a CDN such
+         as jsdelivr or Statically. -->
+    <copyright>Copyright (c) TurtIeSocks</copyright>
+    <!-- Spaces, never commas (CPMR0014), and no "chocolatey" (CPMR0048). -->
+    <tags>shep process-manager supervisor daemon cli rust pm2 foreground service</tags>
+    <summary>A process manager that keeps a flock of long-running processes alive, with logs, watch and cron restarts, and webhook alerts</summary>
+    <description><![CDATA[
+shep is a process manager written in Rust. One binary runs a daemon called the
+shepherd, which keeps a flock of your long-running processes alive, restarts
+them when they die, captures what they print, and says plainly when something
+is wrong.
+
+Every command answers with the whole flock, not just the process you touched.
+The face in the STATUS column is the fastest thing to read: `(o.o)` online,
+`(o~o)` starting, `(>_<)` waiting to restart, `(-.-)` stopped, `(x.x)` errored.
+
+## What it does
+
+* Supervises long-running processes and restarts them when they exit
+* Captures stdout and stderr to rotating log files, readable with `shep bleats`
+* Restarts on file changes, on a cron schedule, or over a memory limit
+* A terminal dashboard, `shep lookout`
+* Webhook alerts, an MCP server, and a key-value store the flock can read
+
+## Three things it will not do on Windows
+
+Windows is the newest of the three supported platforms and these gaps are
+real rather than temporary omissions:
+
+* `shep startup` is not built. Boot-time supervision on Windows means a
+  Service Control Manager service, which is a different program shape rather
+  than another unit template. Run `shep start` in your own session, or wrap
+  `shep runtime` in NSSM or WinSW.
+* There is nothing SIGTERM-shaped that can be delivered to an arbitrary
+  process, so `shep stop` waits out the process's whole `kill_timeout` before
+  terminating it. An app that opts into the shepherd channel with
+  `shutdown_with_message` gets a graceful stop instead.
+* The `user` and `group` fields refuse permanently. Dropping privilege on
+  Windows needs a logon session or a primary-token privilege, which is a
+  different feature rather than a different call.
+
+## Notes on this package
+
+Only `shep.exe` is shimmed. The archive also carries `shep-runtime.exe` and
+`shep-dev.exe`, which are container entrypoint aliases with no desktop use
+case, so they are installed without shims.
+
+`choco uninstall` refuses while a shepherd is still running, rather than
+stopping your processes on your behalf. Run `shep kill` first.
+]]></description>
+    <releaseNotes>https://github.com/TurtIeSocks/shep/releases</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

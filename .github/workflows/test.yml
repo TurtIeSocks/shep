@@ -95,6 +95,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       bench: ${{ steps.filter.outputs.bench }}
+      packaging: ${{ steps.filter.outputs.packaging }}
     steps:
       - uses: actions/checkout@v4
       # Pinned by commit like Swatinem/rust-cache above, not by moving tag
@@ -121,6 +122,71 @@ jobs:
             # cares when it changes.
             bench:
               - 'benches/**'
+            # Feeds both the `packaging` job (Chocolatey) and the `formula`
+            # job (Homebrew). Neither compiles Rust, so neither belongs on the
+            # `rust` filter.
+            packaging:
+              - 'packaging/**'
+              - '.github/workflows/test.yml'
+  # Parses the Chocolatey package's PowerShell and its nuspec, on a runner
+  # that has both. Neither is compiled by anything else here, and the only
+  # other thing that reads them is `release-artifacts.yml`'s `chocolatey`
+  # job, which runs once per release and pushes straight to a moderation
+  # queue. A syntax error found there is found in public, days later.
+  #
+  # A parse, not an execution: the scripts call Chocolatey helper functions
+  # that only exist inside a real install.
+  packaging:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.packaging == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failed = $false
+          Get-ChildItem packaging -Recurse -Filter *.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) {
+              $failed = $true
+              $errors | ForEach-Object { Write-Host "::error::$($_.Extent.File):$($_.Extent.StartLineNumber): $($_.Message)" }
+            } else {
+              Write-Host "ok $($_.FullName)"
+            }
+          }
+          if ($failed) { throw 'PowerShell parse errors' }
+      - shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem packaging -Recurse -Filter *.nuspec | ForEach-Object {
+            [xml](Get-Content $_.FullName -Raw) | Out-Null
+            Write-Host "ok $($_.FullName)"
+          }
+  # `brew style` on the Homebrew formula, which is rubocop with Homebrew's own
+  # cops. Same argument as the `packaging` job above: nothing else parses this
+  # file, and the only other thing that reads it is the release-time push to
+  # the tap.
+  #
+  # The formula is copied to a `Formula/` directory first, which is not
+  # ceremony. Homebrew's rubocop config keys several cops off the path, so
+  # linting `packaging/homebrew/shep.rb` in place reports a
+  # `Style/FrozenStringLiteralComment` offense that no formula in a real tap
+  # has or wants.
+  formula:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.packaging == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p tap/Formula
+          cp packaging/homebrew/shep.rb tap/Formula/shep.rb
+          brew style "$PWD/tap/Formula/shep.rb"
   lint:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}

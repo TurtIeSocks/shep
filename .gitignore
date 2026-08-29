@@ -26,3 +26,4 @@ docs/teach
 # normal; only what those two setup scripts produce is excluded here.
 /examples/polyglot/venv/
 /examples/polyglot/go-http/go-http
+/crates/shep-cli/completions/
