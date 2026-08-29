@@ -1109,7 +1109,7 @@ The maintainer ruled the six remaining daemon-surface verbs (scale, signal, send
 
 Phase 12a built lookout's whole shell (deps, terminal lifecycle, palette, event loop, link supervision) plus only the flock table, then produced rendered TestBackend frames on disk for the maintainer to look at before the other three panes (bleats feed, detail pane, host strip) were designed in 12b.
 
-**Why:** Rin's own words: "let's start with flock table first. I need to see the panels before I can make a full decision." A selected row/cursor was explicitly considered and cut from 12a for the same reason (its only consumer, the detail pane, is 12b).
+**Why:** The flock table went first so the panes could be looked at before the rest of the layout was settled. A selected row and cursor were considered for 12a and cut for the same reason: their only consumer, the detail pane, is 12b.
 
 `docs/writing-plans/plans/2026-08-14-shep-phase12a-lookout-shell.md:8`
 
@@ -1437,7 +1437,7 @@ An earlier draft predicted the Cargo.lock delta could be as large as +344 packag
 
 ### rmcp SDK chosen over hand-rolled stdio JSON-RPC - opposite ruling from `shep serve`
 
-Rin weighed rmcp (official MCP Rust SDK) against hand-rolling the stdio JSON-RPC loop and took the SDK, on the argument that MCP is a still-evolving protocol where tracking an SDK beats owning a parser. This is the deliberate opposite of the `shep serve` ruling, where axum was rejected in favor of hand-rolling on the HTTP surface the metrics dog already has.
+rmcp, the official MCP Rust SDK, was weighed against hand-rolling the stdio JSON-RPC loop and won, on the argument that MCP is a still-evolving protocol where tracking an SDK beats owning a parser. This is the deliberate opposite of the `shep serve` ruling, where axum was rejected in favor of hand-rolling on the HTTP surface the metrics dog already has.
 
 **Why:** Distinguishing principle: a settled, single-endpoint protocol (serve's static file HTTP) favors hand-rolling; an evolving multi-shape protocol (MCP) favors an SDK someone else tracks.
 
