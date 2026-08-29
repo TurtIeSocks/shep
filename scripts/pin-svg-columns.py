@@ -114,20 +114,32 @@ def pin(svg: str) -> tuple[str, int]:
 def main(paths: list[str]) -> int:
     for name in paths:
         path = Path(name)
-        # Both ends pinned to UTF-8. Without it Python uses the host's locale
-        # encoding, and on a Windows shell that is usually cp1252, which cannot
-        # represent a single box-drawing character: the read raises, or worse,
-        # a lossy round-trip writes an asset back with the table gone.
-        before = path.read_text(encoding="utf-8")
-        after, split = pin(before)
-        path.write_text(after, encoding="utf-8")
-        # Encoded, because these are byte counts and a box-drawing character is
-        # three bytes to Python's one. Reporting `len` of the string understated
-        # hero.svg by 2K and put a wrong figure in this commit's own pull request.
-        print(
-            f"{path}: split {split} mixed runs, "
-            f"{len(before.encode('utf-8'))} -> {len(after.encode('utf-8'))} bytes"
-        )
+        # Bytes on both ends, decoded and encoded here rather than by
+        # `read_text`/`write_text`, which get two separate things wrong.
+        #
+        # ENCODING. Without an explicit one Python uses the host's locale, and
+        # on a Windows shell that is usually cp1252. cp1252 does not REFUSE
+        # UTF-8 box-drawing bytes, which would at least be loud; it decodes
+        # them, into three mojibake characters per glyph. The script then sees
+        # 12 characters where the row has 4, divides every `textLength` by
+        # three times too many, and writes a structurally corrupt SVG with no
+        # error anywhere. Verified: `"┌─┼…".encode("utf-8").decode("cp1252")`
+        # returns 12 characters and re-encodes to the identical bytes, so even
+        # a byte-for-byte diff of the file would not catch it.
+        #
+        # NEWLINES. `write_text` defaults to `newline=None`, which translates
+        # every "\n" to `os.linesep`. On Windows that rewrites both assets with
+        # CRLF as a side effect of a run that was meant to change x
+        # coordinates. `write_bytes` performs no translation.
+        raw = path.read_bytes()
+        after, split = pin(raw.decode("utf-8"))
+        written = after.encode("utf-8")
+        path.write_bytes(written)
+        # These are the bytes read and the bytes written, not a character count
+        # standing in for them. A box-drawing character is one character and
+        # three bytes, so `len` of the string understated hero.svg by 2K and put
+        # a wrong figure in this pull request before it was caught.
+        print(f"{path}: split {split} mixed runs, {len(raw)} -> {len(written)} bytes")
     return 0
 
 
