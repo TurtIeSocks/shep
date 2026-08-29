@@ -256,9 +256,13 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 /// - [`NormalizeError::InvalidWatchGlob`]: a `watch_options` or
 ///   `ignore_watch` pattern globset will not compile (carries the app name,
 ///   which of the two lists, the pattern and the reason).
-/// - [`NormalizeError::BadTemplate`]: an `env` value or an `args` entry
-///   carries a `{{...}}` naming something [`crate::config::template`] does
-///   not define (carries the app name, which field, and the rejection).
+/// - [`NormalizeError::BadTemplate`]: an `env` value, an `args` entry, or an
+///   `out_file`/`err_file` path carries a `{{...}}` naming something
+///   [`crate::config::template`] does not define (carries the app name, which
+///   field, and the rejection).
+/// - [`NormalizeError::SharedLogPath`]: `out_file` or `err_file` names one
+///   path with `instances > 1` and `merge_logs` off, so every instance would
+///   write to it without having asked to.
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     normalize_with_home(app, std::env::home_dir().as_deref())
 }
@@ -297,6 +301,11 @@ pub fn normalize_with_home(
     for (index, value) in app.args.iter().enumerate() {
         validate_template(&app.name, &format!("args[{index}]"), value)?;
     }
+    for (field, value) in [("out_file", &app.out_file), ("err_file", &app.err_file)] {
+        if let Some(value) = value {
+            validate_template(&app.name, field, value)?;
+        }
+    }
     if app.script.is_empty() {
         return Err(NormalizeError::MissingScript);
     }
@@ -306,6 +315,25 @@ pub fn normalize_with_home(
     expand_paths(&mut app, home)?;
     if app.instances == 0 {
         return Err(NormalizeError::ZeroInstances);
+    }
+    // After the template validation above, so a malformed `out_file`/`err_file`
+    // is reported as a bad template rather than as a shared path.
+    if app.instances > 1 && !app.merge_logs {
+        for (field, path) in [("out_file", &app.out_file), ("err_file", &app.err_file)] {
+            // Rendered rather than searched for a substring: an escaped
+            // `{{{{instance}}}}` contains the token's spelling but renders to
+            // one literal path for every instance, which is exactly the
+            // collision this refuses. Two slots that render alike collide.
+            if let Some(path) = path
+                && crate::config::template::render(path, &app.name, 0)
+                    == crate::config::template::render(path, &app.name, 1)
+            {
+                return Err(NormalizeError::SharedLogPath {
+                    name: app.name.clone(),
+                    field,
+                });
+            }
+        }
     }
     if let Some(pattern) = &app.cron_restart {
         CronSchedule::parse(pattern, app.cron_timezone.as_deref()).map_err(|e| match e {
@@ -651,6 +679,15 @@ pub enum NormalizeError {
         /// variant does not have to restate the grammar's own copy
         reason: String,
     },
+    /// An explicit log path has no `{{instance}}` in it, the app runs more
+    /// than one instance, and `merge_logs` is off, so every instance would
+    /// write to one file without having asked to.
+    SharedLogPath {
+        /// The sheep name
+        name: String,
+        /// `out_file` or `err_file`
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for NormalizeError {
@@ -737,6 +774,10 @@ impl fmt::Display for NormalizeError {
                 field,
                 reason,
             } => write!(f, "sheep `{name}`, {field}: {reason}"),
+            Self::SharedLogPath { name, field } => write!(
+                f,
+                "sheep `{name}` runs several instances and sets `{field}` to one path: put `{{{{instance}}}}` in it, or set `merge_logs = true` to share it on purpose"
+            ),
         }
     }
 }
@@ -1509,6 +1550,55 @@ target = "http://127.0.0.1:8080/healthz"
         app.args = vec!["--port".to_string(), "91{{slot}}".to_string()];
         let err = normalize(app).unwrap_err();
         assert!(err.to_string().contains("slot"), "{err}");
+    }
+
+    #[test]
+    fn an_explicit_log_path_shared_by_every_instance_is_refused() {
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 3;
+        app.out_file = Some("/var/log/web.log".to_string());
+        let err = normalize(app).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("out_file"), "names the field: {rendered}");
+        assert!(
+            rendered.contains("{{instance}}") && rendered.contains("merge_logs"),
+            "and both ways out: {rendered}"
+        );
+        assert!(
+            !rendered.contains('\u{2014}') && !rendered.contains('\u{2013}'),
+            "no em or en dash in copy a user reads: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_three_ways_out_of_the_shared_log_refusal_all_work() {
+        // A slot in the path.
+        let mut templated = AppConfig::minimal("web", "./srv");
+        templated.instances = 3;
+        templated.out_file = Some("/var/log/web-{{instance}}.log".to_string());
+        assert!(normalize(templated).is_ok());
+
+        // Asking for the merge on purpose.
+        let mut merged = AppConfig::minimal("web", "./srv");
+        merged.instances = 3;
+        merged.out_file = Some("/var/log/web.log".to_string());
+        merged.merge_logs = true;
+        assert!(normalize(merged).is_ok());
+
+        // One instance cannot collide with itself.
+        let mut single = AppConfig::minimal("web", "./srv");
+        single.out_file = Some("/var/log/web.log".to_string());
+        assert!(normalize(single).is_ok());
+    }
+
+    #[test]
+    fn an_escaped_template_in_a_log_path_does_not_satisfy_the_refusal() {
+        // `{{{{instance}}}}` spells the token but renders to one literal path
+        // for every instance, so a substring check would wave it through.
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.instances = 3;
+        app.out_file = Some("/var/log/web-{{{{instance}}}}.log".to_string());
+        assert!(normalize(app).is_err());
     }
 
     #[test]

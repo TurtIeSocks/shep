@@ -162,7 +162,10 @@ const INHERITED: &[&str] = &[
 /// Default log paths are `logs/<name>-<instance>-out.log` and `-err.log`.
 /// When `merge_logs = true`, they become `logs/<name>-out.log` and `-err.log`
 /// (shared across all instances). Explicit `out_file`/`err_file` config
-/// always win over defaults.
+/// always win over defaults, and are rendered through the
+/// `{{instance}}`/`{{name}}` grammar the same as `env` and `args` — normalize
+/// has already refused a path that would render alike for every instance,
+/// unless `merge_logs` asked for that on purpose.
 ///
 /// # Stdin
 ///
@@ -237,13 +240,13 @@ pub fn assemble(
     };
 
     let out_file = if let Some(ref explicit) = config.out_file {
-        PathBuf::from(explicit)
+        PathBuf::from(template::render(explicit, &name, instance))
     } else {
         paths.logs.join(format!("{}out.log", log_stem))
     };
 
     let err_file = if let Some(ref explicit) = config.err_file {
-        PathBuf::from(explicit)
+        PathBuf::from(template::render(explicit, &name, instance))
     } else {
         paths.logs.join(format!("{}err.log", log_stem))
     };
@@ -652,6 +655,20 @@ mod tests {
             Some("z-worker-2d")
         );
         assert!(spec.args.contains(&"912".to_string()), "{:?}", spec.args);
+    }
+
+    #[test]
+    fn a_templated_log_path_renders_per_instance() {
+        let app = normalize(AppConfig {
+            name: "web".to_string(),
+            script: "./srv".to_string(),
+            instances: 3,
+            out_file: Some("/var/log/web-{{instance}}.log".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let spec = assemble(&app, 2, &test_paths(), None);
+        assert_eq!(spec.out_file, PathBuf::from("/var/log/web-2.log"));
     }
 
     /// fails if `stdin` is implied by something. `channel` is implied by
