@@ -3338,8 +3338,13 @@ mod tests {
             let path = dir.path().join("flock.js");
             std::fs::write(
                 &path,
+                // The pipe-holder is a second node, not `sleep`: node exists
+                // wherever this test runs (it gated on node_available above),
+                // while `sleep` on a Windows runner is Git Bash's, and twice
+                // on CI the parent node sat out the whole 5s budget with it.
                 "require('child_process')\
-                 .spawn('sleep', ['30'], { detached: true, stdio: 'inherit' })\
+                 .spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)'], \
+                 { detached: true, stdio: 'inherit' })\
                  .unref(); \
                  module.exports = { app: [] };",
             )
