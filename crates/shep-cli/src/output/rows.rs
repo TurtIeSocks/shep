@@ -896,32 +896,47 @@ pub struct DogEnabledRow {
     pub status: String,
 }
 
-impl Render for DogEnabledRow {
+/// Shared scaffolding for the four dog-action tables:
+/// [`DogEnabledRow`]/[`DogDisabledRow`]/[`DogAdoptedRow`]/[`DogRehomedRow`].
+/// All four render one row of `["NAME", "SOURCE", "SHEPHERD", "STATUS"]` for
+/// a dog verb's outcome, share the same JSON key mapping, column priorities,
+/// and paint dispatch — the only thing that differs per verb is which
+/// fields it has (three carry a bare `DogSource`, [`DogRehomedRow`] an
+/// `Option<DogSource>`), and each type resolves that down to a source label
+/// before building one of these. Every other [`Render`] method is delegated
+/// straight to the associated functions below.
+struct DogActionRow<'a> {
+    name: &'a str,
+    source: &'a str,
+    shepherd_acted: bool,
+    status: &'a str,
+}
+
+impl DogActionRow<'_> {
     fn headers() -> &'static [&'static str] {
         &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
     }
 
     fn rows(&self) -> Vec<Vec<String>> {
         vec![vec![
-            self.name.clone(),
-            dog_source_label(&self.source).to_string(),
+            self.name.to_string(),
+            self.source.to_string(),
             self.shepherd_acted.to_string(),
-            self.status.clone(),
+            self.status.to_string(),
         ]]
     }
 
-    /// The dog-action rows' shared treatment, spelled out here once and
-    /// pointed at from the other three.
+    /// The dog-action rows' shared treatment, spelled out here once for all
+    /// four.
     ///
     /// SOURCE is muted, the same call `DogRows` makes: it says where the
     /// binary came from, never whether anything is healthy.
     ///
     /// STATUS is coloured only when it NAMES a status. This field holds
     /// either a real `ProcStatus` rendering or a sentence saying why no
-    /// shepherd answered ([`Self::status`]'s own doc), and a sentence has no
-    /// role to wear -- colouring it would be decoration, which is the one
-    /// thing the rule here forbids. [`status_named_by`] is what tells the two
-    /// apart.
+    /// shepherd answered, and a sentence has no role to wear -- colouring it
+    /// would be decoration, which is the one thing the rule here forbids.
+    /// [`status_named_by`] is what tells the two apart.
     ///
     /// SHEPHERD is left plain deliberately, and it was the closest call in
     /// this table. `false` is worth knowing -- it means the config changed
@@ -932,8 +947,11 @@ impl Render for DogEnabledRow {
     /// flock pane.
     ///
     /// NAME stays plain, matching every other table in this module.
-    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let rows = self.rows();
+    fn rows_for(
+        rows: Vec<Vec<String>>,
+        presentation: Presentation,
+        status_word: bool,
+    ) -> Vec<Vec<String>> {
         paint(
             rows.clone(),
             Self::headers(),
@@ -944,15 +962,19 @@ impl Render for DogEnabledRow {
     }
 
     /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values.
+    /// If `header` is not one of [`Self::headers`]'s own values. Every real
+    /// caller only ever passes a value straight from `headers()`, so this is
+    /// unreachable in practice; `caller` is the concrete type's own name so
+    /// the panic still names whichever of the four dog-action rows produced
+    /// it.
     #[track_caller]
-    fn json_key_for(header: &str) -> &'static str {
+    fn json_key_for(caller: &'static str, header: &str) -> &'static str {
         match header {
             "NAME" => "name",
             "SOURCE" => "source",
             "SHEPHERD" => "shepherd_acted",
             "STATUS" => "status",
-            other => panic!("DogEnabledRow::headers() does not include {other:?}"),
+            other => panic!("{caller}::headers() does not include {other:?}"),
         }
     }
 
@@ -960,7 +982,7 @@ impl Render for DogEnabledRow {
 
     // Parallel to `headers()` above: `["NAME", "SOURCE", "SHEPHERD",
     // "STATUS"]`. NAME and STATUS are the floor, the same role they play in
-    // `DogRows`. SOURCE and SHEPHERD are this type's own two extras (see
+    // `DogRows`. SOURCE and SHEPHERD are the two extras (see
     // `Render::PRIORITIES`'s own doc for the `6`-and-up rule); SOURCE drops
     // first, one round before SHEPHERD -- the same "least essential" role
     // `DogRows` already gives it (where the binary came from, not whether
@@ -969,9 +991,40 @@ impl Render for DogEnabledRow {
     // highest-priority extra, so this ordering also decides which of the two
     // an operator actually loses at a narrow width.
     // `priorities_line_up_with_headers_for_every_render_impl` (this module's
-    // test section) pins the length and the floor for every impl, this one
-    // included.
+    // test section) pins the length and the floor for every impl, all four
+    // dog-action rows included.
     const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
+}
+
+impl Render for DogEnabledRow {
+    fn headers() -> &'static [&'static str] {
+        DogActionRow::headers()
+    }
+
+    fn rows(&self) -> Vec<Vec<String>> {
+        DogActionRow {
+            name: &self.name,
+            source: dog_source_label(&self.source),
+            shepherd_acted: self.shepherd_acted,
+            status: &self.status,
+        }
+        .rows()
+    }
+
+    /// Shared with the other three dog-action rows — see
+    /// [`DogActionRow::rows_for`]'s own doc for the paint reasoning.
+    fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
+        DogActionRow::rows_for(self.rows(), presentation, status_word)
+    }
+
+    #[track_caller]
+    fn json_key_for(header: &str) -> &'static str {
+        DogActionRow::json_key_for("DogEnabledRow", header)
+    }
+
+    const JSON_ONLY: &'static [&'static str] = DogActionRow::JSON_ONLY;
+
+    const PRIORITIES: &'static [u8] = DogActionRow::PRIORITIES;
 }
 
 /// `shep disable <name>`: what the config edit and, if a shepherd is
@@ -997,48 +1050,35 @@ pub struct DogDisabledRow {
 
 impl Render for DogDisabledRow {
     fn headers() -> &'static [&'static str] {
-        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+        DogActionRow::headers()
     }
 
     fn rows(&self) -> Vec<Vec<String>> {
-        vec![vec![
-            self.name.clone(),
-            dog_source_label(&self.source).to_string(),
-            self.shepherd_acted.to_string(),
-            self.status.clone(),
-        ]]
+        DogActionRow {
+            name: &self.name,
+            source: dog_source_label(&self.source),
+            shepherd_acted: self.shepherd_acted,
+            status: &self.status,
+        }
+        .rows()
     }
 
-    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`] — see
+    /// [`DogActionRow::rows_for`]'s own doc.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let rows = self.rows();
-        paint(
-            rows.clone(),
-            Self::headers(),
-            presentation,
-            status_word,
-            |header, cell, _index| dog_action_paint(header, cell),
-        )
+        DogActionRow::rows_for(self.rows(), presentation, status_word)
     }
 
-    /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        match header {
-            "NAME" => "name",
-            "SOURCE" => "source",
-            "SHEPHERD" => "shepherd_acted",
-            "STATUS" => "status",
-            other => panic!("DogDisabledRow::headers() does not include {other:?}"),
-        }
+        DogActionRow::json_key_for("DogDisabledRow", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = &[];
+    const JSON_ONLY: &'static [&'static str] = DogActionRow::JSON_ONLY;
 
     // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
     // type shares its headers exactly.
-    const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
+    const PRIORITIES: &'static [u8] = DogActionRow::PRIORITIES;
 }
 
 /// `shep adopt <path> [--name <name>]`: what the config edit and, if a shepherd is
@@ -1067,48 +1107,35 @@ pub struct DogAdoptedRow {
 
 impl Render for DogAdoptedRow {
     fn headers() -> &'static [&'static str] {
-        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+        DogActionRow::headers()
     }
 
     fn rows(&self) -> Vec<Vec<String>> {
-        vec![vec![
-            self.name.clone(),
-            dog_source_label(&self.source).to_string(),
-            self.shepherd_acted.to_string(),
-            self.status.clone(),
-        ]]
+        DogActionRow {
+            name: &self.name,
+            source: dog_source_label(&self.source),
+            shepherd_acted: self.shepherd_acted,
+            status: &self.status,
+        }
+        .rows()
     }
 
-    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`] — see
+    /// [`DogActionRow::rows_for`]'s own doc.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let rows = self.rows();
-        paint(
-            rows.clone(),
-            Self::headers(),
-            presentation,
-            status_word,
-            |header, cell, _index| dog_action_paint(header, cell),
-        )
+        DogActionRow::rows_for(self.rows(), presentation, status_word)
     }
 
-    /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        match header {
-            "NAME" => "name",
-            "SOURCE" => "source",
-            "SHEPHERD" => "shepherd_acted",
-            "STATUS" => "status",
-            other => panic!("DogAdoptedRow::headers() does not include {other:?}"),
-        }
+        DogActionRow::json_key_for("DogAdoptedRow", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = &[];
+    const JSON_ONLY: &'static [&'static str] = DogActionRow::JSON_ONLY;
 
     // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
     // type shares its headers exactly.
-    const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
+    const PRIORITIES: &'static [u8] = DogActionRow::PRIORITIES;
 }
 
 /// `shep rehome <name>`: what the config edit and, if a shepherd is
@@ -1140,53 +1167,41 @@ pub struct DogRehomedRow {
 
 impl Render for DogRehomedRow {
     fn headers() -> &'static [&'static str] {
-        &["NAME", "SOURCE", "SHEPHERD", "STATUS"]
+        DogActionRow::headers()
     }
 
     fn rows(&self) -> Vec<Vec<String>> {
-        vec![vec![
-            self.name.clone(),
-            // `-` for `None`, matching `DogRows`' own rule for the same
-            // shape of field — see that type's own `rows` for why.
-            self.source.as_ref().map_or_else(
-                || "-".to_string(),
-                |source| dog_source_label(source).to_string(),
-            ),
-            self.shepherd_acted.to_string(),
-            self.status.clone(),
-        ]]
+        // `-` for `None`, matching `DogRows`' own rule for the same shape of
+        // field — see that type's own `rows` for why.
+        let source_label = self.source.as_ref().map_or_else(
+            || "-".to_string(),
+            |source| dog_source_label(source).to_string(),
+        );
+        DogActionRow {
+            name: &self.name,
+            source: &source_label,
+            shepherd_acted: self.shepherd_acted,
+            status: &self.status,
+        }
+        .rows()
     }
 
-    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`].
+    /// Same treatment, same reasoning, as [`DogEnabledRow::rows_for`] — see
+    /// [`DogActionRow::rows_for`]'s own doc.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let rows = self.rows();
-        paint(
-            rows.clone(),
-            Self::headers(),
-            presentation,
-            status_word,
-            |header, cell, _index| dog_action_paint(header, cell),
-        )
+        DogActionRow::rows_for(self.rows(), presentation, status_word)
     }
 
-    /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        match header {
-            "NAME" => "name",
-            "SOURCE" => "source",
-            "SHEPHERD" => "shepherd_acted",
-            "STATUS" => "status",
-            other => panic!("DogRehomedRow::headers() does not include {other:?}"),
-        }
+        DogActionRow::json_key_for("DogRehomedRow", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = &[];
+    const JSON_ONLY: &'static [&'static str] = DogActionRow::JSON_ONLY;
 
     // Same shape, same reasoning, as `DogEnabledRow::PRIORITIES` -- this
     // type shares its headers exactly.
-    const PRIORITIES: &'static [u8] = &[0, 7, 6, 0];
+    const PRIORITIES: &'static [u8] = DogActionRow::PRIORITIES;
 }
 
 /// `Response::Flushed(Vec<ProcessInfo>)` — the sheep a `shep flush` matched,
@@ -1865,9 +1880,82 @@ pub struct TriggeredRows(pub Vec<ActionReply>);
 /// which `render_table` does not support.
 const TRIGGER_BODY_PREVIEW_CHARS: usize = 80;
 
-impl Render for TriggeredRows {
+/// Shared scaffolding for the three per-sheep reply tables:
+/// [`TriggeredRows`]/[`SignalledRows`]/[`SentLineRows`]. All three render
+/// `["ID", "NAME", "OUTCOME", "DETAIL"]`, share the same JSON key mapping,
+/// column priorities, and paint dispatch ([`reply_paint`]) — the only thing
+/// that differs per verb is which `describe_*_outcome` helper builds a row's
+/// own `(OUTCOME, DETAIL)` pair, so each public type still walks its own
+/// reply list and calls its own describe function, handing the result to
+/// [`Self::row`] to assemble. Every other [`Render`] method is delegated
+/// straight to the associated functions below.
+struct ReplyRows;
+
+impl ReplyRows {
     fn headers() -> &'static [&'static str] {
         &["ID", "NAME", "OUTCOME", "DETAIL"]
+    }
+
+    fn row(id: u32, name: &str, outcome: &str, detail: String) -> Vec<String> {
+        vec![
+            id.to_string(),
+            name.to_string(),
+            outcome.to_string(),
+            detail,
+        ]
+    }
+
+    /// [`reply_paint`], shared across all three per-sheep reply tables.
+    fn rows_for(
+        rows: Vec<Vec<String>>,
+        presentation: Presentation,
+        status_word: bool,
+    ) -> Vec<Vec<String>> {
+        paint(
+            rows.clone(),
+            Self::headers(),
+            presentation,
+            status_word,
+            |header, cell, _index| reply_paint(header, cell),
+        )
+    }
+
+    /// # Panics
+    /// If `header` is not one of [`Self::headers`]'s own values. `caller` is
+    /// the concrete type's own name, so the panic still names whichever of
+    /// the three reply tables produced it.
+    #[track_caller]
+    fn json_key_for(caller: &'static str, header: &str) -> &'static str {
+        match header {
+            "ID" => "id",
+            "NAME" => "name",
+            // Both table columns are read off the one `outcome` object:
+            // OUTCOME is its `kind` tag, DETAIL is a rendering of the rest.
+            // Neither is a bare echo of a JSON scalar the way every other
+            // header here is, which is why both are in `assert_no_drift`'s
+            // own `formatted` list rather than compared cell-for-cell.
+            "OUTCOME" | "DETAIL" => "outcome",
+            other => panic!("{caller}::headers() does not include {other:?}"),
+        }
+    }
+
+    const JSON_ONLY: &'static [&'static str] = &[];
+
+    // Parallel to `headers()` above: `["ID", "NAME", "OUTCOME", "DETAIL"]`.
+    // ID and NAME are the floor `FlockRows` itself uses for row identity;
+    // OUTCOME joins them for the same STATUS-shaped reason `FlockRows`/
+    // `DogRows` give their own outcome column -- an operator needs to know
+    // whether the trigger succeeded even more than the free-text detail
+    // explaining why. DETAIL, each table's one unbounded free-text column,
+    // is the sole `6`-and-up extra, and `render_boxed`'s floor of three means
+    // dropping it is the only narrowing any of these three tables ever does
+    // -- exactly the three-essential-columns shape `FlockRows` itself has.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
+}
+
+impl Render for TriggeredRows {
+    fn headers() -> &'static [&'static str] {
+        ReplyRows::headers()
     }
 
     /// One row per matched sheep. `OUTCOME` is the short, stable kind
@@ -1899,59 +1987,25 @@ impl Render for TriggeredRows {
             .iter()
             .map(|reply| {
                 let (outcome, detail) = describe_outcome(&reply.outcome);
-                vec![
-                    reply.id.to_string(),
-                    reply.name.clone(),
-                    outcome.to_string(),
-                    detail,
-                ]
+                ReplyRows::row(reply.id, &reply.name, outcome, detail)
             })
             .collect()
     }
 
-    /// [`reply_paint`], shared with the other two per-sheep reply tables.
+    /// Shared with the other two per-sheep reply tables — see
+    /// [`ReplyRows::rows_for`]'s own doc.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let rows = self.rows();
-        paint(
-            rows.clone(),
-            Self::headers(),
-            presentation,
-            status_word,
-            |header, cell, _index| reply_paint(header, cell),
-        )
+        ReplyRows::rows_for(self.rows(), presentation, status_word)
     }
 
-    /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        match header {
-            "ID" => "id",
-            "NAME" => "name",
-            // Both table columns are read off the one `outcome` object:
-            // OUTCOME is its `kind` tag, DETAIL is a rendering of the rest.
-            // Neither is a bare echo of a JSON scalar the way every other
-            // header here is, which is why both are in `assert_no_drift`'s
-            // own `formatted` list rather than compared cell-for-cell.
-            "OUTCOME" | "DETAIL" => "outcome",
-            other => panic!("TriggeredRows::headers() does not include {other:?}"),
-        }
+        ReplyRows::json_key_for("TriggeredRows", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = &[];
+    const JSON_ONLY: &'static [&'static str] = ReplyRows::JSON_ONLY;
 
-    // Parallel to `headers()` above: `["ID", "NAME", "OUTCOME", "DETAIL"]`.
-    // ID and NAME are the floor `FlockRows` itself uses for row identity;
-    // OUTCOME joins them for the same STATUS-shaped reason `FlockRows`/
-    // `DogRows` give their own outcome column -- an operator needs to know
-    // whether the trigger succeeded even more than the free-text detail
-    // explaining why. DETAIL, this table's one unbounded free-text column
-    // (`Self::rows`'s own doc: capped at 80 chars, still the longest cell
-    // this table renders), is the sole `6`-and-up extra, and `render_boxed`'s
-    // floor of three means dropping it is the only narrowing this table ever
-    // does -- exactly the three-essential-columns shape `FlockRows` itself
-    // has.
-    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
+    const PRIORITIES: &'static [u8] = ReplyRows::PRIORITIES;
 }
 
 /// [`TriggeredRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
@@ -2025,7 +2079,7 @@ pub struct SignalledRows(pub Vec<SignalReply>);
 
 impl Render for SignalledRows {
     fn headers() -> &'static [&'static str] {
-        &["ID", "NAME", "OUTCOME", "DETAIL"]
+        ReplyRows::headers()
     }
 
     /// One row per matched sheep. `OUTCOME` is the short, stable kind
@@ -2037,47 +2091,27 @@ impl Render for SignalledRows {
             .iter()
             .map(|reply| {
                 let (outcome, detail) = describe_signal_outcome(&reply.outcome);
-                vec![
-                    reply.id.to_string(),
-                    reply.name.clone(),
-                    outcome.to_string(),
-                    detail,
-                ]
+                ReplyRows::row(reply.id, &reply.name, outcome, detail)
             })
             .collect()
     }
 
-    /// [`reply_paint`], shared with the other two per-sheep reply tables.
+    /// Shared with the other two per-sheep reply tables — see
+    /// [`ReplyRows::rows_for`]'s own doc.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let rows = self.rows();
-        paint(
-            rows.clone(),
-            Self::headers(),
-            presentation,
-            status_word,
-            |header, cell, _index| reply_paint(header, cell),
-        )
+        ReplyRows::rows_for(self.rows(), presentation, status_word)
     }
 
-    /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        match header {
-            "ID" => "id",
-            "NAME" => "name",
-            // Both table columns are read off the one `outcome` object, same
-            // as `TriggeredRows::json_key_for`'s own reasoning.
-            "OUTCOME" | "DETAIL" => "outcome",
-            other => panic!("SignalledRows::headers() does not include {other:?}"),
-        }
+        ReplyRows::json_key_for("SignalledRows", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = &[];
+    const JSON_ONLY: &'static [&'static str] = ReplyRows::JSON_ONLY;
 
     // Same shape, same reasoning, as `TriggeredRows::PRIORITIES` -- this
     // type shares its headers exactly.
-    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
+    const PRIORITIES: &'static [u8] = ReplyRows::PRIORITIES;
 }
 
 /// [`SignalledRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
@@ -2109,7 +2143,7 @@ pub struct SentLineRows(pub Vec<LineReply>);
 
 impl Render for SentLineRows {
     fn headers() -> &'static [&'static str] {
-        &["ID", "NAME", "OUTCOME", "DETAIL"]
+        ReplyRows::headers()
     }
 
     /// One row per matched sheep. `OUTCOME` is the short, stable kind
@@ -2121,47 +2155,27 @@ impl Render for SentLineRows {
             .iter()
             .map(|reply| {
                 let (outcome, detail) = describe_line_outcome(&reply.outcome);
-                vec![
-                    reply.id.to_string(),
-                    reply.name.clone(),
-                    outcome.to_string(),
-                    detail,
-                ]
+                ReplyRows::row(reply.id, &reply.name, outcome, detail)
             })
             .collect()
     }
 
-    /// [`reply_paint`], shared with the other two per-sheep reply tables.
+    /// Shared with the other two per-sheep reply tables — see
+    /// [`ReplyRows::rows_for`]'s own doc.
     fn rows_for(&self, presentation: Presentation, status_word: bool) -> Vec<Vec<String>> {
-        let rows = self.rows();
-        paint(
-            rows.clone(),
-            Self::headers(),
-            presentation,
-            status_word,
-            |header, cell, _index| reply_paint(header, cell),
-        )
+        ReplyRows::rows_for(self.rows(), presentation, status_word)
     }
 
-    /// # Panics
-    /// If `header` is not one of `Self::headers()`'s own values.
     #[track_caller]
     fn json_key_for(header: &str) -> &'static str {
-        match header {
-            "ID" => "id",
-            "NAME" => "name",
-            // Both table columns are read off the one `outcome` object, same
-            // as `TriggeredRows::json_key_for`'s own reasoning.
-            "OUTCOME" | "DETAIL" => "outcome",
-            other => panic!("SentLineRows::headers() does not include {other:?}"),
-        }
+        ReplyRows::json_key_for("SentLineRows", header)
     }
 
-    const JSON_ONLY: &'static [&'static str] = &[];
+    const JSON_ONLY: &'static [&'static str] = ReplyRows::JSON_ONLY;
 
     // Same shape, same reasoning, as `TriggeredRows::PRIORITIES` -- this
     // type shares its headers exactly.
-    const PRIORITIES: &'static [u8] = &[0, 0, 0, 6];
+    const PRIORITIES: &'static [u8] = ReplyRows::PRIORITIES;
 }
 
 /// [`SentLineRows::rows`]'s per-outcome split: the short, stable `OUTCOME`
