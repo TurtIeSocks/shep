@@ -583,7 +583,7 @@ mod tests {
     /// revert `acquire`'s Windows arm to `Ok(Self {})` and this reddens
     /// rather than passing quietly.
     ///
-    /// Without the advisory lock this fails hard rather than flakily.
+    /// Without the lock this fails hard rather than flakily.
     #[cfg(any(unix, windows))]
     #[test]
     fn two_writer_processes_do_not_lose_each_other_s_barks() {

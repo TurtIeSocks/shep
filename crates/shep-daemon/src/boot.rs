@@ -2239,11 +2239,14 @@ mod tests {
     }
 
     /// fails if `delete_flock_on_shutdown` leaves anything in the final
-    /// roll. The signal path is what this pins: `ctx.shutdown()` ends `run` the exact
-    /// way a caught `SIGTERM` does, WITHOUT going through any caller-level
+    /// roll. What this pins is the SHARED shutdown watch: `ctx.shutdown()`
+    /// flips the same watch `run`'s `install_signals` handler flips on a
+    /// caught `SIGTERM`, WITHOUT going through any caller-level
     /// `Stop`/`Delete` request first, which is precisely the gap a CLI-side
-    /// `tidy_up` flag alone cannot close. If `delete_flock_on_shutdown` is
-    /// ever ignored — or is threaded through as `false` by mistake — this
+    /// `tidy_up` flag alone cannot close. It does not raise a real `SIGTERM`
+    /// and proves nothing about the signal-listener wiring itself — only
+    /// about the shutdown path both routes share. If `delete_flock_on_shutdown`
+    /// is ever ignored — or is threaded through as `false` by mistake — this
     /// app survives into the roll exactly as
     /// `boot_restores_a_saved_flock_and_tears_down_in_order` above expects
     /// for the ordinary (non-`dev`) case, and this assertion catches it.

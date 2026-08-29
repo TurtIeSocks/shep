@@ -24,10 +24,11 @@ pub struct Flockfile {
     pub apps: Vec<AppConfig>,
 }
 
-// Forward-compat decision: the top level is locked to the `app` key on
-// purpose — a typo'd key must fail loudly. A future schema key (e.g.
-// `version`) gets added HERE explicitly; older binaries then reject newer
-// Flockfiles by design instead of silently ignoring config.
+// Forward-compat decision: application entries are locked to the `app` key
+// on purpose — a typo'd key must fail loudly. `$schema` and `dog` are the
+// two keys explicitly let in beside it (see their own field docs below); a
+// future schema key gets added the same explicit way; older binaries then
+// reject newer Flockfiles by design instead of silently ignoring config.
 #[derive(Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 // `rename` sets `schema_name`, which schemars uses as the root schema's

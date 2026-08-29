@@ -113,8 +113,11 @@ mod tests {
         assert_eq!(role_of(ProcStatus::Stopped), Role::Ink3);
     }
 
-    /// Every face must be distinct, or a face carries nothing the colour
-    /// did not.
+    /// Distinct across these five -- `Stopping` is left out on purpose: it
+    /// shares `Stopped`'s `(-.-)` deliberately (quiet is quiet, whichever
+    /// direction it's headed), so testing it here would fail the very thing
+    /// this test exists to catch. Every other pair must still differ, or a
+    /// face carries nothing the colour did not.
     #[test]
     fn the_faces_are_distinct_from_one_another() {
         let faces = [

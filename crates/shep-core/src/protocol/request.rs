@@ -589,13 +589,17 @@ pub struct ExitInfo {
 // `PartialEq`, and no listing is keyed on, hashed by, or sorted by a whole
 // row.
 /// `#[non_exhaustive]`: this struct grows fields over time with no hand-edit
-/// sweep needed across the workspace. `deferred.md`'s own `ProcessInfo`
-/// entry defers SPLITTING it into several smaller types, not growing it —
-/// this attribute plus [`ProcessInfo::builder`] is "deliberately the
-/// opposite of forcing the split early," which is what makes a field like
-/// `last_exit` cheap to add for a concrete operator need, not a reason to
-/// withhold one. Use [`ProcessInfo::builder`] to construct one; the fields
-/// stay `pub`, so reading them and assigning to them are both unchanged.
+/// sweep needed across OUT-OF-TREE callers — it forbids a struct literal
+/// outside this crate, not inside it. `sample_info()` and
+/// [`ProcessInfoBuilder`] both still name every field and both still need
+/// updating the day a field is added; what the attribute buys is that
+/// nothing downstream does. `deferred.md`'s own `ProcessInfo` entry defers
+/// SPLITTING it into several smaller types, not growing it — this attribute
+/// plus [`ProcessInfo::builder`] is "deliberately the opposite of forcing
+/// the split early," which is what makes a field like `last_exit` cheap to
+/// add for a concrete operator need, not a reason to withhold one. Use
+/// [`ProcessInfo::builder`] to construct one; the fields stay `pub`, so
+/// reading them and assigning to them are both unchanged.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessInfo {

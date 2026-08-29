@@ -42,11 +42,17 @@ fn symlink_refusal_notice(path: &Path) -> String {
 /// **Every component is `symlink_metadata`'d as the path is built, and any
 /// component that is a symlink is refused — intermediate directories
 /// included, unless `follow_symlinks` is set.** A leaf-only check misses the
-/// swapped-directory case, which is the same escape one level up. There is
-/// no `canonicalize` in this branch: it is a blocking syscall on a path this
-/// function is about to walk anyway, and per-request canonicalization
-/// would accept a TOCTOU this design does not need to accept. When the
-/// walk refuses a component for being a symlink, it
+/// swapped-directory case, which is the same escape one level up — at
+/// check time. There is no `canonicalize` in this branch: it is a blocking
+/// syscall on a path this function is about to walk anyway. What this walk
+/// plus [`open_regular`]'s `O_NOFOLLOW` actually close, together, is a
+/// **leaf** swapped in after this check ran — `O_NOFOLLOW` only refuses a
+/// symlink *leaf*, and nothing here re-verifies a path's intermediate
+/// components between this function returning and `open_regular` opening
+/// the result. An intermediate directory swapped into that same gap still
+/// escapes; closing that too needs descriptor-relative opens (walking down
+/// from an already-open directory fd), which this module does not do. When
+/// the walk refuses a component for being a symlink, it
 /// writes one line to stderr, via [`symlink_refusal_notice`], naming the
 /// refused path and `--follow-symlinks` — the sheep's own bleats, and the
 /// only place an operator can tell "refused a symlink" apart from
@@ -59,8 +65,9 @@ fn symlink_refusal_notice(path: &Path) -> String {
 /// result is canonicalized once and checked with [`Path::starts_with`]
 /// against `root`. That is the per-request canonicalize this function
 /// exists to avoid by default, reintroduced deliberately: it reopens the
-/// window between the canonicalize and the eventual open, which is the
-/// TOCTOU this decision closes when the flag is off. The path this mode
+/// window between the canonicalize and the eventual open — the same
+/// canonicalize-to-open gap the default mode narrows to a leaf-only race
+/// rather than closes outright, per the note above. The path this mode
 /// returns is therefore already fully resolved — no symlink component
 /// remains in it — which is why [`open_regular`]'s `O_NOFOLLOW` is not
 /// fighting this mode so much as covering the one instant after the

@@ -146,10 +146,13 @@ pub unsafe fn adopt_fd(fd: RawFd) -> Result<File, SysError> {
     // (this fn's `# Safety` section) is what proves that open descriptor is
     // the intended inherited pipe rather than something this process opened
     // itself in the meantime. `adopt_fd` is the only place in this crate
-    // that constructs a `File` from a bare fd, and the daemon's boot path
-    // (its one caller) invokes it at most once per descriptor — so the
-    // `File` returned here becomes the number's sole owner; nothing else
-    // will read, write, or close it again.
+    // that constructs a `File` from a bare fd. `boot` never calls it — see
+    // this fn's own doc above — and this crate has no other production
+    // caller today either; every in-crate call site is one of this file's
+    // own tests, each adopting a fd it just created and each doing so at
+    // most once per descriptor. The `File` returned here becomes that
+    // number's sole owner; nothing else will read, write, or close it
+    // again.
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -268,7 +271,13 @@ mod tests {
         // succeed (the number IS open — it belongs to someone else now),
         // the adoption would go through, and dropping the returned `File`
         // would double-close another test's descriptor. The high number
-        // removes the race structurally, so no lock is needed.
+        // keeps this closed only as long as this process has fewer than
+        // ~2048 descriptors open at once; it is not a structural
+        // guarantee, just a floor no test in this suite comes close to. If
+        // parallel tests ever pushed descriptor use past it, `parked`
+        // could be reused before the second `adopt_fd` below runs. No lock
+        // is needed for the concurrency this suite actually reaches, not
+        // because the race is impossible at any concurrency.
         const PROBE_FD: RawFd = 2048;
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
         let parked = nix::fcntl::fcntl(a.as_raw_fd(), nix::fcntl::FcntlArg::F_DUPFD(PROBE_FD))

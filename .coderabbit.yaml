@@ -123,8 +123,11 @@ reviews:
 
         Do not suggest widening an input grammar past what the specification
         says. A parser here refusing something is usually the specified
-        behaviour rather than a gap: `reuse_port` is refused at parse time on
-        purpose, and says so in its own error.
+        behaviour rather than a gap. `reuse_port` is the exception, not an
+        instance of it: the key is accepted, not refused, and its value picks
+        reload's ordering — set, the reload overlaps the two instances;
+        unset with a `readiness_probe`, the reload runs serial instead. Do
+        not flag its acceptance as a parser gap.
 
     - path: "crates/shep-daemon/src/**"
       instructions: >-

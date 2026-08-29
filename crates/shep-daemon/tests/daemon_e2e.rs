@@ -2286,7 +2286,10 @@ async fn reload_under_load(name: &str, defiant: bool) -> Vec<Attempt> {
 /// # Why the count is asserted on Linux only
 ///
 /// Because the two platforms do not share the mechanism the count is about.
-/// From this test's own runs, across ~95 connections spanning the reload:
+/// The assertion below only requires more than 20 connection attempts across
+/// the reload -- that is the actual invariant. Below is how one of this
+/// test's own runs split those attempts between the two listeners,
+/// illustrative rather than something enforced:
 ///
 /// - **Linux** load-balances new connections over every listener in the
 ///   `SO_REUSEPORT` group, so the instance being replaced keeps taking a share

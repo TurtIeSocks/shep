@@ -727,11 +727,12 @@ fn is_reachable_as_a_name(selector: &ProcessSelector) -> bool {
 ///
 /// # Dogs
 ///
-/// Routed through [`emit_flock`], not [`emit`], so a dog renders through the
-/// dogs table with its `SOURCE` column rather than through the sheep table
-/// with an ID, a face, and a `FOLD` and `SMIT` it can never fill, and
-/// `shep restart log-rotate` draws the same dog the same way regardless of
-/// which verb asked.
+/// In table form only: routed through [`emit_flock`], not [`emit`], so a dog
+/// renders through the dogs table with its `SOURCE` column rather than
+/// through the sheep table with an ID, a face, and a `FOLD` and `SMIT` it can
+/// never fill, and `shep restart log-rotate` draws the same dog the same way
+/// regardless of which verb asked. `--format json` gives a dog's row no such
+/// treatment -- it goes through [`emit`] like any other row in `narrow`.
 ///
 /// # Errors
 ///
