@@ -204,9 +204,24 @@ Stop all 3 instances of web?  [y/N]
 ```
 
 The detail pane on a group row shows the app-level summary rather than one
-process's fields. The bleats pane on a group row reads every instance's file
-and labels lines by slot, capped, which costs one bounded read per instance
-instead of one per pane.
+process's fields.
+
+**The bleats pane does not follow a group. Descoped during implementation,
+recorded here 2026-08-29.** This section originally said the pane would read
+every instance's file on a group row and label lines by slot, capped. It was
+not built and is not planned. On a group row the pane draws its header and no
+lines, saying `bleats  <name>  follows one instance; select one to see its
+log`; an operator moves the selection onto one slot to read that instance.
+
+Two reasons, in the order they weighed. The pane is fed by
+`Effect::RefreshSelected`, which re-reads the selected sheep's file, and a
+group row has no selected sheep at all, so a fan-out would need a second feed
+shape carried through the effect loop for one pane. And the cost claim in the
+original wording was wrong in the direction that matters: "one bounded read
+per instance" is per instance **per two-second poll**, which is the pane's
+budget multiplied by the instance count on exactly the apps that have the most
+to write. `web/src/pages/docs/lookout.astro` documents the shipped behaviour
+correctly; this paragraph is the artifact that was stale.
 
 ### D6. `SHEP_INSTANCE` and `SHEP_NAME` are always injected and reserved
 
