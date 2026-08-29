@@ -256,15 +256,15 @@ mod tests {
 
     fn test_paths() -> ShepPaths {
         ShepPaths {
-            home: PathBuf::from("/home/rin/.shep"),
-            daemon_config: PathBuf::from("/home/rin/.shep/shep.toml"),
-            snapshot: PathBuf::from("/home/rin/.shep/flock.json"),
-            logs: PathBuf::from("/home/rin/.shep/logs"),
-            pids: PathBuf::from("/home/rin/.shep/pids"),
-            run: PathBuf::from("/home/rin/.shep/run"),
-            socket: PathBuf::from("/home/rin/.shep/run/shep.sock"),
-            barks: PathBuf::from("/home/rin/.shep/barks.jsonl"),
-            kv: PathBuf::from("/home/rin/.shep/kv.json"),
+            home: PathBuf::from("/home/ada/.shep"),
+            daemon_config: PathBuf::from("/home/ada/.shep/shep.toml"),
+            snapshot: PathBuf::from("/home/ada/.shep/flock.json"),
+            logs: PathBuf::from("/home/ada/.shep/logs"),
+            pids: PathBuf::from("/home/ada/.shep/pids"),
+            run: PathBuf::from("/home/ada/.shep/run"),
+            socket: PathBuf::from("/home/ada/.shep/run/shep.sock"),
+            barks: PathBuf::from("/home/ada/.shep/barks.jsonl"),
+            kv: PathBuf::from("/home/ada/.shep/kv.json"),
         }
     }
 
@@ -387,11 +387,11 @@ mod tests {
 
         assert_eq!(
             spec.out_file,
-            PathBuf::from("/home/rin/.shep/logs/web-2-out.log")
+            PathBuf::from("/home/ada/.shep/logs/web-2-out.log")
         );
         assert_eq!(
             spec.err_file,
-            PathBuf::from("/home/rin/.shep/logs/web-2-err.log")
+            PathBuf::from("/home/ada/.shep/logs/web-2-err.log")
         );
     }
 
@@ -411,11 +411,11 @@ mod tests {
 
         assert_eq!(
             spec.out_file,
-            PathBuf::from("/home/rin/.shep/logs/api-out.log")
+            PathBuf::from("/home/ada/.shep/logs/api-out.log")
         );
         assert_eq!(
             spec.err_file,
-            PathBuf::from("/home/rin/.shep/logs/api-err.log")
+            PathBuf::from("/home/ada/.shep/logs/api-err.log")
         );
     }
 
@@ -438,7 +438,7 @@ mod tests {
         // err_file still uses default
         assert_eq!(
             spec.err_file,
-            PathBuf::from("/home/rin/.shep/logs/app-0-err.log")
+            PathBuf::from("/home/ada/.shep/logs/app-0-err.log")
         );
     }
 

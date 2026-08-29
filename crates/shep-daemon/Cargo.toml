@@ -57,7 +57,7 @@ notify.workspace = true
 notify-debouncer-full.workspace = true
 
 # nix is #![cfg(unix)] internally and command-fds does unconditional unix-only fd
-# plumbing, so both would fail to compile on a Windows CI leg. Rin's Windows ruling:
+# plumbing, so both would fail to compile on a Windows CI leg. The maintainer's Windows ruling:
 # the pure tier (this crate's types/traits/fake) compiles everywhere; the OS tier
 # (signal delivery, fd-passing) is unix-only for now. tokio_runner.rs/kill.rs use
 # the workspace-default nix features (signal, process, user); sys.rs's readiness-pipe

@@ -9222,7 +9222,7 @@ mod tests {
         );
     }
 
-    /// Task 49, Rin's own call on the open question in `handle_exited`'s own
+    /// Task 49, the maintainer's own call on the open question in `handle_exited`'s own
     /// doc: an operator's `shep stop` still ends the process by a real
     /// signal, and `last_exit` must say so rather than going back to `None`
     /// because shep, not a crash, asked for it. `never_exits` obeys the
