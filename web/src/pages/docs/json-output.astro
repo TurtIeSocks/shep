@@ -165,7 +165,14 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       it prints one JSON object per line, newline-delimited, with no
       <code>command</code> or <code>data</code> wrapper.
     </Callout>
-    <CodeBlock label="shep bleats web --format json">{`{"schema_version":1,"id":0,"name":"web","stream":"out","line":"…"}`}</CodeBlock>
+    <CodeBlock label="shep bleats web --format json">{`{"schema_version":1,"id":0,"name":"web","stream":"out","instance":null,"line":"…"}`}</CodeBlock>
+    <p>
+      <code>instance</code> is the sheep's slot within its app, when that
+      app has more than one instance registered — <code>null</code>
+      otherwise, and also <code>null</code> for a backlog line read from a
+      log file several instances share, since nothing in that file says
+      which one wrote it.
+    </p>
 
     <h2>Table format is not a lesser version of this</h2>
     <p>

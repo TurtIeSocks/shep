@@ -1,5 +1,5 @@
 @@VERSION@@
-shep 0.1.9
+shep 0.1.12
 @@TOPLEVEL@@
 A process manager for your flock
 
