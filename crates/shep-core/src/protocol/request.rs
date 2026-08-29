@@ -45,16 +45,16 @@ pub enum SelectorSpec {
     Regex(String),
     /// By fold name
     Fold(String),
+    // Both field names are part of the wire contract, and the byte shape is
+    // pinned by `request_wire_v2`, so renaming either breaks that snapshot
+    // rather than sliding through unnoticed.
     /// By app name and instance slot
     ///
     /// Added in protocol 2, and the reason that version exists: a daemon
     /// built against protocol 1 has no such variant and refuses a client
     /// that sends one at the handshake, rather than failing to decode it
     /// later. On the wire this is `{"kind":"instance","value":{"name":
-    /// "web","slot":2}}`, following the enum's own `kind`/`value` tagging,
-    /// and both field names are part of the wire contract: the byte shape
-    /// is pinned by `request_wire_v2`, so renaming either breaks that
-    /// snapshot rather than sliding through.
+    /// "web","slot":2}}`, following the enum's own `kind`/`value` tagging.
     Instance {
         /// The app name
         name: String,
@@ -1206,12 +1206,12 @@ pub enum Response {
     /// listed here as the no-op success it is, so this carries the same
     /// matches `Describe` would.
     Reloading(Vec<ProcessInfo>),
+    // The order is cited as [`sort_flock`]'s shared rule rather than restated
+    // as this reply's own, so the two cannot drift apart.
     /// Answer to `Scale` — the app's instances that will REMAIN, one row
     /// each, by name, then by instance slot, then by id ([`sort_flock`]).
     /// Every row shares one name here, so in practice that is slot order,
     /// with the id breaking a tie only where two rows report the same slot.
-    /// It is stated as the shared rule rather than as this reply's own so
-    /// the two cannot drift.
     ///
     /// Scaling up, these are the instances that exist, the new ones included,
     /// and the answer is complete.
