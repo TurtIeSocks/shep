@@ -169,9 +169,25 @@ rolls up honestly rather than picking a winner, `2 up, 1 down`.
 When a selector or filter matches only some instances, the count and the
 rollups describe the rows actually listed, not the app's true size.
 
-`plain`, `bare` and JSON stay one line per process so they stay greppable. In
-those styles the NAME cell becomes `web:2`, and only for apps with more than
-one instance. JSON rows gain `instance` as a field rather than a suffix.
+`bare` and JSON stay one line per process so they stay greppable. In `bare`
+the NAME cell becomes `web:2`, and only for apps with more than one instance
+where every row reports its slot. JSON rows gain `instance` as a field rather
+than a suffix.
+
+**`plain` groups too, alongside `full`.** This paragraph said otherwise until
+the style dial was actually read. `StyleLevel::boxes()` and `colour()` both
+already treat `Full` and `Plain` as one tier
+(`crates/shep-cli/src/style.rs:58-70`), so the codebase's own idea of a
+human-facing table is those two together, and `bare` is the machine tier.
+Splitting Full from Plain for grouping alone would invent a third distinction
+the dial does not otherwise make, to serve a sentence written before anyone
+looked.
+
+The suffix therefore lives in `FlockRows::rows()` rather than in `rows_for`.
+`render_table`, the non-boxed path, calls `rows()` (`table.rs:37`), while
+`table_of` reaches `rows_for` only when `boxes()` is true. Seventeen types
+override `rows_for`, so moving that dispatch to serve one of them would change
+all of them.
 
 ### D5. Lookout gains two row kinds
 
