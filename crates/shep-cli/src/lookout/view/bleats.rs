@@ -4,7 +4,7 @@
 
 use ratatui::text::{Line, Span};
 
-use super::super::app::App;
+use super::super::app::{App, RowKey};
 use super::super::tail::Stream;
 use super::flock::fit;
 use crate::output::human_bytes;
@@ -30,34 +30,50 @@ pub fn feed_lines(app: &App, width: u16, rows: usize) -> Vec<Line<'static>> {
     // bytes. See the phase plan's design decision 1.
     let lost_lines = feed.missed_lines + feed.lines.len().saturating_sub(body);
 
-    out.push(match app.selected_row() {
+    out.push(match app.selected() {
         None => Line::from(Span::styled(
             fit("bleats  no sheep is selected", width),
             palette.muted(),
         )),
-        Some(row) => match gap_notice(lost_lines, feed.missed_bytes) {
-            Some(notice) => Line::from(Span::styled(
-                fit(&format!("bleats  {}  {notice}", row.info.name), width),
-                // Attention, not alarm: a sheep writing faster than a
-                // two-second poll is busy, not broken. `--bark` means
-                // errored, refused and destructive.
-                palette.attention(),
-            )),
-            // `out then err`, not `out+err`: `+` reads as one merged
-            // stream, and there is no merge — a log line carries no
-            // timestamp, so there is no key to interleave two files on.
-            // This header is the only place on screen that can say so.
-            None => Line::from(Span::styled(
-                fit(
-                    &format!(
-                        "bleats  {}  out then err  from the log files, re-read with each listing",
-                        row.info.name
+        // A group row is selected, but there is no single log to re-read for
+        // it -- the same reason `view::detail`'s own group pane has no lamb
+        // line -- so the header says as much rather than repeating "no
+        // sheep is selected" about a row that plainly is.
+        Some(RowKey::Group(name)) => Line::from(Span::styled(
+            fit(
+                &format!("bleats  {name}  follows one instance; select one to see its log"),
+                width,
+            ),
+            palette.muted(),
+        )),
+        Some(RowKey::Sheep(_)) => {
+            let row = app
+                .selected_row()
+                .expect("a selected sheep is in the flock");
+            match gap_notice(lost_lines, feed.missed_bytes) {
+                Some(notice) => Line::from(Span::styled(
+                    fit(&format!("bleats  {}  {notice}", row.info.name), width),
+                    // Attention, not alarm: a sheep writing faster than a
+                    // two-second poll is busy, not broken. `--bark` means
+                    // errored, refused and destructive.
+                    palette.attention(),
+                )),
+                // `out then err`, not `out+err`: `+` reads as one merged
+                // stream, and there is no merge — a log line carries no
+                // timestamp, so there is no key to interleave two files on.
+                // This header is the only place on screen that can say so.
+                None => Line::from(Span::styled(
+                    fit(
+                        &format!(
+                            "bleats  {}  out then err  from the log files, re-read with each listing",
+                            row.info.name
+                        ),
+                        width,
                     ),
-                    width,
-                ),
-                palette.muted(),
-            )),
-        },
+                    palette.muted(),
+                )),
+            }
+        }
     });
 
     if feed.lines.is_empty() {

@@ -1836,6 +1836,68 @@ mod tests {
         assert_eq!(app.selected(), Some(RowKey::Group("web".to_string())));
     }
 
+    /// fails if `arm`'s read-only refusal stops firing for a group row. The
+    /// gate exists so a keystroke in a dashboard somebody is reading does
+    /// not become an action, and that has to hold for a keypress that would
+    /// reach three processes exactly as much as for one that reaches one.
+    #[test]
+    fn arming_a_group_action_refuses_when_read_only() {
+        let mut app = allowed_with_instances();
+        app.set_control_for_tests(Control::ReadOnly);
+        app.select(RowKey::Group("web".to_string()));
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        assert!(app.action().is_none());
+        assert_eq!(
+            app.notice().map(ToString::to_string).as_deref(),
+            Some("read-only: actions need --allow-control")
+        );
+    }
+
+    /// fails if a group action can be armed while the link is not live. The
+    /// mirror of `every_action_key_refuses_while_the_link_is_not_live`, for
+    /// a `RowKey::Group` selection: A9's reasoning (an action typed during
+    /// the reconnect ladder would queue and land on a connection the
+    /// operator has stopped watching) does not know or care which kind of
+    /// row is selected.
+    #[test]
+    fn arming_a_group_action_refuses_while_the_link_is_not_live() {
+        for link in [
+            Msg::Retrying { attempt: 2 },
+            Msg::Frozen {
+                at_local: "2026-08-16 09:00:00".to_string(),
+            },
+        ] {
+            let mut app = allowed_with_instances();
+            app.select(RowKey::Group("web".to_string()));
+            app.update(link);
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+            assert!(app.action().is_none());
+            assert!(app.notice().is_some_and(Notice::is_grave));
+        }
+    }
+
+    /// fails if a second action can be armed on a group row while one is
+    /// already in flight. The mirror of
+    /// `a_second_action_refuses_while_one_is_in_flight` for a
+    /// `RowKey::Group` target: the in-flight line names one action, and a
+    /// second one racing it would make it ambiguous which (A12).
+    #[test]
+    fn arming_a_group_action_refuses_while_one_is_already_in_flight() {
+        let mut app = allowed_with_instances();
+        app.select(RowKey::Group("web".to_string()));
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        app.update(Msg::Key(KeyPress::Confirm));
+        assert!(app.action().is_some_and(|action| action.sent));
+        app.update(Msg::Key(KeyPress::Action(ActionVerb::Restart)));
+        assert_eq!(
+            app.notice().map(ToString::to_string).as_deref(),
+            Some("one action is already in flight")
+        );
+        let action = app.action().expect("the first one is untouched");
+        assert_eq!(action.verb, ActionVerb::Stop);
+        assert!(action.sent);
+    }
+
     /// fails if an action key acts. It arms, and nothing has been sent: the
     /// whole point of the gate is that one keystroke in a dashboard somebody
     /// is reading does not become an action.

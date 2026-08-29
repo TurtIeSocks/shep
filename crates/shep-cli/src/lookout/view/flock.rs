@@ -364,13 +364,20 @@ pub fn header_line(columns: &[Column], width: u16, style: Style) -> Line<'static
 
 /// One line for a row the table draws: a real sheep, or the header above an
 /// app's grouped instances.
+///
+/// Every production caller sources `key` from [`App::visible_rows`], whose
+/// `Sheep` ids always name a row still in `app`'s own flock, so the blank
+/// fallback below is never drawn in practice. It exists anyway rather than
+/// as an `expect`, on the same "no honest value" rule this table already
+/// applies to a missing pid or a missing cpu reading: a caller that manages
+/// to hand this a stale id gets a blank row instead of a dead dashboard.
 #[must_use]
 pub fn key_line(app: &App, key: &RowKey, columns: &[Column], width: u16) -> Line<'static> {
     match key {
-        RowKey::Sheep(id) => {
-            let row = app.row(*id).expect("a visible sheep is in the flock");
-            row_line(app, row, columns, width)
-        }
+        RowKey::Sheep(id) => app.row(*id).map_or_else(
+            || Line::from(Span::raw(" ".repeat(usize::from(width)))),
+            |row| row_line(app, row, columns, width),
+        ),
         RowKey::Group(name) => group_line(app, name, columns, width),
     }
 }
@@ -823,5 +830,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// fails if a group row's cells stop showing the app's own rollup:
+    /// `web ×3` in NAME, memory SUMMED across instances, ID/PID/EXIT blank
+    /// (a group has no single one of any of the three to report), and
+    /// UPTIME the MINIMUM rather than any one instance's own reading.
+    /// Asserted on the rendered [`Line`], not on `App::group_totals`
+    /// directly -- a change in either the arithmetic or the rendering that
+    /// reads it has to redden this.
+    #[test]
+    fn a_group_rows_cells_show_the_apps_rollup() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let app = fixtures::app_with(
+            vec![
+                ProcessInfo::builder(1, "web", ProcStatus::Online)
+                    .instance(Some(0))
+                    .memory_bytes(Some(100 << 20))
+                    .uptime_ms(120_000)
+                    .build(),
+                ProcessInfo::builder(2, "web", ProcStatus::Online)
+                    .instance(Some(1))
+                    .memory_bytes(Some(150 << 20))
+                    .uptime_ms(30_000)
+                    .build(),
+                ProcessInfo::builder(3, "web", ProcStatus::Online)
+                    .instance(Some(2))
+                    .memory_bytes(Some(50 << 20))
+                    .uptime_ms(600_000)
+                    .build(),
+            ],
+            fixtures::plain(),
+        );
+
+        let line = key_line(&app, &RowKey::Group("web".to_string()), ALL, 200);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        // The exact row, column by column, rather than a substring search:
+        // a substring check on a run of blank cells can pass by accident on
+        // neighbouring padding. `name_width` is the same helper `key_line`
+        // itself calls for the NAME column's own width, not a re-derivation
+        // of the arithmetic under test.
+        let name = name_width(200, ALL);
+        let expected = [
+            fit("", Column::Id.width()),           // ID: blank, no single id
+            fit("web \u{d7}3", name),              // NAME: app x instance count
+            fit("online", Column::Status.width()), // STATUS: every instance agrees
+            fit("", Column::Pid.width()),          // PID: blank, no single pid
+            fit("0", Column::Restarts.width()),    // RESTARTS: summed, all zero
+            fit("", Column::Exit.width()),         // EXIT: blank, no single exit
+            fit("-", Column::Cpu.width()),         // CPU: no reading on any instance
+            // 100 + 150 + 50 = 300 MiB, summed rather than averaged.
+            fit("300.0M", Column::Mem.width()),
+            // The MINIMUM across the three instances (30s), not the first
+            // one's (120s) or the last one's (600s).
+            fit("30s", Column::Uptime.width()),
+            fit("-", Column::Fold.width()),
+            fit("-", Column::Smit.width()),
+        ]
+        .join("  ");
+
+        assert_eq!(rendered, expected, "got {rendered:?}");
     }
 }
