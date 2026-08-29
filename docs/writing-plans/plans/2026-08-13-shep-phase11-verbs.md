@@ -5,7 +5,7 @@
 
 ## Why these six, and why now
 
-Rin's ruling, 2026-08-13: these come **before** lookout and whistle. Both of
+The maintainer's ruling, 2026-08-13: these come **before** lookout and whistle. Both of
 those are surfaces over the daemon's operator API — a TUI pane that cannot
 scale an app and an MCP tool list that cannot send a signal are a UI shipped
 against a hole. Building the verbs first means the two surfaces get built once,
@@ -5531,7 +5531,7 @@ Add to `crates/shep-core/src/paths.rs`'s existing
 `default_layout_under_home_dir` test:
 
 ```rust
-        assert_eq!(p.kv, Path::new("/home/rin/.shep/kv.json"));
+        assert_eq!(p.kv, Path::new("/home/ada/.shep/kv.json"));
 ```
 
 Run `cargo test -p shep-core --lib --all-features`.
@@ -7612,7 +7612,7 @@ information for someone choosing what to put in a reply.
 - **check the test count rather than editing it.** There is no decaying figure
   to update: line 184 reads "Over a thousand tests", which stays true as the
   count grows and needs no edit at all. Confirm the prose is still true against
-  Step 18.4's gate run, and replace it with a specific number only if Rin asks
+  Step 18.4's gate run, and replace it with a specific number only if the maintainer asks
   for one — a hard figure is precisely the thing that would then decay every
   phase. (The first draft of this plan said the opposite and named a figure
   that is not in the file.)

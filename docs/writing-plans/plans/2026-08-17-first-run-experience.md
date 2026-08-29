@@ -485,7 +485,7 @@ returns `String`, so the `&` is required.
 - [ ] **Step 6: Route `Startup` through it too, and delete its own check**
 
 `Commands::Startup` bypasses the shared gate entirely
-(`crates/shep-cli/src/lib.rs:301-309`), which is why the error Rin hit came
+(`crates/shep-cli/src/lib.rs:301-309`), which is why the error the maintainer hit came
 from `startup`'s own code rather than the gate. Replace that arm with:
 
 ```rust
@@ -629,19 +629,19 @@ mod tests {
     /// cannot afford is to look unmaintained.
     #[test]
     fn the_welcome_renders_exactly_this() {
-        let rendered = render(Path::new("/home/rin/.shep"));
+        let rendered = render(Path::new("/home/ada/.shep"));
         let expected = format!(
             "\
       ,-~-.     ,-~-.     ,-~-.
      ( o.o )   ( o.o )   ( o.o )       shep {version}
-      `-^-'     `-^-'     `-^-'        flock at /home/rin/.shep
+      `-^-'     `-^-'     `-^-'        flock at /home/ada/.shep
        \" \"       \" \"       \" \"
     /\\  /\\
    ( o  o )--,   the shepherd keeps them running
     `--..--'  |
       |  |    '
 
-Set up /home/rin/.shep. Logs, pids and the shepherd's socket live here.
+Set up /home/ada/.shep. Logs, pids and the shepherd's socket live here.
 
 Getting started
   shep start server.js    start it and keep it alive
@@ -674,7 +674,7 @@ Getting started
     /// may not.
     #[test]
     fn the_welcome_copy_has_no_em_dashes() {
-        let rendered = render(Path::new("/home/rin/.shep"));
+        let rendered = render(Path::new("/home/ada/.shep"));
         assert!(!rendered.contains('\u{2014}'), "em dash in user-facing copy");
         assert!(!rendered.contains('\u{2013}'), "en dash in user-facing copy");
     }
@@ -825,7 +825,7 @@ Add to `crates/shep-cli/src/welcome.rs`'s `mod tests`:
     /// command the operator actually ran.
     #[test]
     fn the_first_run_welcome_goes_to_stderr() {
-        let (out, err) = drain(|s| on_first_run(s, Format::Table, Path::new("/home/rin/.shep"), true));
+        let (out, err) = drain(|s| on_first_run(s, Format::Table, Path::new("/home/ada/.shep"), true));
         assert!(out.is_empty(), "stdout must stay clean: {out}");
         assert!(err.contains("Getting started"), "stderr must carry it: {err}");
     }
@@ -846,7 +846,7 @@ Add to `crates/shep-cli/src/welcome.rs`'s `mod tests`:
     #[test]
     fn the_welcome_verb_prints_to_stdout_even_when_piped() {
         let (out, err) = drain(|s| {
-            welcome(s, Format::Table, Path::new("/home/rin/.shep"));
+            welcome(s, Format::Table, Path::new("/home/ada/.shep"));
         });
         assert!(out.contains("Getting started"), "stdout must carry it: {out}");
         assert!(err.is_empty(), "nothing belongs on stderr here: {err}");
@@ -857,7 +857,7 @@ Add to `crates/shep-cli/src/welcome.rs`'s `mod tests`:
     #[test]
     fn the_welcome_verb_answers_json_with_an_envelope() {
         let (out, _) = drain(|s| {
-            welcome(s, Format::Json, Path::new("/home/rin/.shep"));
+            welcome(s, Format::Json, Path::new("/home/ada/.shep"));
         });
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["command"], "welcome");
@@ -1361,7 +1361,7 @@ Checked against the spec, 2026-08-17:
 - **Spec §4 (testing)** → distributed; the `shep startup` regression is Task 2
   Step 8.
 
-One spec refinement made while planning, worth Rin's eye at review: the spec
+One spec refinement made while planning, worth the maintainer's eye at review: the spec
 says the welcome is suppressed under `--format json`, written with the
 side-effect case in mind. Task 4 makes `shep welcome --format json` emit a
 normal envelope instead of nothing, since a verb invoked by name that prints

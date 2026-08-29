@@ -3,7 +3,7 @@
 Closes the surviving debt from the five v1.1 audits (`config`, `wire`,
 `platform`, `tests`, `docs`) against merged `main` at `c611853`.
 
-Rin's ruling, 2026-08-12: everything ships in v1 rather than being held for a
+The maintainer's ruling, 2026-08-12: everything ships in v1 rather than being held for a
 point release — *"We're not in a rush to release this to the public. We want a
 hot looking app right off the bat if we have to compete with well established
 apps like pm2 and other rust attempts."* So this phase runs **ahead of** the
@@ -77,7 +77,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 | 3 | wire #2 — `ActionReply` name-only correlation; wire #3 — `SHEP_CHANNEL_VERSION` |
 | 4 | wire #4 — fixture gaps (PARTIAL); wire #5 — the ninefold `Vec<ProcessInfo>` |
 | 5 | platform #1 — the red linux/arm64 test; platform #3 — the never-compiled Linux branch; platform (new) — the windows-gnu gate Phase 9 dropped |
-| 6 | tests #1 — the workflow is made correct; the trigger stays manual by Rin's standing decision, recorded in deferred.md with the cost. **Not closed.** tests #5 — the root-only privilege-drop test (the half that is a CI job) |
+| 6 | tests #1 — the workflow is made correct; the trigger stays manual by the maintainer's standing decision, recorded in deferred.md with the cost. **Not closed.** tests #5 — the root-only privilege-drop test (the half that is a CI job) |
 | 7 | config #5 — IR-20 rationale gap across six error enums |
 | 8 | platform (new) — the false `ring` claim; docs (new) — README's test count, which decays every phase; config #3 — `reuse_port` dead and undocumented; platform #6 — macOS-anchored `sun_path` comment; platform #4 — the `openat2` comment's framing |
 | 9 | tests #6 — fails-only-by-hanging has no checklist line; and the ledger entries for every finding this phase deliberately does not build |
@@ -90,8 +90,8 @@ than rediscovered as new drift. None of them becomes code in Phase 10.
 - **config #4 — `DaemonConfig` is not a proof token.** Marked `needs-design`
   with "user impact: nothing today". Making `DaemonConfig`'s fields private
   and splitting a `validate` step out of `::load` is an architectural call on a
-  type Rin's own open-questions list owns (CLAUDE.md: *if a decision is listed
-  there, it is Rin's, not yours*). Recorded, not decided.
+  type the maintainer's own open-questions list owns (CLAUDE.md: *if a decision is listed
+  there, it is the maintainer's, not yours*). Recorded, not decided.
 - **wire #6 — `ProcessInfo` fuses four concerns.** The audit itself says do not
   act on it speculatively, and says the `lambs` field is what will force the
   question. Task 2 makes that field cheap to add; the split waits for it.
@@ -947,8 +947,8 @@ fn every_setter_writes_its_own_field_and_no_other() {
         .restarts(1)
         .uptime_ms(60_000)
         .fold(Some("backend".to_string()))
-        .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
-        .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+        .out_file(Some("/home/ada/.shep/logs/web-0-out.log".to_string()))
+        .err_file(Some("/home/ada/.shep/logs/web-0-err.log".to_string()))
         .cpu_percent(Some(12.5))
         .memory_bytes(Some(48 * 1024 * 1024))
         .dog(None)
@@ -1006,8 +1006,8 @@ pub fn sample_info() -> ProcessInfo {
         .restarts(3)
         .uptime_ms(60_000)
         .fold(Some("backend".to_string()))
-        .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
-        .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+        .out_file(Some("/home/ada/.shep/logs/web-0-out.log".to_string()))
+        .err_file(Some("/home/ada/.shep/logs/web-0-err.log".to_string()))
         .cpu_percent(Some(12.5))
         .memory_bytes(Some(48 * 1024 * 1024))
         .dog(Some(DogSource::BuiltIn))
@@ -2134,8 +2134,8 @@ into a local built with Task 2's builder:
         let sample = ProcessInfo::builder(3, "web", ProcStatus::WaitingRestart)
             .restarts(2)
             .uptime_ms(500)
-            .out_file(Some("/home/rin/.shep/logs/web-0-out.log".to_string()))
-            .err_file(Some("/home/rin/.shep/logs/web-0-err.log".to_string()))
+            .out_file(Some("/home/ada/.shep/logs/web-0-out.log".to_string()))
+            .err_file(Some("/home/ada/.shep/logs/web-0-err.log".to_string()))
             .build();
 
         let lifecycle = [
@@ -2315,7 +2315,7 @@ write. Both CLI consumers already collapse the two variants into the same
 outcome (`exit.rs:127` → `DaemonUnreachable`; `spawn.rs:246-252` treats `Io`
 and `HandshakeClosed` alike), so nothing user-facing is wrong. But this is the
 only test in the project known to be red anywhere, which means
-`cargo test --workspace` does not go green on the platform Rin is migrating to.
+`cargo test --workspace` does not go green on the platform the maintainer is migrating to.
 
 **#3, precisely.** `notify.rs:122`'s `#[cfg(target_os = "linux")] fn
 send_to_abstract` has never been through a compiler on this codebase. It is
@@ -2341,7 +2341,7 @@ cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-
 EXIT=0    Finished `dev` profile ... in 8.42s
 ```
 
-So this is not an open question for Rin and this plan does not put one to her.
+So this is not an open question for the maintainer and this plan does not put one to her.
 It is a check that was dropped, still works, and goes back. What it needs is a
 stated prerequisite: `ring`'s build script runs `cc` for the target, so the
 cross-compile needs a C toolchain for `x86_64-pc-windows-gnu`. On this machine
@@ -2631,7 +2631,7 @@ passed at `EXIT=0` on a host with mingw-w64 installed, and that it is back in
 
 **Closes:** tests.md #1 (Important, one-line) and the CI half of tests.md #5.
 
-**The standing instruction.** Rin has said to keep ignoring CI minutes until
+**The standing instruction.** the maintainer has said to keep ignoring CI minutes until
 the base phases ship. `.github/workflows/test.yml:12-13` stays
 `on: workflow_dispatch:`. **This task does not add a `push`, `pull_request` or
 `schedule` trigger.** What it does is make the file correct, so that flipping
@@ -2837,7 +2837,7 @@ so 19 jobs, of which the two macOS legs dominate the bill at ten times their
 wall-clock. A `push`+`pull_request` trigger runs the whole file on every commit
 to a branch with a PR open; a `schedule` row adds one run a week regardless.
 
-**The decision is Rin's and has been made for now: leave it manual until the
+**The decision is the maintainer's and has been made for now: leave it manual until the
 base phases ship.** Recorded here so the next person to read the workflow does
 not "fix" the missing trigger, and so that every "all gates green" claim in
 this project's history is understood for what it is — self-reported by the
@@ -3245,7 +3245,7 @@ Root `Cargo.toml`, replacing the sentence:
 
 ```toml
 # Bark's sinks are Discord and Slack webhooks, which are HTTPS, so this is
-# the one thing in the workspace that needs TLS. Rin's ruling (2026-08-12)
+# the one thing in the workspace that needs TLS. The maintainer's ruling (2026-08-12)
 # is a hand-rolled HTTP/1.1 client over tokio-rustls rather than reqwest:
 # reqwest's default rustls feature costs +93 crates over this workspace's
 # existing 196 and pulls aws-lc-sys, which needs BOTH a C compiler and cmake;
@@ -3280,7 +3280,7 @@ wrong — it says `aws_lc_rs` is "a C build dependency", which it is — so this
 is a pointer added, not a claim corrected:
 
 ```toml
-# `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks. Rin's ruling
+# `dog::bark::sinks`'s TLS transport for Discord/Slack webhooks. The maintainer's ruling
 # (2026-08-12): a hand-rolled HTTP/1.1 client over `tokio-rustls`, not
 # `reqwest` — see the root `Cargo.toml` entry for the full accounting,
 # including what ring's own `cc` build dependency costs a cross-compile.
@@ -3624,7 +3624,7 @@ also have to pass.
 
 Nothing constructs one by hand today outside tests, so nothing is currently
 wrong. Deferred because making the fields private and splitting `validate` out
-of `load` is an architectural call on a type whose shape is Rin's to decide,
+of `load` is an architectural call on a type whose shape is the maintainer's to decide,
 not a defect with a known fix. What would force it: any production path that
 assembles a `DaemonConfig` from something other than a file — the daemon-config
 flags layer, for instance.

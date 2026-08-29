@@ -27,7 +27,7 @@ Every doc, changelog line and test name in this phase must be true under that se
 ## Global Constraints
 
 1. **MSRV 1.88, edition 2024.** No new dependency.
-2. **`ProcStatus::Stopping` is the drainee's status** (Rin, 2026-08-10). It already exists, is already on the wire, and is set by nothing — this phase gives it its first writer. Chosen over a new `Draining` variant because `ProcStatus` is **not** `#[non_exhaustive]`, so a variant is a wire *and* API break. This single choice also closes two other findings for free — see Tasks 3 and 4.
+2. **`ProcStatus::Stopping` is the drainee's status** (the maintainer, 2026-08-10). It already exists, is already on the wire, and is set by nothing — this phase gives it its first writer. Chosen over a new `Draining` variant because `ProcStatus` is **not** `#[non_exhaustive]`, so a variant is a wire *and* API break. This single choice also closes two other findings for free — see Tasks 3 and 4.
 3. **Rule 9** one owner per constant; **Rule 10** no task-relative phrasing in shipped comments; **Rule 11** advance a paused clock in steps no larger than the shortest period of the loop under test, and make negative assertions poll a bounded window (`timeout` + `recv`), never a bare `try_recv`.
 4. **The actor never awaits on its own loop.** `CRITICAL-2` at `supervisor.rs`. Reload's waits belong in spawned tasks reporting back as `Msg`, the shape `spawn_readiness_task` established.
 5. **`CommandOrigin` keeps two variants.** Its exhaustive match is a deliberate pin; do not add a third.
@@ -59,11 +59,11 @@ A second variant, discovered in Phase 5: a pool one short lands a sheep *pumples
 
 ## Settled decisions
 
-Recorded so no task re-litigates them. Rin ruled 2, 8 and 9; the rest follow from those or from existing precedent, and are mine — flag any you believe is wrong rather than working around it.
+Recorded so no task re-litigates them. The maintainer ruled 2, 8 and 9; the rest follow from those or from existing precedent, and are mine — flag any you believe is wrong rather than working around it.
 
 | # | Decision |
 |---|---|
-| 1 | Drainee status is `Stopping` (Rin). |
+| 1 | Drainee status is `Stopping` (the maintainer). |
 | 2 | ~~`is_running` excludes `Stopping`, which fixes the muster-roll inflation.~~ **Amended after Task 1's audit:** `is_running` already excluded it, and the "inflation" was never a correctness bug — see the dropped Task 3. Reusing `Stopping` is still right; its payoff is Task 4's guards. |
 | 3 | `ReloadState::SpawningReplacement { new_id }` lives on the **old** entry (it names the new); `Draining { old_pid }` on the **new** entry (it points back at what it must outlive). |
 | 4 | Reload reuses `CommandOrigin::Operator`. No third variant. |
@@ -218,7 +218,7 @@ Member-set semantics are design. **The ordering reload depends on is not — not
 **Files:** Modify `crates/shep-core/src/protocol/request.rs`, `crates/shep-daemon/src/rpc.rs`, `crates/shep-cli/src/{cli.rs,main.rs}`, `crates/shep-cli/src/commands/lifecycle.rs`.
 
 - [ ] **Step 1:** `Request::Reload { selector }` and a response. Additive under `#[non_exhaustive]`; `PROTOCOL_VERSION` stays 1. Add the fixture row and **verify the regenerated snapshot delta is only your addition** — a regenerated fixture is the easiest place in a diff to hide a change.
-- [ ] **Step 2: Reply early, report on the bus** (Rin, 2026-08-09). A reload of N instances costs roughly N × (`listen_timeout` + `graceful_timeout`) ≈ N × 11s, and `MAX_DEADLINE_MS` is 60s, so a synchronous reply cannot cover six instances. New `ProcessEventKind` variants per settled decision 11.
+- [ ] **Step 2: Reply early, report on the bus** (the maintainer, 2026-08-09). A reload of N instances costs roughly N × (`listen_timeout` + `graceful_timeout`) ≈ N × 11s, and `MAX_DEADLINE_MS` is 60s, so a synchronous reply cannot cover six instances. New `ProcessEventKind` variants per settled decision 11.
 - [ ] **Step 3: Required selector**, matching `stop`/`restart`/`delete` — reload restarts processes.
 - [ ] **Step 4: Settled decisions 7, 8, 10** — rejected while shutting down; no-op success for a not-running sheep; refused while one is in flight for the same name.
 - [ ] **Step 5: Commit** — `feat: shep reload`
@@ -233,7 +233,7 @@ Member-set semantics are design. **The ordering reload depends on is not — not
 
 - [ ] **Step 1: One fixture server, two behaviours** — well-behaved (closes its listener on `SIGTERM`, drains, exits) and `SIGTERM`-ignoring. **The gap between those two runs is the finding.** A test asserting unconditional zero-downtime would be green on the good fixture and lying about production.
 - [ ] **Step 2: Assert a count, not a boolean.** "Zero connection errors with a well-behaved app, non-zero with a signal-ignoring one."
-- [ ] **Step 3: Platform split** (Rin, 2026-08-10). **Linux keeps feeding the old listener until it closes; macOS does not** — so Linux is where a reload can actually drop connections, and macOS is where the bug cannot manifest. Assert the error count **on Linux only**; on macOS assert the weaker property that still holds — the reload completes, the new instance serves, the drainee is reaped. State in the test doc what each platform is asserting and why they differ. A single shared assertion would be vacuous on macOS or flaky on Linux.
+- [ ] **Step 3: Platform split** (the maintainer, 2026-08-10). **Linux keeps feeding the old listener until it closes; macOS does not** — so Linux is where a reload can actually drop connections, and macOS is where the bug cannot manifest. Assert the error count **on Linux only**; on macOS assert the weaker property that still holds — the reload completes, the new instance serves, the drainee is reaped. State in the test doc what each platform is asserting and why they differ. A single shared assertion would be vacuous on macOS or flaky on Linux.
 - [ ] **Step 4: Mind the port.** A fixed port under a runner with no serialization will collide; `serial_test` is not a dependency and `SIGNAL_TEST_LOCK` is this repo's precedent for why that bites.
 - [ ] **Step 5: Commit** — `test: prove what a reload does to a live connection`
 
@@ -244,7 +244,7 @@ Member-set semantics are design. **The ordering reload depends on is not — not
 - [ ] **Step 1: Renumber.** "Phase 6" is currently used by three research docs for the UX-surface phase. Reload takes 6; that phase becomes 7. Fix all three in this commit so the collision does not survive.
 - [ ] **Step 2: `map.md`** — verify every claim against the code before writing it, and **cite by symbol, not line number**. That file has twice been synced to what a plan expected rather than what shipped.
 - [ ] **Step 3: Changelogs** (IR-45), reconciled not appended. **Nothing may say "zero-downtime" unqualified** — see The honest claim.
-- [ ] **Step 4: Report to Rin** — every judgement call made on her behalf, anything left unfixed, and the measured cost of the e2e tier.
+- [ ] **Step 4: Report to the maintainer** — every judgement call made on her behalf, anything left unfixed, and the measured cost of the e2e tier.
 - [ ] **Step 5: Commit** — `docs: record what reload does and does not promise`
 
 ---

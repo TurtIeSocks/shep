@@ -183,7 +183,7 @@ ledger edits.
 
 ## What this phase does NOT build
 
-- **HTTP/SSE transport.** Spec §2 defers it to v1.1 and Rin has upheld that.
+- **HTTP/SSE transport.** Spec §2 defers it to v1.1 and the maintainer has upheld that.
   `transport-io` is the only transport feature named in Task 1; the streamable
   HTTP features stay off, which is also most of why the compiled dependency
   bill is 14 crates and not 60.
@@ -208,7 +208,7 @@ ledger edits.
 
 ## The dependency bill
 
-Rin's ruling, 2026-08-14: **`rmcp`, the official Rust MCP SDK.** She weighed it
+The maintainer's ruling, 2026-08-14: **`rmcp`, the official Rust MCP SDK.** She weighed it
 against a hand-rolled stdio JSON-RPC loop and took the SDK on the argument that
 MCP is an evolving protocol where tracking an SDK beats owning a parser —
 consciously the opposite of her `serve` ruling, where axum was overruled in
@@ -630,7 +630,7 @@ the caller least able to work it out. The message carries the count:
 `"api: 2 of 4 instances are already running; use restart_sheep"`. Task 7 tests
 this case specifically.
 
-If Rin wants the wider `start` later, it is a new tool with a new name and its
+If the maintainer wants the wider `start` later, it is a new tool with a new name and its
 own argument, not a widening of this one. That belongs in the same
 conversation as an approval flow, which MCP has (elicitation) and this phase
 does not build.
@@ -1060,7 +1060,7 @@ three inside comments (the MSRV note on line 14, the ratatui rationale on line
 In `Cargo.toml`, immediately after the `crossterm` entry:
 
 ```toml
-# The MCP SDK, for `shep whistle` (spec §8, §9). Rin's ruling (2026-08-14),
+# The MCP SDK, for `shep whistle` (spec §8, §9). The maintainer's ruling (2026-08-14),
 # taken against a hand-rolled stdio JSON-RPC loop: MCP is an evolving
 # protocol, and tracking an SDK beats owning a parser for something whose
 # wire format is still moving. Deliberately the opposite of the `serve`
@@ -3547,7 +3547,7 @@ so.** Spec §8 lists `start_sheep` among the control tools without saying what
 it starts. This plan reads it as "start a registered sheep" and refuses the
 Flockfile/script form outright, on the grounds that the alternative is
 arbitrary code execution behind a gate that is explicitly not a security
-boundary. If Rin reads the spec as promising the wider form, that is a decision
+boundary. If the maintainer reads the spec as promising the wider form, that is a decision
 to take before Task 7, not after — and it should come with an approval flow
 (MCP elicitation), which this phase does not build.
 
@@ -3576,4 +3576,4 @@ daemon start rather than at whistle start, and it is a small addition to
 does routinely and an agent might reasonably be asked to do. This plan leaves
 them out because each is either irreversible or takes free-form input whose
 blast radius is not shep's to bound. That is a judgement about what an agent
-should be trusted with, not a technical limit, and it is Rin's to overrule.
+should be trusted with, not a technical limit, and it is the maintainer's to overrule.

@@ -1,6 +1,6 @@
 # shep v1 — Product & Behavior Specification
 
-Status: draft for Rin's review · 2026-08-07
+Status: draft for the maintainer's review · 2026-08-07
 Inputs: [map.md](../systematic-refactor/refactor-workspace/map.md) (module map),
 [goals.md](../systematic-refactor/refactor-workspace/goals.md),
 [decision-briefs.md](../systematic-refactor/refactor-workspace/decision-briefs.md),
@@ -42,13 +42,13 @@ amendment; vcs metadata (git
 revision shown in describe — `vcs` feature, off by default); `shep web`
 JSON status endpoint (if demand — metrics dog covers observability).
 
-**v1.2 candidate:** fd-passing/LISTEN_FDS true cluster parity (Rin: "v1.1 or
+**v1.2 candidate:** fd-passing/LISTEN_FDS true cluster parity (the maintainer: "v1.1 or
 v1.2 even").
 
 **Amendment, 2026-08-15:** the line above used to split Windows into a v1.0
 "functional tier" (named pipes, Job Objects, start/stop/list/logs) and a
 v1.1 "polish" tier (service integration, ctrl-event graceful stop, full
-e2e). Rin ruled the whole tier out of v1.0 once an actual estimate
+e2e). The maintainer ruled the whole tier out of v1.0 once an actual estimate
 existed rather than a guess — [windows-estimate.md](windows-estimate.md)
 puts it at roughly 36-49 tasks over 4-5 phases, and a redesign rather than
 a port. Windows is 0%, not partial, and stays that way through v1.0; see
@@ -196,7 +196,7 @@ from the parser's own document type and describing the whole document — not
 just `AppConfig` — for editor completion). Field set per map.md app_spec;
 sheep-native names, no pm2 aliases.
 
-**Amended, Phase 14 (Rin's ruling).** `.js` is read only when named
+**Amended, Phase 14 (the maintainer's ruling).** `.js` is read only when named
 explicitly with `shep start <path> --flockfile`. Directory discovery never
 selects a `.js` file and the ten-name order above is unchanged, because
 reading one runs `node` on it: entering a cloned repository and running
@@ -452,7 +452,7 @@ adopt immediately. Companion `docs/migration.md`. All pm2 format knowledge
 confined here.
 
 **serve:** static file server as a managed sheep, hand-rolled rather than on
-axum + tower-http (Rin's ruling — `docs/specs/deferred.md` has the reasoning),
+axum + tower-http (the maintainer's ruling — `docs/specs/deferred.md` has the reasoning),
 SPA fallback, constant-time basic auth from a creds file. `--listing` and
 `--hidden` opt into directory listing and dotfiles, both off by default;
 `--bind` widens the loopback default; `--follow-symlinks` opts into following

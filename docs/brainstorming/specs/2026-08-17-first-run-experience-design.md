@@ -7,7 +7,7 @@ behaviour change, no new verb behaviour beyond one new verb (`welcome`).
 
 ## The problem
 
-Rin, coming from five years of pm2, installed shep and ran the pm2 flow:
+The maintainer, coming from five years of pm2, installed shep and ran the pm2 flow:
 
 ```
 cargo install shep
@@ -281,14 +281,14 @@ discipline already used by `docs/whistle/tools.md`'s catalogue test and
 Recorded because they were judgement calls, not requirements:
 
 1. The welcome fires once per *home*, not once per machine or per user, so a
-   `--home` flock and a second machine each get their own. Rin chose this over
+   `--home` flock and a second machine each get their own. The maintainer chose this over
    pm2's fire-on-every-daemon-spawn.
 2. `shep welcome` is the verb name. Plain English, consistent with the
    terminology doc's rule that straight verbs stay first-class.
 3. Suppression is by stream and format, not a `--no-banner` flag. A flag can
    be added later if anyone asks; nobody has.
 4. The art ships at the "flock and shepherd" size, on the understanding that
-   it may be trimmed to one sheep after Rin lives with it.
+   it may be trimmed to one sheep after the maintainer lives with it.
 5. `import` gets its own help group despite being one verb, because the
    heading "Coming from pm2" is itself a signal to the audience this project
    is courting.

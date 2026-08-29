@@ -3,7 +3,7 @@
 Status: design, not a plan. Nothing here is built.
 Date: 2026-08-16.
 Mode: delegate. Every judgement call is mine; the Assumptions section at the
-bottom is Rin's checkpoint, and each one can be rejected on its own without
+bottom is the maintainer's checkpoint, and each one can be rejected on its own without
 unpicking the rest.
 
 `docs/specs/deferred.md` records three open lookout items, and
@@ -27,7 +27,7 @@ corrections, are in "What I checked" below.
 ## What I checked
 
 Every claim below was read out of this repo. I did not open
-`/Users/rin/GitHub/pm2`, and I edited nothing.
+`~/GitHub/pm2`, and I edited nothing.
 
 **The selector grammar is exact, and it misparses a half-typed regex.**
 `crates/shep-core/src/selector.rs:79` matches names with `want == name` and
@@ -238,7 +238,7 @@ kind of confident wrong number the `-` CPU column and the frozen uptime rule
 exist to prevent. While a filter is set the title reads:
 
 ```
-shep lookout   /home/rin/.shep                                    3 of 6 in the flock
+shep lookout   /home/ada/.shep                                    3 of 6 in the flock
 ```
 
 and with no filter it is unchanged.
@@ -290,7 +290,7 @@ considered superseded by them the moment they exist.
 Mid-type. The table has already narrowed, the title counts both numbers, and the
 status bar carries the query, a cursor, and the only two keys that now mean anything.
 
-shep lookout   /home/rin/.shep                                    2 of 6 in the flock
+shep lookout   /home/ada/.shep                                    2 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   fl…
   ID    NAME                     STATUS           PID      RESTARTS  CPU     MEM
 ──────────────────────────────────────────────────────────────────────────────────
@@ -308,7 +308,7 @@ filter  web▏   enter applies   esc cancels   ctrl-c quits                  rea
 Applied and no longer editing. The keys are back to normal, except esc, and the bar
 says which two keys touch the filter.
 
-shep lookout   /home/rin/.shep                                    2 of 6 in the flock
+shep lookout   /home/ada/.shep                                    2 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.3%   fl…
   ID    NAME                     STATUS           PID      RESTARTS  CPU     MEM
 ──────────────────────────────────────────────────────────────────────────────────
@@ -326,7 +326,7 @@ filter "web"   / edit   esc clear                                          read-
 Nothing matches. The table does not say the flock is empty, because it is not, and
 the count keeps the real size on screen.
 
-shep lookout   /home/rin/.shep                                    0 of 6 in the flock
+shep lookout   /home/ada/.shep                                    0 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu -   flock…
   ID    NAME                     STATUS           PID      RESTARTS  CPU     MEM
 ──────────────────────────────────────────────────────────────────────────────────
@@ -372,7 +372,7 @@ is not destructive, and it is already considered safe enough for an agent to
 invoke unattended. The cost of leaving it out is that an operator watching a
 stopped sheep has to drop to a shell for the one verb that would fix it.
 
-Rin's call: ship the three. Recorded here because the next reader will ask the
+The maintainer's call: ship the three. Recorded here because the next reader will ask the
 same question, and because the answer is a scope decision rather than a
 technical obstacle. Adding `start` later is additive: one key, one arm-time
 refusal for a sheep that is already running, and no new shape anywhere.
@@ -605,7 +605,7 @@ over:
 `R` pressed with the gate open. Nothing has been sent. Enter sends it; anything else,
 including another `R`, takes the question away and moves nothing.
 
-shep lookout   /home/rin/.shep                                          6 in the flock
+shep lookout   /home/ada/.shep                                          6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   fl…
   ID    NAME                     STATUS           PID      RESTARTS  CPU     MEM
 ──────────────────────────────────────────────────────────────────────────────────
@@ -624,7 +624,7 @@ restart api (id 2)? enter confirms, any other key cancels            control ena
 Enter pressed. The request is out and nothing on the table has changed yet, because
 nothing the shepherd said has changed yet. This line survives a stray keypress.
 
-shep lookout   /home/rin/.shep                                          6 in the flock
+shep lookout   /home/ada/.shep                                          6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   fl…
   ID    NAME                     STATUS           PID      RESTARTS  CPU     MEM
 ──────────────────────────────────────────────────────────────────────────────────
@@ -643,7 +643,7 @@ restart api (id 2): sent, waiting for the shepherd                   control ena
 The shepherd refused, in its own words. `selector matched no registered sheep` is the
 daemon's sentence, forwarded rather than rewritten.
 
-shep lookout   /home/rin/.shep                                          5 in the flock
+shep lookout   /home/ada/.shep                                          5 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 11.3%   fl…
   ID    NAME                     STATUS           PID      RESTARTS  CPU     MEM
 ──────────────────────────────────────────────────────────────────────────────────
@@ -781,7 +781,7 @@ timer.
 The detail pane with a lamb list. The age stamp sits before the list so a narrow
 terminal truncates lambs rather than the caveat.
 
-shep lookout   /home/rin/.shep                                          6 in the flock
+shep lookout   /home/ada/.shep                                          6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   fl…
   ID    NAME                     STATUS           PID      RESTARTS  CPU     MEM
 ──────────────────────────────────────────────────────────────────────────────────
@@ -795,8 +795,8 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
 ──────────────────────────────────────────────────────────────────────────────────
 sheep 2  api   online   pid 48219   restarts 1   uptime 1h 28m   cpu 7.1%   mem 241…
 lambs  3 parent-pid descendants, read 4m ago   48220 node   48221 node   48222 node
-out  /home/rin/.shep/logs/api-2-out.log
-err  /home/rin/.shep/logs/api-2-err.log
+out  /home/ada/.shep/logs/api-2-out.log
+err  /home/ada/.shep/logs/api-2-err.log
 ──────────────────────────────────────────────────────────────────────────────────
 bleats  api
 out  GET /healthz 200 3ms
@@ -814,8 +814,8 @@ the pane says which of the two it is looking at.
 
 sheep 4  cron   stopped   pid -   restarts 0   uptime 1h 21m   cpu -   mem -   fold -
 lambs  this sheep is not running, so there is no tree to walk
-out  /home/rin/.shep/logs/cron-4-out.log
-err  /home/rin/.shep/logs/cron-4-err.log
+out  /home/ada/.shep/logs/cron-4-out.log
+err  /home/ada/.shep/logs/cron-4-err.log
 ```
 
 ---
@@ -1033,7 +1033,7 @@ cost: trivial.
 existing boundary, for the same underlying reasons. Flip cost: adding delete
 is a real design change, not a key binding, because it should carry a
 heavier confirmation than the other three; the research's typed-name design
-is recorded above if Rin wants it.
+is recorded above if the maintainer wants it.
 
 **A8. `x` keeps stop; `R` is restart and `L` is reload.** Reasoning: `x` is
 already shipped, tested and in the frames; `r` is taken by refresh, so the

@@ -130,7 +130,7 @@ A single shared tag is still possible: release-plz's own single-tag recipe
 disables `git_tag_enable` workspace-wide and re-enables it, named
 `v{{ version }}`, on one representative package. It is not configured here,
 so it is not what the next release does. Whether to add that configuration
-is Rin's call, not this fix's to make for her.
+is the maintainer's call, not this fix's to make for her.
 
 All five crates share a single workspace version, and the four with code are
 released together. `shep-cli`, the redirect placeholder, carries
@@ -271,7 +271,7 @@ extraction, not one — this single command installs all three binaries:
 `shep-dev`.
 
 The README's status block, badges, and "Try it" section already carry this
-command as of 2026-08-16, ahead of the actual publish, per Rin's call that
+command as of 2026-08-16, ahead of the actual publish, per the maintainer's call that
 the docs should describe the install rather than wait for it. Nothing to
 edit there at publish time; just confirm the badges resolve once the crates
 are up.

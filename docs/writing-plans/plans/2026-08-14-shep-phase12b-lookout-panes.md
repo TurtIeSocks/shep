@@ -4,7 +4,7 @@
 three panes spec §9 names and Phase 12a deliberately did not build. Every
 baseline below was re-measured on merged `main` at `ac8bc8a`.
 
-## Rin's decision, and what it rules out
+## the maintainer's decision, and what it rules out
 
 She read `docs/lookout/frames.txt` and said:
 
@@ -264,10 +264,10 @@ Three panes, one selection, and the frames that show them.
 Each of these is a decision, not an omission. Every one of them is something a
 reader of this plan will be tempted to add.
 
-- **No filter or search line.** Spec §9 names `search/filter`; Rin's ruling
+- **No filter or search line.** Spec §9 names `search/filter`; the maintainer's ruling
   above excludes it from v1 explicitly ("No filtering UI"). It also has an
   unresolved design question 12a already wrote down — whether the filter takes
-  the CLI's selector grammar or plain substring matching — and that is Rin's
+  the CLI's selector grammar or plain substring matching — and that is the maintainer's
   call, not an implementer's. Goes to `docs/specs/deferred.md`.
 - **No `Request::Describe`, and therefore no lambs in the detail pane.**
   `ProcessInfo::lambs` is `None` on a `ListFlock` reply by construction, and
@@ -276,7 +276,7 @@ reader of this plan will be tempted to add.
   A dashboard polling `Describe` every two seconds would put that walk on a
   timer. The detail pane's caption must not claim lambs.
 - **No actions.** `x` still refuses in both control states, with the same two
-  literal sentences 12a shipped. Rin asked for panes; wiring a stop to a
+  literal sentences 12a shipped. The maintainer asked for panes; wiring a stop to a
   selection is a different phase and a different risk. The gate stays honestly
   described as a fat-finger catch.
 - **No focus model, no pane switching, no mouse.** One keymap, one selection,
@@ -653,7 +653,7 @@ with a seven-row flock table.
 above it, the three panes are rendered through the same `fit` the table uses,
 so they truncate with a visible `…` rather than overlapping. A second dimension
 of tiering would buy a marginal aesthetic and cost a whole interaction to test.
-The `cramped` scene (33 columns, 26 rows) is in the gallery so Rin can see the
+The `cramped` scene (33 columns, 26 rows) is in the gallery so the maintainer can see the
 truncated result and say if she disagrees.
 
 The row budget is an invariant with a test, not a comment. Fixed chrome is 4
@@ -688,7 +688,7 @@ already goes through.** An earlier draft of this decision built a second
 mechanism for it: a `Vec<String>` of five segments, a `while … pop()` loop, a
 `joined_width` helper, and a test that walked every width from 200 down to 10
 recording the order things vanished. That is a second, differently-shaped
-fitting path beside the one the rest of the screen uses, and Rin's ruling for
+fitting path beside the one the rest of the screen uses, and the maintainer's ruling for
 this phase is "all three panes, kept as plain as the flock table, no elaborate
 layout". It is cut.
 
@@ -764,7 +764,7 @@ and its reducer arm; Task 8 put the strip on screen; and *no task changed the
 heartbeat arm*, which still yielded `Msg::Tick` and nothing else. Every test
 and every gallery frame injects `Msg::Host` directly, so nothing would have
 caught it — and the shipped binary would have drawn `host  not read yet`
-forever, under a strip Rin had approved from `frames.txt`. Task 6 is where
+forever, under a strip the maintainer had approved from `frames.txt`. Task 6 is where
 `run_ui` gains its `local: L` parameter, so Task 6 is where the heartbeat arm
 gains `app.update(Msg::Host { sample: local.host() })`, and Step 6.2 has a
 `run_ui` test that drives one heartbeat with a `FakeLocal` and asserts
@@ -1054,7 +1054,7 @@ And in `view/status.rs`'s `mod tests`:
         let app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         let hint: String = status_line(&app, 200)
@@ -1510,7 +1510,7 @@ add:
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         app.update(Msg::Snapshot {
@@ -2032,7 +2032,7 @@ pub fn coloured() -> Palette {
 /// A dashboard with `flock` listed and nothing else applied.
 pub fn app_with(flock: Vec<ProcessInfo>, palette: Palette) -> App {
     let t0 = Instant::now();
-    let mut app = App::new(palette, Control::ReadOnly, "/home/rin/.shep".to_string(), t0);
+    let mut app = App::new(palette, Control::ReadOnly, "/home/ada/.shep".to_string(), t0);
     app.update(Msg::Snapshot { rows: flock, at: t0 });
     app
 }
@@ -2048,15 +2048,15 @@ pub fn flock_of(count: u32, with_readings: u32) -> Vec<ProcessInfo> {
                 .uptime_ms(4_512_000)
                 .cpu_percent(reports.then_some(3.5))
                 .memory_bytes(reports.then_some(182 << 20))
-                .out_file(Some(format!("/home/rin/.shep/logs/sheep-{id}-out.log")))
-                .err_file(Some(format!("/home/rin/.shep/logs/sheep-{id}-err.log")))
+                .out_file(Some(format!("/home/ada/.shep/logs/sheep-{id}-out.log")))
+                .err_file(Some(format!("/home/ada/.shep/logs/sheep-{id}-err.log")))
                 .build()
         })
         .collect()
 }
 
 /// One plausible host reading: the same numbers the gallery's scenes use, so a
-/// failure here and a frame Rin is looking at name the same figures.
+/// failure here and a frame the maintainer is looking at name the same figures.
 pub fn sample() -> HostSample {
     HostSample {
         load: (2.31, 4.10, 3.88),
@@ -2261,7 +2261,7 @@ grep -rn 'Msg::Host' crates/ | wc -l                         # 0
     /// the right, so truncating IS the drop order and this is the whole of the
     /// fitting behaviour. An earlier draft built a second mechanism for it and
     /// a test that walked every width from 200 down to 10 recording the order
-    /// things vanished; Rin's ruling for this phase is "as plain as the flock
+    /// things vanished; the maintainer's ruling for this phase is "as plain as the flock
     /// table", and the ellipsis on every other line of the screen is the
     /// precedent. Three widths, not a hundred and ninety.
     #[test]
@@ -3308,7 +3308,7 @@ Task 1 left becomes a coalesced read, **and the heartbeat arm starts producing
 The heartbeat is the one to read twice. Task 4 wrote `Msg::Host`, its reducer
 arm and the strip; **nothing produced the message.** Every pane test and every
 gallery frame injects it directly, so the whole phase would have gone green
-with the shipped binary drawing `host  not read yet` forever, under a strip Rin
+with the shipped binary drawing `host  not read yet` forever, under a strip the maintainer
 had approved from `frames.txt`. `run_ui` gains `local` here, so the sampling
 belongs here.
 
@@ -4044,14 +4044,14 @@ redden; a one-sheep fixture would make it invisible.
     fn the_pane_adds_the_full_name_and_both_log_paths() {
         let app = with_selection(
             ProcessInfo::builder(7, "payments-reconciliation-worker", ProcStatus::Errored)
-                .out_file(Some("/home/rin/.shep/logs/payments-out.log".to_string()))
-                .err_file(Some("/home/rin/.shep/logs/payments-err.log".to_string()))
+                .out_file(Some("/home/ada/.shep/logs/payments-out.log".to_string()))
+                .err_file(Some("/home/ada/.shep/logs/payments-err.log".to_string()))
                 .build(),
         );
         let rendered = render_all(&detail_lines(&app, 200));
         assert!(rendered.contains("payments-reconciliation-worker"), "the whole name");
-        assert!(rendered.contains("out  /home/rin/.shep/logs/payments-out.log"));
-        assert!(rendered.contains("err  /home/rin/.shep/logs/payments-err.log"));
+        assert!(rendered.contains("out  /home/ada/.shep/logs/payments-out.log"));
+        assert!(rendered.contains("err  /home/ada/.shep/logs/payments-err.log"));
     }
 
     /// fails if the STATUS word stops carrying its own colour, or if anything
@@ -4084,7 +4084,7 @@ redden; a one-sheep fixture would make it invisible.
         let app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         let rendered = render_all(&detail_lines(&app, 200));
@@ -4405,7 +4405,7 @@ in advance.
                     assert_eq!(
                         lines
                             .iter()
-                            .filter(|l| l.starts_with("out  /home/rin/.shep/logs/"))
+                            .filter(|l| l.starts_with("out  /home/ada/.shep/logs/"))
                             .count(),
                         1,
                         "the detail pane's out path at {width}x{height}"
@@ -4458,7 +4458,7 @@ in advance.
         assert!(!frame.contains("not read yet"), "and not the pre-heartbeat sentence");
     }
 
-    /// fails if the flock table stops being the spine. Rin's ruling in one
+    /// fails if the flock table stops being the spine. The maintainer's ruling in one
     /// test: whatever else is on screen, the table gets the remainder, and at
     /// the tier where all three panes are up it still has room for more than
     /// a couple of rows.
@@ -4734,7 +4734,7 @@ gutter or the tiers made them wrong.
 `narrow` moves from 49 to **51** columns and this is not cosmetic: the tier is
 now chosen on `width - GUTTER`, so 49 columns would land on the `41` tier —
 which has already dropped CPU — and the scene would contradict its own caption
-in the gallery Rin reads. 12a's own comment records making this exact
+in the gallery the maintainer reads. 12a's own comment records making this exact
 correction once already, for the same reason.
 
 **Five edits this table implies that a table cell does not make**, each of
@@ -4753,7 +4753,7 @@ which has to be written out or it will not happen:
 4. **`sheep()` gains both log paths.** It takes eight arguments and already
    carries `#[allow(clippy::too_many_arguments)]`; adding two more would make
    it ten. Derive them instead, inside the function:
-   `.out_file(Some(format!("/home/rin/.shep/logs/{name}-{id}-out.log")))` and
+   `.out_file(Some(format!("/home/ada/.shep/logs/{name}-{id}-out.log")))` and
    the matching `-err`. Deterministic, no new parameters, and it gives the
    detail pane something to render and `no_detail` something to assert the
    absence of.
@@ -4907,7 +4907,7 @@ caption clause. The captions and their pins, written together:
         // log-path prefix is the detail pane's alone: the feed's body lines
         // are tagged `out  ` too, but they carry log TEXT, not a path.
         assert!(
-            !no_detail.contains("out  /home/rin/.shep/logs/"),
+            !no_detail.contains("out  /home/ada/.shep/logs/"),
             "the detail pane went"
         );
 
@@ -4928,7 +4928,7 @@ caption clause. The captions and their pins, written together:
         // any frame at any width, including a blank one. What "nothing
         // overlaps" actually means is that each pane's own marker appears
         // exactly once, which is a claim about this layout.
-        for marker in ["host  ", "bleats  ", "out  /home/rin/.shep/logs/"] {
+        for marker in ["host  ", "bleats  ", "out  /home/ada/.shep/logs/"] {
             assert_eq!(
                 cramped.lines().filter(|line| line.starts_with(marker)).count(),
                 1,
@@ -5105,7 +5105,7 @@ that. The one being checked here is
 renders the frozen scene at two clock ages and compares the frames byte for
 byte: it reddens only because the frozen scene carries a host sample and the
 strip is on screen, and it is the only check in the phase that would catch a
-strip that kept updating *on the frame Rin is looking at* rather than in the
+strip that kept updating *on the frame the maintainer is looking at* rather than in the
 reducer.
 
 If that second one does not fail, the frozen scene is not getting a host sample
@@ -5115,7 +5115,7 @@ whose strips both say `not read yet`. Revert.
 ### Step 9.7 — read the gallery
 
 Open `docs/lookout/frames.txt` and read all fourteen frames. This is the step
-whose output goes to Rin, and it is the only one no test can do. Look for:
+whose output goes to the maintainer, and it is the only one no test can do. Look for:
 
 - a pane that is technically correct and unreadable
 - a caption that says something the frame does not show — every clause of
@@ -5123,7 +5123,7 @@ whose output goes to Rin, and it is the only one no test can do. Look for:
   is a clause to delete
 - the `cramped` scene: if 33 columns is genuinely unusable, say so in the task
   report rather than fixing it unilaterally. A pane width floor is a knob, and
-  knobs are Rin's call this phase.
+  knobs are the maintainer's call this phase.
 
 ---
 
@@ -5165,11 +5165,11 @@ species of rot as a false caption.
   feed's file-reading decision and its cost, the height tiers) and a shorter
   "What is still open" carrying only what genuinely is: search/filter, actions
   behind the gate, and lambs in the detail pane. **This is public-facing prose
-  in a repository Rin publishes** — draft it, then run the `humanizer` skill
+  in a repository the maintainer publishes** — draft it, then run the `humanizer` skill
   over it before it is final, matching the voice of the existing README rather
   than inventing a new one.
 - **`docs/specs/deferred.md`** — three entries, each with the reason rather
-  than just the name: `search/filter` (Rin's v1 ruling, plus the unresolved
+  than just the name: `search/filter` (the maintainer's v1 ruling, plus the unresolved
   grammar question), lookout actions (the gate exists and refuses honestly),
   lambs in the detail pane (`Describe`'s process-table walk on a two-second
   timer).
@@ -5283,7 +5283,7 @@ reader assume both are checks:
 
 Per CLAUDE.md's default: merge locally into `main`, then delete the branch and
 the worktree in the same response. `cargo publish` is never run without
-`--dry-run`, `git push` and `git tag` are Rin's, and nothing in this phase
+`--dry-run`, `git push` and `git tag` are the maintainer's, and nothing in this phase
 touches `web/` or `docs/shep-design/`.
 
 ## One-line summary of the phase, for the commit body

@@ -1,8 +1,8 @@
 # Refactor Map — pm2 (Node) → shep (Rust workspace)
 
-Primary deliverable. Tree = new structure; every leaf carries `← was` + Action + Notes. Crate names final: `shep-*` (Rin picked `shep` 2026-08-07; naming + lexicon in [../../terminology.md](../../terminology.md)).
+Primary deliverable. Tree = new structure; every leaf carries `← was` + Action + Notes. Crate names final: `shep-*` (the maintainer picked `shep` 2026-08-07; naming + lexicon in [../../terminology.md](../../terminology.md)).
 
-**CLEAN-ROOM NOTE (Rin's decision, 2026-08-07):** pm2 is feature-list inspiration only; implementation is clean-room under our own license (MIT OR Apache-2.0). This document is a *behavior spec*, not a code-derivation map — `← was` lines identify which pm2 feature inspired each module, and "compat"/"byte-exact"/"contract" phrasing means *fidelity to the behavior recorded here*, not compatibility with pm2's artifacts. During implementation: build from this spec, do not open pm2 source. We owe nothing to pm2's file layouts, env-var names, dump formats, or flag spellings — keep them only where they're genuinely good defaults.
+**CLEAN-ROOM NOTE (the maintainer's decision, 2026-08-07):** pm2 is feature-list inspiration only; implementation is clean-room under our own license (MIT OR Apache-2.0). This document is a *behavior spec*, not a code-derivation map — `← was` lines identify which pm2 feature inspired each module, and "compat"/"byte-exact"/"contract" phrasing means *fidelity to the behavior recorded here*, not compatibility with pm2's artifacts. During implementation: build from this spec, do not open pm2 source. We owe nothing to pm2's file layouts, env-var names, dump formats, or flag spellings — keep them only where they're genuinely good defaults.
 
 ## Workspace shape (4 crates — lean by design)
 
@@ -358,7 +358,7 @@ src/
       Action: port + redesign
       Drift (Phase 4, recorded): built as a DIRECTORY, not the `watcher.rs` named above — the
              OS seam and the filtering logic have different test tiers (source.rs needs a real
-             filesystem, mod.rs is pure), and one file would have crossed Rin's 500-line split.
+             filesystem, mod.rs is pure), and one file would have crossed the maintainer's 500-line split.
       Notes: notify + notify-debouncer-full; ONE watcher per name-group (fixes O(N²) fan-out);
              ignore defaults (dotfiles, node_modules) via globset; watch_delay = debounce dur;
              re-check after restart completes (fixes dropped-event gap). disableAll bug not ported.
@@ -427,7 +427,7 @@ src/
       Drift (2026-08-18, recorded): membership survives everything but `delete`. `restorable`
              used to return one list and select `instances_running > 0 && autostart`, which made
              `shep stop` destructive across a daemon restart — the sheep left the flock entirely
-             and its config survived only in a roll nobody reads by hand. Rin hit exactly that
+             and its config survived only in a roll nobody reads by hand. The maintainer hit exactly that
              after a `stop`/`kill`/reinstall cycle and asked why stopping should mean
              forgetting. It returns `members` + `to_start` now: every entry that still
              normalizes is registered, and only the ones that were up and opt into `autostart`
@@ -802,7 +802,7 @@ src/
              APM injection dropped. Runs as managed instance of own binary (hidden subcommand).
       Drift (Phase 15, recorded): shipped as `serve/` with six modules — `path`, `fs`,
              `mime`, `listing`, `auth`, `worker` — hand-rolled on `http.rs` (which moved up
-             out of `dog/` to the crate root, Task 2), not on axum + tower-http (Rin's
+             out of `dog/` to the crate root, Task 2), not on axum + tower-http (the maintainer's
              ruling, 2026-08-15: `docs/specs/deferred.md` has the reasoning). Directory
              listing and dotfiles are both refused by default (`--listing`/`--hidden` opt
              in), the reverse of pm2's own defaults. No `PM2_SERVE_*` env compatibility —
@@ -861,7 +861,7 @@ src/
       Drift (Phase 9, recorded): shipped as a directory — `mod.rs` (`BarkConfig`, `run_loop`),
              `rules.rs` (`Rule`/`Trigger`/`Rules`), `sinks.rs` (`Sink`, delivery) — not the
              single `bark.rs` this entry named. Delivery is hand-rolled HTTP/1.1 over
-             `tokio-rustls`, not reqwest (Rin's ruling, 2026-08-12: fewer transitive
+             `tokio-rustls`, not reqwest (the maintainer's ruling, 2026-08-12: fewer transitive
              dependencies, no C toolchain from `aws-lc-sys`).
       Notes: `run_loop` subscribes the bus AND polls the flock (`poll`, 30s default) as
              reconciliation, so a bus drop under load still fires the alert it would have
@@ -965,7 +965,7 @@ CI: fmt+clippy+nextest × {ubuntu,macos,windows} × {stable,MSRV}; llvm-cov; doc
 - Monit.js (merged into tui.rs), .mocharc, bash test orchestration, dead test helpers
 - Deferred (design ready, not v1): Version.js pull/backward/forward, Modules/* TAR redesign, deploy crate
 
-## Design decisions (Rin ruled 2026-08-07)
+## Design decisions (the maintainer ruled 2026-08-07)
 
 1. **DECIDED: JSON frames v1.** rmp-serde stays a possible later feature; not planned.
 2. **DECIDED**: fd-pipe protocol + probe-based readiness in v1; optional `@shep/io` npm shim v1.1; no Node-IPC emulation.

@@ -80,4 +80,4 @@
 - Tag-triggered release workflow using crates.io Trusted Publishing (OIDC, no token secret); `permissions: contents: read` default on all workflows.
 - SECURITY.md stating premises (what the daemon socket/auth guarantees and under which preconditions), supported-versions window, private advisory reporting. For a process manager this matters more than for most crates — the daemon is a privilege boundary.
 
-Files read: `/Users/rin/GitHub/rand/Cargo.toml`, `clippy.toml`, `src/lib.rs`, `src/distr/bernoulli.rs`, `src/distr/mod.rs`, `src/distr/uniform.rs` (error section), `src/rngs/mod.rs`, `src/rngs/thread.rs`, `src/prelude.rs`, `benches/Cargo.toml`, `benches/benches/bool.rs`, `benches/rustfmt.toml`, `tests/fill.rs`, `CHANGELOG.md`, `SECURITY.md`, `.github/workflows/{test,release}.yml`.
+Files read: `~/GitHub/rand/Cargo.toml`, `clippy.toml`, `src/lib.rs`, `src/distr/bernoulli.rs`, `src/distr/mod.rs`, `src/distr/uniform.rs` (error section), `src/rngs/mod.rs`, `src/rngs/thread.rs`, `src/prelude.rs`, `benches/Cargo.toml`, `benches/benches/bool.rs`, `benches/rustfmt.toml`, `tests/fill.rs`, `CHANGELOG.md`, `SECURITY.md`, `.github/workflows/{test,release}.yml`.

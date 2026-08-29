@@ -29,7 +29,7 @@ Workspace `rust-version = 1.85` (IR-4). But:
 - sysinfo 0.38.4 → MSRV **1.88** (0.39.x → 1.95 — too new, ~Apr 2026)
 - crossterm 0.29.0 → 1.63 (fine); tui-input declares none (trivial deps)
 
-**Recommendation: bump workspace MSRV 1.85 → 1.88** (released 2025-06-26, >13 months old at time of writing — comfortably conservative). Take ratatui 0.30.2 + sysinfo 0.38.4. Fallback if Rin vetoes the bump: ratatui **0.29.0** (MSRV 1.74, pre-modular but API-similar for our usage) + sysinfo **0.36.1** (1.75) + tui-input **0.14.x** — a known-good but aging island; the 0.29→0.30 migration later is mostly import paths. The bump is the better trade: the UX-surface phase shouldn't build on a line that was already superseded when the phase started.
+**Recommendation: bump workspace MSRV 1.85 → 1.88** (released 2025-06-26, >13 months old at time of writing — comfortably conservative). Take ratatui 0.30.2 + sysinfo 0.38.4. Fallback if the maintainer vetoes the bump: ratatui **0.29.0** (MSRV 1.74, pre-modular but API-similar for our usage) + sysinfo **0.36.1** (1.75) + tui-input **0.14.x** — a known-good but aging island; the 0.29→0.30 migration later is mostly import paths. The bump is the better trade: the UX-surface phase shouldn't build on a line that was already superseded when the phase started.
 
 ---
 
@@ -243,7 +243,7 @@ nothing before `init()` that could panic while raw mode is half-entered.
 
 ---
 
-## 6. Open questions for Rin
+## 6. Open questions for the maintainer
 
 1. ~~MSRV bump 1.85 → 1.88 — yes/no (fallback island documented in §1).~~
    **RESOLVED 2026-08-07: bumped.** serde-saphyr forced it before this phase

@@ -38,7 +38,7 @@ backported alone.
 
 ## Global constraints
 
-- **Never read or reference `/Users/rin/GitHub/pm2`.** Clean-room project;
+- **Never read or reference `~/GitHub/pm2`.** Clean-room project;
   behaviour comes from this repo's specs.
 - MSRV 1.88, edition 2024. Workspace lints deny `missing_docs` and
   `missing_debug_implementations`. `#![forbid(unsafe_code)]` outside
@@ -66,7 +66,7 @@ backported alone.
 
 ## Settled decisions
 
-Rin delegated these (2026-08-11) and approved the two she was asked about.
+The maintainer delegated these (2026-08-11) and approved the two she was asked about.
 🔴 marks a decision that changes the fd-3 wire.
 
 | # | Decision |
@@ -77,7 +77,7 @@ Rin delegated these (2026-08-11) and approved the two she was asked about.
 | 4 | **A channel-less sheep is a per-row refusal, not a whole-selector refusal.** Spec §9's grammar (`all`, `/regex/`, `fold:`) makes mixed flocks the normal case; `reopen`/`flush` are the precedent for per-item failure inside a success. |
 | 5 | **New `Response::Triggered(Vec<ActionReply>)`** carrying a struct row. `ProcessInfo` cannot carry a reply body, and `selector_call` is typed to `Vec<ProcessInfo>` so trigger cannot reuse it. `EmptiedFile` is the precedent for a non-`ProcessInfo` row. |
 | 6 | **`trigger` answers on completion, not acceptance.** An action has no structural time floor the way a reload's N × ~11s does. This is what makes the daemon-side timeout (Task 5) necessary. |
-| 7 | 🔴 **Params ship now**, as `Option<String>` on `ShepherdMessage::Action`. Rin approved. Zero apps are deployed and no shim exists, so the field is free today and potentially breaking later. `skip_serializing_if` keeps the no-params string byte-identical to spec §7. |
+| 7 | 🔴 **Params ship now**, as `Option<String>` on `ShepherdMessage::Action`. The maintainer approved. Zero apps are deployed and no shim exists, so the field is free today and potentially breaking later. `skip_serializing_if` keeps the no-params string byte-identical to spec §7. |
 | 8 | **`action_timeout` is a new `UpDuration` on `AppConfig`.** Every existing per-app budget lives there. The daemon-side timeout must be shorter than the RPC budget or the caller gets `DeadlineExceeded` before the honest answer arrives. |
 | 9 | **No bus events in v1.** Every `ProcessEventKind` variant is a lifecycle state transition, and a trigger changes none — the sheep is `Online` before and after. `flush` and `reopen` are already bus-silent (verified: zero `self.emit` calls in either handler). An audit trail, if wanted, is a `daemon.command` topic covering every verb, not one event bolted onto trigger. `ServerFrame` is `#[non_exhaustive]`, so this stays additive. |
 | 10 | **A drainee is skipped, reported per row.** Follows `handle_reload`'s `status != Online` filter. An operator asking `web` should not get an answer from a process that is about to die. |
@@ -148,7 +148,7 @@ reasoning drop **a `Kill`**.
 
 **Files:** Modify `crates/shep-daemon/src/channel.rs`, `docs/specs/shep-v1.md`.
 
-**This is the phase's one irreversible change.** Rin approved it: zero apps are
+**This is the phase's one irreversible change.** the maintainer approved it: zero apps are
 deployed and no `@shep/io` shim exists, so the field is free today and
 potentially breaking later.
 
@@ -303,7 +303,7 @@ a channel exists.
       true`, the fd-3 strings, that an action name is free-form, that the app
       should reply even to a name it does not know, and that the reply is what
       the operator sees.
-- [ ] **Step 4: Report to Rin** — every judgement call, anything left unfixed,
+- [ ] **Step 4: Report to the maintainer** — every judgement call, anything left unfixed,
       and which standing backlog items this phase closed.
 - [ ] **Step 5: Commit** — `docs: record what a custom action is and is not`.
 

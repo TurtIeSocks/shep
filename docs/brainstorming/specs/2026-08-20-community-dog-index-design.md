@@ -1,12 +1,12 @@
 # The community dog index: design
 
 **Date:** 2026-08-20
-**Status:** participate-mode design, both sections approved by Rin
+**Status:** participate-mode design, both sections approved by the maintainer
 **Scope:** the index data and the page that renders it. Not `shep install`.
 
 ## The ask
 
-Rin, 2026-08-20: the docs site should carry a community list of dogs, held as
+The maintainer, 2026-08-20: the docs site should carry a community list of dogs, held as
 a JSON the Astro app reads at build time and turns into a page. Two payoffs
 she named: contributing a dog becomes a pull request, and the same file is an
 index a future `shep` command could read.
@@ -213,7 +213,7 @@ Contributing is a pull request editing one JSON file. No account, no registry,
 no tooling to install.
 
 An entry whose repository has vanished, or which turns hostile, comes off by
-pull request or by Rin directly. The list makes no ongoing claim, which is
+pull request or by the maintainer directly. The list makes no ongoing claim, which is
 exactly why existence-only was the right bar: there is nothing to retract.
 
 ## 5. Deliberately deferred, and compatible with all of it
@@ -245,7 +245,7 @@ exactly why existence-only was the right bar: there is nothing to retract.
 
 ## 7. Assumptions
 
-Judgement calls made while drafting, all confirmed with Rin except where noted:
+Judgement calls made while drafting, all confirmed with the maintainer except where noted:
 
 1. `web/public/dogs.json` rather than `src/data/`, because the file has a
    second consumer that cannot import a TypeScript module. Not raised

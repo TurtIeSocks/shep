@@ -7,7 +7,7 @@ directory is still named `pm2-rs`, which is expected and not a rename to make.
 
 ## ⚠️ Clean-room rule (non-negotiable)
 
-**Never open, read, or port source from `/Users/rin/GitHub/pm2` during
+**Never open, read, or port source from `~/GitHub/pm2` during
 implementation.** That repo was read once, by a dedicated trace phase, to
 produce our behavior specs — implementation works from the specs alone:
 
@@ -15,7 +15,7 @@ produce our behavior specs — implementation works from the specs alone:
 - [docs/systematic-refactor/refactor-workspace/](docs/systematic-refactor/refactor-workspace/) — goals.md (must-haves, constraints, open questions), assessment.md (keep/toss verdicts), trace.md + trace/ (flow inventories, known-bug list — bugs are documented so we do NOT reproduce them)
 
 "Compat"/"contract" language in those docs means fidelity to the spec, not to
-pm2's artifacts. `/Users/rin/GitHub/rand` is the style reference — read freely.
+pm2's artifacts. `~/GitHub/rand` is the style reference — read freely.
 
 ## Commands
 
@@ -288,7 +288,7 @@ never costs clarity.
   `shep-daemon/src/sys.rs` with per-block `// SAFETY:` (IR-22/23).
 - Open design decisions live at the bottom of map.md and in goals.md's open
   questions — check them before making architectural calls; if a decision is
-  listed there, it is Rin's, not yours.
+  listed there, it is the maintainer's, not yours.
 
 ## Status / workflow
 

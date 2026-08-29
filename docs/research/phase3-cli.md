@@ -1,6 +1,6 @@
 # Phase 3 CLI — design research
 
-Status: research for Rin's review · 2026-08-08
+Status: research for the maintainer's review · 2026-08-08
 Scope: `shep-client` + `shep-cli`, wiring the 9 daemon-implemented verbs
 (`Ping`, `ListFlock`, `Describe`, `Start`, `Stop`, `Restart`, `Delete`,
 `Subscribe`, `KillDaemon`) plus hidden `shep daemon`. No code in this doc —
@@ -77,7 +77,7 @@ pre-declaring empty subcommands for `lookout`/`whistle`/`serve`/`import`/dogs.
   - `bleats`: `.visible_alias("logs")`.
   - `stop`: `.alias("thatlldo")` — **hidden**, since spec §9 itself calls it
     an "easter-egg alias"; a visible easter egg in `--help` isn't much of
-    one. (Judgment call — flagged below, confirm with Rin.)
+    one. (Judgment call — flagged below, confirm with the maintainer.)
   - `muster`/`resurrect`: **not** a `Command::alias()` on `muster` — see the
     next bullet.
   - `dev`/`runtime`, `enable`/`disable` etc.: no aliasing needed, land as-is
@@ -195,7 +195,7 @@ Losing a boot race is handled by **retrying `connect()`**, not by treating
    existing `flock` already makes this safe; the client side only needs to
    not give up too early.
 
-**Underspecified — flag for Rin:** where does an auto-spawned (detached, no
+**Underspecified — flag for the maintainer:** where does an auto-spawned (detached, no
 terminal) daemon's own tracing output go? Per-sheep logs have a defined home
 (`$SHEP_HOME/logs/`); the daemon's *own* stdout/stderr today has no
 documented destination once detached. Recommend a `shepd.log` under the same
@@ -273,7 +273,7 @@ DeadlineExceeded   = 8   // RpcErrorCode::DeadlineExceeded
   the same number. Both really do mean "this invocation didn't do what you
   wanted, check stderr," and matching clap's own convention costs nothing;
   giving `runtime` a different number (say 9) would be a one-line change if
-  Rin prefers distinguishability, but I'd default to the collision-is-fine
+  the maintainer prefers distinguishability, but I'd default to the collision-is-fine
   reading unless told otherwise. **Flagged explicitly below as a spec
   ambiguity**, since a scriptable caller genuinely cannot tell "bad CLI
   invocation" from "runtime container found nothing to supervise" from the

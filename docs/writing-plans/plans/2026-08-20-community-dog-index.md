@@ -15,7 +15,7 @@
 - **No new npm dependencies.** The validator uses `node:test` and `node:assert/strict`, both built in. Adding a test framework for one module is the thing this plan is avoiding.
 - **No em dashes or en dashes** (U+2014, U+2013) in any prose a reader sees: the page, the JSON's descriptions, error messages. Hyphens only. Check the bytes.
 - **The page's own copy is public-facing prose.** Run the `humanizer` skill over it before committing: no rule-of-three stacking, no mechanical boldface, no promotional cadence.
-- **Do not touch `crates/shep-cli/src/cli.rs` or `crates/shep-cli/src/commands/init.rs`.** Both carry Rin's own uncommitted work from a teaching session. This plan is `web/`-only and has no reason to go near them.
+- **Do not touch `crates/shep-cli/src/cli.rs` or `crates/shep-cli/src/commands/init.rs`.** Both carry the maintainer's own uncommitted work from a teaching session. This plan is `web/`-only and has no reason to go near them.
 - **`web/` is published.** Every task ends with `cd web && npx astro build` passing. That is the project's docs hard trigger and the only gate that sees this work at all; nothing in the Rust suite touches `web/`.
 - **Existence-only.** The page must never imply review, audit or endorsement. That wording is load-bearing, not decoration.
 
@@ -168,7 +168,7 @@ test("no entry carries an em dash or an en dash", () => {
 - [ ] **Step 3: Run them to watch them fail**
 
 ```bash
-cd /Users/rin/GitHub/pm2-rs/web && node --test scripts/verify-dogs-index.ts
+cd ~/GitHub/shep/web && node --test scripts/verify-dogs-index.ts
 ```
 Expected: FAIL, `../src/data/dogs.ts` does not exist.
 
@@ -181,7 +181,7 @@ The module needs a file-header comment saying what it is and why the JSON lives 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
-cd /Users/rin/GitHub/pm2-rs/web && node --test scripts/verify-dogs-index.ts
+cd ~/GitHub/shep/web && node --test scripts/verify-dogs-index.ts
 ```
 Expected: PASS, 11 tests.
 
@@ -219,7 +219,7 @@ Export `REQUIRED_FIELDS` from `dogs.ts` for this.
 - [ ] **Step 8: Verify the whole build**
 
 ```bash
-cd /Users/rin/GitHub/pm2-rs/web && npm run build
+cd ~/GitHub/shep/web && npm run build
 ```
 Expected: exit 0, and `dist/dogs.json` plus `dist/dogs.schema.json` both present.
 
@@ -296,14 +296,14 @@ Run the `humanizer` skill over every sentence you wrote in Steps 2 to 4 before c
 - [ ] **Step 6: Build and look at it**
 
 ```bash
-cd /Users/rin/GitHub/pm2-rs/web && npm run build
+cd ~/GitHub/shep/web && npm run build
 ```
 Expected: exit 0, 21 pages (20 today plus this one).
 
 Then read the rendered output to confirm the entry actually rendered, rather than trusting the build:
 
 ```bash
-grep -o "shep-log-rotate ([A-Za-z]*)" /Users/rin/GitHub/pm2-rs/web/dist/docs/community-dogs/index.html
+grep -o "shep-log-rotate ([A-Za-z]*)" ~/GitHub/shep/web/dist/docs/community-dogs/index.html
 ```
 Expected: `shep-log-rotate (Spot)`.
 
@@ -323,10 +323,10 @@ git commit -m "feat(web): the community dogs page"
 ## Final verification
 
 ```bash
-cd /Users/rin/GitHub/pm2-rs/web && npm run build
+cd ~/GitHub/shep/web && npm run build
 ```
 ```bash
-cd /Users/rin/GitHub/pm2-rs/web && npx astro check
+cd ~/GitHub/shep/web && npx astro check
 ```
 
 Both as their own command with `$?` read directly, never through a pipe: in zsh a pipeline's `$?` is the last command's.

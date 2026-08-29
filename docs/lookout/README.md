@@ -7,7 +7,7 @@ detail pane plus a bleats feed underneath a selected row — both added in
 Phase 12b, kept as plain as the table that came before them.
 
 This directory is not documentation of a shipped design. It is the thing
-Rin asked for: *"let's start with flock table first. I need to see the
+The maintainer asked for: *"let's start with flock table first. I need to see the
 panels before I can make a full decision."* A TUI cannot be screenshotted
 the way a web page can, so these rendered frames are how she looked at each
 phase before deciding what came next.

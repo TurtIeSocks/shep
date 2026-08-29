@@ -175,7 +175,7 @@ section at the end lists only omissions, and a reader deserves the additions
 in the same place.
 
 - **`shep start --flockfile`** — spec §5 names `.js` config via node but not a
-  flag to reach it. Rin's ruling (never implicitly) plus the `server.js`
+  flag to reach it. The maintainer's ruling (never implicitly) plus the `server.js`
   collision force one; decision 1.
 - **A hidden `shep schema` verb** — spec §5 says the schema "ships in assets"
   and does not say how it gets there. A verb is how the artefact is
@@ -301,9 +301,9 @@ with its own tests, and the `cfg` arm is two lines that call it.
 Eleven of them. Six are rulings the tasks below depend on; five are the small
 calls that would otherwise get made badly at 2am.
 
-### 1. `.js` is opt-in by FLAG, not by extension. Rin's ruling, plus the reason her ruling alone does not settle it
+### 1. `.js` is opt-in by FLAG, not by extension. The maintainer's ruling, plus the reason her ruling alone does not settle it
 
-**Rin's ruling, binding:** build `.js` support, but never implicitly. A `.js`
+**the maintainer's ruling, binding:** build `.js` support, but never implicitly. A `.js`
 Flockfile is used only when named explicitly on the command line, and
 directory discovery never picks one up. Her reason: shelling out to node to
 evaluate a config file is arbitrary code execution, and `cd` into a cloned
@@ -316,7 +316,7 @@ the first draft of this plan cited a line range that was already ten lines
 out). Task 1 adds a test that pins it at ten names and pins that none of them
 ends in `.js`.
 
-That much is Rin's. What her ruling does not settle, and what this plan must:
+That much is the maintainer's. What her ruling does not settle, and what this plan must:
 "named explicitly on the command line" is ambiguous, and the obvious reading
 of it is **wrong**.
 
@@ -349,7 +349,7 @@ where the collision is guaranteed rather than hypothetical.
 
 **Ruling: a new boolean flag on `shep start`, `--flockfile`.** It means "read
 TARGET as a Flockfile rather than as a script". Explicit in the strongest
-sense Rin asked for: the operator has typed a word that means *evaluate this*.
+sense the maintainer asked for: the operator has typed a word that means *evaluate this*.
 
 ```
 shep start ./ecosystem.config.js --flockfile
@@ -427,9 +427,9 @@ message becomes `expected one of \`$schema\`, \`app\``. The test asserts on
 the presence of `apps` and `app`, not on the whole sentence, so it survives
 either way — but read the real message once and confirm.)
 
-### 3. The node failure taxonomy — including the one Rin asked about by name
+### 3. The node failure taxonomy — including the one the maintainer asked about by name
 
-Rin asked specifically: what is the error when someone points `shep start` at
+The maintainer asked specifically: what is the error when someone points `shep start` at
 a `.js` file and node is not installed, because that is the common case for a
 Rust user. Four failure modes, four different sentences, three different exit
 codes:
@@ -968,7 +968,7 @@ ExecStart=/usr/local/bin/shep daemon --foreground --log-level info --log-json
 
 The first clause stops being true the moment openrc exists. **Runtime
 detection is a prerequisite for openrc and separable from BSD**, and the
-asymmetry is the whole answer to Rin's question:
+asymmetry is the whole answer to the maintainer's question:
 
 - On **Linux**, systemd and openrc share one target triple. `target_os` cannot
   distinguish them, so without a runtime probe an openrc renderer would have
@@ -1611,10 +1611,10 @@ decision 4 rules out:
 /// [`FlockFormat::Json`], which is what this module's own doc promises.
 ```
 
-And pin the discovery order, which is Rin's ruling made mechanical:
+And pin the discovery order, which is the maintainer's ruling made mechanical:
 
 ```rust
-    /// fails if a `.js` name is ever added to the discovery order. Rin's
+    /// fails if a `.js` name is ever added to the discovery order. The maintainer's
     /// ruling, 2026-08-15: a `.js` Flockfile is read only when named
     /// explicitly on the command line, because reading one runs node on it,
     /// and `cd` into a cloned repo followed by `shep start` must not execute
@@ -3764,7 +3764,7 @@ And two **new** known-debt entries, both honest admissions this phase creates:
 format. Amend it in the style §13 and §9 already use — state the change and
 the reason, so a later reader does not "restore" it:
 
-> **Amended, Phase 14 (Rin's ruling).** `.js` is read only when named
+> **Amended, Phase 14 (the maintainer's ruling).** `.js` is read only when named
 > explicitly with `shep start <path> --flockfile`. Directory discovery never
 > selects a `.js` file and the ten-name order is unchanged, because reading
 > one runs `node` on it: entering a cloned repository and running `shep start`

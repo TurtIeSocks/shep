@@ -1,6 +1,6 @@
 # Research: Flockfile scaffolding / "add an app to an existing Flockfile" verbs
 
-Research only, for Rin. No pm2 source was opened; everything below comes from
+Research only, for the maintainer. No pm2 source was opened; everything below comes from
 this repo (`shep`, branch `main`) and its own docs.
 
 ## 1. What a Flockfile is today
@@ -477,7 +477,7 @@ of reusing `resolve_target`.
 
 ## What I could not establish
 
-- Whether Rin has an opinion on verb naming beyond what `docs/terminology.md`
+- Whether the maintainer has an opinion on verb naming beyond what `docs/terminology.md`
   states generally — nothing in the tree names candidates for
   "scaffold"/"add app to Flockfile" verbs one way or the other; §7's
   candidate reasoning is inference from the existing rules, not a

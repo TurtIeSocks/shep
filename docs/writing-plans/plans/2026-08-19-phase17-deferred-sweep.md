@@ -10,11 +10,11 @@
 
 - **`docs/idiomatic-rust.md`'s 45 rules** (`IR-<n>`). Every item documented with *why*. `core::error::Error`, not `std::error::Error`. `# Errors` sections. `# Panics` with `#[track_caller]`.
 - **No em dashes or en dashes in anything a user reads**, including `///` comments clap renders into `--help`. A test pins the top-level help.
-- **Clean-room rule, non-negotiable:** never open, read or reference `/Users/rin/GitHub/pm2`.
+- **Clean-room rule, non-negotiable:** never open, read or reference `~/GitHub/pm2`.
 - **One cargo shape per task.** The workspace shares one target-dir lock, so concurrent runs block rather than parallelise. Gates each as their own command with `$?` read directly, never through a pipe.
 - **`cli_e2e` keeps passing.** Where a behaviour change legitimately alters an expectation, say which and why.
 
-## Decisions taken by Rin, 2026-08-19
+## Decisions taken by the maintainer, 2026-08-19
 
 1. **cwd:** a Flockfile app with no `cwd` defaults to **the Flockfile's own directory**.
 2. **CI:** turn automatic CI **on**. The `workflow_dispatch`-only restriction dated from when the repo was private; it is public now, and public repos get free standard runners.
@@ -24,7 +24,7 @@
 
 Held back as genuinely not small, and recorded so nobody folds them in:
 
-- **`check_log_ancestry`'s TOCTOU** — new `unsafe` on a Linux-only path that cannot be executed from this machine, and the subject Rin has said she wants to learn rather than receive.
+- **`check_log_ancestry`'s TOCTOU** — new `unsafe` on a Linux-only path that cannot be executed from this machine, and the subject the maintainer has said she wants to learn rather than receive.
 - **`lookout`'s char-vs-display-column widths** — needs a `unicode-width` dependency the project deliberately refused.
 - **Splitting `ProcessInfo`** — architectural, and `last_exit` moved it closer only yesterday.
 
@@ -111,8 +111,8 @@ Seven `spawn_index` accessors documented as panicking, without the attribute tha
 From the teaching session. Two halves:
 
 - [x] **Make `group` and `blurb` required**, the way `example` already is, with a test that fails the build when a field lacks them. Done 2026-08-23: all forty fields carry both, and `every_field_carries_a_group_and_a_blurb` refuses a missing one, an unknown group, a dash, or a trailing full stop. The count was worse than this line said, 35 blurbs missing rather than 20.
-- [x] **Restore Rin's own prose** for `autorestart` and `cwd`, which unification replaced with the `///` text. `autorestart` is back to her wording; `cwd` already carried hers and was reworded for Task 2 as that entry anticipated. Her wording was "Restarts the process automatically when it exits unexpectedly" and "Falls back to the cwd of the shep daemon if omitted" — the latter needs rewording anyway once Task 2 lands.
-- [ ] **STILL OPEN, needs Rin.** Once every field has a `blurb`, the em-dash sweep Rin made across `app.rs`'s doc comments can be reverted: operator prose lives in `blurb`, so `///` goes back to being for developers. **Ask before reverting it** — it is her change.
+- [x] **Restore the maintainer's own prose** for `autorestart` and `cwd`, which unification replaced with the `///` text. `autorestart` is back to her wording; `cwd` already carried hers and was reworded for Task 2 as that entry anticipated. Her wording was "Restarts the process automatically when it exits unexpectedly" and "Falls back to the cwd of the shep daemon if omitted" — the latter needs rewording anyway once Task 2 lands.
+- [ ] **STILL OPEN, needs the maintainer.** Once every field has a `blurb`, the em-dash sweep the maintainer made across `app.rs`'s doc comments can be reverted: operator prose lives in `blurb`, so `///` goes back to being for developers. **Ask before reverting it** — it is her change.
 
 ---
 

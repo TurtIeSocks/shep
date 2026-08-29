@@ -4,7 +4,7 @@
 #
 # ## This was rewritten on 2026-08-27 to match zendriver-rs
 #
-# Rin's call: zendriver-rs's setup is the one to copy. What that changed here,
+# The maintainer's call: zendriver-rs's setup is the one to copy. What that changed here,
 # and why each change is not just cosmetic:
 #
 #   changelog_update    false -> true. See the section below; this is the one

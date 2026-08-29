@@ -1,6 +1,6 @@
 # Research: metrics dog (spec §8, Phase 5)
 
-Status: design notes for Rin's review · 2026-08-07 · crate versions fetched live
+Status: design notes for the maintainer's review · 2026-08-07 · crate versions fetched live
 from crates.io this date.
 
 Scope: `shep dog metrics` — a first-party dog (shep-client consumer inside the

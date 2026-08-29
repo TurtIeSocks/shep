@@ -7,7 +7,7 @@ merged `main` at `6595df7`.
 
 ## Why this is 12a and not 12
 
-Rin, today: *"let's start with flock table first. I need to see the panels
+The maintainer, today: *"let's start with flock table first. I need to see the panels
 before I can make a full decision."*
 
 So this phase deliberately stops one pane in. It builds the whole shell —
@@ -23,7 +23,7 @@ log plane, the CLI's verb surface, watch/cron/memory-limit restarts,
 SO_REUSEPORT reload, custom actions over the shepherd channel, the pm2 cutover,
 the dogs subsystem with working metrics and bark dogs, an audit-debt phase, and
 the six remaining daemon-surface verbs. The operator API this dashboard renders
-is complete — which was Rin's stated reason (2026-08-13) for putting the verbs
+is complete — which was the maintainer's stated reason (2026-08-13) for putting the verbs
 before the two UI surfaces.
 
 ---
@@ -174,7 +174,7 @@ crates/shep-cli/src/lookout/
 docs/lookout/
   frames.txt    the rendered frames, plain
   frames.ansi   the same frames with colour, for `less -R`
-  README.md     what the frames show and what Rin is deciding from them
+  README.md     what the frames show and what the maintainer is deciding from them
 ```
 
 Plus `Commands::Lookout` in `cli.rs`, its wiring in `main.rs`, the CHANGELOG
@@ -199,7 +199,7 @@ entry, and the `deferred.md` / `README.md` reconciliation.
   this phase's.
 - **The actions themselves** — see design decision 2.
 - **Search / filter.** Spec §9 lists it. It narrows two panes; there is one.
-- **A selected row.** Considered for 12a and cut (Rin, 2026-08-14) — recorded
+- **A selected row.** Considered for 12a and cut (the maintainer, 2026-08-14) — recorded
   here so 12b's author knows it was decided rather than forgotten. A cursor
   means `selected`, a reseat rule for the wholesale snapshot replacement that
   lands every two seconds, `selected_id`, and a REVERSED row style; none of it
@@ -217,7 +217,7 @@ entry, and the `deferred.md` / `README.md` reconciliation.
 
 ## The dependency bill
 
-`ratatui` and a backend are new to this tree. Rin is deliberate about
+`ratatui` and a backend are new to this tree. The maintainer is deliberate about
 dependency weight: reqwest was rejected for hand-rolled HTTP over `tokio-rustls`
 at +93 crates, axum was rejected the same way, and `rmcp` was accepted for
 whistle on the argument that an evolving protocol is worth an SDK. A TUI is not
@@ -347,11 +347,11 @@ cross-check the phase gate runs.
 
 ### 1. Daemon death: bounded retry, then freeze. Never exit.
 
-**Rin's ruling.** lookout retries the connection a bounded number of times,
+**the maintainer's ruling.** lookout retries the connection a bounded number of times,
 then says the shepherd has died and **stops updating**, leaving the last known
 values on screen. It never exits on its own; the operator quits.
 
-**The FIRST connection is not on that ladder** (Rin, 2026-08-14). The ruling
+**The FIRST connection is not on that ladder** (the maintainer, 2026-08-14). The ruling
 above is about a shepherd that dies *underneath* a running dashboard — the
 sentence presupposes it was alive. A shepherd that was never there is a
 different situation, and lookout treats it the way every other client verb
@@ -411,7 +411,7 @@ than "stop polling".
 
 ### 2. Actions are gated off by default. 12a builds the gate and the refusal; 12b builds the actions.
 
-**Rin's ruling** is that lookout is interactive but that acting on a sheep needs
+**the maintainer's ruling** is that lookout is interactive but that acting on a sheep needs
 a flag or config to enable, mirroring the `allow_control` precedent spec §9 sets
 for whistle.
 
@@ -419,7 +419,7 @@ for whistle.
 reason is the same one that makes this phase 12a. An action key needs a
 confirmation affordance, and a confirmation affordance is a layout decision —
 a modal, a status-bar prompt, a second keypress — which is exactly the class of
-decision Rin has said she cannot make before she sees the panes. What *must*
+decision the maintainer has said she cannot make before she sees the panes. What *must*
 exist before any action key is the gate, because a gate retrofitted after the
 keys is a gate someone forgets to route one key through.
 
@@ -745,7 +745,7 @@ That is already the house rule. What it means for a TUI:
 ### 10. The frames are a deliverable, not test scaffolding.
 
 `TestBackend` renders a frame into a plain text buffer. The same mechanism that
-makes a TUI testable headlessly is the mechanism that lets Rin *see* it without
+makes a TUI testable headlessly is the mechanism that lets the maintainer *see* it without
 a terminal — so Task 5 makes that an explicit output: `docs/lookout/frames.txt`
 and `docs/lookout/frames.ansi`, eight scenes, written by a command she can run.
 
@@ -758,7 +758,7 @@ The gallery is built from the **same scene list** the snapshot tests use, so it
 cannot rot: a layout change reddens the insta snapshots in the ordinary suite,
 and regenerating the gallery is the same three scenes' worth of work.
 
-These frames are for Rin to look at **before Phase 12b's layout is decided.**
+These frames are for the maintainer to look at **before Phase 12b's layout is decided.**
 That is their whole purpose. They are not a regression artifact and not
 documentation of a shipped design.
 
@@ -874,7 +874,7 @@ the measured number, in this form:
 > before and after Task 1.)
 
 If `D` is outside 18–24, say so in the task report before continuing. It does
-not block — it is a finding about the estimate, and Rin asked for the number.
+not block — it is a finding about the estimate, and the maintainer asked for the number.
 
 Also record what the new crates actually are, so the next audit does not have to
 re-derive it:
@@ -1384,7 +1384,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -1528,7 +1528,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         app.update(Msg::Snapshot {
@@ -1556,7 +1556,7 @@ mod tests {
         let mut allowed = App::new(
             Palette::detect(None, None, None),
             Control::Allowed,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             t0,
         );
         allowed.update(Msg::Snapshot {
@@ -1571,7 +1571,7 @@ mod tests {
 
     /// fails if lookout learns to exit on its own. A `DaemonShutdown` is a
     /// notice here, where in `bleats` it precedes a clean exit — the whole
-    /// point of Rin's ruling is that a standing dashboard admits it is stale
+    /// point of the maintainer's ruling is that a standing dashboard admits it is stale
     /// rather than vanishing. Only `q` quits.
     #[test]
     fn nothing_but_a_keypress_quits() {
@@ -1730,7 +1730,7 @@ use super::theme::Palette;
 
 /// Whether this lookout may act on a sheep.
 ///
-/// Default is [`Self::ReadOnly`], per Rin's ruling, mirroring the
+/// Default is [`Self::ReadOnly`], per the maintainer's ruling, mirroring the
 /// `allow_control` precedent spec §9 sets for whistle. Turned on by
 /// `--allow-control` or by `lookout.allow_control` in the KV store.
 ///
@@ -2418,7 +2418,7 @@ mod tests {
         let app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         let frame = draw_to(&app, 28, 8);
@@ -2453,7 +2453,7 @@ mod tests {
         let app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         let frame = draw_to(&app, 100, 12);
@@ -2462,14 +2462,14 @@ mod tests {
     }
 
     /// fails if a frozen dashboard does not say so where it cannot be missed.
-    /// This is the whole of Rin's ruling made visible: last values on screen,
+    /// This is the whole of the maintainer's ruling made visible: last values on screen,
     /// and a sentence admitting they are stale.
     #[test]
     fn a_frozen_link_puts_the_banner_under_the_title() {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         app.update(Msg::Frozen {
@@ -2490,7 +2490,7 @@ mod tests {
         let read_only = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             now,
         );
         assert!(draw_to(&read_only, 100, 12).contains("read-only"));
@@ -2498,7 +2498,7 @@ mod tests {
         let allowed = App::new(
             Palette::detect(None, None, None),
             Control::Allowed,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             now,
         );
         let frame = draw_to(&allowed, 100, 12);
@@ -2514,7 +2514,7 @@ mod tests {
         let mut app = App::new(
             Palette::detect(None, None, None),
             Control::ReadOnly,
-            "/home/rin/.shep".to_string(),
+            "/home/ada/.shep".to_string(),
             Instant::now(),
         );
         app.update(Msg::Snapshot {
@@ -2880,7 +2880,7 @@ pub fn title_line(app: &App, home: &str, width: u16) -> Line<'static> {
 
 /// The banner, when there is one. `None` while the link is live.
 ///
-/// The frozen sentence is the whole of Rin's ruling in one line: it names what
+/// The frozen sentence is the whole of the maintainer's ruling in one line: it names what
 /// happened, and it names when the values stopped being current, so an operator
 /// reading a screen full of `online` knows exactly how much to trust it.
 #[must_use]
@@ -3087,7 +3087,7 @@ Revert, then run the full task gate.
 ## Task 5 — `lookout/frames.rs`: the scenes, the snapshots, and the gallery
 
 **This is the task that makes the phase worth its own milestone.** Its output
-is not test infrastructure — it is a file of rendered frames Rin reads before
+is not test infrastructure — it is a file of rendered frames the maintainer reads before
 Phase 12b's layout is decided.
 
 **Files created:**
@@ -3136,7 +3136,7 @@ in the ordinary suite, and regenerating the gallery is the same command.
 | `frozen` | 120x20 | **the shepherd has died** — last values, frozen clock |
 | `refused` | 120x20 | the read-only refusal in the status bar |
 
-`healthy_wide`, `narrow`, `errored`, `empty` and `frozen` are the five Rin named
+`healthy_wide`, `narrow`, `errored`, `empty` and `frozen` are the five the maintainer named
 as the minimum. The other three are cheap next to them and each answers a
 question the five raise.
 
@@ -3180,7 +3180,7 @@ mod tests {
     }
 
     /// fails if a scene stops rendering what it is named for. Each assertion
-    /// is the one sentence that scene exists to show Rin — if one of these
+    /// is the one sentence that scene exists to show the maintainer — if one of these
     /// stops being true, the frame she is looking at is not the frame this
     /// plan promised her.
     #[test]
@@ -3196,7 +3196,7 @@ mod tests {
         // The narrow scene's caption in the gallery makes four specific
         // claims about which columns survive at this width. Each is asserted
         // here, so a scene rendered at a width that contradicts its own
-        // caption reddens the suite rather than shipping to Rin — `STATUS`
+        // caption reddens the suite rather than shipping to the maintainer — `STATUS`
         // alone would not, since STATUS is in the floor tier and present at
         // every width the pane draws at.
         let narrow = render_text(&scene(Scene::Narrow).1);
@@ -3208,7 +3208,7 @@ mod tests {
     }
 
     /// fails if a frozen frame keeps counting. This is the one thing the
-    /// frozen scene exists to show Rin, and it is the property design
+    /// frozen scene exists to show the maintainer, and it is the property design
     /// decision 8 is about.
     ///
     /// **Rendered twice at two different clock ages and compared**, rather
@@ -3417,7 +3417,7 @@ impl Scene {
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so Rin does not have to hold eight of them in her head.
+    /// gallery so the maintainer does not have to hold eight of them in her head.
     #[must_use]
     pub const fn caption(self) -> &'static str {
         match self {
@@ -3440,7 +3440,7 @@ impl Scene {
             // 49, not 46. `columns_for` picks the first tier whose threshold
             // is <= the width, and 46 lands on the `41` tier — which has
             // already dropped CPU, so a scene rendered there would contradict
-            // its own caption in the gallery Rin reads. 49 is the `NO_MEM`
+            // its own caption in the gallery the maintainer reads. 49 is the `NO_MEM`
             // tier: four columns gone, CPU and UPTIME still there.
             Self::Narrow => (49, 14),
             Self::TooNarrow => (28, 8),
@@ -3481,7 +3481,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     let mut app = App::new(
         palette,
         Control::ReadOnly,
-        "/home/rin/.shep".to_string(),
+        "/home/ada/.shep".to_string(),
         t0,
     );
 
@@ -3712,7 +3712,7 @@ In `Scene::size`, change `Self::Narrow` from `(49, 14)` to `(120, 14)`.
 
 **Must go red:** `every_scene_shows_the_thing_it_is_named_for` fails on the
 first `!contains(gone)` iteration — the "narrow" scene is now wide and shows
-every column, so the gallery frame Rin was promised would show nothing about
+every column, so the gallery frame the maintainer was promised would show nothing about
 degradation. `frames_are_pinned` reddens too, which is correct rather than
 duplicative: the snapshot *is* the frame, and this mutation changes the frame.
 
@@ -3728,7 +3728,7 @@ width an earlier draft of this plan specified.
 whose threshold is `<= 46`, which is the `41` tier, and CPU is already gone
 there. Five columns dropped, not four. The point of this mutation is that the
 old width was not a rendering bug — it produced a perfectly good frame with a
-caption underneath it, in the gallery Rin reads, describing a different frame.
+caption underneath it, in the gallery the maintainer reads, describing a different frame.
 
 Revert, then run the full task gate.
 
@@ -3969,7 +3969,7 @@ mod tests {
     }
 
     /// fails if the ladder stops being bounded, or stops ending in a freeze.
-    /// Rin's ruling in one test: bounded retry, then a message saying the
+    /// The maintainer's ruling in one test: bounded retry, then a message saying the
     /// shepherd has died, then nothing. Never an exit.
     ///
     /// `start_paused` so the 250/500/1000/2000/4000 ms waits cost no wall
@@ -4425,7 +4425,7 @@ impl Shepherd for UnixShepherd {
 //! about what was lost, so asking the shepherd what things look like now is the
 //! only repair there is.
 //!
-//! **The freeze is Rin's ruling and it is not `bleats`' behaviour.** `bleats`
+//! **The freeze is the maintainer's ruling and it is not `bleats`' behaviour.** `bleats`
 //! prints a notice and exits when its connection ends, which is right for a
 //! follow. A standing dashboard that vanished would take the last known state
 //! of the flock with it, at the moment an operator most wants to read it. So
@@ -4512,7 +4512,7 @@ impl core::error::Error for UiGone {}
 /// `super::lookout`, which makes it before entering raw mode so that a
 /// shepherd which was never running refuses the way every other client verb
 /// refuses — `daemon_unreachable`, exit 5, no alternate screen — instead of
-/// eight seconds of reconnect banner about a death that never happened. Rin's
+/// eight seconds of reconnect banner about a death that never happened. The maintainer's
 /// retry-then-freeze ruling is about a shepherd that dies *underneath* a
 /// running dashboard, and this signature is where the distinction is enforced
 /// rather than described.
@@ -5153,7 +5153,7 @@ grep -rn 'allow.control' crates/ | wc -l          # 0
     }
 
     /// fails if the control gate stops being off by default, or stops being
-    /// reachable from the flag. Rin's ruling: acting on a sheep needs a flag or
+    /// reachable from the flag. The maintainer's ruling: acting on a sheep needs a flag or
     /// config, mirroring `whistle.allow_control`.
     #[test]
     fn actions_are_off_unless_the_flag_says_otherwise() {
@@ -5363,7 +5363,7 @@ pub struct LookoutArgs {
 //! **This verb does not exit when the shepherd dies.** `bleats` does, and that
 //! is right for a follow. A standing dashboard that vanished would take the
 //! last known state of the flock with it, at the moment an operator most wants
-//! to read it — Rin's ruling, and the reason [`link::RECONNECT_ATTEMPTS`]
+//! to read it — the maintainer's ruling, and the reason [`link::RECONNECT_ATTEMPTS`]
 //! exists.
 
 pub mod app;
@@ -5425,7 +5425,7 @@ pub const MIN_REDRAW: Duration = Duration::from_millis(33);
 /// - [`ExitCode::Usage`] when stdout is not a terminal.
 /// - [`ExitCode::DaemonUnreachable`] (or [`ExitCode::ProtocolMismatch`]) when
 ///   the FIRST connection fails — see [`source::LinkError::exit_code`]. A
-///   shepherd that was never running is not the case Rin's retry-then-freeze
+///   shepherd that was never running is not the case the maintainer's retry-then-freeze
 ///   ruling is about, and lookout refuses it exactly as `shep flock` would.
 /// - [`ExitCode::Failure`] when the terminal could not be put into raw mode.
 ///
@@ -5454,7 +5454,7 @@ pub async fn lookout(
     // The FIRST dial, and it happens HERE — before the palette, before the
     // panic hook, before raw mode, and before anything has been drawn. A
     // shepherd that was never running gets the same refusal `shep flock` gets:
-    // one error envelope on stderr and exit 5. Rin's "lookout never exits on
+    // one error envelope on stderr and exit 5. The maintainer's "lookout never exits on
     // its own" is about a shepherd that dies *underneath* a running dashboard;
     // opening the alternate screen to spend eight seconds reconnecting to
     // something that was never there, announcing a death that never happened
@@ -5957,7 +5957,7 @@ The serial run is not ceremony. It was red on `main` before Phase 5 and it
 caught a real regression in Phase 6, and this phase adds a test that spawns
 tasks and one that writes files.
 
-### Step 9.7 — hand Rin the frames
+### Step 9.7 — hand the maintainer the frames
 
 The last step of the phase is not a command. Send her:
 
@@ -6005,12 +6005,12 @@ them is cheaper than defending them later.
    load.** The argument for it is in design decision 1 and the numbers are
    named constants in one file, so moving them is a one-line change and a
    comment edit. What is *not* adjustable without a redesign is the shape —
-   bounded, then frozen, never exiting — and that is Rin's ruling rather than
+   bounded, then frozen, never exiting — and that is the maintainer's ruling rather than
    an implementation detail.
 2. **The uptime column advancing between polls is a small invention.** The
    shepherd reports `uptime_ms` as of the reply; lookout adds the elapsed time
    since. It is what stops the column from stepping every two seconds, and it
    stops dead when the link is lost — but it does mean the number on screen is
-   derived rather than reported. If Rin would rather see only what the shepherd
+   derived rather than reported. If the maintainer would rather see only what the shepherd
    said, `App::uptime_ms` is the one function to change and its two tests are
    the two to invert.

@@ -79,7 +79,7 @@ crates/shep-daemon/src/
 
 map.md drift to fix when planning: probes.rs is a new module map.md never named
 (spec §7 requires it; spec wins), and watcher.rs becomes `watch/` (two files —
-OS seam vs logic — under Rin's 500-line split rule).
+OS seam vs logic — under the maintainer's 500-line split rule).
 
 Sheep-task integration points (owned by the supervisor from earlier phases):
 registry arms/disarms watch groups, cron schedules, limit enforcement, and
@@ -158,7 +158,7 @@ start (`starting → online`) and reload's AwaitReady gate: Channel = first
 starting immediately; `failure_threshold` does NOT apply to readiness — it is a
 liveness concept); Heuristic = deadline elapse itself. On deadline without
 success: normal start goes online anyway with a warning event (pm2-compatible,
-avoids restart storms — flag for Rin, it's a judgement call); reload treats it
+avoids restart storms — flag for the maintainer, it's a judgement call); reload treats it
 as new-instance failure → abort remaining instances, old flock keeps running
 (§4 reload). Liveness: per-sheep task while online, `sleep(interval)` measured
 from probe completion (no overlap), consecutive-failure counter, threshold →

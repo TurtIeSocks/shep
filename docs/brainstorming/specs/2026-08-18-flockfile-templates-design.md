@@ -7,7 +7,7 @@ change.
 
 ## The ask
 
-Rin, 2026-08-18: "we should have some subcommands for generating various
+The maintainer, 2026-08-18: "we should have some subcommands for generating various
 flock file templates / adding onto existing ones".
 
 Two jobs, then: scaffold a Flockfile that does not exist yet, and add an app
@@ -46,8 +46,8 @@ an ad-hoc start: it is what makes a relative path work from wherever you
 typed it.
 
 It is wrong for a generated file. A Flockfile is a thing you commit. Reusing
-that code path would emit `script = "/Users/rin/GitHub/zeus/server.js"` and
-`cwd = "/Users/rin/GitHub/zeus"` into a file that then only works on one
+that code path would emit `script = "~/GitHub/zeus/server.js"` and
+`cwd = "~/GitHub/zeus"` into a file that then only works on one
 machine, and would differ from every hand-written Flockfile's
 relative-script, no-`cwd` convention.
 
@@ -158,7 +158,7 @@ completion on the file it just wrote.
 
 ## 5. Assumptions
 
-Recorded because they are judgement calls made on Rin's behalf while she was
+Recorded because they are judgement calls made on the maintainer's behalf while she was
 away, not requirements she stated:
 
 1. **One verb, not two.** The file's existence distinguishes create from
@@ -175,7 +175,7 @@ away, not requirements she stated:
 6. **`--force` only replaces whole files.** There is no forced append,
    because the failure modes of append are refusals that mean something.
 
-## 6. Answered by Rin, 2026-08-19
+## 6. Answered by the maintainer, 2026-08-19
 
 1. **Bare `shep init` emits a skeleton, and a fuller one than proposed.** Not
    an empty `app = []`: a Flockfile carrying a commented-out `[[app]]` AND a
@@ -213,16 +213,16 @@ templates cannot be written without them:
    same `file < env < flags` layering `DaemonConfig` already uses, with the
    Flockfile between them because it is the more specific statement about a
    particular flock.
-4. **Rin's own services did not depend on any of this.** `zeus-auth` is a
+4. **the maintainer's own services did not depend on any of this.** `zeus-auth` is a
    compiled binary started as `shep start ./target/release/zeus-auth` from
    its own checkout, so the `spawn_failed` she reported on 2026-08-18 was
    entirely the relative-path resolution bug fixed in `6cf7124`. The
    interpreter gap is real and unrelated to it.
 
 
-## 8. Expansion, decided by Rin 2026-08-19 while writing lesson 1
+## 8. Expansion, decided by the maintainer 2026-08-19 while writing lesson 1
 
-Reviewing her own first skeleton against the spec, Rin named scenarios the
+Reviewing her own first skeleton against the spec, the maintainer named scenarios the
 one-axis design could not express:
 
 > "Helping a user get comfortable with setting up shep/flockfiles. A quick way
@@ -264,7 +264,7 @@ editorial judgement, not correctness.
 ### Kind: all six stay
 
 Offered a cut to three on the grounds that the interpreter mapping (task #47)
-had erased the difference between `node`, `python` and `binary`, Rin kept all
+had erased the difference between `node`, `python` and `binary`, the maintainer kept all
 six: `shep init --template node` is discoverable and reassuring in a way
 `--template service` is not, and the redundancy buys familiarity.
 

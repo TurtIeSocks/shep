@@ -15,8 +15,8 @@
 - **`docs/idiomatic-rust.md`'s rules (IR-1..IR-45).** `core::error::Error`, never `std::error::Error`. `# Errors` sections on fallible public functions. `# Panics` with `#[track_caller]`. Invoke the `shep-idiomatic-rust` skill before writing any Rust here.
 - **No new dependencies.** Everything needed is already in the workspace.
 - **No em dashes or en dashes** in anything a person reads, including `///` comments clap renders into `--help`. A test pins the top-level help.
-- **Clean-room rule, non-negotiable:** never open, read or reference `/Users/rin/GitHub/pm2`.
-- **`crates/shep-cli/src/cli.rs` carries Rin's own uncommitted work** near `DevArgs` (`cli.rs:1097`). Task 3 must edit that file. Stage by name, never `git add -A`, and **never run `git checkout` on it** - that would destroy work of hers that is not in any commit.
+- **Clean-room rule, non-negotiable:** never open, read or reference `~/GitHub/pm2`.
+- **`crates/shep-cli/src/cli.rs` carries the maintainer's own uncommitted work** near `DevArgs` (`cli.rs:1097`). Task 3 must edit that file. Stage by name, never `git add -A`, and **never run `git checkout` on it** - that would destroy work of hers that is not in any commit.
 - **One cargo shape per task.** The workspace shares one target-dir lock. Gates each as their own command with `$?` read directly, never through a pipe: in zsh a pipeline's `$?` is the last command's.
 - **Do not change bark's behaviour.** `crates/shep-cli/src/dog/bark/sinks.rs` is working, tested code on the path that pages people. The extraction takes TLS setup, URL parsing and connect. It leaves `build_request`, `write_and_read`, `read_response` and `parse_status_code` where they are.
 
@@ -320,7 +320,7 @@ git commit -m "feat(cli): parse the dog index, treating every string in it as ho
 - Consumes: everything from Tasks 1 and 2.
 - Produces: `pub struct DogsArgs { pub available: bool, pub filter: Option<String> }`, `Commands::Dogs(DogsArgs)`, and `AvailableDogRows` implementing `Render`.
 
-**`cli.rs` carries Rin's uncommitted work near `DevArgs` (`cli.rs:1097`).** Your change goes in the `Commands` enum, a different region, so there is no conflict. Stage by name. **Never `git checkout` that file.**
+**`cli.rs` carries the maintainer's uncommitted work near `DevArgs` (`cli.rs:1097`).** Your change goes in the `Commands` enum, a different region, so there is no conflict. Stage by name. **Never `git checkout` that file.**
 
 - [ ] **Step 1: Add the args and update the wiring test**
 
@@ -415,7 +415,7 @@ git add -- crates/shep-cli/src/cli.rs crates/shep-cli/src/lib.rs crates/shep-cli
 git commit -m "feat(cli): shep dogs --available lists the community index"
 ```
 
-Stage by name. `crates/shep-cli/src/commands/init.rs` is Rin's and must not appear in this commit.
+Stage by name. `crates/shep-cli/src/commands/init.rs` is the maintainer's and must not appear in this commit.
 
 ---
 
@@ -442,4 +442,4 @@ cd web && npx astro check
 
 Each as its own command with `$?` read directly, never through a pipe.
 
-**Confirm before calling it done:** `git status --porcelain` still shows `crates/shep-cli/src/commands/init.rs` as modified and uncommitted. That is Rin's work. If it has vanished, something ran `git checkout` on it and it is not recoverable from any commit.
+**Confirm before calling it done:** `git status --porcelain` still shows `crates/shep-cli/src/commands/init.rs` as modified and uncommitted. That is the maintainer's work. If it has vanished, something ran `git checkout` on it and it is not recoverable from any commit.

@@ -2,7 +2,7 @@
 
 Traced 2026-08-07 via 9 parallel agents (function-level on <500-line files, flow-level on giants). Full per-bucket detail in [trace/](trace/) — this file is the index + load-bearing findings.
 
-**Repo:** `/Users/rin/GitHub/pm2` — 53k LOC JS total; core `lib/` = 14.6k; rest is vendored `modules/` (pm2-axon, pm2-axon-rpc, pm2-io-agent, pm2-io-bpm, vizion, fclone), vendored `lib/tools/` one-offs, tests, packaging. AGPL-3.0. Active fork: Bun support, OTel, dir-listing serve, hardened vizion.
+**Repo:** `~/GitHub/pm2` — 53k LOC JS total; core `lib/` = 14.6k; rest is vendored `modules/` (pm2-axon, pm2-axon-rpc, pm2-io-agent, pm2-io-bpm, vizion, fclone), vendored `lib/tools/` one-offs, tests, packaging. AGPL-3.0. Active fork: Bun support, OTel, dir-listing serve, hardened vizion.
 
 ## Bucket index
 
