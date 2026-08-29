@@ -58,8 +58,28 @@ pub fn new_bus() -> broadcast::Sender<SharedEvent> {
 ///
 /// The bytes are unchanged — this is how OFTEN [`encode_frame`] runs, never
 /// what it produces.
-#[derive(Clone, Debug)]
+///
+/// # Debug (IR-41)
+///
+/// Unredacted, and hand-written rather than derived. Nothing here is a
+/// secret that [`BusEvent`]'s own `Debug` is not already trusted with — the
+/// wrapper adds a cached frame, which is that same event encoded, and a
+/// test-only encode tally. Both are dropped from the output: the frame
+/// because printing a payload twice tells a reader nothing, and the tally
+/// because a `#[cfg(test)]` field in a derived format would make the string
+/// this type prints under `cargo test` a different one from the string it
+/// prints in a release daemon.
+#[derive(Clone)]
 pub struct SharedEvent(Arc<Shared>);
+
+impl core::fmt::Debug for SharedEvent {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedEvent")
+            .field("event", &self.0.event)
+            .field("encoded", &self.0.frame.get().is_some())
+            .finish()
+    }
+}
 
 /// [`SharedEvent`]'s payload — one allocation per published event.
 #[derive(Debug)]
@@ -567,6 +587,30 @@ mod tests {
         for frame in rest {
             assert_eq!(frame, first, "every subscriber must see identical bytes");
         }
+    }
+
+    /// Fails if [`SharedEvent`]'s `Debug` starts carrying the encoded frame,
+    /// the test-only encode tally, or a redaction nobody asked for (IR-41).
+    ///
+    /// An exact string rather than a `contains`: the claim is what a reader
+    /// of a `tracing` line or a panic message SEES, and every part of it —
+    /// the wrapper's name, the two fields, the event printed whole and
+    /// unredacted — is a decision this pins.
+    #[test]
+    fn shared_event_debug_prints_the_event_and_whether_it_is_encoded() {
+        let event = SharedEvent::new(BusEvent::LogOut {
+            id: 3,
+            line: "hello".to_string(),
+        });
+        assert_eq!(
+            format!("{event:?}"),
+            r#"SharedEvent { event: LogOut { id: 3, line: "hello" }, encoded: false }"#
+        );
+        event.frame().expect("a LogOut encodes");
+        assert_eq!(
+            format!("{event:?}"),
+            r#"SharedEvent { event: LogOut { id: 3, line: "hello" }, encoded: true }"#
+        );
     }
 
     #[tokio::test(start_paused = true)]
