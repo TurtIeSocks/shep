@@ -1904,22 +1904,52 @@ mod tests {
         );
     }
 
-    /// Fails if a line only reaches the file when the buffer fills or when
-    /// something asks — that is, if the pump has no idle flush at all.
+    /// Fails if a line only leaves the buffer when the buffer fills or when
+    /// something asks — that is, if [`IDLE_FLUSH`] bounds nothing.
     ///
-    /// A sheep that logs once and goes quiet is the whole case: nothing here
-    /// sends a `Flush`, nothing reopens, and no second line arrives to push
-    /// the first one out. `assert_file_settles` is the entire assertion, and
-    /// its own deadline is what fails if nothing ever writes the line
-    /// through. Real clock like every other case in this module (IR-33): the
-    /// wait is on file I/O the blocking pool has to actually do. The window's
-    /// arithmetic is pinned on the paused clock instead, by
-    /// [`the_idle_flush_window_is_measured_from_the_oldest_buffered_line`].
-    #[tokio::test]
+    /// A sheep that logs once and goes quiet is the whole case: no `Flush`,
+    /// no reopen, and no second line to push the first one out. One line of
+    /// 70 bytes is nowhere near [`LOG_BUFFER`], so the idle flush is the only
+    /// thing that can write it through.
+    ///
+    /// Paused clock and a counting sink (IR-33), for two different reasons.
+    /// The clock, because the wait is on [`IDLE_FLUSH`] rather than on any
+    /// real work, and a real 50 ms is a claim about the machine. The sink,
+    /// because "the bytes left the buffer" is what is being asserted, and a
+    /// file would answer that only once the blocking pool caught up — which
+    /// is the wall clock again, through the filesystem.
+    #[tokio::test(start_paused = true)]
     async fn a_line_from_a_sheep_that_then_goes_quiet_still_reaches_its_file() {
-        let mut pump = PumpHarness::start();
-        pump.feed(false, "the-only-line").await;
-        assert_file_settles(&pump.out_path, "the-only-line\n").await;
+        const LINE: &str = "the-only-line";
+        let sink = WriteCounter::default();
+        let mut log = LogFile {
+            path: PathBuf::from("quiet.log"),
+            handle: Some(BufWriter::with_capacity(LOG_BUFFER, sink.clone())),
+            buffered_since: None,
+        };
+
+        log.append(LINE).await;
+        assert_eq!(
+            sink.bytes(),
+            0,
+            "one short line must sit in the buffer, or there is nothing for the idle flush to do"
+        );
+
+        let armed = log
+            .buffered_since
+            .expect("an appended line must arm the flush deadline");
+        tokio::time::sleep_until(armed + IDLE_FLUSH).await;
+        log.flush().await.unwrap();
+
+        assert_eq!(
+            sink.bytes(),
+            LINE.len() + 1,
+            "the line and its newline must reach the file once the window closes"
+        );
+        assert_eq!(
+            log.buffered_since, None,
+            "a flush must retire the deadline, or the pump re-arms it every window"
+        );
     }
 
     /// Fails if the idle-flush window is measured from the NEWEST buffered
