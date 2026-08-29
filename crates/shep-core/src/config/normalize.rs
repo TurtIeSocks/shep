@@ -261,11 +261,15 @@ fn expand_paths(app: &mut AppConfig, home: Option<&Path>) -> Result<(), Normaliz
 ///   which of the two lists, the pattern and the reason).
 /// - [`NormalizeError::BadTemplate`]: an `env` value, an `args` entry, or an
 ///   `out_file`/`err_file` path carries a `{{...}}` naming something
-///   [`crate::config::template`] does not define (carries the app name, which
-///   field, and the rejection).
-/// - [`NormalizeError::SharedLogPath`]: `out_file` or `err_file` names one
-///   path with `instances > 1` and `merge_logs` off, so every instance would
-///   write to it without having asked to.
+///   [`crate::config::template`] does not define, **or a `{{` that is never
+///   closed by a `}}`** (carries the app name, which field, and the
+///   rejection).
+/// - [`NormalizeError::SharedLogPath`]: `out_file` or `err_file` renders to
+///   the SAME path for two different slots, with `instances > 1` and
+///   `merge_logs` off, so every instance would write to one file without
+///   having asked to. Rendered, not searched: a path with no `{{instance}}`
+///   in it collides, and so does one carrying only `{{name}}`, or an escaped
+///   `{{{{instance}}}}`, which spells the token but renders as a literal.
 pub fn normalize(app: AppConfig) -> Result<ResolvedApp, NormalizeError> {
     normalize_with_home(app, std::env::home_dir().as_deref())
 }
@@ -439,7 +443,10 @@ pub fn normalize_with_home(
 ///
 /// # Errors
 /// [`NormalizeError::BadTemplate`] if `value` carries a `{{...}}` this
-/// grammar does not define.
+/// grammar does not define, or a `{{` this value never closes. Both of
+/// [`crate::config::template::validate`]'s own rejections map here, so the
+/// two are told apart by the rendered `reason` the variant carries rather
+/// than by the variant.
 fn validate_template(name: &str, field: &str, value: &str) -> Result<(), NormalizeError> {
     crate::config::template::validate(value).map_err(|reason| NormalizeError::BadTemplate {
         name: name.to_string(),
@@ -686,8 +693,9 @@ pub enum NormalizeError {
         /// globset's own rendered reason.
         reason: String,
     },
-    /// A value carries a `{{...}}` that is not a template token. Carries the
-    /// sheep name, which field held it, and the rejection rendered.
+    /// A value carries a `{{...}}` that is not a template token, or a `{{`
+    /// it never closes. Carries the sheep name, which field held it, and the
+    /// rejection rendered.
     BadTemplate {
         /// The sheep name
         name: String,
@@ -697,9 +705,11 @@ pub enum NormalizeError {
         /// variant does not have to restate the grammar's own copy
         reason: String,
     },
-    /// An explicit log path has no `{{instance}}` in it, the app runs more
-    /// than one instance, and `merge_logs` is off, so every instance would
-    /// write to one file without having asked to.
+    /// An explicit log path renders to the same string for two different
+    /// slots, the app runs more than one instance, and `merge_logs` is off,
+    /// so every instance would write to one file without having asked to.
+    /// A path with no `{{instance}}` is the ordinary case; a `{{name}}`-only
+    /// path and an escaped `{{{{instance}}}}` collide for the same reason.
     SharedLogPath {
         /// The sheep name
         name: String,
