@@ -636,7 +636,7 @@ fn flock_matches(selector: &ProcessSelector, flock: &[ProcessInfo]) -> Vec<Proce
             .cloned()
             .collect(),
         other => sheep_only(flock, &|info| {
-            other.matches(&info.name, info.id, info.fold.as_deref())
+            other.matches(&info.name, info.id, info.fold.as_deref(), info.instance)
         }),
     }
 }
@@ -671,6 +671,11 @@ fn selector_miss(
         ProcessSelector::All => Some("the flock is empty; there is nothing to start".to_string()),
         ProcessSelector::Fold(fold) => Some(format!("no sheep is in a fold called {fold}")),
         ProcessSelector::Regex(_) => Some(format!("no sheep matched {target}")),
+        // A colon is not a path character, so `name:slot` is a marker the
+        // same way `fold:` is one, not a filename that could exist instead.
+        ProcessSelector::Instance { name, slot } => {
+            Some(format!("no instance {slot} of {name} is registered"))
+        }
         // A bare name or id carries no marker, so it may equally have been
         // meant as a filename. The unresolvable message names every tier.
         ProcessSelector::Name(_) | ProcessSelector::Id(_) => None,

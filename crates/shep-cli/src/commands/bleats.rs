@@ -152,8 +152,8 @@ fn resolved_name(cache: &HashMap<u32, ProcessInfo>, id: u32) -> String {
 /// nothing to prove it belongs.
 fn selector_allows(selector: &ProcessSelector, cache: &HashMap<u32, ProcessInfo>, id: u32) -> bool {
     match cache.get(&id) {
-        Some(info) => selector.matches(&info.name, info.id, info.fold.as_deref()),
-        None => selector.matches("", id, None),
+        Some(info) => selector.matches(&info.name, info.id, info.fold.as_deref(), info.instance),
+        None => selector.matches("", id, None, None),
     }
 }
 
@@ -318,7 +318,7 @@ fn tail_log_files(
 ) -> ExitCode {
     let mut matched: Vec<&ProcessInfo> = cache
         .values()
-        .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref()))
+        .filter(|info| selector.matches(&info.name, info.id, info.fold.as_deref(), info.instance))
         .collect();
     // Name then id, the one order every operator-facing shep listing takes
     // (`shep_core::protocol::sort_flock`'s own doc). Not `sort_flock` itself:

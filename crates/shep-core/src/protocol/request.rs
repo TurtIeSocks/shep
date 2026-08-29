@@ -45,6 +45,13 @@ pub enum SelectorSpec {
     Regex(String),
     /// By fold name
     Fold(String),
+    /// By app name and instance slot
+    Instance {
+        /// The app name
+        name: String,
+        /// The instance slot, counting from 0
+        slot: u32,
+    },
 }
 
 /// A short marker a dog attaches to a sheep for `shep flock` to paint.

@@ -245,7 +245,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                     let hits: Vec<_> = infos
                         .into_iter()
                         .filter(|i| exact || i.dog.is_none())
-                        .filter(|i| selector.matches(&i.name, i.id, i.fold.as_deref()))
+                        .filter(|i| selector.matches(&i.name, i.id, i.fold.as_deref(), i.instance))
                         .collect();
                     if hits.is_empty() {
                         reply(Err(not_found()))

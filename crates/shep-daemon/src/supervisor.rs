@@ -3444,7 +3444,12 @@ impl<R: ProcessRunner> Actor<R> {
             .filter_map(|(id, slot)| {
                 let config = slot.entry.spec.config();
                 selector
-                    .matches(&config.name, *id, config.fold.as_deref())
+                    .matches(
+                        &config.name,
+                        *id,
+                        config.fold.as_deref(),
+                        Some(slot.entry.instance),
+                    )
                     .then_some(*id)
             })
             .collect();
