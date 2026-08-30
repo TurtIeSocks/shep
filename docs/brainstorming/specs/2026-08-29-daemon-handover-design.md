@@ -192,9 +192,34 @@ What is genuinely lost, and why each is acceptable:
 
 Written to `$SHEP_HOME/run/handover.json` at mode 0600, its path passed in
 an environment variable, unlinked by the successor once read. It carries the
-factual core above plus the descriptor numbers. It carries no environment
-values: a sheep's env may hold secrets, and the successor can re-read them
-from config rather than having them transit a file.
+factual core above plus the descriptor numbers, **and each sheep's whole
+resolved spec, environment included.**
+
+This spec originally said the opposite, that the blob carries no environment
+values because a sheep's env may hold secrets. That was reasoning from a
+principle without checking what shep already does, which is the same mistake
+as the crash-loop claim two sections up.
+
+**The muster roll already persists every sheep's environment in cleartext,
+permanently.** `SavedApp.app` is a whole `AppConfig` and `AppConfig.env` is a
+plain `BTreeMap<String, String>` with no skip attribute, written to
+`flock.json` at `0600`. The type's own doc even notes that `Debug` redacts
+env, so the sensitivity was understood and the value persisted anyway. A
+handover blob carrying the same values, at the same mode, on a file the
+successor unlinks the moment it has read it, is strictly less exposure than
+the file already sitting there for the life of the flock.
+
+Refusing to carry it bought nothing, and cost a great deal. Without a spec
+the successor has to rebuild one from the roll and bind carried sheep to
+roll apps by name and instance, except the roll records a running COUNT per
+app rather than which slots were up, and `muster` starts what it restores.
+That is a second source of truth that can disagree with the blob, plus a
+restore-without-spawning path that does not exist, to protect a value that
+is already on disk.
+
+What still protects it is what always did: mode `0600` set at creation
+rather than by a later `chmod`, inside a `0700` directory, unlinked by the
+successor as soon as it is read.
 
 ### H2a. Staging, and the gate that makes each stage safe to ship
 
