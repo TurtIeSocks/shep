@@ -200,7 +200,7 @@ Actual: 2 passed
 
 The blob carries **no environment values**. A sheep's env may hold secrets and the successor re-reads them from config.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -227,17 +227,23 @@ fn a_blob_from_a_future_version_is_refused_not_guessed_at() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
-- [ ] **Step 3: Implement**
+Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`
+Actual: FAIL, unresolved `Handover`/`CarriedSheep`/`CarriedFds`/`VERSION` (E0425/E0422/E0433 x10)
+
+- [x] **Step 3: Implement**
 
 `version` is checked on load and refused if unrecognised. A successor that cannot understand the blob must fail loudly and let the caller fall back, never adopt a partial picture.
 
 Write with mode `0600` to `$SHEP_HOME/run/handover.json`, and have the successor unlink it after reading. Set the permissions **at creation** (`OpenOptionsExt::mode`), not with a `chmod` afterwards, so there is no window where it is world-readable.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
-- [ ] **Step 5: Task gate, then commit**
+Actual: 569 passed, 18 filtered (up from 564: the plan's three, plus two over
+the file's mode that the plan did not ask for).
+
+- [x] **Step 5: Task gate, then commit**
 
 ---
 

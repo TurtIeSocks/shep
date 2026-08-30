@@ -24,6 +24,7 @@
 
 use core::fmt;
 
+use serde::{Deserialize, Serialize};
 use shep_core::config::AppConfig;
 
 /// Resolved unix credentials for a spawned sheep
@@ -33,7 +34,13 @@ use shep_core::config::AppConfig;
 // silently skipped, since the brief named this type alongside two real
 // accessors (`TopicFilter::patterns`, `SnapshotWriter::writes`) that DID get
 // `#[inline]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+//
+// `Serialize`/`Deserialize` are here for the handover blob (`handover::Handover`),
+// which carries an entry's resolved identity across an `execve` so a restart
+// cannot re-touch the passwd database. Two numeric ids, so the derived
+// representation is the obvious one; see [`SpawnIdentity`]'s note for what
+// changing it would cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
     /// Numeric user id to run the child as
     pub uid: u32,
@@ -61,7 +68,14 @@ pub struct Credentials {
 /// ordinary numbers an operator can read out of `id`, not secrets, and the
 /// daemon's own logs are more useful for naming which one a refused spawn
 /// wanted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` exist for one reader, the handover blob
+/// (`handover::Handover`, crate-internal, hence code font). That blob is
+/// written by one shep image and read by another, possibly newer, one, so
+/// this type's serialized shape is part of the blob's version-1 format:
+/// renaming a variant or retyping a field is a format change and must bump
+/// `handover::VERSION` alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpawnIdentity {
     /// `resolve` has never run for this entry (code font, not a link: the
     /// function is crate-internal while this type is not).

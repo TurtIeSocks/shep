@@ -227,6 +227,11 @@ pub use bus::{Bus, SharedEvent, new_bus};
 pub(crate) mod cron;
 pub(crate) mod entry;
 pub(crate) mod extras;
+// Unix-only, and the module's own contents are what make it so: `fcntl`,
+// `execve` and raw descriptor numbers have no Windows equivalent, and
+// `Arm::for_daemon` already returns the stop arm there. Without this gate the
+// crate does not compile for a Windows target at all.
+#[cfg(unix)]
 pub(crate) mod handover;
 pub(crate) mod kill;
 pub(crate) mod watch;
