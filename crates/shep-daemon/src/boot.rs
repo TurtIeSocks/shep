@@ -1207,6 +1207,13 @@ pub async fn boot<R: ProcessRunner>(
     // each sheep's own side the shepherd was never away.
     #[cfg(unix)]
     let mut carried_apps = Vec::new();
+    // Read before the match consumes `inherited`, and deliberately not
+    // derived from `carried_apps` afterwards: a successor that inherited an
+    // EMPTY flock is still a successor, and the two are only the same
+    // question when the predecessor had at least one sheep. See the restore
+    // guard below for what the difference costs.
+    #[cfg(unix)]
+    let inherited_flock = inherited.is_some();
     #[cfg(unix)]
     let supervisor = match inherited {
         Some((flock, counters)) => {
@@ -1271,8 +1278,13 @@ pub async fn boot<R: ProcessRunner>(
     // one within seconds of taking over. And a restore would START whatever
     // the roll records as running, which for a flock that never stopped
     // means a second copy of every sheep that happens to be down.
-    #[cfg(unix)]
-    let inherited_flock = !carried_apps.is_empty();
+    //
+    // An EMPTY inherited flock is the case that makes `inherited_flock` a
+    // fact about the boot rather than a count of the sheep. `shep daemon
+    // reload` against an idle shepherd carries nothing, and a handover skips
+    // the predecessor's teardown, so the roll on disk is whatever the last
+    // periodic write left. Deriving the flag from `carried_apps` would run
+    // the restore there and start sheep that had just been deleted.
     #[cfg(unix)]
     for app in &carried_apps {
         registry.record_config(app);

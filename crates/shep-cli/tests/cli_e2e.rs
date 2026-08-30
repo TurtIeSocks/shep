@@ -7342,3 +7342,128 @@ fn the_control_socket_accepts_throughout_a_handover() {
 
     graceful_kill(dir.path());
 }
+
+/// Reads `roll` until it records exactly `want` apps, or [`FLOCK_DEADLINE`]
+/// expires, and returns the bytes it held on the last read.
+///
+/// The muster roll is written by a debounced task, so "the flock changed"
+/// and "the roll on disk says so" are two events and the second is the one a
+/// caller here needs. Returns rather than panicking on expiry, so the
+/// failure that reaches CI is the caller's own assertion.
+#[cfg(unix)]
+fn roll_recording(roll: &Path, want: usize) -> Vec<u8> {
+    let start = Instant::now();
+    loop {
+        let bytes = std::fs::read(roll).unwrap_or_default();
+        let apps = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value["apps"].as_array().map(Vec::len));
+        if apps == Some(want) || start.elapsed() >= FLOCK_DEADLINE {
+            return bytes;
+        }
+        std::thread::sleep(FLOCK_POLL_INTERVAL);
+    }
+}
+
+/// A successor that inherited an EMPTY flock must not fall back to the roll.
+///
+/// The two things a boot can do with a muster roll are mutually exclusive,
+/// and which one it does turns on a single fact: was this image handed a
+/// flock, or did it start fresh? A successor was handed one, so it installs
+/// what it was handed and skips the restore. The SIZE of that flock is not
+/// the question and must never be mistaken for it, because a handover skips
+/// the predecessor's teardown: the roll on disk is whatever the last
+/// debounced write left, not the flock as it was at the exec.
+///
+/// The empty case is the one where the two questions give different answers.
+/// `ghost` is started, saved into the roll, then deleted, and the stale roll
+/// is put back under an idle shepherd that has no sheep left to write over
+/// it. The handover from there carries nothing, so a boot deriving "was I a
+/// successor?" from the count of what it carried decides it was a fresh boot
+/// and starts `ghost` again from a roll describing a flock the operator has
+/// already thrown away.
+///
+/// SIGHUP directly, not `shep daemon reload`. The verb runs `shep muster`
+/// against the shepherd it gets back, which would start `ghost` from the
+/// same stale roll through the CLI whatever the boot decided, and a test
+/// that cannot tell those two apart proves nothing about either. The signal
+/// is the whole of the daemon-side handover and nothing else.
+///
+/// The pid check at the end is what keeps this from passing vacuously.
+/// SIGHUP has exactly two outcomes and no third: this image execs into a
+/// successor, or it cannot and stops gracefully instead. On the second, the
+/// polling below finds no shepherd and spawns a fresh one, which is a NEW
+/// pid and a boot that does restore the roll. So a shepherd still answering
+/// on the original pid is a successor and nothing else.
+///
+/// The final wait is on the WRONG outcome deliberately. A restore that is
+/// going to happen happens inside the successor's own boot, and nothing in
+/// this tier is synchronous with that boot, so asserting emptiness once
+/// could pass by looking too early. Waiting [`FLOCK_DEADLINE`] for a sheep
+/// to appear and then asserting none did is the version that cannot pass by
+/// being quick.
+#[cfg(unix)]
+#[test]
+fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("ghost")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&started);
+    let _ = poll_flock(home, |info| info["status"] == "online");
+    let shepherd = wait_for_daemon_pid(home).expect("the shepherd must record a pid");
+
+    assert_success(&shep(home).arg("save").output().unwrap());
+    let roll = home.join("flock.json");
+    let stale = roll_recording(&roll, 1);
+    assert!(
+        !stale.is_empty(),
+        "the roll must record `ghost` before it can go stale: {}",
+        String::from_utf8_lossy(&stale)
+    );
+
+    assert_success(&shep(home).arg("delete").arg("ghost").output().unwrap());
+    let emptied = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(Vec::is_empty)
+    });
+    assert_eq!(
+        emptied.as_array().map(Vec::len),
+        Some(0),
+        "the delete must leave an idle shepherd: {emptied}"
+    );
+    // Waited out rather than assumed: the debounced writer is about to
+    // record the empty flock, and a stale roll put back before that write
+    // lands would simply be overwritten by it.
+    let _ = roll_recording(&roll, 0);
+    std::fs::write(&roll, &stale).unwrap();
+
+    nix::sys::signal::kill(shepherd, nix::sys::signal::Signal::SIGHUP).unwrap();
+
+    let after = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| !rows.is_empty())
+    });
+    assert_eq!(
+        after.as_array().map(Vec::len),
+        Some(0),
+        "a successor must install the flock it was handed and nothing else; \
+         this one restored a stale roll: {after}"
+    );
+    assert_eq!(
+        wait_for_daemon_pid(home),
+        Some(shepherd),
+        "the shepherd must have been replaced in place; a moved pid means \
+         SIGHUP stopped it and the polling above started a fresh one, which \
+         is not the boot this test is about"
+    );
+
+    graceful_kill(home);
+}
