@@ -33,6 +33,13 @@ Those are 2b's and 2c's. The fallback is correct behaviour, not a stub.
 - **Invoke the `shep-idiomatic-rust` skill before writing any Rust.** Cite `IR-<n>` in review.
 - **One cargo shape per task.** Daemon-side work uses `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`. Anything crossing into shep-cli uses `cargo test --workspace --all-features`. Never alternate within a task.
 - Task gate, once per task, each from its own command with `$?` captured directly and never through a pipe: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`.
+- **The Windows cross-check is part of the PER-TASK gate in this phase, not just the phase gate.** Run it with its own target dir so it does not invalidate the host cache:
+
+  ```bash
+  CARGO_TARGET_DIR=/tmp/xcheck-win cargo check --workspace --all-targets --all-features --target x86_64-pc-windows-gnu
+  ```
+
+  This is not the usual convention and it is here for a measured reason. Task 2 added `crates/shep-daemon/src/handover/fds.rs`, which uses `nix` and `std::os::fd`, and wired the module into `lib.rs` with no `#[cfg(unix)]`. That broke the Windows build, and the host-only task gate reported green for a whole task before Task 3 caught it. Every file in this phase is unix-only, so the gate that would notice has to run every time, not at the end.
 - Repo-relative paths only, in code, comments and commit messages. Never an absolute local path. Do not name any person.
 
 ## The failure this phase exists to avoid
