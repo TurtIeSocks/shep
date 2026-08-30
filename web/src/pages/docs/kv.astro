@@ -94,10 +94,10 @@ KEY  VALUE`;
       A key is <code>[A-Za-z0-9._-]</code>, one to 128 bytes, and can't start
       with a dot. <strong>A dot is part of a name, not a path</strong>:
       <code>bark.cooldown</code> is one flat key, not a nested object, and
-      <code>shep get bark</code> won't find it. This is a deliberate
-      departure from pm2's own dotted/colon store: a nesting grammar here
-      would be a second config language, with its own quoting rules, for a
-      store that's explicitly not the primary one. The narrow alphabet is
+      <code>shep get bark</code> won't find it. This is deliberate: a
+      nesting grammar here would be a second config language, with its own
+      quoting rules, for a store that's explicitly not the primary one. The
+      narrow alphabet is
       also why <code>shep get $key</code> never needs quoting in a script. A
       value is a string, capped at 4&nbsp;KiB: the store is read whole on
       every access, and the cap is what keeps <code>kv.json</code> from
