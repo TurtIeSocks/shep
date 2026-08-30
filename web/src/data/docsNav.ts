@@ -216,6 +216,13 @@ export const docsNav: DocsNavGroup[] = [
         },
       },
       {
+        slug: "logs",
+        label: "Logs",
+        built: true,
+        source: "crates/shep-cli/src/commands/logs.rs",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
+      {
         slug: "not-built",
         label: "What's not built",
         built: true,

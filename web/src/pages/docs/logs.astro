@@ -1,0 +1,352 @@
+---
+/*
+ * Logs (`shep bleats/reopen/flush --help`,
+ * crates/shep-cli/src/commands/logs.rs and bleats.rs, shep-daemon's
+ * LogFile::reopen and open_append). Terminal output below was run for real
+ * against target/release/shep on 2026-08-29 - see this page's PR for the
+ * transcript.
+ *
+ * `reopen` had no mention anywhere on this site before this page, and
+ * `flush` had one row in the pm2 comparison table plus one warning aimed at
+ * dog authors on the dogs page. `bleats` was used in examples on four
+ * pages and explained on none of them.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
+
+const bleatsDemo = `$ shep bleats noisy --no-follow
+noisy | to stdout
+noisy | to stderr
+
+$ shep bleats noisy --no-follow --err
+noisy | to stderr
+
+$ shep bleats --no-follow --lines 1
+echoer | got: reload
+noisy | to stdout
+noisy | to stderr`;
+
+const reopenDemo = `$ mv /tmp/shepdocs/home/logs/web-0-out.log /tmp/shepdocs/home/logs/web-0-out.log.1
+$ mv /tmp/shepdocs/home/logs/web-1-out.log /tmp/shepdocs/home/logs/web-1-out.log.1
+$ shep reopen web
+ID  NAME   STATUS  PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
+0   web:0  online  54244  0         -     -    -    43s     -     -
+1   web:1  online  54338  1         -     -    -    37s     -     -`;
+
+const logrotate = `~/.shep/logs/*.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        shep reopen
+    endscript
+}`;
+
+const flushDemo = `$ shep flush worker
+ID  NAME    OUT_FILE                                  ERR_FILE
+2   worker  /tmp/shepdocs/home/logs/worker-0-out.log  /tmp/shepdocs/home/logs/worker-0-err.log
+
+$ shep flush
+error: the following required arguments were not provided:
+  <SELECTOR>
+
+$ shep flush --daemon
+STREAM  FILE                                   RESULT
+stdout  /tmp/shepdocs/home/logs/shepd.out.log  emptied
+stderr  /tmp/shepdocs/home/logs/shepd.err.log  emptied`;
+---
+
+<DocsLayout
+  title="Logs"
+  description="Where a sheep's output lands, how to read it, and the two verbs that act on the files themselves: reopen for an external rotator, flush to empty them."
+  crumb="Reference / Logs"
+  activeSlug="logs"
+>
+  <article>
+    <h1>Logs</h1>
+    <ReferencePills slug="logs" />
+    <p class="lede">
+      A sheep never sees its own log file. It is spawned with its stdout and
+      stderr on pipes, and the shepherd does the file writing on the far side
+      of them. That one fact is why every verb on this page is cheap: swapping
+      the shepherd's handle, or emptying the file under it, is invisible
+      across the process boundary. No signal to the app, no fd surgery, no
+      restart, and no gap in the pipe.
+    </p>
+
+    <h2>Where the lines land</h2>
+    <p>
+      Two files per sheep, under <code>$SHEP_HOME/logs/</code>, named{" "}
+      <code>&lt;name&gt;-&lt;instance&gt;-out.log</code> and{" "}
+      <code>-err.log</code>. An app can point either somewhere else with{" "}
+      <code>out_file</code> and <code>err_file</code>, or fold both streams
+      into one file with <code>merge_logs</code>. A clustered app gets one
+      pair per instance unless it says otherwise, which is why an explicit{" "}
+      <code>out_file</code> on a multi-instance app is refused unless it
+      carries <code>{"{{instance}}"}</code> or the app sets{" "}
+      <code>merge_logs</code>: without one of those, every instance would be
+      appending to the same path by accident rather than on purpose.
+    </p>
+    <p class="fine">
+      Every handle is opened append-only, and a symlink sitting at the path
+      is refused rather than written through. Append matters more than it
+      looks: a handle that tracked its own offset would seek back to where it
+      had got to and write past the end of a file a rotator had just
+      replaced, leaving a sparse hole the size of everything rotated away,
+      after every rotation.
+    </p>
+
+    <h2>Reading them</h2>
+    <VerbSignature
+      verb="bleats"
+      aliases={["logs"]}
+      usage="shep bleats [selector] [--no-follow] [--lines N] [--out | --err]"
+    >
+      <p>
+        Prints the tail of each matched sheep's log files and then follows
+        what arrives next. The selector defaults to <code>all</code>, since
+        reading destroys nothing. <code>--no-follow</code> stops after the
+        tail, <code>--lines</code> sets how much history comes first (15 by
+        default, counted <em>per stream</em>, so the default is up to 15
+        lines of stdout and up to 15 of stderr for each matched sheep), and{" "}
+        <code>--out</code> or <code>--err</code> narrows a sheep to one of
+        its two files.
+      </p>
+    </VerbSignature>
+    <p>
+      Following prints that history first and then subscribes, rather than
+      showing only new lines. A sheep that already crashed has said
+      everything it is going to say, and a follow that skipped the tail
+      showed an empty screen while the reason sat in the file, which is
+      exactly how a boot-looping sheep came to look like it had logged
+      nothing at all. <code>--lines 0</code> is how you ask for the old
+      behaviour.
+    </p>
+    <CodeBlock>{bleatsDemo}</CodeBlock>
+    <p>
+      A sheep's own output always goes to stdout, both streams of it, because
+      both are the data you asked for. Only shep's own diagnostics, the
+      dropped-event count and the shutdown notice, go to stderr, so{" "}
+      <code>shep bleats &gt; file</code> captures everything the flock said
+      and nothing shep said about it. Interleaving a sheep's stderr into
+      shep's would silently lose half the output of that redirect and make{" "}
+      <code>--err</code> produce an empty file.
+    </p>
+    <Callout variant="note">
+      <code>--no-follow</code> reads files and <code>--follow</code> reads
+      the bus, and the difference shows up twice. A stopped sheep still has
+      files, so <code>--no-follow</code> can show its last output while a
+      follow has nothing left to hear. And within one file lines print in
+      append order, but across a sheep's two files there is no merge:{" "}
+      <code>out_file</code> prints in full, then <code>err_file</code>{" "}
+      starts. A log line carries no timestamp, so there is no key to
+      interleave them on, and seeing all of stdout before any of stderr must
+      not be read as everything on stdout having happened first. Following
+      has no such seam, because the bus delivers in arrival order.
+    </Callout>
+    <p class="fine">
+      The tail is bounded twice: <code>--lines</code> lines, found within the
+      last 256 KiB of the file, read one file at a time. Peak memory for that
+      path is one window regardless of how large the flock or the log is.
+    </p>
+
+    <h2>Handing them to a rotator</h2>
+    <VerbSignature verb="reopen" usage="shep reopen [selector]">
+      <p>
+        Closes each matched sheep's log handle and opens the recorded path
+        again, creating the file if the rotator did not. For an external
+        rotator that has renamed the file out from under a running shepherd:
+        rename first, then reopen. The selector defaults to{" "}
+        <code>all</code>, which is the useful default for a{" "}
+        <code>postrotate</code> stanza and is safe because this destroys
+        nothing.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{reopenDemo}</CodeBlock>
+    <p>
+      A zero exit is a promise worth relying on: every matched sheep's log
+      pump holds a handle on the recreated path, so a <code>postrotate</code>{" "}
+      that waits for this command knows no live pump is still filling the
+      archive it just renamed. That holds because the shepherd reaches every
+      writer to a path it is rotating, not only the sheep the selector named.
+      Several instances can share one file, and one of them left unasked
+      would go on filling the archive.
+    </p>
+    <p>
+      A matched sheep that is not running has no pump and nothing to reopen,
+      and is reported alongside the rest rather than as a failure. A pump
+      that could <em>not</em> open its path again fails the command instead,
+      naming the sheep and the path on stderr. The rename is still safe to
+      act on, because the old handle was closed either way, but that sheep is
+      writing its stream nowhere until the path can be opened, and exiting 0
+      there would be the silent failure this verb exists to end.
+    </p>
+    <CodeBlock label="/etc/logrotate.d/shep">{logrotate}</CodeBlock>
+
+    <h2>Emptying them</h2>
+    <VerbSignature verb="flush" usage="shep flush <selector> | shep flush --daemon">
+      <p>
+        Flushes what every pump still owes the file, then truncates it. What
+        gets emptied is exactly the paths the Flockfile named,{" "}
+        <code>out_file</code> and <code>err_file</code> as the shepherd
+        resolved them, for every registered sheep the selector matches,
+        whether or not it has ever run.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{flushDemo}</CodeBlock>
+    <p>
+      The selector is required here and defaulted everywhere else on this
+      page. <code>bleats</code> and <code>reopen</code> default to{" "}
+      <code>all</code> because neither destroys anything; this one follows{" "}
+      <code>stop</code>, <code>restart</code> and <code>delete</code> in
+      demanding a target, because it is the one command on this page whose
+      slip of the finger cannot be undone. <code>shep flush all</code> is a
+      short thing to type when it is meant.
+    </p>
+    <p>
+      The table is one row per sheep carrying both of its paths, rather than
+      the lifecycle columns every other flock-shaped verb answers with. Those
+      keep <code>out_file</code> and <code>err_file</code> out for being too
+      wide, and here they are the answer: a verb that empties files an
+      operator may have mistyped, and then reports uptime and restart counts
+      it did not touch, has said nothing about what it destroyed.
+    </p>
+    <p class="fine">
+      A stopped sheep is emptied like any other, since the shepherd truncates
+      recorded paths rather than open handles, and a stopped sheep's logs are
+      still readable with <code>shep bleats --no-follow</code>. Several sheep
+      can share one path, and each distinct path is truncated once, so the
+      same path can appear in two rows. A sharing sheep the selector skipped
+      has that file emptied under it all the same, with its pump flushed
+      first so none of its pending lines lands in the file afterwards. It is
+      not a row here because it is not a sheep you named, and that is the one
+      thing this table cannot show you.
+    </p>
+    <Callout variant="careful">
+      Those paths are ordinary config values, taken verbatim and never
+      checked against the log directory. An app whose <code>out_file</code>{" "}
+      points at something that is not a log file has that file emptied too,
+      with the shepherd's privileges.
+    </Callout>
+    <p>
+      <code>--daemon</code> empties the shepherd's own two files instead, and
+      takes no selector because no selector can reach them. Those files
+      belong to the CLI: the launcher creates them before the shepherd
+      exists and hands them over as plain fds 1 and 2, so the shepherd never
+      learns their paths and holds no handle it could be asked about. The
+      useful consequence is that <code>shep flush --daemon</code> needs no
+      running shepherd at all.
+    </p>
+    <Callout variant="careful">
+      Never reach for <code>flush</code> as part of rotating anything. Its
+      name reads like settling a buffer and it does the opposite of what a
+      rotator wants: it flushes what is pending and then{" "}
+      <strong>truncates</strong>. Called before a rename, it deletes the
+      lines you were about to rotate. Rename, then <code>reopen</code>.
+    </Callout>
+
+    <h2>Where to go next</h2>
+
+    <div class="next-grid">
+      <a href="/docs/output" class="next-card">
+        <div class="next-title">Terminal output →</div>
+        <div class="next-body">
+          What the tables above are doing: colour, the sheep in the STATUS
+          column, and the <code>full</code>/<code>plain</code>/<code>bare</code>{" "}
+          dial that turns it off.
+        </div>
+      </a>
+      <a href="/docs/dogs" class="next-card">
+        <div class="next-title">Dogs →</div>
+        <div class="next-body">
+          <code>shep barks</code> and the alert history, which is a different
+          file with a different lifetime from anything on this page.
+        </div>
+      </a>
+    </div>
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(36px, 4.6vw, 56px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+</style>
