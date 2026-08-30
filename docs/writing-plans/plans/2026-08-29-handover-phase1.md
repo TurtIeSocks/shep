@@ -510,23 +510,23 @@ Spec G1 says the CLI refuses any daemon whose crate version differs. It does not
 - `crates/shep-cli/src/commands/dogs.rs` calls `Client::connect(..).ok()` at four sites, deliberately tolerating an absent daemon. That `.ok()` swallows a refusal and reports it as an absence, which is the same defect as Task 6's, not this one. Task 6 covers it.
 - `status.rs:70` is `ping` and `admin.rs:61` is `kill`. Both are exempt by design; leave them.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 One per verb, each asserting the verb refuses with `ExitCode::VersionSkew` against a daemon reporting a different version, and proceeds normally against a matching one. Use `shep_client::testing::fake_client_with_ack`, which is the fixture Task 5 found works; the plan's earlier `fake_daemon().version(..)` shape does not exist.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p shep --lib --bins --all-features -- --skip ::slow:: version_skew`
 
-- [ ] **Step 3: Widen the guard and call it at each site**
+- [x] **Step 3: Widen the guard and call it at each site**
 
 `refuse_version_skew` and `VersionGuard` become `pub(crate)`. Each of the three sites calls it immediately after its `Client::connect` succeeds, before doing anything with the client.
 
 None of the three is a recovery verb, so each passes `VersionGuard::Enforce` directly rather than being threaded one, matching what `serve.rs` already does. Put a one-line comment at each site saying why that verb can never be exempt: `lookout` and `whistle` both drive the daemon, and `foreground` registers a sheep.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
-- [ ] **Step 5: Task gate, then commit**
+- [x] **Step 5: Task gate, then commit**
 
 ---
 

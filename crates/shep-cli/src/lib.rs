@@ -1610,8 +1610,13 @@ fn recovery_verb(command: &Commands) -> Option<&'static str> {
 }
 
 /// Whether a shepherd of a different version refuses this invocation.
+///
+/// `pub(crate)`: Task 5b's three verbs (`lookout`, `whistle`, `foreground`)
+/// bypass the seams in this file that would otherwise apply this for them,
+/// by calling `Client::connect` inside their own module — so each names
+/// this directly, always as [`Self::Enforce`], at its own connect site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VersionGuard {
+pub(crate) enum VersionGuard {
     /// Refuse: this verb needs a shepherd that agrees with this binary.
     Enforce,
     /// Never refuse, whatever the shepherd answers: one of
@@ -1662,11 +1667,14 @@ const VERSION_SKEW_REMEDY: &str = RECOVERY_VERBS[1];
 /// condition is what left an operator stuck: every verb refused, and no
 /// sentence anywhere saying that reloading the shepherd was the way out.
 ///
+/// `pub(crate)`, for the three sites Task 5b guards directly — see
+/// [`VersionGuard`]'s own doc.
+///
 /// # Errors
 /// [`ExitCode::VersionSkew`], after writing the refusal to `streams`, when
 /// `guard` is [`VersionGuard::Enforce`] and the shepherd reports a different
 /// version. A [`VersionGuard::Exempt`] verb is always `Ok`.
-fn refuse_version_skew(
+pub(crate) fn refuse_version_skew(
     streams: &mut Streams<'_>,
     client: &Client,
     guard: VersionGuard,

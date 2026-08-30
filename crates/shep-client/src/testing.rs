@@ -172,13 +172,28 @@ pub fn fake_daemon_accepting_repeatedly(
     path: &Path,
     reply: Response,
 ) -> (JoinHandle<()>, Arc<AtomicU32>) {
+    fake_daemon_accepting_repeatedly_with_ack(path, sample_ack(), reply)
+}
+
+/// As [`fake_daemon_accepting_repeatedly`], but with a caller-chosen
+/// [`HelloAck`] — for a caller whose own version-skew guard would otherwise
+/// refuse [`sample_ack`]'s fixed `"9.9.9"` on every one of these repeated
+/// connections.
+///
+/// Panics if `path` cannot be bound — test scaffolding, the same failure mode
+/// [`fake_daemon`] documents.
+pub fn fake_daemon_accepting_repeatedly_with_ack(
+    path: &Path,
+    ack: HelloAck,
+    reply: Response,
+) -> (JoinHandle<()>, Arc<AtomicU32>) {
     let mut listener = Listener::bind(path).unwrap();
     let served = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&served);
     let handle = tokio::spawn(async move {
         while let Ok(stream) = listener.accept().await {
             let mut frames = Framed::new(stream, codec());
-            handshake(&mut frames, sample_ack()).await;
+            handshake(&mut frames, ack.clone()).await;
             let envelope = read_envelope(&mut frames).await;
             // `write_reply` wraps the value in `Ok` itself — its signature is
             // `(&mut Frames, u64, Response)`, testing.rs:155 — so passing an

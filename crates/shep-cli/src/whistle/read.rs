@@ -232,6 +232,17 @@ mod tests {
     /// failed — IR-46: every await in a test needs a forcing mechanism.
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// A [`shep_core::protocol::HelloAck`] this binary's own version guard
+    /// never refuses — `shep_client::testing::sample_ack`'s fixed `"9.9.9"`
+    /// always would, now that every tool call in this file goes through
+    /// `Shepherd::call_with_ack`'s guard.
+    fn matching_ack() -> shep_core::protocol::HelloAck {
+        shep_core::protocol::HelloAck {
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            ..shep_client::testing::sample_ack()
+        }
+    }
+
     /// A `ShepPaths` naming only the two fields any test here reads — the
     /// socket `Shepherd::call` dials and the file `list_barks` opens
     /// directly. The rest are never touched (`Whistle::new` reaches
@@ -270,7 +281,7 @@ mod tests {
             .build();
         let served = shep_client::testing::serve_one_request(
             &socket,
-            shep_client::testing::sample_ack(),
+            matching_ack(),
             Response::Flock(vec![sheep, dog]),
         )
         .await;
@@ -308,7 +319,7 @@ mod tests {
         let socket = shep_client::testing::control_address(dir.path());
         let served = shep_client::testing::serve_one_request(
             &socket,
-            shep_client::testing::sample_ack(),
+            matching_ack(),
             Response::Described(vec![shep_client::testing::sample_info()]),
         )
         .await;
@@ -354,7 +365,7 @@ mod tests {
 
         let served = shep_client::testing::serve_one_request(
             &socket,
-            shep_client::testing::sample_ack(),
+            matching_ack(),
             Response::Described(vec![info]),
         )
         .await;

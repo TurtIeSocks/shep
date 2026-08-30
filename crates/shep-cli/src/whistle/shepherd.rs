@@ -74,6 +74,9 @@ impl Shepherd {
         let client = Client::connect(&self.socket)
             .await
             .map_err(|err| connect_refusal(&self.socket, &err))?;
+        // `whistle` drives the daemon on every tool call, so it can never be
+        // one of `RECOVERY_VERBS`.
+        refuse_if_skewed(&client)?;
         let ack = client.daemon().clone();
         let response = client.request(request).await.map_err(|err| refusal(&err));
         // Dropping the client ends its actor task and closes the socket. Done
@@ -82,6 +85,52 @@ impl Shepherd {
         let _ = client.close().await;
         response.map(|response| (ack, response))
     }
+}
+
+/// Refuses `client` if its shepherd disagrees with this binary's crate
+/// version, reusing [`crate::refuse_version_skew`] — the same guard the
+/// seams in `lib.rs` apply for every other verb.
+///
+/// **Never writes to stdout.** This module's own doc: stdout is the MCP
+/// transport, and one stray byte on it corrupts a JSON-RPC stream the peer
+/// cannot resynchronise. `refuse_version_skew`'s own two render branches
+/// only ever write to a `Streams`' `err` field (`Streams::fail` routes
+/// through `emit_error(&mut *self.err, ..)`; its `Format::Table` branch
+/// writes to `streams.err` directly), so handing it a `Streams` whose `out`
+/// is [`std::io::sink`] and whose `err` is the real stderr is safe: the
+/// human-readable refusal lands where an operator tailing this process's
+/// stderr can see it, and the transport is never touched. The MODEL sees a
+/// separate, in-band [`CallToolResult`] built here, the same shape
+/// [`connect_refusal`] and [`refusal`] already use for every other failure
+/// this call can meet.
+///
+/// # Errors
+/// A [`CallToolResult`] with `is_error: true`, carrying the same facts
+/// [`crate::refuse_version_skew`]'s own message does, when the shepherd's
+/// crate version differs from this binary's.
+fn refuse_if_skewed(client: &Client) -> Result<(), CallToolResult> {
+    let mut sink = std::io::sink();
+    let mut err = std::io::stderr();
+    let mut streams = crate::output::Streams {
+        out: &mut sink,
+        err: &mut err,
+        style: crate::style::Presentation::BARE,
+        fmt: crate::cli::Format::Table,
+    };
+    crate::refuse_version_skew(&mut streams, client, crate::VersionGuard::Enforce).map_err(
+        |_code| {
+            CallToolResult::structured_error(serde_json::json!({
+                "code": crate::exit::ExitCode::VersionSkew.code_str(),
+                "message": format!(
+                    "this shep is {}, the running shepherd is {}; \
+                     `cargo install shep` replaced the binary without \
+                     restarting it — run `shep daemon reload`",
+                    env!("CARGO_PKG_VERSION"),
+                    client.daemon().daemon_version,
+                ),
+            }))
+        },
+    )
 }
 
 /// A connect failure, as an in-band tool error naming the socket ONCE.
@@ -167,6 +216,16 @@ mod tests {
     use super::*;
     use shep_core::protocol::{RpcError, RpcErrorCode};
 
+    /// A [`HelloAck`] this binary's own [`refuse_if_skewed`] never refuses —
+    /// [`shep_client::testing::sample_ack`]'s `"9.9.9"` always would, now
+    /// that `call_with_ack` guards every call this fixture drives through.
+    fn matching_ack() -> HelloAck {
+        HelloAck {
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            ..shep_client::testing::sample_ack()
+        }
+    }
+
     /// fails if a daemon-side refusal stops reaching the model verbatim, or
     /// stops being IN-BAND. shep does not paraphrase the shepherd: "api is
     /// already being reloaded" is actionable and a whistle-invented
@@ -242,8 +301,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = shep_client::testing::control_address(dir.path());
 
-        let (first, first_served) =
-            shep_client::testing::fake_daemon_accepting_repeatedly(&socket, Response::Pong);
+        let (first, first_served) = shep_client::testing::fake_daemon_accepting_repeatedly_with_ack(
+            &socket,
+            matching_ack(),
+            Response::Pong,
+        );
         let shepherd = Shepherd::new(socket.clone());
         let one = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -282,7 +344,11 @@ mod tests {
         std::fs::remove_file(&socket).unwrap();
 
         let (second, _second_served) =
-            shep_client::testing::fake_daemon_accepting_repeatedly(&socket, Response::Pong);
+            shep_client::testing::fake_daemon_accepting_repeatedly_with_ack(
+                &socket,
+                matching_ack(),
+                Response::Pong,
+            );
         let two = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             shepherd.call(Request::Ping),
@@ -291,5 +357,46 @@ mod tests {
         .expect("the second call finished within ten seconds");
         assert!(two.is_ok(), "a fresh connection per call needs no ladder");
         second.abort();
+    }
+
+    /// fails if `call_with_ack`'s guard stops refusing a skewed shepherd, or
+    /// starts doing it by writing to stdout — the one byte this module's
+    /// own doc says must never happen. `whistle` drives the daemon on every
+    /// tool call, so it can never be one of `RECOVERY_VERBS`.
+    #[tokio::test]
+    async fn a_version_skewed_shepherd_is_an_in_band_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let ack = HelloAck {
+            daemon_version: "0.1.8".to_string(),
+            protocol: shep_core::protocol::PROTOCOL_VERSION,
+            pid: 4242,
+        };
+        let (client, _fake) = shep_client::testing::fake_client_with_ack(&addr, ack).await;
+
+        let result = super::refuse_if_skewed(&client).expect_err("a skew must be refused");
+        assert_eq!(result.is_error, Some(true));
+        let structured = result
+            .structured_content
+            .expect("a refusal carries structured content a model can branch on");
+        assert_eq!(structured["code"], "version_skew");
+        let message = structured["message"].as_str().expect("a string message");
+        assert!(message.contains(env!("CARGO_PKG_VERSION")), "{message}");
+        assert!(message.contains("0.1.8"), "{message}");
+    }
+
+    /// A shepherd of this binary's own version is not a skew.
+    #[tokio::test]
+    async fn a_matching_version_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let ack = HelloAck {
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: shep_core::protocol::PROTOCOL_VERSION,
+            pid: 4242,
+        };
+        let (client, _fake) = shep_client::testing::fake_client_with_ack(&addr, ack).await;
+
+        super::refuse_if_skewed(&client).expect("a matching version is not a skew");
     }
 }

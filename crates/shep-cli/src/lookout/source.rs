@@ -178,6 +178,23 @@ impl From<ConnectError> for LinkError {
 #[derive(Debug)]
 pub struct ClientFlock(Client);
 
+impl ClientFlock {
+    /// The wrapped connection, for [`super::lookout`]'s version guard.
+    ///
+    /// The guard is applied there, right after the first
+    /// [`Shepherd::link`] succeeds, rather than inside [`UnixShepherd::link`]
+    /// itself: `link`'s Future carries a `+ Send` bound that a `Streams`
+    /// (which holds `&mut dyn io::Write`, not `Send`) cannot cross, and
+    /// [`super::link::run_link`] holds this same `Shepherd` for the whole
+    /// reconnect ladder, spawned with `tokio::spawn` and so `'static` —
+    /// a borrowed `Streams` could not live in it. This accessor is what
+    /// lets the one call site that DOES have a `Streams`, the first dial,
+    /// reach the client the guard compares against.
+    pub(crate) fn client(&self) -> &Client {
+        &self.0
+    }
+}
+
 impl FlockSource for ClientFlock {
     async fn flock(&self) -> Result<Vec<ProcessInfo>, RequestError> {
         match self.0.request(Request::ListFlock).await? {
@@ -445,5 +462,60 @@ mod tests {
                 .ok()
                 .map(NonZeroUsize::get),
         );
+    }
+
+    /// fails if `mod.rs`'s guard, applied right after the first
+    /// [`Shepherd::link`] succeeds, loses the client it needs to compare
+    /// versions on. `ClientFlock::client` is what makes that reachable —
+    /// see its own doc for why the guard cannot live inside `link` itself.
+    #[tokio::test]
+    async fn a_version_skewed_shepherd_is_refused_through_client_flock() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let ack = shep_core::protocol::HelloAck {
+            daemon_version: "0.1.8".to_string(),
+            protocol: shep_core::protocol::PROTOCOL_VERSION,
+            pid: 4242,
+        };
+        let (client, _fake) = shep_client::testing::fake_client_with_ack(&addr, ack).await;
+        let flock = ClientFlock(client);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = crate::output::Streams {
+            out: &mut out,
+            err: &mut err,
+            style: crate::style::Presentation::BARE,
+            fmt: crate::cli::Format::Table,
+        };
+        let code =
+            crate::refuse_version_skew(&mut streams, flock.client(), crate::VersionGuard::Enforce)
+                .expect_err("a differing crate version must be refused");
+        assert_eq!(code, crate::exit::ExitCode::VersionSkew);
+    }
+
+    /// A shepherd of this binary's own version is not a skew.
+    #[tokio::test]
+    async fn a_matching_version_proceeds_through_client_flock() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let ack = shep_core::protocol::HelloAck {
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: shep_core::protocol::PROTOCOL_VERSION,
+            pid: 4242,
+        };
+        let (client, _fake) = shep_client::testing::fake_client_with_ack(&addr, ack).await;
+        let flock = ClientFlock(client);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = crate::output::Streams {
+            out: &mut out,
+            err: &mut err,
+            style: crate::style::Presentation::BARE,
+            fmt: crate::cli::Format::Table,
+        };
+        crate::refuse_version_skew(&mut streams, flock.client(), crate::VersionGuard::Enforce)
+            .expect("a matching version is not a skew");
     }
 }
