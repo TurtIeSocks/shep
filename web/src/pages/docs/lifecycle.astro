@@ -1,0 +1,603 @@
+---
+/*
+ * Stopping and replacing a sheep (`shep stop/restart/reload/delete --help`,
+ * crates/shep-daemon/src/kill.rs, crates/shep-daemon/src/supervisor.rs's
+ * ReloadMode and apply_immediate, crates/shep-daemon/src/brain.rs's
+ * decide_on_exit, crates/shep-daemon/src/snapshot.rs's restorable). Terminal
+ * output below was run for real against target/release/shep on 2026-08-29 -
+ * see this page's PR for the transcript.
+ *
+ * These four verbs are the ones an operator types most and had no page of
+ * their own: the material was smeared across startup.astro, examples.astro,
+ * from-pm2.astro, first-flockfile.astro, output.astro, folds.astro,
+ * shepherd-channel.astro, not-built.astro, talking-to-a-sheep.astro and
+ * whistle.astro, each covering a fragment for its own reason. This page
+ * collects the one thing none of them state directly: what each verb
+ * leaves behind, and in particular what shep stop leaves in the muster
+ * roll that shep delete removes for good.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
+
+const stopSurvivesDemo = `$ shep stop parked
+ID  NAME    STATUS   PID    RESTARTS  EXIT     CPU  MEM   UPTIME  FOLD  SMIT
+0   keeper  online   79454  0         -        -    1.4M  6s      -     -
+1   parked  stopped  -      0         SIGTERM  -    -     0s      -     -
+4   probed  online   79458  0         -        -    1.5M  6s      -     -
+2   web     online   79456  0         -        -    1.4M  6s      -     -
+3   worker  online   79457  0         -        -    1.4M  6s      -     -
+
+$ shep save
+FILE                                     APPS
+/tmp/shepdocs-lifecycle/home/flock.json  5
+
+$ shep kill
+PID    SOCKET_REMOVED
+79433  true
+
+$ shep muster
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
+1   keeper  online    79631  0         -     -    -    0s      -     -
+0   parked  stopped   -      0         -     -    -    0s      -     -
+2   probed  starting  79632  0         -     -    -    0s      -     -
+3   web     online    79633  0         -     -    -    0s      -     -
+4   worker  online    79634  0         -     -    -    0s      -     -`;
+
+const deleteRemovesDemo = `$ shep delete parked
+notice[delete]: deleted 1 sheep, id 0
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
+1   keeper  online  79631  0         -     -    1.4M  5s      -     -
+2   probed  online  79632  0         -     -    1.5M  5s      -     -
+3   web     online  79633  0         -     -    1.4M  5s      -     -
+4   worker  online  79634  0         -     -    1.4M  5s      -     -
+
+$ shep save
+FILE                                     APPS
+/tmp/shepdocs-lifecycle/home/flock.json  4
+
+$ shep kill
+PID    SOCKET_REMOVED
+79610  true
+
+$ shep muster
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
+0   keeper  online    79791  0         -     -    -    0s      -     -
+1   probed  starting  79792  0         -     -    -    0s      -     -
+2   web     online    79793  0         -     -    -    0s      -     -
+3   worker  online    79794  0         -     -    -    0s      -     -`;
+
+const restartDemo = `$ shep restart keeper
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM     UPTIME  FOLD  SMIT
+0   keeper  online  79867  1         -     -    640.0K  0s      -     -
+1   probed  online  79792  0         -     -    1.5M    5s      -     -
+2   web     online  79793  0         -     -    1.4M    5s      -     -
+3   worker  online  79794  0         -     -    1.4M    5s      -     -`;
+
+const overlapDemo = `$ shep reload worker
+ID  NAME      STATUS    PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
+0   keeper    online    79867  1         -     -    1.4M  2s      -     -
+1   probed    online    79792  0         -     -    1.5M  7s      -     -
+2   web       online    79793  0         -     -    1.4M  7s      -     -
+3   worker:0  stopping  79794  0         -     -    1.4M  7s      -     -
+4   worker:0  starting  79907  0         -     -    -     0s      -     -
+
+$ shep flock
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
+0   keeper  online  79867  1         -     -    1.4M  4s      -     -
+1   probed  online  79792  0         -     -    1.5M  10s     -     -
+2   web     online  79793  0         -     -    1.4M  10s     -     -
+4   worker  online  79907  0         -     -    1.4M  2s      -     -`;
+
+const brokenOverlapDemo = `$ shep reload web
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
+0   keeper  online    79867  1         -     0.0%  1.4M  10s     -     -
+1   probed  online    79792  0         -     0.0%  1.5M  15s     -     -
+2   web:0   stopping  79793  0         -     0.0%  1.4M  15s     -     -
+5   web:0   starting  80029  0         -     -     -     0s      -     -
+4   worker  online    79907  0         -     0.0%  1.4M  7s      -     -
+
+$ shep bleats web --no-follow --lines 4
+web | http_server pid=79456 listening on 127.0.0.1:19293
+web | http_server pid=79633 listening on 127.0.0.1:19293
+web | http_server pid=79793 listening on 127.0.0.1:19293
+web |
+web | thread 'main' (54715137) panicked at examples/src/bin/http_server.rs:31:33:
+web | could not bind 127.0.0.1:19293: Address already in use (os error 48)
+web | note: run with \`RUST_BACKTRACE=1\` environment variable to display a backtrace
+
+$ shep flock
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
+0   keeper  online  79867  1         -     0.0%  1.4M  12s     -     -
+1   probed  online  79792  0         -     0.0%  1.5M  17s     -     -
+2   web     online  79793  0         -     0.0%  1.4M  17s     -     -
+4   worker  online  79907  0         -     0.0%  1.4M  10s     -     -`;
+
+const serialGapDemo = `$ shep reload probed
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
+0   keeper  online    79867  1         -     0.0%  1.4M  3m 42s  -     -
+7   probed  stopping  80436  0         -     0.0%  0B    2m 56s  -     -
+2   web     online    79793  0         -     0.0%  1.4M  3m 48s  -     -
+4   worker  online    79907  0         -     0.0%  1.4M  3m 40s  -     -
+
+$ while sleep 0.3; do curl -m 0.5 -s -o /dev/null -w "%{http_code}\\n" http://127.0.0.1:19294/; done
+000
+000
+000
+000
+000
+000
+000
+000
+000
+200
+200
+200
+
+$ shep flock
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
+0   keeper  online    79867  1         -     0.0%  1.4M  3m 46s  -     -
+8   probed  starting  82373  0         -     -     -     3s      -     -
+2   web     online    79793  0         -     0.0%  1.4M  3m 51s  -     -
+4   worker  online    79907  0         -     0.0%  1.4M  3m 44s  -     -`;
+---
+
+<DocsLayout
+  title="Stopping and replacing a sheep"
+  description="What shep stop, restart, reload and delete each do to a running sheep and to the muster roll: one kill ladder shared by three of them, two different orders a reload can run, and the one difference between stop and delete that decides what comes back after a restart."
+  crumb="Concepts / Stopping and replacing a sheep"
+  activeSlug="lifecycle"
+>
+  <article>
+    <h1>Stopping and replacing a sheep</h1>
+    <ReferencePills slug="lifecycle" />
+    <p class="lede">
+      Four verbs end a sheep's current process: <code>stop</code>,{" "}
+      <code>restart</code>, <code>reload</code> and <code>delete</code>. All
+      four take the same selector grammar as everything else (a name, an id,{" "}
+      <code>fold:&lt;name&gt;</code>, <code>all</code>, and the rest are on{" "}
+      <a href="/docs/folds">the folds page</a>),
+      and three of them run through the exact same kill ladder underneath.
+      What they don't share is what they leave behind: a stopped sheep is
+      still in the flock, a deleted one is gone, and a reload can end either
+      as a clean handover or as a crash you get to watch happen. That is what
+      this page is for.
+    </p>
+
+    <div class="verb-table">
+      <div class="row header">
+        <span>verb</span> <span>the current process</span> <span>the muster roll</span>
+      </div>
+      <div class="row">
+        <span><code>stop</code></span>
+        <span>killed, through the ladder below</span>
+        <span>stays, entry marked stopped</span>
+      </div>
+      <div class="row">
+        <span><code>restart</code></span>
+        <span>killed, then a fresh one at once</span>
+        <span>stays, marked online again</span>
+      </div>
+      <div class="row">
+        <span><code>reload</code></span>
+        <span>one instance replaced, old or new order below</span>
+        <span>unchanged, still the same app</span>
+      </div>
+      <div class="row">
+        <span><code>delete</code></span>
+        <span>killed if running, through the same ladder</span>
+        <span>removed, for good</span>
+      </div>
+    </div>
+    <p class="fine">
+      <code>shep thatlldo</code> is a hidden, working alias for{" "}
+      <code>stop</code>, "graceful stop" in{" "}
+      <a href="/docs/getting-started">Getting started</a>'s own alias grid.
+      It isn't in <code>--help</code>, but it runs the same code as the row
+      above.
+    </p>
+
+    <h2>One ladder, two grace periods</h2>
+    <p>
+      <code>stop</code>, <code>restart</code> and <code>delete</code> all
+      end a live process the same way. First, either the app's configured{" "}
+      <code>kill_signal</code> goes to the sheep's whole process group
+      (lambs included), or, if the app set{" "}
+      <code>shutdown_with_message</code>, a{" "}
+      <code>{`{"kind":"shutdown"}`}</code> message goes over the{" "}
+      <a href="/docs/shepherd-channel">shepherd channel</a> instead, no
+      signal at all. Then shep waits. If the process is still alive when the
+      grace period runs out, the whole process tree gets{" "}
+      <code>SIGKILL</code>, a signal nothing can trap, and that's the end of
+      it either way.
+    </p>
+    <p>
+      The grace period is where the two verbs that also drive a reload
+      diverge from the two that don't. <code>stop</code>, <code>restart</code>{" "}
+      and <code>delete</code> wait <code>kill_timeout</code>, 1.6 seconds by
+      default. A <code>reload</code>'s drain of the OLD instance waits{" "}
+      <code>graceful_timeout</code> instead, 8 seconds by default and
+      configured separately, because a reload's whole premise is that the
+      instance being replaced might be mid-request and deserves more time to
+      finish than an ordinary stop does. See{" "}
+      <a href="/docs/first-flockfile">the field table</a> for both,
+      and <a href="/docs/examples">
+        Examples
+      </a> for a live run watching a sheep that ignores its stop signal get
+      escalated to <code>SIGKILL</code>.
+    </p>
+    <Callout variant="note">
+      A signal <code>stop</code> sends is never mistaken for something else
+      afterward. Whatever the app's own <code>autorestart</code> says, an
+      exit that ends a manual <code>stop</code> is always recorded as a clean
+      stop, never as something worth restarting for. That's also why an
+      operator's command always wins a race against the daemon's own: a
+      cron occurrence or a watched file landing on a sheep mid-kill-ladder
+      gets dropped rather than reviving it out from under you.
+    </Callout>
+    <p class="fine">
+      On Windows there is nothing SIGTERM-shaped to send, so{" "}
+      <code>stop</code> waits out the whole of <code>kill_timeout</code> with
+      no signal delivered and then terminates the process directly, unless
+      the app opted into <code>shutdown_with_message</code>. See{" "}
+      <a href="/docs/not-built">
+        What's not built yet
+      </a>.
+    </p>
+
+    <h2>What stays, what goes: the muster roll</h2>
+    <p>
+      shep keeps a file at <code>$SHEP_HOME/flock.json</code>, the muster
+      roll, recording every registered app's config and whether it was
+      running the last time the roll was written. A shepherd that starts
+      back up reads it and restores what was up.{" "}
+      <a href="/docs/startup">Surviving reboots</a> is the
+      full account of <code>save</code> and <code>muster</code>; this
+      section is only the one thing that page doesn't say: what{" "}
+      <code>stop</code> leaves in that file, and what <code>delete</code>{" "}
+      takes out of it.
+    </p>
+    <VerbSignature verb="stop" usage="shep stop <selector>...">
+      <p>
+        Runs the kill ladder against every matched sheep and marks it{" "}
+        <code>stopped</code>. The sheep is not removed: it stays a member of
+        the flock, still shows up in <code>shep flock</code>, and is still
+        there for the next <code>restart</code> or <code>delete</code> to
+        find.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{stopSurvivesDemo}</CodeBlock>
+    <p>
+      <code>parked</code> was stopped, then the roll was saved, then the
+      whole shepherd went down and came back through <code>muster</code>.
+      It's back, registered, still called <code>parked</code>, still{" "}
+      <code>stopped</code>. Nothing restarted it, because it wasn't running
+      when the roll was written and <code>muster</code>'s rule is "was it up
+      when we saved," not "does it exist."
+    </p>
+    <VerbSignature verb="delete" usage="shep delete <selector>...">
+      <p>
+        Runs the same kill ladder if the sheep is running, then removes the
+        registration entirely. In table format the listing that follows is
+        the whole remaining flock, the same as every other lifecycle verb;
+        the ids it removed are named on stderr because their own rows are
+        gone by the time anything could print them.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{deleteRemovesDemo}</CodeBlock>
+    <p>
+      Same sheep, same save-kill-muster sequence, different verb. This time{" "}
+      <code>parked</code> is not in the restored flock at all, not even as a{" "}
+      <code>stopped</code> row. Deleting it took it out of the registry
+      immediately, so it was never a candidate for the roll <code>save</code>{" "}
+      wrote afterward, and <code>muster</code> can only restore what the
+      roll remembers. There's no undelete: the config is gone unless you
+      kept the Flockfile that produced it.
+    </p>
+    <p class="fine">
+      whistle's four control tools mirror three of these verbs (
+      <code>start_sheep</code>, <code>stop_sheep</code>,{" "}
+      <code>restart_sheep</code>, <code>reload_sheep</code>), deliberately
+      with no <code>delete_sheep</code>. See{" "}
+      <a href="/docs/whistle">whistle</a>.
+    </p>
+
+    <h2>restart: back immediately</h2>
+    <VerbSignature verb="restart" usage="shep restart <selector>...">
+      <p>
+        Runs the kill ladder, then spawns a fresh process in the same slot
+        at once, whatever <code>autorestart</code> or{" "}
+        <code>stop_exit_codes</code> would otherwise decide. The restart
+        budget is reset the same way a spec-mandated manual action always
+        resets it, and the daemon records that a person asked for this one,
+        which is what lets <code>shep describe</code> and the bus tell an
+        operator's restart apart from one the daemon raised on its own.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{restartDemo}</CodeBlock>
+    <p class="fine">
+      <code>keeper</code>'s pid changed and its <code>RESTARTS</code> column
+      went from 0 to 1. Everything else in the flock is untouched: a
+      lifecycle verb's listing always shows the whole flock, not only what it
+      touched, which is why the other three rows are here too. See{" "}
+      <a href="/docs/output#after-a-lifecycle-command">
+        Terminal output
+      </a>.
+    </p>
+
+    <h2>reload: one instance at a time, in one of two orders</h2>
+    <p>
+      A reload overlaps the old instance and the new one by default: the
+      replacement is spawned and confirmed before the old one drains, so the
+      app is never short an instance. Whether that overlap is actually
+      seamless is a property of the app, not of shep. shep never binds an
+      app's listening socket and never sets <code>SO_REUSEPORT</code> on
+      one; if the app hasn't set that option on its own listener, the second
+      instance has nowhere to go but <code>EADDRINUSE</code>, the moment it
+      tries to bind the port the first one is still holding.
+    </p>
+    <VerbSignature verb="reload" usage="shep reload <selector>...">
+      <p>
+        Replaces each matched sheep's instances one at a time with a fresh
+        process, so a clustered app is never short more than one instance
+        mid-swap. Answers as soon as the shepherd accepts the reload,
+        printing the flock as it stands at that moment; the swaps themselves
+        land afterward and are reported on the bus.
+      </p>
+    </VerbSignature>
+    <p>
+      Before anything is killed, shep has to decide the order, and it picks
+      from the app's own config: an app with a <code>readiness_probe</code>{" "}
+      and no <code>reuse_port</code> is reloaded serially, old instance
+      fully gone before the new one starts. Every other app overlaps, new
+      instance spawned and confirmed before the old one drains: that's an
+      app with no probe at all, one using <code>wait_ready</code> (its
+      channel belongs to one instance, so an outgoing instance has no way to
+      answer on the replacement's behalf, and <code>wait_ready</code> wins
+      over a configured probe if an app sets both), or a probed app that
+      also sets <code>reuse_port</code>.
+    </p>
+    <p>
+      The reason is what a <code>readiness_probe</code> is actually asking.
+      It polls an address, and an address can't say which of two processes
+      answered it. Overlap two instances of a probed app and the outgoing
+      one is still bound when the probe lands, so it answers for the
+      incoming one and shep calls a release ready that may never have come
+      up at all. Serializing removes the ambiguity by removing the
+      overlap: there's only ever one instance to ask.
+    </p>
+
+    <h3>Overlap, done right</h3>
+    <p>
+      <code>worker</code> below has no probe, so it always overlaps. It
+      writes to its own log file and binds nothing, so there's nothing for
+      two instances to fight over:
+    </p>
+    <CodeBlock>{overlapDemo}</CodeBlock>
+    <p>
+      <code>reload</code>'s own printed table is the proof: it shows two
+      rows for <code>worker</code> at once, id 3 <code>stopping</code> on
+      the old pid and id 4 <code>starting</code> on the new one. Both are
+      real, live processes for that moment, which is the entire point of
+      overlapping. A moment later the drainee is gone and the replacement
+      has taken the name back.
+    </p>
+
+    <h3>Overlap, when the app doesn't cooperate</h3>
+    <p>
+      <code>web</code> also has no probe, so it also overlaps, but it
+      binds a port and does nothing to share it. shep never sets{" "}
+      <code>SO_REUSEPORT</code> on an app's behalf; that has to happen
+      inside the child, on a socket shep never sees. Without it, two
+      instances cannot hold the same port at once:
+    </p>
+    <CodeBlock>{brokenOverlapDemo}</CodeBlock>
+    <p>
+      The replacement spawns, tries to bind the port the drainee is still
+      holding, and panics with <code>Address already in use</code>. The
+      reload is abandoned right there: the drainee was never told to
+      drain, so it's still the one answering requests, still on its
+      original pid, and <code>RESTARTS</code> never moves, because the
+      failure belongs to a replacement that was never registered as{" "}
+      <em>the</em> sheep. This exits 0. The daemon accepted the reload and
+      the acceptance is what the exit code answers for; the failed swap is
+      reported only on the bus, under{" "}
+      <code>process.reload_abandoned</code>.
+    </p>
+    <Callout variant="careful">
+      <code>reuse_port = true</code> doesn't make an app share its socket.
+      It tells shep the app already does, on its own, so shep will pick the
+      overlap order for it. Setting the field without the app actually
+      calling the option doesn't fail at config time; it fails exactly like
+      the run above, at reload time, with the same panic. Getting this
+      right is entirely on the app.
+    </Callout>
+
+    <h3>Serial: the gap you can see</h3>
+    <p>
+      <code>probed</code> has a <code>readiness_probe</code> and no{" "}
+      <code>reuse_port</code>, so it reloads serially. Watch the flock table
+      right after the command, and watch the address itself while the swap
+      runs:
+    </p>
+    <CodeBlock>{serialGapDemo}</CodeBlock>
+    <p>
+      <code>reload</code>'s own table shows only one row for{" "}
+      <code>probed</code>, <code>stopping</code>, no replacement id yet: a
+      serial reload doesn't spawn one until the old instance is fully gone.{" "}
+      <code>curl</code>'s <code>000</code> is what it prints when there's
+      nobody to connect to at all, not a real status code, and nine of them
+      at roughly 300ms apiece is about the 2.7 seconds the drain and the
+      new instance's own startup delay together take here, before the
+      probe passes and the address answers again. An overlapping reload
+      never produces that gap, because the old instance is still bound the
+      entire time. A serial one always will, on any app whose replacement
+      takes real time to become ready.
+    </p>
+    <p class="fine">
+      <code>SIGKILL</code>ing a sheep's own process never reaches every
+      lamb it forked; see{" "}
+      <a href="/docs/folds">Folds</a> for what a stop
+      actually kills versus what a sheep's process tree contains.
+    </p>
+
+    <h2>Where to go next</h2>
+
+    <div class="next-grid">
+      <a href="/docs/startup" class="next-card">
+        <div class="next-title">Surviving reboots →</div>
+        <div class="next-body">
+          <code>shep save</code> and <code>shep muster</code> in full, plus
+          the reboot runbook this page's roll demos borrow from.
+        </div>
+      </a>
+      <a href="/docs/from-pm2" class="next-card">
+        <div class="next-title">Coming from pm2 →</div>
+        <div class="next-body">
+          What <code>instances</code> does and doesn't do, and both real
+          ways to put N instances behind one address.
+        </div>
+      </a>
+      <a href="/docs/examples" class="next-card">
+        <div class="next-title">Examples →</div>
+        <div class="next-body">
+          A sheep that blocks its stop signal, watched live all the way to
+          the <code>SIGKILL</code> that ends it.
+        </div>
+      </a>
+      <a href="/docs/talking-to-a-sheep" class="next-card">
+        <div class="next-title">Talking to a sheep →</div>
+        <div class="next-body">
+          The three verbs that reach a running sheep without replacing it:
+          a signal, a line on stdin, a named action over the channel.
+        </div>
+      </a>
+    </div>
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(36px, 4.6vw, 56px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  h3 {
+    font-size: 20px;
+    letter-spacing: -0.02em;
+    margin: 28px 0 8px;
+  }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 24px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+  }
+
+  .verb-table {
+    border: 3px solid var(--line);
+    border-radius: 16px;
+    overflow-x: auto;
+    margin: 0 0 8px;
+  }
+
+  .verb-table .row {
+    display: grid;
+    grid-template-columns: minmax(90px, 0.7fr) minmax(180px, 1.4fr) minmax(160px, 1.2fr);
+    gap: 14px;
+    padding: 12px 20px;
+    font-size: 14.5px;
+    align-items: start;
+  }
+
+  .verb-table .row:not(:last-child) {
+    border-bottom: 2px solid var(--hair);
+  }
+
+  .verb-table .row.header {
+    background: var(--paper-2);
+    font-family: "Space Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 700;
+  }
+
+  .verb-table .row:not(.header) span:first-child {
+    font-family: "Space Mono", monospace;
+    font-weight: 700;
+  }
+
+  .verb-table .row:not(.header) span:not(:first-child) {
+    color: var(--ink-2);
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+</style>

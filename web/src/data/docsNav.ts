@@ -125,6 +125,17 @@ export const docsNav: DocsNavGroup[] = [
         },
       },
       {
+        slug: "lifecycle",
+        label: "Stopping and replacing a sheep",
+        built: true,
+        source: [
+          "crates/shep-daemon/src/kill.rs",
+          "crates/shep-daemon/src/supervisor.rs",
+          "crates/shep-daemon/src/snapshot.rs",
+        ],
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+      },
+      {
         slug: "dogs",
         label: "Dogs",
         built: true,
