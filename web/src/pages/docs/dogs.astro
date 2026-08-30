@@ -10,6 +10,10 @@ import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 import VerbSignature from "../../components/docs/VerbSignature.astro";
+
+const barksDemo = `$ shep barks
+WHEN                 RULE    SUBJECT  MESSAGE                                                                     SINKS
+2026-08-29 21:06:35  daemon  flaky    dog flaky exhausted its restart budget: 15 restarts against a budget of 16  -`;
 ---
 
 <DocsLayout
@@ -235,6 +239,37 @@ sinks = ["oncall"]`}</CodeBlock>
       an advisory file lock, never truncated in place, because two different
       processes append to it: the bark dog when a rule fires, and the
       shepherd itself when an enabled dog exhausts its own restart budget.
+    </p>
+
+    <h2>Reading the alert history</h2>
+    <VerbSignature verb="barks" usage="shep barks [--tail N]">
+      <p>
+        Prints that file, newest last, with <code>--tail</code> to see only
+        the last few. It reads <code>barks.jsonl</code> straight off disk and
+        never connects to the shepherd, which is the whole point: the history
+        is on disk precisely so it outlives the shepherd, and the moment this
+        verb exists for is an operator reading it after a crash. Same
+        precedent as <code>shep flush --daemon</code>, which also works on
+        files rather than through the socket.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{barksDemo}</CodeBlock>
+    <p>
+      <code>SINKS</code> names each sink the alert was delivered to, with{" "}
+      <code>(failed)</code> appended to any that refused it, so a delivery
+      failure is visible in the table you are already reading rather than
+      only in <code>--format json</code>. It never carries the sink's own
+      error text, which can quote a webhook's HTTP response and would widen
+      an already-tight column for something the JSON already has in full. A{" "}
+      <code>-</code> means the shepherd wrote the record itself, with no
+      sinks and no webhook code behind it, which is the case above.
+    </p>
+    <p class="fine">
+      A line that won't parse costs you that one record, not the history. A
+      writer that died mid-append, or a record from a newer shep, is skipped
+      and the rest still prints. This file is read during an incident, and
+      refusing the whole ring over one bad line would be the wrong failure
+      mode.
     </p>
 
     <h2>Writing your own</h2>
