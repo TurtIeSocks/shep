@@ -164,6 +164,53 @@ pub enum LogCtl {
         /// gone owes no bytes to anything.
         done: oneshot::Sender<Result<(), FlushError>>,
     },
+    /// Write out whatever the pump has buffered, wait for it to reach the
+    /// files, then acknowledge with the four descriptor numbers the pump is
+    /// holding. Sent while assembling a daemon handover.
+    ///
+    /// # Why the flush and the report are one request
+    ///
+    /// A pump that reported its numbers and was then asked separately to
+    /// flush would leave a window in which the blob already claims a
+    /// descriptor is ready to carry while the bytes behind it are still in
+    /// the buffer. Those bytes die with the image at the `execve`, and the
+    /// successor cannot repair them because it never saw them — a gap in a
+    /// sheep's log, which is one of the two things a handover exists to
+    /// avoid. Doing both under one acknowledgement makes the ordering
+    /// structural rather than a rule a caller has to keep.
+    ///
+    /// # Why this variant is unix-only when the rest of the enum is not
+    ///
+    /// It answers with raw descriptor numbers, and Windows has none of
+    /// those, no `execve` to carry them across, and no handover:
+    /// `Arm::for_daemon` returns the stop-and-start arm there. Gating the
+    /// variant rather than the enum keeps [`Self::Reopen`] and
+    /// [`Self::Flush`] portable, which they are.
+    #[cfg(unix)]
+    ReportFds {
+        /// Fires once both handles have nothing buffered and no write left
+        /// in flight, carrying the descriptors the blob is to name.
+        ///
+        /// `CarriedFds::none` is the honest answer for a pump holding
+        /// nothing — a stream that reached EOF has had its read end closed,
+        /// and a log file whose open failed has no handle. It is never an
+        /// error: a number that names nothing is what the successor must not
+        /// be handed.
+        ///
+        /// # When it never fires
+        ///
+        /// Exactly as [`Self::Reopen`]'s: a pump that ends between accepting
+        /// a request and serving it drops this sender. Treat that as the
+        /// same stopped-sheep no-op a failed send means; a pump that is gone
+        /// holds no descriptors.
+        ///
+        /// `CarriedFds` is `shep-daemon`'s own type and is not reachable
+        /// from outside the crate, so an out-of-tree runner can drop this
+        /// sender but cannot answer it. That is the same no-op a pump that
+        /// has ended produces, and a runner with no handover support is
+        /// exactly a runner nothing hands over.
+        done: oneshot::Sender<crate::handover::CarriedFds>,
+    },
 }
 
 /// A [`LogCtl::Reopen`] that could not open one or both of a sheep's log

@@ -144,6 +144,38 @@ pub struct Candidate<'a> {
     pub pending_delete: bool,
 }
 
+/// A [`Candidate`] that owns its entry.
+///
+/// The supervisor cannot lend one. Assembling a snapshot means asking every
+/// log pump for its descriptors, and no `.await` on a pump may happen on the
+/// actor loop (see `Actor::handle_reopen` for the cycle that rules it out),
+/// so the assembly runs on a task of its own and the entries have to travel
+/// there. A borrow cannot.
+///
+/// [`Self::as_candidate`] is how it reaches [`fitness`], which stays a pure
+/// function over borrowed data.
+#[derive(Debug, Clone)]
+pub struct OwnedCandidate {
+    /// The sheep's lifecycle entry, cloned off the supervisor's slot.
+    pub entry: ProcessEntry,
+    /// Whether an operator's command is waiting on this sheep's next exit.
+    pub pending_stop: bool,
+    /// Whether an operator's `delete` targets this sheep.
+    pub pending_delete: bool,
+}
+
+impl OwnedCandidate {
+    /// Borrow this as the [`Candidate`] [`fitness`] takes.
+    #[must_use]
+    pub fn as_candidate(&self) -> Candidate<'_> {
+        Candidate {
+            entry: &self.entry,
+            pending_stop: self.pending_stop,
+            pending_delete: self.pending_delete,
+        }
+    }
+}
+
 /// Decide whether a flock can be handed over in place.
 ///
 /// Whole-flock, not per-sheep: the handover blob describes one process
@@ -273,6 +305,37 @@ pub struct Handover {
 }
 
 impl Handover {
+    /// Describe a flock for the successor.
+    ///
+    /// Every argument comes from a different owner, which is why none of
+    /// them is read in here: `sheep` is assembled from the supervisor's
+    /// slots and its pumps, `fds` from `boot`, and `counters` from the
+    /// actor. Nothing in this crate can see all three.
+    #[must_use]
+    pub fn new(sheep: Vec<CarriedSheep>, fds: DaemonFds, counters: Counters) -> Self {
+        Self {
+            version: VERSION,
+            sheep,
+            listener_fd: fds.listener,
+            pidfile_fd: fds.pidfile,
+            next_id: counters.next_id,
+            next_deadline: counters.next_deadline,
+            next_action_stamp: counters.next_action_stamp,
+        }
+    }
+
+    /// Every sheep this blob carries.
+    #[must_use]
+    pub fn sheep(&self) -> &[CarriedSheep] {
+        &self.sheep
+    }
+
+    /// The entry id the successor is to issue next.
+    #[must_use]
+    pub const fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
     /// Where the blob lives under `paths`: `$SHEP_HOME/run/handover.json`.
     #[must_use]
     pub fn path(paths: &ShepPaths) -> PathBuf {
@@ -287,14 +350,11 @@ impl Handover {
     /// named leaks into the successor's image, which is the mirror of the
     /// failure this module exists to avoid.
     fn named_fds(&self) -> impl Iterator<Item = RawFd> + '_ {
-        [self.listener_fd, self.pidfile_fd]
-            .into_iter()
-            .chain(self.sheep.iter().flat_map(|sheep| {
-                let fds = sheep.fds;
-                [fds.out_pipe, fds.err_pipe, fds.out_log, fds.err_log]
-                    .into_iter()
-                    .flatten()
-            }))
+        [self.listener_fd, self.pidfile_fd].into_iter().chain(
+            self.sheep
+                .iter()
+                .flat_map(|sheep| sheep.fds.all().into_iter().flatten()),
+        )
     }
 
     /// Write the blob under `paths`, at mode `0600`, and return where it
@@ -414,6 +474,37 @@ impl core::error::Error for LoadError {
     }
 }
 
+/// The daemon's own two descriptors, as the party that opened them knows
+/// them.
+///
+/// A pair rather than two arguments because both are a bare `RawFd`: passing
+/// them positionally lets a caller swap them silently, and the swap is not
+/// detectable afterwards — the successor would `flock` its control socket
+/// and listen on its pidfile. This is the same argument [`CarriedFds`] makes
+/// for grouping its four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonFds {
+    /// The control listener's descriptor number.
+    pub listener: RawFd,
+    /// The pidfile lock's descriptor number.
+    pub pidfile: RawFd,
+}
+
+/// The three supervisor counters a successor must not reissue.
+///
+/// They reset to zero in every constructor, so a successor that did not
+/// carry them would hand out an entry id, a reload-watchdog stamp or an
+/// action stamp that a caller is still holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counters {
+    /// The next entry id.
+    pub next_id: u32,
+    /// The next reload-watchdog stamp.
+    pub next_deadline: u64,
+    /// The next action-wait stamp.
+    pub next_action_stamp: u64,
+}
+
 /// One sheep, as the successor will find it.
 ///
 /// Two halves. [`Self::app`] is what the sheep IS, carried whole so the
@@ -505,6 +596,18 @@ impl CarriedSheep {
             app: entry.spec.config().clone(),
         }
     }
+
+    /// The descriptor numbers this instance's output travels on.
+    #[must_use]
+    pub const fn fds(&self) -> CarriedFds {
+        self.fds
+    }
+
+    /// The supervisor slot's respawn epoch at the moment of the handover.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 /// The four descriptor numbers one sheep's output travels on.
@@ -530,6 +633,33 @@ pub struct CarriedFds {
     pub out_log: Option<RawFd>,
     /// The appending handle on the sheep's stderr log file.
     pub err_log: Option<RawFd>,
+}
+
+impl CarriedFds {
+    /// The four numbers, listener-order irrelevant but fixed: stdout's pipe,
+    /// stderr's pipe, stdout's log, stderr's log.
+    ///
+    /// One array rather than four field reads, so a caller that walks all of
+    /// them — clearing `FD_CLOEXEC`, checking each is open — cannot walk
+    /// three by mistake.
+    #[must_use]
+    pub const fn all(&self) -> [Option<RawFd>; 4] {
+        [self.out_pipe, self.err_pipe, self.out_log, self.err_log]
+    }
+
+    /// The no-descriptors case: a sheep that is registered and not running.
+    ///
+    /// Not a failure, and [`fitness`] does not refuse it. A stopped sheep
+    /// has no pump, so it has nothing to carry and nothing to lose.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            out_pipe: None,
+            err_pipe: None,
+            out_log: None,
+            err_log: None,
+        }
+    }
 }
 
 /// Where this process's binary was when it started, as `argv[0]` resolved

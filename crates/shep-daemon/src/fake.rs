@@ -650,6 +650,35 @@ impl ScriptedRunner {
     }
 }
 
+/// Four real, distinct, open descriptors for a fake pump to report, and the
+/// handles that keep them open.
+///
+/// `/dev/null` because the fake never writes anything to them: what a caller
+/// asserts about a handover blob is that the numbers in it name something
+/// open, not what is on the far side.
+///
+/// # Panics
+///
+/// If `/dev/null` cannot be opened four times, which on any unix a test
+/// suite runs on means the process is out of descriptors.
+#[cfg(unix)]
+#[track_caller]
+fn open_reportable_fds() -> ([std::fs::File; 4], crate::handover::CarriedFds) {
+    use std::os::fd::AsRawFd as _;
+
+    let files = core::array::from_fn(|_| {
+        std::fs::File::open("/dev/null").expect("a test host must be able to open /dev/null")
+    });
+    let files: [std::fs::File; 4] = files;
+    let fds = crate::handover::CarriedFds {
+        out_pipe: Some(files[0].as_raw_fd()),
+        err_pipe: Some(files[1].as_raw_fd()),
+        out_log: Some(files[2].as_raw_fd()),
+        err_log: Some(files[3].as_raw_fd()),
+    };
+    (files, fds)
+}
+
 impl ProcessRunner for ScriptedRunner {
     type Proc = FakeProc;
 
@@ -749,6 +778,11 @@ impl ProcessRunner for ScriptedRunner {
         let lamb_holds_the_pipe = script.lamb_holds_the_pipe;
         let logs_for_pump = logs_tx.clone();
         tokio::spawn(async move {
+            #[cfg(unix)]
+            let mut reportable_fds: Option<(
+                [std::fs::File; 4],
+                crate::handover::CarriedFds,
+            )> = None;
             loop {
                 tokio::select! {
                     ctl = log_ctl_rx.recv() => match ctl {
@@ -771,6 +805,20 @@ impl ProcessRunner for ScriptedRunner {
                             // handle there is nothing queued that could
                             // fail to land.
                             let _ = done.send(Ok(()));
+                        }
+                        // The fake writes no files, so it holds no
+                        // descriptors of its own. A caller assembling a
+                        // handover still asserts that the numbers it gets
+                        // are really open, so four `/dev/null` handles stand
+                        // in — opened on the first request and held for the
+                        // rest of this task's life, so a suite full of tests
+                        // that never ask for a handover opens nothing. That
+                        // the numbers are the PUMP's own is
+                        // `tokio_runner`'s tier, against a real pipe.
+                        #[cfg(unix)]
+                        Some(LogCtl::ReportFds { done }) => {
+                            let fds = reportable_fds.get_or_insert_with(open_reportable_fds);
+                            let _ = done.send(fds.1);
                         }
                         None => break, // nothing holds ProcIo::log_ctl
                     },

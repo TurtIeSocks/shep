@@ -627,7 +627,7 @@ The four descriptors `CarriedFds` names are owned by the log pump task, inside `
 
 **The counters and the per-slot fields are only reachable inside the actor.** `next_id`, `next_deadline` and `next_action_stamp` are private `Actor` fields; `epoch`, `manual` and `pending_delete` are on the private `SheepSlot`. So the command assembles both the `Candidate` list and the `Handover` from in there, rather than exposing accessors.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test]
@@ -676,19 +676,19 @@ async fn the_snapshot_carries_the_actors_counters_and_slot_state() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: handover_snapshot`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add the `LogCtl` variant. Follow `Reopen`'s existing shape for the acknowledgement channel rather than inventing a second one, and give its doc comment the flush-and-report reasoning above.
 
 A sheep with no live pump (registered but stopped) reports `None` for all four. That is the `Option<RawFd>` case `CarriedFds` already models, and Task 1's gate does not refuse it: a stopped sheep has no descriptors to carry and nothing to lose.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
-- [ ] **Step 5: Task gate, then commit**
+- [x] **Step 5: Task gate, then commit**
 
 #### Task 8b: the adopt seam on the runner
 

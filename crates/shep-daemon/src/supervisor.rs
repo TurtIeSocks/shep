@@ -60,6 +60,8 @@ use crate::bus::{Bus, SharedEvent};
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasRegistry};
+#[cfg(unix)]
+use crate::handover::{CarriedFds, CarriedSheep, Counters, DaemonFds, Handover, OwnedCandidate};
 use crate::kill::kill_process;
 use crate::privilege::{self, Credentials, PrivilegeError, SpawnIdentity};
 use crate::probes::Prober;
@@ -464,6 +466,32 @@ pub(crate) enum Command {
         /// Answers once every path has been truncated — off a task of its
         /// own, never the actor loop (see [`Actor::handle_flush`]).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
+    /// Describes the whole flock for a daemon handover: what the fitness
+    /// gate needs, and the blob the successor reads.
+    ///
+    /// One command rather than a set of getters because everything it
+    /// answers with is private to the actor — the three counters are its
+    /// own fields, `epoch`, `manual` and `pending_delete` are on
+    /// [`SheepSlot`], and the descriptor numbers are known only to each
+    /// sheep's log pump.
+    #[cfg(unix)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "task 8d sends this from `boot`'s handover arm; nothing outside this \
+                      crate's own tests constructs it yet"
+        )
+    )]
+    HandoverSnapshot {
+        /// The daemon's own two descriptors, which `boot` knows and the
+        /// actor does not.
+        fds: DaemonFds,
+        /// Answers once every live pump has flushed and reported — off a
+        /// task of its own, never the actor loop (see
+        /// [`Actor::handle_handover_snapshot`]).
+        reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
     },
     /// Puts one named action on the shepherd channel of every sheep matching
     /// `selector` and answers with what each app said back, or with why
@@ -1219,6 +1247,43 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::Reopen { selector, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Describes the whole flock for a daemon handover: one
+    /// [`OwnedCandidate`] per registered sheep for the fitness gate, and the
+    /// [`Handover`] blob the successor reads.
+    ///
+    /// `fds` are the daemon's own listener and pidfile descriptors, which
+    /// `boot` opened and the actor has never seen.
+    ///
+    /// Answers once every live pump has flushed what it was holding and
+    /// reported its descriptors. A registered sheep that is not running has
+    /// no pump, and carries no descriptors: that is not a refusal, and the
+    /// gate does not treat it as one.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    ///
+    #[cfg(unix)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "task 8d calls this from `boot`'s handover arm; nothing outside this \
+                      crate's own tests calls it yet"
+        )
+    )]
+    pub(crate) async fn handover_snapshot(
+        &self,
+        fds: DaemonFds,
+    ) -> Result<Snapshot, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::HandoverSnapshot { fds, reply }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -2429,6 +2494,15 @@ impl<R: ProcessRunner> Actor<R> {
             }
             Command::Flush { selector, reply } => {
                 self.handle_flush(&selector, reply);
+                false
+            }
+            // Not rejected while `shutting_down` either, and for the same
+            // reason: a snapshot registers nothing, spawns nothing and
+            // changes no actor state. What it does with the answer is the
+            // caller's business.
+            #[cfg(unix)]
+            Command::HandoverSnapshot { fds, reply } => {
+                self.handle_handover_snapshot(fds, reply);
                 false
             }
             // Not rejected while `shutting_down` either, for the reason
@@ -5439,6 +5513,59 @@ impl<R: ProcessRunner> Actor<R> {
         spawn_reopen_task(matched, pumps, reply);
     }
 
+    /// Reads everything a handover needs off the actor and hands it to a
+    /// task that asks each live pump for its descriptors.
+    ///
+    /// Synchronous and `&self` for the reasons [`Self::handle_reopen`] gives
+    /// at length: a descriptor report waits on a pump's flush, and awaiting
+    /// that inside the actor loop closes CRITICAL-2's cycle.
+    ///
+    /// The entries are CLONED rather than borrowed because of that split.
+    /// Nothing the actor lends can outlive the loop, and the assembly
+    /// happens after it — which is the whole reason
+    /// [`OwnedCandidate`](OwnedCandidate) exists next to
+    /// `Candidate`.
+    ///
+    /// Every registered sheep is described, with no selector: a handover
+    /// carries one process image, so the flock is carried whole or refused
+    /// whole.
+    #[cfg(unix)]
+    fn handle_handover_snapshot(
+        &self,
+        fds: DaemonFds,
+        reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
+    ) {
+        let mut drafts: Vec<HandoverDraft> = self
+            .sheep
+            .values()
+            .map(|slot| HandoverDraft {
+                entry: slot.entry.clone(),
+                // Any manual command owning this sheep's next exit, not just
+                // a `Stop`. A `Restart` or a `Delete` waiting on that exit
+                // is as unsafe to carry, and the gate refuses in the strict
+                // direction by design.
+                pending_stop: slot.manual.is_some(),
+                pending_delete: slot.pending_delete,
+                epoch: slot.epoch,
+                log_ctl: slot.log_ctl.clone(),
+            })
+            .collect();
+        // `HashMap` iteration order is arbitrary, and the blob is written to
+        // a file an operator may read: id order makes two snapshots of an
+        // unchanged flock identical.
+        drafts.sort_unstable_by_key(|draft| draft.entry.id);
+        spawn_handover_task(
+            drafts,
+            fds,
+            Counters {
+                next_id: self.next_id,
+                next_deadline: self.next_deadline,
+                next_action_stamp: self.next_action_stamp,
+            },
+            reply,
+        );
+    }
+
     /// Resolves `selector` and hands every match to a task that flushes its
     /// log pump, truncates its log files and then answers the caller.
     ///
@@ -7117,6 +7244,94 @@ fn spawn_send_line_task(
         rows.sort_unstable_by(|a, b| (a.name.as_str(), a.id).cmp(&(b.name.as_str(), b.id)));
         let _ = reply.send(Ok(rows));
     });
+}
+
+/// What a [`Command::HandoverSnapshot`] answers with: one candidate per
+/// registered sheep for the fitness gate, and the blob a successor reads.
+///
+/// A pair rather than one type because the two go to different places and
+/// only one of them crosses the exec — the candidates decide whether there
+/// is to be an exec at all, and are then done with.
+#[cfg(unix)]
+type Snapshot = (Vec<OwnedCandidate>, Handover);
+
+/// One sheep on its way from the actor to the handover task.
+///
+/// Everything here is read off a [`SheepSlot`] inside the actor loop, since
+/// nothing outside can see any of it, and carried out owned because the
+/// assembly runs on a task of its own.
+#[cfg(unix)]
+#[derive(Debug)]
+struct HandoverDraft {
+    /// The sheep's lifecycle entry, cloned off the slot.
+    entry: ProcessEntry,
+    /// Whether a manual command owns this sheep's next exit.
+    pending_stop: bool,
+    /// Whether a `Delete` targets this sheep.
+    pending_delete: bool,
+    /// The slot's respawn epoch, so a timer armed before the exec is still
+    /// recognised as stale after it.
+    epoch: u64,
+    /// This sheep's log pump, or `None` for a slot whose spawn never
+    /// succeeded.
+    log_ctl: Option<mpsc::Sender<LogCtl>>,
+}
+
+/// Spawns the task that assembles one handover snapshot and answers its
+/// caller.
+///
+/// Every await lives in here, off the actor loop — see
+/// [`Actor::handle_reopen`] for the cycle that rules out doing it inline.
+///
+/// The sheep are visited one after another rather than concurrently, exactly
+/// as [`spawn_reopen_task`] visits them, and the same trade applies: a
+/// stalled pump delays the sheep behind it, and the request's own deadline
+/// is what bounds the caller either way.
+///
+/// Must be called from within a Tokio runtime context.
+#[cfg(unix)]
+fn spawn_handover_task(
+    drafts: Vec<HandoverDraft>,
+    fds: DaemonFds,
+    counters: Counters,
+    reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
+) {
+    tokio::spawn(async move {
+        let mut candidates = Vec::with_capacity(drafts.len());
+        let mut carried = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let fds = match &draft.log_ctl {
+                Some(log_ctl) => report_fds(log_ctl).await,
+                None => CarriedFds::none(),
+            };
+            carried.push(CarriedSheep::from_entry(&draft.entry, draft.epoch, fds));
+            candidates.push(OwnedCandidate {
+                entry: draft.entry,
+                pending_stop: draft.pending_stop,
+                pending_delete: draft.pending_delete,
+            });
+        }
+        let blob = Handover::new(carried, fds, counters);
+        let _ = reply.send(Ok((candidates, blob)));
+    });
+}
+
+/// Asks one sheep's log pump to flush what it is holding and report the four
+/// descriptors it owns, and waits for the answer.
+///
+/// Not reaching a pump at all is [`CarriedFds::none`], not an error, and both
+/// shapes of it mean the same thing that [`reopen_logs`] documents: there is
+/// no pump, so there are no descriptors. A stopped sheep has nothing to
+/// carry and nothing to lose, and the fitness gate does not refuse it.
+///
+/// [`CarriedFds::none`]: CarriedFds::none
+#[cfg(unix)]
+async fn report_fds(log_ctl: &mpsc::Sender<LogCtl>) -> CarriedFds {
+    let (done, ack) = oneshot::channel();
+    if log_ctl.send(LogCtl::ReportFds { done }).await.is_err() {
+        return CarriedFds::none();
+    }
+    ack.await.unwrap_or_else(|_| CarriedFds::none())
 }
 
 /// Spawns the task that carries out one `Reopen` and answers its caller.
@@ -14574,6 +14789,12 @@ mod tests {
                                 message: PUMP_REFUSAL.to_string(),
                             }));
                         }
+                        // This runner exists for the reopen and flush
+                        // refusals; a handover never reaches it.
+                        #[cfg(unix)]
+                        LogCtl::ReportFds { done } => {
+                            let _ = done.send(CarriedFds::none());
+                        }
                     }
                 }
             });
@@ -15124,6 +15345,12 @@ mod tests {
                         }
                         LogCtl::Reopen { done } => {
                             let _ = done.send(Ok(()));
+                        }
+                        // This runner exists for the flush ordering; a
+                        // handover never reaches it.
+                        #[cfg(unix)]
+                        LogCtl::ReportFds { done } => {
+                            let _ = done.send(CarriedFds::none());
                         }
                     }
                 }
@@ -16581,5 +16808,112 @@ mod tests {
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
+    }
+
+    /// Two descriptors standing in for the daemon's own, so a snapshot taken
+    /// in a test names numbers that are really open rather than plausible
+    /// ones. The daemon supplies its listener and pidfile from `boot`; the
+    /// actor never learns them, which is why they are an argument.
+    #[cfg(unix)]
+    fn daemon_fds(dir: &tempfile::TempDir) -> (DaemonFds, [std::fs::File; 2]) {
+        use std::os::fd::AsRawFd as _;
+
+        let listener = std::fs::File::create(dir.path().join("listener.stand-in")).unwrap();
+        let pidfile = std::fs::File::create(dir.path().join("pidfile.stand-in")).unwrap();
+        let fds = DaemonFds {
+            listener: listener.as_raw_fd(),
+            pidfile: pidfile.as_raw_fd(),
+        };
+        // Returned alongside so the caller holds both files open: a closed
+        // descriptor's number is free to be handed to the next open.
+        (fds, [listener, pidfile])
+    }
+
+    /// Whether `fd` names something open in this process.
+    #[cfg(unix)]
+    fn is_open(fd: std::os::fd::RawFd) -> bool {
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).is_ok()
+    }
+
+    /// Fails if a snapshot of a live flock does not name four open
+    /// descriptors for every sheep in it.
+    ///
+    /// The blob is what the successor adopts by number, and a number it
+    /// cannot adopt is not a gap it can repair: losing a sheep's stdout read
+    /// end blocks the child on `write()` once the pipe buffer fills, which
+    /// reads as an application hang rather than as a shep bug.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_from_a_live_flock_names_four_open_descriptors_per_sheep() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner =
+            ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("web", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("api", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let (candidates, blob) = handle.handover_snapshot(fds).await.unwrap();
+
+        assert_eq!(candidates.len(), 2, "both sheep must reach the gate");
+        assert_eq!(blob.sheep().len(), 2);
+        for sheep in blob.sheep() {
+            for fd in sheep.fds().all() {
+                let fd = fd.expect("a running sheep has all four descriptors");
+                assert!(is_open(fd), "blob names a closed descriptor: {fd}");
+            }
+        }
+    }
+
+    /// Fails if a snapshot loses the three actor counters or the two slot
+    /// fields nothing outside the actor can see.
+    ///
+    /// These are the reason this is a command rather than a getter, and each
+    /// one is load-bearing on its own: a successor that reissued a live id
+    /// would collide with a caller still holding it, and a manual stop the
+    /// gate never saw is a flock carried while an operator is waiting on its
+    /// exit.
+    ///
+    /// The sheep here has no live pump, which is also the registered-but-not
+    /// -running case: it reports no descriptors, and that is not a refusal.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn the_snapshot_carries_the_actors_counters_and_slot_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let (mut actor, _ctl_rx) = actor_with_stopping_drainee(&dir, 4242, 7);
+        actor.sheep.get_mut(&0).unwrap().manual = Some(PendingManual {
+            kind: ManualKind::Stop,
+            origin: CommandOrigin::Operator,
+        });
+
+        let (reply, rx) = oneshot::channel();
+        actor.handle_handover_snapshot(fds, reply);
+        let (candidates, blob) = rx.await.unwrap().unwrap();
+
+        assert!(
+            candidates[0].pending_stop,
+            "a pending stop must reach the gate"
+        );
+        assert!(
+            !candidates[0].pending_delete,
+            "nothing asked for this sheep to be deleted"
+        );
+        assert!(
+            blob.next_id() > 0,
+            "a successor that reissues a live id collides"
+        );
+        assert_eq!(blob.sheep()[0].epoch(), 7, "a stale timer must stay stale");
+        assert_eq!(
+            blob.sheep()[0].fds(),
+            CarriedFds::none(),
+            "a sheep with no pump has no descriptors to carry"
+        );
     }
 }

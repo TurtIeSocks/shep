@@ -32,7 +32,7 @@ use core::time::Duration;
 use std::fs;
 use std::io;
 #[cfg(unix)]
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -868,6 +868,16 @@ impl ProcessRunner for TokioRunner {
 
         let (logs_tx, logs_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (log_ctl_tx, log_ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        // Read off the handles this spawn is about to give away, and before
+        // the `take`s below move them: this is the only place the numbers a
+        // handover carries are known.
+        #[cfg(unix)]
+        let pipes = PipeFds {
+            out: child.stdout.as_ref().map(AsRawFd::as_raw_fd),
+            err: child.stderr.as_ref().map(AsRawFd::as_raw_fd),
+        };
+        #[cfg(not(unix))]
+        let pipes = PipeFds;
         spawn_log_pump(
             child.stdout.take(),
             child.stderr.take(),
@@ -875,6 +885,7 @@ impl ProcessRunner for TokioRunner {
             spec.err_file.clone(),
             logs_tx,
             log_ctl_rx,
+            pipes,
         );
 
         let (to_stdin_tx, to_stdin_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -990,6 +1001,19 @@ impl LogFile<tokio::fs::File> {
             }),
         }
     }
+
+    /// This stream's open log-file descriptor, or `None` when the open
+    /// failed and there is no handle at all.
+    ///
+    /// Read off the live handle rather than remembered, so a
+    /// [`Self::reopen`] that swapped the file cannot leave a stale number
+    /// behind for a handover to carry.
+    #[cfg(unix)]
+    fn raw_fd(&self) -> Option<RawFd> {
+        self.handle
+            .as_ref()
+            .map(|handle| handle.get_ref().as_raw_fd())
+    }
 }
 
 impl<W: AsyncWrite + Unpin> LogFile<W> {
@@ -1046,12 +1070,43 @@ impl<W: AsyncWrite + Unpin> LogFile<W> {
     }
 }
 
+/// The descriptor numbers of a pump's two stream readers.
+///
+/// Told to the pump rather than read off its readers, because the pump is
+/// generic over them and an in-memory stream has no descriptor at all. The
+/// caller holding the real `ChildStdout` is the one place the numbers are
+/// known, and it reads them off the same object it is about to hand over.
+///
+/// Empty on Windows, which has no descriptors to carry and no handover to
+/// carry them: `Arm::for_daemon` returns the stop-and-start arm there.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Default)]
+struct PipeFds {
+    /// The read end of the child's stdout, while the pump still holds it.
+    out: Option<RawFd>,
+    /// The read end of the child's stderr, while the pump still holds it.
+    err: Option<RawFd>,
+}
+
+/// See the unix definition above; there is nothing to carry here.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, Default)]
+struct PipeFds;
+
 /// Both of a sheep's log files — the pair one [`LogCtl::Reopen`] swaps, and
-/// the pair one [`LogCtl::Flush`] drains.
+/// the pair one [`LogCtl::Flush`] drains — and the two stream descriptors
+/// alongside them, which is the set a handover carries.
 #[derive(Debug)]
 struct LogFiles {
     out: LogFile,
     err: LogFile,
+    /// The stream read ends the pump still holds, cleared per stream as
+    /// each one ends.
+    ///
+    /// Cleared rather than left standing because the reader is dropped at
+    /// the same moment, which closes the descriptor: a number the kernel is
+    /// free to hand to the next `open` must never reach a handover blob.
+    pipes: PipeFds,
 }
 
 impl LogFiles {
@@ -1150,6 +1205,26 @@ impl LogFiles {
                 // not truncate anything on the strength of an answer it never
                 // read.
                 let _ = done.send(result);
+            }
+            // The flush comes FIRST and in the same request, which is the
+            // whole point of the variant — see `LogCtl::ReportFds`. A
+            // failure is logged rather than reported: the answer has no room
+            // for one, and the descriptor is still the one to carry, since
+            // the successor inherits the same handle on the same file and is
+            // the only party left that could write to it.
+            #[cfg(unix)]
+            LogCtl::ReportFds { done } => {
+                for file in [&mut self.out, &mut self.err] {
+                    if let Err(error) = file.flush().await {
+                        tracing::error!(%error, "log flush before a handover report failed");
+                    }
+                }
+                let _ = done.send(crate::handover::CarriedFds {
+                    out_pipe: self.pipes.out,
+                    err_pipe: self.pipes.err,
+                    out_log: self.out.raw_fd(),
+                    err_log: self.err.raw_fd(),
+                });
             }
         }
     }
@@ -1343,6 +1418,7 @@ fn spawn_log_pump<O, E>(
     err_path: PathBuf,
     logs_tx: mpsc::Sender<LogLine>,
     mut ctl_rx: mpsc::Receiver<LogCtl>,
+    pipes: PipeFds,
 ) where
     O: AsyncRead + Unpin + Send + 'static,
     E: AsyncRead + Unpin + Send + 'static,
@@ -1351,6 +1427,7 @@ fn spawn_log_pump<O, E>(
         let mut files = LogFiles {
             out: LogFile::open(out_path).await,
             err: LogFile::open(err_path).await,
+            pipes,
         };
         let mut out_lines = stdout.map(|reader| BufReader::new(reader).lines());
         let mut err_lines = stderr.map(|reader| BufReader::new(reader).lines());
@@ -1364,14 +1441,30 @@ fn spawn_log_pump<O, E>(
                 result = next_line(&mut out_lines) => {
                     match deliver_line(result, false, &mut files, &logs_tx, &mut ctl_rx).await {
                         AfterLine::KeepReading => {}
-                        AfterLine::StreamEnded => out_lines = None,
+                        // Dropping the reader closes the descriptor, so the
+                        // number stops being ours in the same statement it
+                        // stops being readable.
+                        AfterLine::StreamEnded => {
+                            out_lines = None;
+                            #[cfg(unix)]
+                            {
+                                files.pipes.out = None;
+                            }
+                        }
                         AfterLine::LogsClosed => break,
                     }
                 }
                 result = next_line(&mut err_lines) => {
                     match deliver_line(result, true, &mut files, &logs_tx, &mut ctl_rx).await {
                         AfterLine::KeepReading => {}
-                        AfterLine::StreamEnded => err_lines = None,
+                        // As above: the number goes with the reader.
+                        AfterLine::StreamEnded => {
+                            err_lines = None;
+                            #[cfg(unix)]
+                            {
+                                files.pipes.err = None;
+                            }
+                        }
                         AfterLine::LogsClosed => break,
                     }
                 }
@@ -1639,6 +1732,8 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use core::task::{Context, Poll};
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::collections::BTreeSet;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
@@ -1650,6 +1745,8 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::handover::CarriedFds;
 
     // What needs a real OS child lives in `tests/real_runner.rs`; what is
     // reachable with no process at all belongs here (IR-38). The log pump is
@@ -1679,16 +1776,26 @@ mod tests {
     /// same observation.
     const STREAM_BUFFER: usize = 4096;
 
-    /// One pump over two in-memory streams and two real files — everything
+    /// One pump over two streams and two real files — everything
     /// [`spawn_log_pump`] takes, with no child process involved.
-    struct PumpHarness {
+    ///
+    /// Generic over the writing side only so the descriptor cases can swap
+    /// the in-memory pair for a real one: an in-memory pipe has no
+    /// descriptor at all, which is exactly why the pump is TOLD its stream
+    /// numbers rather than reading them off its own readers. Everything
+    /// else about the two harnesses is identical, and every case that is
+    /// about bytes uses the cheaper [`PumpHarness::start`].
+    struct PumpHarness<W = DuplexStream> {
         dir: tempfile::TempDir,
         out_path: PathBuf,
         err_path: PathBuf,
-        out_writer: DuplexStream,
-        err_writer: DuplexStream,
+        out_writer: W,
+        err_writer: W,
         logs: mpsc::Receiver<LogLine>,
         ctl: mpsc::Sender<LogCtl>,
+        /// The stream descriptor numbers this harness handed the pump, which
+        /// is what a descriptor report has to answer with.
+        pipes: PipeFds,
     }
 
     impl PumpHarness {
@@ -1707,6 +1814,7 @@ mod tests {
                 err_path.clone(),
                 logs_tx,
                 ctl_rx,
+                PipeFds::default(),
             );
             Self {
                 dir,
@@ -1716,9 +1824,68 @@ mod tests {
                 err_writer,
                 logs,
                 ctl,
+                pipes: PipeFds::default(),
+            }
+        }
+    }
+
+    /// A pump reading two REAL pipes, for the cases that are about
+    /// descriptor numbers rather than about bytes.
+    ///
+    /// `tokio::net::unix::pipe` is what a child's stdout actually is, so the
+    /// numbers this hands the pump are the same kind of thing a spawn hands
+    /// it, and the test can hold the writing ends open for as long as it
+    /// needs the reading ends to stay valid.
+    #[cfg(unix)]
+    impl PumpHarness<tokio::net::unix::pipe::Sender> {
+        fn start_over_pipes() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let out_path = dir.path().join("out.log");
+            let err_path = dir.path().join("err.log");
+            let (out_writer, out_reader) = tokio::net::unix::pipe::pipe().unwrap();
+            let (err_writer, err_reader) = tokio::net::unix::pipe::pipe().unwrap();
+            let pipes = PipeFds {
+                out: Some(out_reader.as_raw_fd()),
+                err: Some(err_reader.as_raw_fd()),
+            };
+            let (logs_tx, logs) = mpsc::channel(CHANNEL_CAPACITY);
+            let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            spawn_log_pump(
+                Some(out_reader),
+                Some(err_reader),
+                out_path.clone(),
+                err_path.clone(),
+                logs_tx,
+                ctl_rx,
+                pipes,
+            );
+            Self {
+                dir,
+                out_path,
+                err_path,
+                out_writer,
+                err_writer,
+                logs,
+                ctl,
+                pipes,
             }
         }
 
+        /// Sends a [`LogCtl::ReportFds`] and waits for the answer.
+        async fn report_fds(&self) -> CarriedFds {
+            let (done, ack) = oneshot::channel();
+            self.ctl
+                .send(LogCtl::ReportFds { done })
+                .await
+                .expect("the pump must still be reading its control channel");
+            timeout(PUMP_DEADLINE, ack)
+                .await
+                .expect("a descriptor report must be acknowledged")
+                .expect("the pump must answer rather than drop the acknowledgement")
+        }
+    }
+
+    impl<W: AsyncWrite + Unpin> PumpHarness<W> {
         /// Writes one line into the chosen stream and waits for the pump to
         /// hand it back on `logs` — which is proof the pump read it and
         /// issued its file write, and orders the two streams against each
@@ -1806,6 +1973,76 @@ mod tests {
             "{}: expected {expected:?}, found {:?}",
             path.display(),
             fs::read_to_string(path)
+        );
+    }
+
+    /// Whether `fd` names something open in this process.
+    ///
+    /// `F_GETFD` is the cheapest question the kernel answers about a
+    /// descriptor, and it is the one `handover::fds` already asks.
+    #[cfg(unix)]
+    fn is_open(fd: RawFd) -> bool {
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).is_ok()
+    }
+
+    /// Fails if a descriptor report answers with anything but the four
+    /// numbers the pump is really holding.
+    ///
+    /// The numbers must be the pump's own, not a guess: an fd number is only
+    /// meaningful in the process that owns it, and the whole handover is
+    /// built on carrying exactly these. The two stream numbers are asserted
+    /// against the ones this harness handed over, which is the half a
+    /// looser `is_some()` would let a wrong-but-open descriptor pass.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pump_reports_the_descriptors_it_holds() {
+        let pump = PumpHarness::start_over_pipes();
+        let fds = pump.report_fds().await;
+
+        assert_eq!(fds.out_pipe, pump.pipes.out, "stdout's read end");
+        assert_eq!(fds.err_pipe, pump.pipes.err, "stderr's read end");
+        assert!(
+            fds.out_log.is_some() && fds.err_log.is_some(),
+            "a pump that opened both log files must name both handles: {fds:?}"
+        );
+
+        let named: Vec<RawFd> = fds.all().into_iter().flatten().collect();
+        assert_eq!(named.len(), 4, "a running sheep has all four: {fds:?}");
+        for fd in &named {
+            assert!(
+                is_open(*fd),
+                "the blob would name a closed descriptor: {fd}"
+            );
+        }
+        let distinct: BTreeSet<RawFd> = named.iter().copied().collect();
+        assert_eq!(distinct.len(), 4, "four descriptors, four numbers: {fds:?}");
+    }
+
+    /// Fails if a report is answered before what the pump is holding has
+    /// reached the file.
+    ///
+    /// Written before the report, readable on disk after it, with no
+    /// settling in between — deliberately not [`assert_file_settles`], since
+    /// polling would let [`IDLE_FLUSH`] pass the case that the report itself
+    /// is supposed to have flushed. A blob whose descriptors are ready but
+    /// whose bytes are not is a log gap the successor cannot repair, because
+    /// the bytes died with the image at the exec.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reporting_flushes_first() {
+        let mut pump = PumpHarness::start_over_pipes();
+        pump.feed(false, "before-the-blob").await;
+        pump.feed(true, "and-on-stderr").await;
+
+        let _ = pump.report_fds().await;
+
+        assert_eq!(
+            fs::read_to_string(&pump.out_path).unwrap(),
+            "before-the-blob\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&pump.err_path).unwrap(),
+            "and-on-stderr\n"
         );
     }
 
@@ -1965,6 +2202,7 @@ mod tests {
         let mut files = LogFiles {
             out: LogFile::open(dir.path().join("out.log")).await,
             err: LogFile::open(dir.path().join("err.log")).await,
+            pipes: PipeFds::default(),
         };
         assert_eq!(
             files.flush_deadline(),
