@@ -848,13 +848,85 @@ A carried sheep with no descriptors (registered but stopped, `CarriedFds::none()
 
 #### Task 8d: the arms, and proving a sheep never noticed
 
-The fitness query over the socket (spec H3a), the CLI's arm choice, the SIGHUP handler, and the end-to-end tests.
+**Files:**
+- Modify: `crates/shep-core/src/protocol/request.rs` (a fitness query)
+- Modify: `crates/shep-daemon/src/rpc.rs`, `boot.rs` (answer it; the SIGHUP arm)
+- Modify: `crates/shep-cli/src/commands/daemon.rs` (`Arm::Handover`)
+- Test: an end-to-end integration test
 
-**The two assertions that define success live here**: a sheep's pid is unchanged across a reload, and its log gains no gap.
+**Cross-crate, so the cargo shape is `cargo test --workspace --all-features`.**
 
-Also here: delete the four `#[expect(dead_code)]` attributes, which fire as unfulfilled once their items are called. The module-level one in `handover/mod.rs` gets deleted outright rather than narrowed, and its reason string is already stale (it still names task 5).
+**The two assertions that define success, and the whole phase:**
 
-**One hazard, found while reviewing Task 8's refusal.** The pump reads through a `BufReader`, so bytes consumed but not yet a complete line die with the image, and the successor's fresh reader starts mid-line and emits the remainder as its own line. 8a's flush covers `LogFile`'s buffer, not that one. Under a chatty sheep the no-gap assertion sees a torn line rather than a missing one, so write it to catch both.
+- a sheep's pid is UNCHANGED across a `shep daemon reload`
+- its log gains no gap
+
+A version passing neither is the stop arm phase 1 already shipped.
+
+##### The fitness query, and why `PROTOCOL_VERSION` does not move
+
+Spec H3a: a signal carries no reply, so a daemon that takes SIGHUP, refuses, and falls back to its own graceful stop leaves the CLI polling for a successor nobody started. The CLI therefore asks first, over the socket, and only then chooses an arm.
+
+Adding a `Request` variant would normally bump `PROTOCOL_VERSION`, the way `SelectorSpec::Instance` did, because an older daemon cannot deserialize a variant it has never seen. **It does not need to here, and the reason is an invariant worth a test rather than a comment.**
+
+`daemon reload` is an exempt verb, so it connects to a mismatched daemon deliberately. It learns the daemon's version from the handshake, and a daemon predating the handover takes the stop arm **without the query ever being sent**. So no daemon that cannot parse the variant is ever asked. Pin that with a test: a reload against an older daemon must reach the stop arm and must not send a fitness query.
+
+If that invariant cannot be held, bump the version rather than shipping a query an old daemon meets as a parse error.
+
+##### What SIGHUP does
+
+Phase 1 made it a graceful stop so a stray signal could never drop a flock uncleanly. It now hands over, because the CLI has already asked and only signals a flock it was told is carryable. Keep the graceful stop as the arm taken when a handover cannot proceed.
+
+##### The torn-line hazard
+
+The pump reads through a `BufReader`, so bytes consumed but not yet a complete line die with the image, and the successor's fresh reader starts mid-line and emits the remainder as its own line. 8a's flush covers `LogFile`'s buffer, not that one.
+
+**Write the no-gap assertion to catch a torn line, not only a missing one.** A sheep emitting a numbered sequence across the reload is the cheap version: assert every number appears exactly once, in order, each on its own line.
+
+##### Cleanup that comes due here
+
+Four `#[expect(dead_code)]` attributes fire as unfulfilled once their items are called. `handover/mod.rs`'s module-level one gets deleted outright rather than narrowed, and its reason text is already stale.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn a_sheep_keeps_its_pid_and_its_log_across_a_handover() {
+    let before = flock_pids().await;
+    let seen_before = read_sequence();
+    reload().await;
+    assert_eq!(flock_pids().await, before, "a moved pid means it was respawned");
+    let seen = read_sequence();
+    assert!(seen.len() > seen_before.len(), "the sheep stopped logging");
+    assert_no_duplicates_or_tears(&seen);
+}
+
+#[tokio::test]
+async fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
+    // The gate doing its job. Not a handover, and not a failure either.
+    let out = reload_with_channel_sheep().await;
+    assert!(out.contains("shepherd channel"), "{out}");
+    assert_ne!(flock_pids().await, before, "the stop arm does restart");
+}
+
+#[tokio::test]
+async fn a_reload_against_an_older_daemon_never_sends_the_query() {
+    // What keeps PROTOCOL_VERSION where it is.
+    let sent = record_requests(|| reload_against_version("0.1.8")).await;
+    assert!(!sent.iter().any(is_fitness_query), "{sent:?}");
+}
+
+#[tokio::test]
+async fn the_control_socket_accepts_throughout() { ... }
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+- [ ] **Step 3: Implement**
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Full phase gate, then commit**
 
 ## Phase gate
 
