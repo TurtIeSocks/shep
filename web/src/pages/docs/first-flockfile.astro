@@ -26,6 +26,28 @@ const initScaffold = `# Manage your app in a Flockfile
 # Where the process runs. Without it, the daemon's own directory
 #cwd = "/srv/app"`;
 
+const stockDemo = `$ shep stock web 4
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM     UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    3.0M    0s      -     -
+1   web:1   online  62889  0         -     -    3.0M    0s      -     -
+3   web:2   online  62936  0         -     -    176.0K  0s      -     -
+4   web:3   online  62937  0         -     -    144.0K  0s      -     -
+2   worker  online  62890  0         -     -    3.0M    0s      -     -
+
+$ shep stock web 2
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    3.0M  1s      -     -
+1   web:1   online  62889  0         -     -    3.0M  1s      -     -
+3   web:2   online  62936  0         -     -    0B    1s      -     -
+4   web:3   online  62937  0         -     -    0B    1s      -     -
+2   worker  online  62890  0         -     -    3.0M  1s      -     -
+
+$ shep flock
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    3.0M  2s      -     -
+1   web:1   online  62889  0         -     -    3.0M  2s      -     -
+2   worker  online  62890  0         -     -    3.0M  2s      -     -`;
+
 const initJsonRefusal = `$ shep init deploy.json --all
 error[usage]: JSON has no comment syntax, so a full scaffold would pin every default instead of explaining it; write a .json5 Flockfile for the same syntax with comments, or drop --all`;
 
@@ -384,6 +406,33 @@ Z_DEVICE_ID = "z-{{instance}}d"`}</CodeBlock>
       refused rather than silently overwritten:
     </p>
     <CodeBlock label="env sets a reserved variable">{`error[invalid_config]: the daemon reported InvalidConfig: sheep \`z-worker\` sets \`SHEP_INSTANCE\` in env, but shep injects it: use a different name, or \`{{instance}}\` in your own variable`}</CodeBlock>
+
+    <h2>Changing the count without editing the file</h2>
+    <VerbSignature verb="stock" aliases={["scale"]} usage="shep stock <name> <n>">
+      <p>
+        An absolute count, not a change: <code>shep stock web 4</code> means
+        web has four instances afterwards, whatever it had before. There is
+        no <code>+N</code> or <code>-N</code> form, so running it twice
+        leaves the same flock as running it once.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{stockDemo}</CodeBlock>
+    <p>
+      Stocking up fills the lowest free slots, and stocking down releases the
+      highest, so stocking out and back gives you the same slot numbers, the
+      same <code>SHEP_INSTANCE</code> values and the same log files you
+      started with. Slots are not ids: <code>web:2</code> above arrived with
+      id 3, because an id is handed out once per sheep and a slot describes
+      its place in the app.
+    </p>
+    <p>
+      The second command printed four instances because it answers the
+      moment the shepherd accepts, and the two on their way out were still
+      running their stop ladders at that point. They report themselves on
+      the bus under <code>process.delete</code>, and a listing a moment later
+      shows the flock settled. The new count goes into the muster roll, so{" "}
+      <a href="/docs/startup">a reboot</a> keeps it.
+    </p>
 
     <h2>The full field reference</h2>
     <p>
