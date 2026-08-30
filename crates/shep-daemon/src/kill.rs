@@ -24,7 +24,11 @@ use crate::runner::{ExitOutcome, RunningProcess, StopSignal};
 ///    `stop_signal` parser from `app.kill_signal`) to the sheep's whole
 ///    process group — lambs included, see [`RunningProcess::signal`].
 /// 2. Waits up to `grace` for the process to exit.
-/// 3. On timeout, SIGKILLs the whole process tree and waits for that to land.
+/// 3. On timeout, `SIGKILL`s that SAME process group and waits for that to
+///    land — not the whole process tree, which is what the block comment
+///    below spends a paragraph explaining this rung cannot reach. On
+///    Windows it is the sheep's whole job, which nothing escapes; see
+///    `RunningProcess::kill_tree`'s two arms.
 ///
 /// `grace` is the caller's, not the app's, because an app configures two of
 /// them for two different asks: `kill_timeout` for an ordinary stop, and
