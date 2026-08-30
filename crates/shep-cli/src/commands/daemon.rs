@@ -717,10 +717,17 @@ async fn hand_over(
         Ok(pid) => pid,
         Err(code) => return code,
     };
+    // Opened BEFORE the signal, and held across it. The predecessor's
+    // accepted connections are not carried across its `execve`, so this one
+    // closing is the proof that the old image is gone. Without it there is
+    // no way to tell a successor from a predecessor that has been signalled
+    // and has not execed yet: both answer, on the same pid, at the same
+    // version.
+    let witness = Client::connect(&paths.socket).await.ok();
     if let Err((code, message)) = signal_handover(pid) {
         return streams.fail(code, &message);
     }
-    match await_successor(paths, wait).await {
+    match await_successor(paths, witness, wait).await {
         // The successor carried the flock; nothing to restore.
         Some(client) => report_reload(&client, streams, false).await,
         None => {
@@ -779,8 +786,36 @@ fn signal_handover(pid: u32) -> Result<(), (ExitCode, String)> {
 /// A connect failure inside the window is expected, not a fault: the
 /// successor is mid-boot and has not accepted yet.
 #[cfg(unix)]
-async fn await_successor(paths: &ShepPaths, wait: std::time::Duration) -> Option<Client> {
+async fn await_successor(
+    paths: &ShepPaths,
+    witness: Option<Client>,
+    wait: std::time::Duration,
+) -> Option<Client> {
     let deadline = tokio::time::Instant::now() + wait;
+
+    // Stage one: wait out the predecessor. A request answered on `witness`
+    // says the OLD image is still serving, because that connection cannot
+    // survive its exec. Only once it stops answering is a fresh connection
+    // worth trusting.
+    //
+    // Skipped when no witness could be opened, which means nothing was
+    // answering before the signal either, so there is no predecessor to
+    // outlive.
+    if let Some(witness) = witness {
+        while witness
+            .request(shep_core::protocol::Request::ListFlock)
+            .await
+            .is_ok()
+        {
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(SUCCESSOR_POLL_INTERVAL).await;
+        }
+    }
+
+    // Stage two: the old image is gone. Now an answered request can only
+    // have come from the successor.
     loop {
         // A handshake proves a daemon answered. It does NOT prove the
         // answer came from the successor, and the two are genuinely
