@@ -13,6 +13,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-08-30
+
+### Added
+
+- The handshake refusal names the daemon's version
+- Refuse a shepherd whose version differs, and name the fix
+- Guard the three verbs that connect on their own
+- Shep daemon reload, the verb the skew refusal names
+- Make shep daemon reload discoverable from --help
+
+### Fixed
+
+- Shep kill can stop a daemon that refuses the handshake
+- A refusal is not an absence
+- Sanitise the daemon's version before printing the refusal
+
+
 ## [0.1.16] - 2026-08-30
 
 ### Fixed
