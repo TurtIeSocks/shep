@@ -251,6 +251,35 @@ version, which is a stronger check than a reply would have been: it proves
 the successor is serving, not merely that the predecessor received
 something.
 
+### H3a. The trigger is a signal; the DECISION is a question over the socket
+
+Found while implementing 2a, and it is a hole in H3 rather than a detail
+under it.
+
+A signal carries no reply. So a daemon that receives SIGHUP, decides it
+cannot carry its flock, and falls back to its own graceful stop leaves the
+CLI polling for a successor that nobody started. The flock goes down the
+kill ladder and stays down. That is worse than either arm.
+
+**So the CLI asks before it signals.** It queries fitness over the control
+socket, and only then chooses: a `Carryable` answer sends SIGHUP, a
+`Refused` answer runs the stop arm and prints the reason.
+
+This does not weaken H3, which says a socket REQUEST cannot be the trigger.
+The trigger is still the signal. What moves to the socket is the decision,
+and it can only ever be needed where the socket already works:
+
+- to pick the handover arm at all, the CLI must know the daemon's version,
+  which requires a successful handshake
+- a handshake that succeeds means the socket is good, so a fitness query
+  works too
+- a handshake that fails means the stop arm regardless, and fitness never
+  comes up
+
+The refusal also has to reach the operator rather than the daemon log. They
+ran `shep daemon reload`; the sentence explaining why their flock restarted
+belongs in front of them.
+
 ### H4. `shep daemon reload` is the one verb
 
 It reports what happened to each sheep rather than announcing that the
