@@ -159,8 +159,24 @@ of two overlapping instances answered it. Serialising costs a gap you can
 see, the drain plus the replacement's start, and buys a success you can
 trust. It also fixes a failure the overlap never worked around: an app that
 does not set `SO_REUSEPORT` cannot have two instances bound to one port, so
-overlapping it spawns a replacement that takes `EADDRINUSE` and crash-loops.
-That includes every Node app on macOS, where the option is `ENOTSUP`.
+overlapping it spawns a replacement that takes `EADDRINUSE` and dies. That
+includes every Node app on macOS, where the option is `ENOTSUP`.
+
+The replacement dies ONCE. This paragraph said "crash-loops" until
+2026-08-30 and that is not what happens. Measured twice independently, with
+`autorestart = true`: the reload aborts and the instance being replaced is
+still online afterwards, on its original pid, with its restart count still
+at zero. The ordering is why. `SpawnNew` precedes `DrainOld`, so a
+replacement that never reaches `AwaitReady` means `DrainOld` never runs and
+nothing was ever dropped. The overlap fails safe.
+
+Recorded in that direction deliberately. The old wording described worse
+behaviour than shep has, and an operator told to expect a crash loop goes
+looking for a restart storm that was never there. The real defect is the
+opposite kind and is still open: the daemon logs NOTHING about the aborted
+reload, so the only evidence is `EADDRINUSE` in the sheep's own stderr file.
+That silence is the same shape as a version-mismatched dog reporting
+`online` while doing nothing.
 
 `reuse_port` is the app's own claim that it sets `SO_REUSEPORT` before its
 own `bind()`. shep never binds a listen socket on an app's behalf and cannot
