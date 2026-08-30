@@ -887,7 +887,7 @@ The pump reads through a `BufReader`, so bytes consumed but not yet a complete l
 
 Four `#[expect(dead_code)]` attributes fire as unfulfilled once their items are called. `handover/mod.rs`'s module-level one gets deleted outright rather than narrowed, and its reason text is already stale.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test]
@@ -920,13 +920,13 @@ async fn a_reload_against_an_older_daemon_never_sends_the_query() {
 async fn the_control_socket_accepts_throughout() { ... }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
-- [ ] **Step 5: Full phase gate, then commit**
+- [x] **Step 5: Full phase gate, then commit**
 
 ## Phase gate
 
