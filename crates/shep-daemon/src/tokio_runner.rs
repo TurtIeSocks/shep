@@ -2198,6 +2198,60 @@ mod tests {
         assert_eq!(distinct.len(), 4, "four descriptors, four numbers: {fds:?}");
     }
 
+    /// Fails if a report still names a stream whose descriptor the pump has
+    /// already let go of.
+    ///
+    /// The `files.pipes.out = None` in the `StreamEnded` arm is the guard
+    /// that keeps a closed descriptor out of a handover blob, and nothing
+    /// else in this file exercises it.
+    /// [`a_pump_reports_the_descriptors_it_holds`] reports while both
+    /// streams are live, so it passes whether or not the clearing exists.
+    ///
+    /// A number is the whole of what the blob carries, and a closed one is
+    /// free for the next `open` in this process to be handed. The successor
+    /// would then adopt whatever that open produced as this sheep's stdout,
+    /// which `adopt`'s kind check catches only when the two happen to be
+    /// different kinds of object.
+    ///
+    /// One stream, not both. `err_pipe` staying at the harness's own number
+    /// is what makes this a case about the ended stream rather than about a
+    /// pump that stopped answering.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_after_a_stream_ends_names_no_descriptor_for_it() {
+        let mut pump = PumpHarness::start_over_pipes();
+        pump.feed(false, "before-the-eof").await;
+
+        drop(pump.out_writer);
+        let_the_pump_settle().await;
+
+        // Sent through the field rather than through `report_fds`, because
+        // dropping the writer above moves out of the harness and a `&self`
+        // method is no longer reachable. Same request either way.
+        let (done, ack) = oneshot::channel();
+        pump.ctl
+            .send(LogCtl::ReportFds { done })
+            .await
+            .expect("a pump with one live stream still reads its control channel");
+        let fds = timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a descriptor report must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        assert_eq!(
+            fds.out_pipe, None,
+            "stdout is at EOF and its descriptor is gone: {fds:?}"
+        );
+        assert_eq!(
+            fds.err_pipe, pump.pipes.err,
+            "stderr is still live and keeps its own number: {fds:?}"
+        );
+        assert!(
+            fds.out_log.is_some() && fds.err_log.is_some(),
+            "both log handles are held whichever stream ended: {fds:?}"
+        );
+    }
+
     /// Fails if a report is answered before what the pump is holding has
     /// reached the file.
     ///
