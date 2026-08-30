@@ -610,25 +610,109 @@ The three seams Task 6 predicted are all confirmed small. They are also not the 
 
 **The fallback design changed too. See the spec's new H3a.** A daemon that refuses internally and stops gracefully leaves the CLI polling for a successor nobody started, so fitness is now asked over the socket before the CLI signals.
 
-#### Task 8a: report descriptors and build the blob
+#### Task 8a: report descriptors, and build the blob from a live flock
 
-`LogCtl` gains a variant that flushes and reports the four raw fds. A supervisor command fans it out over the flock, waits, and assembles both the `Candidate` list and the `Handover` blob from inside the actor, where the private counters and `SheepSlot` fields are reachable. Ends with a test that a blob built from a live flock names four open descriptors per sheep.
+**Files:**
+- Modify: `crates/shep-daemon/src/runner.rs` (`LogCtl`)
+- Modify: `crates/shep-daemon/src/tokio_runner.rs` (the log pump's handler)
+- Modify: `crates/shep-daemon/src/supervisor.rs` (a new actor command)
+- Test: alongside each
+
+**Interfaces:**
+- Produces: a supervisor command returning `Result<(Vec<Candidate>, Handover), _>`, consumed by 8d.
+
+The four descriptors `CarriedFds` names are owned by the log pump task, inside `Lines<BufReader<ChildStdout>>` and `LogFile`. Nothing outside that task can see them, and `LogCtl` today has only `Reopen` and `Flush` (`runner.rs:102`).
+
+**Flush and report in ONE round trip, not two.** A pump that reports its numbers and is then asked separately to flush leaves a window where the buffered bytes are not on disk but the blob already claims the descriptor is ready to carry. The new variant does both and acknowledges once, which is the same shape `Reopen` already uses.
+
+**The counters and the per-slot fields are only reachable inside the actor.** `next_id`, `next_deadline` and `next_action_stamp` are private `Actor` fields; `epoch`, `manual` and `pending_delete` are on the private `SheepSlot`. So the command assembles both the `Candidate` list and the `Handover` from in there, rather than exposing accessors.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn a_pump_reports_the_descriptors_it_holds() {
+    // The numbers must be the pump's own, not a guess: an fd number is only
+    // meaningful in the process that owns it, and the whole handover is
+    // built on carrying exactly these.
+    let (pump, ctl) = spawn_pump_fixture().await;
+    let fds = ask_for_fds(&ctl).await.unwrap();
+    assert!(fds.out_pipe.is_some() && fds.err_pipe.is_some());
+    assert!(fds.out_log.is_some() && fds.err_log.is_some());
+    assert!(all_distinct(&fds));
+}
+
+#[tokio::test]
+async fn reporting_flushes_first() {
+    // Written before the report, readable on disk after it. A blob whose
+    // descriptors are ready but whose bytes are not is a log gap the
+    // successor cannot repair, because the bytes died with the image.
+    let (pump, ctl) = spawn_pump_fixture().await;
+    write_line(&pump, "before-the-blob").await;
+    let _ = ask_for_fds(&ctl).await.unwrap();
+    assert!(read_log_file().contains("before-the-blob"));
+}
+
+#[tokio::test]
+async fn a_blob_from_a_live_flock_names_four_open_descriptors_per_sheep() {
+    let sup = supervisor_with_two_plain_sheep().await;
+    let (candidates, blob) = sup.handover_snapshot().await.unwrap();
+    assert_eq!(candidates.len(), 2);
+    for s in &blob.sheep {
+        for fd in s.fds.all() {
+            assert!(is_open(fd.unwrap()), "blob names a closed descriptor");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_snapshot_carries_the_actors_counters_and_slot_state() {
+    // These are the fields nothing outside the actor can see, and the
+    // reason this is a command rather than a getter.
+    let sup = supervisor_with_a_pending_stop().await;
+    let (candidates, blob) = sup.handover_snapshot().await.unwrap();
+    assert!(candidates[0].pending_stop, "a pending stop must reach the gate");
+    assert!(blob.next_id > 0, "a successor that reissues a live id collides");
+}
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: handover_snapshot`
+
+- [ ] **Step 3: Implement**
+
+Add the `LogCtl` variant. Follow `Reopen`'s existing shape for the acknowledgement channel rather than inventing a second one, and give its doc comment the flush-and-report reasoning above.
+
+A sheep with no live pump (registered but stopped) reports `None` for all four. That is the `Option<RawFd>` case `CarriedFds` already models, and Task 1's gate does not refuse it: a stopped sheep has no descriptors to carry and nothing to lose.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Task gate, then commit**
 
 #### Task 8b: the adopt seam on the runner
 
-`ProcessRunner` gains a defaulted `adopt` (IR-20, so out-of-tree implementors do not break). `TokioProc` becomes spawned-or-adopted, backed by Task 7's `AdoptedReaper` on the adopted arm. `ProcIo` is built from adopted handles. The three small seams land here: `LogFile::from_file`, `Listener`'s constructor in shep-core, and the `PidfileLock` arm that holds an already-locked descriptor without re-locking.
+`ProcessRunner` gains a defaulted `adopt` (IR-20, so an out-of-tree implementor does not break). `TokioProc` becomes spawned-or-adopted, backed by Task 7's `AdoptedReaper` on the adopted arm, and `ProcIo` is built from adopted handles.
 
-#### Task 8c: the successor boot path
+The three seams Task 6 measured land here, all confirmed small: `LogFile::from_file` taking an open handle plus its path, a `#[cfg(unix)]` constructor on `shep_core::transport::Listener`, and a `PidfileLock` arm holding an already-locked descriptor. **That arm must not re-lock**, since the descriptor crossed the exec with its `flock` intact and re-acquiring means releasing first.
 
-Bind carried sheep to muster-roll apps by name and instance, and install adopted slots in the actor without spawning. This is where 5's design decision gets made and written down.
+#### Task 8c: install the adopted flock
+
+Insert slots carrying the blob's ids, epochs, statuses and `last_exit`, without spawning. `spawn_fresh` is the only path that inserts a live slot today.
+
+**This is much smaller than it was, because the blob now carries each sheep's `AppConfig`.** The earlier version had to rebuild every spec from the muster roll and bind carried sheep to roll apps by name and instance, against a roll that records a running count rather than which slots were up, with `muster` starting whatever it restored. All of that is gone: the blob is self-sufficient, there is no second source of truth, and no restore-without-spawning path is needed.
+
+Re-normalize each carried `AppConfig` to recover its `ResolvedApp`, exactly as `snapshot.rs:333` already does on a muster.
 
 #### Task 8d: the arms, and proving a sheep never noticed
 
-The fitness query over the socket, the CLI's arm choice, the SIGHUP handler, and the end-to-end tests. **The two assertions that define success live here**: a sheep's pid is unchanged across a reload, and its log gains no gap.
+The fitness query over the socket (spec H3a), the CLI's arm choice, the SIGHUP handler, and the end-to-end tests.
 
-Also here: delete the four `#[expect(dead_code)]` attributes, which fire as unfulfilled once their items are called.
+**The two assertions that define success live here**: a sheep's pid is unchanged across a reload, and its log gains no gap.
 
-**One hazard for 8d, found while reviewing 8's refusal.** The pump reads through a `BufReader`, so bytes consumed but not yet a complete line die with the image, and the successor's fresh reader starts mid-line and emits the remainder as its own line. A pre-exec flush handles `LogFile`'s buffer but not that one. Under a chatty sheep the no-gap assertion would catch it as a torn line rather than a missing one.
+Also here: delete the four `#[expect(dead_code)]` attributes, which fire as unfulfilled once their items are called. The module-level one in `handover/mod.rs` gets deleted outright rather than narrowed, and its reason string is already stale (it still names task 5).
+
+**One hazard, found while reviewing Task 8's refusal.** The pump reads through a `BufReader`, so bytes consumed but not yet a complete line die with the image, and the successor's fresh reader starts mid-line and emits the remainder as its own line. 8a's flush covers `LogFile`'s buffer, not that one. Under a chatty sheep the no-gap assertion sees a torn line rather than a missing one, so write it to catch both.
 
 ## Phase gate
 
