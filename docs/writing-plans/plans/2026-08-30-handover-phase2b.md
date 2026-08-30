@@ -12,9 +12,9 @@
 
 **The three structural tasks come first.** The tear is not a property of the sheep 2b adds; it affects every sheep 2a already carries. Widening the gate first would ship a known defect to more apps and make it harder to attribute when it bites. Fix the foundation, then widen.
 
-1. carry the pump's reader buffer
+1. quiesce the pump at the report (was "carry the reader buffer"; that design was measured and rejected, see Task 1)
 2. give `report_fds` a deadline, with an answer that distinguishes a wedged pump from a stopped one
-3. pin a reported descriptor until the exec
+3. pin a reported descriptor until the exec (folded into 1: a parked pump cannot release a number)
 4. stdin
 5. the shepherd channel
 6. multi-instance
