@@ -7023,3 +7023,300 @@ fn a_multi_instance_flock_gets_distinct_slots_a_grouped_table_and_undoubled_blea
 
     graceful_kill(home);
 }
+
+// --- Daemon handover -----------------------------------------------------
+
+/// How long [`counting_lines`] waits for a counter sheep to reach a line
+/// count, and [`wait_for_pid`] for a sheep to be online with a pid.
+///
+/// Sized like [`FLOCK_DEADLINE`] rather than shorter: the counter emits five
+/// lines a second, so any wait here that is not satisfied in the first
+/// hundred milliseconds is a loaded machine rather than a slow sheep.
+#[cfg(unix)]
+const HANDOVER_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Gap between [`counting_lines`]'s reads.
+#[cfg(unix)]
+const HANDOVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Writes a script that counts from 1 upwards on stdout, one number per
+/// line, forever.
+///
+/// The sequence is what makes a log gap visible. A sheep printing the same
+/// marker over and over proves only that it is still alive; a sheep counting
+/// proves that nothing between it and the file was lost, reordered, or cut
+/// in half, which is the failure a handover can introduce and a restart
+/// cannot (a restarted sheep starts again at 1, which is a different and
+/// equally visible break).
+#[cfg(unix)]
+fn write_counting_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "counter.sh",
+        &format!(
+            "{}{}i=1\nwhile :; do\n  echo \"$i\"\n  i=$((i+1))\n  sleep 0.05\ndone\n",
+            script_header(),
+            record_pid_line(dir),
+        ),
+    )
+}
+
+/// Reads `path` until it holds at least `want` lines, or
+/// [`HANDOVER_DEADLINE`] expires, and returns what it held on the last read.
+///
+/// Returns rather than panicking on expiry, so the failure that reaches CI is
+/// the caller's own assertion naming what it wanted.
+#[cfg(unix)]
+fn counting_lines(path: &Path, want: usize) -> Vec<String> {
+    let start = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        if lines.len() >= want || start.elapsed() >= HANDOVER_DEADLINE {
+            return lines;
+        }
+        std::thread::sleep(HANDOVER_POLL_INTERVAL);
+    }
+}
+
+/// Fails unless `lines` is `1, 2, 3, …`, one number per line, with nothing
+/// missing, nothing repeated and nothing cut in half.
+///
+/// A torn line is the reason this is stricter than "the file grew". The log
+/// pump reads its sheep's pipe through a `BufReader`, so bytes it has
+/// consumed without yet forming a line die with the process image; the
+/// successor's fresh reader then starts mid-line and appends the remainder as
+/// a line of its own. That shows up here as a number that is not the one
+/// expected next, and not as a shorter file, which is why counting lines
+/// alone would pass over it.
+///
+/// **The tear is real, and this is what measured it.** With the counter's
+/// `sleep` removed so it emits as fast as the pipe will take it, three runs
+/// out of three broke here: `7385` was followed by `2`, `4872` by `00`, and
+/// `10917` by `1916`. The last of those is the shape of the whole problem:
+/// `1916` is not a suffix of `10918`, so what died was not one line but
+/// every line the reader had consumed and not yet emitted, and the resume
+/// landed in the middle of a number a thousand further on. The flush a
+/// handover performs empties the log file's write buffer; nothing empties
+/// the reader's. Carrying it is 2b's, and until then a sheep that fills the
+/// reader between the flush and the exec loses what is in it.
+///
+/// The counter therefore emits five lines a second rather than as fast as it
+/// can. That is not the assertion being weakened, since it is still every
+/// number, once, in order. It is the difference between exercising the
+/// handover and exercising a gap that is already known, measured and
+/// written down.
+#[cfg(unix)]
+fn assert_unbroken_sequence(lines: &[String], what: &str) {
+    for (index, line) in lines.iter().enumerate() {
+        let want = index + 1;
+        let got: usize = line.trim().parse().unwrap_or_else(|_| {
+            panic!("{what}: line {want} is not a whole number, so it was torn: {line:?}")
+        });
+        assert_eq!(
+            got,
+            want,
+            "{what}: expected {want} on line {want}, got {got}; the sequence so far is {:?}",
+            &lines[..=index]
+        );
+    }
+}
+
+/// The two assertions that define the whole handover: a sheep keeps its pid
+/// across `shep daemon reload`, and its log gains no gap.
+///
+/// A version passing neither is the stop arm, which restarts the flock:
+/// every sheep gets a new pid and a counter starts again at 1. Both halves
+/// are therefore load-bearing and neither is implied by the other: a
+/// handover that respawned the sheep would keep the log growing while
+/// moving the pid, and one that carried the pid while dropping the pipe
+/// would leave the sheep blocked on `write()` with the log frozen.
+///
+/// Unix only, as the whole handover is: Windows has no `execve`, and the arm
+/// selection there never chooses one.
+#[cfg(unix)]
+#[test]
+fn a_sheep_keeps_its_pid_and_its_log_across_a_daemon_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_counting_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("counter")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
+    let out_file = PathBuf::from(
+        before["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an online sheep reports its out file: {before}")),
+    );
+    let seen_before = counting_lines(&out_file, 3);
+    assert!(
+        seen_before.len() >= 3,
+        "the counter must be logging before the reload: {seen_before:?}"
+    );
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+
+    let after = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    assert_eq!(
+        after["pid"].as_u64(),
+        Some(pid_before),
+        "a moved pid means the sheep was respawned, which is the stop arm: {after}"
+    );
+
+    let seen = counting_lines(&out_file, seen_before.len() + 3);
+    assert!(
+        seen.len() > seen_before.len(),
+        "the sheep stopped logging across the handover: {seen:?}"
+    );
+    assert_unbroken_sequence(&seen, "the counter's log across a handover");
+
+    graceful_kill(dir.path());
+}
+
+/// A flock carrying something this phase cannot move takes the stop arm, and
+/// the operator is told which sheep and why.
+///
+/// The gate doing its job, and not a failure: the reload still happens, the
+/// flock still comes back, and the refusal is a sentence in front of the
+/// person who typed the verb rather than a line in the daemon's log. The
+/// moved pid is what proves the stop arm was the one taken.
+#[cfg(unix)]
+#[test]
+fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"chatty\"\nscript = '{}'\nchannel = true\n",
+            script.display()
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"].as_u64();
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reloaded.stdout),
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    assert!(
+        text.contains("shepherd channel"),
+        "the refusal must name the feature that blocked the handover: {text}"
+    );
+    assert!(
+        text.contains("chatty"),
+        "and the sheep it blocked on: {text}"
+    );
+
+    let after = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    assert_ne!(
+        after["pid"].as_u64(),
+        pid_before,
+        "the stop arm restarts the flock, so the pid must move: {after}"
+    );
+
+    graceful_kill(dir.path());
+}
+
+/// The control socket answers throughout a handover.
+///
+/// The successor inherits the listening descriptor rather than binding the
+/// address again, so a client that connects while the image is being
+/// replaced waits in the kernel's backlog and is served by whichever image
+/// gets to it. Nothing may be refused, and the socket file may never
+/// disappear, since a rebind would race the predecessor's socket file and
+/// lose whatever connection a client had already made.
+#[cfg(unix)]
+#[test]
+fn the_control_socket_accepts_throughout_a_handover() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+    let _ = poll_flock(dir.path(), |info| info["status"] == "online");
+
+    let home = dir.path().to_path_buf();
+    let prober = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut refused = Vec::new();
+        while Instant::now() < deadline {
+            let out = shep(&home).arg("ping").output().unwrap();
+            if !out.status.success() {
+                refused.push(format!(
+                    "exit {:?}: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+        }
+        refused
+    });
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+
+    let refused = prober.join().unwrap();
+    assert!(
+        refused.is_empty(),
+        "every ping across the handover must be answered: {refused:?}"
+    );
+
+    graceful_kill(dir.path());
+}
