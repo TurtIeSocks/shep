@@ -128,7 +128,15 @@ pub(crate) fn sample_host() -> Option<HostReading> {
     let system = System::new_with_specifics(
         RefreshKind::nothing()
             .with_memory(MemoryRefreshKind::everything())
-            .with_processes(ProcessRefreshKind::nothing()),
+            // `.without_tasks()`, and `nothing()` does not already mean it:
+            // `ProcessRefreshKind::nothing()` is `Default::default()`, whose
+            // one `true` field is `tasks`. Left on, sysinfo's Linux backend
+            // inserts every THREAD on the machine into `processes()` as a row
+            // of its own, so `processes` below reports the host's thread
+            // count rather than its process count — 354 against 46 on the box
+            // this was found on. It is the cheaper walk too: without it every
+            // scrape reads `/proc/<pid>/task/` for every process on the host.
+            .with_processes(ProcessRefreshKind::nothing().without_tasks()),
     );
     Some(HostReading {
         memory_total_bytes: system.total_memory(),
