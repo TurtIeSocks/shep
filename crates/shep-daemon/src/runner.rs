@@ -188,8 +188,8 @@ pub enum LogCtl {
         done: oneshot::Sender<Result<(), FlushError>>,
     },
     /// Write out whatever the pump has buffered, wait for it to reach the
-    /// files, then acknowledge with the four descriptor numbers the pump is
-    /// holding. Sent while assembling a daemon handover.
+    /// files, then acknowledge with the descriptor numbers a blob is to
+    /// name for this sheep. Sent while assembling a daemon handover.
     ///
     /// # Why the flush and the report are one request
     ///
@@ -909,7 +909,7 @@ pub trait ProcessRunner: Send + Sync + 'static {
 /// One inherited sheep, and everything a runner needs to supervise it again.
 ///
 /// Produced by the successor's `handover::adopt` and consumed by
-/// [`ProcessRunner::adopt`]. The four handles are owned, because adopting is
+/// [`ProcessRunner::adopt`]. The handles are owned, because adopting is
 /// exactly the act of taking ownership of them; `None` on a pair means the
 /// predecessor had no handle to carry, which is what a sheep whose log open
 /// had failed, or one with no live pump, looks like.
@@ -937,6 +937,13 @@ pub struct AdoptSpec {
     pub out_log: Option<tokio::fs::File>,
     /// The appending handle on its stderr log, likewise.
     pub err_log: Option<tokio::fs::File>,
+    /// The write end of its stdin pipe, still the one the child reads from,
+    /// for a sheep whose app asked for one.
+    ///
+    /// The one handle here the daemon writes to. `None` is the commoner
+    /// sheep, which has `/dev/null` on fd 0, and an adoption puts a stdin
+    /// pump back only when there is an end for it to write to.
+    pub stdin_pipe: Option<tokio::net::unix::pipe::Sender>,
     /// The one reaper this successor waits every adopted pid through.
     ///
     /// Shared rather than owned per sheep: a status can be collected once,

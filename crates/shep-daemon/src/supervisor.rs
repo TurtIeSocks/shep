@@ -3480,6 +3480,7 @@ impl<R: ProcessRunner> Actor<R> {
             err_pipe,
             out_log,
             err_log,
+            stdin_pipe,
         } = sheep;
         let app = normalize(carried.app().clone()).map_err(|source| AdoptError::Spec {
             sheep: carried.name().to_string(),
@@ -3563,6 +3564,7 @@ impl<R: ProcessRunner> Actor<R> {
                 err_pipe,
                 out_log,
                 err_log,
+                stdin_pipe,
                 reaper: Arc::clone(reaper),
             })
             .map_err(|source| AdoptError::Runner {
@@ -17380,8 +17382,8 @@ mod tests {
         nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).is_ok()
     }
 
-    /// Fails if a snapshot of a live flock does not name four open
-    /// descriptors for every sheep in it.
+    /// Fails if a snapshot of a live flock does not name an open
+    /// descriptor for everything the fake pump reports.
     ///
     /// The blob is what the successor adopts by number, and a number it
     /// cannot adopt is not a gap it can repair: losing a sheep's stdout read
@@ -17389,7 +17391,7 @@ mod tests {
     /// reads as an application hang rather than as a shep bug.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
-    async fn a_blob_from_a_live_flock_names_four_open_descriptors_per_sheep() {
+    async fn a_blob_from_a_live_flock_names_open_descriptors_per_sheep() {
         let (events, _rx) = crate::bus::test_bus(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
@@ -17410,7 +17412,7 @@ mod tests {
         assert_eq!(blob.sheep().len(), 2);
         for sheep in blob.sheep() {
             for fd in sheep.fds().all() {
-                let fd = fd.expect("a running sheep has all four descriptors");
+                let fd = fd.expect("the fake reports every descriptor a blob can carry");
                 assert!(is_open(fd), "blob names a closed descriptor: {fd}");
             }
         }
@@ -17426,7 +17428,7 @@ mod tests {
     /// The refusal has to name the sheep, and it has to be its own reason
     /// rather than an empty `CarriedFds`: `none()` is what a STOPPED sheep
     /// reports, so collapsing a wedged live pump into it would pass the gate
-    /// and carry that sheep with its four descriptors dropped.
+    /// and carry that sheep with its descriptors dropped.
     ///
     /// Two sheep, one of each kind, so a gate that refused every flock with
     /// a pump in it would pass here for the wrong reason.
@@ -17713,6 +17715,7 @@ mod tests {
             err_pipe: None,
             out_log: None,
             err_log: None,
+            stdin_pipe: None,
         }
     }
 

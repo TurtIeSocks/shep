@@ -69,12 +69,12 @@ pub struct Adopted {
     pub pidfile: File,
 }
 
-/// One sheep's output plumbing, rebuilt.
+/// One sheep's output plumbing, rebuilt, and its input plumbing with it.
 ///
-/// `None` on all four means an instance that is registered and not running,
-/// which is the only reason a blob names no descriptor for it. A descriptor
-/// that is named and missing is a refusal, not a `None`; see this module's
-/// own docs.
+/// `None` on all of the first four means an instance that is registered and
+/// not running, which is the only reason a blob names no descriptor for
+/// them. A descriptor that is named and missing is a refusal, not a `None`;
+/// see this module's own docs.
 #[derive(Debug)]
 pub struct AdoptedSheep {
     /// What the blob said about this sheep.
@@ -87,6 +87,11 @@ pub struct AdoptedSheep {
     pub out_log: Option<tokio::fs::File>,
     /// The appending handle on its stderr log file.
     pub err_log: Option<tokio::fs::File>,
+    /// The write end of its stdin pipe, for a sheep whose app asked for one.
+    ///
+    /// The only handle here the daemon writes to rather than reads from,
+    /// and `None` for the commoner sheep that has `/dev/null` on fd 0.
+    pub stdin_pipe: Option<pipe::Sender>,
 }
 
 /// Rebuild everything `blob` describes, around descriptors this process
@@ -99,8 +104,8 @@ pub struct AdoptedSheep {
 ///
 /// The blob names one descriptor number twice, or any descriptor it names is
 /// not open in this process, is not the kind of object it was named as (a
-/// read end that is not a pipe), or could not be registered with the
-/// runtime. The error names the sheep and the stream, because that is what
+/// read end that is not a pipe, a stdin end that is not writable), or could
+/// not be registered with the runtime. The error names the sheep and the stream, because that is what
 /// an operator needs in order to know which process is now unsupervised.
 ///
 /// There is no partial success and no fallback. By the time this runs the
@@ -212,13 +217,14 @@ fn adopt_listener(fd: RawFd) -> io::Result<tokio::net::UnixListener> {
     tokio::net::UnixListener::from_std(listener)
 }
 
-/// Rebuild one sheep's four handles.
+/// Rebuild one sheep's five handles.
 fn adopt_sheep(carried: &CarriedSheep) -> io::Result<AdoptedSheep> {
     let CarriedFds {
         out_pipe,
         err_pipe,
         out_log,
         err_log,
+        stdin,
     } = carried.fds;
     let name = &carried.name;
     Ok(AdoptedSheep {
@@ -226,6 +232,7 @@ fn adopt_sheep(carried: &CarriedSheep) -> io::Result<AdoptedSheep> {
         err_pipe: adopt_pipe(err_pipe, name, "stderr")?,
         out_log: adopt_log(out_log, name, "stdout")?,
         err_log: adopt_log(err_log, name, "stderr")?,
+        stdin_pipe: adopt_stdin(stdin, name)?,
         carried: carried.clone(),
     })
 }
@@ -243,6 +250,29 @@ fn adopt_pipe(fd: Option<RawFd>, sheep: &str, stream: &str) -> io::Result<Option
         io::Error::new(
             error.kind(),
             format!("sheep '{sheep}' {stream} pipe is not a readable pipe: {error}"),
+        )
+    })
+}
+
+/// Rebuild one stdin write end as an async writer, if the blob named one.
+///
+/// The mirror of [`adopt_pipe`], and the check is what makes it worth its
+/// own function: `pipe::Sender::from_file` refuses a descriptor that is not
+/// a pipe OR is not open for writing, so a blob that named the end the child
+/// reads from is refused here rather than adopted into a `shep whisper` that
+/// can never land.
+///
+/// Nothing is opened and nothing is reopened, exactly as everywhere else in
+/// this module: the child's fd 0 is the other end of this same pipe and has
+/// been throughout, so a successor that recreated the pair would be writing
+/// to a pipe the app is not reading.
+fn adopt_stdin(fd: Option<RawFd>, sheep: &str) -> io::Result<Option<pipe::Sender>> {
+    let Some(fd) = fd else { return Ok(None) };
+    let file = adopt_fd(fd, &format!("sheep '{sheep}' stdin pipe"))?;
+    pipe::Sender::from_file(file).map(Some).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("sheep '{sheep}' stdin is not a writable pipe: {error}"),
         )
     })
 }
@@ -350,6 +380,7 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
             })],
         );
         blob.sheep[0].fds.out_log = Some(blob.listener_fd);
@@ -380,6 +411,7 @@ mod tests {
                 err_pipe: None,
                 out_log: Some(handle.into_raw_fd()),
                 err_log: None,
+                stdin: None,
             })],
         );
 
@@ -415,6 +447,7 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
             })],
         );
 
@@ -449,6 +482,7 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
             })],
         );
         let pidfile_fd = blob.pidfile_fd;
@@ -475,6 +509,7 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
             })],
         );
 
@@ -489,6 +524,81 @@ mod tests {
             .expect("the adopted pipe must produce the line written before it")
             .unwrap();
         assert_eq!(line.as_deref(), Some("a line"));
+    }
+
+    /// fails if a carried stdin write end does not reach the end the child
+    /// reads.
+    ///
+    /// The direction is the whole case. Every other descriptor a sheep
+    /// carries is one the daemon reads from; this is the one it writes to,
+    /// and a blob that named the wrong end of the pair would still adopt,
+    /// still be a pipe, and still never reach the app.
+    #[tokio::test]
+    async fn an_adopted_stdin_pipe_writes_to_the_end_the_child_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        // The child's fd 0 stays here, exactly as it does across a real
+        // exec: the daemon carries only the write end.
+        let (mut child_end, daemon_end) = std::io::pipe().unwrap();
+        let blob = blob_with(
+            &socket,
+            vec![carried(CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+                stdin: Some(daemon_end.into_raw_fd()),
+            })],
+        );
+
+        let mut adopted = adopt(&blob).unwrap();
+
+        let mut stdin = adopted.sheep[0]
+            .stdin_pipe
+            .take()
+            .expect("an adopted stdin pipe");
+        stdin.write_all(b"whisper\n").await.unwrap();
+        stdin.flush().await.unwrap();
+        // A blocking read of bytes already written, so there is nothing to
+        // wait for and nothing to time out.
+        let mut buf = [0_u8; 8];
+        std::io::Read::read_exact(&mut child_end, &mut buf).expect("the child end must read");
+        assert_eq!(&buf, b"whisper\n");
+    }
+
+    /// fails if the stdin number is adopted without checking which end of
+    /// the pipe it is.
+    ///
+    /// A read end passes `is_pipe` and would be adopted as a writer, so
+    /// every `shep whisper` after the handover would fail on a descriptor
+    /// the successor was told was fine.
+    #[tokio::test]
+    async fn a_pipe_read_end_offered_as_stdin_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let blob = blob_with(
+            &socket,
+            vec![carried(CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+                stdin: Some(reader.into_raw_fd()),
+            })],
+        );
+
+        let err = adopt(&blob).expect_err("a read end is not something to write to");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("web"),
+            "the refusal must name the sheep: {text}"
+        );
+        assert!(
+            text.contains("stdin"),
+            "the refusal must name what could not be adopted: {text}"
+        );
     }
 
     #[tokio::test]
@@ -509,6 +619,7 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
             })],
         );
 

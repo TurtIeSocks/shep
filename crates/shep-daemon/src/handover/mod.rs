@@ -2,8 +2,8 @@
 //! place, the [`Handover`] blob that describes it, and (in a later task) the
 //! exec that carries it.
 //!
-//! Phase 2a carries only the plainest sheep: no shepherd channel, no stdin,
-//! no dog, one instance, no in-flight reload, and nothing an operator has
+//! Phase 2a carries only the plainest sheep: no shepherd channel, no dog,
+//! one instance, no in-flight reload, and nothing an operator has
 //! already asked to stop or delete. [`fitness`] is the gate: get it wrong in
 //! the permissive direction and a half-built handover corrupts a live
 //! flock; get it wrong in the strict direction and the caller merely falls
@@ -63,7 +63,7 @@ pub enum Fitness {
 #[non_exhaustive]
 pub enum RefusedReason {
     /// The sheep's log pump did not report its descriptors before the
-    /// snapshot's deadline, so nothing knows which four numbers it holds.
+    /// snapshot's deadline, so nothing knows which descriptors it holds.
     ///
     /// First in this enum and first in [`refusal`]'s order, because it is
     /// the only variant that is not a statement about the sheep's config: a
@@ -77,11 +77,6 @@ pub enum RefusedReason {
     /// The sheep holds a shepherd channel: `channel`, `wait_ready` or
     /// `shutdown_with_message`, whose socketpair 2b carries.
     Channel {
-        /// The sheep's name.
-        sheep: String,
-    },
-    /// The sheep has `stdin = true`, whose pipe 2b carries.
-    Stdin {
         /// The sheep's name.
         sheep: String,
     },
@@ -129,7 +124,6 @@ impl core::fmt::Display for RefusedReason {
                 );
             }
             Self::Channel { sheep } => (sheep, "a shepherd channel"),
-            Self::Stdin { sheep } => (sheep, "stdin"),
             Self::Dog { sheep } => (sheep, "being a dog"),
             Self::MultiInstance { sheep } => (sheep, "more than one instance"),
             Self::ReloadInFlight { sheep } => (sheep, "an in-flight reload"),
@@ -166,7 +160,7 @@ pub struct Candidate<'a> {
     /// A third answer rather than a `CarriedFds::none()`, and the
     /// distinction is the whole point: `none()` is what a STOPPED sheep
     /// reports, and a wedged live pump collapsed into it would be carried
-    /// with its four descriptors silently dropped. So it reaches the gate
+    /// with its descriptors silently dropped. So it reaches the gate
     /// here, on the candidate, instead of being folded into the blob.
     pub pump_unresponsive: bool,
 }
@@ -233,9 +227,6 @@ fn refusal(candidate: &Candidate<'_>) -> Option<RefusedReason> {
     }
     if config.channel || config.wait_ready || config.shutdown_with_message {
         return Some(RefusedReason::Channel { sheep: name() });
-    }
-    if config.stdin {
-        return Some(RefusedReason::Stdin { sheep: name() });
     }
     if entry.dog.is_some() {
         return Some(RefusedReason::Dog { sheep: name() });
@@ -540,7 +531,7 @@ impl core::error::Error for LoadError {
 /// them positionally lets a caller swap them silently, and the swap is not
 /// detectable afterwards — the successor would `flock` its control socket
 /// and listen on its pidfile. This is the same argument [`CarriedFds`] makes
-/// for grouping its four.
+/// for grouping its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonFds {
     /// The control listener's descriptor number.
@@ -735,19 +726,26 @@ impl CarriedSheep {
     }
 }
 
-/// The four descriptor numbers one sheep's output travels on.
+/// The descriptor numbers one sheep's output travels on, and the one its
+/// input travels back through.
 ///
-/// Grouped rather than spelled as four fields on [`CarriedSheep`] for two
+/// Grouped rather than spelled as five fields on [`CarriedSheep`] for two
 /// reasons: they are all `Option<RawFd>`, so a constructor taking them
-/// positionally would let a caller swap two of them silently, and they share
-/// one fact, which is that a running instance has all four and a registered
-/// one that is not running has none.
+/// positionally would let a caller swap two of them silently, and four of
+/// them share one fact, which is that a running instance has all four and a
+/// registered one that is not running has none.
 ///
-/// `None` is that second case and only that case. A blob naming a
-/// descriptor that is not open in the successor is a failure to refuse, not
-/// a `None` to tolerate: losing a sheep's stdout read end does not lose its
-/// output, it blocks the child on `write()` once the 64KiB pipe buffer
-/// fills, which reads as an application hang rather than as a shep bug.
+/// `None` on those four is that second case and only that case. A blob
+/// naming a descriptor that is not open in the successor is a failure to
+/// refuse, not a `None` to tolerate: losing a sheep's stdout read end does
+/// not lose its output, it blocks the child on `write()` once the 64KiB
+/// pipe buffer fills, which reads as an application hang rather than as a
+/// shep bug.
+///
+/// [`Self::stdin`] is the exception on both counts, and it is the only
+/// field here whose direction is the other way round: it is a WRITE end the
+/// daemon holds, and it is present only for a running sheep whose app asked
+/// for one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CarriedFds {
     /// The read end of the sheep's stdout pipe.
@@ -758,18 +756,50 @@ pub struct CarriedFds {
     pub out_log: Option<RawFd>,
     /// The appending handle on the sheep's stderr log file.
     pub err_log: Option<RawFd>,
+    /// The write end of the sheep's stdin pipe, which `shep whisper` writes
+    /// a line into.
+    ///
+    /// `None` for a sheep whose app did not set `stdin = true`, which has
+    /// `/dev/null` on fd 0 and nothing for the daemon to hold, as well as
+    /// for a sheep that is not running.
+    ///
+    /// # Why an absent field is `None` rather than a refusal to load
+    ///
+    /// The predecessor in a handover is by definition a different build,
+    /// and one from before this field existed refused to carry a sheep with
+    /// a stdin pipe at all. So its blobs describe sheep that genuinely had
+    /// no such descriptor, which is what `None` says. Parsing them as an
+    /// error instead would leave the successor refusing to boot after the
+    /// predecessor had already exec'd itself away, and a whole flock
+    /// unsupervised is a steep price for one added field. [`VERSION`] is
+    /// unmoved for the same reason: nothing an older reader must understand
+    /// has changed.
+    ///
+    /// Serde's derive already lets an `Option` field be absent, so there is
+    /// no `#[serde(default)]` here: adding one changes nothing, and a
+    /// reader would reasonably take it as meaning that without it the field
+    /// is required. What holds the behaviour still is
+    /// `a_blob_written_before_stdin_was_carried_still_loads`, which loads a
+    /// blob with the key removed.
+    pub stdin: Option<RawFd>,
 }
 
 impl CarriedFds {
-    /// The four numbers, listener-order irrelevant but fixed: stdout's pipe,
-    /// stderr's pipe, stdout's log, stderr's log.
+    /// The five numbers, listener-order irrelevant but fixed: stdout's pipe,
+    /// stderr's pipe, stdout's log, stderr's log, stdin's pipe.
     ///
-    /// One array rather than four field reads, so a caller that walks all of
+    /// One array rather than five field reads, so a caller that walks all of
     /// them — clearing `FD_CLOEXEC`, checking each is open — cannot walk
-    /// three by mistake.
+    /// four by mistake.
     #[must_use]
-    pub const fn all(&self) -> [Option<RawFd>; 4] {
-        [self.out_pipe, self.err_pipe, self.out_log, self.err_log]
+    pub const fn all(&self) -> [Option<RawFd>; 5] {
+        [
+            self.out_pipe,
+            self.err_pipe,
+            self.out_log,
+            self.err_log,
+            self.stdin,
+        ]
     }
 
     /// The no-descriptors case: a sheep that is registered and not running.
@@ -783,6 +813,7 @@ impl CarriedFds {
             err_pipe: None,
             out_log: None,
             err_log: None,
+            stdin: None,
         }
     }
 }
@@ -1128,8 +1159,8 @@ mod tests {
     use crate::privilege::SpawnIdentity;
     use crate::testing::{app_with, test_paths};
 
-    /// A plain, `Online` entry: no channel, no stdin, not a dog, one
-    /// instance, no in-flight reload. Every field a real spawn would set is
+    /// A plain, `Online` entry: no channel, not a dog, one instance, no
+    /// in-flight reload. Every field a real spawn would set is
     /// present so a future field this gate should read cannot be silently
     /// left at a `Default` that hides a bug.
     fn entry_fixture(mutate: impl FnOnce(&mut AppConfig)) -> ProcessEntry {
@@ -1243,13 +1274,15 @@ mod tests {
         ));
     }
 
+    /// fails if the gate still refuses a sheep whose app asked for a stdin
+    /// pipe.
+    ///
+    /// The write end is one more descriptor through the machinery that
+    /// already carries four, and [`CarriedFds::stdin`] is where it travels.
     #[test]
-    fn stdin_refuses() {
+    fn a_sheep_with_stdin_is_carried() {
         let e = entry_fixture(|app| app.stdin = true);
-        assert!(matches!(
-            fitness(&[plain(&e)]),
-            Fitness::Refused(RefusedReason::Stdin { .. })
-        ));
+        assert_eq!(fitness(&[plain(&e)]), Fitness::Carryable);
     }
 
     #[test]
@@ -1307,6 +1340,7 @@ mod tests {
                 err_pipe: Some(12),
                 out_log: Some(13),
                 err_log: Some(14),
+                stdin: Some(15),
             },
         )
     }
@@ -1410,6 +1444,38 @@ mod tests {
         let mut v = serde_json::to_value(sample_handover()).unwrap();
         v["version"] = serde_json::json!(u32::MAX);
         assert!(Handover::load_value(v).is_err());
+    }
+
+    /// fails if a blob written before this daemon carried stdin stops
+    /// loading.
+    ///
+    /// The predecessor in a handover is by definition a different build,
+    /// and one old enough not to know about [`CarriedFds::stdin`] refused
+    /// to carry a sheep that had one. So an absent field is not a gap to
+    /// guess at: it says this sheep had no stdin pipe, which is what
+    /// `None` means. Making it a hard parse failure instead would leave the
+    /// successor refusing to boot after the predecessor had already exec'd
+    /// itself away, which is a whole flock unsupervised for one added
+    /// field.
+    #[test]
+    fn a_blob_written_before_stdin_was_carried_still_loads() {
+        let mut value = serde_json::to_value(sample_handover()).unwrap();
+        let fds = value["sheep"][0]["fds"]
+            .as_object_mut()
+            .expect("a carried sheep names its descriptors");
+        assert!(
+            fds.remove("stdin").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(value).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].fds.stdin, None);
+        assert_eq!(
+            loaded.sheep[0].fds.out_pipe,
+            sample_handover().sheep[0].fds.out_pipe,
+            "the other four are unchanged by the one that was absent"
+        );
     }
 
     #[test]
@@ -1602,6 +1668,7 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
             },
         );
 
@@ -1643,6 +1710,7 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
             },
         );
 
@@ -1679,6 +1747,10 @@ mod tests {
         let listener = tempfile::tempfile().unwrap();
         let pidfile = tempfile::tempfile().unwrap();
         let out_log = tempfile::tempfile().unwrap();
+        // The stdin write end rides along, because it is the newest of the
+        // five and the one a `named_fds` that still yielded four would
+        // silently leave close-on-exec.
+        let (_child_end, stdin) = std::io::pipe().unwrap();
         let blob = handover_with_fds(
             &entry_fixture(|_| {}),
             listener.as_raw_fd(),
@@ -1688,14 +1760,20 @@ mod tests {
                 err_pipe: None,
                 out_log: Some(out_log.as_raw_fd()),
                 err_log: None,
+                stdin: Some(stdin.as_raw_fd()),
             },
         );
 
         // The precondition, so the assertion below cannot pass on a
         // descriptor that was never cleared in the first place.
-        for file in [&listener, &pidfile, &out_log] {
+        for fd in [
+            listener.as_fd(),
+            pidfile.as_fd(),
+            out_log.as_fd(),
+            stdin.as_fd(),
+        ] {
             assert!(
-                !fds::is_kept(file.as_fd()).unwrap(),
+                !fds::is_kept(fd).unwrap(),
                 "the daemon opens everything close-on-exec, so this starts set"
             );
         }
@@ -1713,6 +1791,7 @@ mod tests {
             listener.as_raw_fd(),
             pidfile.as_raw_fd(),
             out_log.as_raw_fd(),
+            stdin.as_raw_fd(),
         ];
         expected.sort_unstable();
         assert_eq!(
@@ -1723,9 +1802,14 @@ mod tests {
 
         let err = exec_into(&target, &blob, &paths).unwrap_err();
 
-        for file in [&listener, &pidfile, &out_log] {
+        for fd in [
+            listener.as_fd(),
+            pidfile.as_fd(),
+            out_log.as_fd(),
+            stdin.as_fd(),
+        ] {
             assert!(
-                !fds::is_kept(file.as_fd()).unwrap(),
+                !fds::is_kept(fd).unwrap(),
                 "a failed exec left a descriptor exec-inheritable: {err}"
             );
         }

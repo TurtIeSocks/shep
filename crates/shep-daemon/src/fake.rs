@@ -730,31 +730,34 @@ impl ScriptedRunner {
     }
 }
 
-/// Four real, distinct, open descriptors for a fake pump to report, and the
+/// Five real, distinct, open descriptors for a fake pump to report, and the
 /// handles that keep them open.
 ///
 /// `/dev/null` because the fake never writes anything to them: what a caller
 /// asserts about a handover blob is that the numbers in it name something
-/// open, not what is on the far side.
+/// open, not what is on the far side. Five rather than four so a fake sheep
+/// stands in for one with a stdin pipe too, which is the widest shape a blob
+/// carries and so the one that catches a caller walking only part of it.
 ///
 /// # Panics
 ///
-/// If `/dev/null` cannot be opened four times, which on any unix a test
+/// If `/dev/null` cannot be opened five times, which on any unix a test
 /// suite runs on means the process is out of descriptors.
 #[cfg(unix)]
 #[track_caller]
-fn open_reportable_fds() -> ([std::fs::File; 4], crate::handover::CarriedFds) {
+fn open_reportable_fds() -> ([std::fs::File; 5], crate::handover::CarriedFds) {
     use std::os::fd::AsRawFd as _;
 
     let files = core::array::from_fn(|_| {
         std::fs::File::open("/dev/null").expect("a test host must be able to open /dev/null")
     });
-    let files: [std::fs::File; 4] = files;
+    let files: [std::fs::File; 5] = files;
     let fds = crate::handover::CarriedFds {
         out_pipe: Some(files[0].as_raw_fd()),
         err_pipe: Some(files[1].as_raw_fd()),
         out_log: Some(files[2].as_raw_fd()),
         err_log: Some(files[3].as_raw_fd()),
+        stdin: Some(files[4].as_raw_fd()),
     };
     (files, fds)
 }
@@ -866,7 +869,7 @@ impl ProcessRunner for ScriptedRunner {
         tokio::spawn(async move {
             #[cfg(unix)]
             let mut reportable_fds: Option<(
-                [std::fs::File; 4],
+                [std::fs::File; 5],
                 crate::handover::CarriedFds,
             )> = None;
             // Every unanswered report, kept alive rather than dropped — see
@@ -901,7 +904,7 @@ impl ProcessRunner for ScriptedRunner {
                         // The fake writes no files, so it holds no
                         // descriptors of its own. A caller assembling a
                         // handover still asserts that the numbers it gets
-                        // are really open, so four `/dev/null` handles stand
+                        // are really open, so five `/dev/null` handles stand
                         // in — opened on the first request and held for the
                         // rest of this task's life, so a suite full of tests
                         // that never ask for a handover opens nothing. That

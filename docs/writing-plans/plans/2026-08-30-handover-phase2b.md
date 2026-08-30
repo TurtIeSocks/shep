@@ -190,6 +190,33 @@ One refusal each, from `handover::fitness`: `Stdin`, `Channel`, `MultiInstance`,
 
 Sketch only. Each removes exactly one variant and its test.
 
+#### Task 4: stdin
+
+- [x] **Step 1: Write the failing tests**
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Prove each one non-vacuous**
+- [x] **Step 5: Drive a real reload, and whisper to the sheep afterwards**
+- [x] **Step 6: Task gate, then commit**
+
+##### Outcome
+
+It was one more descriptor, and `CarriedFds` grew a fifth field for it. The direction changed three things, none of them structural:
+
+- The successor rebuilds it with `pipe::Sender::from_file` rather than `Receiver`, which is the check that refuses a blob naming the end the child reads from.
+- `CarriedFds`'s "all four or none" rule no longer holds. Four descriptors say whether a sheep is running; the fifth says whether its app asked for a pipe on fd 0, which is a different question.
+- The blob format grew a field without moving `VERSION`. Serde already lets an absent `Option` field load as `None`, and `None` is what an older predecessor's blob truthfully means: it refused to carry a stdin sheep at all. A hard parse failure here would leave a successor refusing to boot after its predecessor had exec'd itself away.
+
+**No parking, and the asymmetry is the reason.** A log pump is parked because it READS: bytes it takes off the pipe after the report are bytes the successor cannot find there, and lines it writes after the flush die in the write buffer at the exec. A stdin pump does neither. It writes what an operator hands it, and a line written before the exec is delivered.
+
+What parking also bought was pinning, and stdin gets that from ownership instead: the pump ends only when the last `to_stdin` sender drops, and the supervisor's own slot holds one for as long as the sheep is registered, so the number cannot be closed and reissued between the report and the exec.
+
+One residual, not closed and not new. A pump inside `write_all` at the exec leaves a partial line in the pipe, and the successor's next whisper lands behind it. Any daemon death has always done this, and `LineOutcome::NotWritten` is what the operator gets either way.
+
+##### Drill, measured
+
+Six `shep daemon reload`s over a flock of two, one of them `/bin/cat` with `stdin = true`. Every reload exit 0, the shepherd's pid unmoved at 97553, both sheep unmoved at 97575 and 97576, uptime continuous. A `shep whisper` after each reload reached the same never-restarted `cat`, whose echo landed in its own log file in order, no gaps and no duplicates.
+
 ---
 
 ### Task 8: re-arm audit, and the end-to-end case
@@ -224,10 +251,10 @@ Baselines on that drill, three reloads: `origin/main` loses about 2900 lines, 2b
 
 ## Working state, for whoever picks this up
 
-- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1 and 2 committed; task 3 folded into 1.
-- Counts after task 2: **623** daemon lib with `--skip ::slow::`, **2076** workspace.
+- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2 and 4 committed; task 3 folded into 1.
+- Counts after task 4: **631** daemon lib with `--skip ::slow::`, **2084** workspace.
 - The rejected buffer-carry patch is at `stash@{0}` and in this session's scratchpad as `task1-carry.patch`. Read it for plumbing, not design.
-- `handover/mod.rs`'s module header still says "Phase 2a carries only the plainest sheep", which goes wrong as tasks 4 to 7 land.
+- `handover/mod.rs`'s module header still says "Phase 2a carries only the plainest sheep". Task 4 struck stdin from its list; tasks 5 to 7 have the rest of it to strike.
 - PR #73 has two threads left open for 2b. Both are now addressed: the `report_fds` deadline is task 2, and descriptor pinning fell out of task 1's parking. They can be closed with a pointer to those commits.
 - `spawn_handover_task` visits sheep serially, so a flock of wedged pumps waits N x 2s before the fallback. Named in `REPORT_DEADLINE`'s doc, not fixed.
 

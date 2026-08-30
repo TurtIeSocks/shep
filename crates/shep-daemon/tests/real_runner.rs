@@ -998,6 +998,7 @@ fn adopt_spec(dir: &tempfile::TempDir, pid: u32, reaper: &Arc<AdoptedReaper>) ->
         err_pipe: None,
         out_log: None,
         err_log: None,
+        stdin_pipe: None,
         reaper: Arc::clone(reaper),
     }
 }
