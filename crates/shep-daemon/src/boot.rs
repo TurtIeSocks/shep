@@ -504,6 +504,22 @@ pub fn daemon_liveness(paths: &ShepPaths) -> Result<Shepherd, BootError> {
         }
         Err(BootError::AlreadyRunning { pid: Some(pid) }) => Ok(Shepherd::Running(pid)),
         Err(BootError::AlreadyRunning { pid: None }) => Ok(Shepherd::Booting),
+        // A home whose layout was never created cannot be holding a lock, so
+        // this is an absence and not a failure. `init_dirs` makes `pids/` on
+        // every boot, so its absence means no daemon has ever run here, which
+        // is precisely what `Absent` says. Reported as an error instead, a
+        // `shep kill` against a fresh `$SHEP_HOME` exits `Failure` rather than
+        // `DaemonUnreachable`, which is a worse answer to a correct question.
+        //
+        // Narrow on purpose. Only `NotFound`, and only for a path under
+        // `pids/`. A permissions error or a corrupt lock file is a real
+        // failure and must still say so.
+        Err(BootError::Io {
+            ref path,
+            ref source,
+        }) if source.kind() == ErrorKind::NotFound && path.starts_with(&paths.pids) => {
+            Ok(Shepherd::Absent)
+        }
         Err(other) => Err(other),
     }
 }
