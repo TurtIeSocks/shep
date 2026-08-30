@@ -893,7 +893,33 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             let mut out = std::io::stdout().lock();
             return completions::completions(&mut out, args);
         }
-        Commands::Daemon(ref args) => return run_daemon_command(fmt, &cli.global, args).await,
+        Commands::Daemon(ref args) => {
+            // `daemon reload` is a different verb wearing the same word:
+            // it stops a shepherd and starts one rather than being one.
+            // Unlocked handles, for the reason `bleats` takes them -- this
+            // runs for as long as a shepherd's teardown ladder plus a boot,
+            // which is seconds, not the milliseconds the locked pair below
+            // is right for.
+            if let Some(cli::DaemonCmd::Reload) = args.cmd {
+                let paths = match resolve_paths(&cli.global) {
+                    Ok(paths) => paths,
+                    Err(code) => {
+                        emit_error_locked(fmt, code, UNRESOLVED_HOME);
+                        return code;
+                    }
+                };
+                let mut out = std::io::stdout();
+                let mut err = std::io::stderr();
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                    style,
+                    fmt,
+                };
+                return commands::daemon::reload(&mut streams, &paths, guard).await;
+            }
+            return run_daemon_command(fmt, &cli.global, args).await;
+        }
         // Routed through `ensure_home` rather than reading `--home` raw:
         // this is the verb that installs a unit without starting anything,
         // so it is the one that needs `$SHEP_HOME` to exist beforehand, and
@@ -1449,7 +1475,9 @@ fn emit_error_locked(fmt: Format, code: ExitCode, message: &str) {
 /// either faking `connect_or_spawn` itself (testing nothing new) or spawning
 /// a real child from this test binary (the hang/flake risk this project
 /// avoids in unit tests).
-async fn connect_or_spawn_client(
+/// `pub(crate)`: `commands::daemon`'s reload starts the successor it just
+/// stopped through this same autostart, rather than growing a second one.
+pub(crate) async fn connect_or_spawn_client(
     streams: &mut Streams<'_>,
     paths: &ShepPaths,
     guard: VersionGuard,
@@ -1575,10 +1603,9 @@ fn unreachable_message(err: &shep_client::ConnectError) -> String {
 /// if it is a way out of that state, never merely one that is inconvenient
 /// to lose.
 ///
-/// `shep daemon reload` is the command [`refuse_version_skew`] names, and it
-/// is not built yet. Its name is listed now so the exemption is already
-/// right on the day the verb lands, rather than being remembered then;
-/// [`recovery_verb`] gains its arm at the same time.
+/// `shep daemon reload` is the command [`refuse_version_skew`] names, so the
+/// two are read out of this one list rather than spelled twice -- see
+/// [`VERSION_SKEW_REMEDY`].
 const RECOVERY_VERBS: [&str; 3] = ["kill", "daemon reload", "ping"];
 
 /// Which [`RECOVERY_VERBS`] entry `command` is, or `None` for an ordinary
@@ -1591,10 +1618,12 @@ fn recovery_verb(command: &Commands) -> Option<&'static str> {
     match command {
         Commands::Kill => Some("kill"),
         Commands::Ping => Some("ping"),
-        // `shep daemon reload` is pending. When it lands, its arm belongs
-        // here: `Commands::Daemon(args)` carrying the reload subcommand,
-        // answering `Some("daemon reload")`. A bare `shep daemon` is the
-        // hidden boot re-exec and is not a recovery verb.
+        // A bare `shep daemon` is the hidden boot re-exec, which reaches no
+        // shepherd and so has nothing to be exempt from.
+        Commands::Daemon(args) => match args.cmd {
+            Some(cli::DaemonCmd::Reload) => Some("daemon reload"),
+            None => None,
+        },
         _ => None,
     }
 }
@@ -3042,11 +3071,29 @@ mod tests {
         assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
     }
 
+    /// A [`DaemonArgs`] carrying `cmd` and nothing else, for asking which
+    /// guard the `daemon` verb's two shapes get.
+    fn daemon_args(cmd: Option<cli::DaemonCmd>) -> DaemonArgs {
+        DaemonArgs {
+            cmd,
+            no_restore: false,
+            foreground: false,
+            log_json: None,
+            log_level: None,
+            socket: None,
+            max_cron_sleep: None,
+        }
+    }
+
     /// fails if a verb leaves [`RECOVERY_VERBS`], or if one arrives without
     /// being listed there with its reason.
     #[test]
     fn every_exempt_verb_is_one_of_the_documented_recovery_verbs() {
-        for command in [Commands::Kill, Commands::Ping] {
+        for command in [
+            Commands::Kill,
+            Commands::Ping,
+            Commands::Daemon(daemon_args(Some(cli::DaemonCmd::Reload))),
+        ] {
             let verb =
                 recovery_verb(&command).unwrap_or_else(|| panic!("{command:?} must stay exempt"));
             assert!(
@@ -3054,9 +3101,16 @@ mod tests {
                 "{verb} is exempt but undocumented"
             );
         }
-        assert!(
-            RECOVERY_VERBS.contains(&"daemon reload"),
-            "the verb the refusal names must stay on the list it is not yet built for"
+        assert_eq!(
+            recovery_verb(&Commands::Daemon(daemon_args(Some(cli::DaemonCmd::Reload)))),
+            Some("daemon reload"),
+            "the verb the skew refusal names must be the verb the skew guard exempts"
+        );
+        // The hidden boot re-exec, which reaches no shepherd at all.
+        assert_eq!(recovery_verb(&Commands::Daemon(daemon_args(None))), None);
+        assert_eq!(
+            VersionGuard::for_command(&Commands::Daemon(daemon_args(None))),
+            VersionGuard::Enforce
         );
         assert_eq!(recovery_verb(&Commands::Flock), None);
         assert_eq!(

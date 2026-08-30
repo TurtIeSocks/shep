@@ -96,6 +96,7 @@ pub async fn run(streams: &mut Streams<'_>, quiet: bool, options: ForegroundOpti
     // daemon for readiness-reporting purposes, the same as `shep daemon
     // --foreground`, even though nothing here speaks the notify protocol.
     let daemon_args = DaemonArgs {
+        cmd: None,
         no_restore: true,
         foreground: true,
         log_json: None,

@@ -30,7 +30,11 @@ use crate::output::{KillRow, Streams, emit, write_outcome};
 /// (`boot.rs:727`), behind the full kill ladder over every online sheep
 /// (`:722`) — this has to cover that ladder's whole budget, not just a
 /// round trip (IR-26: named, not a prose "a few seconds").
-const KILL_TEARDOWN_WAIT: Duration = Duration::from_secs(10);
+///
+/// `pub(crate)`: `commands::daemon`'s reload waits out the same teardown,
+/// because a shepherd's ladder does not get shorter for having been asked
+/// to stop by a reload rather than by a kill.
+pub(crate) const KILL_TEARDOWN_WAIT: Duration = Duration::from_secs(10);
 
 /// Gap between socket-existence checks while waiting out teardown. Fixed, not
 /// a backoff: the wait is already bounded and short, and a backoff would only
@@ -116,28 +120,11 @@ async fn kill_socket_free_with_wait(
         Err(err) => return streams.fail(ExitCode::Failure, &err.to_string()),
     };
 
-    // Two arms for the same reason `control_address_answers` has two: the
-    // platforms do not offer the same thing. Unix has a signal whose handler
-    // the daemon already installs; Windows has no way to deliver an
-    // arbitrary console control event to another process, so there is
-    // nothing here to write and guessing at one would stop the shepherd
-    // without walking the ladder.
+    if let Err((code, message)) = signal_graceful_stop(pid) {
+        return streams.fail(code, &message);
+    }
     #[cfg(unix)]
     {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-
-        let Ok(target) = i32::try_from(pid) else {
-            let message = format!("the recorded pid {pid} is not one this platform can signal");
-            return streams.fail(ExitCode::Internal, &message);
-        };
-        // SIGTERM, not SIGKILL: the daemon's own handler runs the kill
-        // ladder over every online sheep before it exits, so the flock stops
-        // cleanly rather than being orphaned with broken pipes.
-        if let Err(errno) = signal::kill(Pid::from_raw(target), Signal::SIGTERM) {
-            let message = format!("could not signal the shepherd at pid {pid}: {errno}");
-            return streams.fail(ExitCode::Failure, &message);
-        }
         // The same completion check the socket path uses, so a socket-free
         // stop is no more willing to claim success before teardown finishes
         // than a socket one is.
@@ -157,16 +144,62 @@ async fn kill_socket_free_with_wait(
             streams.fail(ExitCode::DeadlineExceeded, message)
         }
     }
+    // Unreachable: `signal_graceful_stop` has already returned above on this
+    // platform. Written as a `cfg` rather than an `unreachable!` so nothing
+    // here can panic if that ever stops being true.
     #[cfg(windows)]
     {
         let _ = wait;
+        ExitCode::Failure
+    }
+}
+
+/// Asks the shepherd at `pid` to stop the way its own handler does.
+///
+/// The one place in the CLI that knows what stopping a shepherd without its
+/// control socket means per platform, so `kill`'s fallback and
+/// `commands::daemon`'s reload share it rather than each growing their own
+/// arm of it.
+///
+/// `SIGTERM`, never `SIGKILL`. The daemon's own handler drives the graceful
+/// teardown that runs the kill ladder over every online sheep before
+/// stopping, so the flock stops cleanly instead of being orphaned.
+///
+/// Two arms for the same reason `control_address_answers` has two: the
+/// platforms do not offer the same thing. Unix has a signal whose handler
+/// the daemon already installs; Windows has no way to deliver an arbitrary
+/// console control event to another process, so there is nothing to send
+/// and guessing at one would stop the shepherd without walking the ladder.
+///
+/// # Errors
+/// The exit code and the sentence to report, when the pid is not one this
+/// platform can name, when the signal itself failed, or on Windows, which
+/// has no signal to send at all. The caller prints it; this function writes
+/// nothing.
+pub(crate) fn signal_graceful_stop(pid: u32) -> Result<(), (ExitCode, String)> {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{self, Signal};
+        use nix::unistd::Pid;
+
+        let Ok(target) = i32::try_from(pid) else {
+            let message = format!("the recorded pid {pid} is not one this platform can signal");
+            return Err((ExitCode::Internal, message));
+        };
+        signal::kill(Pid::from_raw(target), Signal::SIGTERM).map_err(|errno| {
+            let message = format!("could not signal the shepherd at pid {pid}: {errno}");
+            (ExitCode::Failure, message)
+        })
+    }
+    #[cfg(windows)]
+    {
         let message = format!(
             "stopping the shepherd without the control pipe is not available on Windows: \
              there is no signal to send it. The shepherd (pid {pid}) does handle the console \
              control events, so press Ctrl-C in the window it is running in, or close that \
              window, and it will stop its flock on the way out"
         );
-        streams.fail(ExitCode::Failure, &message)
+        Err((ExitCode::Failure, message))
     }
 }
 
@@ -248,7 +281,11 @@ pub async fn kill_with_wait(client: Client, streams: &mut Streams<'_>, wait: Dur
 /// socket file gives on unix. `ERROR_PIPE_BUSY` is deliberately treated as
 /// STILL ALIVE rather than gone: it means the pipe is there and every
 /// instance is in use, which is a daemon that has not finished.
-async fn wait_for_socket_to_disappear(socket: &Path, wait: Duration) -> bool {
+///
+/// `pub(crate)`: `commands::daemon`'s reload waits out the same teardown
+/// before it starts a successor, and a second waiter would be a second
+/// answer to the platform question above.
+pub(crate) async fn wait_for_socket_to_disappear(socket: &Path, wait: Duration) -> bool {
     let start = Instant::now();
     loop {
         if !control_address_answers(socket) {

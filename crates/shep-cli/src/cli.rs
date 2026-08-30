@@ -1116,6 +1116,14 @@ pub struct StyleArgs {
 /// `shep daemon --foreground --log-level info` without a config file.
 #[derive(Debug, clap::Args)]
 pub struct DaemonArgs {
+    /// What to do to the shepherd. Omit to BE the shepherd.
+    ///
+    /// `None` is the boot path and the reason this is optional at all: the
+    /// binary daemonizes by re-execing itself with `daemon` and nothing
+    /// else (`crate::launch::launch_daemon`), so a required subcommand here
+    /// would break daemonization itself rather than merely a verb.
+    #[command(subcommand)]
+    pub cmd: Option<DaemonCmd>,
     /// Boot without restoring the saved muster roll
     #[arg(long)]
     pub no_restore: bool,
@@ -1142,6 +1150,22 @@ pub struct DaemonArgs {
     /// Longest a cron worker sleeps before re-deriving its next occurrence
     #[arg(long, value_name = "DURATION", value_parser = duration_flag)]
     pub max_cron_sleep: Option<shep_core::values::UpDuration>,
+}
+
+/// The one thing `shep daemon` can be asked to do rather than be.
+///
+/// A separate enum rather than a flag on [`DaemonArgs`] because it is a
+/// different verb: `shep daemon` runs a shepherd in this process, and
+/// `shep daemon reload` replaces the one already running with this
+/// binary's own code.
+#[derive(Debug, clap::Subcommand)]
+pub enum DaemonCmd {
+    /// Replace the running shepherd with this binary, and bring the flock back
+    ///
+    /// `cargo install shep` replaces the binary and leaves the shepherd
+    /// running the old code. This is what restarts it, and it is the
+    /// command a version-skew refusal names.
+    Reload,
 }
 
 /// Arguments to `shep init`.
@@ -1490,6 +1514,82 @@ mod tests {
                 other => panic!("expected Daemon, got {other:?}"),
             }
         }
+    }
+
+    /// `shep daemon` with no subcommand is how this binary daemonizes:
+    /// `launch::launch_daemon` re-execs it with exactly that one argument.
+    /// An optional subcommand must not turn a bare invocation into a
+    /// missing-subcommand error, or daemonization itself stops working and
+    /// nothing in shep starts.
+    #[test]
+    fn a_bare_shep_daemon_still_boots_and_is_not_a_subcommand_error() {
+        use clap::Parser;
+        let parsed =
+            Cli::try_parse_from(["shep", "daemon"]).expect("`shep daemon` must still parse");
+        let Commands::Daemon(args) = parsed.command else {
+            panic!("`shep daemon` must still parse as the daemon verb");
+        };
+        assert!(
+            args.cmd.is_none(),
+            "bare `shep daemon` must remain the boot path"
+        );
+    }
+
+    /// fails if the subcommand changes what any existing `daemon` flag
+    /// means. clap can behave surprisingly when a subcommand and a struct's
+    /// own flags share one `Args` type, and every one of these flags is an
+    /// init unit's `ExecStart` line somewhere.
+    #[test]
+    fn the_daemon_flags_still_parse_alongside_the_subcommand() {
+        use clap::Parser;
+        let argv = [
+            "shep",
+            "daemon",
+            "--foreground",
+            "--no-restore",
+            "--log-json=false",
+            "--log-level",
+            "info",
+            "--socket",
+            "run/shep.sock",
+            "--max-cron-sleep",
+            "30s",
+        ];
+        let parsed = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
+        let Commands::Daemon(args) = parsed.command else {
+            panic!("expected the daemon verb")
+        };
+        assert!(args.foreground);
+        assert!(args.no_restore);
+        assert_eq!(args.log_json, Some(false));
+        assert_eq!(args.log_level, Some(shep_core::config::LogLevel::Info));
+        assert_eq!(args.socket.as_deref(), Some(Path::new("run/shep.sock")));
+        assert_eq!(
+            args.max_cron_sleep
+                .map(shep_core::values::UpDuration::as_duration),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert!(
+            args.cmd.is_none(),
+            "flags alone must not select a subcommand"
+        );
+    }
+
+    /// The verb the version-skew refusal names. It has to parse, or that
+    /// refusal points an operator at a command that does not exist.
+    #[test]
+    fn daemon_reload_parses_as_the_reload_subcommand() {
+        use clap::Parser;
+        let parsed = Cli::try_parse_from(["shep", "daemon", "reload"])
+            .expect("`shep daemon reload` must parse");
+        let Commands::Daemon(args) = parsed.command else {
+            panic!("expected the daemon verb")
+        };
+        assert!(
+            matches!(args.cmd, Some(DaemonCmd::Reload)),
+            "got {:?}",
+            args.cmd
+        );
     }
 
     /// fails if the flag grammar widens past the env grammar — the exact

@@ -578,7 +578,7 @@ Narrow the blanket catch so it distinguishes "could not connect at all", which i
 
 Phase 1 ships the stop arm only. It reports what happened to each sheep rather than announcing that the flock stopped, because phase 2's handover does not stop it and the same output shape has to be true under both.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -612,11 +612,11 @@ async fn reload_reports_each_sheep_rather_than_announcing_the_flock_stopped() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p shep --lib --bins --all-features -- --skip ::slow:: reload`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Arm selection, with unknown always meaning the safe arm:
 
@@ -635,7 +635,7 @@ The stop arm composes three things that already exist: SIGTERM the proven pid, w
 
 `Arm::Handover` is unreachable in phase 1. Return it from nothing yet, and leave the variant with a doc comment saying phase 2 fills it. Do NOT add a stub that pretends to hand over.
 
-- [ ] **Step 4: Run to verify they pass, then task gate and commit**
+- [x] **Step 4: Run to verify they pass, then task gate and commit**
 
 ---
 
