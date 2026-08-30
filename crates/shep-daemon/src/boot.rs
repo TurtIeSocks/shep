@@ -1884,7 +1884,9 @@ fn install_signals(
             tracing::warn!(
                 %refusal,
                 "SIGHUP: this flock could not be handed to a successor; stopping gracefully \
-                 instead, and a client that asked first has already been told why"
+                 instead. This line may be the only record of the reason: a signal carries no \
+                 sender, and the case this gate exists for is a flock that changed between a \
+                 client's question and the signal, where that client was told nothing"
             );
             let _ = hup_shutdown.send(true);
         }
@@ -2104,8 +2106,11 @@ impl fmt::Display for BootError {
             Self::Adopt(reason) => write!(
                 f,
                 "this shepherd was handed a flock it could not take over: {reason}. The flock is \
-                 still running and nothing is supervising it; `shep daemon reload` starts a \
-                 shepherd for it"
+                 still running and nothing is supervising it. `shep daemon reload` is not the \
+                 way back: it needs a live shepherd to ask and to signal, and this process is \
+                 about to exit without ever serving. It holds the pidfile until it does, so the \
+                 home is claimable straight afterwards and `shep muster` starts a shepherd from \
+                 the roll"
             ),
         }
     }
