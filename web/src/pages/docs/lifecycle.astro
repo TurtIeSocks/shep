@@ -209,7 +209,7 @@ ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
       <code>{`{"kind":"shutdown"}`}</code> message goes over the{" "}
       <a href="/docs/shepherd-channel">shepherd channel</a> instead, no
       signal at all. Then shep waits. If the process is still alive when the
-      grace period runs out, the whole process tree gets{" "}
+      grace period runs out, that same process group gets{" "}
       <code>SIGKILL</code>, a signal nothing can trap, and that's the end of
       it either way.
     </p>
