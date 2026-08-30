@@ -607,14 +607,14 @@ async fn reload_with_wait(
         // needs a fitness answer, a refused handshake has no connection to
         // ask over, and a stop-and-start is the right arm for a shepherd the
         // socket will not talk to anyway.
-        && let Ok(client) = connected
+        && let Ok(client) = &connected
     {
-        match ask_fitness(&client).await {
+        match ask_fitness(client).await {
             Fitness::Carryable => {
                 // Before the signal, never after: the shepherd is about to
                 // replace its own image, and a connection held across that
                 // is a connection to a process that no longer exists.
-                drop(client);
+                drop(connected);
                 return hand_over(streams, paths, guard, wait).await;
             }
             // Not a failure. The flock carries something this shepherd
@@ -626,6 +626,16 @@ async fn reload_with_wait(
             }
         }
     }
+    // Before the stop arm too, and for a sharper reason than the handover's.
+    // `stop_and_start` signals the shepherd and then waits for its control
+    // address to stop answering. On Windows that address is a named pipe and
+    // the wait probes it, treating `ERROR_PIPE_BUSY` as a daemon that has not
+    // finished; a client handle held open here keeps the pipe instance alive
+    // past the daemon's exit, so the wait can run out its whole budget and
+    // the reload fails `DeadlineExceeded` without ever starting a successor.
+    // `admin::kill_with_wait` drops its own client before the same wait for
+    // the same reason.
+    drop(connected);
     stop_and_start(streams, paths, guard, wait).await
 }
 
