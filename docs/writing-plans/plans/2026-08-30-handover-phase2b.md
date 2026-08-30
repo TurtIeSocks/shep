@@ -111,6 +111,27 @@ An `awk` or shell loop emitting with no sleep. The rejected design passed every 
 
 - [x] **Step 6: Task gate, then commit**
 
+#### Outcome, measured after the fact
+
+The drain was manufacturing the loss it existed to prevent. It counted bytes EMITTED against its budget, but every `next_line` on an empty reader issued a `read(2)` pulling up to 8 KiB out of the pipe. On a stream that is never empty the reader refilled as fast as it drained, so when the loop stopped it held bytes it had just taken from the pipe: gone from the pipe the successor inherits, never written, destroyed at the exec. A larger budget would have read more as well as written more, so raising the bound could never have helped.
+
+It now writes only whole lines already in the reader's buffer and stops when no newline remains, so the buffer strictly shrinks and nothing new arrives to replace what is written.
+
+Same drill each time, `awk` with no sleep at roughly 1.6M lines a second, three reloads, `shep stop` before counting:
+
+| build | lines | gaps | lines lost |
+|---|---|---|---|
+| `origin/main` | 19,892,398 | 3 | 2872 |
+| first attempt | 23,038,701 | 3 | 1954 |
+| shipped | 19.3M to 23.8M | 1 to 3 | **1 to 3** |
+| shipped, verified independently | 9,877,880 | 0 | **0** |
+
+Zero duplicates throughout, pid unmoved, every reload exit 0.
+
+**Known limitation, deliberately not closed here.** At most one line per reload, often none: the line the sheep was mid-way through when the report landed, split between the reader's buffer tail and `tokio::io::Lines`' private accumulator, whose head is unreachable. The tail lands in the log as a short line of its own, so the seam reads as a gap plus one part-eaten line rather than a rewind. A naive counter mistakes that for a rewind and reports nonsense.
+
+The cheap fix was designed and rejected. Writing the reader's tail out verbatim would make the seam byte-perfect, but every write this pump makes today is a whole line, and several sheep can share one file under `merge_logs`, where a partial write and its continuation are two `write(2)` calls that another instance's line can land between. That trades one torn line for two. Closing it properly means the pump owning its read buffer rather than using `Lines`, which this plan already defers.
+
 ### Task 2: a deadline on `report_fds`, and an answer that is not ambiguous
 
 A stalled pump blocks the handover AND its graceful-stop fallback, so the daemon has no way out.
