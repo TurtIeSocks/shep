@@ -650,6 +650,25 @@ The stop arm composes three things that already exist: SIGTERM the proven pid, w
 
 Per the repo's docs trigger, this task changed what an operator types and sees, so the CLI reference must be regenerated and the site must build.
 
+- [ ] **Step 0: Make `shep daemon reload` discoverable, which spec G5 asks for**
+
+Task 7 shipped the verb and reported the problem it leaves behind: **the version-skew refusal names a verb that `shep --help` does not list.** `daemon` is `#[command(hide = true)]` because it is the internal re-exec path, so its subcommand is hidden with it. An operator who reads the refusal is told the fix; one who goes looking for it cannot find it. That is the incident's shape again, in a smaller costume.
+
+`shep --help`'s verb listing is hand-rolled, not clap's: `VERB_GROUPS` near the top of `crates/shep-cli/src/cli.rs`, rendered into the block a few lines below it. Both need to agree, and there is an exact-string test over that output.
+
+**Do not simply append `daemon reload` to the "The shepherd" group.** Those entries are bare words, and `reload` ALREADY appears in "Run things", where it means reloading a sheep. Inline it would read as two more verbs, one of which collides with a different verb that does a different thing.
+
+Give it its own labelled line instead, in the same style as the existing `Aliases` footer, and use it to carry the upgrade sentence G5 asks for. Something in this shape, wording yours:
+
+```
+Aliases          flock: list, ls   bleats: logs   lookout: dash   stock: scale   whisper: sendline
+Upgrading        cargo install shep replaces the binary, not the running shepherd: shep daemon reload
+```
+
+That one line does three jobs: it makes the verb discoverable, it distinguishes it from the sheep-level `reload` by spelling out the whole path, and it is the `shep --help` half of G5.
+
+Update the exact-string test rather than deleting it. Then run the generator, since this changes `--help` output.
+
 - [ ] **Step 1: Add the upgrade note and the happy path**
 
 ```
