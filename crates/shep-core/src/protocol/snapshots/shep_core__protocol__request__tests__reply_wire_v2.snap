@@ -499,5 +499,27 @@ expression: replies
         ]
       }
     }
+  },
+  {
+    "id": 28,
+    "result": {
+      "Ok": {
+        "kind": "handover_fitness",
+        "data": {
+          "refusal": null
+        }
+      }
+    }
+  },
+  {
+    "id": 29,
+    "result": {
+      "Ok": {
+        "kind": "handover_fitness",
+        "data": {
+          "refusal": "sheep 'web' has a shepherd channel"
+        }
+      }
+    }
   }
 ]
