@@ -692,9 +692,89 @@ A sheep with no live pump (registered but stopped) reports `None` for all four. 
 
 #### Task 8b: the adopt seam on the runner
 
-`ProcessRunner` gains a defaulted `adopt` (IR-20, so an out-of-tree implementor does not break). `TokioProc` becomes spawned-or-adopted, backed by Task 7's `AdoptedReaper` on the adopted arm, and `ProcIo` is built from adopted handles.
+**Files:**
+- Modify: `crates/shep-daemon/src/runner.rs` (`ProcessRunner`)
+- Modify: `crates/shep-daemon/src/tokio_runner.rs` (`TokioProc`, `LogFile`, the pump)
+- Modify: `crates/shep-core/src/transport.rs` (a constructor)
+- Modify: `crates/shep-daemon/src/boot.rs` (`PidfileLock`)
+- Test: alongside each
 
-The three seams Task 6 measured land here, all confirmed small: `LogFile::from_file` taking an open handle plus its path, a `#[cfg(unix)]` constructor on `shep_core::transport::Listener`, and a `PidfileLock` arm holding an already-locked descriptor. **That arm must not re-lock**, since the descriptor crossed the exec with its `flock` intact and re-acquiring means releasing first.
+**Cross-crate, so the cargo shape is `cargo test --workspace --all-features`.**
+
+An adopted sheep has no `tokio::process::Child` and there is no way to make one. Task 7 built and tested `AdoptedReaper` for exactly this, and it currently has no route into the supervisor. This task is that route.
+
+**`ProcessRunner::adopt` is DEFAULTED (IR-20).** shep-daemon is published, so a required method would break every out-of-tree implementor. The default returns an error saying adoption is unsupported by this runner, which is the truthful answer for a runner that never took part in a handover.
+
+**`TokioProc` becomes spawned-or-adopted.** It already stores `pid: u32` separately from its `Child`, precisely because `Child::id()` returns `None` after a wait, so the pid half needs nothing. What changes is the wait: the spawned arm keeps `child.wait()`, the adopted arm goes through `AdoptedReaper`. `signal` and `kill_tree` address the pid and are untouched.
+
+The three seams Task 6 measured, all confirmed small:
+
+- `LogFile::from_file(path, file)`. `LogFile` is already generic over its sink with only `path` and `handle`, and `reopen` goes back through `open_append` by path, so rotation keeps working on an adopted handle unchanged.
+- a `#[cfg(unix)]` constructor on `shep_core::transport::Listener`, whose inner `tokio::net::UnixListener` is private and which offers only `bind(&Path)`.
+- a `PidfileLock` arm holding an already-locked `std::fs::File`. **It must not re-lock.** The descriptor crossed the exec with its `flock` intact, and re-acquiring means releasing first, which opens a window for a second daemon to win the home.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn an_adopted_proc_reports_its_real_exit() {
+    // The whole point of the seam. Task 7 proved the reaper; this proves it
+    // is reachable through the type the supervisor actually holds.
+    let mut proc = adopted_proc_for(spawn_exiting_with(3).await);
+    assert_eq!(proc.wait().await.unwrap().code, Some(3));
+}
+
+#[tokio::test]
+async fn a_spawned_proc_still_reports_its_real_exit() {
+    // Regression. The adopted arm must not disturb the path every sheep
+    // takes today.
+    let mut proc = runner.spawn(&spec_exiting_with(4)).unwrap().0;
+    assert_eq!(proc.wait().await.unwrap().code, Some(4));
+}
+
+#[tokio::test]
+async fn an_adopted_proc_reports_a_signal_as_a_signal() {
+    // rows.rs renders code and signal differently, so collapsing them makes
+    // the EXIT column lie.
+    let mut proc = adopted_proc_for(spawn_then_kill().await);
+    let out = proc.wait().await.unwrap();
+    assert_eq!((out.code, out.signal), (None, Some(9)));
+}
+
+#[test]
+fn a_log_file_from_an_open_handle_still_appends() {
+    // Not merely writable. Task 6 caught this exact difference by swapping
+    // .append(true) for .write(true) and watching the file lose its first
+    // line.
+    let f = open_appending(&path);
+    write_line(&path, "first");
+    let mut lf = LogFile::from_file(path.clone(), f.into());
+    lf.write_line("second");
+    assert_eq!(read(&path), "first
+second
+");
+}
+
+#[test]
+fn the_adopted_pidfile_arm_does_not_release_the_lock() {
+    // The failure it prevents: releasing to re-acquire opens a window where
+    // a second daemon wins the home. `flock` conflicts between separate
+    // descriptions even inside one process, which is what makes this
+    // testable at all.
+    let held = PidfileLock::acquire(&paths).unwrap();
+    let adopted = PidfileLock::from_locked(dup_of(&held));
+    assert!(PidfileLock::acquire(&paths).is_err(), "the lock must never be free");
+    drop(adopted);
+}
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+- [ ] **Step 3: Implement**
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Task gate, then commit**
 
 #### Task 8c: install the adopted flock
 
