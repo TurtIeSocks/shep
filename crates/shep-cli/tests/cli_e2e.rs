@@ -7312,10 +7312,32 @@ fn the_control_socket_accepts_throughout_a_handover() {
         .unwrap();
     assert_success(&reloaded);
 
+    // What the listener crossing the exec actually buys, and what it does
+    // not. The listener's descriptor is carried, so no client ever finds the
+    // address unbound. An ACCEPTED connection is not carried, deliberately:
+    // rebuilding a half-read frame's protocol state is not something the
+    // successor can do, and the spec's H2 records the consequence as a client
+    // seeing its connection drop and retrying.
+    //
+    // So a ping whose reply was in flight at the instant of the exec fails,
+    // and must be tolerated. A ping that could not connect at all means the
+    // address went away, which is the property this test exists to defend.
+    //
+    // Asserting the stronger thing was wrong rather than merely strict, and
+    // it passed on macOS purely because the window is narrow: the four Linux
+    // jobs on the first CI run of this test all caught it.
     let refused = prober.join().unwrap();
+    let (dropped, unreachable): (Vec<_>, Vec<_>) = refused
+        .into_iter()
+        .partition(|line| line.contains("the connection closed before a reply arrived"));
     assert!(
-        refused.is_empty(),
-        "every ping across the handover must be answered: {refused:?}"
+        unreachable.is_empty(),
+        "the control address must stay bound across the handover: {unreachable:?}"
+    );
+    assert!(
+        dropped.len() <= 1,
+        "at most the one request in flight at the exec may drop, got {}: {dropped:?}",
+        dropped.len()
     );
 
     graceful_kill(dir.path());
