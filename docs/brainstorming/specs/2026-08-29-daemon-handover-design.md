@@ -139,7 +139,12 @@ failing to acquire it proves a live daemon owns that pidfile. The signal
 path uses the lock, not the file's contents.
 
 SIGHUP because SIGUSR2 is already the log-reopen signal (`boot.rs:1437`)
-and SIGHUP is otherwise unhandled by the daemon. Every other daemon signal
+and SIGHUP was otherwise unhandled when this was written. Phase 1 has since
+installed it as a graceful stop, deliberately: SIGHUP's default disposition
+terminates the process, so a daemon too old to hand over that is signalled
+by a newer client walks the kill ladder instead of dropping its flock with
+broken pipes. The handover replaces that meaning; it does not introduce the
+handler. Every other daemon signal
 today is a shutdown: terminate, interrupt, quit.
 
 A signal carries no reply, which costs nothing here. The daemon is about to
