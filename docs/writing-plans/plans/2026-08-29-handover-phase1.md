@@ -274,7 +274,7 @@ kill ladder over every sheep before exiting."
 
 SIGHUP's default disposition terminates the process. Phase 2 uses SIGHUP as the handover trigger, and a phase 2 CLI picks its arm by version so it should never signal a daemon too old to hand over. This task is the floor under that: a stray or mistaken SIGHUP takes the graceful path instead of dropping the flock with broken pipes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -287,12 +287,12 @@ fn sighup_is_installed_alongside_the_shutdown_signals() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: sighup`
 Expected: FAIL
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add `SignalKind::hangup()` to the existing list at :1394 alongside `terminate`, `interrupt` and `quit`. The comment at :1317 says the list is not iterated because each is parameterised by a `SignalKind`; keep that shape and add one entry.
 
@@ -306,12 +306,12 @@ Document at the call site why hangup is in a list of shutdown signals:
 // client without the flock paying for the version gap.
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: sighup`
 Expected: PASS
 
-- [ ] **Step 5: Task gate, then commit**
+- [x] **Step 5: Task gate, then commit**
 
 ---
 

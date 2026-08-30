@@ -1463,6 +1463,13 @@ fn install_signals(
         SignalKind::terminate(),
         SignalKind::interrupt(),
         SignalKind::quit(),
+        // SIGHUP is here as a floor, not as its final meaning. It becomes
+        // the handover trigger, and until it does its kernel default is an
+        // unhandled terminate that would drop the flock's pipes rather than
+        // walk the ladder. A daemon that treats it as a graceful stop can be
+        // signalled by a newer client without the flock paying for the
+        // version gap.
+        SignalKind::hangup(),
     ] {
         // An early return here drops `signals`, whose own `Drop` aborts
         // every task already pushed — registering the 2nd or 3rd kind
@@ -2782,6 +2789,38 @@ mod tests {
         // `boot` returns — well before `run()`'s own task is ever polled.
         let run = tokio::spawn(daemon.run());
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!paths.socket.exists());
+    }
+
+    #[tokio::test]
+    async fn sighup_triggers_the_same_graceful_shutdown() {
+        // Task 3 (2026-08-29): SIGHUP's default disposition is to
+        // terminate the process, and this handler is what replaces that
+        // default. Phase 2 makes SIGHUP the handover trigger; until it
+        // does, a stray or mistaken SIGHUP must still walk the same
+        // graceful path SIGTERM does rather than drop the flock's pipes.
+        // Mirrors `sigterm_triggers_the_same_graceful_shutdown` above —
+        // see that test's own comments for why raising a real signal here
+        // is safe only because the handler is installed first, and for
+        // why `SIGNAL_TEST_LOCK` is required.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let daemon = boot(
+            ScriptedRunner::new(vec![]),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let run = tokio::spawn(daemon.run());
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP).unwrap();
         tokio::time::timeout(Duration::from_secs(5), run)
             .await
             .unwrap()
