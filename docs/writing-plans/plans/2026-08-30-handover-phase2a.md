@@ -334,7 +334,7 @@ the Linux-only test protects is exercised on a platform that compiles it).
 
 Order matters and getting it wrong loses a flock: write the blob to disk FIRST, then clear `FD_CLOEXEC` on every descriptor the blob names, then `execv`. If the exec fails, the blob is stale and must be removed before returning the error, or the next boot adopts a picture that never happened.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -351,17 +351,46 @@ fn an_exec_replaces_the_image_and_keeps_a_descriptor() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+shep-daemon is a library, so there is no helper binary to reach for and the
+plan's `helper_bin()` has nothing to return. The test binary is its own
+helper instead: three stages of the same test, selected by environment. The
+ordinary run re-runs this one test in a child with `--exact` and a marker
+naming a temp `$SHEP_HOME`; that child writes `hello` into a pipe, names the
+read end in a blob, and calls `hand_over`; the image `execve` lands in sees
+`SHEP_HANDOVER`, reads the blob, and reads the same fd number back. A second
+test covers the failed-exec cleanup, which needs a target that cannot run
+and so goes through a private `exec_into` rather than `hand_over`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 2: Run to verify it fails**
+
+Actual: FAIL, unresolved `HANDOVER_ENV`/`hand_over`/`exec_into` (E0425 x4).
+
+- [x] **Step 3: Implement**
 
 Use `nix::unistd::execv`. Pass the successor's marker through the environment: the blob's path in `SHEP_HANDOVER`, following the `SHEP_CHANNEL_FD` precedent of naming a descriptor-carrying thing in the environment.
 
 `execve` resets every signal handler to `SIG_DFL`, so nothing that was installed survives. That is expected and the successor re-installs; do not try to preserve handlers.
 
-- [ ] **Step 4: Run to verify it passes**
+`nix::unistd::execve`, not `execv`. `execv` inherits this process's
+`environ`, so setting `SHEP_HANDOVER` in it would mean `std::env::set_var`,
+which is unsafe in edition 2024 and unsound in a process with as many
+threads as the daemon; handing the environment over explicitly needs
+neither, and keeps the module free of unsafe (IR-22/23). Descriptors are
+cleared through a new `fds::keep_raw_across_exec`, for the same reason:
+`BorrowedFd::borrow_raw` is unsafe and a number needs no borrow.
 
-- [ ] **Step 5: Task gate, then commit**
+`exec_target()` resolves before the blob is written, so the one failure that
+leaves nothing behind gets no cleanup; blob, then descriptors, then exec is
+exactly as ordered above.
+
+- [x] **Step 4: Run to verify it passes**
+
+Actual: 577 passed, 18 filtered (up from 575: the plan's exec test, plus the
+one over the failed-exec cleanup the ordering argument demands). The exec
+test was also confirmed non-vacuous by removing the `FD_CLOEXEC` loop, at
+which point the successor cannot read the descriptor and it fails.
+
+- [x] **Step 5: Task gate, then commit**
 
 ---
 

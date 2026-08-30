@@ -21,9 +21,12 @@
 
 mod fds;
 
+use core::convert::Infallible;
+use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -249,6 +252,24 @@ impl Handover {
     #[must_use]
     pub fn path(paths: &ShepPaths) -> PathBuf {
         paths.run.join(FILE_NAME)
+    }
+
+    /// Every descriptor number this blob names, listener and pidfile
+    /// first.
+    ///
+    /// This is the exact set [`hand_over`] clears `FD_CLOEXEC` on, and
+    /// nothing else may be added to it: a descriptor kept without being
+    /// named leaks into the successor's image, which is the mirror of the
+    /// failure this module exists to avoid.
+    fn named_fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        [self.listener_fd, self.pidfile_fd]
+            .into_iter()
+            .chain(self.sheep.iter().flat_map(|sheep| {
+                let fds = sheep.fds;
+                [fds.out_pipe, fds.err_pipe, fds.out_log, fds.err_log]
+                    .into_iter()
+                    .flatten()
+            }))
     }
 
     /// Write the blob under `paths`, at mode `0600`, and return where it
@@ -610,6 +631,139 @@ fn launch_path_from_argv() -> Option<PathBuf> {
     has_separator.then(|| std::env::current_dir().ok().map(|cwd| cwd.join(&argv0)))?
 }
 
+/// The environment variable a handover leaves for its successor, holding
+/// the path of the blob it is to adopt.
+///
+/// Its presence is also the successor's only marker that it is one: an
+/// image started any other way has no blob to read and boots normally.
+/// Naming a descriptor-carrying thing in the environment follows the
+/// `SHEP_CHANNEL_FD` precedent this daemon already sets for a sheep's
+/// shepherd channel.
+pub const HANDOVER_ENV: &str = "SHEP_HANDOVER";
+
+/// Replace this process with a fresh copy of the shep binary, handing it
+/// `blob`'s flock.
+///
+/// Returns [`Infallible`] rather than `()` so that a call site reads as
+/// what it is: on success there is no successor statement, because there is
+/// no successor image running this code. Only the error arm returns.
+///
+/// The order is the whole of this function, and getting it wrong loses a
+/// flock:
+///
+/// 1. write the blob, so the successor has something to read before there
+///    is any chance of it existing;
+/// 2. clear `FD_CLOEXEC` on every descriptor the blob names, and only
+///    those, since a descriptor kept without being named leaks into the new
+///    image;
+/// 3. `execv` the binary [`exec_target`] resolves, which is deliberately
+///    not this running image.
+///
+/// If the exec fails, the blob on disk is a lie: it describes a handover
+/// that never happened, and the next boot would adopt a picture of a
+/// process image that does not exist. It is removed before the error is
+/// returned, and the caller falls back to the stop-and-start arm.
+///
+/// The target is resolved before anything is written, so the one failure
+/// that needs no cleanup does not get any.
+///
+/// Nothing this process installed on a signal survives. `execve` resets
+/// every disposition that names a handler back to `SIG_DFL`, so tokio's
+/// `SIGCHLD` handling and this daemon's own installer both go, and the
+/// successor installs them again. That is the design, not a loss to work
+/// around.
+///
+/// # Errors
+///
+/// No binary is safe to exec (see [`exec_target`]), the blob could not be
+/// written, a descriptor it names is not open, or the exec itself failed.
+/// Every one of those returns with no blob left on disk.
+pub fn hand_over(blob: &Handover, paths: &ShepPaths) -> io::Result<Infallible> {
+    exec_into(&exec_target()?, blob, paths)
+}
+
+/// [`hand_over`], against a caller-chosen binary.
+///
+/// Split out so a test can point the exec at something that cannot run and
+/// watch the blob be cleaned up; production has exactly one target and
+/// [`exec_target`] chooses it.
+///
+/// # Errors
+///
+/// As [`hand_over`], minus the target resolution.
+fn exec_into(target: &Path, blob: &Handover, paths: &ShepPaths) -> io::Result<Infallible> {
+    let written = blob.write(paths)?;
+    let failure = match exec_with_blob(target, blob, &written) {
+        Ok(never) => match never {},
+        Err(err) => err,
+    };
+    match fs::remove_file(&written) {
+        Ok(()) | Err(_) => Err(failure),
+    }
+}
+
+/// Clear `FD_CLOEXEC` on what `blob` names, then become `target`.
+///
+/// # Errors
+///
+/// A descriptor the blob names is not open, a path or an environment entry
+/// holds an interior NUL, or the exec failed. On any of them this process
+/// is still itself and `written` is still on disk, which is what
+/// [`exec_into`] cleans up.
+fn exec_with_blob(target: &Path, blob: &Handover, written: &Path) -> io::Result<Infallible> {
+    for fd in blob.named_fds() {
+        fds::keep_raw_across_exec(fd)?;
+    }
+
+    let path = c_string(target.as_os_str().as_bytes())?;
+    let argv = std::env::args_os()
+        .map(|arg| c_string(arg.as_bytes()))
+        .collect::<io::Result<Vec<_>>>()?;
+    let env = successor_env(written)?;
+
+    // `execve` rather than `execv`: `execv` inherits this process's
+    // `environ`, so pointing the successor at the blob would mean
+    // `std::env::set_var`, which is unsafe in edition 2024 and unsound in a
+    // process with as many threads as this one. Handing the environment
+    // over explicitly needs neither.
+    nix::unistd::execve(&path, &argv, &env).map_err(io::Error::from)
+}
+
+/// This process's environment, with [`HANDOVER_ENV`] set to `written`.
+///
+/// Any inherited value of that variable is dropped rather than kept: a
+/// successor that adopts a blob must adopt the one its predecessor just
+/// wrote, and a stale entry from an earlier handover would name a file that
+/// has already been read and unlinked.
+///
+/// # Errors
+///
+/// A name or value holds an interior NUL, which no environment this process
+/// was given can.
+fn successor_env(written: &Path) -> io::Result<Vec<CString>> {
+    let mut env = std::env::vars_os()
+        .filter(|(name, _)| name != HANDOVER_ENV)
+        .map(|(name, value)| {
+            let mut entry = name.into_vec();
+            entry.push(b'=');
+            entry.extend(value.into_vec());
+            c_string(&entry)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let mut marker = HANDOVER_ENV.as_bytes().to_vec();
+    marker.push(b'=');
+    marker.extend(written.as_os_str().as_bytes());
+    env.push(c_string(&marker)?);
+    Ok(env)
+}
+
+/// `bytes` as a C string, with an interior NUL reported as an `io::Error`
+/// rather than as a `NulError` nothing else in this module speaks.
+fn c_string(bytes: &[u8]) -> io::Result<CString> {
+    CString::new(bytes).map_err(io::Error::other)
+}
+
 #[cfg(test)]
 mod tests {
     use shep_core::config::AppConfig;
@@ -940,5 +1094,153 @@ mod tests {
         // contract that an absolute right-hand side replaces the left.
         let p = launch_path_from_argv().expect("argv[0] names a path");
         assert!(p.is_file(), "{}", p.display());
+    }
+
+    /// Names the directory the exec self-test's middle stage works in, and
+    /// tells that stage it is not the ordinary run of the test.
+    const SELFTEST_HOME: &str = "SHEP_HANDOVER_SELFTEST";
+
+    /// The full path of the self-test, as libtest's `--exact` wants it.
+    const SELFTEST_NAME: &str =
+        "handover::tests::an_exec_replaces_the_image_and_keeps_a_descriptor";
+
+    /// A blob naming real descriptors: `entry`'s sheep carries `fds`, and
+    /// the listener and pidfile numbers are the caller's own open files.
+    fn handover_with_fds(
+        entry: &ProcessEntry,
+        listener_fd: RawFd,
+        pidfile_fd: RawFd,
+        fds: CarriedFds,
+    ) -> Handover {
+        Handover {
+            version: VERSION,
+            sheep: vec![CarriedSheep::from_entry(entry, 7, fds)],
+            listener_fd,
+            pidfile_fd,
+            next_id: 9,
+            next_deadline: 5,
+            next_action_stamp: 2,
+        }
+    }
+
+    fn selftest_paths(home: &Path) -> ShepPaths {
+        let home = home.display().to_string();
+        let paths = ShepPaths::resolve(
+            &|key| (key == "SHEP_HOME").then(|| home.clone()),
+            Path::new("/nonexistent"),
+        );
+        std::fs::create_dir_all(&paths.run).unwrap();
+        paths
+    }
+
+    #[test]
+    fn an_exec_replaces_the_image_and_keeps_a_descriptor() {
+        // Three stages of the same test binary. The ordinary run is the
+        // parent: it re-runs this one test in a child, which writes into a
+        // pipe and hands over, and the image that `hand_over` execs into
+        // reads that pipe back by number. There is no helper binary to
+        // borrow here, shep-daemon being a library, and a test that stopped
+        // short of a real `execve` would prove none of what this one does.
+        if let Some(blob) = std::env::var_os(HANDOVER_ENV) {
+            successor_stage(Path::new(&blob));
+        }
+        if let Some(home) = std::env::var_os(SELFTEST_HOME) {
+            exec_stage(Path::new(&home));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(SELFTEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(SELFTEST_HOME, dir.path())
+            .env_remove(HANDOVER_ENV)
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The whole mechanism in one assertion: a pipe written before the
+        // exec is readable by the process after it, on the same fd number,
+        // proving both that the image changed and that the descriptor
+        // crossed.
+        assert!(stdout.contains("adopted: hello"), "{stdout}");
+    }
+
+    /// The middle stage: fill a pipe, name its read end in a blob, and hand
+    /// over. Returns only if the exec failed, which is a test failure.
+    fn exec_stage(home: &Path) -> ! {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        let paths = selftest_paths(home);
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"hello").unwrap();
+        drop(writer);
+
+        let listener = tempfile::tempfile().unwrap();
+        let pidfile = tempfile::tempfile().unwrap();
+        let blob = handover_with_fds(
+            &entry_fixture(|_| {}),
+            listener.as_raw_fd(),
+            pidfile.as_raw_fd(),
+            CarriedFds {
+                out_pipe: Some(reader.as_raw_fd()),
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+            },
+        );
+
+        let err = hand_over(&blob, &paths).unwrap_err();
+        panic!("the exec should not have returned: {err}");
+    }
+
+    /// The stage after the exec: read the blob this process was pointed at,
+    /// and read the descriptor it names.
+    fn successor_stage(blob_path: &Path) -> ! {
+        let blob = Handover::read(blob_path).expect("the successor's blob");
+        let fd = blob.sheep[0].fds.out_pipe.expect("a carried stdout pipe");
+        let mut buf = [0_u8; 16];
+        let read = nix::unistd::read(fd, &mut buf).expect("the carried descriptor is open");
+        println!("adopted: {}", String::from_utf8_lossy(&buf[..read]));
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn a_failed_exec_leaves_no_blob_behind() {
+        // A blob that outlives a failed exec describes a handover that never
+        // happened, and the next boot would adopt a picture of a process
+        // image that does not exist.
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = selftest_paths(dir.path());
+        let target = dir.path().join("not-a-binary");
+        std::fs::write(&target, "this will never execute").unwrap();
+
+        let listener = tempfile::tempfile().unwrap();
+        let pidfile = tempfile::tempfile().unwrap();
+        let blob = handover_with_fds(
+            &entry_fixture(|_| {}),
+            listener.as_raw_fd(),
+            pidfile.as_raw_fd(),
+            CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+            },
+        );
+
+        let err = exec_into(&target, &blob, &paths).unwrap_err();
+        assert!(
+            !Handover::path(&paths).exists(),
+            "a failed exec left a blob behind: {err}"
+        );
     }
 }

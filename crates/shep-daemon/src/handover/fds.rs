@@ -12,7 +12,7 @@
 //! not a shep one.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
@@ -36,7 +36,25 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 /// Returns an error if `fcntl` fails, which on a valid open descriptor
 /// should not happen in practice.
 pub fn keep_across_exec(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let fd = fd.as_raw_fd();
+    keep_raw_across_exec(fd.as_raw_fd())
+}
+
+/// [`keep_across_exec`], for a descriptor known only by its number.
+///
+/// The handover blob names descriptors as numbers, not as borrows, and the
+/// borrowed form is reached only through `BorrowedFd::borrow_raw`, which is
+/// unsafe and would have to live in `sys.rs` (IR-22/23). `fcntl` on a
+/// number needs neither, so the number is the primitive here and the
+/// borrowed form delegates to it.
+///
+/// The same warning applies: call this only for a descriptor the successor
+/// will adopt.
+///
+/// # Errors
+///
+/// Returns an error if `fcntl` fails, which is what a number naming no open
+/// descriptor looks like.
+pub fn keep_raw_across_exec(fd: RawFd) -> io::Result<()> {
     let flags = fcntl(fd, FcntlArg::F_GETFD)?;
     let mut flags = FdFlag::from_bits_truncate(flags);
     flags.remove(FdFlag::FD_CLOEXEC);
