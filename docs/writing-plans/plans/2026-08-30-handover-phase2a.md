@@ -28,7 +28,7 @@ Those are 2b's and 2c's. The fallback is correct behaviour, not a stub.
 - MSRV 1.88, edition 2024. **No new crate dependencies in any task.**
 - The whole phase is `#[cfg(unix)]`. Windows has no `execve`; `Arm::for_daemon` already returns the stop arm there and must keep doing so.
 - Unsafe is permitted ONLY in `crates/shep-daemon/src/sys.rs`, with a per-block `// SAFETY:` comment (IR-22/23). `fcntl`, `execv` and `waitpid` go through `nix`, which is safe-wrapped; if any raw call is unavoidable it lives in `sys.rs` and nowhere else.
-- Every new public item needs a doc comment, a `# Errors` section if it returns `Result`, and a deliberate `Debug` decision. **The handover blob carries no environment values and no secrets**; if a type could ever hold one, redact it with an exact-string test (IR-41).
+- Every new public item needs a doc comment, a `# Errors` section if it returns `Result`, and a deliberate `Debug` decision. **The handover blob does carry each sheep's resolved `AppConfig`, environment included** (see `Handover`'s own doc for why refusing to carry it bought nothing). What protects it is mode `0600` set at creation inside a `0700` directory, an unlink by the successor the moment it has read it, and `AppConfig`'s `Debug` printing `env` as a count rather than as pairs, pinned by an exact-string test (IR-41).
 - `core::error::Error`, never `std::error::Error`.
 - **Invoke the `shep-idiomatic-rust` skill before writing any Rust.** Cite `IR-<n>` in review.
 - **One cargo shape per task.** Daemon-side work uses `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`. Anything crossing into shep-cli uses `cargo test --workspace --all-features`. Never alternate within a task.
