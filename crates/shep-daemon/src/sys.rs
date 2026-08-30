@@ -191,6 +191,14 @@ pub unsafe fn adopt_fd(fd: RawFd) -> Result<File, SysError> {
 /// is trusted exactly as far as everything else the daemon reads out of its
 /// own home. Do not call this on a descriptor number from anywhere else.
 ///
+/// **One number, one owner.** The argument above is about a number naming
+/// the wrong object; a blob naming the SAME number twice would instead build
+/// two owners of the right one, and the second drop would close a descriptor
+/// the first owner, or a later open, is still using.
+/// `handover::adopt::adopt` refuses a repeated number before it adopts
+/// anything, so every call that reaches here is the only call for its
+/// number.
+///
 /// # Errors
 /// - [`SysError::ReservedFd`]: `fd` is below 3 (stdio is owned elsewhere).
 /// - [`SysError::BadFd`]: `fd` names no open descriptor in this process,

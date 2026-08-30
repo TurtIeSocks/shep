@@ -97,11 +97,11 @@ pub struct AdoptedSheep {
 ///
 /// # Errors
 ///
-/// Any descriptor the blob names is not open in this process, is not the
-/// kind of object it was named as (a read end that is not a pipe), or could
-/// not be registered with the runtime. The error names the sheep and the
-/// stream, because that is what an operator needs in order to know which
-/// process is now unsupervised.
+/// The blob names one descriptor number twice, or any descriptor it names is
+/// not open in this process, is not the kind of object it was named as (a
+/// read end that is not a pipe), or could not be registered with the
+/// runtime. The error names the sheep and the stream, because that is what
+/// an operator needs in order to know which process is now unsupervised.
 ///
 /// There is no partial success and no fallback. By the time this runs the
 /// predecessor has already `execve`d itself away, so there is no image left
@@ -115,6 +115,7 @@ pub struct AdoptedSheep {
 /// happen without one.
 #[track_caller]
 pub fn adopt(blob: &Handover) -> io::Result<Adopted> {
+    refuse_repeated_fds(blob)?;
     let listener = adopt_listener(blob.listener_fd)?;
     let sheep = blob
         .sheep
@@ -130,6 +131,41 @@ pub fn adopt(blob: &Handover) -> io::Result<Adopted> {
         sheep,
         pidfile,
     })
+}
+
+/// Refuses a blob naming one descriptor number more than once.
+///
+/// Before the first adoption, never during. Each adoption builds an owner of
+/// its number, and `sys::adopt_handover_fd`'s safety argument rests on that
+/// owner being the only one: a second owner of the same number closes it a
+/// second time on drop, and whatever this process opened in between is what
+/// the second close reaches.
+///
+/// A blob the daemon wrote cannot contain a repeat, since every number in it
+/// is a distinct open descriptor at the moment of the snapshot. This is for
+/// the residual `adopt_handover_fd`'s doc already names: a blob that was
+/// edited, or one left by a handover that never completed. Refusing costs one
+/// pass over at most a few dozen numbers and makes the sole-owner claim true
+/// rather than merely expected.
+///
+/// # Errors
+///
+/// Names the repeated number. There is nothing to say about which of the two
+/// mentions is the wrong one, because nothing here can know.
+fn refuse_repeated_fds(blob: &Handover) -> io::Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for fd in blob.named_fds() {
+        if !seen.insert(fd) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the handover blob names descriptor {fd} more than once, so adopting it \
+                     would build two owners of one number"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Remove the blob at `path`, now that its descriptors are adopted.
@@ -290,6 +326,41 @@ mod tests {
             .expect("the adopted listener must accept")
             .unwrap()
             .expect("the adopted listener accepts");
+    }
+
+    /// A blob naming one number twice is refused before anything is adopted.
+    ///
+    /// Two owners of one descriptor close it twice, and the second close
+    /// lands on whatever this process opened in between. That is precisely
+    /// the recycling hazard `sys::adopt_handover_fd` argues cannot arise, and
+    /// its argument holds only while each number has a single owner.
+    ///
+    /// The listener's own number is the one repeated, because the refusal has
+    /// to come before the first adoption rather than at the field that
+    /// happens to collide: reaching a duplicate mid-way would already have
+    /// built the first owner.
+    #[tokio::test]
+    async fn a_blob_naming_one_descriptor_twice_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        let mut blob = blob_with(
+            &socket,
+            vec![carried(CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+            })],
+        );
+        blob.sheep[0].fds.out_log = Some(blob.listener_fd);
+
+        let err = adopt(&blob).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            err.to_string().contains("more than once"),
+            "the refusal must say what is wrong with the blob: {err}"
+        );
     }
 
     #[tokio::test]
