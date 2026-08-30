@@ -1642,6 +1642,13 @@ enum ReloadMode {
     /// `EADDRINUSE`, including on macOS, where Node cannot set the option at
     /// all (`ENOTSUP`).
     ///
+    /// Note which app this is about, because it is NOT one that ever takes
+    /// `Serial`. `ReloadMode::of` sends a probed app without `reuse_port`
+    /// here; the measured case below has NO probe, so it takes `Overlap` and
+    /// meets `EADDRINUSE` there. `Serial` is what spares a PROBED app the
+    /// same collision. The paragraph sits here because it is the failure
+    /// this variant exists to avoid, not one it can produce.
+    ///
     /// This said "and crash-loops" until 2026-08-29, and that is not what
     /// happens. Measured twice independently, on macOS, one instance, no
     /// probe, `autorestart = true`: the replacement takes `EADDRINUSE` and
