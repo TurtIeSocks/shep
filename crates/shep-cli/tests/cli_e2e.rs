@@ -7029,9 +7029,10 @@ fn a_multi_instance_flock_gets_distinct_slots_a_grouped_table_and_undoubled_blea
 /// How long [`counting_lines`] waits for a counter sheep to reach a line
 /// count, and [`wait_for_pid`] for a sheep to be online with a pid.
 ///
-/// Sized like [`FLOCK_DEADLINE`] rather than shorter: the counter emits five
-/// lines a second, so any wait here that is not satisfied in the first
-/// hundred milliseconds is a loaded machine rather than a slow sheep.
+/// Sized like [`FLOCK_DEADLINE`] rather than shorter. The counter emits five
+/// lines a second, so the longest wait any caller here asks for is six lines,
+/// which an idle machine satisfies in a little over a second. Twenty seconds
+/// is therefore a loaded runner's margin and not the sheep's own pace.
 #[cfg(unix)]
 const HANDOVER_DEADLINE: Duration = Duration::from_secs(20);
 
@@ -7054,7 +7055,7 @@ fn write_counting_script(dir: &TempDir) -> PathBuf {
         dir,
         "counter.sh",
         &format!(
-            "{}{}i=1\nwhile :; do\n  echo \"$i\"\n  i=$((i+1))\n  sleep 0.05\ndone\n",
+            "{}{}i=1\nwhile :; do\n  echo \"$i\"\n  i=$((i+1))\n  sleep 0.2\ndone\n",
             script_header(),
             record_pid_line(dir),
         ),
