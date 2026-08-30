@@ -535,6 +535,16 @@ The third test is the one that matters. Give it its own name in CI's serial job 
 
 `Arm::Handover` is currently unreachable and carries `#[expect(dead_code)]`. Constructing it without removing that attribute is a compile error, which is deliberate; remove it here.
 
+**Task 6 found two seams this task needs that the plan did not anticipate. Both make Task 8 a cross-crate change, so its cargo shape is `cargo test --workspace --all-features`, not the daemon-only inner loop.**
+
+1. **`spawn_log_pump` cannot take an adopted log handle.** It takes `out_path: PathBuf` / `err_path: PathBuf` (`crates/shep-daemon/src/tokio_runner.rs:1339`) and calls `LogFile::open` itself, so there is no seam for a file that is already open. The fix is small because `LogFile` is already generic over its sink with only `path` and `handle`: it needs a constructor taking a `tokio::fs::File` plus the path for later reopens. Do NOT write a parallel pump. `LogFile::reopen` goes back through `open_append` by path, so rotation keeps working on an adopted handle unchanged.
+
+2. **`shep_core::transport::Listener` cannot be built from an adopted listener.** Its inner `tokio::net::UnixListener` is private and the type offers only `bind(&Path)`. Adoption yields a bare `tokio::net::UnixListener`, so wiring it into the accept loop needs a constructor added in shep-core.
+
+Also from Task 6: `PidfileLock` cannot hold the adopted descriptor, because its unix field is `nix::fcntl::Flock<File>` and `nix` has no constructor for an already-locked file that does not lock it again. `Adopted` carries a plain `std::fs::File`, so this task needs a `PidfileLock` variant or enum arm that holds it. **It must not re-lock**: the descriptor crossed the exec with its `flock` intact, and re-acquiring means releasing first, which opens a window for a second daemon.
+
+Three `#[expect(dead_code)]` attributes come due here and will fire as unfulfilled once their items are called: the module-wide one in `handover/mod.rs` (delete it outright rather than narrowing, per Task 5), and the ones on `successor_handover` and `Successor` in `boot.rs`.
+
 SIGHUP currently runs a graceful stop (phase 1, Task 3). It now runs the fitness check and either hands over or falls through to that same graceful stop.
 
 - [ ] **Step 1: Write the failing tests**
