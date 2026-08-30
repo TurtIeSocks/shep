@@ -5960,6 +5960,13 @@ impl<R: ProcessRunner> Actor<R> {
                 // fails it.
                 pending_stop: slot.manual.is_some(),
                 pending_delete: slot.pending_delete,
+                // Always `false` here, and it has to be: this gate awaits
+                // nothing, so it cannot ask a pump anything, and a pump that
+                // is wedged right now may well have answered by the time a
+                // SIGHUP arrives. The snapshot's own gate is the one that
+                // knows (see `spawn_handover_task`), which is why that one
+                // is load-bearing and this one is a courtesy to the client.
+                pump_unresponsive: false,
             })
             .collect();
         let _ = reply.send(Ok(fitness(&candidates)));
@@ -7658,8 +7665,11 @@ type Snapshot = (Vec<OwnedCandidate>, Handover, ParkedPumps);
 /// The log pumps a snapshot stopped, so a handover that is then abandoned
 /// can start them reading again.
 ///
-/// Taking the snapshot parks every pump it reaches, because a report is
-/// only true while nothing moves behind it (see `LogFiles::reading`). The
+/// Taking the snapshot parks every pump that ANSWERS it, because a report
+/// is only true while nothing moves behind it (see `LogFiles::reading`). A
+/// pump that missed [`REPORT_DEADLINE`] is deliberately not in here: it
+/// never parked, so a resume would wake something that was never asleep.
+/// The
 /// exec is what normally ends that park, by replacing the whole image.
 /// Every other way out leaves this daemon running with pumps that have
 /// stopped reading, and nothing else ever starts one again. See
@@ -7732,23 +7742,37 @@ fn spawn_handover_task(
         let mut carried = Vec::with_capacity(drafts.len());
         let mut parked = ParkedPumps::default();
         for draft in drafts {
-            let fds = match &draft.log_ctl {
-                Some(log_ctl) => {
-                    let fds = report_fds(log_ctl).await;
-                    // Recorded whatever the answer was. A pump that could
-                    // not be reached is a failed send that resumes nothing,
-                    // and one that answered `none` has still been asked to
-                    // park.
-                    parked.0.push(log_ctl.clone());
-                    fds
-                }
-                None => CarriedFds::none(),
+            // The three answers go to three different places, which is why
+            // `report_fds` distinguishes them at all:
+            //
+            // - only a pump that ANSWERED parked, so only that one is owed a
+            //   resume. A wedged pump never stopped reading, and one that is
+            //   gone is reading nothing.
+            // - only a wedged pump refuses the flock. It is the one case
+            //   where a live sheep's descriptors are unknown, and the gate
+            //   below is the only thing standing between that and a
+            //   successor adopting a sheep with no stdout.
+            // - the blob gets `none()` for both of the answers without
+            //   descriptors. For a wedged pump that is a value nothing ever
+            //   reads: the gate refuses on the candidate, so this blob is
+            //   dropped rather than written.
+            let (fds, pump_unresponsive) = match &draft.log_ctl {
+                Some(log_ctl) => match report_fds(log_ctl).await {
+                    PumpReport::Parked(fds) => {
+                        parked.0.push(log_ctl.clone());
+                        (fds, false)
+                    }
+                    PumpReport::Gone => (CarriedFds::none(), false),
+                    PumpReport::Unresponsive => (CarriedFds::none(), true),
+                },
+                None => (CarriedFds::none(), false),
             };
             carried.push(CarriedSheep::from_entry(&draft.entry, draft.epoch, fds));
             candidates.push(OwnedCandidate {
                 entry: draft.entry,
                 pending_stop: draft.pending_stop,
                 pending_delete: draft.pending_delete,
+                pump_unresponsive,
             });
         }
         let blob = Handover::new(carried, fds, counters);
@@ -7756,23 +7780,88 @@ fn spawn_handover_task(
     });
 }
 
-/// Asks one sheep's log pump to write out everything it is holding, report
-/// the four descriptors it owns, and stop reading until the exec; and waits
-/// for the answer.
+/// What one log pump answered a snapshot's [`LogCtl::ReportFds`] with.
 ///
-/// Not reaching a pump at all is [`CarriedFds::none`], not an error, and both
-/// shapes of it mean the same thing that [`reopen_logs`] documents: there is
-/// no pump, so there are no descriptors. A stopped sheep has nothing to
-/// carry and nothing to lose, and the fitness gate does not refuse it.
+/// Three answers rather than two, and the third is the point. A pump that
+/// cannot be reached and a pump that is wedged both have no descriptors to
+/// give, but they mean opposite things: the first is a sheep that has
+/// stopped and has nothing to lose, and the second is a live sheep whose
+/// four descriptors this daemon simply does not know. Folding the second
+/// into [`CarriedFds::none`] would carry it, silently dropping its stdout,
+/// stderr and both log handles.
 ///
 /// [`CarriedFds::none`]: CarriedFds::none
 #[cfg(unix)]
-async fn report_fds(log_ctl: &mpsc::Sender<LogCtl>) -> CarriedFds {
+#[derive(Debug)]
+enum PumpReport {
+    /// The pump answered, and has stopped reading its streams until the
+    /// exec. It is owed a [`LogCtl::Resume`] if the handover is abandoned.
+    Parked(CarriedFds),
+    /// There is no pump on the other end any more: the send found a closed
+    /// mailbox, or the answer channel dropped unanswered. Either way the
+    /// task is over, so it is reading nothing and is owed nothing.
+    ///
+    /// Not a refusal. A registered sheep that is not running reaches the
+    /// gate exactly like this, and carrying it is correct: there is nothing
+    /// to carry.
+    Gone,
+    /// The pump did not answer inside [`REPORT_DEADLINE`].
+    ///
+    /// It never parked, so it is still reading its sheep's streams while
+    /// every pump before it in the sweep is frozen, and it must NOT be
+    /// resumed: a resume would wake something that was never asleep.
+    Unresponsive,
+}
+
+/// How long a snapshot waits for ONE log pump to report its descriptors.
+///
+/// The work it bounds is small and known (IR-26): the pump drains at most
+/// one bufferful per stream into that stream's log file and flushes both, so
+/// this covers a handful of `write(2)`s of at most 8 KiB each. That is
+/// microseconds on a healthy filesystem and single-digit milliseconds on a
+/// busy one, which puts two seconds three orders of magnitude clear of the
+/// work. The margin is deliberate and the asymmetry is why: firing early
+/// costs the WHOLE flock its handover, while firing late costs a few seconds
+/// before the same fallback. So this fires only for a pump that is genuinely
+/// stuck, on a filesystem that has stopped completing writes, rather than
+/// for one that is merely slow.
+///
+/// Two seconds also matches [`STDIN_WRITE_TIMEOUT`], the closest sibling in
+/// this file: a bounded wait on an acknowledgement from a pump-tier task
+/// whose failure mode is a peer that has stopped consuming.
+///
+/// Per pump, not per sweep, because the pumps are visited one at a time and
+/// the refusal has to name WHICH sheep went quiet. A flock of wedged pumps
+/// therefore costs N times this before the caller falls back, which is the
+/// price of that name.
+#[cfg(unix)]
+const REPORT_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Asks one sheep's log pump to write out everything it is holding, report
+/// the four descriptors it owns, and stop reading until the exec; and waits
+/// up to [`REPORT_DEADLINE`] for the answer.
+///
+/// Not reaching a pump at all is [`PumpReport::Gone`], not an error, and
+/// both shapes of it mean the same thing that [`reopen_logs`] documents:
+/// there is no pump, so there are no descriptors. A stopped sheep has
+/// nothing to carry and nothing to lose, and the fitness gate does not
+/// refuse it.
+///
+/// The deadline covers the send as well as the answer. A pump that has
+/// stopped serving its mailbox fills it and blocks the send instead, which
+/// is the same stall arriving one step earlier.
+#[cfg(unix)]
+async fn report_fds(log_ctl: &mpsc::Sender<LogCtl>) -> PumpReport {
     let (done, ack) = oneshot::channel();
-    if log_ctl.send(LogCtl::ReportFds { done }).await.is_err() {
-        return CarriedFds::none();
-    }
-    ack.await.unwrap_or_else(|_| CarriedFds::none())
+    let answer = async {
+        if log_ctl.send(LogCtl::ReportFds { done }).await.is_err() {
+            return PumpReport::Gone;
+        }
+        ack.await.map_or(PumpReport::Gone, PumpReport::Parked)
+    };
+    tokio::time::timeout(REPORT_DEADLINE, answer)
+        .await
+        .unwrap_or(PumpReport::Unresponsive)
 }
 
 /// Spawns the task that carries out one `Reopen` and answers its caller.
@@ -17325,6 +17414,127 @@ mod tests {
                 assert!(is_open(fd), "blob names a closed descriptor: {fd}");
             }
         }
+    }
+
+    /// Fails if a wedged log pump hangs the snapshot instead of refusing it.
+    ///
+    /// A pump that never answers has no deadline above it but this one: the
+    /// SIGHUP path awaits the snapshot before it can fall back, so the same
+    /// stall takes out the handover AND the graceful stop it would have
+    /// fallen back to, and the daemon has no way out at all.
+    ///
+    /// The refusal has to name the sheep, and it has to be its own reason
+    /// rather than an empty `CarriedFds`: `none()` is what a STOPPED sheep
+    /// reports, so collapsing a wedged live pump into it would pass the gate
+    /// and carry that sheep with its four descriptors dropped.
+    ///
+    /// Two sheep, one of each kind, so a gate that refused every flock with
+    /// a pump in it would pass here for the wrong reason.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_that_never_reports_refuses_the_snapshot_instead_of_hanging() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 2])
+            .with_a_pump_that_never_reports(&["wedged"]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("answering", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("wedged", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        // Far longer than the deadline under test, and never actually
+        // waited: the clock is paused, so it advances only once every task
+        // is blocked. What it buys is a FAILURE rather than a hung suite if
+        // the snapshot has no deadline of its own.
+        let snapshot =
+            tokio::time::timeout(Duration::from_secs(3600), handle.handover_snapshot(fds))
+                .await
+                .expect("a snapshot over a wedged pump must answer rather than hang")
+                .unwrap();
+        let (candidates, _blob, _parked) = snapshot;
+
+        let borrowed: Vec<crate::handover::Candidate<'_>> = candidates
+            .iter()
+            .map(crate::handover::OwnedCandidate::as_candidate)
+            .collect();
+        assert_eq!(
+            crate::handover::fitness(&borrowed),
+            crate::handover::Fitness::Refused(crate::handover::RefusedReason::PumpUnresponsive {
+                sheep: "wedged".to_string(),
+            }),
+            "the gate must refuse, and must name the sheep whose pump went quiet"
+        );
+        for candidate in &candidates {
+            assert_eq!(
+                candidate.pump_unresponsive,
+                candidate.entry.spec.config().name == "wedged",
+                "exactly the wedged sheep is unresponsive, not its neighbour"
+            );
+        }
+    }
+
+    /// Fails if the snapshot puts a pump it never heard from into the set it
+    /// owes a resume to.
+    ///
+    /// A report parks the pump that answers it, and only that one: a pump
+    /// that missed the deadline is still reading its streams. Resuming it
+    /// would wake something that was never asleep, and the counter it lands
+    /// on is the one an abandoned handover is audited by, so a spurious
+    /// resume reads as a repaired pump forever after.
+    ///
+    /// Asserted by sending the resumes rather than by counting the set, so
+    /// this is a claim about which pump is told rather than about how many
+    /// senders are held.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_that_missed_the_deadline_is_not_in_the_parked_set() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = Arc::new(
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 2])
+                .with_a_pump_that_never_reports(&["wedged"]),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(SharedRunner(Arc::clone(&runner)), test_paths(&dir), events);
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("answering", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("wedged", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let (_candidates, _blob, parked) =
+            tokio::time::timeout(Duration::from_secs(3600), handle.handover_snapshot(fds))
+                .await
+                .expect("a snapshot over a wedged pump must answer rather than hang")
+                .unwrap();
+        parked.resume().await;
+
+        // By name, because spawn order is the supervisor's business and
+        // every counter here is indexed by it.
+        let answering = runner.spawn_index_of("answering").expect("started above");
+        let wedged = runner.spawn_index_of("wedged").expect("started above");
+        // A resume carries no acknowledgement, so a send that has returned
+        // has only been queued. Bounded, and instant under the paused clock.
+        let delivered = async {
+            while runner.resumes(answering) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), delivered)
+            .await
+            .expect("the pump that answered was parked, and is owed a resume");
+        assert_eq!(
+            runner.resumes(wedged),
+            0,
+            "a pump that never answered never parked, so nothing may resume it"
+        );
     }
 
     /// Fails if a snapshot loses the three actor counters or the two slot

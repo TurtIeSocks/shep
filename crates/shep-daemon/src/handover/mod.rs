@@ -46,9 +46,12 @@ pub enum Fitness {
 
 /// Why a flock cannot be handed over in place, and what happens instead.
 ///
-/// Every variant is a feature phase 2a does not yet carry, not an error. The
-/// caller falls back to the stop arm, which is correct behaviour rather
-/// than a degraded one.
+/// Almost every variant is a feature phase 2a does not yet carry rather than
+/// an error, and the caller falls back to the stop arm, which is correct
+/// behaviour rather than a degraded one. [`Self::PumpUnresponsive`] is the
+/// exception and is a fault: it says a sheep's log pump did not answer in
+/// time, so nothing here knows which descriptors that sheep holds. The
+/// answer is still to refuse and stop, which is why it lives with the rest.
 ///
 /// `#[non_exhaustive]`, unlike [`crate::boot::Shepherd`]: that enum is
 /// closed by its mechanism (a pidfile lock is either free, held-with-pid or
@@ -59,6 +62,18 @@ pub enum Fitness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RefusedReason {
+    /// The sheep's log pump did not report its descriptors before the
+    /// snapshot's deadline, so nothing knows which four numbers it holds.
+    ///
+    /// First in this enum and first in [`refusal`]'s order, because it is
+    /// the only variant that is not a statement about the sheep's config: a
+    /// sheep can be both wedged and multi-instance, and the wedge is the
+    /// fact an operator needs, since it will still be true after every
+    /// feature below has shipped.
+    PumpUnresponsive {
+        /// The sheep's name.
+        sheep: String,
+    },
     /// The sheep holds a shepherd channel: `channel`, `wait_ready` or
     /// `shutdown_with_message`, whose socketpair 2b carries.
     Channel {
@@ -102,6 +117,17 @@ pub enum RefusedReason {
 impl core::fmt::Display for RefusedReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let (sheep, feature) = match self {
+            // Its own sentence rather than a `feature` for the one below:
+            // "has a wedged log pump, which this daemon cannot yet hand
+            // over" would read as a gap a later phase closes, and this one
+            // will still be a fault when every other variant has gone.
+            Self::PumpUnresponsive { sheep } => {
+                return write!(
+                    f,
+                    "sheep '{sheep}' has a log pump that did not report its descriptors in \
+                     time; reload falls back to a stop-and-start instead"
+                );
+            }
             Self::Channel { sheep } => (sheep, "a shepherd channel"),
             Self::Stdin { sheep } => (sheep, "stdin"),
             Self::Dog { sheep } => (sheep, "being a dog"),
@@ -134,6 +160,15 @@ pub struct Candidate<'a> {
     pub pending_stop: bool,
     /// Whether an operator's `delete` targets this sheep.
     pub pending_delete: bool,
+    /// Whether this sheep's log pump was asked for its descriptors and did
+    /// not answer in time.
+    ///
+    /// A third answer rather than a `CarriedFds::none()`, and the
+    /// distinction is the whole point: `none()` is what a STOPPED sheep
+    /// reports, and a wedged live pump collapsed into it would be carried
+    /// with its four descriptors silently dropped. So it reaches the gate
+    /// here, on the candidate, instead of being folded into the blob.
+    pub pump_unresponsive: bool,
 }
 
 /// A [`Candidate`] that owns its entry.
@@ -154,6 +189,9 @@ pub struct OwnedCandidate {
     pub pending_stop: bool,
     /// Whether an operator's `delete` targets this sheep.
     pub pending_delete: bool,
+    /// Whether this sheep's log pump missed the snapshot's deadline; see
+    /// [`Candidate::pump_unresponsive`].
+    pub pump_unresponsive: bool,
 }
 
 impl OwnedCandidate {
@@ -164,6 +202,7 @@ impl OwnedCandidate {
             entry: &self.entry,
             pending_stop: self.pending_stop,
             pending_delete: self.pending_delete,
+            pump_unresponsive: self.pump_unresponsive,
         }
     }
 }
@@ -189,6 +228,9 @@ fn refusal(candidate: &Candidate<'_>) -> Option<RefusedReason> {
     let config = entry.spec.config();
     let name = || config.name.clone();
 
+    if candidate.pump_unresponsive {
+        return Some(RefusedReason::PumpUnresponsive { sheep: name() });
+    }
     if config.channel || config.wait_ready || config.shutdown_with_message {
         return Some(RefusedReason::Channel { sheep: name() });
     }
@@ -1115,6 +1157,7 @@ mod tests {
             entry,
             pending_stop: false,
             pending_delete: false,
+            pump_unresponsive: false,
         }
     }
 
@@ -1146,6 +1189,35 @@ mod tests {
         };
         let text = r.to_string();
         assert!(text.contains("shepherd channel"), "{text}");
+    }
+
+    /// A wedged pump refuses, and says so as a fault rather than as a
+    /// feature this daemon has not shipped yet.
+    ///
+    /// The wording matters more than it looks: every other refusal here is
+    /// "wait for a later version", and an operator who reads that about a
+    /// stuck filesystem will wait for something that is never coming.
+    #[test]
+    fn a_pump_that_did_not_report_in_time_refuses_as_a_fault_not_a_feature() {
+        let e = entry_fixture(|_| {});
+        let candidate = Candidate {
+            entry: &e,
+            pending_stop: false,
+            pending_delete: false,
+            pump_unresponsive: true,
+        };
+        let Fitness::Refused(r) = fitness(&[candidate]) else {
+            panic!("a sheep whose descriptors are unknown cannot be carried")
+        };
+        let text = r.to_string();
+        assert!(
+            text.contains("did not report its descriptors in time"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("cannot yet"),
+            "a wedged pump is not a feature a later phase ships: {text}"
+        );
     }
 
     #[test]
@@ -1216,6 +1288,7 @@ mod tests {
             entry: &e,
             pending_stop: true,
             pending_delete: false,
+            pump_unresponsive: false,
         };
         assert!(matches!(
             fitness(&[candidate]),
@@ -1346,6 +1419,7 @@ mod tests {
             entry: &e,
             pending_stop: false,
             pending_delete: true,
+            pump_unresponsive: false,
         };
         assert!(matches!(
             fitness(&[candidate]),

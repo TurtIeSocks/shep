@@ -150,19 +150,19 @@ A stalled pump blocks the handover AND its graceful-stop fallback, so the daemon
 
 **The gate refuses on the third answer.** A sheep whose pump did not answer is not carryable, and the stop arm is correct for it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 At minimum: a pump that never answers makes the snapshot refuse rather than hang; the refusal names that sheep; a timed-out pump is not in the parked set; and every pump that DID park is resumed when the snapshot refuses.
 
 The last one is the easy one to omit and the expensive one to omit.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Pick the deadline deliberately and say why in the code. It bounds a flush plus a drain of at most one buffer per stream, so it is a small multiple of a disk write rather than a guess.
 
-- [ ] **Step 4: Prove non-vacuous, then task gate and commit**
+- [x] **Step 4: Prove non-vacuous, then task gate and commit**
 
 A real reload is not required here, since nothing about the healthy path changes. Say so rather than skipping it silently.
 

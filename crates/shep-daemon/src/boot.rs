@@ -3585,6 +3585,91 @@ mod tests {
             .unwrap();
     }
 
+    /// The second refusal path, and the one nothing else covers: a snapshot
+    /// abandoned because a pump went quiet still owes a resume to every pump
+    /// that DID answer.
+    ///
+    /// Its sibling above proves the resume for a refusal the gate reads off
+    /// a sheep's config. A missed deadline is a different way in, and it
+    /// arrives with one pump already parked and one that never was. Miss it
+    /// and a handover abandoned on a wedged pump leaves the REST of the
+    /// flock parked, which is a silent logging stop for the life of the
+    /// daemon and strictly worse than the stall this deadline exists to end.
+    ///
+    /// No `boot()` and no signal here, unlike its sibling: this is about
+    /// what `hand_over_now` does with a snapshot, and building the
+    /// supervisor directly is what lets the clock be paused, so the deadline
+    /// costs the suite nothing to wait out.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_handover_abandoned_on_a_wedged_pump_resumes_the_pumps_that_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = Arc::new(
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 2])
+                .with_a_pump_that_never_reports(&["wedged"]),
+        );
+        let supervisor = crate::supervisor::spawn_supervisor(
+            SharedRunner(Arc::clone(&runner)),
+            paths.clone(),
+            events,
+        );
+        supervisor
+            .start(vec![
+                normalize(AppConfig::minimal("answering", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("wedged", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        // Deliberately invalid, as its sibling above explains: if the gate
+        // ever stopped refusing, `hand_over` would meet `EBADF` and return
+        // rather than exec this test binary into a re-run of the whole
+        // suite. The assertion on the message is what tells those apart.
+        let seam = HandoverSeam {
+            supervisor: supervisor.clone(),
+            fds: crate::handover::DaemonFds {
+                listener: -1,
+                pidfile: -1,
+            },
+            paths: paths.clone(),
+        };
+        let refusal = hand_over_now(&seam)
+            .await
+            .expect_err("a flock with a pump that never reported cannot be carried");
+        assert!(
+            refusal.contains("did not report its descriptors in time"),
+            "the refusal must say the pump went quiet, not something else: {refusal}"
+        );
+        assert!(
+            refusal.contains("wedged"),
+            "the refusal must name the sheep whose pump went quiet: {refusal}"
+        );
+
+        let answering = runner.spawn_index_of("answering").expect("started above");
+        let wedged = runner.spawn_index_of("wedged").expect("started above");
+        // Polled rather than read once: a resume carries no acknowledgement
+        // (see `LogCtl::Resume`), so a send that has returned has been
+        // queued rather than served. Instant under the paused clock, and
+        // bounded so a pump that is never told fails here instead of
+        // hanging.
+        let delivered = async {
+            while runner.resumes(answering) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), delivered)
+            .await
+            .expect("the pump that answered was parked, and a refusal owes it a resume");
+        assert_eq!(
+            runner.resumes(wedged),
+            0,
+            "a pump that never answered never parked, so nothing may resume it"
+        );
+    }
+
     #[tokio::test]
     async fn a_repeat_sigterm_is_observed_not_swallowed() {
         // Pins Decision 3 (2026-08-08): each shutdown-signal listener
