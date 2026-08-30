@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-08-30
+
+### Added
+
+- Expose whether a live shepherd owns this home
+- SIGHUP falls back to graceful shutdown
+- The handshake refusal names the daemon's version
+
+### Fixed
+
+- Tell a booting shepherd apart from an absent one
+- A home that never ran a daemon is Absent, not a failure
+
+
 ## [0.1.16] - 2026-08-30
 
 ### Fixed
