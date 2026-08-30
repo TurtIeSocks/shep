@@ -47,17 +47,6 @@ $ shep unstartup
 ACTION   TARGET                                                          RESULT
 removed  /Library/LaunchDaemons/io.github.turtiesocks.shep.deploy.plist  absent`;
 
-const runbook = `1.  shep import --dry-run           # read the Flockfile before it's written
-2.  shep import                     # writes ./Flockfile.toml; starts nothing
-3.  pm2 delete all && pm2 kill      # the one destructive step, and it's pm2's
-4.  shep start ./Flockfile.toml     # the flock comes up under shep
-5.  shep flock                      # every app online, CPU and MEM populated
-6.  shep save                       # names the roll it wrote and the app count
-7.  sudo shep startup --user <you>  # writes and enables the unit
-8.  systemctl status shep-<you>     # active (running), and green
-9.  reboot
-10. systemctl status shep-<you>     # active (running) WITHOUT anyone logging in
-11. shep flock                      # the same apps, new pids, uptime near zero`;
 ---
 
 <DocsLayout
@@ -177,21 +166,6 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
       reported rather than aborting the whole muster.
     </Callout>
 
-    <h2>The runbook</h2>
-    <p>
-      This is the full sequence a migration from pm2 walks through (import,
-      start, save, install, reboot, verify), end to end on a Linux box:
-    </p>
-    <CodeBlock>{runbook}</CodeBlock>
-    <p>
-      Step 8's <code>active (running)</code> means something specific: the
-      generated unit is <code>Type=notify</code>, so systemd doesn't consider
-      it started until the daemon itself says so: it sends that signal
-      only once the muster restore from step 6's roll has finished, not the
-      moment the process execs. A green status at step 8 is already evidence
-      the restore path works, before the reboot ever happens.
-    </p>
-
     <h2>Is it up, and stopping it on purpose</h2>
     <VerbSignature verb="ping" usage="shep ping">
       <p>
@@ -254,8 +228,9 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
       <a href="/docs/from-pm2" class="next-card">
         <div class="next-title">Coming from pm2 →</div>
         <div class="next-body">
-          The runbook above is the tail end of this guide: start there for
-          the import step and the env rule that precedes it.
+          The full runbook, from <code>shep import</code> through the
+          reboot check, lives there: this page covers the save and muster
+          half in more depth.
         </div>
       </a>
       <a href="/docs/containers" class="next-card">
