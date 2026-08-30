@@ -497,7 +497,7 @@ Targeted waits are safe precisely because tokio holds no `Child` for an adopted 
 
 Read `crates/shep-cli/src/commands/reap.rs` first. It is prior art for the vocabulary and the `nix` usage, but NOT for the architecture: it works by living in a separate process from tokio's reaper, which a successor cannot do.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -517,13 +517,59 @@ fn reaping_an_adopted_pid_does_not_disturb_a_tokio_spawned_child() {
 
 The third test is the one that matters. Give it its own name in CI's serial job if it proves contention-sensitive, following `two_concurrent_boots`.
 
-- [ ] **Step 2: Run to verify they fail**
+Written as four real-child tests plus three that need no child. The plan's
+three, plus: a pid that had already exited before the reaper's first look
+(the kernel holds the zombie, so it must yield the real status rather than
+an error), a second wait replaying the first one's status instead of
+meeting `ECHILD`, pid 0 refused because `waitpid(0, ..)` is a group-wide
+wait wearing a different number, and a pure `outcome_of` case pinning that
+a code and a signal are never collapsed into each other.
 
-- [ ] **Step 3: Implement**
+`waitpid(-1, ..)` also turned out NOT to be catchable by two children
+exiting at the same instant, which is how the regression test was written
+first: in isolation the wildcard passed, because tokio's own driver reaps
+its child before the reaper's wakeup lands, leaving only the adopted pid
+for the wildcard to find. The version that stands rests on a stronger
+property instead. tokio calls `waitpid` for a live `Child` only when its
+`wait()` is polled, so a supervised child that exits with nothing awaiting
+it leaves its status pending in the kernel while the adopted sheep is still
+running, and a wildcard takes that pending status every time.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 2: Run to verify they fail**
 
-- [ ] **Step 5: Task gate, then commit**
+Actual: FAIL, unresolved `AdoptedReaper`/`outcome_of` (E0432).
+
+- [x] **Step 3: Implement**
+
+`AdoptedReaper::wait` arms its own `SIGCHLD` stream through
+`tokio::signal::unix::signal`, which multiplexes, so it takes nothing away
+from the stream tokio's process driver arms for itself. Armed BEFORE the
+first look, so an exit landing in between wakes the loop instead of being
+lost; a pid that already exited needs no wakeup, since the first look finds
+the zombie.
+
+The reaper remembers each status it takes. A status can be collected once,
+so a second or concurrent wait on a reaped pid would meet `ECHILD` and lose
+it; the map makes it replay, which is the contract `RunningProcess::wait`
+already states for tokio-supervised sheep. The lock spans the `waitpid`
+call so two concurrent waits cannot interleave a take with a lookup.
+
+No unsafe: `nix::sys::wait` is safe-wrapped and the pid needs no borrow.
+
+- [x] **Step 4: Run to verify they pass**
+
+Actual: 594 passed, 18 filtered (up from 587: the plan's three plus the four
+above). Confirmed non-vacuous by substituting `Pid::from_raw(-1)` for the
+targeted pid, at which point the regression test fails on its own with the
+adopted pid reporting the supervised child's exit code, and three of the
+other real-child tests fail too when the binary runs whole.
+
+- [x] **Step 5: Task gate, then commit**
+
+Actual: fmt 0, clippy 0, `cargo test --workspace --all-features` 0, doc 0,
+windows-gnu cross-check 0. Clippy's `zombie_processes` fires on every test
+child here and is expected with a reason rather than silenced: adding the
+`Child::wait()` it asks for would take the status the assertions are about.
 
 ---
 

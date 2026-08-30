@@ -21,6 +21,7 @@
 
 pub(crate) mod adopt;
 mod fds;
+pub(crate) mod reap;
 
 use core::convert::Infallible;
 use std::ffi::CString;
