@@ -472,6 +472,47 @@ impl PidfileLock {
     }
 }
 
+/// Whether a live shepherd owns this home, and what pid it recorded.
+///
+/// Proof of life is the pidfile LOCK, never the pidfile's contents. A live
+/// daemon holds that lock for its whole run and the kernel drops it on
+/// process death, `SIGKILL` included, so a failure to acquire it is the only
+/// evidence that cannot be faked by a stale file whose pid has since been
+/// reused. `Ok(None)` therefore means the lock was free, whatever the file
+/// says.
+///
+/// The pid comes from the file the holder wrote, so it is the one weak part
+/// of the answer: a daemon that holds the lock but has not reached
+/// `PidfileLock::record` yet is a live daemon with no pid to report, and
+/// reads here as `Ok(None)`. That window is the few statements between
+/// `acquire` and `record` inside [`boot`].
+///
+/// Answers a question; never claims the home. A lock this acquires is
+/// released before the call returns.
+///
+/// Both platform arms of `PidfileLock` are reachable through this, and it
+/// needs no `cfg` of its own: unix contends on the pidfile's `flock` and
+/// Windows on a sibling `.lock` file's share mode, and both report a
+/// contended lock as [`BootError::AlreadyRunning`].
+///
+/// # Errors
+/// - [`BootError::Io`] — the pidfile could not be opened, created or read.
+///   A contended lock is NOT an error here; it is the `Some` case.
+pub fn daemon_liveness(paths: &ShepPaths) -> Result<Option<u32>, BootError> {
+    match PidfileLock::acquire(paths) {
+        // We took it, so nobody else holds it. Released by this `drop`
+        // rather than at the end of the scope, so that the window in which
+        // a question-asker holds a claim on someone else's home is as
+        // short as the type allows.
+        Ok(lock) => {
+            drop(lock);
+            Ok(None)
+        }
+        Err(BootError::AlreadyRunning { pid }) => Ok(pid),
+        Err(other) => Err(other),
+    }
+}
+
 /// The socket this daemon binds: the layout default, or a config override
 #[must_use]
 pub(crate) fn socket_path(paths: &ShepPaths, override_path: Option<&Path>) -> PathBuf {
@@ -1788,6 +1829,41 @@ mod tests {
         write_pidfile(&paths, 4242).unwrap();
         assert_eq!(read_pidfile(&paths).unwrap(), Some(4242));
         assert_eq!(pidfile(&paths), paths.pids.join("shepd.pid"));
+    }
+
+    #[test]
+    fn liveness_reports_none_when_no_daemon_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        assert_eq!(daemon_liveness(&paths).unwrap(), None);
+    }
+
+    #[test]
+    fn liveness_reports_none_for_a_stale_pidfile_nobody_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        std::fs::write(pidfile(&paths), "999999").unwrap();
+        // The file exists and names a pid. Nothing holds the lock, so this is
+        // NOT a live daemon and must not be reported as one.
+        assert_eq!(daemon_liveness(&paths).unwrap(), None);
+    }
+
+    #[test]
+    fn liveness_reports_the_pid_a_lock_holder_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let mut held = PidfileLock::acquire(&paths).unwrap();
+        held.record(&paths, 4242).unwrap();
+        assert_eq!(daemon_liveness(&paths).unwrap(), Some(4242));
+        drop(held);
+        assert_eq!(
+            daemon_liveness(&paths).unwrap(),
+            None,
+            "a released lock is not a live daemon, whatever the file still says"
+        );
     }
 
     #[test]
