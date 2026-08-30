@@ -98,7 +98,15 @@ pub struct LogLine {
 /// either variant usable as a barrier. A logrotate `postrotate` stanza needs
 /// that of [`Self::Reopen`] before it compresses or deletes the file it
 /// renamed; `shep flush` needs it of [`Self::Flush`] before it truncates.
+/// `#[non_exhaustive]` because this crate is published and this enum just
+/// grew a variant. An out-of-tree `ProcessRunner` matching it exhaustively
+/// would break on that addition, and would break again on the next one.
+/// Marking it now costs those matchers one wildcard arm, once, in a 0.1.x
+/// release where that is expected, instead of every time the handover needs
+/// to ask a pump something new (IR-20, and the same call `BootError` makes a
+/// few modules over).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LogCtl {
     /// Drop the current handle and open the path again, then acknowledge.
     /// Sent when an external rotator has renamed the file.
