@@ -214,10 +214,14 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
     <CodeBlock>{pingDemo}</CodeBlock>
     <p>
       A reply is not treated as success. <code>shep kill</code> waits for the
-      socket file to actually disappear before reporting one, which is what
+      control address to stop answering before reporting one, which is what
       makes <code>shep kill &amp;&amp; shep start</code> safe: without the
-      wait, the new shepherd could bind before the old one had finished
-      unlinking the path out from under it.
+      wait, the new shepherd could claim the address before the old one had
+      released it. On unix that means watching the socket file disappear,
+      since the daemon unlinks it last. On Windows the address is a named
+      pipe with no directory entry to watch, so <code>shep kill</code> probes
+      it instead, and a connect that fails because the name is gone is the
+      same proof.
     </p>
 
     <h2>Honestly: openrc and the BSDs are untested</h2>
