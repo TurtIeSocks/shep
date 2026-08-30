@@ -3419,6 +3419,14 @@ impl<R: ProcessRunner> Actor<R> {
     /// roll, which recorded a running COUNT per app rather than which
     /// instance was up, and whose restore path starts what it restores.
     ///
+    /// # Where the start time comes from
+    ///
+    /// The operating system, via
+    /// [`handover::uptime`](crate::handover::uptime). It is the one field
+    /// the blob cannot carry, and re-deriving it is what stops a sheep that
+    /// has been up three days reporting `0s` uptime the moment a successor
+    /// takes over.
+    ///
     /// # What a sheep that is not running installs as
     ///
     /// A slot with no pump and no `ctl`, which is the state it was already
@@ -3549,11 +3557,14 @@ impl<R: ProcessRunner> Actor<R> {
         // consulted. An adopted sheep installed without it would sit
         // `Online` forever after its process died.
         //
-        // The clock restarts at the handover, so this instance's reported
-        // uptime does too. The blob cannot help: `started_at` is a
-        // `tokio::time::Instant`, which has no epoch and means nothing
-        // outside the runtime that read it.
-        entry.started_at = Some(tokio::time::Instant::now());
+        // Derived from the operating system rather than stamped here. The
+        // blob cannot carry it: `started_at` is a `tokio::time::Instant`,
+        // which has no epoch and means nothing outside the runtime that
+        // read it. Asking the process table how old the pid is, and
+        // subtracting that from this runtime's clock, is what keeps a sheep
+        // that has been up three days reporting three days in `shep flock`'s
+        // UPTIME column instead of `0s` the moment a successor takes over.
+        entry.started_at = Some(crate::handover::uptime::started_at_of(proc.pid()));
         let log_ctl = io.log_ctl.clone();
         let to_child = io.to_child.clone();
         let to_stdin = io.to_stdin.clone();

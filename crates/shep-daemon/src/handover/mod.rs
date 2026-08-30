@@ -22,6 +22,7 @@
 pub(crate) mod adopt;
 mod fds;
 pub(crate) mod reap;
+pub(crate) mod uptime;
 
 use core::convert::Infallible;
 use std::ffi::CString;
@@ -277,6 +278,7 @@ const FILE_NAME: &str = "handover.json";
 /// means nothing outside the runtime that read it. The successor re-derives
 /// each sheep's start time from the operating system, which is authoritative
 /// about a pid it did not spawn in a way a carried value could never be.
+/// [`uptime::started_at_of`] is that derivation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handover {
     /// The format this blob was written in; see [`VERSION`].
