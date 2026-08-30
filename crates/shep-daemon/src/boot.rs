@@ -3398,6 +3398,16 @@ mod tests {
     /// the message is what tells the two failures apart.
     #[tokio::test]
     async fn a_sighup_over_a_flock_it_cannot_carry_refuses_before_it_execs() {
+        // Real time + real signal listeners. This case raises nothing
+        // itself, but `SIGNAL_TEST_LOCK`'s rule is "calls `boot()`
+        // successfully", not "calls `raise()`": a successful `boot()`
+        // installs SIGTERM, SIGHUP and SIGUSR2 listeners that run for this
+        // test's whole duration, and a concurrent `raise()` in one of the
+        // shutdown cases reaches them too. This daemon would then shut down
+        // ahead of its own `ctx.shutdown()` while absorbing a delivery the
+        // other test needed, which is the way a real regression there gets
+        // masked.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
@@ -3433,7 +3443,13 @@ mod tests {
         );
 
         ctx.shutdown();
-        daemon.run().await.unwrap();
+        // Bounded, like the sibling above. The lock this case now holds is
+        // held across this await, so a teardown that hung would stop every
+        // other signal test in the module rather than failing this one.
+        tokio::time::timeout(Duration::from_secs(5), daemon.run())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
