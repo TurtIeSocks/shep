@@ -141,12 +141,12 @@ pub enum RefusedReason {
 
 Everything the daemon holds is close-on-exec by default, verified against pinned `mio`, `tokio`, `std` and `command-fds` sources. `command-fds` is the one place in the tree that already clears the flag deliberately, for the shepherd channel's fd 3; read `command-fds-0.3.3/src/lib.rs` for the shape before writing this.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
 fn a_fresh_pipe_is_close_on_exec_and_can_be_kept() {
-    let (r, _w) = nix::unistd::pipe().unwrap();
+    let (r, _w) = std::io::pipe().unwrap();
     // Establishes the default this whole phase depends on. If this ever
     // fails, std changed and the fd inventory needs re-auditing.
     assert!(!is_kept(r.as_fd()).unwrap(), "std pipes are CLOEXEC by default");
@@ -156,22 +156,34 @@ fn a_fresh_pipe_is_close_on_exec_and_can_be_kept() {
 
 #[test]
 fn keeping_is_idempotent() {
-    let (r, _w) = nix::unistd::pipe().unwrap();
+    let (r, _w) = std::io::pipe().unwrap();
     keep_across_exec(r.as_fd()).unwrap();
     keep_across_exec(r.as_fd()).unwrap();
     assert!(is_kept(r.as_fd()).unwrap());
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+`nix::unistd::pipe()`, as originally written above, wraps the raw `pipe(2)`
+syscall and is not close-on-exec by default — only `std::io::pipe()` (stable
+since Rust 1.87, this workspace runs 1.88) matches the "std pipes are
+CLOEXEC by default" assumption the comment states and the phase's descriptor
+inventory depends on. Swapped in both tests before running them.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 2: Run to verify they fail**
+
+Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: fds::tests`
+Actual: FAIL, unresolved `is_kept`/`keep_across_exec` (E0425 ×6)
+
+- [x] **Step 3: Implement**
 
 Read the existing flags with `F_GETFD`, clear only the `FD_CLOEXEC` bit, write back with `F_SETFD`. **Do not write a bare `0`**: that would clobber any other flag the descriptor carries, and it makes the call non-idempotent in a way the second test above is written to catch.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
-- [ ] **Step 5: Task gate, then commit**
+Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: fds::tests`
+Actual: 2 passed
+
+- [x] **Step 5: Task gate, then commit**
 
 ---
 

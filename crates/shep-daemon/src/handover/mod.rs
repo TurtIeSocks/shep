@@ -18,6 +18,8 @@
     reason = "task 8 wires fitness into boot.rs's SIGHUP arm; nothing calls it yet"
 )]
 
+mod fds;
+
 use crate::entry::ProcessEntry;
 
 /// Whether a flock can be handed over in place, or must fall back to a
