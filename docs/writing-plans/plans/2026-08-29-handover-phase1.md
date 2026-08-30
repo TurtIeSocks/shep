@@ -320,10 +320,17 @@ Expected: PASS
 **Files:**
 - Modify: `crates/shep-core/src/protocol/` (the `RpcError` definition)
 - Modify: `crates/shep-daemon/src/server.rs` (:475)
-- Test: both files
+- Modify: `crates/shep-client/src/connection.rs` (the variant at :77, the flattening at :190)
+- Test: all three
 
 **Interfaces:**
-- Produces: `RpcError.daemon_version: Option<String>`, consumed by Task 7's arm selection.
+- Produces: `RpcError.daemon_version: Option<String>` AND `ConnectError::ProtocolMismatch.daemon_version: Option<String>`, consumed by Task 7's arm selection.
+
+**Both halves are required, and this plan originally specified only the first.** Found while reviewing Task 2. `crates/shep-client/src/connection.rs:190` flattens the whole `RpcError` into `ConnectError::ProtocolMismatch { client, message }`, keeping `err.message` and dropping everything else, so a field added to `RpcError` alone is discarded four lines after it arrives and Task 7 never sees it.
+
+`ConnectError::ProtocolMismatch`'s own doc at `connection.rs:77` also has to change. It currently reads "the daemon's version exists only inside this prose, never as a separate field" and tells callers not to parse the message. That was a deliberate design statement, and Task 7 needs it reversed: the version becomes a field precisely so nobody has to parse prose for it. Update the doc in the same commit rather than leaving it contradicting the type beneath it.
+
+Also add to `crates/shep-daemon/src/server.rs`'s side: the comment at `connection.rs:187` notes the flattening is "sound only because `server.rs` is the sole producer today and always sends `ProtocolMismatch`". That stays true; do not widen it.
 
 To choose between the handover arm and the stop arm, the CLI must know the running daemon's version. `HelloAck.daemon_version` answers it on a clean handshake, but a protocol refusal reports the daemon's PROTOCOL and not its version, and a protocol bump is exactly when a reload matters most.
 
@@ -366,9 +373,46 @@ async fn a_protocol_refusal_carries_the_daemon_version() {
 Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: protocol_refusal`
 Expected: FAIL, no field `daemon_version`
 
-- [ ] **Step 4: Implement**
+- [ ] **Step 4: Implement, both halves**
 
-Add the field with `#[serde(default, skip_serializing_if = "Option::is_none")]` so a daemon that has nothing to say serializes exactly as before, then populate it at `server.rs:475`, which today reads `hello.protocol` and discards the rest.
+Daemon and wire side: add the field with `#[serde(default, skip_serializing_if = "Option::is_none")]` so a daemon that has nothing to say serializes exactly as before, then populate it at `server.rs:475`, which today reads `hello.protocol` and discards the rest.
+
+Client side: carry it through the flattening at `connection.rs:190`, which currently keeps only `err.message`:
+
+```rust
+let ack = reply.map_err(|err| ConnectError::ProtocolMismatch {
+    client: PROTOCOL_VERSION,
+    daemon_version: err.daemon_version,
+    message: err.message,
+})?;
+```
+
+Then rewrite `ConnectError::ProtocolMismatch`'s doc at `connection.rs:77`. It says the daemon's version lives only in the prose and must not be parsed; that is exactly what this task stops being true.
+
+- [ ] **Step 4b: Test the client half separately**
+
+The daemon-side test does not cover the flattening, which is where the field would be lost.
+
+```rust
+#[tokio::test]
+async fn a_refusal_carries_the_daemon_version_past_the_flattening() {
+    let err = connect_to_refusing_daemon().await.unwrap_err();
+    let ConnectError::ProtocolMismatch { daemon_version, .. } = err else {
+        panic!("expected a protocol refusal, got {err:?}");
+    };
+    assert_eq!(daemon_version.as_deref(), Some("0.1.16"));
+}
+
+#[tokio::test]
+async fn an_old_daemons_refusal_still_connects_and_reports_no_version() {
+    // A daemon predating this field sends no `daemon_version`. That must
+    // deserialize cleanly and read as None, not fail the handshake, or
+    // this field breaks the exact upgrade it exists to smooth.
+    let err = connect_to_refusing_daemon_without_version().await.unwrap_err();
+    let ConnectError::ProtocolMismatch { daemon_version, .. } = err else { panic!() };
+    assert_eq!(daemon_version, None);
+}
+```
 
 - [ ] **Step 5: Run to verify it passes, then task gate and commit**
 
@@ -379,6 +423,8 @@ Add the field with `#[serde(default, skip_serializing_if = "Option::is_none")]` 
 **Files:**
 - Modify: `crates/shep-cli/src/lib.rs`
 - Test: same file
+
+**Task 2 left a gap here worth closing while you are in this file.** It moved `Commands::Kill`'s dispatch from `connect_client` + `admin::kill(client, ..)` to `admin::kill(&paths, ..)`, because a handshake refusal is raised inside `Client::connect` and never yields a `Client` to hand onward. Nothing tests `run`'s dispatch arms, so that wiring is held only by the compiler. A fixture that drives `run` for one arm would cover it and would serve Task 6 too.
 
 Not just a protocol mismatch. Any difference. The dangerous state was believing `cargo install shep` upgrades a running system. It does not, it never did, and a check that says so is worth more than one that lets a mixed pair limp along.
 
