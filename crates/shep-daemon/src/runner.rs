@@ -17,6 +17,12 @@
 //! go through that pair, so neither half can drift from the other on what it
 //! is willing to open.
 //!
+//! A few items here are `#[cfg(unix)]`, and that is a design decision rather
+//! than portability work left unfinished. Windows has no `execve`, so a
+//! shepherd there is replaced by stop-and-start and no image ever adopts a
+//! process it did not spawn; the handover surfaces those items exist for have
+//! nothing to be on that platform. Each one says so at its own definition.
+//!
 //! This whole module is public and stays that way: [`ProcessRunner`] is the
 //! bound on [`boot`](crate::boot::boot), which `shep-cli` calls, so a caller
 //! outside this crate has to be able to name it — and naming it drags in every
