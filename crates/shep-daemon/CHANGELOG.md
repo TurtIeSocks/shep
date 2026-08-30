@@ -10,6 +10,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-08-30
+
+### Added
+
+- Whole-flock fitness gate for phase 2a
+- Clear FD_CLOEXEC on a descriptor, and prove it
+- Carry a flock's state across the exec in a handover blob
+- Resolve a handover's exec target without current_exe
+- Write the blob, keep the descriptors, exec the successor
+- Adopt a handover's descriptors in the successor
+- Reap adopted pids one at a time, never wildcard
+- Carry each sheep's resolved spec in the handover blob
+- Report a log pump's descriptors and snapshot a flock for handover
+- Give the runner an adopt seam for a carried sheep
+- Install a flock the successor inherited
+- SIGHUP hands the flock to a successor
+
+### Fixed
+
+- Mark LogCtl non_exhaustive, since 8a just grew it
+- Derive an adopted sheep's start time from the OS
+- A successor skips the roll whatever size its flock is
+- Two handover messages that misdescribed their own state
+- A failed handover puts FD_CLOEXEC back
+- Refuse a handover blob that names one descriptor twice
+- Make the descriptor-restore case able to fail
+
+
 ## [0.1.17] - 2026-08-30
 
 ### Added

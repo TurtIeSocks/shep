@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-08-30
+
+### Added
+
+- Give the runner an adopt seam for a carried sheep
+- A fitness query for the daemon handover
+- SIGHUP hands the flock to a successor
+
+
 ## [0.1.17] - 2026-08-30
 
 ### Added

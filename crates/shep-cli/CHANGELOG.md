@@ -13,6 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-08-30
+
+### Added
+
+- Daemon reload takes the handover arm
+
+### Fixed
+
+- The handover drops an in-flight request, by design
+- A successor skips the roll whatever size its flock is
+- Reload drops its probe connection before the stop arm
+- Running_version is read only on unix, so bind it only there
+- Prove the successor is serving before reporting through it
+- Make the descriptor-restore case able to fail
+- Outlive the predecessor before trusting a successor
+- Refuse the handover arm when no witness can be held
+
+
 ## [0.1.17] - 2026-08-30
 
 ### Added
