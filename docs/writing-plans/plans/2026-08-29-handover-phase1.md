@@ -650,7 +650,7 @@ The stop arm composes three things that already exist: SIGTERM the proven pid, w
 
 Per the repo's docs trigger, this task changed what an operator types and sees, so the CLI reference must be regenerated and the site must build.
 
-- [ ] **Step 0: Make `shep daemon reload` discoverable, which spec G5 asks for**
+- [x] **Step 0: Make `shep daemon reload` discoverable, which spec G5 asks for**
 
 Task 7 shipped the verb and reported the problem it leaves behind: **the version-skew refusal names a verb that `shep --help` does not list.** `daemon` is `#[command(hide = true)]` because it is the internal re-exec path, so its subcommand is hidden with it. An operator who reads the refusal is told the fix; one who goes looking for it cannot find it. That is the incident's shape again, in a smaller costume.
 
@@ -669,7 +669,7 @@ That one line does three jobs: it makes the verb discoverable, it distinguishes 
 
 Update the exact-string test rather than deleting it. Then run the generator, since this changes `--help` output.
 
-- [ ] **Step 1: Add the upgrade note and the happy path**
+- [x] **Step 1: Add the upgrade note and the happy path**
 
 ```
 cargo install shep
@@ -679,7 +679,7 @@ shep daemon reload
 
 **No pm2 comparison anywhere.** Direct comparison lives only in `from-pm2.astro`; link there if a migrating reader would want it.
 
-- [ ] **Step 2: Regenerate the CLI reference**
+- [x] **Step 2: Regenerate the CLI reference**
 
 ```bash
 cargo build --release
@@ -690,7 +690,7 @@ cargo build --release
 
 `git diff` afterwards is the check. A stale copy fails no build, which is why it drifts.
 
-- [ ] **Step 3: Build and typecheck the site**
+- [x] **Step 3: Build and typecheck the site**
 
 ```bash
 cd web && npx astro check
@@ -701,7 +701,7 @@ cd web && npx astro build
 
 Both must exit 0. `astro check` is the one that catches a wrong component prop; `astro build` is green on a prop that does not exist.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ---
 
