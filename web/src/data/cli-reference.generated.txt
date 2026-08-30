@@ -1,5 +1,5 @@
 @@VERSION@@
-shep 0.1.15
+shep 0.1.16
 @@TOPLEVEL@@
 A process manager for your flock
 
@@ -23,6 +23,7 @@ Coming from pm2  import
 Help             welcome init help completions style
 
 Aliases          flock: list, ls   bleats: logs   lookout: dash   stock: scale   whisper: sendline
+Upgrading        cargo install shep replaces the binary, not the running shepherd: shep daemon reload
 
       --format <FORMAT>
           Output format

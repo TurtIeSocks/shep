@@ -82,6 +82,7 @@ Coming from pm2  import
 Help             welcome init help completions style
 
 Aliases          flock: list, ls   bleats: logs   lookout: dash   stock: scale   whisper: sendline
+Upgrading        cargo install shep replaces the binary, not the running shepherd: shep daemon reload
 
 {options}{after-help}";
 
@@ -1396,6 +1397,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `daemon reload` is hidden along with `daemon`, since `daemon` itself
+    /// is `#[command(hide = true)]` -- it is the internal re-exec path, not
+    /// a verb an operator picks off a menu. The version-skew refusal (Task
+    /// 5) names `shep daemon reload` as the fix, so `--help` must name it
+    /// too or an operator who goes looking for it finds nothing.
+    #[test]
+    fn the_help_template_names_the_upgrade_path() {
+        let line = HELP_TEMPLATE
+            .lines()
+            .find(|l| l.starts_with("Upgrading"))
+            .expect("HELP_TEMPLATE has an Upgrading line");
+        assert_eq!(
+            line,
+            "Upgrading        cargo install shep replaces the binary, not the running shepherd: shep daemon reload"
+        );
     }
 
     /// `HELP_TEMPLATE` is a literal and `HELP_GROUPS` is structured data, so
