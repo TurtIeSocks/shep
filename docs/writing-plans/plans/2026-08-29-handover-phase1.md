@@ -54,11 +54,13 @@ The `execve` handover itself. Phase 1 ships the guard, the recovery path, and th
 - Test: same file, in its existing `mod tests`
 
 **Interfaces:**
-- Produces: `pub fn daemon_liveness(paths: &ShepPaths) -> Result<Option<u32>, BootError>` — `Ok(Some(pid))` when a live daemon holds the lock, `Ok(None)` when nothing does, `Err` only on a real IO failure. Tasks 2 and 7 both consume this.
+- Produces: `pub fn daemon_liveness(paths: &ShepPaths) -> Result<Shepherd, BootError>` and `pub enum Shepherd { Absent, Running(u32), Booting }`. Tasks 2 and 7 both consume this.
+
+**Delivered with three states, not the two this plan first specified.** `Option<u32>` collapsed "nothing is running" and "a daemon is booting" into the same `None`: `boot` takes the lock at `PidfileLock::acquire` and records its pid several statements later, binding the socket in between, stale-socket recovery included. A caller reading that window as an absence would refuse with the wrong reason, or start a second daemon that then dies unable to take the lock. `Shepherd` is deliberately exhaustive rather than `#[non_exhaustive]`: the set is closed by the mechanism, and a missed arm here means signalling the wrong process.
 
 The pidfile alone is not proof: a stale pidfile from a crash still exists and its pid may have been reused. A live daemon HOLDS the lock, and the kernel drops it on process death, so **failing to acquire the lock is the proof of life** and the pid to report is the one recorded in the file.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -95,12 +97,12 @@ fn liveness_reports_the_pid_a_lock_holder_recorded() {
 
 Reuse whatever `tempdir`/`test_paths` helper `boot.rs`'s existing `mod tests` already uses; do not add a new one. Read `pidfile_round_trips_and_reports_absence` at :1783 first and follow its setup exactly.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: liveness`
 Expected: FAIL, `cannot find function daemon_liveness`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 /// Whether a live shepherd owns this home, and what pid it recorded.
@@ -134,12 +136,12 @@ Verify `BootError::AlreadyRunning`'s real field shape at its definition before w
 
 Also widen `read_pidfile` from `pub(crate)` to `pub` if `daemon_liveness` ends up needing it, and give it a doc comment saying it reports what was RECORDED and is not evidence of life.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: liveness`
 Expected: PASS, 3 tests
 
-- [ ] **Step 5: Task gate, then commit**
+- [x] **Step 5: Task gate, then commit**
 
 ```bash
 git add crates/shep-daemon/src/boot.rs
@@ -196,6 +198,8 @@ async fn kill_refuses_a_pid_the_lock_does_not_prove_is_sheps() {
 }
 ```
 
+Add a third case: `Shepherd::Booting` must report that a shepherd is starting, not that none is running, and must signal nothing.
+
 Follow the fixture style already in `admin.rs`'s `mod tests`. Note its comment at :200 explaining that `cfg(unix)` there is about the FAKE's mechanism, not the feature.
 
 - [ ] **Step 2: Run to verify they fail**
@@ -217,8 +221,14 @@ Add a socket-free path that runs when the socket cannot be used for any reason, 
 /// # Errors
 /// Reports, and exits non-zero, when no live shepherd owns this home.
 async fn kill_socket_free(paths: &ShepPaths, streams: &mut Streams<'_>) -> ExitCode {
-    let Some(pid) = boot::daemon_liveness(paths).unwrap_or(None) else {
-        return streams.fail(EXIT_NO_DAEMON, "no shepherd running");
+    let pid = match boot::daemon_liveness(paths)? {
+        Shepherd::Running(pid) => pid,
+        // Alive and owns the home, but there is no pid to signal yet. Must
+        // not be reported as an absence, and must not be guessed at.
+        Shepherd::Booting => {
+            return streams.fail(EXIT_NO_DAEMON, "a shepherd is starting up; try again");
+        }
+        Shepherd::Absent => return streams.fail(EXIT_NO_DAEMON, "no shepherd running"),
     };
     // SIGTERM, not SIGKILL: the daemon's own handler runs the kill ladder
     // over every sheep before it exits, so the flock stops cleanly.

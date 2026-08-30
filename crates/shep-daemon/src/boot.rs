@@ -472,20 +472,13 @@ impl PidfileLock {
     }
 }
 
-/// Whether a live shepherd owns this home, and what pid it recorded.
+/// What, if anything, owns this home's pidfile lock.
 ///
 /// Proof of life is the pidfile LOCK, never the pidfile's contents. A live
 /// daemon holds that lock for its whole run and the kernel drops it on
 /// process death, `SIGKILL` included, so a failure to acquire it is the only
 /// evidence that cannot be faked by a stale file whose pid has since been
-/// reused. `Ok(None)` therefore means the lock was free, whatever the file
-/// says.
-///
-/// The pid comes from the file the holder wrote, so it is the one weak part
-/// of the answer: a daemon that holds the lock but has not reached
-/// `PidfileLock::record` yet is a live daemon with no pid to report, and
-/// reads here as `Ok(None)`. That window is the few statements between
-/// `acquire` and `record` inside [`boot`].
+/// reused.
 ///
 /// Answers a question; never claims the home. A lock this acquires is
 /// released before the call returns.
@@ -497,8 +490,9 @@ impl PidfileLock {
 ///
 /// # Errors
 /// - [`BootError::Io`] — the pidfile could not be opened, created or read.
-///   A contended lock is NOT an error here; it is the `Some` case.
-pub fn daemon_liveness(paths: &ShepPaths) -> Result<Option<u32>, BootError> {
+///   A contended lock is NOT an error here; it is [`Shepherd::Running`] or
+///   [`Shepherd::Booting`].
+pub fn daemon_liveness(paths: &ShepPaths) -> Result<Shepherd, BootError> {
     match PidfileLock::acquire(paths) {
         // We took it, so nobody else holds it. Released by this `drop`
         // rather than at the end of the scope, so that the window in which
@@ -506,11 +500,45 @@ pub fn daemon_liveness(paths: &ShepPaths) -> Result<Option<u32>, BootError> {
         // short as the type allows.
         Ok(lock) => {
             drop(lock);
-            Ok(None)
+            Ok(Shepherd::Absent)
         }
-        Err(BootError::AlreadyRunning { pid }) => Ok(pid),
+        Err(BootError::AlreadyRunning { pid: Some(pid) }) => Ok(Shepherd::Running(pid)),
+        Err(BootError::AlreadyRunning { pid: None }) => Ok(Shepherd::Booting),
         Err(other) => Err(other),
     }
+}
+
+/// What [`daemon_liveness`] found holding a home's pidfile lock.
+///
+/// Three states, not two, because "nothing is running" and "something is
+/// starting up" call for opposite actions and an `Option<u32>` cannot tell
+/// them apart. Both would read as `None`: [`boot`] takes the lock at
+/// `PidfileLock::acquire` and records its pid a few statements later, and
+/// binding the socket happens in between, stale-socket recovery included.
+/// A caller that read that window as an absence would refuse with the wrong
+/// reason, or start a second daemon that then dies unable to take the lock.
+///
+/// Deliberately NOT `#[non_exhaustive]`, unlike [`BootError`]. The set is
+/// closed by the mechanism rather than by today's implementation: the lock
+/// is either free or held, and a holder either has written its pid or has
+/// not. There is no fourth thing for a future boot step to add, and callers
+/// get exhaustiveness checking on a decision where a missed arm means
+/// signalling the wrong process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shepherd {
+    /// Nothing holds this home's pidfile lock.
+    ///
+    /// A stale pidfile naming a long-dead pid still reads as this, which is
+    /// the whole point of asking the lock rather than the file.
+    Absent,
+    /// A shepherd holds the lock and recorded this pid.
+    Running(u32),
+    /// A shepherd holds the lock but has not recorded a pid yet.
+    ///
+    /// It is alive and owns the home, so it must not be treated as absent,
+    /// but there is no pid to signal. A caller should report that a
+    /// shepherd is starting rather than guess at either.
+    Booting,
 }
 
 /// The socket this daemon binds: the layout default, or a config override
@@ -1836,7 +1864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        assert_eq!(daemon_liveness(&paths).unwrap(), None);
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
     }
 
     #[test]
@@ -1847,7 +1875,7 @@ mod tests {
         std::fs::write(pidfile(&paths), "999999").unwrap();
         // The file exists and names a pid. Nothing holds the lock, so this is
         // NOT a live daemon and must not be reported as one.
-        assert_eq!(daemon_liveness(&paths).unwrap(), None);
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
     }
 
     #[test]
@@ -1857,13 +1885,28 @@ mod tests {
         init_dirs(&paths).unwrap();
         let mut held = PidfileLock::acquire(&paths).unwrap();
         held.record(&paths, 4242).unwrap();
-        assert_eq!(daemon_liveness(&paths).unwrap(), Some(4242));
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Running(4242));
         drop(held);
         assert_eq!(
             daemon_liveness(&paths).unwrap(),
-            None,
+            Shepherd::Absent,
             "a released lock is not a live daemon, whatever the file still says"
         );
+    }
+
+    #[test]
+    fn liveness_reports_booting_for_a_holder_that_has_not_recorded_a_pid_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        // `boot` takes the lock and records its pid a few statements later,
+        // binding the socket in between. A caller that read this window as
+        // an absence would start a second daemon that then dies unable to
+        // take the lock.
+        let held = PidfileLock::acquire(&paths).unwrap();
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Booting);
+        drop(held);
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
     }
 
     #[test]
