@@ -83,7 +83,8 @@ stderr  /tmp/shepdocs/home/logs/shepd.err.log  emptied`;
     <p>
       Two files per sheep, under <code>$SHEP_HOME/logs/</code>, named{" "}
       <code>&lt;name&gt;-&lt;instance&gt;-out.log</code> and{" "}
-      <code>-err.log</code>. An app can point either somewhere else with{" "}
+      <code>&lt;name&gt;-&lt;instance&gt;-err.log</code>. An app can point either
+      somewhere else with{" "}
       <code>out_file</code> and <code>err_file</code>, or fold both streams
       into one file with <code>merge_logs</code>. A clustered app gets one
       pair per instance unless it says otherwise, which is why an explicit{" "}
