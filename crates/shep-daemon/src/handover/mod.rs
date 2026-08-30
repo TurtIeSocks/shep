@@ -944,7 +944,10 @@ pub const HANDOVER_ENV: &str = "SHEP_HANDOVER";
 ///
 /// No binary is safe to exec (see [`exec_target`]), the blob could not be
 /// written, a descriptor it names is not open, or the exec itself failed.
-/// Every one of those returns with no blob left on disk.
+/// Every one of those returns with no blob left on disk, and with
+/// `FD_CLOEXEC` back on every descriptor the attempt cleared it from, so the
+/// caller's fallback to a graceful stop leaves nothing exec-inheritable
+/// behind it.
 pub fn hand_over(blob: &Handover, paths: &ShepPaths) -> io::Result<Infallible> {
     exec_into(&exec_target()?, blob, paths)
 }
@@ -978,8 +981,48 @@ fn exec_into(target: &Path, blob: &Handover, paths: &ShepPaths) -> io::Result<In
 /// is still itself and `written` is still on disk, which is what
 /// [`exec_into`] cleans up.
 fn exec_with_blob(target: &Path, blob: &Handover, written: &Path) -> io::Result<Infallible> {
+    let mut cleared = Vec::new();
+    let failure = match keep_and_exec(target, blob, written, &mut cleared) {
+        Ok(never) => match never {},
+        Err(err) => err,
+    };
+    // Every descriptor put back the way it was found. Without this the
+    // daemon returns to the graceful-stop fallback with the listener, the
+    // pidfile and every carried log descriptor still exec-inheritable, and
+    // the supervisor is still running: a restart or a queued `Start` in the
+    // window before teardown spawns a sheep that inherits them, and a child
+    // holding the pidfile keeps this home claimed after the daemon it
+    // belonged to has gone.
+    //
+    // Failures ignored, one descriptor at a time, because there is nothing
+    // better to do with them: the error being carried out of here is the one
+    // that matters, and a descriptor whose `fcntl` fails now is one that was
+    // already not what the blob said it was.
+    for fd in cleared {
+        let _ = fds::close_raw_after_exec(fd);
+    }
+    Err(failure)
+}
+
+/// [`exec_with_blob`]'s body, recording what it cleared as it goes.
+///
+/// Split out so the caller can restore on every failure path with one piece
+/// of cleanup rather than one per `?`. `cleared` is pushed to only after a
+/// clear succeeds, so it never names a descriptor this process did not
+/// change.
+///
+/// # Errors
+///
+/// As [`exec_with_blob`].
+fn keep_and_exec(
+    target: &Path,
+    blob: &Handover,
+    written: &Path,
+    cleared: &mut Vec<RawFd>,
+) -> io::Result<Infallible> {
     for fd in blob.named_fds() {
         fds::keep_raw_across_exec(fd)?;
+        cleared.push(fd);
     }
 
     let path = c_string(target.as_os_str().as_bytes())?;
@@ -1524,5 +1567,62 @@ mod tests {
             !Handover::path(&paths).exists(),
             "a failed exec left a blob behind: {err}"
         );
+    }
+
+    /// A failed exec puts `FD_CLOEXEC` back on everything it cleared.
+    ///
+    /// The clearing is what makes a descriptor cross an `execve`, and when
+    /// the exec does not happen the daemon returns to the graceful-stop
+    /// fallback with its supervisor still running. A restart or a queued
+    /// `Start` in the window before teardown then spawns a sheep that
+    /// inherits whatever is still exec-inheritable, and a child holding the
+    /// pidfile keeps this home claimed after the daemon that owned it has
+    /// gone.
+    ///
+    /// Asserted on both the daemon's own two descriptors and a carried log
+    /// handle, because `named_fds` yields them from two different places and
+    /// a restore that walked only the first pair would pass on a shorter
+    /// case.
+    #[test]
+    fn a_failed_exec_makes_every_descriptor_close_on_exec_again() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = selftest_paths(dir.path());
+        let target = dir.path().join("not-a-binary");
+        std::fs::write(&target, "this will never execute").unwrap();
+
+        let listener = tempfile::tempfile().unwrap();
+        let pidfile = tempfile::tempfile().unwrap();
+        let out_log = tempfile::tempfile().unwrap();
+        let blob = handover_with_fds(
+            &entry_fixture(|_| {}),
+            listener.as_raw_fd(),
+            pidfile.as_raw_fd(),
+            CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: Some(out_log.as_raw_fd()),
+                err_log: None,
+            },
+        );
+
+        // The precondition, so the assertion below cannot pass on a
+        // descriptor that was never cleared in the first place.
+        for file in [&listener, &pidfile, &out_log] {
+            assert!(
+                !fds::is_kept(file.as_fd()).unwrap(),
+                "the daemon opens everything close-on-exec, so this starts set"
+            );
+        }
+
+        let err = exec_into(&target, &blob, &paths).unwrap_err();
+
+        for file in [&listener, &pidfile, &out_log] {
+            assert!(
+                !fds::is_kept(file.as_fd()).unwrap(),
+                "a failed exec left a descriptor exec-inheritable: {err}"
+            );
+        }
     }
 }

@@ -67,6 +67,30 @@ pub fn keep_raw_across_exec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Set `FD_CLOEXEC` on `fd` again, undoing a [`keep_raw_across_exec`] whose
+/// exec never happened.
+///
+/// The inverse of that function, bit for bit: reads the current flags,
+/// sets only `FD_CLOEXEC`, writes them back. Nothing else the descriptor
+/// carries is disturbed.
+///
+/// Restoring is the right direction and not merely the symmetric one.
+/// Everything the daemon opens is close-on-exec at creation, per this
+/// module's own preamble, so the flag this puts back is the flag the
+/// descriptor had before the handover cleared it.
+///
+/// # Errors
+///
+/// Returns an error if `fcntl` fails, which on a valid open descriptor
+/// should not happen in practice.
+pub fn close_raw_after_exec(fd: RawFd) -> io::Result<()> {
+    let flags = fcntl(fd, FcntlArg::F_GETFD)?;
+    let mut flags = FdFlag::from_bits_truncate(flags);
+    flags.insert(FdFlag::FD_CLOEXEC);
+    fcntl(fd, FcntlArg::F_SETFD(flags))?;
+    Ok(())
+}
+
 /// Whether `fd` currently survives an `execve` (i.e. `FD_CLOEXEC` is
 /// clear).
 ///
