@@ -41,7 +41,7 @@ pub enum Fitness {
 /// `#[non_exhaustive]`, unlike [`crate::boot::Shepherd`]: that enum is
 /// closed by its mechanism (a pidfile lock is either free, held-with-pid or
 /// held-without, and there is no fourth state). This one is closed by
-/// nothing but how much of the handover has shipped — 2b and 2c each widen
+/// nothing but how much of the handover has shipped. 2b and 2c each widen
 /// what phase 2a refuses today into something a later phase carries, so a
 /// match here must keep tolerating a variant this module has not named yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +69,7 @@ pub enum RefusedReason {
         /// The sheep's name.
         sheep: String,
     },
-    /// The sheep is mid-reload — drainee or replacement — which 2c carries.
+    /// The sheep is mid-reload, drainee or replacement, which 2c carries.
     ReloadInFlight {
         /// The sheep's name.
         sheep: String,
@@ -111,8 +111,8 @@ impl core::fmt::Display for RefusedReason {
 /// Bundles a [`ProcessEntry`] with the two facts that do not live on it: a
 /// pending manual stop and a pending delete both live on the supervisor's
 /// private slot type, not on the entry it wraps, so `fitness` cannot reach
-/// them through `entry` alone. The caller — the supervisor, which owns both
-/// — builds this view; `fitness` stays a pure function over data it is
+/// them through `entry` alone. The caller, the supervisor, which owns both
+/// of them, builds this view; `fitness` stays a pure function over data it is
 /// handed rather than reaching into the registry itself.
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate<'a> {

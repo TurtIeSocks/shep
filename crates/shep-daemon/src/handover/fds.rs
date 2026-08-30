@@ -8,7 +8,7 @@
 //! module never touches is closed by the kernel at the exec boundary and
 //! silently dropped from the new image. For a sheep's stdout read end, that
 //! does not lose the sheep's output: the child blocks on `write()` once the
-//! 64KiB pipe buffer fills, and hangs — which reads as an application bug,
+//! 64KiB pipe buffer fills, and hangs, which reads as an application bug
 //! not a shep one.
 
 use std::io;
