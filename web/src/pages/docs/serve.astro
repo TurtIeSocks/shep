@@ -102,8 +102,8 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
     </p>
     <p class="fine">
       What isn't here: range requests, conditional requests, ETags,
-      compression, keep-alive, TLS, HTTP/2, or any <code>PM2_SERVE_*</code>
-      compatibility <NotBuilt note="range/conditional requests are v1.1 candidates" />.
+      compression, keep-alive, TLS, or HTTP/2
+      <NotBuilt note="range/conditional requests are v1.1 candidates" />.
       <code>shep serve</code> takes no configuration from the environment:
       pass <code>--port</code>, <code>--bind</code>, <code>--spa</code>,
       <code>--auth</code> and the flags above on the command line instead.
@@ -111,16 +111,6 @@ $ curl -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8080/link.html
       request.
     </p>
 
-    <h2>Coming from pm2</h2>
-    <p>
-      Three defaults are flipped from pm2's own <code>serve</code>, and each
-      is a regression before it's a fix if you weren't expecting it: listing
-      and dotfiles are pm2's <em>on</em>, shep's <em>off</em>; following an
-      in-docroot symlink is pm2's <em>on</em>, shep's <em>off</em>. All three
-      are one flag away (<code>--listing</code>, <code>--hidden</code>,
-      <code>--follow-symlinks</code>) once you've decided the trade is worth
-      it for your layout.
-    </p>
     <h2>Where to go next</h2>
 
     <div class="next-grid">
