@@ -721,7 +721,8 @@ async fn hand_over(
         return streams.fail(code, &message);
     }
     match await_successor(paths, wait).await {
-        Some(client) => report_reload(&client, streams).await,
+        // The successor carried the flock; nothing to restore.
+        Some(client) => report_reload(&client, streams, false).await,
         None => {
             // Said out loud rather than silently repaired: the flock is
             // about to be started rather than carried, so an operator who
@@ -734,7 +735,7 @@ async fn hand_over(
                 Ok(client) => client,
                 Err(code) => return code,
             };
-            report_reload(&client, streams).await
+            report_reload(&client, streams, true).await
         }
     }
 }
@@ -781,8 +782,25 @@ fn signal_handover(pid: u32) -> Result<(), (ExitCode, String)> {
 async fn await_successor(paths: &ShepPaths, wait: std::time::Duration) -> Option<Client> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
+        // A handshake proves a daemon answered. It does NOT prove the
+        // answer came from the successor, and the two are genuinely
+        // indistinguishable here: `execve` keeps the pid, and the arm that
+        // reaches this code can be selected against a shepherd of this very
+        // version, so neither the pid nor the version in the ack separates
+        // them. Connecting to the PREDECESSOR is therefore normal, not a
+        // race to be narrowed, and its connection dies at the exec.
+        //
+        // So the readiness test is a REQUEST, not a handshake: an answered
+        // request can only have come from a daemon that is serving, which
+        // the outgoing image stops doing the moment it execs. Four Linux CI
+        // jobs found this by way of `daemon reload` reporting a successful
+        // handover and then exiting 5 on the very next call.
         if let Ok(client) = Client::connect(&paths.socket).await
             && client.daemon().daemon_version == env!("CARGO_PKG_VERSION")
+            && client
+                .request(shep_core::protocol::Request::ListFlock)
+                .await
+                .is_ok()
         {
             return Some(client);
         }
@@ -858,7 +876,7 @@ async fn stop_and_start(
         Ok(client) => client,
         Err(code) => return code,
     };
-    report_reload(&client, streams).await
+    report_reload(&client, streams, true).await
 }
 
 /// Reports the shepherd now serving, then what happened to each sheep.
@@ -869,18 +887,41 @@ async fn stop_and_start(
 /// line above the table names the SHEPHERD's version and pid, which is true
 /// under both arms and is the fact the operator ran this verb for.
 ///
-/// `Request::Muster` rather than a plain list: under the stop arm the
-/// successor has already restored the roll by the time this runs, so the
-/// muster spawns nothing new and reports the flock that restore produced —
-/// see `commands::muster::muster`'s own doc on why that is idempotent.
-async fn report_reload(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
+/// `restored` says which arm ran, and it decides how the flock is asked for.
+///
+/// Under the STOP arm the successor has already restored the roll by the
+/// time this runs, so `Request::Muster` spawns nothing new and reports the
+/// flock that restore produced. See `commands::muster::muster`'s own doc on
+/// why that is idempotent.
+///
+/// Under the HANDOVER arm it must NOT muster, for two reasons that arrived
+/// together. Semantically there is nothing to restore: the sheep never
+/// stopped, so a muster is being asked to bring back processes that are
+/// already running, off a roll the predecessor never had a chance to
+/// rewrite. And in practice it fails, which is how this was found. Four
+/// Linux CI jobs caught `shep daemon reload` reporting a successful handover
+/// and then exiting 5:
+///
+/// ```text
+/// notice[reload]: the shepherd is now 0.1.17 (pid 10579)
+/// error[daemon_unreachable]: the connection closed before a reply arrived
+/// ```
+///
+/// A successor answers its socket as soon as the listener is carried, which
+/// is before its rehydrate has finished, so a muster arriving in that window
+/// meets a daemon not yet ready to serve one. A plain `ListFlock` is what
+/// the handover arm actually wants: it reports, and asks for nothing.
+async fn report_reload(client: &Client, streams: &mut Streams<'_>, restored: bool) -> ExitCode {
     let shepherd = client.daemon();
     let message = format!(
         "the shepherd is now {} (pid {})",
         shepherd.daemon_version, shepherd.pid
     );
     streams.aside("reload", &message);
-    muster::muster(client, streams).await
+    if restored {
+        return muster::muster(client, streams).await;
+    }
+    crate::commands::query::flock(client, streams).await
 }
 
 #[cfg(test)]
@@ -1363,7 +1404,7 @@ otel = "/usr/local/bin/shep-otel"
                 style: crate::style::Presentation::BARE,
                 fmt: Format::Table,
             };
-            report_reload(&client, &mut streams).await
+            report_reload(&client, &mut streams, true).await
         };
 
         assert_eq!(code, ExitCode::Success);
