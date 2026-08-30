@@ -778,11 +778,73 @@ fn the_adopted_pidfile_arm_does_not_release_the_lock() {
 
 #### Task 8c: install the adopted flock
 
-Insert slots carrying the blob's ids, epochs, statuses and `last_exit`, without spawning. `spawn_fresh` is the only path that inserts a live slot today.
+**Files:**
+- Modify: `crates/shep-daemon/src/supervisor.rs` (a sibling to `spawn_fresh`)
+- Test: same file
 
-**This is much smaller than it was, because the blob now carries each sheep's `AppConfig`.** The earlier version had to rebuild every spec from the muster roll and bind carried sheep to roll apps by name and instance, against a roll that records a running count rather than which slots were up, with `muster` starting whatever it restored. All of that is gone: the blob is self-sufficient, there is no second source of truth, and no restore-without-spawning path is needed.
+**Interfaces:**
+- Consumes: `Handover` and `CarriedSheep` (Task 3), `ProcessRunner::adopt` and `AdoptSpec` (8b).
 
-Re-normalize each carried `AppConfig` to recover its `ResolvedApp`, exactly as `snapshot.rs:333` already does on a muster.
+`spawn_fresh` is the only path that inserts a `SheepSlot` with a live `ctl`, and it spawns. A successor needs one that installs a slot around a process that is already running.
+
+**Much smaller than it was, because the blob carries each sheep's `AppConfig`.** The earlier design rebuilt every spec from the muster roll and bound carried sheep to roll apps by name and instance, against a roll that records a running count rather than which slots were up, with `muster` starting whatever it restored. All gone. Re-normalize each carried `AppConfig` to recover its `ResolvedApp`, exactly as `snapshot.rs:333` already does on a muster.
+
+**Restore the counters before installing any slot.** `next_id`, `next_deadline` and `next_action_stamp` reset to zero in every constructor, so a successor that installs sheep first and restores counters second can hand a fresh sheep an id a caller is still holding.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[tokio::test]
+async fn an_adopted_flock_keeps_its_pids_and_ids() {
+    // The blob's whole purpose. A sheep whose pid moved was respawned, and
+    // this phase exists to not do that.
+    let sup = supervisor_from_blob(blob_with_two_sheep()).await;
+    let info = sup.list().await.unwrap();
+    assert_eq!(pids_of(&info), vec![4242, 4243]);
+    assert_eq!(ids_of(&info), vec![7, 8]);
+}
+
+#[tokio::test]
+async fn an_adopted_sheep_keeps_its_counters_and_last_exit() {
+    // Losing these is silent. RESTARTS resetting to zero hands a
+    // crash-looping app amnesty it did not earn, and a lost last_exit
+    // answers "why did it stop" with nothing.
+    let sup = supervisor_from_blob(blob_with_history()).await;
+    let info = sup.list().await.unwrap();
+    assert_eq!(info[0].restarts, 4);
+    assert_eq!(info[0].last_exit, Some(ExitInfo { code: Some(2), signal: None }));
+}
+
+#[tokio::test]
+async fn an_adopted_sheeps_exit_flows_through_the_ordinary_path() {
+    // The one that proves the reaper is actually wired. An adopted sheep
+    // that exits must reach handle_exited and be judged by decide_on_exit
+    // like any other, not sit there online forever.
+    let sup = supervisor_from_blob(blob_with_one_real_child()).await;
+    kill_the_child();
+    let info = await_status(&sup, ProcStatus::Stopped).await;
+    assert!(info[0].last_exit.is_some(), "the exit must be recorded, not lost");
+}
+
+#[tokio::test]
+async fn the_successor_does_not_reissue_a_live_id() {
+    // Counters restored BEFORE any slot is installed. A successor that
+    // starts next_id at zero hands a new sheep an id a caller still holds.
+    let sup = supervisor_from_blob(blob_whose_next_id_is(9)).await;
+    let fresh = sup.start(&plain_app()).await.unwrap();
+    assert!(fresh.id >= 9, "reissued a live id: {}", fresh.id);
+}
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+- [ ] **Step 3: Implement**
+
+A carried sheep with no descriptors (registered but stopped, `CarriedFds::none()`) installs as a slot with no pump and no `ctl`, which is the state it was already in. Do not try to adopt a process that is not running.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Task gate, then commit**
 
 #### Task 8d: the arms, and proving a sheep never noticed
 
