@@ -91,22 +91,18 @@ const LOG_BUFFER: usize = 8 * 1024;
 /// buffer until its next one, which for some sheep is never.
 const IDLE_FLUSH: Duration = Duration::from_millis(50);
 
-/// Bytes a descriptor report writes out of a stream's reader before it
-/// stops, per stream.
+/// Bytes each stream's reader may hold ahead of the lines it has emitted.
 ///
-/// A `BufReader` reads ahead by [`LOG_BUFFER`] and no further, so one
-/// bufferful is the whole of what a report can find stranded in userspace,
-/// and stranded is the word: those bytes are behind the descriptor the blob
-/// carries rather than in it, and the `execve` destroys them. What the
-/// drain declines to take is in no danger, because it is still in the
-/// kernel's pipe and the successor inherits the pipe by number.
-///
-/// The bound is what keeps the two apart. Without it a report served while
-/// a chatty sheep is writing would go on reading for as long as the sheep
-/// kept it fed, and the handover would wait on a sheep rather than on a
-/// buffer.
+/// Asked for explicitly rather than left to `BufReader`'s default, which is
+/// the same 8 KiB, because this number is load-bearing twice over and a
+/// default is a poor place to keep a bound someone has to reason about.
+/// It is the whole of what a handover can find stranded in userspace: bytes
+/// taken off the pipe and not yet written are behind the descriptor the
+/// blob carries rather than in it, and the `execve` destroys them. It is
+/// also the whole of what [`drain_ready`] can write, which is what keeps a
+/// descriptor report answerable while a chatty sheep runs.
 #[cfg(unix)]
-const MAX_DRAIN: usize = LOG_BUFFER;
+const READ_BUFFER: usize = 8 * 1024;
 
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
 #[derive(Debug, Default)]
@@ -1339,16 +1335,24 @@ impl LogFiles {
     /// blob cannot be closed and handed to the next `open` before the
     /// successor adopts it.
     ///
-    /// # The residual
+    /// # The residual, measured
     ///
-    /// A fragment of a line in flight at the exec is still lost.
-    /// [`tokio::io::Lines`] accumulates the line it is part-way through in
-    /// a private field and exposes only its inner reader, so bytes taken
-    /// towards a line whose newline has not arrived are reachable by
-    /// nothing here. What that costs is a fragment of the one line the
-    /// sheep had not finished writing, against the block the parking
-    /// itself saves. Closing it means the pump reading through a buffer it
-    /// owns rather than through `Lines`.
+    /// One line per reload at most, and often none. The line the sheep was
+    /// part-way through at the exec is split between the tail of the
+    /// reader's buffer and [`tokio::io::Lines`]' own accumulator, which is
+    /// private, and its head dies with the image: the successor picks the
+    /// pipe up mid-line and writes the tail as a line of its own. Three
+    /// reloads of a sheep emitting about 1.6M lines/second lost 3, 1 and 2
+    /// lines across three runs (2026-08-30), against 2872 for the same
+    /// drill on the pump this replaced.
+    ///
+    /// Closing it means the pump reading through a buffer it owns rather
+    /// than through `Lines`, so that it can write the whole line. Writing
+    /// the reader's tail out verbatim instead is NOT the cheap version of
+    /// that: every write this pump makes is a whole line today, and several
+    /// sheep can share one file (`merge_logs`), where a partial write and
+    /// its continuation are two `write(2)`s that another instance's line
+    /// can land between. That would trade one torn line for two.
     fn reading(&self) -> bool {
         #[cfg(unix)]
         {
@@ -1483,6 +1487,13 @@ impl LogFiles {
             // it is the same fix.
             #[cfg(unix)]
             LogCtl::ReportFds { done } => {
+                // First, though nothing between here and the answer could
+                // read a stream anyway: `serve` runs to completion inside
+                // the pump's own task, which is the only reader either
+                // stream has. Setting it here makes that invariant local
+                // instead of something to re-derive from the task
+                // structure.
+                self.parked = true;
                 drain_ready(&mut streams.out, &mut self.out).await;
                 drain_ready(&mut streams.err, &mut self.err).await;
                 for file in [&mut self.out, &mut self.err] {
@@ -1490,7 +1501,6 @@ impl LogFiles {
                         tracing::error!(%error, "log flush before a handover report failed");
                     }
                 }
-                self.parked = true;
                 let _ = done.send(crate::handover::CarriedFds {
                     out_pipe: self.pipes.out,
                     err_pipe: self.pipes.err,
@@ -1632,6 +1642,23 @@ where
     }
 }
 
+/// One stream's reader, at the capacity a handover reasons about.
+///
+/// A free function rather than an inline `BufReader::with_capacity` at each
+/// of the two call sites, so the two cannot drift: [`drain_ready`]'s bound
+/// is this capacity, and a stream built at some other one would strand more
+/// than the bound says.
+#[cfg(unix)]
+fn with_read_buffer<R: AsyncRead>(reader: R) -> BufReader<R> {
+    BufReader::with_capacity(READ_BUFFER, reader)
+}
+
+/// See the unix definition above; nothing here reasons about the capacity.
+#[cfg(not(unix))]
+fn with_read_buffer<R: AsyncRead>(reader: R) -> BufReader<R> {
+    BufReader::new(reader)
+}
+
 /// A pump's two line readers, held in one place so a control request can
 /// reach them.
 ///
@@ -1651,20 +1678,46 @@ struct Streams<O, E> {
     err: Option<Lines<BufReader<E>>>,
 }
 
-/// Writes out whatever one stream's reader has already taken off its pipe,
-/// and stops as soon as the reader would have to wait for more.
+/// Writes out the whole lines one stream's reader is already holding, and
+/// touches the pipe behind it not at all.
 ///
-/// This is what a descriptor report owes the successor, and it is bounded
-/// twice over: by [`MAX_DRAIN`], and by the reader having nothing ready.
-/// The bound is what keeps a report from following a sheep that is still
-/// writing, since on a busy stream the pipe is ready again the instant it
-/// is read.
+/// This is what a descriptor report owes the successor. The reader has
+/// taken up to [`READ_BUFFER`] off the pipe that the successor will never
+/// see there, and the `execve` destroys it: those bytes reach a file only
+/// if this image writes them.
+///
+/// # Why it must not read the pipe
+///
+/// Measured, at about 1.6M lines/second (2026-08-30). A drain that reads
+/// while it writes refills the reader as fast as it empties it, so any
+/// budget it stops at leaves a reader holding bytes it has JUST taken out
+/// of the pipe. The loss is then buffer-shaped rather than rate-shaped and
+/// does not shrink with a larger budget, because a bigger budget reads more
+/// as well as writing more: three reloads at that rate lost 1954 lines
+/// through a drain bounded by an emitted-byte count.
+///
+/// Stopping at "no whole line is buffered" instead has neither problem. The
+/// buffer strictly shrinks, since a `read_line` that finds its delimiter
+/// already buffered returns without a syscall, so the loop cannot follow a
+/// sheep however fast it writes and needs no budget at all. What it leaves
+/// is bounded by [`READ_BUFFER`] because that is the reader's whole
+/// capacity.
+///
+/// # What it still leaves
+///
+/// The partial line at the end of the buffer, plus anything
+/// [`tokio::io::Lines`] is holding in the private accumulator it does not
+/// expose. Those are the same line: the one the sheep had not finished
+/// writing. It reaches the log as its own tail, since the successor picks
+/// the pipe up mid-line, so a reload's seam costs one line rather than a
+/// block. Closing that means the pump reading through a buffer it owns
+/// rather than through `Lines`.
 ///
 /// EOF and a read failure both end the drain and are left for the pump's
-/// own loop to see, which it does when it resumes. A report that met one
-/// still names that stream's descriptor: the reader has not been dropped,
-/// so the number is still this process's, and the successor adopts a pipe
-/// that is at EOF exactly as this pump would have found it.
+/// own loop to see when it resumes. A report that met one still names that
+/// stream's descriptor: the reader has not been dropped, so the number is
+/// still this process's, and the successor adopts a pipe at EOF exactly as
+/// this pump would have found it.
 ///
 /// Nothing drained here is forwarded on `logs_tx`, deliberately. That
 /// channel feeds live `log.*` bus subscribers, and every one of them is
@@ -1676,19 +1729,16 @@ async fn drain_ready<R>(lines: &mut Option<Lines<BufReader<R>>>, file: &mut LogF
 where
     R: AsyncRead + Unpin,
 {
-    let mut drained = 0;
-    while drained < MAX_DRAIN {
-        // `biased`, so the ready branch is the answer to "the reader had
-        // nothing waiting" rather than a coin flip against a reader that
-        // did. `next_line` is documented cancel-safe, so the poll that
-        // loses costs nothing: a partial line stays in the reader.
-        let ready = tokio::select! {
-            biased;
-            result = next_line(lines) => result,
-            () = core::future::ready(()) => return,
+    let Some(reader) = lines.as_mut() else {
+        return;
+    };
+    while reader.get_ref().buffer().contains(&b'\n') {
+        // Ready on the first poll, and that is the loop's whole argument: a
+        // delimiter already in the buffer means no `read(2)`, so nothing
+        // new arrives to replace what is written.
+        let Ok(Some(line)) = reader.next_line().await else {
+            return;
         };
-        let Ok(Some(line)) = ready else { return };
-        drained += line.len() + 1;
         file.append(&line).await;
     }
 }
@@ -1780,8 +1830,8 @@ fn spawn_log_pump<O, E>(
             parked: false,
         };
         let mut streams = Streams {
-            out: stdout.map(|reader| BufReader::new(reader).lines()),
-            err: stderr.map(|reader| BufReader::new(reader).lines()),
+            out: stdout.map(|reader| with_read_buffer(reader).lines()),
+            err: stderr.map(|reader| with_read_buffer(reader).lines()),
         };
 
         while streams.out.is_some() || streams.err.is_some() {
@@ -2598,6 +2648,124 @@ mod tests {
         );
     }
 
+    /// Fails if a report takes bytes off a pipe that it does not write.
+    ///
+    /// The invariant the successor depends on, and the one no other case
+    /// here can see. Every byte the sheep wrote has to be in one of two
+    /// places when the report is answered: in the log file, because this
+    /// pump wrote it, or still in the pipe, because the successor inherits
+    /// the pipe by descriptor number. A byte in neither is a byte the
+    /// `execve` destroys.
+    ///
+    /// A drain that reads the pipe while it writes produces those by the
+    /// bufferful, and nothing else in this module notices, because on this
+    /// side of an exec the stranded bytes are still in the reader and a
+    /// resumed pump emits them quite happily. It took a real reload at
+    /// about 1.6M lines/second to find, at 2872 lines lost across three
+    /// reloads. Hence the second handle: a `try_clone` shares one open file
+    /// description, so what it can still read is exactly what the successor
+    /// would have found.
+    ///
+    /// The one line of slack is [`drain_ready`]'s documented residual: the
+    /// line the sheep was part-way through is split between the reader's
+    /// buffer and `Lines`' private accumulator, and its head is not
+    /// reachable from here. Slack, not silence: this fails at two.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_leaves_in_the_pipe_everything_it_did_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("out.log");
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        // The successor's view, taken before the pump owns the reader.
+        let inherited = reader.try_clone().unwrap();
+        let reader =
+            tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap();
+        let (logs_tx, logs) = mpsc::channel(CHANNEL_CAPACITY);
+        let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let pipes = PipeFds {
+            out: Some(reader.as_raw_fd()),
+            err: None,
+        };
+        spawn_log_pump(
+            Some(reader),
+            None::<DuplexStream>,
+            LogSink::Path(out_path.clone()),
+            LogSink::Path(dir.path().join("err.log")),
+            logs_tx,
+            ctl_rx,
+            pipes,
+        );
+
+        // More than one `READ_BUFFER`, so the reader is full and the pipe
+        // still holds the rest; under `SMALLEST_PIPE`, so this write does
+        // not park against a pump that has stopped draining.
+        let lines = u32::try_from(SMALLEST_PIPE * 3 / 4 / RUN_LINE).unwrap();
+        let run: String = (1..=lines).map(|n| format!("{n:07}\n")).collect();
+        assert!(run.len() > READ_BUFFER, "the reader must fill");
+        std::io::Write::write_all(&mut writer, run.as_bytes()).unwrap();
+        wait_for_a_full_logs_channel(&logs).await;
+
+        let (done, ack) = oneshot::channel();
+        ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+        timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a descriptor report must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        // The sheep goes quiet, so the inherited handle reaches EOF rather
+        // than waiting for a writer that outlives the test.
+        drop(writer);
+        let rest = read_to_eof(inherited).await;
+        let written = fs::read_to_string(&out_path).unwrap();
+        assert!(
+            run.starts_with(&written),
+            "the pump must write the run's own bytes, in order"
+        );
+        assert!(
+            run.ends_with(&rest),
+            "what is left in the pipe must be the run's own tail"
+        );
+        assert!(
+            written.len() + rest.len() >= run.len() - RUN_LINE,
+            "{} of {} bytes reached neither the file ({}) nor the pipe ({}): the report read \
+             them out of the pipe and then dropped them",
+            run.len() - written.len() - rest.len(),
+            run.len(),
+            written.len(),
+            rest.len()
+        );
+    }
+
+    /// Everything still readable from a pipe handle, to EOF.
+    ///
+    /// `WouldBlock` is retried rather than treated as the end: the handle
+    /// shares its open file description with a `tokio` reader, which put
+    /// the description in non-blocking mode, so an empty moment reads as an
+    /// error rather than as a wait.
+    #[cfg(unix)]
+    async fn read_to_eof(handle: std::io::PipeReader) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let drained = timeout(PUMP_DEADLINE, async {
+            loop {
+                match std::io::Read::read(&mut &handle, &mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("the successor's handle must be readable: {error}"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the pipe must reach EOF once the sheep is gone"
+        );
+        String::from_utf8(out).expect("a pipe of ASCII lines")
+    }
+
     /// The smallest buffer a pipe starts with on any host these cases run
     /// on: macOS opens one at 16 KiB, Linux at 64.
     ///
@@ -2614,11 +2782,11 @@ mod tests {
     /// Fails if a report follows a sheep that is still writing instead of
     /// rescuing what its reader already held.
     ///
-    /// [`MAX_DRAIN`] is what stops the two from being the same loop. A
-    /// reader can strand at most one bufferful, and what the drain declines
-    /// to take is not lost: it is still in the kernel's pipe, which the
-    /// successor inherits by descriptor number. So the bound costs nothing
-    /// and is what keeps a report answerable while a chatty sheep runs.
+    /// A reader can strand at most one [`READ_BUFFER`], and the drain
+    /// writes whole lines out of that buffer without reading the pipe
+    /// behind it, so it cannot write more than the buffer held however fast
+    /// the sheep is writing. The slack is one line: [`tokio::io::Lines`]
+    /// may have been part-way through one before the buffer was filled.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_report_drains_at_most_one_bufferful() {
@@ -2628,7 +2796,7 @@ mod tests {
         // parks.
         let lines = u32::try_from(SMALLEST_PIPE * 3 / 4 / RUN_LINE).unwrap();
         let run: String = (1..=lines).map(|n| format!("{n:07}\n")).collect();
-        assert!(run.len() > MAX_DRAIN, "the run must reach the bound");
+        assert!(run.len() > READ_BUFFER, "the run must reach the bound");
         pump.out_writer.write_all(run.as_bytes()).await.unwrap();
         wait_for_a_full_logs_channel(&pump.logs).await;
         pump.flush().await;
@@ -2642,7 +2810,7 @@ mod tests {
             "the report must rescue what the reader was holding"
         );
         assert!(
-            drained <= u64::try_from(MAX_DRAIN + RUN_LINE).unwrap(),
+            drained <= u64::try_from(READ_BUFFER + RUN_LINE).unwrap(),
             "the report drained {drained} bytes, which is more than one \
              bufferful: it is following the sheep rather than catching up"
         );
