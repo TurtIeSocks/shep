@@ -309,15 +309,60 @@ pub(crate) fn read_pidfile(paths: &ShepPaths) -> Result<Option<u32>, BootError> 
 /// `ERROR_SHARING_VIOLATION`. Both are immediate — this is the one lock in
 /// the workspace that must NOT wait, unlike the kv and bark rings, whose
 /// Windows arms retry precisely because their unix arms block.
+///
+/// # The adopted arm
+///
+/// A successor does not take this lock: it inherits the descriptor that
+/// already holds it. See [`UnixLock`] for why it must not take it again.
 #[derive(Debug)]
 struct PidfileLock {
     #[cfg(unix)]
-    flock: nix::fcntl::Flock<std::fs::File>,
+    flock: UnixLock,
     /// The sibling lock file, held open with every share flag cleared.
     /// Named with a leading underscore because it is held, never read —
     /// [`PidfileLock::record`] writes the pidfile itself.
     #[cfg(windows)]
     _handle: std::fs::File,
+}
+
+/// How this process came to hold the pidfile's `flock`, which is the one
+/// thing the two ways of starting a shepherd differ on.
+///
+/// # Why an adopted descriptor is never re-locked
+///
+/// A `flock` lock belongs to the open file DESCRIPTION, not to the process
+/// and not to the path, so it crosses an `execve` still held: a successor
+/// inherits the descriptor and the lock on it in one act, before it runs a
+/// line of its own code. Taking the lock again would mean releasing it
+/// first, since `nix` offers no constructor for an already-locked file that
+/// does not lock it, and that window is exactly long enough for a second
+/// daemon to claim this `$SHEP_HOME` while the only process supervising its
+/// flock is mid-boot. So the adopted arm holds the file and does nothing
+/// else with it.
+///
+/// The release rules stay identical either way. The kernel drops the lock
+/// when the last descriptor on the description closes, process death
+/// included, so a successor that crashes leaves the home claimable exactly
+/// as a predecessor that crashed did.
+#[cfg(unix)]
+#[derive(Debug)]
+enum UnixLock {
+    /// Taken here, by this process, with `flock(LOCK_EX | LOCK_NB)`.
+    Taken(nix::fcntl::Flock<std::fs::File>),
+    /// Inherited across a handover `execve`, still locked, never re-locked.
+    Adopted(std::fs::File),
+}
+
+#[cfg(unix)]
+impl UnixLock {
+    /// The locked pidfile itself, which [`PidfileLock::record`] writes
+    /// through.
+    fn file(&mut self) -> &mut std::fs::File {
+        match self {
+            Self::Taken(flock) => flock,
+            Self::Adopted(file) => file,
+        }
+    }
 }
 
 /// The sibling file the Windows arm locks: the pidfile with `.lock` appended.
@@ -358,7 +403,9 @@ impl PidfileLock {
                 source,
             })?;
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(flock) => Ok(Self { flock }),
+            Ok(flock) => Ok(Self {
+                flock: UnixLock::Taken(flock),
+            }),
             Err((_file, nix::errno::Errno::EWOULDBLOCK)) => Err(BootError::AlreadyRunning {
                 pid: read_pidfile(paths)?,
             }),
@@ -447,12 +494,35 @@ impl PidfileLock {
             .map_err(|source| BootError::Io { path, source })
     }
 
+    /// Holds a pidfile descriptor this image inherited, already locked.
+    ///
+    /// Nothing here locks, unlocks, truncates or writes. `file` crossed an
+    /// `execve` from the predecessor with its `flock` intact, and taking
+    /// ownership of it is the whole job: it keeps the descriptor open for
+    /// the rest of this process's life, which is what keeps the lock held.
+    /// See [`UnixLock`] for why re-acquiring would be a bug rather than
+    /// belt and braces.
+    ///
+    /// The pidfile's contents need no update either. An `execve` keeps the
+    /// pid, so the number the predecessor recorded is this process's own.
+    #[cfg(unix)]
+    #[allow(
+        dead_code,
+        reason = "task 8c installs the adopted flock and is what calls this; the arm it holds \
+                  the home with has to exist before there is a caller for it"
+    )]
+    fn from_locked(file: std::fs::File) -> Self {
+        Self {
+            flock: UnixLock::Adopted(file),
+        }
+    }
+
     #[cfg(unix)]
     fn record(&mut self, paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
         use std::io::{Seek, SeekFrom, Write};
 
         let path = pidfile(paths);
-        let file = &mut *self.flock;
+        let file = self.flock.file();
         file.set_len(0).map_err(|source| BootError::Io {
             path: path.clone(),
             source,
@@ -1897,6 +1967,51 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// fails if adopting the pidfile descriptor ever leaves the lock free.
+    ///
+    /// The failure it prevents: an arm that re-locked would have to release
+    /// first, and that window is exactly long enough for a second daemon to
+    /// win this home while the only one supervising its flock is mid-boot.
+    ///
+    /// What makes the assertion possible at all is that `flock` conflicts
+    /// between separate open file DESCRIPTIONS even inside one process, so
+    /// this process can ask for the lock it already holds and be refused.
+    ///
+    /// `mem::forget` plus `sys::adopt_handover_fd` stands in for the
+    /// `execve` a successor arrives through, and is as close to it as one
+    /// process can get: forgetting the lock skips the `flock(fd, LOCK_UN)`
+    /// its drop would run, exactly as an exec does, and adopting the number
+    /// back gives the descriptor a single new owner, exactly as the
+    /// successor gives it one. Duplicating it instead would leave a second
+    /// descriptor holding the same lock, and both assertions below would
+    /// then hold whatever the adopted arm did with its own.
+    #[test]
+    fn the_adopted_pidfile_arm_does_not_release_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+
+        let mut held = PidfileLock::acquire(&paths).expect("the predecessor must win");
+        let fd = std::os::fd::AsRawFd::as_raw_fd(held.flock.file());
+        core::mem::forget(held);
+        let inherited = crate::sys::adopt_handover_fd(fd)
+            .expect("the successor adopts the number the blob named");
+
+        let adopted = PidfileLock::from_locked(inherited);
+        let refusal = PidfileLock::acquire(&paths)
+            .expect_err("the lock must never be free while a successor holds it");
+        assert!(
+            matches!(refusal, BootError::AlreadyRunning { .. }),
+            "a contended lock must report AlreadyRunning, got {refusal:?}"
+        );
+
+        // And it is a lock rather than a descriptor nobody can ever release:
+        // a successor that exits closes the only handle left, and the kernel
+        // frees the home for the next daemon.
+        drop(adopted);
+        PidfileLock::acquire(&paths).expect("a successor that exits must leave the home claimable");
     }
 
     /// Serializes every test in this module that calls `boot()` and expects

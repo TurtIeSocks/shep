@@ -280,6 +280,24 @@ impl Listener {
         }
     }
 
+    /// Wraps a socket this process was handed rather than one it bound.
+    ///
+    /// The successor's half of a daemon handover. The control socket is one
+    /// of the descriptors an outgoing shepherd passes across its `execve`,
+    /// so the image that takes over adopts the listener instead of binding
+    /// the address again: a rebind would race the predecessor's socket file
+    /// and lose whatever connection a client had already made.
+    ///
+    /// Unix only, and the whole handover is. Windows has no `execve`, and
+    /// its arm of [`Self::bind`] makes the bind itself the daemon's mutual
+    /// exclusion, so a second image could not create the pipe to hand on in
+    /// the first place.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn from_unix_listener(listener: tokio::net::UnixListener) -> Self {
+        Self { listener }
+    }
+
     /// Waits for the next peer and returns its connected stream.
     ///
     /// # Errors
@@ -387,6 +405,33 @@ mod tests {
                 std::process::id()
             ))
         }
+    }
+
+    /// fails if a listener rebuilt around an inherited socket cannot serve.
+    ///
+    /// The successor half of a daemon handover: the control socket is one
+    /// descriptor the outgoing shepherd hands on, so its replacement binds
+    /// nothing and wraps what it was given. A `bind` here instead would
+    /// meet the socket file the predecessor left behind, and the connection
+    /// a client had already made to it would be dropped on the floor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listener_built_around_an_inherited_socket_still_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = address(dir.path(), "adopted");
+        let inherited = tokio::net::UnixListener::bind(&addr).unwrap();
+
+        let mut listener = Listener::from_unix_listener(inherited);
+        let client = tokio::spawn(async move {
+            let mut stream = connect(&addr).await.unwrap();
+            stream.write_all(b"still here\n").await.unwrap();
+        });
+
+        let mut served = listener.accept().await.unwrap();
+        let mut said = [0_u8; 11];
+        served.read_exact(&mut said).await.unwrap();
+        assert_eq!(&said, b"still here\n");
+        client.await.unwrap();
     }
 
     /// fails if the transport cannot carry bytes both ways on this platform.

@@ -37,6 +37,8 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::Arc;
 
 #[cfg(unix)]
 use command_fds::{CommandFdExt, FdMapping};
@@ -57,6 +59,8 @@ use tokio::time::{Instant, sleep_until};
 #[cfg(unix)]
 use crate::boot::DIR_MODE;
 use crate::channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
+#[cfg(unix)]
+use crate::runner::{AdoptSpec, AdoptedReaper};
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, LogLine, Preflight, ProcIo, ProcessRunner, ReopenError,
     RunnerError, RunningProcess, SpawnSpec, StdinWrite, StopSignal, check_log_ancestry,
@@ -131,8 +135,12 @@ pub struct TokioProc {
     /// Captured once at spawn time — `tokio::process::Child::id` reports
     /// `None` after the child has been waited to completion, but callers
     /// (e.g. a kill ladder) may still need the pid after that point.
+    ///
+    /// Also the whole of an adopted sheep's identity: a successor inherits a
+    /// pid and no `Child` at all, which is why this was never read off the
+    /// child in the first place.
     pid: u32,
-    child: Child,
+    proc: Supervised,
     /// The job object this sheep and every process it spawns belong to —
     /// Windows' stand-in for the unix process group `process_group(0)`
     /// establishes, and what [`RunningProcess::kill_tree`] terminates.
@@ -144,19 +152,62 @@ pub struct TokioProc {
     job: crate::sys_windows::Job,
 }
 
+/// Where this proc's exit comes from: tokio, or a targeted `waitpid`.
+///
+/// The two arms are the two ways a sheep can be under this daemon's care.
+/// A spawned one has a `tokio::process::Child` and tokio does the waiting.
+/// An adopted one crossed an `execve` into a successor that has no `Child`
+/// for it and no way to make one, since only `Command::spawn` produces those,
+/// so its exit is collected by [`AdoptedReaper`]'s targeted wait instead.
+///
+/// Only the wait differs. `signal`, `signal_process` and `kill_tree` all
+/// address the pid, which is the same number either way.
+#[derive(Debug)]
+enum Supervised {
+    /// Started by this daemon, and waited by tokio.
+    Spawned(Child),
+    /// Inherited across a handover, and waited by the reaper the successor
+    /// shares between every sheep it adopted.
+    #[cfg(unix)]
+    Adopted(Arc<AdoptedReaper>),
+}
+
 impl RunningProcess for TokioProc {
     fn pid(&self) -> u32 {
         self.pid
     }
 
     async fn wait(&mut self) -> ExitOutcome {
+        let child = match &mut self.proc {
+            Supervised::Spawned(child) => child,
+            // The reaper carries the same cancel-safety contract by its own
+            // route: a status it has taken is remembered and replayed, so a
+            // dropped wait loses nothing and a second one answers the same.
+            // It reports an error where tokio cannot (nothing else in this
+            // process may reap an adopted pid, and something that did has
+            // taken the exit with it), which lands on the same degenerate
+            // outcome the failed-wait arm below returns.
+            #[cfg(unix)]
+            Supervised::Adopted(reaper) => {
+                return match reaper.wait(self.pid).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        tracing::error!(pid = self.pid, %error, "adopted process wait failed");
+                        ExitOutcome {
+                            code: None,
+                            signal: None,
+                        }
+                    }
+                };
+            }
+        };
         // tokio::process::Child::wait is documented cancel-safe (repeat
         // calls, or calls after a dropped-mid-flight future, replay the
         // cached result instead of restarting) — RunningProcess::wait's own
         // cancel-safety contract is inherited directly from it, no extra
         // latching needed on our side (contrast the scripted fake, which
         // has to hand-roll that latch itself).
-        match self.child.wait().await {
+        match child.wait().await {
             Ok(status) => ExitOutcome {
                 code: status.code(),
                 // Always `None` on Windows, and that is the truth rather
@@ -275,9 +326,9 @@ impl RunningProcess for TokioProc {
     /// [`Self::kill_tree`].
     #[cfg(windows)]
     fn signal_process(&mut self, sig: OperatorSignal) -> Result<(), RunnerError> {
+        let Supervised::Spawned(child) = &mut self.proc;
         match sig {
-            OperatorSignal::Kill => self
-                .child
+            OperatorSignal::Kill => child
                 .start_kill()
                 .map_err(|error| RunnerError::SignalFailed(error.to_string())),
             other => Err(RunnerError::SignalFailed(format!(
@@ -584,6 +635,75 @@ impl ProcessRunner for TokioRunner {
         what_exec_will_find(spec)
     }
 
+    /// Takes a sheep this image inherited rather than started.
+    ///
+    /// Nothing is spawned, opened or signalled. The carried pipe read ends
+    /// are handed to the same log pump a spawn feeds, the carried
+    /// log handles are written through rather than reopened, and the pid is
+    /// the one the sheep has been running under all along. From the sheep's
+    /// side the shepherd was never away.
+    ///
+    /// The three channels a spawn may wire are all closed here rather than
+    /// left dangling, exactly as a spawn closes the ones its own spec did
+    /// not ask for. Phase 2a's fitness gate refuses to carry any sheep with
+    /// a shepherd channel or a stdin pipe, so a carried sheep has neither,
+    /// and a caller's `is_closed()` says so at once instead of a send
+    /// buffering into a channel nobody drains.
+    #[cfg(unix)]
+    fn adopt(&self, spec: AdoptSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+        let AdoptSpec {
+            pid,
+            out_file,
+            err_file,
+            out_pipe,
+            err_pipe,
+            out_log,
+            err_log,
+            reaper,
+        } = spec;
+
+        let (logs_tx, logs_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (log_ctl_tx, log_ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        // Read off the readers before they are moved into the pump, as the
+        // spawn path does: these are the numbers the NEXT handover carries,
+        // and a successor that reported its predecessor's would be naming
+        // descriptors this process does not have.
+        let pipes = PipeFds {
+            out: out_pipe.as_ref().map(AsRawFd::as_raw_fd),
+            err: err_pipe.as_ref().map(AsRawFd::as_raw_fd),
+        };
+        spawn_log_pump(
+            out_pipe,
+            err_pipe,
+            carried_sink(out_file, out_log),
+            carried_sink(err_file, err_log),
+            logs_tx,
+            log_ctl_rx,
+            pipes,
+        );
+
+        let (from_child_tx, from_child) = mpsc::channel(CHANNEL_CAPACITY);
+        drop(from_child_tx);
+        let (to_child, to_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        drop(to_child_rx);
+        let (to_stdin, to_stdin_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        drop(to_stdin_rx);
+
+        Ok((
+            TokioProc {
+                pid,
+                proc: Supervised::Adopted(reaper),
+            },
+            ProcIo {
+                logs: logs_rx,
+                from_child,
+                to_child,
+                log_ctl: log_ctl_tx,
+                to_stdin,
+            },
+        ))
+    }
+
     fn spawn(&self, spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
@@ -881,8 +1001,8 @@ impl ProcessRunner for TokioRunner {
         spawn_log_pump(
             child.stdout.take(),
             child.stderr.take(),
-            spec.out_file.clone(),
-            spec.err_file.clone(),
+            LogSink::Path(spec.out_file.clone()),
+            LogSink::Path(spec.err_file.clone()),
             logs_tx,
             log_ctl_rx,
             pipes,
@@ -909,12 +1029,28 @@ impl ProcessRunner for TokioRunner {
         Ok((
             TokioProc {
                 pid,
-                child,
+                proc: Supervised::Spawned(child),
                 #[cfg(windows)]
                 job,
             },
             io,
         ))
+    }
+}
+
+/// The sink for one carried stream: its handle when the blob had one, and
+/// its path when it did not.
+///
+/// A sheep whose log open had failed before the handover carries no handle
+/// for that stream, which is a `None` rather than a refusal (see
+/// `handover::adopt`). Opening the path here is the right recovery: it is
+/// what the predecessor's pump would have done at its next reopen, and it
+/// costs the successor nothing when the open fails again.
+#[cfg(unix)]
+fn carried_sink(path: PathBuf, handle: Option<tokio::fs::File>) -> LogSink {
+    match handle {
+        Some(file) => LogSink::Carried(path, file),
+        None => LogSink::Path(path),
     }
 }
 
@@ -938,7 +1074,51 @@ struct LogFile<W = tokio::fs::File> {
     buffered_since: Option<Instant>,
 }
 
+/// Where one stream's log handle comes from when a pump starts.
+///
+/// Two arms because a successor's pump starts differently from a spawn's: it
+/// is handed a handle that is already open on the file, and opening the path
+/// again instead would lose `O_APPEND` and the guarantee that goes with it
+/// (see [`open_append`]). The path travels with the handle either way, so a
+/// later [`LogCtl::Reopen`] behaves identically for both.
+enum LogSink {
+    /// Open this path for appending, which is what every spawn does.
+    Path(PathBuf),
+    /// Write through this already-open appending handle, on this path.
+    #[cfg(unix)]
+    Carried(PathBuf, tokio::fs::File),
+}
+
 impl LogFile<tokio::fs::File> {
+    /// Builds the log file a [`LogSink`] describes.
+    async fn from_sink(sink: LogSink) -> Self {
+        match sink {
+            LogSink::Path(path) => Self::open(path).await,
+            #[cfg(unix)]
+            LogSink::Carried(path, file) => Self::from_file(path, file),
+        }
+    }
+
+    /// Takes an already-open appending handle on `path`, opening nothing.
+    ///
+    /// The successor's half of a handover. `O_APPEND` is a file status flag
+    /// on the open file description, so it crossed the `execve` with the
+    /// descriptor and is still set; reopening `path` here would produce a
+    /// handle that passes a naive write test and then writes at its own
+    /// tracked offset, which is the sparse hole [`open_append`] documents.
+    ///
+    /// Nothing else about the file changes. [`Self::reopen`] still goes back
+    /// through [`open_append`] by path, so a rotation works on a carried
+    /// handle exactly as it does on an opened one.
+    #[cfg(unix)]
+    fn from_file(path: PathBuf, file: tokio::fs::File) -> Self {
+        Self {
+            path,
+            handle: Some(BufWriter::with_capacity(LOG_BUFFER, file)),
+            buffered_since: None,
+        }
+    }
+
     /// Opens `path` for appending, keeping the path for later reopens.
     ///
     /// A failed open is not fatal here — it is already logged, and the pump
@@ -1414,8 +1594,8 @@ where
 fn spawn_log_pump<O, E>(
     stdout: Option<O>,
     stderr: Option<E>,
-    out_path: PathBuf,
-    err_path: PathBuf,
+    out_sink: LogSink,
+    err_sink: LogSink,
     logs_tx: mpsc::Sender<LogLine>,
     mut ctl_rx: mpsc::Receiver<LogCtl>,
     pipes: PipeFds,
@@ -1425,8 +1605,8 @@ fn spawn_log_pump<O, E>(
 {
     tokio::spawn(async move {
         let mut files = LogFiles {
-            out: LogFile::open(out_path).await,
-            err: LogFile::open(err_path).await,
+            out: LogFile::from_sink(out_sink).await,
+            err: LogFile::from_sink(err_sink).await,
             pipes,
         };
         let mut out_lines = stdout.map(|reader| BufReader::new(reader).lines());
@@ -1810,8 +1990,8 @@ mod tests {
             spawn_log_pump(
                 Some(out_reader),
                 Some(err_reader),
-                out_path.clone(),
-                err_path.clone(),
+                LogSink::Path(out_path.clone()),
+                LogSink::Path(err_path.clone()),
                 logs_tx,
                 ctl_rx,
                 PipeFds::default(),
@@ -1853,8 +2033,8 @@ mod tests {
             spawn_log_pump(
                 Some(out_reader),
                 Some(err_reader),
-                out_path.clone(),
-                err_path.clone(),
+                LogSink::Path(out_path.clone()),
+                LogSink::Path(err_path.clone()),
                 logs_tx,
                 ctl_rx,
                 pipes,
@@ -2701,6 +2881,43 @@ mod tests {
         assert!(
             error.message.starts_with(&format!("{}: ", path.display())),
             "the failure must name the file it belongs to: {error}"
+        );
+    }
+
+    /// Fails if a log handle carried across a handover writes anywhere but
+    /// the end of the file.
+    ///
+    /// Not merely "the handle is writable". `O_APPEND` is a file status flag
+    /// on the open file description, so it crosses an exec with the
+    /// descriptor, and a handle that lost it writes at its own tracked
+    /// offset instead: the first line already in the file is overwritten
+    /// here, and after a `copytruncate` rotation the same difference leaves
+    /// a sparse hole the size of everything rotated away. The content
+    /// assertion below is what tells the two apart, which is why it reads
+    /// both lines rather than checking the file is non-empty.
+    ///
+    /// `cfg(unix)` alongside the constructor it drives, and the whole
+    /// handover with it: Windows has no `execve`, so no image there is ever
+    /// handed a log handle it did not open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_log_file_from_an_open_handle_still_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.log");
+        fs::write(&path, "first\n").unwrap();
+
+        // Opened exactly as a predecessor's pump had it, and handed over
+        // rather than reopened by path.
+        let handle = open_append(&path).await.unwrap();
+        let mut log = LogFile::from_file(path.clone(), handle);
+
+        log.append("second").await;
+        log.flush().await.expect("the carried handle must be live");
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "first\nsecond\n",
+            "a carried handle must append, not write at its own offset"
         );
     }
 

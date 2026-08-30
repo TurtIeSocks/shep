@@ -713,7 +713,7 @@ The three seams Task 6 measured, all confirmed small:
 - a `#[cfg(unix)]` constructor on `shep_core::transport::Listener`, whose inner `tokio::net::UnixListener` is private and which offers only `bind(&Path)`.
 - a `PidfileLock` arm holding an already-locked `std::fs::File`. **It must not re-lock.** The descriptor crossed the exec with its `flock` intact, and re-acquiring means releasing first, which opens a window for a second daemon to win the home.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test]
@@ -768,13 +768,13 @@ fn the_adopted_pidfile_arm_does_not_release_the_lock() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
-- [ ] **Step 5: Task gate, then commit**
+- [x] **Step 5: Task gate, then commit**
 
 #### Task 8c: install the adopted flock
 
