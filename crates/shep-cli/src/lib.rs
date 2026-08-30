@@ -1726,6 +1726,14 @@ pub(crate) fn refuse_version_skew(
         // shape, kept identical so this refusal reads like every other one.
         Format::Table => {
             let cause = VERSION_SKEW_CAUSE.join("\n");
+            // `summary` interpolates `daemon_version`, which arrives over the
+            // socket and is therefore attacker-shaped: a daemon this client
+            // did not build can put a newline or an escape sequence in it and
+            // forge lines on the operator's terminal. `emit_error` sanitises
+            // for exactly this reason and this branch bypasses it to keep the
+            // multi-line layout, so it sanitises the interpolated value
+            // itself. The fixed text around it is ours and needs nothing.
+            let summary = crate::terminal_safe::sanitise(&summary).0;
             let _ = writeln!(
                 streams.err,
                 "error[{}]: {summary}\n\n{cause}\n\n  shep {VERSION_SKEW_REMEDY}",
