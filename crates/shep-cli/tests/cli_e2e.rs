@@ -7290,9 +7290,16 @@ fn the_control_socket_accepts_throughout_a_handover() {
     let _ = poll_flock(dir.path(), |info| info["status"] == "online");
 
     let home = dir.path().to_path_buf();
+    // The prober says when it is really probing, and the reload waits for
+    // that. Without the handshake the reload could finish before the first
+    // `ping` ever ran, and the case would pass with every probe served by the
+    // successor alone, which proves nothing about the address staying bound
+    // across the exec.
+    let (probing, started_probing) = std::sync::mpsc::channel();
     let prober = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut refused = Vec::new();
+        let mut announced = false;
         while Instant::now() < deadline {
             let out = shep(&home).arg("ping").output().unwrap();
             if !out.status.success() {
@@ -7302,9 +7309,16 @@ fn the_control_socket_accepts_throughout_a_handover() {
                     String::from_utf8_lossy(&out.stderr)
                 ));
             }
+            if !announced {
+                announced = true;
+                let _ = probing.send(());
+            }
         }
         refused
     });
+    started_probing
+        .recv_timeout(FLOCK_DEADLINE)
+        .expect("the prober must reach the shepherd before the reload starts");
 
     let reloaded = shep(dir.path())
         .arg("daemon")
