@@ -65,7 +65,10 @@ use crate::handover::adopt::AdoptedSheep;
 #[cfg(unix)]
 use crate::handover::reap::AdoptedReaper;
 #[cfg(unix)]
-use crate::handover::{CarriedFds, CarriedSheep, Counters, DaemonFds, Handover, OwnedCandidate};
+use crate::handover::{
+    Candidate, CarriedFds, CarriedSheep, Counters, DaemonFds, Fitness, Handover, OwnedCandidate,
+    fitness,
+};
 use crate::kill::kill_process;
 use crate::privilege::{self, Credentials, PrivilegeError, SpawnIdentity};
 use crate::probes::Prober;
@@ -482,14 +485,6 @@ pub(crate) enum Command {
     /// [`SheepSlot`], and the descriptor numbers are known only to each
     /// sheep's log pump.
     #[cfg(unix)]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "task 8d sends this from `boot`'s handover arm; nothing outside this \
-                      crate's own tests constructs it yet"
-        )
-    )]
     HandoverSnapshot {
         /// The daemon's own two descriptors, which `boot` knows and the
         /// actor does not.
@@ -498,6 +493,18 @@ pub(crate) enum Command {
         /// task of its own, never the actor loop (see
         /// [`Actor::handle_handover_snapshot`]).
         reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
+    },
+    /// Answers whether this flock could be handed to a successor in place.
+    ///
+    /// The same gate [`Command::HandoverSnapshot`]'s caller applies, asked
+    /// on its own and without the descriptor round trip, because a client
+    /// asks it before anything is signalled (spec H3a) and a question must
+    /// not flush a pump.
+    #[cfg(unix)]
+    HandoverFitness {
+        /// Answers on the actor loop: the gate reads slot state this actor
+        /// already holds and awaits nothing.
+        reply: oneshot::Sender<Result<Fitness, SupervisorError>>,
     },
     /// Puts one named action on the shepherd channel of every sheep matching
     /// `selector` and answers with what each app said back, or with why
@@ -1275,14 +1282,6 @@ impl SupervisorHandle {
     /// - [`SupervisorError::EngineStopped`] — the actor is gone.
     ///
     #[cfg(unix)]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "task 8d calls this from `boot`'s handover arm; nothing outside this \
-                      crate's own tests calls it yet"
-        )
-    )]
     pub(crate) async fn handover_snapshot(
         &self,
         fds: DaemonFds,
@@ -1290,6 +1289,26 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::HandoverSnapshot { fds, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Whether this shepherd's flock could be handed to a successor in
+    /// place, or the reason it could not.
+    ///
+    /// Read-only, and nothing here begins a handover: the trigger is a
+    /// signal, and this is the question a client asks before sending one
+    /// (spec H3a).
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`]: the actor is gone.
+    #[cfg(unix)]
+    pub(crate) async fn handover_fitness(&self) -> Result<Fitness, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::HandoverFitness { reply }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -1574,14 +1593,6 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     /// Panics if called outside a Tokio runtime context, which is where the
     /// actor task and every adopted sheep's pump have to be spawned.
     #[cfg(unix)]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "task 8d calls this from `boot`'s successor arm; nothing outside this \
-                      crate's own tests calls it yet"
-        )
-    )]
     pub(crate) fn spawn_adopted(
         self,
         flock: Vec<AdoptedSheep>,
@@ -2635,6 +2646,14 @@ impl<R: ProcessRunner> Actor<R> {
             #[cfg(unix)]
             Command::HandoverSnapshot { fds, reply } => {
                 self.handle_handover_snapshot(fds, reply);
+                false
+            }
+            // Not rejected while `shutting_down` either, for the reason
+            // above: a question registers nothing, spawns nothing and
+            // changes no actor state.
+            #[cfg(unix)]
+            Command::HandoverFitness { reply } => {
+                self.handle_handover_fitness(reply);
                 false
             }
             // Not rejected while `shutting_down` either, for the reason
@@ -5908,6 +5927,37 @@ impl<R: ProcessRunner> Actor<R> {
             },
             reply,
         );
+    }
+
+    /// Answers whether every sheep this actor holds could be carried across
+    /// a handover.
+    ///
+    /// On the actor loop, unlike [`Self::handle_handover_snapshot`], and the
+    /// difference is that this awaits nothing: the gate reads slot state
+    /// already in hand, where a snapshot has to ask every log pump for its
+    /// descriptors.
+    ///
+    /// Visited in id order rather than [`HashMap`] order, so a flock with two
+    /// unsupported sheep names the same one every time it is asked. An
+    /// operator who fixes what the refusal named and asks again should meet
+    /// the next problem, not a coin flip between the two.
+    #[cfg(unix)]
+    fn handle_handover_fitness(&self, reply: oneshot::Sender<Result<Fitness, SupervisorError>>) {
+        let mut slots: Vec<&SheepSlot> = self.sheep.values().collect();
+        slots.sort_unstable_by_key(|slot| slot.entry.id);
+        let candidates: Vec<Candidate<'_>> = slots
+            .iter()
+            .map(|slot| Candidate {
+                entry: &slot.entry,
+                // Any manual command owning this sheep's next exit, exactly
+                // as `handle_handover_snapshot` reads it: the two must answer
+                // the same question, or a flock passes the gate and then
+                // fails it.
+                pending_stop: slot.manual.is_some(),
+                pending_delete: slot.pending_delete,
+            })
+            .collect();
+        let _ = reply.send(Ok(fitness(&candidates)));
     }
 
     /// Resolves `selector` and hands every match to a task that flushes its

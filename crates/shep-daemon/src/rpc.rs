@@ -522,6 +522,9 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 daemon_version: None,
             })),
         },
+        Request::HandoverFitness => reply(Ok(Response::HandoverFitness {
+            refusal: handover_refusal(ctx).await,
+        })),
         Request::KillDaemon => Outcome::Shutdown(Reply {
             id,
             result: Ok(Response::ShuttingDown),
@@ -534,6 +537,48 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             daemon_version: None,
         })),
     }
+}
+
+/// Why this shepherd cannot hand its flock to a successor in place, or
+/// `None` when it can.
+///
+/// The sentence is rendered here rather than on the wire as a structured
+/// reason, for the reason [`Response::HandoverFitness`] gives: the set of
+/// things a handover cannot yet carry is exactly the set of things that
+/// phase has not built, and the client does nothing with it but print it.
+///
+/// An engine that has stopped is a refusal too, not an error. The caller
+/// asked whether to signal a shepherd, and one whose actor is gone must be
+/// answered no.
+#[cfg(unix)]
+async fn handover_refusal(ctx: &RpcContext) -> Option<String> {
+    match ctx.supervisor.handover_fitness().await {
+        Ok(crate::handover::Fitness::Carryable) => None,
+        Ok(crate::handover::Fitness::Refused(reason)) => Some(reason.to_string()),
+        Err(err) => Some(format!(
+            "this shepherd could not check whether its flock can be handed over ({err})"
+        )),
+    }
+}
+
+/// Windows has no `execve`, so there is no image for a successor to become
+/// and every flock is refused.
+///
+/// A refusal rather than an unimplemented request, because the two mean
+/// different things to the caller: this one is answered, and the answer is
+/// what sends `shep daemon reload` to the stop-and-start arm that is the
+/// permanent Windows answer (spec H5).
+#[cfg(windows)]
+#[expect(
+    clippy::unused_async,
+    reason = "one signature for both platforms; the unix arm awaits the supervisor"
+)]
+async fn handover_refusal(_ctx: &RpcContext) -> Option<String> {
+    Some(
+        "this shepherd runs on Windows, which has no `execve`, so its flock cannot be handed to \
+         a successor in place"
+            .to_string(),
+    )
 }
 
 /// Fills in each running sheep's live CPU and memory.

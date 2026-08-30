@@ -298,6 +298,23 @@ impl Listener {
         Self { listener }
     }
 
+    /// The descriptor this listener is bound on.
+    ///
+    /// The predecessor's half of a daemon handover, and the counterpart to
+    /// [`Self::from_unix_listener`]: an outgoing shepherd has to name this
+    /// number in the blob it hands on, since a descriptor number is only
+    /// meaningful in the process that owns it and the successor adopts it by
+    /// number. Borrowed, never owned: closing it would close the control
+    /// socket out from under a daemon that is still serving.
+    ///
+    /// Unix only, as the whole handover is.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.listener.as_raw_fd()
+    }
+
     /// Waits for the next peer and returns its connected stream.
     ///
     /// # Errors

@@ -105,6 +105,27 @@ impl FlockRegistry {
         }
     }
 
+    /// Records one app's config directly, for a successor rebuilding this
+    /// registry from a handover blob.
+    ///
+    /// [`Self::record`] takes [`ResolvedApp`]s because every other caller
+    /// has just normalized one. A successor has not: it holds the
+    /// [`AppConfig`] the blob carried, which the supervisor re-normalizes on
+    /// its own way to installing the sheep, and normalizing it a second time
+    /// here would be a second place for the two to disagree.
+    ///
+    /// Load-bearing rather than a convenience. The registry is what the
+    /// muster roll is written from, so a successor that left it empty would
+    /// overwrite a good roll with an empty one within seconds of taking
+    /// over, and a reboot after that would restore nothing.
+    #[cfg(unix)]
+    pub(crate) fn record_config(&self, config: &AppConfig) {
+        self.apps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(config.name.clone(), config.clone());
+    }
+
     /// Drops every recorded app, so the next [`Self::roll`] describes an
     /// empty flock regardless of what is still live in the supervisor's own
     /// listing.

@@ -35,6 +35,11 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 ///
 /// Returns an error if `fcntl` fails, which on a valid open descriptor
 /// should not happen in practice.
+#[allow(
+    dead_code,
+    reason = "exercised by this module's own tests; production goes through \
+                             `keep_raw_across_exec`, which a blob's numbers are all it has"
+)]
 pub fn keep_across_exec(fd: BorrowedFd<'_>) -> io::Result<()> {
     keep_raw_across_exec(fd.as_raw_fd())
 }
@@ -69,6 +74,7 @@ pub fn keep_raw_across_exec(fd: RawFd) -> io::Result<()> {
 ///
 /// Returns an error if `fcntl` fails, which on a valid open descriptor
 /// should not happen in practice.
+#[allow(dead_code, reason = "read by this module's own tests")]
 pub fn is_kept(fd: BorrowedFd<'_>) -> io::Result<bool> {
     let flags = fcntl(fd.as_raw_fd(), FcntlArg::F_GETFD)?;
     let flags = FdFlag::from_bits_truncate(flags);

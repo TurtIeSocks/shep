@@ -10,15 +10,6 @@
 //! back to the stop-and-start arm that already works. That asymmetry is why
 //! an unclear case refuses rather than guesses.
 
-// Nothing in this crate calls `fitness` or writes a blob yet. Task 8 wires
-// the gate into `boot.rs`'s SIGHUP arm and task 5 writes the blob; until
-// then, an honestly-unreachable gate is better than a stub that pretends to
-// decide something and always answers the same way.
-#![expect(
-    dead_code,
-    reason = "tasks 5 and 8 wire the blob and the gate into boot.rs; nothing calls them yet"
-)]
-
 pub(crate) mod adopt;
 mod fds;
 pub(crate) mod reap;
@@ -327,15 +318,39 @@ impl Handover {
     }
 
     /// Every sheep this blob carries.
+    ///
+    /// Read by this crate's own tests and by `adopt`, which reaches the
+    /// field directly from inside the module; `allow` rather than `expect`
+    /// because the expectation would go unfulfilled in a test build.
     #[must_use]
+    #[allow(dead_code, reason = "read by this crate's own tests")]
     pub fn sheep(&self) -> &[CarriedSheep] {
         &self.sheep
     }
 
     /// The entry id the successor is to issue next.
+    ///
+    /// [`Self::counters`] is what a successor restores from; this is the one
+    /// counter a test asserts on its own.
     #[must_use]
+    #[allow(dead_code, reason = "read by this crate's own tests")]
     pub const fn next_id(&self) -> u32 {
         self.next_id
+    }
+
+    /// The three counters the successor restores before installing any
+    /// sheep.
+    ///
+    /// All three together rather than one accessor each: they are restored
+    /// in one act, and a successor that carried two of them would reissue a
+    /// live stamp of the third.
+    #[must_use]
+    pub const fn counters(&self) -> Counters {
+        Counters {
+            next_id: self.next_id,
+            next_deadline: self.next_deadline,
+            next_action_stamp: self.next_action_stamp,
+        }
     }
 
     /// Where the blob lives under `paths`: `$SHEP_HOME/run/handover.json`.
@@ -601,6 +616,7 @@ impl CarriedSheep {
 
     /// The descriptor numbers this instance's output travels on.
     #[must_use]
+    #[allow(dead_code, reason = "read by this crate's own tests")]
     pub const fn fds(&self) -> CarriedFds {
         self.fds
     }
