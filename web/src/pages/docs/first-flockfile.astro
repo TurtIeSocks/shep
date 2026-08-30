@@ -11,6 +11,23 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
+
+const initScaffold = `# Manage your app in a Flockfile
+# Add as many apps as you would like using TOML syntax
+
+#[[app]]
+# A convenient and unique name for shep to display
+#name = "my-first-sheep"
+# The script that shep should use to launch your app
+#script = "./index.js"
+# Restarts the process automatically when it exits unexpectedly
+#autorestart = true
+# Where the process runs. Without it, the daemon's own directory
+#cwd = "/srv/app"`;
+
+const initJsonRefusal = `$ shep init deploy.json --all
+error[usage]: JSON has no comment syntax, so a full scaffold would pin every default instead of explaining it; write a .json5 Flockfile for the same syntax with comments, or drop --all`;
 
 interface Field {
   name: string;
@@ -136,6 +153,53 @@ const fieldGroups: FieldGroup[] = [
     <CodeBlock label="Flockfile.toml">{`[[app]]
 name   = "web"
 script = "./server"`}</CodeBlock>
+
+    <h2>Or start from a generated one</h2>
+    <VerbSignature verb="init" usage="shep init [path] [--all] [--force]">
+      <p>
+        Writes a commented Flockfile to fill in. With no path that's{" "}
+        <code>Flockfile.toml</code> in the current directory; give it one and
+        the extension picks the language, out of <code>.toml</code>,{" "}
+        <code>.yaml</code>, <code>.yml</code>, <code>.json</code> and{" "}
+        <code>.json5</code>.
+      </p>
+    </VerbSignature>
+    <CodeBlock label="Flockfile.toml">{initScaffold}</CodeBlock>
+    <p>
+      Almost every line is commented out, and uncommenting the ones you want
+      is the whole workflow. The generator builds a real document first and
+      comments it in a single pass afterwards, which is why the same
+      scaffold exists in four languages instead of one: the comment marker
+      never touches the structure. A test uncomments each format
+      mechanically and parses the result, so this is a Flockfile that works
+      rather than prose shaped like one.
+    </p>
+    <p>
+      <code>--all</code> writes every field the grammar has instead of the
+      handful worth meeting on day one, which is 82 lines of TOML against
+      the 12 above. <code>--force</code> replaces a Flockfile that is
+      already there, keeping <em>that</em> file's format rather than the
+      default one, so forcing over a <code>.yaml</code> writes YAML instead
+      of dropping TOML into it. Without <code>--force</code>, an existing
+      Flockfile is a refusal and nothing is written.
+    </p>
+    <Callout variant="note">
+      JSON has no comment syntax, so the thing this verb makes cannot be
+      made in it. A <code>.json</code> scaffold is a live minimal document
+      with real values and no guidance, and <code>--all</code> is refused
+      there outright rather than fudged, because a JSON document naming
+      every field would pin every default explicitly. That is a Flockfile
+      you would tell somebody not to commit.
+    </Callout>
+    <CodeBlock>{initJsonRefusal}</CodeBlock>
+    <p class="fine">
+      Writing a second Flockfile beside an existing one is legal and said out
+      loud rather than refused, since somebody naming a path explicitly may
+      well be migrating. Discovery walks the fixed order below and stops at
+      the first hit, so the new file can be one shep never reads;{" "}
+      <code>shep init</code> prints an <code>init_shadowed</code> notice
+      naming both files when it spots that.
+    </p>
 
     <h2>Formats and discovery</h2>
     <p>
