@@ -472,6 +472,97 @@ impl PidfileLock {
     }
 }
 
+/// The handover blob this process was handed, if it is a successor.
+///
+/// A successor is a shep image an outgoing daemon `execve`d in its own
+/// place, handing it a live flock. Its only marker is `SHEP_HANDOVER` in the
+/// environment, naming the blob to adopt; an image started any other way has
+/// no variable, no blob, and boots normally.
+///
+/// # Why a refusal is not an error
+///
+/// By the time this runs the predecessor has already replaced itself, so
+/// there is no image left to fall back to and no stop arm to take. That
+/// leaves exactly two outcomes for a blob that cannot be used, and this
+/// function chooses the second:
+///
+/// 1. refuse to boot at all, which leaves the operator no shepherd and a
+///    flock nothing is watching;
+/// 2. say so at `error` level and continue as an ordinary boot, which is
+///    correct for the case this actually happens in.
+///
+/// The case it actually happens in is a STALE VARIABLE: something inherited
+/// `SHEP_HANDOVER` from a process that has long since finished its handover,
+/// and the blob it names was unlinked at the time. There is no live flock
+/// behind it, and a fresh boot is exactly right.
+///
+/// A genuinely lost blob is the other case, and it is self-limiting rather
+/// than dangerous. A real successor inherited the pidfile descriptor too,
+/// with its `flock` still held, so the fresh boot this returns to cannot
+/// take that lock and stops at [`BootError::AlreadyRunning`] before it
+/// restores a thing. The one way a fresh boot proceeds is the one way it
+/// should: no pidfile descriptor was inherited, so this was never a real
+/// handover.
+///
+/// Silence is the outcome neither case may have, which is why every refusal
+/// logs at `error` with the blob's path and what was wrong with it.
+///
+/// Unix only, as the whole handover is: Windows has no `execve`, so
+/// `Arm::for_daemon` never chooses a handover there and no image can be a
+/// successor.
+#[cfg(unix)]
+#[must_use]
+#[expect(
+    dead_code,
+    reason = "task 8 calls this from `boot`; detecting a successor before there is anything to \
+              hand it is the half of the job this task ships"
+)]
+pub(crate) fn successor_handover() -> Option<Successor> {
+    let path = PathBuf::from(std::env::var_os(crate::handover::HANDOVER_ENV)?);
+    let blob = successor_handover_at(&path)?;
+    Some(Successor { path, blob })
+}
+
+/// A handover blob, and where it was read from.
+///
+/// The path is kept because the successor unlinks the blob once it has
+/// adopted what it describes, and only then: a blob left behind after a
+/// refusal is evidence, while one left behind after a success would be
+/// adopted again by the next boot.
+#[cfg(unix)]
+#[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "task 8 reads both fields: the blob to adopt, and the path to unlink afterwards"
+)]
+pub(crate) struct Successor {
+    /// Where the blob was read from.
+    pub path: PathBuf,
+    /// What it said.
+    pub blob: crate::handover::Handover,
+}
+
+/// [`successor_handover`], against a caller-named path.
+///
+/// Split out so a test can drive every refusal without touching the
+/// environment, which is process-global and, since edition 2024, unsafe to
+/// write.
+#[cfg(unix)]
+fn successor_handover_at(path: &Path) -> Option<crate::handover::Handover> {
+    match crate::handover::Handover::read(path) {
+        Ok(blob) => Some(blob),
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                %error,
+                "this process was handed a handover blob it cannot use, and is booting as if \
+                 it were fresh; if a flock was running, it is no longer supervised"
+            );
+            None
+        }
+    }
+}
+
 /// What, if anything, owns this home's pidfile lock.
 ///
 /// Proof of life is the pidfile LOCK, never the pidfile's contents. A live
@@ -3114,5 +3205,61 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// A blob written by hand rather than by `Handover::write`, so this
+    /// module's tests pin the on-disk shape a successor has to read rather
+    /// than round-tripping whatever the writer happens to emit.
+    fn write_blob(path: &Path, version: u32) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"version":{version},"sheep":[],"listener_fd":3,"pidfile_fd":4,"next_id":0,"next_deadline":0,"next_action_stamp":0}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_blob_on_disk_makes_this_process_a_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handover.json");
+        write_blob(&path, 1);
+
+        assert!(successor_handover_at(&path).is_some());
+    }
+
+    #[test]
+    fn a_missing_blob_is_refused_out_loud_rather_than_silently() {
+        // A stale inherited variable and a lost blob look the same from
+        // here, and neither may pass for a fresh boot without a word.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.json");
+
+        let logs = capture_logs(|| assert!(successor_handover_at(&path).is_none()));
+
+        assert!(logs.contains("never-written.json"), "{logs}");
+    }
+
+    #[test]
+    fn a_blob_of_an_unknown_version_is_refused_out_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handover.json");
+        write_blob(&path, u32::MAX);
+
+        let logs = capture_logs(|| assert!(successor_handover_at(&path).is_none()));
+
+        assert!(logs.contains("version"), "{logs}");
+    }
+
+    #[test]
+    fn a_refused_blob_is_left_on_disk_for_an_operator_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handover.json");
+        write_blob(&path, u32::MAX);
+
+        capture_logs(|| assert!(successor_handover_at(&path).is_none()));
+
+        assert!(path.exists(), "a refused blob is evidence, not litter");
     }
 }

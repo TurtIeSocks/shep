@@ -19,6 +19,7 @@
     reason = "tasks 5 and 8 wire the blob and the gate into boot.rs; nothing calls them yet"
 )]
 
+pub(crate) mod adopt;
 mod fds;
 
 use core::convert::Infallible;

@@ -30,6 +30,15 @@
 //! narrower, locally-checkable obligation, not a widening of the
 //! exception.
 //!
+//! **The second entry point, [`adopt_handover_fd`], is safe on purpose.**
+//! It is [`adopt_fd`] for a handover's successor, and its whole doc is the
+//! argument for why the ordering obligation is discharged by the situation
+//! rather than by the call site: a descriptor inherited across `execve` is
+//! open before the new image runs at all, so the kernel can never hand its
+//! number to anything this process opens later. That argument holds for
+//! handover descriptors and for nothing else, which is why it is a second,
+//! narrowly documented function rather than a relaxation of [`adopt_fd`].
+//!
 //! **Rejected alternative:** have the parent pass a socket path
 //! (`SHEP_READY_SOCK`) and let the child connect and write. It is entirely
 //! safe and was the first design. Its cost is a second socket in the boot
@@ -87,7 +96,7 @@
 //!     time against a fd the test itself just created — a different,
 //!     lower-stakes situation than production double-adoption, and not
 //!     what this scenario is about.)
-#![allow(unsafe_code)] // IR-24 exception — seven sites total, all in this file (its own definition plus 6 test call sites; `boot.rs` has none — see the essay above and `crate::boot::BootOptions::ready_fd`'s doc).
+#![allow(unsafe_code)] // IR-24 exception: eight sites total, all in this file (`adopt_fd`'s own definition, `adopt_handover_fd`'s block, and 6 test call sites). `boot.rs` has none; see the essay above and `crate::boot::BootOptions::ready_fd`'s doc.
 
 use core::fmt;
 
@@ -147,13 +156,58 @@ pub unsafe fn adopt_fd(fd: RawFd) -> Result<File, SysError> {
     // the intended inherited pipe rather than something this process opened
     // itself in the meantime. `adopt_fd` is the only place in this crate
     // that constructs a `File` from a bare fd. `boot` never calls it — see
-    // this fn's own doc above — and this crate has no other production
-    // caller today either; every in-crate call site is one of this file's
-    // own tests, each adopting a fd it just created and each doing so at
-    // most once per descriptor. The `File` returned here becomes that
-    // number's sole owner; nothing else will read, write, or close it
-    // again.
+    // this fn's own doc above — and its only in-crate caller outside this
+    // file's own tests is `adopt_handover_fd` below, which discharges the
+    // ordering contract from the situation rather than from where it sits.
+    // The `File` returned here becomes that number's sole owner; nothing
+    // else will read, write, or close it again.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Takes ownership of a descriptor a handover blob names, without the
+/// caller having to discharge [`adopt_fd`]'s ordering precondition itself.
+///
+/// This is [`adopt_fd`] for exactly one situation: the process is a
+/// handover's successor, and `fd` is a number its own predecessor wrote
+/// into the blob at `$SHEP_HOME/run/handover.json` moments before it
+/// `execve`d this image. It is safe to call, and the argument for that is
+/// specific to that situation rather than general.
+///
+/// **Why the recycling hazard cannot arise here.** [`adopt_fd`]'s `#
+/// Safety` section exists because `F_GETFD` proves only that a number is
+/// open right now, never who opened it, so a stale number could name
+/// something this process opened for itself. A descriptor genuinely
+/// inherited across `execve` is never in that position: it is already open
+/// the instant the new image starts, and the kernel allocates the lowest
+/// FREE number, so nothing this process opens afterwards can ever be handed
+/// one of them. The ordering obligation `adopt_fd` pushes onto its caller is
+/// discharged by the inheritance itself, not by where the call sits.
+///
+/// **What that leaves.** A blob naming a number that was NOT inherited,
+/// one left over from a handover that never completed or one an operator
+/// edited, could name a descriptor this process opened. The blob is
+/// written mode `0600` inside `$SHEP_HOME/run`, which is `0700`, and it is
+/// removed both when an exec fails and once a successor has read it, so it
+/// is trusted exactly as far as everything else the daemon reads out of its
+/// own home. Do not call this on a descriptor number from anywhere else.
+///
+/// # Errors
+/// - [`SysError::ReservedFd`]: `fd` is below 3 (stdio is owned elsewhere).
+/// - [`SysError::BadFd`]: `fd` names no open descriptor in this process,
+///   which is what a blob naming a descriptor that did not survive the exec
+///   looks like. Refusing is the whole point: a sheep whose stdout read end
+///   is missing does not lose its output, it blocks on `write()` once the
+///   pipe buffer fills.
+pub fn adopt_handover_fd(fd: RawFd) -> Result<File, SysError> {
+    // SAFETY: `fd` was inherited across `execve` from this process's own
+    // predecessor, which cleared `FD_CLOEXEC` on it and named it in the
+    // handover blob. An inherited descriptor is open before this image runs
+    // its first instruction, so its number is never free for anything this
+    // process opens to be given, which is precisely the recycling scenario
+    // (c) that makes `adopt_fd` unsafe. See this function's own doc for the
+    // one residual case (a blob naming a number that was not inherited) and
+    // why the blob is trusted that far.
+    unsafe { adopt_fd(fd) }
 }
 
 /// Errors adopting an inherited descriptor.

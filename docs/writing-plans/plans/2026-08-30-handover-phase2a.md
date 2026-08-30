@@ -415,7 +415,7 @@ Rebuild each one from its raw number:
 
 **The pidfile lock needs no rebuilding and must not be re-acquired.** `flock` is a property of the open file description, so it survived the exec with its descriptor. Re-acquiring would mean releasing first, opening a window for a second daemon to win it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -436,13 +436,47 @@ fn a_blob_naming_a_descriptor_that_is_not_open_fails_loudly() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
-- [ ] **Step 3: Implement**
+Actual: FAIL, unresolved `adopt` and `successor_handover_at` (E0432/E0425 x5).
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 3: Implement**
 
-- [ ] **Step 5: Task gate, then commit**
+Nothing here opens anything: every object is wrapped around an inherited
+number, which is what preserves `O_APPEND` on the log handles and the `flock`
+on the pidfile without a single reopen.
+
+The one unsafe stays in `sys.rs`, as a second safe entry point
+`adopt_handover_fd` next to the existing `adopt_fd`. `adopt_fd` is an
+`unsafe fn` whose precondition is an ordering claim about the call site, and
+calling it from `handover::adopt` would put an `unsafe` block outside
+`sys.rs` (IR-22/23). The handover situation discharges that precondition
+structurally rather than by ordering: an inherited descriptor is open before
+the successor's first instruction, so the kernel can never hand its number to
+anything this process opens later. That argument is written where the unsafe
+lives.
+
+The pidfile is adopted LAST, so any refusal before it leaves that descriptor
+open and unowned and its lock still held. A successor that cannot rehydrate
+must not release this home to a second daemon on its way out.
+
+`successor_handover` in `boot.rs` reads `SHEP_HANDOVER`, and a blob that is
+missing or of an unknown version is logged at `error` and treated as a fresh
+boot rather than as a panic or a silent fall-through. The predecessor is gone
+by then, so there is no stop arm to take; the case this actually happens in
+is a stale inherited variable with no live flock behind it, and a genuinely
+lost blob is self-limiting because the inherited pidfile lock stops the fresh
+boot at `AlreadyRunning` before it restores anything.
+
+- [x] **Step 4: Run to verify they pass**
+
+Actual: 587 passed, 18 filtered (up from 577: the plan's three, plus three
+over the pidfile ordering, an adopted pipe really reading, and a file offered
+where a pipe was named). The `O_APPEND` test was confirmed non-vacuous by
+handing it a non-appending handle, at which point the write at offset 0
+overwrites the file and it fails.
+
+- [x] **Step 5: Task gate, then commit**
 
 ---
 
