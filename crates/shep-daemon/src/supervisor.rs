@@ -7648,11 +7648,43 @@ fn spawn_send_line_task(
 /// What a [`Command::HandoverSnapshot`] answers with: one candidate per
 /// registered sheep for the fitness gate, and the blob a successor reads.
 ///
-/// A pair rather than one type because the two go to different places and
-/// only one of them crosses the exec — the candidates decide whether there
-/// is to be an exec at all, and are then done with.
+/// Three types rather than one because they go to three different places
+/// and only one of them crosses the exec: the candidates decide whether
+/// there is to be an exec at all and are then done with, and the parked
+/// pumps matter only if there is not.
 #[cfg(unix)]
-type Snapshot = (Vec<OwnedCandidate>, Handover);
+type Snapshot = (Vec<OwnedCandidate>, Handover, ParkedPumps);
+
+/// The log pumps a snapshot stopped, so a handover that is then abandoned
+/// can start them reading again.
+///
+/// Taking the snapshot parks every pump it reaches, because a report is
+/// only true while nothing moves behind it (see `LogFiles::reading`). The
+/// exec is what normally ends that park, by replacing the whole image.
+/// Every other way out leaves this daemon running with pumps that have
+/// stopped reading, and nothing else ever starts one again. See
+/// [`LogCtl::Resume`] for what that costs.
+///
+/// The party that parked them hands them back, rather than the abort path
+/// re-reading the actor's slots: the flock can have changed by then, and
+/// what is owed a resume is what was reported, not what is registered now.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct ParkedPumps(Vec<mpsc::Sender<LogCtl>>);
+
+#[cfg(unix)]
+impl ParkedPumps {
+    /// Lets every pump this snapshot parked read its sheep's streams again.
+    ///
+    /// A send that fails is a pump that has ended since the report, which
+    /// is nothing to repair: the sheep it belonged to is no longer being
+    /// read by anything either way.
+    pub(crate) async fn resume(&self) {
+        for pump in &self.0 {
+            let _ = pump.send(LogCtl::Resume).await;
+        }
+    }
+}
 
 /// One sheep on its way from the actor to the handover task.
 ///
@@ -7698,9 +7730,18 @@ fn spawn_handover_task(
     tokio::spawn(async move {
         let mut candidates = Vec::with_capacity(drafts.len());
         let mut carried = Vec::with_capacity(drafts.len());
+        let mut parked = ParkedPumps::default();
         for draft in drafts {
             let fds = match &draft.log_ctl {
-                Some(log_ctl) => report_fds(log_ctl).await,
+                Some(log_ctl) => {
+                    let fds = report_fds(log_ctl).await;
+                    // Recorded whatever the answer was. A pump that could
+                    // not be reached is a failed send that resumes nothing,
+                    // and one that answered `none` has still been asked to
+                    // park.
+                    parked.0.push(log_ctl.clone());
+                    fds
+                }
                 None => CarriedFds::none(),
             };
             carried.push(CarriedSheep::from_entry(&draft.entry, draft.epoch, fds));
@@ -7711,12 +7752,13 @@ fn spawn_handover_task(
             });
         }
         let blob = Handover::new(carried, fds, counters);
-        let _ = reply.send(Ok((candidates, blob)));
+        let _ = reply.send(Ok((candidates, blob, parked)));
     });
 }
 
-/// Asks one sheep's log pump to flush what it is holding and report the four
-/// descriptors it owns, and waits for the answer.
+/// Asks one sheep's log pump to write out everything it is holding, report
+/// the four descriptors it owns, and stop reading until the exec; and waits
+/// for the answer.
 ///
 /// Not reaching a pump at all is [`CarriedFds::none`], not an error, and both
 /// shapes of it mean the same thing that [`reopen_logs`] documents: there is
@@ -15199,6 +15241,11 @@ mod tests {
                         LogCtl::ReportFds { done } => {
                             let _ = done.send(CarriedFds::none());
                         }
+                        // Nothing to start reading again: this runner reads
+                        // no streams, and never reported anything to park
+                        // for.
+                        #[cfg(unix)]
+                        LogCtl::Resume => {}
                     }
                 }
             });
@@ -15756,6 +15803,11 @@ mod tests {
                         LogCtl::ReportFds { done } => {
                             let _ = done.send(CarriedFds::none());
                         }
+                        // Nothing to start reading again: this runner reads
+                        // no streams, and never reported anything to park
+                        // for.
+                        #[cfg(unix)]
+                        LogCtl::Resume => {}
                     }
                 }
             });
@@ -17263,7 +17315,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (candidates, blob) = handle.handover_snapshot(fds).await.unwrap();
+        let (candidates, blob, _parked) = handle.handover_snapshot(fds).await.unwrap();
 
         assert_eq!(candidates.len(), 2, "both sheep must reach the gate");
         assert_eq!(blob.sheep().len(), 2);
@@ -17299,7 +17351,7 @@ mod tests {
 
         let (reply, rx) = oneshot::channel();
         actor.handle_handover_snapshot(fds, reply);
-        let (candidates, blob) = rx.await.unwrap().unwrap();
+        let (candidates, blob, _parked) = rx.await.unwrap().unwrap();
 
         assert!(
             candidates[0].pending_stop,

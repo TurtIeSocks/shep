@@ -93,21 +93,23 @@ A 950-line patch is preserved in this session's scratchpad as `task1-carry.patch
 
 Whether the blob still carries buffered bytes at all is now an open question rather than a given. A parked pump's reader may simply be empty by construction, in which case the field goes.
 
-- [ ] **Step 1: Write the failing test**
+**Answered: no field.** A parked pump's reader is NOT empty by construction, because `select!` can serve the report while a line sits ready in the `BufReader`, and a pump parked on a full `logs` channel holds a bufferful. So the report DRAINS the reader into the log file before it answers, bounded at one bufferful (`MAX_DRAIN`), instead of copying it into the blob. What the drain declines to take is not lost: it is still in the kernel's pipe, which the successor inherits by number. That leaves `CarriedFds` unchanged, so no wire or blob change, and no adopt-side prepend.
+
+- [x] **Step 1: Write the failing test**
 
 The measurement that matters is a chatty sheep across a reload, with every line appearing exactly once, in order. The rejected attempt's harness proved a test can pass while the log is duplicating, so assert absence of duplicates as well as absence of gaps.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
-- [ ] **Step 3: Implement, including the un-park**
+- [x] **Step 3: Implement, including the un-park**
 
-- [ ] **Step 4: Prove it non-vacuous**
+- [x] **Step 4: Prove it non-vacuous**
 
-- [ ] **Step 5: Drive a real reload, on a sheep fast enough to tear**
+- [x] **Step 5: Drive a real reload, on a sheep fast enough to tear**
 
 An `awk` or shell loop emitting with no sleep. The rejected design passed every suite it had and failed here, three runs of three.
 
-- [ ] **Step 6: Task gate, then commit**
+- [x] **Step 6: Task gate, then commit**
 
 ### Task 2: a deadline on `report_fds`, and an answer that is not ambiguous
 

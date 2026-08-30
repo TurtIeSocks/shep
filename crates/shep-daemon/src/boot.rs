@@ -1995,11 +1995,45 @@ pub(crate) struct HandoverSeam {
 /// a graceful stop.
 #[cfg(unix)]
 async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible, String> {
-    let (candidates, blob) = seam
+    let (candidates, blob, parked) = seam
         .supervisor
         .handover_snapshot(seam.fds)
         .await
         .map_err(|err| format!("the supervisor could not describe its flock: {err}"))?;
+    let refusal = match hand_over_carrying(&candidates, &blob, seam) {
+        Ok(never) => match never {},
+        Err(refusal) => refusal,
+    };
+    // Taking the snapshot stopped every pump it reached, and this process
+    // is the one that owes them a resume: there is no successor image to do
+    // it, and nothing else in the daemon ever sends one. The caller falls
+    // back to a graceful stop, which is a stretch of seconds during which
+    // the flock is being told to exit and is writing exactly the lines an
+    // operator will reach for. A refusal that changes nothing else must not
+    // silently cost them.
+    //
+    // Here rather than inside `exec_into`'s own error path, which restores
+    // `FD_CLOEXEC` on the same failure: the gate below refuses BEFORE
+    // anything is exec'd, so a resume that lived with the descriptors would
+    // miss the abort that happens most often. This is where every way out
+    // meets.
+    parked.resume().await;
+    Err(refusal)
+}
+
+/// [`hand_over_now`]'s body, split out so a single resume can cover every
+/// way it refuses.
+///
+/// # Errors
+///
+/// The flock cannot be carried, or the exec itself failed. Both leave this
+/// process still itself, with no blob on disk.
+#[cfg(unix)]
+fn hand_over_carrying(
+    candidates: &[crate::handover::OwnedCandidate],
+    blob: &crate::handover::Handover,
+    seam: &HandoverSeam,
+) -> Result<core::convert::Infallible, String> {
     let borrowed: Vec<crate::handover::Candidate<'_>> = candidates
         .iter()
         .map(crate::handover::OwnedCandidate::as_candidate)
@@ -2007,7 +2041,7 @@ async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible,
     if let crate::handover::Fitness::Refused(reason) = crate::handover::fitness(&borrowed) {
         return Err(reason.to_string());
     }
-    crate::handover::hand_over(&blob, &seam.paths).map_err(|err| err.to_string())
+    crate::handover::hand_over(blob, &seam.paths).map_err(|err| err.to_string())
 }
 
 /// Error type returned from this module's boot steps
@@ -3452,6 +3486,99 @@ mod tests {
         // Bounded, like the sibling above. The lock this case now holds is
         // held across this await, so a teardown that hung would stop every
         // other signal test in the module rather than failing this one.
+        tokio::time::timeout(Duration::from_secs(5), daemon.run())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The sharp edge of parking a pump: a handover that reports and then
+    /// refuses has to leave every pump reading again.
+    ///
+    /// Taking the snapshot stops each pump where it stands, which is what
+    /// makes the report still true at the exec. There is no exec here, and
+    /// nothing else in the daemon ever sends a resume, so a missing one is
+    /// not a slow log or a lost line: it is a flock that logs nothing more,
+    /// through the graceful stop this refusal falls back to and for as long
+    /// as the daemon lives after it, having reported no failure beyond the
+    /// refusal itself.
+    ///
+    /// Two sheep, because the resume has to reach every pump that was
+    /// reported to rather than the one the refusal named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_handover_starts_every_pump_reading_again() {
+        // As the sibling above: a successful `boot()` installs real signal
+        // listeners for this test's whole duration.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 2]));
+        let daemon = boot(
+            SharedRunner(Arc::clone(&runner)),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+        let plain = AppConfig::minimal("quiet", "./srv");
+        // The refusal: a shepherd channel is a sheep 2a cannot carry, and
+        // the gate reads it after every pump has already been reported to.
+        let mut talkative = AppConfig::minimal("chatty", "./srv");
+        talkative.channel = true;
+        ctx.supervisor
+            .start(vec![
+                normalize(plain).unwrap(),
+                normalize(talkative).unwrap(),
+            ])
+            .await
+            .unwrap();
+        for sheep in 0..2 {
+            assert!(
+                runner.log_ctl_live(sheep),
+                "sheep {sheep} must have a live log pump before the report, or this case                  proves nothing"
+            );
+        }
+
+        let seam = HandoverSeam {
+            supervisor: ctx.supervisor.clone(),
+            fds: crate::handover::DaemonFds {
+                listener: -1,
+                pidfile: -1,
+            },
+            paths: paths.clone(),
+        };
+        let refusal = hand_over_now(&seam)
+            .await
+            .expect_err("a flock with a shepherd channel cannot be carried");
+        assert!(
+            refusal.contains("shepherd channel"),
+            "the gate must refuse before anything is exec'd: {refusal}"
+        );
+
+        // Polled rather than read once: a resume carries no acknowledgement
+        // (see `LogCtl::Resume`), so a send that has returned has been
+        // queued rather than served. Bounded, so a pump that is never told
+        // fails here instead of hanging.
+        let both_resumed = async {
+            while runner.resumes(0) == 0 || runner.resumes(1) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), both_resumed)
+            .await
+            .expect("every pump a refused handover reported to must be reading again");
+        for sheep in 0..2 {
+            assert_eq!(
+                runner.resumes(sheep),
+                1,
+                "sheep {sheep} must be resumed once rather than repeatedly"
+            );
+        }
+
+        ctx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), daemon.run())
             .await
             .unwrap()

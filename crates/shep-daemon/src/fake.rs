@@ -368,6 +368,10 @@ struct SpawnedProc {
     /// How many [`LogCtl::Flush`] requests it has answered — read back via
     /// [`ScriptedRunner::flushes`].
     flushes: Arc<AtomicU32>,
+    /// How many [`LogCtl::Resume`] requests it has been sent — read back via
+    /// [`ScriptedRunner::resumes`].
+    #[cfg(unix)]
+    resumes: Arc<AtomicU32>,
     /// Every line written to this spawn's stdin, in write order — read back
     /// via [`ScriptedRunner::stdin_lines`].
     stdin_lines: Arc<Mutex<Vec<String>>>,
@@ -612,6 +616,26 @@ impl ScriptedRunner {
             .load(Ordering::SeqCst)
     }
 
+    /// How many [`LogCtl::Resume`] requests the proc spawned at
+    /// `spawn_index` has been sent.
+    ///
+    /// The counter an abandoned handover is asserted against: a report
+    /// parks a real pump, so a handover that reported and then refused owes
+    /// one of these to every pump it reported to, or that sheep's log stops
+    /// for the life of the daemon.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[cfg(unix)]
+    #[must_use]
+    #[track_caller]
+    pub fn resumes(&self, spawn_index: usize) -> u32 {
+        self.spawned.lock().unwrap()[spawn_index]
+            .resumes
+            .load(Ordering::SeqCst)
+    }
+
     /// Every line the daemon has written to the stdin of the proc spawned at
     /// `spawn_index`, in write order.
     ///
@@ -775,6 +799,10 @@ impl ProcessRunner for ScriptedRunner {
         let reopen_count = Arc::clone(&reopens);
         let flushes = Arc::new(AtomicU32::new(0));
         let flush_count = Arc::clone(&flushes);
+        #[cfg(unix)]
+        let resumes = Arc::new(AtomicU32::new(0));
+        #[cfg(unix)]
+        let resume_count = Arc::clone(&resumes);
         let lamb_holds_the_pipe = script.lamb_holds_the_pipe;
         let logs_for_pump = logs_tx.clone();
         tokio::spawn(async move {
@@ -819,6 +847,15 @@ impl ProcessRunner for ScriptedRunner {
                         Some(LogCtl::ReportFds { done }) => {
                             let fds = reportable_fds.get_or_insert_with(open_reportable_fds);
                             let _ = done.send(fds.1);
+                        }
+                        // Counted rather than acted on: the fake reads no
+                        // streams, so it has none to start reading again.
+                        // What a caller asserts here is that an abandoned
+                        // handover sent one at all, which is the half that
+                        // lives above the pump.
+                        #[cfg(unix)]
+                        Some(LogCtl::Resume) => {
+                            resume_count.fetch_add(1, Ordering::SeqCst);
                         }
                         None => break, // nothing holds ProcIo::log_ctl
                     },
@@ -933,6 +970,8 @@ impl ProcessRunner for ScriptedRunner {
             log_ctl_live,
             reopens,
             flushes,
+            #[cfg(unix)]
+            resumes,
             stdin_lines,
             credentials: spec.credentials,
         });

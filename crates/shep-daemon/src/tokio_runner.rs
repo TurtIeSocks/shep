@@ -91,6 +91,23 @@ const LOG_BUFFER: usize = 8 * 1024;
 /// buffer until its next one, which for some sheep is never.
 const IDLE_FLUSH: Duration = Duration::from_millis(50);
 
+/// Bytes a descriptor report writes out of a stream's reader before it
+/// stops, per stream.
+///
+/// A `BufReader` reads ahead by [`LOG_BUFFER`] and no further, so one
+/// bufferful is the whole of what a report can find stranded in userspace,
+/// and stranded is the word: those bytes are behind the descriptor the blob
+/// carries rather than in it, and the `execve` destroys them. What the
+/// drain declines to take is in no danger, because it is still in the
+/// kernel's pipe and the successor inherits the pipe by number.
+///
+/// The bound is what keeps the two apart. Without it a report served while
+/// a chatty sheep is writing would go on reading for as long as the sheep
+/// kept it fed, and the handover would wait on a sheep rather than on a
+/// buffer.
+#[cfg(unix)]
+const MAX_DRAIN: usize = LOG_BUFFER;
+
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
 #[derive(Debug, Default)]
 pub struct TokioRunner;
@@ -1287,12 +1304,60 @@ struct LogFiles {
     /// the same moment, which closes the descriptor: a number the kernel is
     /// free to hand to the next `open` must never reach a handover blob.
     pipes: PipeFds,
+    /// Whether this pump has answered a [`LogCtl::ReportFds`] that no
+    /// [`LogCtl::Resume`] has ended, and so has stopped reading its
+    /// sheep's streams.
+    ///
+    /// See [`LogFiles::reading`] for why a report parks a pump at all.
+    #[cfg(unix)]
+    parked: bool,
 }
 
 impl LogFiles {
     /// The file a line from this stream is appended to (`err` picks stderr).
     fn stream(&mut self, err: bool) -> &mut LogFile {
         if err { &mut self.err } else { &mut self.out }
+    }
+
+    /// Whether the pump should still be reading its sheep's streams.
+    ///
+    /// False between a [`LogCtl::ReportFds`] and the exec that consumes it,
+    /// which is the whole of what parking means and the reason the variant
+    /// is more than a question.
+    ///
+    /// A report is a SNAPSHOT: two descriptor numbers the successor will
+    /// adopt, and a flush that empties the write buffer behind them. The
+    /// exec happens later. A pump that goes on reading in between appends
+    /// lines that the `execve` then destroys in the write buffer, and takes
+    /// bytes off the pipe that the successor can no longer find there, so
+    /// the same window loses a sheep's output twice over. Parking makes
+    /// every part of the snapshot still true when it is used, rather than
+    /// true when it was taken.
+    ///
+    /// It also pins the two stream numbers. A pump that is not reading
+    /// cannot reach EOF, so it cannot drop a reader, so a number in the
+    /// blob cannot be closed and handed to the next `open` before the
+    /// successor adopts it.
+    ///
+    /// # The residual
+    ///
+    /// A fragment of a line in flight at the exec is still lost.
+    /// [`tokio::io::Lines`] accumulates the line it is part-way through in
+    /// a private field and exposes only its inner reader, so bytes taken
+    /// towards a line whose newline has not arrived are reachable by
+    /// nothing here. What that costs is a fragment of the one line the
+    /// sheep had not finished writing, against the block the parking
+    /// itself saves. Closing it means the pump reading through a buffer it
+    /// owns rather than through `Lines`.
+    fn reading(&self) -> bool {
+        #[cfg(unix)]
+        {
+            !self.parked
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
     }
 
     /// When the pump owes the older of the two buffers a flush, or `None`
@@ -1344,7 +1409,18 @@ impl LogFiles {
     /// OF THESE PER SHEEP (reopen) or PER PATH (flush) with `"; "`, so one
     /// separator at both levels would punctuate a single sheep that failed on
     /// both streams exactly like two that failed on one each.
-    async fn serve(&mut self, ctl: LogCtl) {
+    #[cfg_attr(
+        not(unix),
+        allow(
+            unused_variables,
+            reason = "`streams` is read only by `ReportFds`, and that variant is unix-only"
+        )
+    )]
+    async fn serve<O, E>(&mut self, ctl: LogCtl, streams: &mut Streams<O, E>)
+    where
+        O: AsyncRead + Unpin,
+        E: AsyncRead + Unpin,
+    {
         match ctl {
             LogCtl::Reopen { done } => {
                 let mut failures = Vec::new();
@@ -1392,13 +1468,29 @@ impl LogFiles {
             // for one, and the descriptor is still the one to carry, since
             // the successor inherits the same handle on the same file and is
             // the only party left that could write to it.
+            //
+            // The drain comes first, and for the same reason. What a reader
+            // has taken off its pipe and not yet emitted is on the far side
+            // of the descriptor the blob carries: the successor inherits
+            // the pipe, not this process's memory, so those bytes reach no
+            // file unless this one writes them. Draining them beats
+            // carrying them in the blob, which was tried and measured. A
+            // blob is a snapshot and a pump is live, so bytes copied at the
+            // report are bytes the predecessor then writes to the log
+            // ANYWAY before the exec, and the successor replays them: one
+            // real reload produced a duplicated line and 459 lines of
+            // reordered output. Parking is what makes the drain sound, and
+            // it is the same fix.
             #[cfg(unix)]
             LogCtl::ReportFds { done } => {
+                drain_ready(&mut streams.out, &mut self.out).await;
+                drain_ready(&mut streams.err, &mut self.err).await;
                 for file in [&mut self.out, &mut self.err] {
                     if let Err(error) = file.flush().await {
                         tracing::error!(%error, "log flush before a handover report failed");
                     }
                 }
+                self.parked = true;
                 let _ = done.send(crate::handover::CarriedFds {
                     out_pipe: self.pipes.out,
                     err_pipe: self.pipes.err,
@@ -1406,6 +1498,11 @@ impl LogFiles {
                     err_log: self.err.raw_fd(),
                 });
             }
+            // No acknowledgement to send, and nothing to undo but the flag:
+            // the drain above emptied the reader rather than copying it, so
+            // a resumed pump picks its sheep up wherever the pipe left off.
+            #[cfg(unix)]
+            LogCtl::Resume => self.parked = false,
         }
     }
 }
@@ -1425,17 +1522,22 @@ enum AfterLine {
 ///
 /// The wait for room on `logs_tx` keeps serving `ctl_rx` — see
 /// [`reserve_slot`] for the cycle that would otherwise close.
-async fn deliver_line(
+async fn deliver_line<O, E>(
     result: io::Result<Option<String>>,
     err: bool,
     files: &mut LogFiles,
     logs_tx: &mpsc::Sender<LogLine>,
     ctl_rx: &mut mpsc::Receiver<LogCtl>,
-) -> AfterLine {
+    streams: &mut Streams<O, E>,
+) -> AfterLine
+where
+    O: AsyncRead + Unpin,
+    E: AsyncRead + Unpin,
+{
     match result {
         Ok(Some(line)) => {
             files.stream(err).append(&line).await;
-            let Some(slot) = reserve_slot(logs_tx, files, ctl_rx).await else {
+            let Some(slot) = reserve_slot(logs_tx, files, ctl_rx, streams).await else {
                 return AfterLine::LogsClosed;
             };
             slot.send(LogLine { err, line });
@@ -1471,11 +1573,16 @@ async fn deliver_line(
 /// runs, the sheep task waits on the acknowledgement, and the pump cannot
 /// look at the request that would produce it. Serving control requests from
 /// inside the wait breaks that cycle by construction rather than by timing.
-async fn reserve_slot<'tx>(
+async fn reserve_slot<'tx, O, E>(
     logs_tx: &'tx mpsc::Sender<LogLine>,
     files: &mut LogFiles,
     ctl_rx: &mut mpsc::Receiver<LogCtl>,
-) -> Option<mpsc::Permit<'tx, LogLine>> {
+    streams: &mut Streams<O, E>,
+) -> Option<mpsc::Permit<'tx, LogLine>>
+where
+    O: AsyncRead + Unpin,
+    E: AsyncRead + Unpin,
+{
     loop {
         // Recomputed every iteration from the STORED mark, so losing the
         // race never extends the window (`snapshot::run_writer`'s debounce
@@ -1488,7 +1595,7 @@ async fn reserve_slot<'tx>(
         tokio::select! {
             slot = logs_tx.reserve() => return slot.ok(),
             ctl = ctl_rx.recv() => match ctl {
-                Some(ctl) => files.serve(ctl).await,
+                Some(ctl) => files.serve(ctl, streams).await,
                 // Nothing can reach the pump any more, but the line in hand
                 // is still owed to the receiver. Waiting for it outside the
                 // `select!` rather than looping avoids spinning on a closed
@@ -1522,6 +1629,67 @@ where
     match lines {
         Some(lines) => lines.next_line().await,
         None => core::future::pending().await,
+    }
+}
+
+/// A pump's two line readers, held in one place so a control request can
+/// reach them.
+///
+/// They were two locals in the pump's own task until a handover had to
+/// drain them: [`LogCtl::ReportFds`] is served from two places, the pump's
+/// own `select!` and [`reserve_slot`]'s, and only one of those could see a
+/// local. Nothing else about them changed, and neither reader is touched
+/// here between lines.
+///
+/// `None` per stream is one that has reached EOF or failed. The pump drops
+/// the reader at that moment, which closes the descriptor, so a stream with
+/// no reader has neither a number nor bytes left to write.
+struct Streams<O, E> {
+    /// The stdout reader, until stdout ends.
+    out: Option<Lines<BufReader<O>>>,
+    /// The stderr reader, until stderr ends.
+    err: Option<Lines<BufReader<E>>>,
+}
+
+/// Writes out whatever one stream's reader has already taken off its pipe,
+/// and stops as soon as the reader would have to wait for more.
+///
+/// This is what a descriptor report owes the successor, and it is bounded
+/// twice over: by [`MAX_DRAIN`], and by the reader having nothing ready.
+/// The bound is what keeps a report from following a sheep that is still
+/// writing, since on a busy stream the pipe is ready again the instant it
+/// is read.
+///
+/// EOF and a read failure both end the drain and are left for the pump's
+/// own loop to see, which it does when it resumes. A report that met one
+/// still names that stream's descriptor: the reader has not been dropped,
+/// so the number is still this process's, and the successor adopts a pipe
+/// that is at EOF exactly as this pump would have found it.
+///
+/// Nothing drained here is forwarded on `logs_tx`, deliberately. That
+/// channel feeds live `log.*` bus subscribers, and every one of them is
+/// about to go with the image; a wait for room on it would put the whole
+/// handover behind whoever is draining the bus. The file is the record, and
+/// the file gets every line.
+#[cfg(unix)]
+async fn drain_ready<R>(lines: &mut Option<Lines<BufReader<R>>>, file: &mut LogFile)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut drained = 0;
+    while drained < MAX_DRAIN {
+        // `biased`, so the ready branch is the answer to "the reader had
+        // nothing waiting" rather than a coin flip against a reader that
+        // did. `next_line` is documented cancel-safe, so the poll that
+        // loses costs nothing: a partial line stays in the reader.
+        let ready = tokio::select! {
+            biased;
+            result = next_line(lines) => result,
+            () = core::future::ready(()) => return,
+        };
+        let Ok(Some(line)) = ready else { return };
+        drained += line.len() + 1;
+        file.append(&line).await;
     }
 }
 
@@ -1608,24 +1776,35 @@ fn spawn_log_pump<O, E>(
             out: LogFile::from_sink(out_sink).await,
             err: LogFile::from_sink(err_sink).await,
             pipes,
+            #[cfg(unix)]
+            parked: false,
         };
-        let mut out_lines = stdout.map(|reader| BufReader::new(reader).lines());
-        let mut err_lines = stderr.map(|reader| BufReader::new(reader).lines());
+        let mut streams = Streams {
+            out: stdout.map(|reader| BufReader::new(reader).lines()),
+            err: stderr.map(|reader| BufReader::new(reader).lines()),
+        };
 
-        while out_lines.is_some() || err_lines.is_some() {
+        while streams.out.is_some() || streams.err.is_some() {
             // Recomputed every iteration from the STORED mark; see
             // `reserve_slot`, which carries the same branch for the window
             // this loop cannot see.
             let flush_at = files.flush_deadline();
             tokio::select! {
-                result = next_line(&mut out_lines) => {
-                    match deliver_line(result, false, &mut files, &logs_tx, &mut ctl_rx).await {
+                result = next_line(&mut streams.out), if files.reading() => {
+                    // Bound before the `match` rather than matched on
+                    // directly: the future borrows `streams`, and a
+                    // scrutinee's temporaries outlive the arms, so an arm
+                    // could not clear the reader that future was reading.
+                    let after =
+                        deliver_line(result, false, &mut files, &logs_tx, &mut ctl_rx, &mut streams)
+                            .await;
+                    match after {
                         AfterLine::KeepReading => {}
                         // Dropping the reader closes the descriptor, so the
                         // number stops being ours in the same statement it
                         // stops being readable.
                         AfterLine::StreamEnded => {
-                            out_lines = None;
+                            streams.out = None;
                             #[cfg(unix)]
                             {
                                 files.pipes.out = None;
@@ -1634,12 +1813,15 @@ fn spawn_log_pump<O, E>(
                         AfterLine::LogsClosed => break,
                     }
                 }
-                result = next_line(&mut err_lines) => {
-                    match deliver_line(result, true, &mut files, &logs_tx, &mut ctl_rx).await {
+                result = next_line(&mut streams.err), if files.reading() => {
+                    let after =
+                        deliver_line(result, true, &mut files, &logs_tx, &mut ctl_rx, &mut streams)
+                            .await;
+                    match after {
                         AfterLine::KeepReading => {}
                         // As above: the number goes with the reader.
                         AfterLine::StreamEnded => {
-                            err_lines = None;
+                            streams.err = None;
                             #[cfg(unix)]
                             {
                                 files.pipes.err = None;
@@ -1650,7 +1832,7 @@ fn spawn_log_pump<O, E>(
                 }
                 ctl = ctl_rx.recv() => {
                     match ctl {
-                        Some(ctl) => files.serve(ctl).await,
+                        Some(ctl) => files.serve(ctl, &mut streams).await,
                         None => break, // nothing holds a `log_ctl` sender
                     }
                 }
@@ -2050,8 +2232,16 @@ mod tests {
                 pipes,
             }
         }
+    }
 
+    impl<W: AsyncWrite + Unpin> PumpHarness<W> {
         /// Sends a [`LogCtl::ReportFds`] and waits for the answer.
+        ///
+        /// Generic over the writing side rather than living with the
+        /// descriptor cases, because what a report does to the pump is not
+        /// about descriptors at all: it flushes, it drains, and it parks.
+        /// The cases about those three run over the cheaper in-memory pair.
+        #[cfg(unix)]
         async fn report_fds(&self) -> CarriedFds {
             let (done, ack) = oneshot::channel();
             self.ctl
@@ -2063,9 +2253,20 @@ mod tests {
                 .expect("a descriptor report must be acknowledged")
                 .expect("the pump must answer rather than drop the acknowledgement")
         }
-    }
 
-    impl<W: AsyncWrite + Unpin> PumpHarness<W> {
+        /// Sends a [`LogCtl::Resume`], which carries no acknowledgement.
+        ///
+        /// Nothing to wait for by design (see the variant): every case that
+        /// resumes a pump then waits on what the pump does next, which is a
+        /// stronger barrier than an answer would be.
+        #[cfg(unix)]
+        async fn resume(&self) {
+            self.ctl
+                .send(LogCtl::Resume)
+                .await
+                .expect("a parked pump must still be reading its control channel");
+        }
+
         /// Writes one line into the chosen stream and waits for the pump to
         /// hand it back on `logs` — which is proof the pump read it and
         /// issued its file write, and orders the two streams against each
@@ -2280,6 +2481,173 @@ mod tests {
         );
     }
 
+    /// How long a case watches a parked pump before believing it.
+    ///
+    /// Several [`IDLE_FLUSH`] windows, because that is what turns a pump
+    /// that read a line into a file that shows one: a pump still reading
+    /// appends within microseconds and the idle flush writes it through
+    /// 50ms later, so a file unchanged across six of those windows is a
+    /// pump that never read.
+    #[cfg(unix)]
+    const STILL_WINDOWS: u32 = 6;
+
+    /// Lines a case writes straight into a stream, bypassing
+    /// [`PumpHarness::feed`], when the point is a pump that has fallen
+    /// behind rather than one keeping up.
+    ///
+    /// More than `CHANNEL_CAPACITY`, so the pump fills `logs`, parks in
+    /// [`reserve_slot`], and holds the rest in its reader.
+    #[cfg(unix)]
+    const BURST: u32 = 60;
+
+    /// Fails if `path` changes at all over the next few flush windows.
+    ///
+    /// The negative half of the parking case, and the reason it is a window
+    /// rather than a single read: a pump that is still reading loses this
+    /// on its first poll, while a parked one cannot lose it at any length.
+    #[cfg(unix)]
+    async fn assert_file_holds_still(path: &Path, expected: &str) {
+        for window in 1..=STILL_WINDOWS {
+            tokio::time::sleep(IDLE_FLUSH).await;
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                expected,
+                "{}: a parked pump wrote during flush window {window}",
+                path.display()
+            );
+        }
+    }
+
+    /// Waits until nothing more will fit on `logs`, which is the state a
+    /// handover finds a chatty sheep's pump in.
+    ///
+    /// The forcing mechanism (IR-46) for both cases below: with the channel
+    /// full the pump is parked inside [`reserve_slot`], so everything it has
+    /// read past that point is in its reader and nothing but a report can
+    /// get it out.
+    #[cfg(unix)]
+    async fn wait_for_a_full_logs_channel(logs: &mpsc::Receiver<LogLine>) {
+        let filled = timeout(PUMP_DEADLINE, async {
+            while logs.len() < CHANNEL_CAPACITY {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            filled.is_ok(),
+            "the pump must fall behind a burst it cannot forward"
+        );
+    }
+
+    /// Fails if a pump goes on reading its sheep's streams after it has
+    /// reported.
+    ///
+    /// This is the whole of the handover's read side. A report is a
+    /// SNAPSHOT — descriptors, and a flush that empties the write buffer
+    /// behind them — and the exec that consumes it happens later. Anything
+    /// the pump reads in between is written to the log file by an image
+    /// that is about to be replaced, and is then in neither the pipe the
+    /// successor inherits nor the buffer it could have been handed: a gap.
+    /// Parking makes the snapshot still true when it is used.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pump_that_has_reported_stops_reading_until_it_is_resumed() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "before-the-report").await;
+
+        let _ = pump.report_fds().await;
+
+        // The sheep does not stop writing because its shepherd is being
+        // replaced. Every one of these has to still be in the pipe at the
+        // exec, which is the same claim as the file not growing.
+        pump.out_writer
+            .write_all(b"after-1\nafter-2\n")
+            .await
+            .unwrap();
+        assert_file_holds_still(&pump.out_path, "before-the-report\n").await;
+
+        pump.resume().await;
+        assert_file_settles(&pump.out_path, "before-the-report\nafter-1\nafter-2\n").await;
+    }
+
+    /// Fails if a report leaves lines stranded in the pump's reader.
+    ///
+    /// The read side's other half, and the one a polite sheep hides: a
+    /// stream that emits a line and waits leaves the reader empty at every
+    /// instant a report could land, so a case built on one passes against
+    /// no implementation at all. A busy sheep fills `logs`, and everything
+    /// the pump has pulled off the pipe past that sits in a userspace
+    /// buffer that the exec destroys and no descriptor carries.
+    ///
+    /// Asserted with no settling: the report's own flush is the barrier.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_lands_what_the_reader_was_holding() {
+        let mut pump = PumpHarness::start();
+        let burst: String = (1..=BURST).map(|n| format!("{n}\n")).collect();
+        pump.out_writer.write_all(burst.as_bytes()).await.unwrap();
+        wait_for_a_full_logs_channel(&pump.logs).await;
+
+        let _ = pump.report_fds().await;
+
+        assert_eq!(
+            fs::read_to_string(&pump.out_path).unwrap(),
+            burst,
+            "every line the reader held must be on disk once, in order, \
+             before the report is answered"
+        );
+    }
+
+    /// The smallest buffer a pipe starts with on any host these cases run
+    /// on: macOS opens one at 16 KiB, Linux at 64.
+    ///
+    /// The case below writes its whole run in one go into a pipe whose
+    /// reader has stopped draining it, so the run has to fit under this or
+    /// the writing side parks and the test deadlocks instead of failing.
+    #[cfg(unix)]
+    const SMALLEST_PIPE: usize = 16 * 1024;
+
+    /// One line of the run below, sized so the arithmetic in it is exact.
+    #[cfg(unix)]
+    const RUN_LINE: usize = 8;
+
+    /// Fails if a report follows a sheep that is still writing instead of
+    /// rescuing what its reader already held.
+    ///
+    /// [`MAX_DRAIN`] is what stops the two from being the same loop. A
+    /// reader can strand at most one bufferful, and what the drain declines
+    /// to take is not lost: it is still in the kernel's pipe, which the
+    /// successor inherits by descriptor number. So the bound costs nothing
+    /// and is what keeps a report answerable while a chatty sheep runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_drains_at_most_one_bufferful() {
+        let mut pump = PumpHarness::start_over_pipes();
+        // Three quarters of the smallest pipe: over `MAX_DRAIN`, so the
+        // bound is really reached, and under the pipe, so the writer never
+        // parks.
+        let lines = u32::try_from(SMALLEST_PIPE * 3 / 4 / RUN_LINE).unwrap();
+        let run: String = (1..=lines).map(|n| format!("{n:07}\n")).collect();
+        assert!(run.len() > MAX_DRAIN, "the run must reach the bound");
+        pump.out_writer.write_all(run.as_bytes()).await.unwrap();
+        wait_for_a_full_logs_channel(&pump.logs).await;
+        pump.flush().await;
+        let before = fs::metadata(&pump.out_path).unwrap().len();
+
+        let _ = pump.report_fds().await;
+
+        let drained = fs::metadata(&pump.out_path).unwrap().len() - before;
+        assert!(
+            drained > 0,
+            "the report must rescue what the reader was holding"
+        );
+        assert!(
+            drained <= u64::try_from(MAX_DRAIN + RUN_LINE).unwrap(),
+            "the report drained {drained} bytes, which is more than one \
+             bufferful: it is following the sheep rather than catching up"
+        );
+    }
+
     /// A sink standing in for the [`tokio::fs::File`] a real [`LogFile`]
     /// holds, counting the writes that reach it.
     ///
@@ -2437,6 +2805,8 @@ mod tests {
             out: LogFile::open(dir.path().join("out.log")).await,
             err: LogFile::open(dir.path().join("err.log")).await,
             pipes: PipeFds::default(),
+            #[cfg(unix)]
+            parked: false,
         };
         assert_eq!(
             files.flush_deadline(),

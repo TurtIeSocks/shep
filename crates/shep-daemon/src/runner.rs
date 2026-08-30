@@ -234,6 +234,38 @@ pub enum LogCtl {
         /// exactly a runner nothing hands over.
         done: oneshot::Sender<crate::handover::CarriedFds>,
     },
+    /// Read the sheep's streams again after a [`Self::ReportFds`] that no
+    /// exec followed. Sent when a handover is abandoned.
+    ///
+    /// A report parks the pump, because a snapshot only stays true while
+    /// nothing moves behind it. The exec is what normally ends that park,
+    /// and it ends it by replacing the whole image. Every other way out of
+    /// a handover leaves this daemon running with a pump that has stopped
+    /// reading, and it stays stopped for the rest of that daemon's life. So
+    /// an abandoned handover owes every pump it reported one of these.
+    ///
+    /// Today that life is short: both aborts fall back to a graceful stop,
+    /// so what a missing resume costs is every line the flock writes while
+    /// it is being stopped, which is the stretch an operator asking why
+    /// reads first. It is not bounded by that, though, and should not be
+    /// reasoned about as if it were: anything that ever abandons a handover
+    /// without also stopping makes the same omission permanent.
+    ///
+    /// # Why there is no acknowledgement
+    ///
+    /// Nobody is ordered against it. The caller is on its way to a graceful
+    /// stop or back to normal service, and neither reads the pump's files
+    /// or its descriptors, which is what [`Self::Flush`] and
+    /// [`Self::Reopen`] have callers waiting on. Sending one to a pump that
+    /// was never parked is a no-op, so this is safe to send widely rather
+    /// than exactly.
+    ///
+    /// # Why this variant is unix-only when the rest of the enum is not
+    ///
+    /// As [`Self::ReportFds`]: there is no handover to abandon on a
+    /// platform with no `execve`, so there is no park to end.
+    #[cfg(unix)]
+    Resume,
 }
 
 /// A [`LogCtl::Reopen`] that could not open one or both of a sheep's log
