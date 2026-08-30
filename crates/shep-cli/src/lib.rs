@@ -1381,10 +1381,12 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         Commands::Set(ref args) => kv::set(&mut streams, &paths, args),
         Commands::Get(ref args) => kv::get(&mut streams, &paths, args),
         Commands::Unset(ref args) => kv::unset(&mut streams, &paths, args),
-        Commands::Kill => match connect_client(&mut streams, &paths).await {
-            Ok(client) => admin::kill(client, &mut streams).await,
-            Err(code) => code,
-        },
+        // The one verb that does its own connecting. `connect_client`'s
+        // contract is to report and give up, and giving up is what left an
+        // operator with a live daemon nothing could stop, so `kill` takes
+        // the paths and decides for itself — see `commands::admin`'s module
+        // doc.
+        Commands::Kill => admin::kill(&paths, &mut streams).await,
         Commands::Init(ref args) => init::init(&mut streams, args).await,
         // Reads a file and writes a file; starts nothing, so there is
         // nothing to ask the socket. `logs::flush_daemon` is the other arm

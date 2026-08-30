@@ -171,7 +171,7 @@ Today `kill` handshakes, so it cannot stop a daemon that refuses the handshake. 
 
 SIGTERM is already the right signal. The daemon's handler drives the graceful teardown that runs the kill ladder over every online sheep before stopping, so the flock stops cleanly rather than being orphaned.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test]
@@ -202,12 +202,12 @@ Add a third case: `Shepherd::Booting` must report that a shepherd is starting, n
 
 Follow the fixture style already in `admin.rs`'s `mod tests`. Note its comment at :200 explaining that `cfg(unix)` there is about the FAKE's mechanism, not the feature.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p shep --lib --bins --all-features -- --skip ::slow:: kill_`
 Expected: FAIL, unresolved function
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add a socket-free path that runs when the socket cannot be used for any reason, refusal included:
 
@@ -242,12 +242,12 @@ Reuse the existing `wait_for_socket_to_disappear` so the socket-free path gets t
 
 Windows has no SIGTERM. Gate the signal send `#[cfg(unix)]` and on Windows report that the socket-free stop is not available, naming what the operator can do instead. Do not guess at a Windows equivalent.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p shep --lib --bins --all-features -- --skip ::slow:: kill_`
 Expected: PASS
 
-- [ ] **Step 5: Task gate, then commit**
+- [x] **Step 5: Task gate, then commit**
 
 ```bash
 git add crates/shep-cli/src/commands/admin.rs
