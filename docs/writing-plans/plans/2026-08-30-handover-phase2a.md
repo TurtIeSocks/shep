@@ -271,7 +271,7 @@ On Linux it does not. `current_exe()` reads `/proc/self/exe`, which resolves to 
 
 So: prefer a path recorded at boot, and treat `current_exe()` as a fallback whose Linux result must be validated before use.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -298,15 +298,28 @@ fn a_deleted_inode_path_is_never_returned() {
 
 The Linux test cannot fail on a developer's Mac. **CI is the only thing that runs it**, per this repo's own rule that a local gate does not cover Linux. Say so in the commit message.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
-- [ ] **Step 3: Implement**
+Actual: FAIL, unresolved `exec_target`/`check_target`/`TargetProblem`/
+`launch_path_from_argv` (E0425/E0433 x9).
 
-Record the daemon's own launch path at boot into the `RunningDaemon` context, taken from `argv[0]` resolved against the cwd at startup, and fall back to `current_exe()` only when that is unusable. Reject any candidate whose string contains `" (deleted)"` or which does not exist on disk, and return a clear error rather than exec'ing something wrong.
+- [x] **Step 3: Implement**
 
-- [ ] **Step 4: Run to verify they pass**
+`RunningDaemon` turned out to be the wrong home. `exec_target()` takes no
+arguments and is called from the exec path, which holds no daemon context by
+then, and the struct's fields are private with nothing threading them to
+this module. So the recorded path is a process-global `OnceLock` in this
+module, set by a new `record_launch_path()` that `boot` calls first thing.
 
-- [ ] **Step 5: Task gate, then commit**
+Record the daemon's own launch path at boot, taken from `argv[0]` resolved against the cwd at startup, and fall back to `current_exe()` only when that is unusable. Reject any candidate whose string contains `" (deleted)"` or which does not exist on disk, and return a clear error rather than exec'ing something wrong.
+
+- [x] **Step 4: Run to verify they pass**
+
+Actual: 575 passed, 18 filtered (up from 569: the plan's one portable test,
+plus five over the validation itself and the argv[0] resolution, so the rule
+the Linux-only test protects is exercised on a platform that compiles it).
+
+- [x] **Step 5: Task gate, then commit**
 
 ---
 

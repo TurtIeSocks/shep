@@ -26,6 +26,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use shep_core::paths::ShepPaths;
@@ -456,6 +457,159 @@ pub struct CarriedFds {
     pub err_log: Option<RawFd>,
 }
 
+/// Where this process's binary was when it started, as `argv[0]` resolved
+/// against the startup directory. Set once by [`record_launch_path`], and
+/// read only by [`exec_target`], whose doc carries the argument for why a
+/// recorded path beats asking the kernel later.
+///
+/// The inner `Option` is the "recorded, and there was nothing usable to
+/// record" case, which must not be confused with "never recorded": both
+/// fall through to the same fallback, but only the second is a bug in
+/// whoever forgot the call.
+static LAUNCH_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Record how this process was invoked, for a later [`exec_target`].
+///
+/// Call this once, as early in the daemon's life as there is anywhere to
+/// call it from: it reads `argv[0]` and the current directory, and the
+/// second of those is only the startup directory for as long as nothing has
+/// moved it. The first call wins; a later one is ignored, so a test or a
+/// second boot in the same process cannot overwrite the real launch path.
+///
+/// This is process-global state rather than a field on [`RunningDaemon`]
+/// because [`exec_target`] takes no arguments and is called from the exec
+/// path, which holds no daemon context by then.
+///
+/// [`RunningDaemon`]: crate::boot::RunningDaemon
+pub fn record_launch_path() {
+    let _ = LAUNCH_PATH.set(launch_path_from_argv());
+}
+
+/// The binary to `execv` for a handover, and never the running image.
+///
+/// # Why this does not use [`std::env::current_exe`]
+///
+/// Everywhere else in this workspace resolves its own binary that way, and
+/// here it is wrong. `current_exe` answers "which image am I running?",
+/// while a handover needs "which file holds the version an operator just
+/// installed?". Those are the same path only until somebody upgrades, which
+/// is the one moment this function exists for.
+///
+/// On Linux `current_exe` reads `/proc/self/exe`, a symlink to the *inode*
+/// this process was executed from rather than to a path. `cargo install`
+/// and every package manager replace a binary by renaming a new file over
+/// it, which leaves the old inode unlinked and still open, so the readlink
+/// comes back as `"<path> (deleted)"`. Exec'ing that string fails, and
+/// stripping the suffix is a guess about text the kernel does not promise:
+/// a path may legitimately end that way. So a handover using `current_exe`
+/// on Linux cannot upgrade, which is the whole feature.
+///
+/// On macOS the same sequence returns a clean path that holds the NEW
+/// image, so the naive version passes every local test. That is worse than
+/// failing, not better, and it is why this function is written the way it
+/// is. Do not simplify it back.
+///
+/// So: prefer the path this process was launched from, recorded by
+/// [`record_launch_path`] before anything could move the current directory,
+/// and fall back to `current_exe` only when that is unusable. Both arms go
+/// through [`check_target`], because a fallback that skips validation is
+/// the same bug with an extra step.
+///
+/// A bare `argv[0]` with no separator in it (a `PATH` lookup, so `shep
+/// daemon` typed by hand rather than the CLI's own spawn, which passes an
+/// absolute path) is not resolvable from `argv[0]` alone and is left to the
+/// `current_exe` arm.
+///
+/// # Errors
+/// - [`io::ErrorKind::NotFound`] if neither candidate is a file on disk
+///   that is safe to exec. The message names what each one was, and what
+///   was wrong with it. The caller falls back to the stop-and-start arm, which
+///   restarts the flock but does reach the new binary.
+pub fn exec_target() -> io::Result<PathBuf> {
+    let recorded = LAUNCH_PATH.get().cloned().flatten();
+    let current = std::env::current_exe();
+
+    let mut refusals = Vec::new();
+    for candidate in [recorded, current.as_deref().ok().map(Path::to_path_buf)] {
+        let Some(candidate) = candidate else { continue };
+        match check_target(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(problem) => refusals.push(format!("{} ({problem})", candidate.display())),
+        }
+    }
+
+    if let Err(e) = &current {
+        refusals.push(format!("this process's own image ({e})"));
+    }
+    if refusals.is_empty() {
+        refusals.push("no candidate at all".to_owned());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no binary to hand over to: {}", refusals.join("; ")),
+    ))
+}
+
+/// Why a candidate path is not safe to `execv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetProblem {
+    /// The path carries Linux's `" (deleted)"` suffix, so it names an
+    /// unlinked inode rather than a file.
+    DeletedInode,
+    /// Nothing is at the path, or it could not be read.
+    Missing,
+    /// Something is at the path, but it is a directory or a device.
+    NotAFile,
+}
+
+impl core::fmt::Display for TargetProblem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let text = match self {
+            Self::DeletedInode => "names a deleted inode, not a file",
+            Self::Missing => "is not on disk",
+            Self::NotAFile => "is not a file",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Whether `candidate` is a file this daemon may replace itself with.
+///
+/// The `" (deleted)"` check runs first and refuses even a path that really
+/// does exist. A file genuinely named that way is vanishingly rare, a
+/// handover of it merely falls back to the stop arm, and the alternative is
+/// exec'ing an old image while reporting an upgrade.
+fn check_target(candidate: &Path) -> Result<(), TargetProblem> {
+    if candidate.to_string_lossy().contains(" (deleted)") {
+        return Err(TargetProblem::DeletedInode);
+    }
+    match std::fs::metadata(candidate) {
+        Ok(meta) if meta.is_file() => Ok(()),
+        Ok(_) => Err(TargetProblem::NotAFile),
+        Err(_) => Err(TargetProblem::Missing),
+    }
+}
+
+/// This process's `argv[0]`, resolved against the current directory.
+///
+/// `None` when there is no `argv[0]`, when it is empty, or when it holds no
+/// separator and so came from a `PATH` lookup this cannot undo. An absolute
+/// `argv[0]`, which is what `launch_command` gives the daemon it spawns,
+/// passes through the join unchanged.
+fn launch_path_from_argv() -> Option<PathBuf> {
+    let argv0 = PathBuf::from(std::env::args_os().next()?);
+    if argv0.as_os_str().is_empty() {
+        return None;
+    }
+    if argv0.is_absolute() {
+        return Some(argv0);
+    }
+    let has_separator = argv0
+        .parent()
+        .is_some_and(|dir| !dir.as_os_str().is_empty());
+    has_separator.then(|| std::env::current_dir().ok().map(|cwd| cwd.join(&argv0)))?
+}
+
 #[cfg(test)]
 mod tests {
     use shep_core::config::AppConfig;
@@ -718,5 +872,73 @@ mod tests {
             fitness(&[candidate]),
             Fitness::Refused(RefusedReason::PendingDelete { .. })
         ));
+    }
+
+    #[test]
+    fn the_exec_target_exists_and_is_a_file() {
+        let p = exec_target().unwrap();
+        assert!(p.is_file(), "{}", p.display());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_deleted_inode_path_is_never_returned() {
+        // /proc/self/exe resolves to the inode, so a binary replaced by a
+        // `cargo install` rename gives `"<path> (deleted)"`. Exec'ing that
+        // fails, which would make a handover silently unable to upgrade,
+        // which is the whole point of the feature.
+        let p = exec_target().unwrap();
+        assert!(
+            !p.to_string_lossy().contains("(deleted)"),
+            "exec target resolved to a deleted inode: {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn a_deleted_inode_candidate_is_refused_on_every_platform() {
+        // The portable half of the test above. The Linux one asserts the
+        // whole resolution never yields such a path, but a macOS run never
+        // compiles it, so the rule it protects would go unexercised here.
+        // This one drives the same check directly.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep (deleted)");
+        std::fs::write(&path, "an exec target that really is on disk").unwrap();
+
+        assert_eq!(
+            check_target(&path),
+            Err(TargetProblem::DeletedInode),
+            "existing on disk must not excuse the suffix"
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_is_not_on_disk_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            check_target(&dir.path().join("never-written")),
+            Err(TargetProblem::Missing)
+        );
+    }
+
+    #[test]
+    fn a_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(check_target(dir.path()), Err(TargetProblem::NotAFile));
+    }
+
+    #[test]
+    fn a_real_binary_passes_the_check() {
+        assert_eq!(check_target(&std::env::current_exe().unwrap()), Ok(()));
+    }
+
+    #[test]
+    fn argv0_resolves_against_the_startup_directory() {
+        // The test harness is invoked by an absolute path, so this proves
+        // the argv[0] arm reaches a real file rather than that the join
+        // itself is correct; the join is exercised by `Path::join`'s own
+        // contract that an absolute right-hand side replaces the left.
+        let p = launch_path_from_argv().expect("argv[0] names a path");
+        assert!(p.is_file(), "{}", p.display());
     }
 }

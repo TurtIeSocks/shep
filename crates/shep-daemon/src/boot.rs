@@ -888,6 +888,15 @@ pub async fn boot<R: ProcessRunner>(
     paths: ShepPaths,
     mut options: BootOptions,
 ) -> Result<RunningDaemon, BootError> {
+    // Before anything else, because it reads the current directory and
+    // that is only the startup directory until something moves it. A
+    // handover execs this path rather than `current_exe()`; see
+    // `handover::exec_target` for why those differ exactly when an
+    // operator has upgraded. `#[cfg(unix)]` because the whole handover
+    // module is: Windows has no `execve` and takes the stop arm.
+    #[cfg(unix)]
+    crate::handover::record_launch_path();
+
     // Copied out up front, purely a `bool`, so nothing later in this fn has
     // to remember to read it off `options` before that struct is consumed.
     let delete_flock_on_shutdown = options.delete_flock_on_shutdown;
