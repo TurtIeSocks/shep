@@ -432,7 +432,11 @@ Not just a protocol mismatch. Any difference. The dangerous state was believing 
 
 **Three verbs stay exempt: `kill`, `daemon reload`, `ping`.** The first two are how an operator gets out, `ping` is how they see what is running. A guard whose remedy is itself guarded is the trap this design exists to remove.
 
-- [ ] **Step 1: Write the failing tests**
+**`EXIT_VERSION_SKEW` is not a name the code had, and the exit code is a new one.** The enum is `ExitCode` in `crates/shep-cli/src/exit.rs`, and none of its twelve variants fitted: `ProtocolMismatch` (6) is the daemon REFUSING a handshake over differing wire versions, which is a question the wire asks itself, and this guard fires on a handshake that SUCCEEDED. Collapsing the two would print "protocol mismatch" about a protocol that matched. So `ExitCode::VersionSkew = 12` is a new row, `code_str()` is `"version_skew"`, and `output::emit_error`'s own `error[{code}]: {message}` shape produces the spec's first line for free.
+
+**The refusal writes its own block rather than going through `Streams::fail`, under `--format table` only.** `fail` routes into `output::emit_error`, which sanitises through `terminal_safe::sanitise`, and that collapses every `\n` to a space — right for daemon-supplied text, wrong for a fixed block whose remedy has to sit on its own line to be copied. Under `--format json` it is one envelope with one `error.message` carrying the same facts. The two renderings share `VERSION_SKEW_CAUSE`, held as its two rendered lines and joined with `"\n"` or `" "`, so they cannot drift.
+
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test]
@@ -460,12 +464,12 @@ async fn the_three_recovery_verbs_are_not_refused() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p shep --lib --bins --all-features -- --skip ::slow:: version_`
 Expected: FAIL
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 The message names the fix rather than the condition. Exact text, and Step 1's tests pin it:
 
@@ -480,7 +484,7 @@ shepherd, which is still running the old code.
 
 Put the exempt list in one named constant with a doc comment giving the reason, not an inline match arm. A future verb added to it should have to read why.
 
-- [ ] **Step 4: Run to verify they pass, then task gate and commit**
+- [x] **Step 4: Run to verify they pass, then task gate and commit**
 
 ---
 

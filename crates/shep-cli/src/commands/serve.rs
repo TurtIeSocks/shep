@@ -339,10 +339,15 @@ async fn register(
     app.args = sheep_args(root, auth, args);
     app.fold.clone_from(&args.fold);
 
-    let client = match crate::connect_or_spawn_client(streams, paths).await {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
+    // Names the guard rather than being threaded one from `run`'s dispatch:
+    // `serve` is not one of `crate::RECOVERY_VERBS` and cannot become one —
+    // it registers a sheep, which is the opposite of a way out of a version
+    // skew — so there is no value here but `Enforce` to pass down.
+    let client =
+        match crate::connect_or_spawn_client(streams, paths, crate::VersionGuard::Enforce).await {
+            Ok(client) => client,
+            Err(code) => return code,
+        };
 
     request_and_render(
         &client,

@@ -835,6 +835,11 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
 /// still outranks it.
 async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
     let fmt = cli.global.format;
+    // Resolved once, here, rather than at each of the seventeen call sites
+    // that reach a shepherd: `cli.command` is partially moved by the
+    // dispatch below, so an arm cannot borrow it to ask this question, and
+    // an arm that could would be an arm that could forget to.
+    let guard = VersionGuard::for_command(&cli.command);
 
     // `StdoutLock`/`StderrLock` are process-wide and are held for as long as
     // the guard lives, so the locked pair further down is right for exactly
@@ -1045,7 +1050,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             style,
             fmt,
         };
-        return match connect_client(&mut streams, &paths).await {
+        return match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => bleats::bleats(&client, &mut streams, cli.global.quiet, args).await,
             Err(code) => code,
         };
@@ -1215,11 +1220,11 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 None
             };
             if args.targets.is_empty() && discovered.is_none() {
-                return start_bare_shepherd(&mut streams, &paths).await;
+                return start_bare_shepherd(&mut streams, &paths, guard).await;
             }
             let shep_toml_text = std::fs::read_to_string(&paths.daemon_config).ok();
             let interpreters = interpreters_from_config(shep_toml_text.as_deref());
-            match connect_or_spawn_client(&mut streams, &paths).await {
+            match connect_or_spawn_client(&mut streams, &paths, guard).await {
                 Ok(client) => {
                     lifecycle::start(
                         &client,
@@ -1234,36 +1239,36 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             }
         }
         Commands::Stop(ref args) | Commands::Thatlldo(ref args) => {
-            match connect_client(&mut streams, &paths).await {
+            match connect_client(&mut streams, &paths, guard).await {
                 Ok(client) => lifecycle::stop(&client, &mut streams, args).await,
                 Err(code) => code,
             }
         }
-        Commands::Restart(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Restart(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => lifecycle::restart(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Reload(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Reload(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => lifecycle::reload(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Delete(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Delete(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => lifecycle::delete(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Stock(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Stock(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => lifecycle::stock(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Trigger(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Trigger(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => trigger::trigger(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Signal(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Signal(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => signal::signal(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Whisper(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Whisper(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => whisper::whisper(&client, &mut streams, args).await,
             Err(code) => code,
         },
@@ -1276,12 +1281,25 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // enforces that, and it is right to: a consumer that asked for
         // machine output should not have to tell a real listing apart from a
         // consolation prize. So JSON keeps the refusal, humans get the roll.
+        //
+        // Its own `Client::connect`, not `connect_client`, because that
+        // helper reports and gives up and this arm has a fallback to reach.
+        // The version guard therefore has to be applied by hand here — the
+        // one dispatch arm where it is not inherited from the helper.
         Commands::Flock => match Client::connect(&paths.socket).await {
-            Ok(client) => query::flock(&client, &mut streams).await,
-            Err(_) if fmt == Format::Json => match connect_client(&mut streams, &paths).await {
-                Ok(client) => query::flock(&client, &mut streams).await,
+            Ok(client) => match refuse_version_skew(&mut streams, &client, guard) {
+                Ok(()) => query::flock(&client, &mut streams).await,
+                // A skew is not an absence: the shepherd answered, so the
+                // roll fallback below would print a listing while hiding
+                // the reason every other verb is refusing.
                 Err(code) => code,
             },
+            Err(_) if fmt == Format::Json => {
+                match connect_client(&mut streams, &paths, guard).await {
+                    Ok(client) => query::flock(&client, &mut streams).await,
+                    Err(code) => code,
+                }
+            }
             Err(_) => query::flock_from_roll(&mut streams, &paths),
         },
         // The guard arm is what makes `--available` work with no shepherd
@@ -1291,7 +1309,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         Commands::Dogs(ref args) if args.available => {
             query::available_dogs(&mut streams, args).await
         }
-        Commands::Dogs(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Dogs(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => query::dogs(&client, &mut streams, args).await,
             Err(code) => code,
         },
@@ -1326,11 +1344,11 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         Commands::Disable(ref args) => dogs::disable(&mut streams, &paths, &args.name).await,
         Commands::Adopt(ref args) => dogs::adopt(&mut streams, &paths, args).await,
         Commands::Rehome(ref args) => dogs::rehome(&mut streams, &paths, &args.name).await,
-        Commands::Describe(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Describe(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => query::describe(&client, &mut streams, args).await,
             Err(code) => code,
         },
-        Commands::Fold(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Fold(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => query::fold(&client, &mut streams, args).await,
             Err(code) => code,
         },
@@ -1346,15 +1364,15 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // of a daemon that is not running is not a thing, and autostarting
         // one to save an empty flock would overwrite a good roll with an
         // empty one.
-        Commands::Save => match connect_client(&mut streams, &paths).await {
+        Commands::Save => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => muster::save(&client, &mut streams).await,
             Err(code) => code,
         },
-        Commands::Muster => match connect_or_spawn_client(&mut streams, &paths).await {
+        Commands::Muster => match connect_or_spawn_client(&mut streams, &paths, guard).await {
             Ok(client) => muster::muster(&client, &mut streams).await,
             Err(code) => code,
         },
-        Commands::Reopen(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Reopen(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => logs::reopen(&client, &mut streams, args).await,
             Err(code) => code,
         },
@@ -1366,7 +1384,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // an operator reaches for this, and `connect_client` never autostarts
         // one to be told to do nothing.
         Commands::Flush(ref args) if args.daemon => logs::flush_daemon(&mut streams, &paths),
-        Commands::Flush(ref args) => match connect_client(&mut streams, &paths).await {
+        Commands::Flush(ref args) => match connect_client(&mut streams, &paths, guard).await {
             Ok(client) => logs::flush(&client, &mut streams, args).await,
             Err(code) => code,
         },
@@ -1444,10 +1462,18 @@ fn emit_error_locked(fmt: Format, code: ExitCode, message: &str) {
 async fn connect_or_spawn_client(
     streams: &mut Streams<'_>,
     paths: &ShepPaths,
+    guard: VersionGuard,
 ) -> Result<Client, ExitCode> {
     let launch_paths = paths.clone();
     match connect_or_spawn(&paths.socket, move || launch_daemon(&launch_paths)).await {
-        Ok(SpawnOutcome::Connected(client) | SpawnOutcome::Spawned(client)) => Ok(client),
+        // The guard applies to a shepherd this call CONNECTED to as much as
+        // to one it started: a daemon it just spawned is this same binary
+        // and can never skew, and one that was already up is exactly the
+        // case the guard exists for.
+        Ok(SpawnOutcome::Connected(client) | SpawnOutcome::Spawned(client)) => {
+            refuse_version_skew(streams, &client, guard)?;
+            Ok(client)
+        }
         Err(err) => {
             let code = ExitCode::from(&err);
             Err(streams.fail(code, &err.to_string()))
@@ -1465,7 +1491,11 @@ async fn connect_or_spawn_client(
 ///
 /// Reports rather than re-boots when one is already up, because typing
 /// `shep start` twice should say what happened, not silently do nothing.
-async fn start_bare_shepherd(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode {
+async fn start_bare_shepherd(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    guard: VersionGuard,
+) -> ExitCode {
     let before = status::ShepherdStatus::probe(paths).await;
     if let Some(online) = &before.online {
         let message = format!(
@@ -1475,7 +1505,7 @@ async fn start_bare_shepherd(streams: &mut Streams<'_>, paths: &ShepPaths) -> Ex
         streams.aside("start", &message);
         return ExitCode::Success;
     }
-    match connect_or_spawn_client(streams, paths).await {
+    match connect_or_spawn_client(streams, paths, guard).await {
         Ok(client) => {
             // Asked after the boot, not before: bringing the shepherd up
             // restores the muster roll, so a flock that looked empty a
@@ -1544,11 +1574,157 @@ fn unreachable_message(err: &shep_client::ConnectError) -> String {
     }
 }
 
+/// The verbs a version skew must never refuse, spelled the way an operator
+/// types them.
+///
+/// `kill` and `daemon reload` are how an operator gets OUT of a skew;
+/// `ping` is how they see what is running without being refused. A guard
+/// whose remedy is itself guarded is the trap this whole check exists to
+/// remove — the incident behind it left a live daemon, a live flock, and no
+/// command in shep able to touch either. So a verb belongs on this list only
+/// if it is a way out of that state, never merely one that is inconvenient
+/// to lose.
+///
+/// `shep daemon reload` is the command [`refuse_version_skew`] names, and it
+/// is not built yet. Its name is listed now so the exemption is already
+/// right on the day the verb lands, rather than being remembered then;
+/// [`recovery_verb`] gains its arm at the same time.
+const RECOVERY_VERBS: [&str; 3] = ["kill", "daemon reload", "ping"];
+
+/// Which [`RECOVERY_VERBS`] entry `command` is, or `None` for an ordinary
+/// verb the version guard applies to.
+///
+/// Returns the name rather than a bool so a test can hold this mapping and
+/// that documented list against each other, which is what keeps a verb from
+/// becoming exempt without its reason being written down.
+fn recovery_verb(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Kill => Some("kill"),
+        Commands::Ping => Some("ping"),
+        // `shep daemon reload` is pending. When it lands, its arm belongs
+        // here: `Commands::Daemon(args)` carrying the reload subcommand,
+        // answering `Some("daemon reload")`. A bare `shep daemon` is the
+        // hidden boot re-exec and is not a recovery verb.
+        _ => None,
+    }
+}
+
+/// Whether a shepherd of a different version refuses this invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionGuard {
+    /// Refuse: this verb needs a shepherd that agrees with this binary.
+    Enforce,
+    /// Never refuse, whatever the shepherd answers: one of
+    /// [`RECOVERY_VERBS`].
+    Exempt,
+}
+
+impl VersionGuard {
+    /// The guard that applies to `command`.
+    fn for_command(command: &Commands) -> Self {
+        match recovery_verb(command) {
+            Some(_) => Self::Exempt,
+            None => Self::Enforce,
+        }
+    }
+}
+
+/// Why a skew happens, as the two lines the table form prints.
+///
+/// Held as its rendered lines rather than as one string, because the JSON
+/// form joins them with a space and the table form with a newline; one
+/// constant means the two renderings cannot drift into saying different
+/// things.
+const VERSION_SKEW_CAUSE: [&str; 2] = [
+    "`cargo install shep` replaced the binary. It did not restart the",
+    "shepherd, which is still running the old code.",
+];
+
+/// The one command that fixes a skew.
+///
+/// Read out of [`RECOVERY_VERBS`] rather than spelled again, because the two
+/// have to agree: a remedy the guard itself refused is exactly the trap this
+/// design exists to remove. Dropping `daemon reload` from that list changes
+/// what this refusal prints, and the test pinning the wording catches it.
+const VERSION_SKEW_REMEDY: &str = RECOVERY_VERBS[1];
+
+/// Refuses a shepherd whose crate version differs from this binary's.
+///
+/// Any difference, not only a protocol difference. A protocol-only check
+/// misses the case the incident actually hit: `cargo install shep` replaces
+/// the binary and leaves the shepherd running the old code, and the two can
+/// agree on every byte of the wire while disagreeing about what a verb does.
+/// So the comparison is [`shep_core::protocol::HelloAck::daemon_version`]
+/// against this crate's own `CARGO_PKG_VERSION`, on a handshake that
+/// SUCCEEDED. Nothing here crosses the wire that did not already.
+///
+/// The message names the fix rather than the condition, because naming the
+/// condition is what left an operator stuck: every verb refused, and no
+/// sentence anywhere saying that reloading the shepherd was the way out.
+///
+/// # Errors
+/// [`ExitCode::VersionSkew`], after writing the refusal to `streams`, when
+/// `guard` is [`VersionGuard::Enforce`] and the shepherd reports a different
+/// version. A [`VersionGuard::Exempt`] verb is always `Ok`.
+fn refuse_version_skew(
+    streams: &mut Streams<'_>,
+    client: &Client,
+    guard: VersionGuard,
+) -> Result<(), ExitCode> {
+    let running = client.daemon().daemon_version.as_str();
+    if guard == VersionGuard::Exempt || running == env!("CARGO_PKG_VERSION") {
+        return Ok(());
+    }
+    let code = ExitCode::VersionSkew;
+    let summary = format!(
+        "this shep is {}, the running shepherd is {running}",
+        env!("CARGO_PKG_VERSION")
+    );
+    match streams.fmt {
+        // One line, one envelope. A `--format json` consumer has no use for
+        // the layout below, and it still gets every fact in `error.message`.
+        Format::Json => {
+            let cause = VERSION_SKEW_CAUSE.join(" ");
+            streams.fail(
+                code,
+                &format!("{summary}. {cause} Run `shep {VERSION_SKEW_REMEDY}`."),
+            );
+        }
+        // Written straight to the stream rather than through
+        // [`Streams::fail`], which routes into `output::emit_error` and so
+        // through `terminal_safe::sanitise` — and that collapses every `\n`
+        // to a space. Right for daemon-supplied text, wrong for this fixed
+        // block: the remedy has to sit on a line of its own to be seen and
+        // copied. The `error[code]: message` first line is emit_error's own
+        // shape, kept identical so this refusal reads like every other one.
+        Format::Table => {
+            let cause = VERSION_SKEW_CAUSE.join("\n");
+            let _ = writeln!(
+                streams.err,
+                "error[{}]: {summary}\n\n{cause}\n\n  shep {VERSION_SKEW_REMEDY}",
+                code.code_str()
+            );
+        }
+    }
+    Err(code)
+}
+
 /// Connects to the daemon at `paths.socket`. Never autostarts — see
 /// [`run`]'s own doc for why that matters.
-async fn connect_client(streams: &mut Streams<'_>, paths: &ShepPaths) -> Result<Client, ExitCode> {
+///
+/// `guard` is this invocation's [`VersionGuard`]: a connected shepherd of a
+/// different version is refused here, at the one seam every verb that needs
+/// a [`Client`] passes through, so no verb has to remember to ask.
+async fn connect_client(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    guard: VersionGuard,
+) -> Result<Client, ExitCode> {
     match Client::connect(&paths.socket).await {
-        Ok(client) => Ok(client),
+        Ok(client) => {
+            refuse_version_skew(streams, &client, guard)?;
+            Ok(client)
+        }
         Err(err) => {
             let code = ExitCode::from(&err);
             Err(streams.fail(code, &unreachable_message(&err)))
@@ -2632,6 +2808,173 @@ mod tests {
         assert!(
             !text.contains("shep start"),
             "a permission failure must not send the operator to `shep start`, got {text:?}"
+        );
+    }
+
+    /// A [`Streams`] over two byte buffers, so a refusal's exact text can be
+    /// read back. `BARE`/`Table` because these tests assert on words, not on
+    /// colour.
+    fn buffered_streams<'a>(out: &'a mut Vec<u8>, err: &'a mut Vec<u8>) -> Streams<'a> {
+        Streams {
+            out,
+            err,
+            style: style::Presentation::BARE,
+            fmt: Format::Table,
+        }
+    }
+
+    /// A real [`Client`], past a real handshake, whose peer announced
+    /// `version`. The [`shep_client::testing::FakeDaemon`] is returned so it
+    /// outlives the client.
+    async fn client_announcing(
+        addr: &std::path::Path,
+        version: &str,
+    ) -> (Client, shep_client::testing::FakeDaemon) {
+        let ack = shep_core::protocol::HelloAck {
+            daemon_version: version.to_owned(),
+            protocol: shep_core::protocol::PROTOCOL_VERSION,
+            pid: 4242,
+        };
+        shep_client::testing::fake_client_with_ack(addr, ack).await
+    }
+
+    /// The case a protocol-only check misses entirely, and the one the
+    /// incident actually hit: the wire versions agree, the crate versions do
+    /// not, and `cargo install shep` left a new binary talking to an old
+    /// shepherd.
+    #[tokio::test]
+    async fn a_version_difference_with_no_protocol_difference_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let (client, _fake) = client_announcing(&addr, "0.1.8").await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = buffered_streams(&mut out, &mut err);
+        let code = refuse_version_skew(&mut streams, &client, VersionGuard::Enforce)
+            .expect_err("a differing crate version must be refused");
+        assert_eq!(code, ExitCode::VersionSkew);
+    }
+
+    /// fails if the refusal stops naming the fix. A message that names only
+    /// the condition is what this guard exists to replace: the operator whose
+    /// box this bricked could read every word of "protocol mismatch" and
+    /// still not know that reloading the shepherd was the way out.
+    #[tokio::test]
+    async fn the_error_names_the_command_that_fixes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let (client, _fake) = client_announcing(&addr, "0.1.8").await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = buffered_streams(&mut out, &mut err);
+            let _ = refuse_version_skew(&mut streams, &client, VersionGuard::Enforce);
+        }
+        let text = String::from_utf8(err).unwrap();
+        assert!(text.contains("error[version_skew]"), "{text}");
+        assert!(text.contains("this shep is"), "{text}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains("the running shepherd is 0.1.8"), "{text}");
+        assert!(
+            text.contains("`cargo install shep` replaced the binary"),
+            "{text}"
+        );
+        assert!(text.contains("shep daemon reload"), "{text}");
+    }
+
+    /// A daemon of this binary's own version is not a skew, so nothing is
+    /// written and nothing is refused.
+    #[tokio::test]
+    async fn a_matching_version_passes_without_a_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let (client, _fake) = client_announcing(&addr, env!("CARGO_PKG_VERSION")).await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = buffered_streams(&mut out, &mut err);
+            refuse_version_skew(&mut streams, &client, VersionGuard::Enforce)
+                .expect("a matching version is not a skew");
+        }
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    }
+
+    /// A guard whose remedy is itself guarded is the trap this design exists
+    /// to remove: an exempt verb reaches a skewed daemon and says nothing.
+    #[tokio::test]
+    async fn the_recovery_verbs_are_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let (client, _fake) = client_announcing(&addr, "0.1.8").await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = buffered_streams(&mut out, &mut err);
+            refuse_version_skew(&mut streams, &client, VersionGuard::Exempt)
+                .expect("a recovery verb is never refused on version skew");
+        }
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    }
+
+    /// fails if a verb leaves [`RECOVERY_VERBS`], or if one arrives without
+    /// being listed there with its reason.
+    #[test]
+    fn every_exempt_verb_is_one_of_the_documented_recovery_verbs() {
+        for command in [Commands::Kill, Commands::Ping] {
+            let verb =
+                recovery_verb(&command).unwrap_or_else(|| panic!("{command:?} must stay exempt"));
+            assert!(
+                RECOVERY_VERBS.contains(&verb),
+                "{verb} is exempt but undocumented"
+            );
+        }
+        assert!(
+            RECOVERY_VERBS.contains(&"daemon reload"),
+            "the verb the refusal names must stay on the list it is not yet built for"
+        );
+        assert_eq!(recovery_verb(&Commands::Flock), None);
+        assert_eq!(
+            VersionGuard::for_command(&Commands::Flock),
+            VersionGuard::Enforce
+        );
+        assert_eq!(
+            VersionGuard::for_command(&Commands::Kill),
+            VersionGuard::Exempt
+        );
+    }
+
+    /// Nothing else drives [`run`]'s dispatch arms, so the wiring behind each
+    /// verb is held only by the compiler — and `kill`'s arm is the one that
+    /// changed most recently, from a shared `connect_client` to its own
+    /// connect. This drives the arm end to end against a home no shepherd
+    /// owns and asserts the code that arm's own path produces.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_dispatches_kill_to_the_socket_free_path() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        // The two directories a booted shepherd would have made: `pids/`
+        // holds the lock `kill`'s socket-free path reads, and `run/` the
+        // control socket it first tries to connect over.
+        let paths = ShepPaths::resolve(
+            &|key| (key == "SHEP_HOME").then(|| home.to_string_lossy().into_owned()),
+            std::path::Path::new("/nonexistent"),
+        );
+        std::fs::create_dir_all(&paths.pids).unwrap();
+        std::fs::create_dir_all(&paths.run).unwrap();
+        let argv = ["shep", "--home", home.to_str().unwrap(), "kill"];
+        let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
+
+        assert_eq!(
+            run(cli, style::Presentation::BARE).await,
+            ExitCode::DaemonUnreachable,
+            "`kill` against an unowned home must reach its own socket-free path"
         );
     }
 }
