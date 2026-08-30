@@ -68,7 +68,7 @@ fn liveness_reports_none_when_no_daemon_holds_the_lock() {
     let tmp = tempdir().unwrap();
     let paths = test_paths(&tmp);
     init_dirs(&paths).unwrap();
-    assert_eq!(daemon_liveness(&paths).unwrap(), None);
+    assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn liveness_reports_none_for_a_stale_pidfile_nobody_holds() {
     std::fs::write(pidfile(&paths), "999999").unwrap();
     // The file exists and names a pid. Nothing holds the lock, so this is
     // NOT a live daemon and must not be reported as one.
-    assert_eq!(daemon_liveness(&paths).unwrap(), None);
+    assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
 }
 
 #[test]
@@ -89,9 +89,9 @@ fn liveness_reports_the_pid_a_lock_holder_recorded() {
     init_dirs(&paths).unwrap();
     let mut held = PidfileLock::acquire(&paths).unwrap();
     held.record(&paths, 4242).unwrap();
-    assert_eq!(daemon_liveness(&paths).unwrap(), Some(4242));
+    assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Running(4242));
     drop(held);
-    assert_eq!(daemon_liveness(&paths).unwrap(), None);
+    assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
 }
 ```
 
@@ -118,15 +118,16 @@ Expected: FAIL, `cannot find function daemon_liveness`
 /// # Errors
 /// - [`BootError::Io`] — the lock directory could not be read or created.
 ///   A contended lock is NOT an error here; it is the `Some` case.
-pub fn daemon_liveness(paths: &ShepPaths) -> Result<Option<u32>, BootError> {
+pub fn daemon_liveness(paths: &ShepPaths) -> Result<Shepherd, BootError> {
     match PidfileLock::acquire(paths) {
         // We took it, so nobody else holds it. Release immediately: this
         // helper answers a question, it does not claim the home.
         Ok(lock) => {
             drop(lock);
-            Ok(None)
+            Ok(Shepherd::Absent)
         }
-        Err(BootError::AlreadyRunning { pid, .. }) => Ok(pid),
+        Err(BootError::AlreadyRunning { pid: Some(pid) }) => Ok(Shepherd::Running(pid)),
+        Err(BootError::AlreadyRunning { pid: None }) => Ok(Shepherd::Booting),
         Err(other) => Err(other),
     }
 }
@@ -644,7 +645,7 @@ The stop arm composes three things that already exist: SIGTERM the proven pid, w
 **Files:**
 - Modify: `web/src/pages/docs/getting-started.astro` (install step)
 - Modify: whichever page carries the upgrade guidance, found by grep rather than assumed
-- Regenerate: `web/src/content/cli/` via the script
+- Regenerate: `web/src/data/cli-reference.generated.txt`, which is what `web/scripts/generate-cli-reference.sh` actually writes
 
 `cargo install shep` upgrades the binary and nothing else. The running daemon keeps the old code until it is reloaded, and every dog keeps its own until it is reinstalled.
 
