@@ -596,6 +596,11 @@ async fn reload_with_wait(
         Ok(client) => Ok(client),
         Err(err) => Err(version_from_refusal(&err).map(str::to_owned)),
     };
+    // `cfg(unix)`, like its only reader below. Windows has no `execve`, so
+    // the arm is never in question there and the binding would be an
+    // `unused_variables` warning on live code rather than a value nothing
+    // happens to read yet.
+    #[cfg(unix)]
     let running_version = match &connected {
         Ok(client) => Some(client.daemon().daemon_version.clone()),
         Err(from_refusal) => from_refusal.clone(),
