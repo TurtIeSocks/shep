@@ -1489,6 +1489,16 @@ mod tests {
             "{stdout}{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        // Checked before the real assertion, because the two failures look
+        // the same from the outside and only one of them is about the
+        // handover. `--exact` against a name that no longer resolves matches
+        // nothing: the child runs zero tests, exits successfully, and prints
+        // no marker, which would otherwise be reported as a descriptor that
+        // did not cross.
+        assert!(
+            stdout.contains("running 1 test"),
+            "the child ran no test, so `{SELFTEST_NAME}` is not where this test lives any more;              `--exact` needs the full path and nothing updates it automatically: {stdout}"
+        );
         // The whole mechanism in one assertion: a pipe written before the
         // exec is readable by the process after it, on the same fd number,
         // proving both that the image changed and that the descriptor
