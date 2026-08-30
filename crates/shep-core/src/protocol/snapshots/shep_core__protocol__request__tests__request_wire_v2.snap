@@ -268,5 +268,12 @@ expression: requests
         }
       }
     }
+  },
+  {
+    "id": 24,
+    "deadline_ms": null,
+    "body": {
+      "kind": "handover_fitness"
+    }
   }
 ]

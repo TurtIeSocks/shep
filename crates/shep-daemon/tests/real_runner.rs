@@ -11,13 +11,15 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use shep_core::signals::OperatorSignal;
 use shep_daemon::channel::{ChildMessage, ShepherdMessage};
 use shep_daemon::privilege::Credentials;
 use shep_daemon::runner::{
-    ProcIo, ProcessRunner, RunningProcess, SpawnSpec, StdinWrite, StopSignal,
+    AdoptSpec, AdoptedReaper, ProcIo, ProcessRunner, RunningProcess, SpawnSpec, StdinWrite,
+    StopSignal,
 };
 use shep_daemon::tokio_runner::TokioRunner;
 
@@ -960,5 +962,183 @@ async fn a_child_that_did_not_ask_for_stdin_gets_eof_at_once() {
     let outcome = tokio::time::timeout(Duration::from_secs(10), proc.wait())
         .await
         .expect("cat did not exit on EOF within 10s");
+    assert_eq!(outcome.code, Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// Adoption: the seam a successor reaches a still-running sheep through.
+//
+// Every child below is spawned by `std::process::Command`, which is what
+// makes these cases about adoption at all: tokio holds no `Child` for such a
+// process, so its exit can only be collected by the targeted `waitpid` an
+// `AdoptedReaper` runs. A `tokio::process::Command` child would prove
+// nothing, because tokio would be waiting it.
+// ---------------------------------------------------------------------------
+
+/// A child the way an adopted sheep reaches a successor: no `tokio::Child`
+/// anywhere, so nothing but the reaper will ever wait on it.
+fn adopted_child(script: &str) -> std::process::Child {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", script])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn a shell")
+}
+
+/// The plainest adoption: a pid and its two log paths, no carried handles.
+///
+/// Every handle is `None` here, which is the shape a sheep whose log opens
+/// had failed arrives in. The cases that are about handles fill them in.
+fn adopt_spec(dir: &tempfile::TempDir, pid: u32, reaper: &Arc<AdoptedReaper>) -> AdoptSpec {
+    AdoptSpec {
+        pid,
+        out_file: dir.path().join("out.log"),
+        err_file: dir.path().join("err.log"),
+        out_pipe: None,
+        err_pipe: None,
+        out_log: None,
+        err_log: None,
+        reaper: Arc::clone(reaper),
+    }
+}
+
+/// fails if an adopted sheep's real exit never reaches the supervisor.
+///
+/// The whole point of the seam. Task 7 proved the reaper in isolation; this
+/// proves it is reachable through `RunningProcess`, the type the supervisor
+/// actually holds, so an adopted sheep's exit drives autorestart and the
+/// EXIT column exactly as a spawned one's does.
+#[tokio::test]
+#[expect(
+    clippy::zombie_processes,
+    reason = "the reaper collects these statuses; a Child::wait would take them first"
+)]
+async fn an_adopted_proc_reports_its_real_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = adopted_child("exit 3");
+    let pid = child.id();
+    let reaper = Arc::new(AdoptedReaper::new());
+
+    let (mut proc, io) = TokioRunner::new()
+        .adopt(adopt_spec(&dir, pid, &reaper))
+        .expect("the real runner must be able to adopt");
+    assert_eq!(
+        proc.pid(),
+        pid,
+        "an adopted proc keeps the pid it was given"
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), proc.wait())
+        .await
+        .expect("the adopted pid must be reaped within the budget");
+    assert_eq!((outcome.code, outcome.signal), (Some(3), None));
+    drop(io);
+}
+
+/// fails if the adopted arm disturbed the path every sheep takes today.
+///
+/// Regression, and the reason it is worth a case of its own: `wait` now
+/// chooses between two sources of an exit, and the spawned one is the choice
+/// every running flock depends on.
+#[tokio::test]
+async fn a_spawned_proc_still_reports_its_real_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = TokioRunner::new();
+    let (mut proc, io) = runner
+        .spawn(&spec_for(&dir, "/bin/sh", &["-c", "exit 4"]))
+        .unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), proc.wait())
+        .await
+        .expect("a spawned child must be waited within the budget");
+    assert_eq!((outcome.code, outcome.signal), (Some(4), None));
+    drop(io);
+}
+
+/// fails if an adopted sheep killed by a signal reports a code instead.
+///
+/// `output/rows.rs`'s `exit_cell` renders a code and a signal differently,
+/// so collapsing the two makes the EXIT column lie about how a sheep died.
+#[tokio::test]
+#[expect(
+    clippy::zombie_processes,
+    reason = "the reaper collects these statuses; a Child::wait would take them first"
+)]
+async fn an_adopted_proc_reports_a_signal_as_a_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = adopted_child("sleep 30");
+    let pid = child.id();
+    let reaper = Arc::new(AdoptedReaper::new());
+
+    let (mut proc, io) = TokioRunner::new()
+        .adopt(adopt_spec(&dir, pid, &reaper))
+        .expect("the real runner must be able to adopt");
+    // Per-process rather than `kill_tree`, and the difference is about the
+    // fixture rather than about adoption: a real sheep is the leader of its
+    // own group because the predecessor spawned it that way, while a child
+    // spawned here is in the test binary's group, so the group-wide rung
+    // has no group of its own to address. `signal_process` addresses the
+    // pid, which is the number an adopted proc carries and the one thing it
+    // was never going to have to relearn.
+    proc.signal_process(OperatorSignal::Kill)
+        .expect("SIGKILL the adopted sheep");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), proc.wait())
+        .await
+        .expect("the adopted pid must be reaped within the budget");
+    assert_eq!((outcome.code, outcome.signal), (None, Some(9)));
+    drop(io);
+}
+
+/// fails if an adopted sheep's output stops reaching its log file.
+///
+/// The other half of the seam, and the one a successor's operator notices
+/// first: the carried pipe read end has to feed the same pump a spawn feeds,
+/// and the carried log handle has to be written through rather than reopened.
+/// The line already in the file is what proves the second half, because a
+/// handle that lost `O_APPEND` would write over it.
+#[tokio::test]
+#[expect(
+    clippy::zombie_processes,
+    reason = "the reaper collects these statuses; a Child::wait would take them first"
+)]
+async fn an_adopted_pump_appends_the_carried_pipes_lines_through_the_carried_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_file = dir.path().join("out.log");
+    fs::write(&out_file, "before-the-handover\n").unwrap();
+
+    let mut child = adopted_child("echo after-the-handover");
+    let pid = child.id();
+    let stdout = child.stdout.take().expect("piped stdout");
+    let carried_pipe = tokio::net::unix::pipe::Receiver::from_file(std::fs::File::from(
+        std::os::fd::OwnedFd::from(stdout),
+    ))
+    .expect("a child's stdout is a readable pipe");
+    let carried_log = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&out_file)
+        .await
+        .expect("open the log the predecessor was appending to");
+
+    let reaper = Arc::new(AdoptedReaper::new());
+    let mut spec = adopt_spec(&dir, pid, &reaper);
+    spec.out_file = out_file.clone();
+    spec.out_pipe = Some(carried_pipe);
+    spec.out_log = Some(carried_log);
+
+    let (mut proc, mut io) = TokioRunner::new()
+        .adopt(spec)
+        .expect("the real runner must be able to adopt");
+
+    let line = tokio::time::timeout(Duration::from_secs(10), io.logs.recv())
+        .await
+        .expect("the carried pipe must still be pumped")
+        .expect("the pump must forward the line");
+    assert_eq!(line.line, "after-the-handover");
+    await_file_contents(&out_file, "before-the-handover\nafter-the-handover\n").await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), proc.wait())
+        .await
+        .expect("the adopted pid must be reaped within the budget");
     assert_eq!(outcome.code, Some(0));
 }

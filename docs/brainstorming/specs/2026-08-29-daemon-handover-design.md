@@ -73,53 +73,174 @@ cannot `wait()` on it, so a new daemon can never learn that a sheep exited
 or reap it.
 
 `execve` keeps both. This is how nginx, HAProxy and Envoy do a binary
-upgrade, and shep's case is smaller than any of them: shep never holds an
-app's listening socket, only pipes, child handles and its own control
-socket.
+upgrade.
+
+This spec originally added "and shep's case is smaller than any of them",
+on the grounds that shep never holds an app's listening socket, only pipes,
+child handles and its own control socket. **That was written before the
+surface was measured, and it is too generous.** The listening-socket point
+is true and it is the hardest part of nginx's problem, but H2's measurements
+show shep pays two costs nginx does not: a per-sheep descriptor count that
+reaches 145 for a 20-sheep flock, and a permanent second reaping mechanism,
+because tokio will not hand back a `Child` for a pid it did not spawn.
+Easier in one dimension, not smaller overall.
 
 ### H2. What crosses the exec, and what is rebuilt
 
-Three categories, and getting the boundary right is most of the work.
+**Measured 2026-08-30, and it revised this section twice.** What follows is
+read off the code with citations, not reasoned from the mechanism. Three of
+this spec's original claims were wrong in specifics and are corrected below
+rather than quietly edited, because the corrections are what make the work
+bigger than it first looked.
 
-**Descriptors that must survive.** Rust opens descriptors close-on-exec, so
-every one of these needs `FD_CLOEXEC` cleared deliberately, and every other
-descriptor must keep it. Getting this backwards either leaks descriptors
-into the new image or silently loses a sheep's output.
+#### Descriptors: the count, and the second half nobody planned for
 
-- each sheep's stdout and stderr pipe read ends
-- each sheep's log file write ends
-- the control socket listener, so no client sees a closed socket during
-  the swap
-- the pidfile lock, which is held on a descriptor and survives with it, so
-  the successor keeps proving liveness without a window where a second
-  daemon could win the lock
+Everything is `FD_CLOEXEC` by default, confirmed against pinned sources
+rather than assumed: `mio` sets it on every socket, epoll and kqueue fd, and
+std sets it on every file and pipe.
 
-**A blob describing them.** Written to `$SHEP_HOME/run/handover.json` at
-mode 0600, its path passed in an environment variable, unlinked by the
-successor once read. It carries each sheep's identity, its pid, which
-descriptor numbers belong to it, its restart counters, its epoch and its
-start time. It carries no environment values: a sheep's env may hold
-secrets, and the successor can re-read them from config rather than having
-them transit a file.
+Per sheep or dog: 2 log file handles, 2 pipe read ends, plus 1 for the
+shepherd channel if it asks for one, plus 1 for stdin if `stdin = true`,
+plus 1 more on Linux for tokio's per-child `pidfd`. Daemon-wide: the
+listener, the pidfile lock, the signal self-pipe, the reactor.
 
-**Everything else is rebuilt.** Cron schedules, watchers and debouncers all
-derive from config. The bus, every `mpsc` and every `oneshot` are rebuilt
-empty.
+**20 sheep is 85 descriptors, and 145 in the worst case.** `merge_logs` does
+NOT reduce the count, which is easy to assume and wrong: it changes the path
+stem so instances share a filename, and every instance still opens its own
+handle on that one inode.
+
+**The half this spec originally missed is that clearing the flag is not
+enough. The successor also has to learn each descriptor's NUMBER.** There is
+exactly one piece of prior art in the tree: `command-fds` clears
+`FD_CLOEXEC` deliberately for the shepherd channel, and `SHEP_CHANNEL_FD`
+names the number in the environment. That pattern generalises. Nothing else
+in the tree does it.
+
+**The worst single failure is not lost output.** Lose a sheep's stdout read
+end and the child does not lose its output, it BLOCKS on write once the
+64KiB pipe buffer fills, and hangs. Silent, and it looks like an application
+bug rather than a shep bug. One descriptor on the wrong side is worse than
+everything else on this list combined.
+
+#### Reaping: there is no way back to a `Child`
+
+**`tokio::process::Child` has no constructor from a bare pid.** It is
+produced only by `Command::spawn`. So a sheep that survives the exec cannot
+be awaited through tokio at all, and this spec's original line about reaping
+"becoming SIGCHLD plus `waitpid`" understated it: that is not a smaller
+version of the same thing, it is a second mechanism.
+
+The obvious form of it is banned, and this repo already knows why.
+`crates/shep-cli/src/commands/reap.rs:6` records that a blind
+`waitpid(-1, WNOHANG)` in the same process races tokio's own reaper and
+steals statuses it needed; `docs/decisions.md:1588` records the same as a
+decision, and CI has been bitten by it (`crates/shep-cli/tests/init.rs:325`).
+`tokio_runner.rs:172` is already written to expect the loss: the outcome
+degrades to `{code: None, signal: None}` and the real exit is gone.
+
+What makes it tractable is that tokio only ever reaps TARGETED, with
+`waitpid(pid, WNOHANG)` on pids it owns. So targeted reaping of adopted pids
+is safe precisely because tokio holds no `Child` for them. The successor
+therefore runs two reaping mechanisms side by side, permanently: hand-rolled
+targeted waits for adopted sheep, tokio's own path for anything spawned
+after. A wildcard wait stays forbidden forever.
+
+`execve` also resets every handler to `SIG_DFL`, so tokio's SIGCHLD handler
+does not survive and neither does shep's own signal installer. Both are
+re-armed by the successor, and there is a window.
+
+#### State: bigger than the roll, and two fields that cannot serialize
+
+**Two fields cannot be carried as they stand.** `ProcessEntry.started_at`
+and `limits/stats.rs`'s `Baseline.at` are `tokio::time::Instant`, which has
+no epoch and means nothing outside the runtime that read it. UPTIME and CPU%
+need a different representation, not a better serializer.
+
+**The muster roll is not a foundation for this.** It omits `id`, `instance`,
+`restarts`, `last_exit`, `credentials`, `manual` and `reload`, and it
+collapses a multi-instance app to a bare count, so an app running slots 1
+and 3 restores as 0 and 1 and every `{{instance}}` template and `name:2`
+selector then points somewhere else. Dogs are not in it at all. This spec
+originally said the roll "records what an app IS rather than which pid is
+currently serving it"; accurate, and understated.
+
+**One correctness bug the original design would have shipped.**
+`SheepSlot.manual` records that an exit was operator-requested, and
+`handle_exited` takes it to decide whether an exit is a clean stop or a
+crash. Lose it and a `shep stop` racing a handover has its app RESPAWNED
+despite an explicit stop, because the exit reads as an ordinary crash. The
+same shape applies to `pending_delete`.
+
+Also load-bearing and easy to miss: `credentials` is pinned deliberately so
+a passwd-db change cannot move a running app's identity, so the successor
+must carry the resolved value rather than re-deriving it. The three counters
+(`next_id`, `next_deadline`, `next_action_stamp`) reset to zero in every
+constructor, so a successor that does not carry them can reissue an id a
+caller is still holding.
 
 What is genuinely lost, and why each is acceptable:
 
 | lost | consequence | why it is fine |
 |---|---|---|
-| `tokio::process::Child` handles | reaping becomes SIGCHLD plus `waitpid`, on raw pids | the successor is still the parent, so the kernel still delivers |
-| in-flight RPCs | the client sees the connection drop | clients already retry a dropped connection |
+| in-flight RPCs | the client sees the connection drop | clients already retry, and the accepted socket's protocol state could not be rebuilt anyway |
 | bus subscriptions | subscribers resubscribe | `lookout` already repairs drift on a two-second poll |
 | pending action waiters | a caller awaiting a custom action gets no reply | these already carry a timeout |
+| watch debouncers | changes during the swap are missed | the debounce window lives inside a third-party thread and is not shep's to carry |
+| CPU% baselines | one blank cell for up to 15s | the sampler already renders a missing baseline as absent rather than inventing a number |
 
-The supervisor's live state is channels, `Child` handles and oneshot
-waiters. **None of it is serializable, and none of it should be.** What
-crosses is the small factual core: which pid is which sheep, which
-descriptor carries its output, what its counters were. The machinery around
-that is rebuilt from scratch on the far side.
+#### The blob
+
+Written to `$SHEP_HOME/run/handover.json` at mode 0600, its path passed in
+an environment variable, unlinked by the successor once read. It carries the
+factual core above plus the descriptor numbers, **and each sheep's whole
+resolved spec, environment included.**
+
+This spec originally said the opposite, that the blob carries no environment
+values because a sheep's env may hold secrets. That was reasoning from a
+principle without checking what shep already does, which is the same mistake
+as the crash-loop claim two sections up.
+
+**The muster roll already persists every sheep's environment in cleartext,
+permanently.** `SavedApp.app` is a whole `AppConfig` and `AppConfig.env` is a
+plain `BTreeMap<String, String>` with no skip attribute, written to
+`flock.json` at `0600`. The type's own doc even notes that `Debug` redacts
+env, so the sensitivity was understood and the value persisted anyway. A
+handover blob carrying the same values, at the same mode, on a file the
+successor unlinks the moment it has read it, is strictly less exposure than
+the file already sitting there for the life of the flock.
+
+Refusing to carry it bought nothing, and cost a great deal. Without a spec
+the successor has to rebuild one from the roll and bind carried sheep to
+roll apps by name and instance, except the roll records a running COUNT per
+app rather than which slots were up, and `muster` starts what it restores.
+That is a second source of truth that can disagree with the blob, plus a
+restore-without-spawning path that does not exist, to protect a value that
+is already on disk.
+
+What still protects it is what always did: mode `0600` set at creation
+rather than by a later `chmod`, inside a `0700` directory, unlinked by the
+successor as soon as it is read.
+
+### H2a. Staging, and the gate that makes each stage safe to ship
+
+The surface above does not land in one step, and a half-built handover that
+silently mishandles an app is worse than no handover. **Phase 1 already
+built the seam that makes staging safe:** `Arm::for_daemon` chooses between
+a handover and a stop-and-start, and a successor can refuse to hand over
+whatever it cannot yet carry.
+
+So each stage widens what counts as carryable, and everything else falls
+back to the stop arm, which is correct rather than merely tolerable.
+
+- **2a, the spine.** Sheep with nothing but stdout, stderr and log files:
+  no channel, no stdin, no dog, no in-flight reload. Descriptor survival and
+  number transport, the factual core, targeted reaping, rehydrate. Any flock
+  containing anything else takes the stop arm.
+- **2b, the surface.** Shepherd channel, stdin, dogs, multi-instance, and
+  re-arming watch, cron and memory limits.
+- **2c, the hard cases.** A handover mid-reload, `manual` and
+  `pending_delete`, the counters, the reload deadline watchdog, and rollback
+  when a rehydrate fails.
 
 ### H3. The trigger is a signal, never the socket
 
@@ -154,6 +275,35 @@ confirms by polling the control socket until a handshake reports the new
 version, which is a stronger check than a reply would have been: it proves
 the successor is serving, not merely that the predecessor received
 something.
+
+### H3a. The trigger is a signal; the DECISION is a question over the socket
+
+Found while implementing 2a, and it is a hole in H3 rather than a detail
+under it.
+
+A signal carries no reply. So a daemon that receives SIGHUP, decides it
+cannot carry its flock, and falls back to its own graceful stop leaves the
+CLI polling for a successor that nobody started. The flock goes down the
+kill ladder and stays down. That is worse than either arm.
+
+**So the CLI asks before it signals.** It queries fitness over the control
+socket, and only then chooses: a `Carryable` answer sends SIGHUP, a
+`Refused` answer runs the stop arm and prints the reason.
+
+This does not weaken H3, which says a socket REQUEST cannot be the trigger.
+The trigger is still the signal. What moves to the socket is the decision,
+and it can only ever be needed where the socket already works:
+
+- to pick the handover arm at all, the CLI must know the daemon's version,
+  which requires a successful handshake
+- a handshake that succeeds means the socket is good, so a fitness query
+  works too
+- a handshake that fails means the stop arm regardless, and fitness never
+  comes up
+
+The refusal also has to reach the operator rather than the daemon log. They
+ran `shep daemon reload`; the sentence explaining why their flock restarted
+belongs in front of them.
 
 ### H4. `shep daemon reload` is the one verb
 

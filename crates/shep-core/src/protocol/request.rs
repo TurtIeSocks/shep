@@ -425,6 +425,33 @@ pub enum Request {
         /// The dog's name
         name: String,
     },
+    /// Ask whether this daemon could hand its flock to a successor in place,
+    /// rather than stopping it and starting it again (`shep daemon reload`).
+    ///
+    /// Read-only, and nothing here triggers a handover. The trigger is a
+    /// signal and always was: a socket request cannot be the trigger, because
+    /// the case that most needs a reload is the one where the daemon refuses
+    /// the client at the handshake. What travels over the socket is the
+    /// DECISION, for a reason a signal cannot serve (spec H3a) -- a signal
+    /// carries no reply, so a daemon that took one, refused, and fell back to
+    /// its own graceful stop would leave the client polling for a successor
+    /// nobody started, with the flock down and staying down.
+    ///
+    /// Answers [`Response::HandoverFitness`]. Every refusal is a feature the
+    /// running daemon cannot yet carry, not an error: the caller falls back
+    /// to a stop-and-start, which is correct behaviour rather than a degraded
+    /// one, and prints the reason to the operator who asked for the reload.
+    ///
+    /// # Why this variant does not move `PROTOCOL_VERSION`
+    ///
+    /// An older daemon cannot deserialize a variant it has never seen, which
+    /// is normally what a bump is for. It is never sent to one. `daemon
+    /// reload` is an exempt verb, so it connects to a mismatched daemon
+    /// deliberately, learns the daemon's crate version from the handshake,
+    /// and takes the stop arm for anything predating the handover without
+    /// ever asking. shep-cli's `commands::daemon` holds that gate and a test
+    /// of its own pins it.
+    HandoverFitness,
     /// Graceful daemon shutdown
     KillDaemon,
     /// Subscribe this connection to bus topics (glob patterns)
@@ -1289,6 +1316,21 @@ pub enum Response {
     },
     /// Answer to `EnableDog` — the dog as it stands now
     DogStarted(ProcessInfo),
+    /// Answer to `HandoverFitness`: `None` when the whole flock can be
+    /// carried across a daemon handover, and otherwise the sentence saying
+    /// which sheep cannot be and why.
+    ///
+    /// A rendered sentence rather than a structured reason, deliberately. The
+    /// set of things a handover cannot yet carry is exactly the set of things
+    /// that phase has not built, so it changes with every phase that widens
+    /// it, and a wire enum would make each of those a protocol change for a
+    /// string the client does nothing with but print. The daemon owns the
+    /// wording because the daemon owns the gate.
+    HandoverFitness {
+        /// Why the flock cannot be handed over in place, or `None` when it
+        /// can.
+        refusal: Option<String>,
+    },
     /// Answer to `Subscribe`
     Subscribed,
     /// Answer to `KillDaemon`
@@ -2029,6 +2071,15 @@ mod tests {
                     },
                 },
             },
+            // The one request in this enum that an older daemon must never
+            // be sent, so the one whose exact tag matters most: shep-cli
+            // gates it on the daemon's crate version, and a rename here
+            // would be a variant nothing on either side recognises.
+            Envelope {
+                id: 24,
+                deadline_ms: None,
+                body: Request::HandoverFitness,
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v2", requests);
     }
@@ -2303,6 +2354,20 @@ mod tests {
                         .instance(Some(2))
                         .build(),
                 ])),
+            },
+            // Both shapes of the handover answer, because the difference
+            // between them is a `null` and a caller that read the key's
+            // presence rather than its value would pass on one and refuse
+            // every flock on the other.
+            Reply {
+                id: 28,
+                result: Ok(Response::HandoverFitness { refusal: None }),
+            },
+            Reply {
+                id: 29,
+                result: Ok(Response::HandoverFitness {
+                    refusal: Some("sheep 'web' has a shepherd channel".to_string()),
+                }),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v2", replies);

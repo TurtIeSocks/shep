@@ -17,6 +17,12 @@
 //! go through that pair, so neither half can drift from the other on what it
 //! is willing to open.
 //!
+//! A few items here are `#[cfg(unix)]`, and that is a design decision rather
+//! than portability work left unfinished. Windows has no `execve`, so a
+//! shepherd there is replaced by stop-and-start and no image ever adopts a
+//! process it did not spawn; the handover surfaces those items exist for have
+//! nothing to be on that platform. Each one says so at its own definition.
+//!
 //! This whole module is public and stays that way: [`ProcessRunner`] is the
 //! bound on [`boot`](crate::boot::boot), which `shep-cli` calls, so a caller
 //! outside this crate has to be able to name it — and naming it drags in every
@@ -34,6 +40,15 @@ use shep_core::signals::OperatorSignal;
 
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::privilege::Credentials;
+
+/// Re-exported so [`AdoptSpec`] can name it: the reaper lives in the
+/// crate-private `handover` module, and a public signature may not carry a
+/// type nothing outside the crate can reach.
+///
+/// Unix only, as the whole handover is. Windows has no `execve`, so no image
+/// there ever adopts a process it did not spawn.
+#[cfg(unix)]
+pub use crate::handover::reap::AdoptedReaper;
 
 /// One exit observation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +113,15 @@ pub struct LogLine {
 /// either variant usable as a barrier. A logrotate `postrotate` stanza needs
 /// that of [`Self::Reopen`] before it compresses or deletes the file it
 /// renamed; `shep flush` needs it of [`Self::Flush`] before it truncates.
+/// `#[non_exhaustive]` because this crate is published and this enum just
+/// grew a variant. An out-of-tree `ProcessRunner` matching it exhaustively
+/// would break on that addition, and would break again on the next one.
+/// Marking it now costs those matchers one wildcard arm, once, in a 0.1.x
+/// release where that is expected, instead of every time the handover needs
+/// to ask a pump something new (IR-20, and the same call `BootError` makes a
+/// few modules over).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LogCtl {
     /// Drop the current handle and open the path again, then acknowledge.
     /// Sent when an external rotator has renamed the file.
@@ -163,6 +186,53 @@ pub enum LogCtl {
         /// the same stopped-sheep no-op a failed send means — a pump that is
         /// gone owes no bytes to anything.
         done: oneshot::Sender<Result<(), FlushError>>,
+    },
+    /// Write out whatever the pump has buffered, wait for it to reach the
+    /// files, then acknowledge with the four descriptor numbers the pump is
+    /// holding. Sent while assembling a daemon handover.
+    ///
+    /// # Why the flush and the report are one request
+    ///
+    /// A pump that reported its numbers and was then asked separately to
+    /// flush would leave a window in which the blob already claims a
+    /// descriptor is ready to carry while the bytes behind it are still in
+    /// the buffer. Those bytes die with the image at the `execve`, and the
+    /// successor cannot repair them because it never saw them — a gap in a
+    /// sheep's log, which is one of the two things a handover exists to
+    /// avoid. Doing both under one acknowledgement makes the ordering
+    /// structural rather than a rule a caller has to keep.
+    ///
+    /// # Why this variant is unix-only when the rest of the enum is not
+    ///
+    /// It answers with raw descriptor numbers, and Windows has none of
+    /// those, no `execve` to carry them across, and no handover:
+    /// `Arm::for_daemon` returns the stop-and-start arm there. Gating the
+    /// variant rather than the enum keeps [`Self::Reopen`] and
+    /// [`Self::Flush`] portable, which they are.
+    #[cfg(unix)]
+    ReportFds {
+        /// Fires once both handles have nothing buffered and no write left
+        /// in flight, carrying the descriptors the blob is to name.
+        ///
+        /// `CarriedFds::none` is the honest answer for a pump holding
+        /// nothing — a stream that reached EOF has had its read end closed,
+        /// and a log file whose open failed has no handle. It is never an
+        /// error: a number that names nothing is what the successor must not
+        /// be handed.
+        ///
+        /// # When it never fires
+        ///
+        /// Exactly as [`Self::Reopen`]'s: a pump that ends between accepting
+        /// a request and serving it drops this sender. Treat that as the
+        /// same stopped-sheep no-op a failed send means; a pump that is gone
+        /// holds no descriptors.
+        ///
+        /// `CarriedFds` is `shep-daemon`'s own type and is not reachable
+        /// from outside the crate, so an out-of-tree runner can drop this
+        /// sender but cannot answer it. That is the same no-op a pump that
+        /// has ended produces, and a runner with no handover support is
+        /// exactly a runner nothing hands over.
+        done: oneshot::Sender<crate::handover::CarriedFds>,
     },
 }
 
@@ -767,6 +837,80 @@ pub trait ProcessRunner: Send + Sync + 'static {
         let _ = spec;
         Preflight::Unknown
     }
+
+    /// Rebuilds a proc around a sheep this process inherited rather than
+    /// started.
+    ///
+    /// The successor half of a handover. Every handle in `spec` crossed an
+    /// `execve` with its `FD_CLOEXEC` cleared, so the sheep on the far side
+    /// of them never noticed the shepherd being replaced: same pid, same
+    /// pipes, same open file description on each log. Nothing here spawns,
+    /// signals or reopens anything.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunnerError::AdoptFailed`] if this runner cannot take a process
+    ///   it did not spawn, which is what the default answers, or if the
+    ///   carried handles could not be wired to a pump.
+    ///
+    /// # Default implementation
+    ///
+    /// Refuses. A defaulted method rather than a required one for the reason
+    /// [`Self::preflight`] gives: this is a `pub` trait in a published
+    /// library, and adding a required method to one breaks every out-of-tree
+    /// implementor with no version bump to warn them (IR-20). The refusal is
+    /// also the truthful answer for a runner that never took part in a
+    /// handover, rather than a stub that pretends to adopt.
+    ///
+    /// Unix only. Windows has no `execve` and `Arm::for_daemon` returns the
+    /// stop-and-start arm there, so no Windows image is ever a successor and
+    /// a portable method would be a promise this workspace could not keep.
+    #[cfg(unix)]
+    fn adopt(&self, spec: AdoptSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+        let _ = spec;
+        Err(RunnerError::AdoptFailed(
+            "this runner cannot adopt a process it did not spawn".to_string(),
+        ))
+    }
+}
+
+/// One inherited sheep, and everything a runner needs to supervise it again.
+///
+/// Produced by the successor's `handover::adopt` and consumed by
+/// [`ProcessRunner::adopt`]. The four handles are owned, because adopting is
+/// exactly the act of taking ownership of them; `None` on a pair means the
+/// predecessor had no handle to carry, which is what a sheep whose log open
+/// had failed, or one with no live pump, looks like.
+///
+/// `Debug` is derived, and deliberately so (IR-41): descriptor numbers, a
+/// pid and two log paths are all an operator already reads out of
+/// `shep flock`, and no environment value or other secret reaches this type.
+/// The blob it is built from carries the same rule.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct AdoptSpec {
+    /// The pid the sheep has been running under all along, unchanged by the
+    /// handover.
+    pub pid: u32,
+    /// Where its stdout is logged, kept so a later rotation can reopen it.
+    pub out_file: PathBuf,
+    /// Where its stderr is logged, kept for the same reason.
+    pub err_file: PathBuf,
+    /// The read end of its stdout pipe, still the one the child writes into.
+    pub out_pipe: Option<tokio::net::unix::pipe::Receiver>,
+    /// The read end of its stderr pipe, likewise.
+    pub err_pipe: Option<tokio::net::unix::pipe::Receiver>,
+    /// The appending handle on its stdout log, written through rather than
+    /// reopened so `O_APPEND` survives.
+    pub out_log: Option<tokio::fs::File>,
+    /// The appending handle on its stderr log, likewise.
+    pub err_log: Option<tokio::fs::File>,
+    /// The one reaper this successor waits every adopted pid through.
+    ///
+    /// Shared rather than owned per sheep: a status can be collected once,
+    /// so two reapers racing on one pid would have one take the exit and the
+    /// other meet `ECHILD` with the exit already gone.
+    pub reaper: std::sync::Arc<AdoptedReaper>,
 }
 
 /// What a [`ProcessRunner`] can tell about a [`SpawnSpec`] before anything is
@@ -853,8 +997,8 @@ pub struct SpawnSpec {
 
 /// Error type returned from spawn and process control
 ///
-/// `#[non_exhaustive]`: today's three variants cover spawn, signal delivery
-/// and a stdin write, and a future process-control primitive — a cgroup
+/// `#[non_exhaustive]`: today's variants cover spawn, adoption, signal
+/// delivery and a stdin write, and a future process-control primitive — a cgroup
 /// freeze, or a Windows job-object failure — would need its own variant
 /// rather than stretching one of these to mean something it does not cover,
 /// and shep-daemon is a published library an out-of-tree matcher should not
@@ -869,6 +1013,10 @@ pub enum RunnerError {
     /// A write to a child's stdin failed (carries the OS message, or the
     /// shepherd's own bound when the app was not reading).
     WriteFailed(String),
+    /// A sheep inherited across a handover could not be taken back under
+    /// supervision: this runner does not adopt at all, or the carried
+    /// handles could not be wired to a pump.
+    AdoptFailed(String),
 }
 
 impl fmt::Display for RunnerError {
@@ -877,6 +1025,7 @@ impl fmt::Display for RunnerError {
             Self::SpawnFailed(msg) => write!(f, "process spawn failed: {msg}"),
             Self::SignalFailed(msg) => write!(f, "signal delivery failed: {msg}"),
             Self::WriteFailed(msg) => write!(f, "stdin write failed: {msg}"),
+            Self::AdoptFailed(msg) => write!(f, "process adoption failed: {msg}"),
         }
     }
 }

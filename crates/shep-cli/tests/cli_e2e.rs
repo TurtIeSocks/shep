@@ -7023,3 +7023,462 @@ fn a_multi_instance_flock_gets_distinct_slots_a_grouped_table_and_undoubled_blea
 
     graceful_kill(home);
 }
+
+// --- Daemon handover -----------------------------------------------------
+
+/// How long [`counting_lines`] waits for a counter sheep to reach a line
+/// count, and [`wait_for_pid`] for a sheep to be online with a pid.
+///
+/// Sized like [`FLOCK_DEADLINE`] rather than shorter. The counter emits five
+/// lines a second, so the longest wait any caller here asks for is six lines,
+/// which an idle machine satisfies in a little over a second. Ten seconds is
+/// therefore a loaded runner's margin and not the sheep's own pace.
+#[cfg(unix)]
+const HANDOVER_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Gap between [`counting_lines`]'s reads.
+#[cfg(unix)]
+const HANDOVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Writes a script that counts from 1 upwards on stdout, one number per
+/// line, forever.
+///
+/// The sequence is what makes a log gap visible. A sheep printing the same
+/// marker over and over proves only that it is still alive; a sheep counting
+/// proves that nothing between it and the file was lost, reordered, or cut
+/// in half, which is the failure a handover can introduce and a restart
+/// cannot (a restarted sheep starts again at 1, which is a different and
+/// equally visible break).
+#[cfg(unix)]
+fn write_counting_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "counter.sh",
+        &format!(
+            "{}{}i=1\nwhile :; do\n  echo \"$i\"\n  i=$((i+1))\n  sleep 0.2\ndone\n",
+            script_header(),
+            record_pid_line(dir),
+        ),
+    )
+}
+
+/// Reads `path` until it holds at least `want` lines, or
+/// [`HANDOVER_DEADLINE`] expires, and returns what it held on the last read.
+///
+/// Returns rather than panicking on expiry, so the failure that reaches CI is
+/// the caller's own assertion naming what it wanted.
+#[cfg(unix)]
+fn counting_lines(path: &Path, want: usize) -> Vec<String> {
+    let start = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        if lines.len() >= want || start.elapsed() >= HANDOVER_DEADLINE {
+            return lines;
+        }
+        std::thread::sleep(HANDOVER_POLL_INTERVAL);
+    }
+}
+
+/// Fails unless `lines` is `1, 2, 3, …`, one number per line, with nothing
+/// missing, nothing repeated and nothing cut in half.
+///
+/// A torn line is the reason this is stricter than "the file grew". The log
+/// pump reads its sheep's pipe through a `BufReader`, so bytes it has
+/// consumed without yet forming a line die with the process image; the
+/// successor's fresh reader then starts mid-line and appends the remainder as
+/// a line of its own. That shows up here as a number that is not the one
+/// expected next, and not as a shorter file, which is why counting lines
+/// alone would pass over it.
+///
+/// **The tear is real, and this is what measured it.** With the counter's
+/// `sleep` removed so it emits as fast as the pipe will take it, three runs
+/// out of three broke here: `7385` was followed by `2`, `4872` by `00`, and
+/// `10917` by `1916`. The last of those is the shape of the whole problem:
+/// `1916` is not a suffix of `10918`, so what died was not one line but
+/// every line the reader had consumed and not yet emitted, and the resume
+/// landed in the middle of a number a thousand further on. The flush a
+/// handover performs empties the log file's write buffer; nothing empties
+/// the reader's. Carrying it is 2b's, and until then a sheep that fills the
+/// reader between the flush and the exec loses what is in it.
+///
+/// The counter therefore emits five lines a second rather than as fast as it
+/// can. That is not the assertion being weakened, since it is still every
+/// number, once, in order. It is the difference between exercising the
+/// handover and exercising a gap that is already known, measured and
+/// written down.
+#[cfg(unix)]
+fn assert_unbroken_sequence(lines: &[String], what: &str) {
+    for (index, line) in lines.iter().enumerate() {
+        let want = index + 1;
+        let got: usize = line.trim().parse().unwrap_or_else(|_| {
+            panic!("{what}: line {want} is not a whole number, so it was torn: {line:?}")
+        });
+        assert_eq!(
+            got,
+            want,
+            "{what}: expected {want} on line {want}, got {got}; the sequence so far is {:?}",
+            &lines[..=index]
+        );
+    }
+}
+
+/// The two assertions that define the whole handover: a sheep keeps its pid
+/// across `shep daemon reload`, and its log gains no gap.
+///
+/// A version passing neither is the stop arm, which restarts the flock:
+/// every sheep gets a new pid and a counter starts again at 1. Both halves
+/// are therefore load-bearing and neither is implied by the other: a
+/// handover that respawned the sheep would keep the log growing while
+/// moving the pid, and one that carried the pid while dropping the pipe
+/// would leave the sheep blocked on `write()` with the log frozen.
+///
+/// Unix only, as the whole handover is: Windows has no `execve`, and the arm
+/// selection there never chooses one.
+#[cfg(unix)]
+#[test]
+fn a_sheep_keeps_its_pid_and_its_log_across_a_daemon_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_counting_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("counter")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
+    let out_file = PathBuf::from(
+        before["out_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an online sheep reports its out file: {before}")),
+    );
+    let seen_before = counting_lines(&out_file, 3);
+    assert!(
+        seen_before.len() >= 3,
+        "the counter must be logging before the reload: {seen_before:?}"
+    );
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+
+    let after = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    assert_eq!(
+        after["pid"].as_u64(),
+        Some(pid_before),
+        "a moved pid means the sheep was respawned, which is the stop arm: {after}"
+    );
+
+    let seen = counting_lines(&out_file, seen_before.len() + 3);
+    assert!(
+        seen.len() > seen_before.len(),
+        "the sheep stopped logging across the handover: {seen:?}"
+    );
+    assert_unbroken_sequence(&seen, "the counter's log across a handover");
+
+    graceful_kill(dir.path());
+}
+
+/// A flock carrying something this phase cannot move takes the stop arm, and
+/// the operator is told which sheep and why.
+///
+/// The gate doing its job, and not a failure: the reload still happens, the
+/// flock still comes back, and the refusal is a sentence in front of the
+/// person who typed the verb rather than a line in the daemon's log. The
+/// moved pid is what proves the stop arm was the one taken.
+#[cfg(unix)]
+#[test]
+fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"chatty\"\nscript = '{}'\nchannel = true\n",
+            script.display()
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"].as_u64();
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reloaded.stdout),
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    assert!(
+        text.contains("shepherd channel"),
+        "the refusal must name the feature that blocked the handover: {text}"
+    );
+    assert!(
+        text.contains("chatty"),
+        "and the sheep it blocked on: {text}"
+    );
+
+    let after = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    assert_ne!(
+        after["pid"].as_u64(),
+        pid_before,
+        "the stop arm restarts the flock, so the pid must move: {after}"
+    );
+
+    graceful_kill(dir.path());
+}
+
+/// The control socket answers throughout a handover.
+///
+/// The successor inherits the listening descriptor rather than binding the
+/// address again, so a client that connects while the image is being
+/// replaced waits in the kernel's backlog and is served by whichever image
+/// gets to it. Nothing may be refused, and the socket file may never
+/// disappear, since a rebind would race the predecessor's socket file and
+/// lose whatever connection a client had already made.
+#[cfg(unix)]
+#[test]
+fn the_control_socket_accepts_throughout_a_handover() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+    let _ = poll_flock(dir.path(), |info| info["status"] == "online");
+
+    let home = dir.path().to_path_buf();
+    // The prober says when it is really probing, and the reload waits for
+    // that. Without the handshake the reload could finish before the first
+    // `ping` ever ran, and the case would pass with every probe served by the
+    // successor alone, which proves nothing about the address staying bound
+    // across the exec.
+    let (probing, started_probing) = std::sync::mpsc::channel();
+    let prober = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut refused = Vec::new();
+        let mut announced = false;
+        while Instant::now() < deadline {
+            let out = shep(&home).arg("ping").output().unwrap();
+            if !out.status.success() {
+                refused.push(format!(
+                    "exit {:?}: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            if !announced {
+                announced = true;
+                let _ = probing.send(());
+            }
+        }
+        refused
+    });
+    started_probing
+        .recv_timeout(FLOCK_DEADLINE)
+        .expect("the prober must reach the shepherd before the reload starts");
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+
+    // What the listener crossing the exec actually buys, and what it does
+    // not. The listener's descriptor is carried, so no client ever finds the
+    // address unbound. An ACCEPTED connection is not carried, deliberately:
+    // rebuilding a half-read frame's protocol state is not something the
+    // successor can do, and the spec's H2 records the consequence as a client
+    // seeing its connection drop and retrying.
+    //
+    // So a ping whose reply was in flight at the instant of the exec fails,
+    // and must be tolerated. A ping that could not connect at all means the
+    // address went away, which is the property this test exists to defend.
+    //
+    // Asserting the stronger thing was wrong rather than merely strict, and
+    // it passed on macOS purely because the window is narrow: the four Linux
+    // jobs on the first CI run of this test all caught it.
+    let refused = prober.join().unwrap();
+    let (dropped, unreachable): (Vec<_>, Vec<_>) = refused
+        .into_iter()
+        .partition(|line| line.contains("the connection closed before a reply arrived"));
+    assert!(
+        unreachable.is_empty(),
+        "the control address must stay bound across the handover: {unreachable:?}"
+    );
+    assert!(
+        dropped.len() <= 1,
+        "at most the one request in flight at the exec may drop, got {}: {dropped:?}",
+        dropped.len()
+    );
+
+    graceful_kill(dir.path());
+}
+
+/// Reads `roll` until it records exactly `want` apps, or [`FLOCK_DEADLINE`]
+/// expires, and returns the bytes it held on the last read.
+///
+/// The muster roll is written by a debounced task, so "the flock changed"
+/// and "the roll on disk says so" are two events and the second is the one a
+/// caller here needs. Returns rather than panicking on expiry, so the
+/// failure that reaches CI is the caller's own assertion.
+#[cfg(unix)]
+fn roll_recording(roll: &Path, want: usize) -> Vec<u8> {
+    let start = Instant::now();
+    loop {
+        let bytes = std::fs::read(roll).unwrap_or_default();
+        let apps = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value["apps"].as_array().map(Vec::len));
+        if apps == Some(want) || start.elapsed() >= FLOCK_DEADLINE {
+            return bytes;
+        }
+        std::thread::sleep(FLOCK_POLL_INTERVAL);
+    }
+}
+
+/// A successor that inherited an EMPTY flock must not fall back to the roll.
+///
+/// The two things a boot can do with a muster roll are mutually exclusive,
+/// and which one it does turns on a single fact: was this image handed a
+/// flock, or did it start fresh? A successor was handed one, so it installs
+/// what it was handed and skips the restore. The SIZE of that flock is not
+/// the question and must never be mistaken for it, because a handover skips
+/// the predecessor's teardown: the roll on disk is whatever the last
+/// debounced write left, not the flock as it was at the exec.
+///
+/// The empty case is the one where the two questions give different answers.
+/// `ghost` is started, saved into the roll, then deleted, and the stale roll
+/// is put back under an idle shepherd that has no sheep left to write over
+/// it. The handover from there carries nothing, so a boot deriving "was I a
+/// successor?" from the count of what it carried decides it was a fresh boot
+/// and starts `ghost` again from a roll describing a flock the operator has
+/// already thrown away.
+///
+/// SIGHUP directly, not `shep daemon reload`. The verb runs `shep muster`
+/// against the shepherd it gets back, which would start `ghost` from the
+/// same stale roll through the CLI whatever the boot decided, and a test
+/// that cannot tell those two apart proves nothing about either. The signal
+/// is the whole of the daemon-side handover and nothing else.
+///
+/// The pid check at the end is what keeps this from passing vacuously.
+/// SIGHUP has exactly two outcomes and no third: this image execs into a
+/// successor, or it cannot and stops gracefully instead. On the second, the
+/// polling below finds no shepherd and spawns a fresh one, which is a NEW
+/// pid and a boot that does restore the roll. So a shepherd still answering
+/// on the original pid is a successor and nothing else.
+///
+/// The final wait is on the WRONG outcome deliberately. A restore that is
+/// going to happen happens inside the successor's own boot, and nothing in
+/// this tier is synchronous with that boot, so asserting emptiness once
+/// could pass by looking too early. Waiting [`FLOCK_DEADLINE`] for a sheep
+/// to appear and then asserting none did is the version that cannot pass by
+/// being quick.
+#[cfg(unix)]
+#[test]
+fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("ghost")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&started);
+    let _ = poll_flock(home, |info| info["status"] == "online");
+    let shepherd = wait_for_daemon_pid(home).expect("the shepherd must record a pid");
+
+    assert_success(&shep(home).arg("save").output().unwrap());
+    let roll = home.join("flock.json");
+    let stale = roll_recording(&roll, 1);
+    assert!(
+        !stale.is_empty(),
+        "the roll must record `ghost` before it can go stale: {}",
+        String::from_utf8_lossy(&stale)
+    );
+
+    assert_success(&shep(home).arg("delete").arg("ghost").output().unwrap());
+    let emptied = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(Vec::is_empty)
+    });
+    assert_eq!(
+        emptied.as_array().map(Vec::len),
+        Some(0),
+        "the delete must leave an idle shepherd: {emptied}"
+    );
+    // Waited out rather than assumed: the debounced writer is about to
+    // record the empty flock, and a stale roll put back before that write
+    // lands would simply be overwritten by it.
+    let _ = roll_recording(&roll, 0);
+    std::fs::write(&roll, &stale).unwrap();
+
+    nix::sys::signal::kill(shepherd, nix::sys::signal::Signal::SIGHUP).unwrap();
+
+    let after = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| !rows.is_empty())
+    });
+    assert_eq!(
+        after.as_array().map(Vec::len),
+        Some(0),
+        "a successor must install the flock it was handed and nothing else; \
+         this one restored a stale roll: {after}"
+    );
+    assert_eq!(
+        wait_for_daemon_pid(home),
+        Some(shepherd),
+        "the shepherd must have been replaced in place; a moved pid means \
+         SIGHUP stopped it and the polling above started a fresh one, which \
+         is not the boot this test is about"
+    );
+
+    graceful_kill(home);
+}

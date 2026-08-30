@@ -819,6 +819,54 @@ pub async fn fake_client_with_push(path: &Path) -> (Client, FakeDaemon) {
     fake_client_on(path).await
 }
 
+/// Binds `path` and serves EVERY connection made to it, handshaking with
+/// `ack`, answering each request through `answer`, and forwarding each
+/// decoded [`Envelope`] onto the returned channel.
+///
+/// The multi-connection sibling of [`fake_client_answering`], and the
+/// difference is the whole reason it exists. That helper accepts exactly one
+/// connection, which is right for a test that drives the [`Client`] it hands
+/// back; a test that instead drives a whole CLI verb has the verb open its
+/// own connections, and a second connect against a one-shot fake sits in the
+/// kernel's backlog until the client's own deadline expires. `ack` is a
+/// parameter for the same reason: the verb under test reads
+/// [`HelloAck::daemon_version`] and decides what to do from it, so a fixed
+/// [`sample_ack`] would pin the test to one branch.
+///
+/// The task is detached and runs until the listener errors, which happens
+/// when the caller's `TempDir` goes away.
+pub async fn fake_daemon_answering_with_ack(
+    path: &Path,
+    ack: HelloAck,
+    answer: impl Fn(&Request) -> Response + Send + Sync + Clone + 'static,
+) -> mpsc::UnboundedReceiver<Envelope> {
+    let mut listener = Listener::bind(path).unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(stream) = listener.accept().await {
+            let tx = tx.clone();
+            let ack = ack.clone();
+            let answer = answer.clone();
+            tokio::spawn(async move {
+                let mut frames = Framed::new(stream, codec());
+                handshake(&mut frames, ack).await;
+                while let Some(Ok(frame)) = frames.next().await {
+                    let Ok(envelope) = decode_frame::<Envelope>(&frame) else {
+                        break;
+                    };
+                    let id = envelope.id;
+                    let reply = answer(&envelope.body);
+                    if tx.send(envelope).is_err() {
+                        break;
+                    }
+                    write_reply(&mut frames, id, reply).await;
+                }
+            });
+        }
+    });
+    rx
+}
+
 /// As [`fake_client_capturing_envelopes`], but the caller decides what each
 /// request is answered with — for a test asserting on what a MULTI-REQUEST
 /// caller puts on the wire.

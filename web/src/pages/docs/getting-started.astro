@@ -75,6 +75,21 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       <div><span class="prompt">$</span> cargo install shep-log-rotate<span class="muted"> # and every other dog</span></div>
       <div><span class="prompt">$</span> shep daemon reload</div>
     </div>
+    <p>
+      A flock that can be carried keeps running through the reload. The
+      shepherd replaces its own image in place, so every sheep keeps the pid
+      it already had and its log carries on where it was. One that cannot is
+      stopped and started instead, which moves every pid and starts every log
+      again; the note below says which flocks those are.
+    </p>
+    <p class="fine">
+      Not every flock can be carried yet. A sheep with a shepherd channel,
+      <code>stdin = true</code>, more than one instance, a dog, or anything
+      mid-reload sends the reload down the older path instead: the flock is
+      stopped and started, and the reload prints which sheep held it back.
+      The first reload after upgrading to this version always takes that
+      path, because the shepherd being replaced predates the handover.
+    </p>
     <Callout variant="careful">
       Skip <code>shep daemon reload</code> and the new binary answers
       <code>shep --version</code> while the running shepherd is still the

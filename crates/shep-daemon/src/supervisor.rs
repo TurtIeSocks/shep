@@ -60,11 +60,22 @@ use crate::bus::{Bus, SharedEvent};
 use crate::channel::{ChildMessage, ShepherdMessage};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
 use crate::extras::{Extras, ExtrasRegistry};
+#[cfg(unix)]
+use crate::handover::adopt::AdoptedSheep;
+#[cfg(unix)]
+use crate::handover::reap::AdoptedReaper;
+#[cfg(unix)]
+use crate::handover::{
+    Candidate, CarriedFds, CarriedSheep, Counters, DaemonFds, Fitness, Handover, OwnedCandidate,
+    fitness,
+};
 use crate::kill::kill_process;
 use crate::privilege::{self, Credentials, PrivilegeError, SpawnIdentity};
 use crate::probes::Prober;
 use crate::probes::os::OsProber;
 use crate::probes::ready::{Readiness, ReadinessSource, await_ready};
+#[cfg(unix)]
+use crate::runner::AdoptSpec;
 use crate::runner::{
     ExitOutcome, FlushError, LogCtl, Preflight, ProcIo, ProcessRunner, ReopenError, RunnerError,
     RunningProcess, SpawnSpec, StdinWrite, check_log_ancestry, open_log_path,
@@ -464,6 +475,36 @@ pub(crate) enum Command {
         /// Answers once every path has been truncated — off a task of its
         /// own, never the actor loop (see [`Actor::handle_flush`]).
         reply: oneshot::Sender<Result<Vec<ProcessInfo>, SupervisorError>>,
+    },
+    /// Describes the whole flock for a daemon handover: what the fitness
+    /// gate needs, and the blob the successor reads.
+    ///
+    /// One command rather than a set of getters because everything it
+    /// answers with is private to the actor — the three counters are its
+    /// own fields, `epoch`, `manual` and `pending_delete` are on
+    /// [`SheepSlot`], and the descriptor numbers are known only to each
+    /// sheep's log pump.
+    #[cfg(unix)]
+    HandoverSnapshot {
+        /// The daemon's own two descriptors, which `boot` knows and the
+        /// actor does not.
+        fds: DaemonFds,
+        /// Answers once every live pump has flushed and reported — off a
+        /// task of its own, never the actor loop (see
+        /// [`Actor::handle_handover_snapshot`]).
+        reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
+    },
+    /// Answers whether this flock could be handed to a successor in place.
+    ///
+    /// The same gate [`Command::HandoverSnapshot`]'s caller applies, asked
+    /// on its own and without the descriptor round trip, because a client
+    /// asks it before anything is signalled (spec H3a) and a question must
+    /// not flush a pump.
+    #[cfg(unix)]
+    HandoverFitness {
+        /// Answers on the actor loop: the gate reads slot state this actor
+        /// already holds and awaits nothing.
+        reply: oneshot::Sender<Result<Fitness, SupervisorError>>,
     },
     /// Puts one named action on the shepherd channel of every sheep matching
     /// `selector` and answers with what each app said back, or with why
@@ -1224,6 +1265,55 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
+    /// Describes the whole flock for a daemon handover: one
+    /// [`OwnedCandidate`] per registered sheep for the fitness gate, and the
+    /// [`Handover`] blob the successor reads.
+    ///
+    /// `fds` are the daemon's own listener and pidfile descriptors, which
+    /// `boot` opened and the actor has never seen.
+    ///
+    /// Answers once every live pump has flushed what it was holding and
+    /// reported its descriptors. A registered sheep that is not running has
+    /// no pump, and carries no descriptors: that is not a refusal, and the
+    /// gate does not treat it as one.
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`] — the actor is gone.
+    ///
+    #[cfg(unix)]
+    pub(crate) async fn handover_snapshot(
+        &self,
+        fds: DaemonFds,
+    ) -> Result<Snapshot, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::HandoverSnapshot { fds, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Whether this shepherd's flock could be handed to a successor in
+    /// place, or the reason it could not.
+    ///
+    /// Read-only, and nothing here begins a handover: the trigger is a
+    /// signal, and this is the question a client asks before sending one
+    /// (spec H3a).
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`]: the actor is gone.
+    #[cfg(unix)]
+    pub(crate) async fn handover_fitness(&self) -> Result<Fitness, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::HandoverFitness { reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
     /// Empties the log files of every sheep matching `selector`: flushes
     /// every pump writing to one of the paths those sheep were registered
     /// with, then truncates those paths.
@@ -1466,11 +1556,77 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     /// Must be called from within a Tokio runtime context.
     pub(crate) fn spawn(self) -> SupervisorHandle {
         let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
-        let actor = Actor {
+        let actor = self.build(tx.clone());
+        tokio::spawn(actor.run(rx));
+        SupervisorHandle { tx }
+    }
+
+    /// Spawns the actor around a flock this image inherited rather than
+    /// started, restoring the predecessor's `counters` first.
+    ///
+    /// Every sheep in `flock` is installed under the id, epoch, status and
+    /// history the blob carried for it, around the descriptors that crossed
+    /// the `execve`. Nothing here spawns, signals or reopens anything: from
+    /// each sheep's own side the shepherd was never away.
+    ///
+    /// # Why the counters are restored before any slot is installed
+    ///
+    /// [`Actor::next_id`], [`Actor::next_deadline`] and
+    /// [`Actor::next_action_stamp`] reset to zero in every constructor, and
+    /// installing first would leave a window in which a fresh sheep could be
+    /// handed an id a caller is still holding. The three assignments below
+    /// therefore come before the loop rather than after it, and that order
+    /// is the whole of the guarantee.
+    ///
+    /// # Errors
+    ///
+    /// - [`AdoptError::Spec`] — a carried config no longer normalizes.
+    /// - [`AdoptError::Runner`] — the runner refused the inherited handles.
+    ///
+    /// Either one leaves a running process unsupervised, so a caller that
+    /// meets one refuses to boot rather than serving a flock it only half
+    /// holds: the predecessor has already `execve`d itself away by this
+    /// point, and there is no image left to hand the flock back to.
+    ///
+    /// Must be called from within a Tokio runtime context, which is where
+    /// the actor task and every adopted sheep's pump have to be spawned.
+    ///
+    /// Stated as a requirement rather than under a `# Panics` heading, which
+    /// is how the sibling [`Self::spawn`] states the identical one. IR-21
+    /// makes a `# Panics` section and `#[track_caller]` one decision, and
+    /// `#[track_caller]` buys nothing here: the panic is raised inside
+    /// `tokio::spawn`, which does not carry the attribute itself, so the
+    /// location reported would be tokio's either way.
+    #[cfg(unix)]
+    pub(crate) fn spawn_adopted(
+        self,
+        flock: Vec<AdoptedSheep>,
+        counters: Counters,
+    ) -> Result<SupervisorHandle, AdoptError> {
+        let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
+        let mut actor = self.build(tx.clone());
+        // Before the loop below, per this method's own doc.
+        actor.next_id = counters.next_id;
+        actor.next_deadline = counters.next_deadline;
+        actor.next_action_stamp = counters.next_action_stamp;
+        // One reaper for the whole adopted flock: a status can be collected
+        // once, so two reapers racing on one pid would have one take the
+        // exit and the other meet `ECHILD` with the exit already gone.
+        let reaper = Arc::new(AdoptedReaper::new());
+        for sheep in flock {
+            actor.install_adopted(sheep, &reaper)?;
+        }
+        tokio::spawn(actor.run(rx));
+        Ok(SupervisorHandle { tx })
+    }
+
+    /// The actor both spawn paths start from: no sheep, counters at zero.
+    fn build(self, tx: mpsc::Sender<Msg>) -> Actor<R> {
+        Actor {
             runner: self.runner,
             paths: self.paths,
             events: self.events,
-            tx: tx.clone(),
+            tx,
             sheep: HashMap::new(),
             next_id: 0,
             next_deadline: 0,
@@ -1481,9 +1637,66 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
             registry: ExtrasRegistry::default(),
             reloads: HashMap::new(),
             smits: Smits::new(),
-        };
-        tokio::spawn(actor.run(rx));
-        SupervisorHandle { tx }
+        }
+    }
+}
+
+/// Why a flock this image inherited could not be installed.
+///
+/// Both variants name the sheep, because that is what an operator needs in
+/// order to know which process is now unsupervised.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum AdoptError {
+    /// The config the blob carried for this sheep no longer normalizes.
+    ///
+    /// Reachable when a successor's `normalize` has tightened since the
+    /// predecessor accepted the app. Carrying the resolved spec instead
+    /// would not avoid it: the alternative to the blob is the muster roll,
+    /// which re-normalizes the identical config and meets the identical
+    /// refusal.
+    Spec {
+        /// The sheep whose config was refused.
+        sheep: String,
+        /// What `normalize` said about it.
+        source: shep_core::config::NormalizeError,
+    },
+    /// The runner would not take this sheep's inherited handles.
+    ///
+    /// A runner that never took part in a handover refuses by default, and
+    /// a real one refuses a handle it cannot wire to a pump.
+    Runner {
+        /// The sheep whose adoption was refused.
+        sheep: String,
+        /// What the runner said about it.
+        source: RunnerError,
+    },
+}
+
+#[cfg(unix)]
+impl fmt::Display for AdoptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spec { sheep, source } => {
+                write!(
+                    f,
+                    "sheep '{sheep}' carried a config that no longer validates: {source}"
+                )
+            }
+            Self::Runner { sheep, source } => {
+                write!(f, "sheep '{sheep}' could not be adopted: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl core::error::Error for AdoptError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Spec { source, .. } => Some(source),
+            Self::Runner { source, .. } => Some(source),
+        }
     }
 }
 
@@ -2431,6 +2644,23 @@ impl<R: ProcessRunner> Actor<R> {
                 self.handle_flush(&selector, reply);
                 false
             }
+            // Not rejected while `shutting_down` either, and for the same
+            // reason: a snapshot registers nothing, spawns nothing and
+            // changes no actor state. What it does with the answer is the
+            // caller's business.
+            #[cfg(unix)]
+            Command::HandoverSnapshot { fds, reply } => {
+                self.handle_handover_snapshot(fds, reply);
+                false
+            }
+            // Not rejected while `shutting_down` either, for the reason
+            // above: a question registers nothing, spawns nothing and
+            // changes no actor state.
+            #[cfg(unix)]
+            Command::HandoverFitness { reply } => {
+                self.handle_handover_fitness(reply);
+                false
+            }
             // Not rejected while `shutting_down` either, for the reason
             // above: an action registers nothing and spawns nothing. What it
             // reaches is a child the shutdown's own kill ladder is already
@@ -3191,6 +3421,218 @@ impl<R: ProcessRunner> Actor<R> {
                 Err(format!("{error}; {attempted}"))
             }
         }
+    }
+
+    /// Installs one sheep this image inherited rather than started: the
+    /// sibling to [`Self::spawn_fresh`] that puts a slot around a process
+    /// which is already running.
+    ///
+    /// Everything the blob carried comes back as it was — id, instance,
+    /// status, epoch, restart count, `last_exit` and resolved identity — and
+    /// nothing is derived a second time. Nothing here spawns, signals or
+    /// reopens anything.
+    ///
+    /// # How the spec comes back
+    ///
+    /// By re-normalizing the `AppConfig` the blob carried, exactly as
+    /// `snapshot::restorable` does on a muster. `normalize` is pure over one
+    /// of its own outputs — it reads no filesystem, and a `~/` it expanded no
+    /// longer begins with `~` — so re-normalizing a config that has already
+    /// been through it is a no-op that hands back the `ResolvedApp` proof
+    /// token. That is what removed this task's earlier binding to the muster
+    /// roll, which recorded a running COUNT per app rather than which
+    /// instance was up, and whose restore path starts what it restores.
+    ///
+    /// # Where the start time comes from
+    ///
+    /// The operating system, via
+    /// [`handover::uptime`](crate::handover::uptime). It is the one field
+    /// the blob cannot carry, and re-deriving it is what stops a sheep that
+    /// has been up three days reporting `0s` uptime the moment a successor
+    /// takes over.
+    ///
+    /// # What a sheep that is not running installs as
+    ///
+    /// A slot with no pump and no `ctl`, which is the state it was already
+    /// in. A carried sheep with no pid has no process to take over, and its
+    /// [`CarriedFds`] are `CarriedFds::none()` for that same reason; neither
+    /// is a refusal, and the fitness gate does not treat it as one.
+    ///
+    /// # Why nothing is emitted on the bus
+    ///
+    /// A `Start` or an `Online` would announce a transition to a sheep that
+    /// has been running throughout. This is the successor learning what was
+    /// already true.
+    ///
+    /// # Errors
+    ///
+    /// - [`AdoptError::Spec`] — the carried config no longer normalizes.
+    /// - [`AdoptError::Runner`] — the runner refused the inherited handles.
+    #[cfg(unix)]
+    fn install_adopted(
+        &mut self,
+        sheep: AdoptedSheep,
+        reaper: &Arc<AdoptedReaper>,
+    ) -> Result<(), AdoptError> {
+        let AdoptedSheep {
+            carried,
+            out_pipe,
+            err_pipe,
+            out_log,
+            err_log,
+        } = sheep;
+        let app = normalize(carried.app().clone()).map_err(|source| AdoptError::Spec {
+            sheep: carried.name().to_string(),
+            source,
+        })?;
+        // Reused as resolved, never re-resolved, exactly as `respawn` reuses
+        // it: the value was pinned at the predecessor's first spawn so that a
+        // later change to the passwd database could not move a running app's
+        // identity underneath it, and looking the name up again here would
+        // reintroduce the very re-lookup that pinning prevents.
+        let credentials = match carried.credentials() {
+            SpawnIdentity::Resolved(credentials) => credentials,
+            SpawnIdentity::Unresolved => None,
+        };
+        // Assembled for its log paths only, as `register_without_spawning`
+        // does: nothing is spawned here, but the entry has to name the files
+        // this sheep is writing to, and a later rotation reopens them by
+        // path.
+        let spec = assemble(&app, carried.instance(), &self.paths, credentials);
+        let id = carried.id();
+        let status = carried.status();
+        let mut entry = ProcessEntry {
+            id,
+            spec: app.clone(),
+            instance: carried.instance(),
+            status,
+            pid: carried.pid(),
+            restarts: carried.restarts(),
+            // Filled in below for a sheep with a process, and left `None`
+            // here for one without, which is what a registered-and-stopped
+            // slot carries anyway.
+            started_at: None,
+            // The counted window starts again with the successor. The
+            // restart COUNT is carried (losing it would hand a crash-looping
+            // app amnesty it did not earn), while the window it is counted
+            // over is a run of wall-clock this image did not observe.
+            budget: RestartBudget::default(),
+            // Phase 2a's fitness gate refuses to carry a flock with a reload
+            // in flight, so there is no reload state to restore.
+            reload: ReloadState::None,
+            credentials: carried.credentials(),
+            out_file: spec.out_file.clone(),
+            err_file: spec.err_file.clone(),
+            // The gate refuses any flock carrying a dog, so a carried sheep
+            // is never one, and the blob has no field for it to lose.
+            dog: None,
+            last_exit: carried.last_exit(),
+        };
+
+        let Some(pid) = carried.pid() else {
+            // Registered and not running: no pump, no `ctl`, nothing to
+            // adopt. Trying to adopt a process that is not there would be
+            // asking the reaper to wait on a pid this image never had.
+            self.sheep.insert(
+                id,
+                SheepSlot {
+                    entry,
+                    ctl: None,
+                    log_ctl: None,
+                    to_child: None,
+                    signals: None,
+                    to_stdin: None,
+                    manual: None,
+                    pending_delete: false,
+                    epoch: carried.epoch(),
+                    ready_tx: None,
+                    actions: ActionWaits::default(),
+                    ready_failed: false,
+                },
+            );
+            return Ok(());
+        };
+
+        let (proc, io) = self
+            .runner
+            .adopt(AdoptSpec {
+                pid,
+                out_file: spec.out_file.clone(),
+                err_file: spec.err_file.clone(),
+                out_pipe,
+                err_pipe,
+                out_log,
+                err_log,
+                reaper: Arc::clone(reaper),
+            })
+            .map_err(|source| AdoptError::Runner {
+                sheep: carried.name().to_string(),
+                source,
+            })?;
+        // Off the proc rather than off the blob, as both spawn paths take it:
+        // the pid this entry reports has to be the one the runner will
+        // signal, and for an adoption those are the same number by
+        // construction.
+        entry.pid = Some(proc.pid());
+        // Load-bearing, and not merely a nicer uptime: `handle_exited` reads
+        // `started_at` to decide whether an exit is a real one, and an entry
+        // without it takes the duplicate-`Msg::Exited` branch, which resolves
+        // pending replies and returns before `decide_on_exit` is ever
+        // consulted. An adopted sheep installed without it would sit
+        // `Online` forever after its process died.
+        //
+        // Derived from the operating system rather than stamped here. The
+        // blob cannot carry it: `started_at` is a `tokio::time::Instant`,
+        // which has no epoch and means nothing outside the runtime that
+        // read it. Asking the process table how old the pid is, and
+        // subtracting that from this runtime's clock, is what keeps a sheep
+        // that has been up three days reporting three days in `shep flock`'s
+        // UPTIME column instead of `0s` the moment a successor takes over.
+        entry.started_at = Some(crate::handover::uptime::started_at_of(proc.pid()));
+        let log_ctl = io.log_ctl.clone();
+        let to_child = io.to_child.clone();
+        let to_stdin = io.to_stdin.clone();
+        let handles = spawn_sheep_task::<R::Proc>(
+            id,
+            proc,
+            io,
+            app.clone(),
+            self.events.clone(),
+            self.tx.clone(),
+        );
+        self.sheep.insert(
+            id,
+            SheepSlot {
+                entry,
+                ctl: Some(handles.ctl),
+                log_ctl: Some(log_ctl),
+                to_child: Some(to_child),
+                signals: Some(handles.signals),
+                to_stdin: Some(to_stdin),
+                // The gate refuses a flock with a manual stop or a pending
+                // delete waiting on an exit, so there is no marker to carry.
+                manual: None,
+                pending_delete: false,
+                epoch: carried.epoch(),
+                // A readiness wait that was still running belonged to the
+                // predecessor's own task, which the exec took with it. An
+                // instance the blob reports as `Online` has already resolved
+                // one; one it reports as `Starting` has not, and stays
+                // `Starting` until it next exits — see this phase's residuals.
+                ready_tx: None,
+                actions: ActionWaits::default(),
+                ready_failed: false,
+            },
+        );
+        // The same arming a spawn gets on its way to `Online`, and for the
+        // same reason: a watch, a schedule or a memory limit this image did
+        // not arm is one the app quietly stops having. Only for an instance
+        // that is already serving — `went_online` makes the argument for why
+        // arming happens at that transition and not at the spawn.
+        if status == ProcStatus::Online {
+            self.arm_extras(id);
+        }
+        Ok(())
     }
 
     /// Respawns an already-registered id in place: reassembles from its
@@ -5439,6 +5881,90 @@ impl<R: ProcessRunner> Actor<R> {
         spawn_reopen_task(matched, pumps, reply);
     }
 
+    /// Reads everything a handover needs off the actor and hands it to a
+    /// task that asks each live pump for its descriptors.
+    ///
+    /// Synchronous and `&self` for the reasons [`Self::handle_reopen`] gives
+    /// at length: a descriptor report waits on a pump's flush, and awaiting
+    /// that inside the actor loop closes CRITICAL-2's cycle.
+    ///
+    /// The entries are CLONED rather than borrowed because of that split.
+    /// Nothing the actor lends can outlive the loop, and the assembly
+    /// happens after it — which is the whole reason
+    /// [`OwnedCandidate`](OwnedCandidate) exists next to
+    /// `Candidate`.
+    ///
+    /// Every registered sheep is described, with no selector: a handover
+    /// carries one process image, so the flock is carried whole or refused
+    /// whole.
+    #[cfg(unix)]
+    fn handle_handover_snapshot(
+        &self,
+        fds: DaemonFds,
+        reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
+    ) {
+        let mut drafts: Vec<HandoverDraft> = self
+            .sheep
+            .values()
+            .map(|slot| HandoverDraft {
+                entry: slot.entry.clone(),
+                // Any manual command owning this sheep's next exit, not just
+                // a `Stop`. A `Restart` or a `Delete` waiting on that exit
+                // is as unsafe to carry, and the gate refuses in the strict
+                // direction by design.
+                pending_stop: slot.manual.is_some(),
+                pending_delete: slot.pending_delete,
+                epoch: slot.epoch,
+                log_ctl: slot.log_ctl.clone(),
+            })
+            .collect();
+        // `HashMap` iteration order is arbitrary, and the blob is written to
+        // a file an operator may read: id order makes two snapshots of an
+        // unchanged flock identical.
+        drafts.sort_unstable_by_key(|draft| draft.entry.id);
+        spawn_handover_task(
+            drafts,
+            fds,
+            Counters {
+                next_id: self.next_id,
+                next_deadline: self.next_deadline,
+                next_action_stamp: self.next_action_stamp,
+            },
+            reply,
+        );
+    }
+
+    /// Answers whether every sheep this actor holds could be carried across
+    /// a handover.
+    ///
+    /// On the actor loop, unlike [`Self::handle_handover_snapshot`], and the
+    /// difference is that this awaits nothing: the gate reads slot state
+    /// already in hand, where a snapshot has to ask every log pump for its
+    /// descriptors.
+    ///
+    /// Visited in id order rather than [`HashMap`] order, so a flock with two
+    /// unsupported sheep names the same one every time it is asked. An
+    /// operator who fixes what the refusal named and asks again should meet
+    /// the next problem, not a coin flip between the two.
+    #[cfg(unix)]
+    fn handle_handover_fitness(&self, reply: oneshot::Sender<Result<Fitness, SupervisorError>>) {
+        let mut slots: Vec<&SheepSlot> = self.sheep.values().collect();
+        slots.sort_unstable_by_key(|slot| slot.entry.id);
+        let candidates: Vec<Candidate<'_>> = slots
+            .iter()
+            .map(|slot| Candidate {
+                entry: &slot.entry,
+                // Any manual command owning this sheep's next exit, exactly
+                // as `handle_handover_snapshot` reads it: the two must answer
+                // the same question, or a flock passes the gate and then
+                // fails it.
+                pending_stop: slot.manual.is_some(),
+                pending_delete: slot.pending_delete,
+            })
+            .collect();
+        let _ = reply.send(Ok(fitness(&candidates)));
+    }
+
     /// Resolves `selector` and hands every match to a task that flushes its
     /// log pump, truncates its log files and then answers the caller.
     ///
@@ -7119,6 +7645,94 @@ fn spawn_send_line_task(
     });
 }
 
+/// What a [`Command::HandoverSnapshot`] answers with: one candidate per
+/// registered sheep for the fitness gate, and the blob a successor reads.
+///
+/// A pair rather than one type because the two go to different places and
+/// only one of them crosses the exec — the candidates decide whether there
+/// is to be an exec at all, and are then done with.
+#[cfg(unix)]
+type Snapshot = (Vec<OwnedCandidate>, Handover);
+
+/// One sheep on its way from the actor to the handover task.
+///
+/// Everything here is read off a [`SheepSlot`] inside the actor loop, since
+/// nothing outside can see any of it, and carried out owned because the
+/// assembly runs on a task of its own.
+#[cfg(unix)]
+#[derive(Debug)]
+struct HandoverDraft {
+    /// The sheep's lifecycle entry, cloned off the slot.
+    entry: ProcessEntry,
+    /// Whether a manual command owns this sheep's next exit.
+    pending_stop: bool,
+    /// Whether a `Delete` targets this sheep.
+    pending_delete: bool,
+    /// The slot's respawn epoch, so a timer armed before the exec is still
+    /// recognised as stale after it.
+    epoch: u64,
+    /// This sheep's log pump, or `None` for a slot whose spawn never
+    /// succeeded.
+    log_ctl: Option<mpsc::Sender<LogCtl>>,
+}
+
+/// Spawns the task that assembles one handover snapshot and answers its
+/// caller.
+///
+/// Every await lives in here, off the actor loop — see
+/// [`Actor::handle_reopen`] for the cycle that rules out doing it inline.
+///
+/// The sheep are visited one after another rather than concurrently, exactly
+/// as [`spawn_reopen_task`] visits them, and the same trade applies: a
+/// stalled pump delays the sheep behind it, and the request's own deadline
+/// is what bounds the caller either way.
+///
+/// Must be called from within a Tokio runtime context.
+#[cfg(unix)]
+fn spawn_handover_task(
+    drafts: Vec<HandoverDraft>,
+    fds: DaemonFds,
+    counters: Counters,
+    reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
+) {
+    tokio::spawn(async move {
+        let mut candidates = Vec::with_capacity(drafts.len());
+        let mut carried = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let fds = match &draft.log_ctl {
+                Some(log_ctl) => report_fds(log_ctl).await,
+                None => CarriedFds::none(),
+            };
+            carried.push(CarriedSheep::from_entry(&draft.entry, draft.epoch, fds));
+            candidates.push(OwnedCandidate {
+                entry: draft.entry,
+                pending_stop: draft.pending_stop,
+                pending_delete: draft.pending_delete,
+            });
+        }
+        let blob = Handover::new(carried, fds, counters);
+        let _ = reply.send(Ok((candidates, blob)));
+    });
+}
+
+/// Asks one sheep's log pump to flush what it is holding and report the four
+/// descriptors it owns, and waits for the answer.
+///
+/// Not reaching a pump at all is [`CarriedFds::none`], not an error, and both
+/// shapes of it mean the same thing that [`reopen_logs`] documents: there is
+/// no pump, so there are no descriptors. A stopped sheep has nothing to
+/// carry and nothing to lose, and the fitness gate does not refuse it.
+///
+/// [`CarriedFds::none`]: CarriedFds::none
+#[cfg(unix)]
+async fn report_fds(log_ctl: &mpsc::Sender<LogCtl>) -> CarriedFds {
+    let (done, ack) = oneshot::channel();
+    if log_ctl.send(LogCtl::ReportFds { done }).await.is_err() {
+        return CarriedFds::none();
+    }
+    ack.await.unwrap_or_else(|_| CarriedFds::none())
+}
+
 /// Spawns the task that carries out one `Reopen` and answers its caller.
 ///
 /// Every await a reopen needs lives in here, off the actor loop — see
@@ -7589,6 +8203,11 @@ mod tests {
     // a case can order itself against the actor. Imported here rather than
     // beside the module's other `tokio::sync` uses, which do not need it.
     use tokio::sync::watch;
+    // Test-only: the one case that needs a real exit needs the real runner,
+    // because a scripted one would prove the fake rather than the targeted
+    // `waitpid` an adopted pid is reaped by.
+    #[cfg(unix)]
+    use crate::tokio_runner::TokioRunner;
     // Test-only: `RefusesOneSpawn` counts every spawn ATTEMPTED, which is
     // the number `ScriptedRunner`'s own counters cannot report. Aliased
     // because `Ordering` in this module already means `cmp::Ordering` to a
@@ -14574,6 +15193,12 @@ mod tests {
                                 message: PUMP_REFUSAL.to_string(),
                             }));
                         }
+                        // This runner exists for the reopen and flush
+                        // refusals; a handover never reaches it.
+                        #[cfg(unix)]
+                        LogCtl::ReportFds { done } => {
+                            let _ = done.send(CarriedFds::none());
+                        }
                     }
                 }
             });
@@ -15124,6 +15749,12 @@ mod tests {
                         }
                         LogCtl::Reopen { done } => {
                             let _ = done.send(Ok(()));
+                        }
+                        // This runner exists for the flush ordering; a
+                        // handover never reaches it.
+                        #[cfg(unix)]
+                        LogCtl::ReportFds { done } => {
+                            let _ = done.send(CarriedFds::none());
                         }
                     }
                 }
@@ -16581,5 +17212,425 @@ mod tests {
                 Ok::<(), proptest::test_runner::TestCaseError>(())
             })?;
         }
+    }
+
+    /// Two descriptors standing in for the daemon's own, so a snapshot taken
+    /// in a test names numbers that are really open rather than plausible
+    /// ones. The daemon supplies its listener and pidfile from `boot`; the
+    /// actor never learns them, which is why they are an argument.
+    #[cfg(unix)]
+    fn daemon_fds(dir: &tempfile::TempDir) -> (DaemonFds, [std::fs::File; 2]) {
+        use std::os::fd::AsRawFd as _;
+
+        let listener = std::fs::File::create(dir.path().join("listener.stand-in")).unwrap();
+        let pidfile = std::fs::File::create(dir.path().join("pidfile.stand-in")).unwrap();
+        let fds = DaemonFds {
+            listener: listener.as_raw_fd(),
+            pidfile: pidfile.as_raw_fd(),
+        };
+        // Returned alongside so the caller holds both files open: a closed
+        // descriptor's number is free to be handed to the next open.
+        (fds, [listener, pidfile])
+    }
+
+    /// Whether `fd` names something open in this process.
+    #[cfg(unix)]
+    fn is_open(fd: std::os::fd::RawFd) -> bool {
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).is_ok()
+    }
+
+    /// Fails if a snapshot of a live flock does not name four open
+    /// descriptors for every sheep in it.
+    ///
+    /// The blob is what the successor adopts by number, and a number it
+    /// cannot adopt is not a gap it can repair: losing a sheep's stdout read
+    /// end blocks the child on `write()` once the pipe buffer fills, which
+    /// reads as an application hang rather than as a shep bug.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_from_a_live_flock_names_four_open_descriptors_per_sheep() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner =
+            ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("web", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("api", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let (candidates, blob) = handle.handover_snapshot(fds).await.unwrap();
+
+        assert_eq!(candidates.len(), 2, "both sheep must reach the gate");
+        assert_eq!(blob.sheep().len(), 2);
+        for sheep in blob.sheep() {
+            for fd in sheep.fds().all() {
+                let fd = fd.expect("a running sheep has all four descriptors");
+                assert!(is_open(fd), "blob names a closed descriptor: {fd}");
+            }
+        }
+    }
+
+    /// Fails if a snapshot loses the three actor counters or the two slot
+    /// fields nothing outside the actor can see.
+    ///
+    /// These are the reason this is a command rather than a getter, and each
+    /// one is load-bearing on its own: a successor that reissued a live id
+    /// would collide with a caller still holding it, and a manual stop the
+    /// gate never saw is a flock carried while an operator is waiting on its
+    /// exit.
+    ///
+    /// The sheep here has no live pump, which is also the registered-but-not
+    /// -running case: it reports no descriptors, and that is not a refusal.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn the_snapshot_carries_the_actors_counters_and_slot_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let (mut actor, _ctl_rx) = actor_with_stopping_drainee(&dir, 4242, 7);
+        actor.sheep.get_mut(&0).unwrap().manual = Some(PendingManual {
+            kind: ManualKind::Stop,
+            origin: CommandOrigin::Operator,
+        });
+
+        let (reply, rx) = oneshot::channel();
+        actor.handle_handover_snapshot(fds, reply);
+        let (candidates, blob) = rx.await.unwrap().unwrap();
+
+        assert!(
+            candidates[0].pending_stop,
+            "a pending stop must reach the gate"
+        );
+        assert!(
+            !candidates[0].pending_delete,
+            "nothing asked for this sheep to be deleted"
+        );
+        assert!(
+            blob.next_id() > 0,
+            "a successor that reissues a live id collides"
+        );
+        assert_eq!(blob.sheep()[0].epoch(), 7, "a stale timer must stay stale");
+        assert_eq!(
+            blob.sheep()[0].fds(),
+            CarriedFds::none(),
+            "a sheep with no pump has no descriptors to carry"
+        );
+    }
+
+    /// A runner that takes an inherited sheep without a real process behind
+    /// it, so the install path can be driven under the paused clock.
+    ///
+    /// `wait` never resolves: these cases assert on what an install PUTS in
+    /// the flock, and an exit that arrived on its own would race them. The
+    /// one case that needs a real exit uses [`crate::tokio_runner::TokioRunner`]
+    /// and a real child, because a fake exit would prove the fake rather than
+    /// the reaper.
+    #[cfg(unix)]
+    #[derive(Debug, Default)]
+    struct AdoptingRunner;
+
+    /// The pid [`AdoptingRunner`] gives anything it spawns fresh, which is
+    /// deliberately not a pid any carried sheep in these cases holds.
+    #[cfg(unix)]
+    const STAND_IN_SPAWN_PID: u32 = 7000;
+
+    /// A proc with a pid and no process: it reports what it was built with
+    /// and never exits.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct StandInProc {
+        pid: u32,
+    }
+
+    #[cfg(unix)]
+    impl RunningProcess for StandInProc {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        async fn wait(&mut self) -> ExitOutcome {
+            core::future::pending().await
+        }
+
+        fn signal(&mut self, _sig: crate::runner::StopSignal) -> Result<(), RunnerError> {
+            Ok(())
+        }
+
+        fn kill_tree(&mut self) -> Result<(), RunnerError> {
+            Ok(())
+        }
+    }
+
+    /// Four channels shaped the way an adopted sheep's are: logs and
+    /// shepherd traffic closed, since nothing here writes either.
+    #[cfg(unix)]
+    fn stand_in_io() -> ProcIo {
+        let (_logs_tx, logs) = mpsc::channel(1);
+        let (_from_child_tx, from_child) = mpsc::channel(1);
+        let (to_child, to_child_rx) = mpsc::channel(1);
+        drop(to_child_rx);
+        let (log_ctl, log_ctl_rx) = mpsc::channel(1);
+        drop(log_ctl_rx);
+        let (to_stdin, to_stdin_rx) = mpsc::channel(1);
+        drop(to_stdin_rx);
+        ProcIo {
+            logs,
+            from_child,
+            to_child,
+            log_ctl,
+            to_stdin,
+        }
+    }
+
+    #[cfg(unix)]
+    impl ProcessRunner for AdoptingRunner {
+        type Proc = StandInProc;
+
+        fn spawn(&self, _spec: &SpawnSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
+            Ok((
+                StandInProc {
+                    pid: STAND_IN_SPAWN_PID,
+                },
+                stand_in_io(),
+            ))
+        }
+
+        fn adopt(
+            &self,
+            spec: crate::runner::AdoptSpec,
+        ) -> Result<(Self::Proc, ProcIo), RunnerError> {
+            Ok((StandInProc { pid: spec.pid }, stand_in_io()))
+        }
+    }
+
+    /// One sheep as a blob describes it, with `mutate` free to give it a
+    /// history no fresh registration could have.
+    #[cfg(unix)]
+    fn carried(
+        name: &str,
+        id: u32,
+        pid: Option<u32>,
+        mutate: impl FnOnce(&mut ProcessEntry),
+    ) -> CarriedSheep {
+        let mut app = AppConfig::minimal(name, "./srv");
+        // Nothing in these cases wants a respawn: the install path is what
+        // is under test, and an automatic restart would spawn a second
+        // process behind the assertions.
+        app.autorestart = false;
+        let mut entry = ProcessEntry {
+            id,
+            spec: normalize(app).unwrap(),
+            instance: 0,
+            status: ProcStatus::Online,
+            pid,
+            restarts: 0,
+            started_at: None,
+            budget: RestartBudget::default(),
+            reload: ReloadState::None,
+            credentials: SpawnIdentity::Resolved(None),
+            out_file: PathBuf::new(),
+            err_file: PathBuf::new(),
+            dog: None,
+            last_exit: None,
+        };
+        mutate(&mut entry);
+        CarriedSheep::from_entry(&entry, 0, CarriedFds::none())
+    }
+
+    /// A carried sheep with no descriptors to rebuild, which is every case
+    /// below that does not open real pipes.
+    #[cfg(unix)]
+    fn without_handles(carried: CarriedSheep) -> crate::handover::adopt::AdoptedSheep {
+        crate::handover::adopt::AdoptedSheep {
+            carried,
+            out_pipe: None,
+            err_pipe: None,
+            out_log: None,
+            err_log: None,
+        }
+    }
+
+    /// Counters as a blob carries them, with `next_id` the one a case cares
+    /// about.
+    #[cfg(unix)]
+    const fn counters(next_id: u32) -> Counters {
+        Counters {
+            next_id,
+            next_deadline: 0,
+            next_action_stamp: 0,
+        }
+    }
+
+    /// Every row of a listing by id, which is the order these cases name
+    /// their sheep in.
+    #[cfg(unix)]
+    fn by_id(mut info: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+        info.sort_unstable_by_key(|row| row.id);
+        info
+    }
+
+    /// Fails if an installed flock does not come back under the pids and ids
+    /// the blob named.
+    ///
+    /// The blob's whole purpose. A sheep whose pid moved was respawned, and
+    /// this phase exists to not do that.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_flock_keeps_its_pids_and_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried("web", 7, Some(4242), |_| {})),
+                    without_handles(carried("api", 8, Some(4243), |_| {})),
+                ],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        let info = by_id(sup.list().await);
+
+        assert_eq!(
+            info.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![7, 8],
+            "the successor reissued ids instead of carrying them"
+        );
+        assert_eq!(
+            info.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            vec![Some(4242), Some(4243)],
+            "a sheep whose pid moved was respawned"
+        );
+    }
+
+    /// Fails if an adopted sheep comes back without the history the blob
+    /// carried for it.
+    ///
+    /// Losing these is silent. RESTARTS resetting to zero hands a
+    /// crash-looping app amnesty it did not earn, and a lost `last_exit`
+    /// answers "why did it stop" with nothing.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_sheep_keeps_its_counters_and_last_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, Some(4242), |entry| {
+                    entry.restarts = 4;
+                    entry.last_exit = Some(ExitInfo {
+                        code: Some(2),
+                        signal: None,
+                    });
+                }))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        let info = sup.list().await;
+
+        assert_eq!(info[0].restarts, 4, "the restart count was reset");
+        assert_eq!(
+            info[0].last_exit,
+            Some(ExitInfo {
+                code: Some(2),
+                signal: None
+            }),
+            "the last exit was lost"
+        );
+    }
+
+    /// Fails if an adopted sheep's exit never reaches the ordinary path.
+    ///
+    /// The one that proves the reaper is actually wired. An adopted sheep
+    /// that exits must reach `handle_exited` and be judged by
+    /// `decide_on_exit` like any other, not sit there `Online` forever.
+    ///
+    /// A real child and the real runner, because a scripted exit would prove
+    /// the fake rather than the targeted `waitpid` an adopted pid needs.
+    /// `/bin/sh` is spawned by `std::process::Command`, so tokio holds no
+    /// `Child` for it and nothing but the reaper will ever wait on it —
+    /// exactly how a sheep reaches a successor.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The child is deliberately never `Child::wait()`ed on: that is the shape
+    // under test. An adopted sheep reaches a successor as a bare pid with no
+    // handle to wait through, and a `wait()` added here would take the status
+    // the supervisor is supposed to collect.
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the adopted flock's reaper collects this status; a Child::wait would take it first"
+    )]
+    async fn an_adopted_sheeps_exit_flows_through_the_ordinary_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("a test host can spawn a shell");
+        let pid = child.id();
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, Some(pid), |_| {}))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap()),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("the adopted child is signalable");
+
+        let info = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let info = sup.list().await;
+                if info[0].status == ProcStatus::Stopped {
+                    return info;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an adopted sheep's exit reaches the actor");
+
+        assert_eq!(
+            info[0].last_exit,
+            Some(ExitInfo {
+                code: None,
+                signal: Some(9)
+            }),
+            "the exit must be recorded, not lost"
+        );
+    }
+
+    /// Fails if a successor hands a fresh sheep an id a caller is still
+    /// holding.
+    ///
+    /// Counters restored BEFORE any slot is installed. A successor that
+    /// starts `next_id` at zero hands a new sheep an id the predecessor
+    /// already gave out.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn the_successor_does_not_reissue_a_live_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, Some(4242), |_| {}))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        let fresh = sup
+            .start(vec![normalize(AppConfig::minimal("api", "./srv")).unwrap()])
+            .await
+            .expect("a fresh app starts under a successor");
+
+        assert!(fresh[0].id >= 9, "reissued a live id: {}", fresh[0].id);
     }
 }

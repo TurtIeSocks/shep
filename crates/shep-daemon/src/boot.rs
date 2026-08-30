@@ -309,15 +309,72 @@ pub(crate) fn read_pidfile(paths: &ShepPaths) -> Result<Option<u32>, BootError> 
 /// `ERROR_SHARING_VIOLATION`. Both are immediate — this is the one lock in
 /// the workspace that must NOT wait, unlike the kv and bark rings, whose
 /// Windows arms retry precisely because their unix arms block.
+///
+/// # The adopted arm
+///
+/// A successor does not take this lock: it inherits the descriptor that
+/// already holds it. See [`UnixLock`] for why it must not take it again.
 #[derive(Debug)]
 struct PidfileLock {
     #[cfg(unix)]
-    flock: nix::fcntl::Flock<std::fs::File>,
+    flock: UnixLock,
     /// The sibling lock file, held open with every share flag cleared.
     /// Named with a leading underscore because it is held, never read —
     /// [`PidfileLock::record`] writes the pidfile itself.
     #[cfg(windows)]
     _handle: std::fs::File,
+}
+
+/// How this process came to hold the pidfile's `flock`, which is the one
+/// thing the two ways of starting a shepherd differ on.
+///
+/// # Why an adopted descriptor is never re-locked
+///
+/// A `flock` lock belongs to the open file DESCRIPTION, not to the process
+/// and not to the path, so it crosses an `execve` still held: a successor
+/// inherits the descriptor and the lock on it in one act, before it runs a
+/// line of its own code. Taking the lock again would mean releasing it
+/// first, since `nix` offers no constructor for an already-locked file that
+/// does not lock it, and that window is exactly long enough for a second
+/// daemon to claim this `$SHEP_HOME` while the only process supervising its
+/// flock is mid-boot. So the adopted arm holds the file and does nothing
+/// else with it.
+///
+/// The release rules stay identical either way. The kernel drops the lock
+/// when the last descriptor on the description closes, process death
+/// included, so a successor that crashes leaves the home claimable exactly
+/// as a predecessor that crashed did.
+#[cfg(unix)]
+#[derive(Debug)]
+enum UnixLock {
+    /// Taken here, by this process, with `flock(LOCK_EX | LOCK_NB)`.
+    Taken(nix::fcntl::Flock<std::fs::File>),
+    /// Inherited across a handover `execve`, still locked, never re-locked.
+    Adopted(std::fs::File),
+}
+
+#[cfg(unix)]
+impl UnixLock {
+    /// The locked pidfile itself, which [`PidfileLock::record`] writes
+    /// through.
+    fn file(&mut self) -> &mut std::fs::File {
+        match self {
+            Self::Taken(flock) => flock,
+            Self::Adopted(file) => file,
+        }
+    }
+
+    /// The descriptor carrying the lock, for the blob a handover hands on.
+    ///
+    /// Borrowed, never owned. Closing this would release the `flock` that is
+    /// the only thing keeping a second daemon out of this `$SHEP_HOME`.
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        match self {
+            Self::Taken(flock) => flock.as_raw_fd(),
+            Self::Adopted(file) => file.as_raw_fd(),
+        }
+    }
 }
 
 /// The sibling file the Windows arm locks: the pidfile with `.lock` appended.
@@ -358,7 +415,9 @@ impl PidfileLock {
                 source,
             })?;
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(flock) => Ok(Self { flock }),
+            Ok(flock) => Ok(Self {
+                flock: UnixLock::Taken(flock),
+            }),
             Err((_file, nix::errno::Errno::EWOULDBLOCK)) => Err(BootError::AlreadyRunning {
                 pid: read_pidfile(paths)?,
             }),
@@ -447,12 +506,39 @@ impl PidfileLock {
             .map_err(|source| BootError::Io { path, source })
     }
 
+    /// Holds a pidfile descriptor this image inherited, already locked.
+    ///
+    /// Nothing here locks, unlocks, truncates or writes. `file` crossed an
+    /// `execve` from the predecessor with its `flock` intact, and taking
+    /// ownership of it is the whole job: it keeps the descriptor open for
+    /// the rest of this process's life, which is what keeps the lock held.
+    /// See [`UnixLock`] for why re-acquiring would be a bug rather than
+    /// belt and braces.
+    ///
+    /// The pidfile's contents need no update either. An `execve` keeps the
+    /// pid, so the number the predecessor recorded is this process's own.
+    #[cfg(unix)]
+    fn from_locked(file: std::fs::File) -> Self {
+        Self {
+            flock: UnixLock::Adopted(file),
+        }
+    }
+
+    /// The descriptor the lock lives on, for a handover blob to name.
+    ///
+    /// See [`UnixLock::as_raw_fd`]: borrowed, and closing it would hand this
+    /// `$SHEP_HOME` to whoever asks next.
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.flock.as_raw_fd()
+    }
+
     #[cfg(unix)]
     fn record(&mut self, paths: &ShepPaths, pid: u32) -> Result<(), BootError> {
         use std::io::{Seek, SeekFrom, Write};
 
         let path = pidfile(paths);
-        let file = &mut *self.flock;
+        let file = self.flock.file();
         file.set_len(0).map_err(|source| BootError::Io {
             path: path.clone(),
             source,
@@ -469,6 +555,121 @@ impl PidfileLock {
             })?;
         file.sync_all()
             .map_err(|source| BootError::Io { path, source })
+    }
+}
+
+/// The handover blob this process was handed, if it is a successor.
+///
+/// A successor is a shep image an outgoing daemon `execve`d in its own
+/// place, handing it a live flock. Its only marker is `SHEP_HANDOVER` in the
+/// environment, naming the blob to adopt; an image started any other way has
+/// no variable, no blob, and boots normally.
+///
+/// # Why a refusal is not an error
+///
+/// By the time this runs the predecessor has already replaced itself, so
+/// there is no image left to fall back to and no stop arm to take. That
+/// leaves exactly two outcomes for a blob that cannot be used, and this
+/// function chooses the second:
+///
+/// 1. refuse to boot at all, which leaves the operator no shepherd and a
+///    flock nothing is watching;
+/// 2. say so at `error` level and continue as an ordinary boot, which is
+///    correct for the case this actually happens in.
+///
+/// The case it actually happens in is a STALE VARIABLE: something inherited
+/// `SHEP_HANDOVER` from a process that has long since finished its handover,
+/// and the blob it names was unlinked at the time. There is no live flock
+/// behind it, and a fresh boot is exactly right.
+///
+/// A genuinely lost blob is the other case, and it is self-limiting rather
+/// than dangerous. A real successor inherited the pidfile descriptor too,
+/// with its `flock` still held, so the fresh boot this returns to cannot
+/// take that lock and stops at [`BootError::AlreadyRunning`] before it
+/// restores a thing. The one way a fresh boot proceeds is the one way it
+/// should: no pidfile descriptor was inherited, so this was never a real
+/// handover.
+///
+/// Silence is the outcome neither case may have, which is why every refusal
+/// logs at `error` with the blob's path and what was wrong with it.
+///
+/// Unix only, as the whole handover is: Windows has no `execve`, so
+/// `Arm::for_daemon` never chooses a handover there and no image can be a
+/// successor.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn successor_handover() -> Option<Successor> {
+    let path = PathBuf::from(std::env::var_os(crate::handover::HANDOVER_ENV)?);
+    let blob = successor_handover_at(&path)?;
+    Some(Successor { path, blob })
+}
+
+/// Rebuild everything a successor was handed: the lock, the listener, and
+/// every sheep's plumbing.
+///
+/// The blob is removed once its descriptors are adopted, and only then. One
+/// left behind after a refusal is evidence an operator can read; one left
+/// after a success is a picture of a handover that has already happened, and
+/// the next boot would adopt it again.
+///
+/// # Errors
+///
+/// - [`BootError::Adopt`]: a descriptor the blob names is not open in this
+///   process, or is not the kind of object it was named as.
+///
+/// There is no partial success and no fallback here. By the time this runs
+/// the predecessor has already `execve`d itself away, so there is no image
+/// left to hand the flock back to: a successor that cannot rehydrate refuses
+/// to boot rather than serving a flock it only half holds, and the operator's
+/// own `shep daemon reload` starts one in its place.
+#[cfg(unix)]
+fn rehydrate(carried: Successor, paths: &ShepPaths) -> Result<Rehydrated, BootError> {
+    let Successor { path, blob } = carried;
+    let counters = blob.counters();
+    let adopted = crate::handover::adopt::adopt(&blob)
+        .map_err(|source| BootError::Adopt(source.to_string()))?;
+    crate::handover::adopt::discard_blob(&path);
+    let _ = paths;
+    Ok((
+        PidfileLock::from_locked(adopted.pidfile),
+        Listener::from_unix_listener(adopted.listener),
+        (adopted.sheep, counters),
+    ))
+}
+
+/// A handover blob, and where it was read from.
+///
+/// The path is kept because the successor unlinks the blob once it has
+/// adopted what it describes, and only then: a blob left behind after a
+/// refusal is evidence, while one left behind after a success would be
+/// adopted again by the next boot.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct Successor {
+    /// Where the blob was read from.
+    pub path: PathBuf,
+    /// What it said.
+    pub blob: crate::handover::Handover,
+}
+
+/// [`successor_handover`], against a caller-named path.
+///
+/// Split out so a test can drive every refusal without touching the
+/// environment, which is process-global and, since edition 2024, unsafe to
+/// write.
+#[cfg(unix)]
+fn successor_handover_at(path: &Path) -> Option<crate::handover::Handover> {
+    match crate::handover::Handover::read(path) {
+        Ok(blob) => Some(blob),
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                %error,
+                "this process was handed a handover blob it cannot use, and is booting as if \
+                 it were fresh; if a flock was running, it is no longer supervised"
+            );
+            None
+        }
     }
 }
 
@@ -827,6 +1028,26 @@ pub struct BootOptions {
     /// `crate::snapshot::FlockRegistry::clear`'s own doc for the shutdown
     /// gap this closes.
     pub delete_flock_on_shutdown: bool,
+    /// Let SIGHUP replace this process's image with a successor holding the
+    /// same flock, rather than stopping gracefully.
+    ///
+    /// `true` for every boot the `shep` binary performs, which is what makes
+    /// `shep daemon reload` a handover rather than a stop-and-start.
+    ///
+    /// **Defaults to `false`, and the default is the safe direction rather
+    /// than the polite one.** A handover `execve`s the file this process was
+    /// launched from, so it is only ever correct where that file IS the shep
+    /// binary. A test harness, or any program embedding this crate, is
+    /// launched from something else entirely, and a SIGHUP there would
+    /// replace the whole program with a fresh copy of itself, which is not a
+    /// subtle failure but a process that re-runs from the top forever.
+    /// A caller that opts in is asserting it is the shepherd binary.
+    ///
+    /// The graceful stop is what a boot that has not opted in does with
+    /// SIGHUP, which is also what a handover that cannot proceed falls back
+    /// to. Unix only in effect: Windows has no `execve` and every arm of the
+    /// reload there is a stop-and-start (spec H5).
+    pub handover: bool,
 }
 
 /// Brings the daemon up: signal handlers, layout, roll restore, bus,
@@ -888,6 +1109,15 @@ pub async fn boot<R: ProcessRunner>(
     paths: ShepPaths,
     mut options: BootOptions,
 ) -> Result<RunningDaemon, BootError> {
+    // Before anything else, because it reads the current directory and
+    // that is only the startup directory until something moves it. A
+    // handover execs this path rather than `current_exe()`; see
+    // `handover::exec_target` for why those differ exactly when an
+    // operator has upgraded. `#[cfg(unix)]` because the whole handover
+    // module is: Windows has no `execve` and takes the stop arm.
+    #[cfg(unix)]
+    crate::handover::record_launch_path();
+
     // Copied out up front, purely a `bool`, so nothing later in this fn has
     // to remember to read it off `options` before that struct is consumed.
     let delete_flock_on_shutdown = options.delete_flock_on_shutdown;
@@ -896,6 +1126,10 @@ pub async fn boot<R: ProcessRunner>(
     //    observable) exists — see this fn's own doc.
     let (shutdown, shutdown_rx) = watch::channel(false);
     let shutdown = Arc::new(shutdown);
+    #[cfg(unix)]
+    let (signals, connect_supervisor, connect_handover) =
+        install_signals(Arc::clone(&shutdown), paths.clone())?;
+    #[cfg(windows)]
     let (signals, connect_supervisor) = install_signals(Arc::clone(&shutdown), paths.clone())?;
 
     // 2. Layout, then claim exclusive ownership of $SHEP_HOME BEFORE
@@ -905,9 +1139,26 @@ pub async fn boot<R: ProcessRunner>(
     //    bind-and-recover sequence, and for the rest of this daemon's life
     //    (kept in `RunningDaemon`, dropped only at the end of `run`).
     init_dirs(&paths)?;
-    let mut pidfile_lock = PidfileLock::acquire(&paths)?;
     let socket = socket_path(&paths, options.socket.as_deref());
-    let listener = bind_socket(&paths, &socket)?;
+    // A successor takes neither the lock nor the address: it inherited both,
+    // still held, in the same act that made it this process. Rebinding would
+    // race the predecessor's own socket file and lose whatever connection a
+    // client had already made, and re-locking would mean releasing first.
+    #[cfg(unix)]
+    let (mut pidfile_lock, listener, inherited) = match successor_handover() {
+        Some(carried) => {
+            let (lock, listener, flock) = rehydrate(carried, &paths)?;
+            (lock, listener, Some(flock))
+        }
+        None => (
+            PidfileLock::acquire(&paths)?,
+            bind_socket(&paths, &socket)?,
+            None,
+        ),
+    };
+    #[cfg(windows)]
+    let (mut pidfile_lock, listener) =
+        (PidfileLock::acquire(&paths)?, bind_socket(&paths, &socket)?);
     let pid = std::process::id();
     pidfile_lock.record(&paths, pid)?;
 
@@ -949,9 +1200,34 @@ pub async fn boot<R: ProcessRunner>(
     // baseline, the RPC layer reads a live sample against it, and a second
     // state would leave one of the two reading an empty watch set.
     let stats = Arc::clone(&extras.stats);
-    let supervisor = SupervisorBuilder::new(runner, paths.clone(), events.clone())
-        .extras(extras)
-        .spawn();
+    let builder = SupervisorBuilder::new(runner, paths.clone(), events.clone()).extras(extras);
+    // A successor installs the flock it inherited rather than spawning one:
+    // every sheep keeps the pid, the id, the epoch and the history it had a
+    // moment ago, and nothing here signals, spawns or reopens anything. From
+    // each sheep's own side the shepherd was never away.
+    #[cfg(unix)]
+    let mut carried_apps = Vec::new();
+    // Read before the match consumes `inherited`, and deliberately not
+    // derived from `carried_apps` afterwards: a successor that inherited an
+    // EMPTY flock is still a successor, and the two are only the same
+    // question when the predecessor had at least one sheep. See the restore
+    // guard below for what the difference costs.
+    #[cfg(unix)]
+    let inherited_flock = inherited.is_some();
+    #[cfg(unix)]
+    let supervisor = match inherited {
+        Some((flock, counters)) => {
+            // Read before the flock is moved: the registry below is rebuilt
+            // from these, and the roll would otherwise be written empty.
+            carried_apps.extend(flock.iter().map(|sheep| sheep.carried.app().clone()));
+            builder
+                .spawn_adopted(flock, counters)
+                .map_err(|source| BootError::Adopt(source.to_string()))?
+        }
+        None => builder.spawn(),
+    };
+    #[cfg(windows)]
+    let supervisor = builder.spawn();
     // Ordered, not stylistic: the reporter needs the handle the builder
     // returns, and the actor must never own a receiver a subsystem feeds.
     //
@@ -978,9 +1254,45 @@ pub async fn boot<R: ProcessRunner>(
     // still alive.
     let _ = connect_supervisor.send(supervisor.clone());
 
+    // The other half of step 1's SIGHUP task, parked on this since before
+    // the socket existed. It carries the two descriptors a handover blob has
+    // to name, which only this function knows: an fd number means nothing
+    // outside the process that owns it, and the supervisor has never seen
+    // either of them.
+    #[cfg(unix)]
+    let _ = connect_handover.send(options.handover.then(|| HandoverSeam {
+        supervisor: supervisor.clone(),
+        fds: crate::handover::DaemonFds {
+            listener: listener.as_raw_fd(),
+            pidfile: pidfile_lock.as_raw_fd(),
+        },
+        paths: paths.clone(),
+    }));
+
     let registry = FlockRegistry::new();
 
-    if options.restore {
+    // A successor rebuilds the registry from the blob rather than from the
+    // roll, and skips the restore entirely. Both halves matter. The registry
+    // is what the snapshot writer builds the muster roll from, so a
+    // successor that left it empty would overwrite a good roll with an empty
+    // one within seconds of taking over. And a restore would START whatever
+    // the roll records as running, which for a flock that never stopped
+    // means a second copy of every sheep that happens to be down.
+    //
+    // An EMPTY inherited flock is the case that makes `inherited_flock` a
+    // fact about the boot rather than a count of the sheep. `shep daemon
+    // reload` against an idle shepherd carries nothing, and a handover skips
+    // the predecessor's teardown, so the roll on disk is whatever the last
+    // periodic write left. Deriving the flag from `carried_apps` would run
+    // the restore there and start sheep that had just been deleted.
+    #[cfg(unix)]
+    for app in &carried_apps {
+        registry.record_config(app);
+    }
+    #[cfg(windows)]
+    let inherited_flock = false;
+
+    if options.restore && !inherited_flock {
         restore_flock(&paths, &registry, &supervisor).await?;
     }
 
@@ -1470,7 +1782,7 @@ fn install_signals(
 fn install_signals(
     shutdown: Arc<watch::Sender<bool>>,
     paths: ShepPaths,
-) -> Result<(SignalTasks, oneshot::Sender<SupervisorHandle>), BootError> {
+) -> Result<InstalledSignals, BootError> {
     let mut signals = SignalTasks {
         tasks: Vec::with_capacity(4),
     };
@@ -1479,13 +1791,6 @@ fn install_signals(
         SignalKind::terminate(),
         SignalKind::interrupt(),
         SignalKind::quit(),
-        // SIGHUP is here as a floor, not as its final meaning. It becomes
-        // the handover trigger, and until it does its kernel default is an
-        // unhandled terminate that would drop the flock's pipes rather than
-        // walk the ladder. A daemon that treats it as a graceful stop can be
-        // signalled by a newer client without the flock paying for the
-        // version gap.
-        SignalKind::hangup(),
     ] {
         // An early return here drops `signals`, whose own `Drop` aborts
         // every task already pushed — registering the 2nd or 3rd kind
@@ -1526,6 +1831,67 @@ fn install_signals(
         }));
     }
 
+    // SIGHUP is the handover trigger, and it is a signal rather than a
+    // request for the reason spec H3 gives: the case that most needs a
+    // reload is the one where the daemon refuses the client at the
+    // handshake, and a remedy delivered over the channel it is meant to
+    // repair is not a remedy. It has its own task rather than riding in the
+    // loop above, because the two dispositions are different: the shutdown
+    // signals stop this daemon, and this one replaces it.
+    //
+    // The graceful stop stays as the arm taken when a handover cannot
+    // proceed. SIGHUP's kernel default is an unhandled terminate that would
+    // drop the flock's pipes rather than walk the ladder, so a stray or
+    // mistaken one, or one whose handover is refused, must still end the way
+    // every other shutdown signal does.
+    let mut hup = signal(SignalKind::hangup()).map_err(|source| BootError::Io {
+        path: paths.home.clone(),
+        source,
+    })?;
+    let (connect_handover, handover_rx) = oneshot::channel::<Option<HandoverSeam>>();
+    let hup_shutdown = Arc::clone(&shutdown);
+    signals.tasks.push(tokio::spawn(async move {
+        // Parked until `boot` reaches step 4, exactly as the SIGUSR2 task
+        // below is, and for the same reason: the descriptors and the
+        // supervisor a handover needs do not exist when signals are
+        // installed. A signal that arrives before then is buffered by the
+        // stream, which was registered above.
+        //
+        // `None` is a boot that did not arm the handover
+        // ([`BootOptions::handover`]), and an `Err` is a boot that never got
+        // that far. Both mean this task has no image to hand anything to,
+        // and both still have to answer SIGHUP: its kernel default is an
+        // unhandled terminate, so a task that simply returned here would
+        // leave a stray signal killing the daemon outright and dropping
+        // every sheep's pipes.
+        let seam = handover_rx.await.ok().flatten();
+        // `if`, not `while`: this task handles at most one SIGHUP, unlike
+        // the shutdown listeners above, which stay armed for the process's
+        // life. On the success arm there is no image left to loop in, and on
+        // every other arm this daemon is now stopping, and a second SIGHUP
+        // during that teardown would find the same graceful stop already
+        // underway.
+        if hup.recv().await.is_some() {
+            let refusal = match &seam {
+                Some(seam) => match hand_over_now(seam).await {
+                    // No successor statement on the success arm, because
+                    // there is no successor image running this code.
+                    Ok(never) => match never {},
+                    Err(refusal) => refusal,
+                },
+                None => "this shepherd was not booted with the handover armed".to_string(),
+            };
+            tracing::warn!(
+                %refusal,
+                "SIGHUP: this flock could not be handed to a successor; stopping gracefully \
+                 instead. This line may be the only record of the reason: a signal carries no \
+                 sender, and the case this gate exists for is a flock that changed between a \
+                 client's question and the signal, where that client was told nothing"
+            );
+            let _ = hup_shutdown.send(true);
+        }
+    }));
+
     let mut usr2 = signal(SignalKind::user_defined2()).map_err(|source| BootError::Io {
         path: paths.home.clone(),
         source,
@@ -1534,6 +1900,7 @@ fn install_signals(
     signals.tasks.push(tokio::spawn(async move {
         // Parked until `boot` reaches step 4 — see this fn's own doc for why
         // the wait loses no signal, and for what an `Err` here means.
+
         let Ok(supervisor) = supervisor_rx.await else {
             return;
         };
@@ -1561,7 +1928,86 @@ fn install_signals(
         }
     }));
 
-    Ok((signals, connect_supervisor))
+    Ok((signals, connect_supervisor, connect_handover))
+}
+
+/// What [`install_signals`] hands back: the live listener tasks, and the two
+/// senders that connect them to state `boot` has not built yet.
+///
+/// The SIGUSR2 task needs a [`SupervisorHandle`] to reopen through, and the
+/// SIGHUP task needs a whole [`HandoverSeam`] or the `None` that says this
+/// boot did not arm one. Both are parked on their receivers from the moment
+/// the handlers are installed, which is before the socket exists.
+#[cfg(unix)]
+type InstalledSignals = (
+    SignalTasks,
+    oneshot::Sender<SupervisorHandle>,
+    oneshot::Sender<Option<HandoverSeam>>,
+);
+
+/// What [`rehydrate`] rebuilds from a blob: the home's lock, the control
+/// listener, and the flock to install with the counters it ran under.
+#[cfg(unix)]
+type Rehydrated = (
+    PidfileLock,
+    Listener,
+    (
+        Vec<crate::handover::adopt::AdoptedSheep>,
+        crate::handover::Counters,
+    ),
+);
+
+/// Everything the SIGHUP task needs to replace this daemon's image.
+///
+/// A struct handed over a channel rather than three arguments, because none
+/// of it exists when [`install_signals`] runs: the descriptors are opened
+/// two steps later and the supervisor a step after that.
+///
+/// `Debug` is derived and carries nothing sensitive: two descriptor numbers,
+/// a mailbox and the home's own paths. The blob those descriptors end up in
+/// is a different matter and does carry each sheep's environment; see
+/// [`crate::handover::Handover`]'s own doc for what protects it.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct HandoverSeam {
+    /// The flock to carry.
+    supervisor: SupervisorHandle,
+    /// The daemon's own two descriptors, which the actor never sees.
+    fds: crate::handover::DaemonFds,
+    /// The home, for the blob's path.
+    paths: ShepPaths,
+}
+
+/// Replace this process with a successor holding `seam`'s flock.
+///
+/// The gate runs HERE as well as in the client that asked before signalling,
+/// and both are load-bearing. The client asks so that a refusal reaches the
+/// operator and the flock is stopped-and-started rather than left down (spec
+/// H3a); this one asks because a signal is a signal: anyone can send one,
+/// peer input is untrusted, and the flock can change between the question
+/// and the signal.
+///
+/// # Errors
+///
+/// The sentence to log, when the flock cannot be carried, when the actor is
+/// gone, or when the exec itself failed. Every one of them leaves this
+/// process still itself, with no blob on disk, and the caller falls back to
+/// a graceful stop.
+#[cfg(unix)]
+async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible, String> {
+    let (candidates, blob) = seam
+        .supervisor
+        .handover_snapshot(seam.fds)
+        .await
+        .map_err(|err| format!("the supervisor could not describe its flock: {err}"))?;
+    let borrowed: Vec<crate::handover::Candidate<'_>> = candidates
+        .iter()
+        .map(crate::handover::OwnedCandidate::as_candidate)
+        .collect();
+    if let crate::handover::Fitness::Refused(reason) = crate::handover::fitness(&borrowed) {
+        return Err(reason.to_string());
+    }
+    crate::handover::hand_over(&blob, &seam.paths).map_err(|err| err.to_string())
 }
 
 /// Error type returned from this module's boot steps
@@ -1581,6 +2027,16 @@ fn install_signals(
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum BootError {
+    /// A flock this image inherited across a handover could not be
+    /// installed.
+    ///
+    /// The descriptor a blob named is not open here, is not the kind of
+    /// object it was named as, or the supervisor would not take it. A
+    /// `String` rather than the underlying error, because the two sources
+    /// are different types in different modules and neither is part of this
+    /// crate's public surface; what a caller needs is the sentence naming
+    /// which sheep is now unsupervised.
+    Adopt(String),
     /// A filesystem step failed (carries the path and the OS error)
     ///
     /// Deliberately has no `From<std::io::Error>`, and neither does any
@@ -1648,6 +2104,15 @@ impl fmt::Display for BootError {
                 path.display()
             ),
             Self::ReadyWrite(err) => write!(f, "writing the readiness line failed: {err}"),
+            Self::Adopt(reason) => write!(
+                f,
+                "this shepherd was handed a flock it could not take over: {reason}. The flock is \
+                 still running and nothing is supervising it. `shep daemon reload` is not the \
+                 way back: it needs a live shepherd to ask and to signal, and this process is \
+                 about to exit without ever serving. It holds the pidfile until it does, so the \
+                 home is claimable straight afterwards and `shep muster` starts a shepherd from \
+                 the roll"
+            ),
         }
     }
 }
@@ -1662,6 +2127,9 @@ impl core::error::Error for BootError {
             Self::SocketPathTooLong { .. } => None,
             Self::Snapshot(err) => Some(err),
             Self::ReadyWrite(err) => Some(err),
+            // No source: both underlying types are module-private, so the
+            // sentence is the whole report (see the variant's own doc).
+            Self::Adopt(_) => None,
         }
     }
 }
@@ -1797,6 +2265,74 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// fails if adopting the pidfile descriptor ever leaves the lock free.
+    ///
+    /// The failure it prevents: an arm that re-locked would have to release
+    /// first, and that window is exactly long enough for a second daemon to
+    /// win this home while the only one supervising its flock is mid-boot.
+    ///
+    /// What makes the assertion possible at all is that `flock` conflicts
+    /// between separate open file DESCRIPTIONS even inside one process, so
+    /// this process can ask for the lock it already holds and be refused.
+    ///
+    /// `mem::forget` plus `sys::adopt_handover_fd` stands in for the
+    /// `execve` a successor arrives through, and is as close to it as one
+    /// process can get: forgetting the lock skips the `flock(fd, LOCK_UN)`
+    /// its drop would run, exactly as an exec does, and adopting the number
+    /// back gives the descriptor a single new owner, exactly as the
+    /// successor gives it one. Duplicating it instead would leave a second
+    /// descriptor holding the same lock, and both assertions below would
+    /// then hold whatever the adopted arm did with its own.
+    #[test]
+    fn the_adopted_pidfile_arm_does_not_release_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+
+        let mut held = PidfileLock::acquire(&paths).expect("the predecessor must win");
+        let fd = std::os::fd::AsRawFd::as_raw_fd(held.flock.file());
+        core::mem::forget(held);
+        let inherited = crate::sys::adopt_handover_fd(fd)
+            .expect("the successor adopts the number the blob named");
+
+        let adopted = PidfileLock::from_locked(inherited);
+        let refusal = PidfileLock::acquire(&paths)
+            .expect_err("the lock must never be free while a successor holds it");
+        assert!(
+            matches!(refusal, BootError::AlreadyRunning { .. }),
+            "a contended lock must report AlreadyRunning, got {refusal:?}"
+        );
+
+        // And it is a lock rather than a descriptor nobody can ever release:
+        // a successor that exits closes the only handle left, and the kernel
+        // frees the home for the next daemon.
+        //
+        // Retried rather than demanded on the first attempt, for the reason
+        // `stale_socket_leftover` spells out at length a few tests below: a
+        // `fork` copies the whole descriptor table, so any child another test
+        // in this binary spawns concurrently holds a duplicate of this
+        // descriptor until its own `exec` runs — and a duplicate holds the
+        // `flock` with it. That is a lying fixture rather than a lock this
+        // arm failed to release, and it was reproducible the moment a
+        // supervisor test began spawning a real child. The assertion is
+        // unweakened: the home must become claimable, and a lock genuinely
+        // still held fails this loop just as flatly as it failed the single
+        // attempt.
+        drop(adopted);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let claimed = loop {
+            match PidfileLock::acquire(&paths) {
+                Ok(claimed) => break claimed,
+                Err(error) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "a successor that exits must leave the home claimable: {error:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(claimed);
     }
 
     /// Serializes every test in this module that calls `boot()` and expects
@@ -2815,11 +3351,20 @@ mod tests {
 
     #[tokio::test]
     async fn sighup_triggers_the_same_graceful_shutdown() {
-        // Task 3 (2026-08-29): SIGHUP's default disposition is to
-        // terminate the process, and this handler is what replaces that
-        // default. Phase 2 makes SIGHUP the handover trigger; until it
-        // does, a stray or mistaken SIGHUP must still walk the same
-        // graceful path SIGTERM does rather than drop the flock's pipes.
+        // SIGHUP's default disposition is to terminate the process, and
+        // this handler is what replaces that default. SIGHUP is the
+        // handover trigger now, but a boot that has not opted in
+        // (`BootOptions::handover`, left `false` by the default below) has
+        // no successor to become, and a stray or mistaken SIGHUP must still
+        // walk the same graceful path SIGTERM does rather than drop the
+        // flock's pipes.
+        //
+        // That default is also what keeps this test from replacing the test
+        // binary with a fresh copy of itself, which is what an opted-in boot
+        // would do here: `exec_target` resolves the file this process was
+        // launched from, and in a test that file is the harness. See
+        // `BootOptions::handover`'s own doc.
+        //
         // Mirrors `sigterm_triggers_the_same_graceful_shutdown` above —
         // see that test's own comments for why raising a real signal here
         // is safe only because the handler is installed first, and for
@@ -2845,6 +3390,74 @@ mod tests {
         assert!(!paths.socket.exists());
     }
 
+    /// The daemon-side gate, and why a client asking first is not enough.
+    ///
+    /// A signal is a signal: anyone can send one, and the flock can change
+    /// between the client's question and the signal. So the SIGHUP path runs
+    /// [`crate::handover::fitness`] again and refuses on its own, which is
+    /// what makes the fallback to a graceful stop reachable at all.
+    ///
+    /// **The descriptors are deliberately invalid.** If the gate ever
+    /// stopped refusing, `hand_over` would go on to clear `FD_CLOEXEC` on
+    /// them, meet `EBADF`, and return, rather than exec'ing this test binary
+    /// into an endless re-run of the whole suite. The assertion on
+    /// the message is what tells the two failures apart.
+    #[tokio::test]
+    async fn a_sighup_over_a_flock_it_cannot_carry_refuses_before_it_execs() {
+        // Real time + real signal listeners. This case raises nothing
+        // itself, but `SIGNAL_TEST_LOCK`'s rule is "calls `boot()`
+        // successfully", not "calls `raise()`": a successful `boot()`
+        // installs SIGTERM, SIGHUP and SIGUSR2 listeners that run for this
+        // test's whole duration, and a concurrent `raise()` in one of the
+        // shutdown cases reaches them too. This daemon would then shut down
+        // ahead of its own `ctx.shutdown()` while absorbing a delivery the
+        // other test needed, which is the way a real regression there gets
+        // masked.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let daemon = boot(
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+        let mut app = AppConfig::minimal("chatty", "./srv");
+        app.channel = true;
+        ctx.supervisor
+            .start(vec![normalize(app).unwrap()])
+            .await
+            .unwrap();
+
+        let seam = HandoverSeam {
+            supervisor: ctx.supervisor.clone(),
+            fds: crate::handover::DaemonFds {
+                listener: -1,
+                pidfile: -1,
+            },
+            paths: paths.clone(),
+        };
+        let refusal = hand_over_now(&seam)
+            .await
+            .expect_err("a flock with a shepherd channel cannot be carried");
+        assert!(
+            refusal.contains("shepherd channel"),
+            "the gate must refuse before anything is exec'd: {refusal}"
+        );
+
+        ctx.shutdown();
+        // Bounded, like the sibling above. The lock this case now holds is
+        // held across this await, so a teardown that hung would stop every
+        // other signal test in the module rather than failing this one.
+        tokio::time::timeout(Duration::from_secs(5), daemon.run())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn a_repeat_sigterm_is_observed_not_swallowed() {
         // Pins Decision 3 (2026-08-08): each shutdown-signal listener
@@ -2863,11 +3476,12 @@ mod tests {
         let paths = test_paths(&dir);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let shutdown = Arc::new(shutdown);
-        // The SIGUSR2 half of the return is dropped unused: this case drives
-        // the shutdown listeners only, and a dropped sender simply ends the
-        // SIGUSR2 listener that is parked on its receiver (see
+        // The SIGUSR2 and SIGHUP halves of the return are dropped unused:
+        // this case drives the shutdown listeners only, and a dropped sender
+        // simply ends the task parked on its receiver (see
         // `install_signals`'s own doc) without disturbing the three below.
-        let (signals, _connect_supervisor) = install_signals(shutdown, paths).unwrap();
+        let (signals, _connect_supervisor, _connect_handover) =
+            install_signals(shutdown, paths).unwrap();
 
         // First SIGTERM: starts shutdown, exactly as before this decision.
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
@@ -3105,5 +3719,61 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// A blob written by hand rather than by `Handover::write`, so this
+    /// module's tests pin the on-disk shape a successor has to read rather
+    /// than round-tripping whatever the writer happens to emit.
+    fn write_blob(path: &Path, version: u32) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"version":{version},"sheep":[],"listener_fd":3,"pidfile_fd":4,"next_id":0,"next_deadline":0,"next_action_stamp":0}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_blob_on_disk_makes_this_process_a_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handover.json");
+        write_blob(&path, 1);
+
+        assert!(successor_handover_at(&path).is_some());
+    }
+
+    #[test]
+    fn a_missing_blob_is_refused_out_loud_rather_than_silently() {
+        // A stale inherited variable and a lost blob look the same from
+        // here, and neither may pass for a fresh boot without a word.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.json");
+
+        let logs = capture_logs(|| assert!(successor_handover_at(&path).is_none()));
+
+        assert!(logs.contains("never-written.json"), "{logs}");
+    }
+
+    #[test]
+    fn a_blob_of_an_unknown_version_is_refused_out_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handover.json");
+        write_blob(&path, u32::MAX);
+
+        let logs = capture_logs(|| assert!(successor_handover_at(&path).is_none()));
+
+        assert!(logs.contains("version"), "{logs}");
+    }
+
+    #[test]
+    fn a_refused_blob_is_left_on_disk_for_an_operator_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handover.json");
+        write_blob(&path, u32::MAX);
+
+        capture_logs(|| assert!(successor_handover_at(&path).is_none()));
+
+        assert!(path.exists(), "a refused blob is evidence, not litter");
     }
 }
