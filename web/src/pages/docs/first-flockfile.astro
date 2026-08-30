@@ -73,7 +73,7 @@ const fieldGroups: FieldGroup[] = [
       { name: "cwd", type: "string?", default: "the Flockfile's own directory", does: "Working directory at spawn. Unset, an app in a Flockfile runs where that Flockfile lives, so a relative script resolves the way you would read it." },
       { name: "interpreter", type: "string?", default: "none", does: "Interpreter override; \"none\" runs the script directly." },
       { name: "env", type: "map<string,string>", default: "{}", does: "Merged over the daemon's filtered environment; values support {{instance}} and {{name}}. SHEP_INSTANCE and SHEP_NAME are always set and may not be set here." },
-      { name: "instances", type: "integer", default: "1", does: "How many separate copies of this app to run (pm2's fork mode, not its cluster mode: no shared socket). SHEP_INSTANCE and SHEP_NAME are always set on every instance; other env values, args, out_file and err_file may use {{instance}} and {{name}} templates." },
+      { name: "instances", type: "integer", default: "1", does: "How many separate copies of this app to run, each its own process; shep does not share a socket between them (see reuse_port if the app does that itself). SHEP_INSTANCE and SHEP_NAME are always set on every instance; other env values, args, out_file and err_file may use {{instance}} and {{name}} templates." },
       { name: "increment_var", type: "string?", default: "removed", does: "Refused at normalize with the replacement named: set env.YOUR_VAR = \"{{instance}}\" instead." },
     ],
   },
