@@ -58,7 +58,7 @@ const rustRows: ExampleRow[] = [
 const polyglotRows: ExampleRow[] = [
   {
     program: "node-http / node-http-cluster",
-    demonstrates: "The pm2 audience's default case, plus instances above 1.",
+    demonstrates: "A plain Node HTTP server, plus instances above 1.",
     watch: "curl 127.0.0.1:19090/, then 19091 through 19094 for each clustered instance.",
   },
   {
@@ -308,22 +308,18 @@ py = "python3"`}</CodeBlock>
       <code>node-http-cluster</code> is the same script again,
       <code>instances = 4</code>. Each instance gets its own
       <code>SHEP_INSTANCE</code> env var (0 through 3), and the script adds
-      that to its base port — four separate listeners on 19091 through
-      19094, not one port shared four ways. That is a genuinely different
-      shape from pm2's own cluster mode, which does not use
-      <code>SO_REUSEPORT</code> at all: pm2 runs Node's built-in
-      <code>cluster</code> module, where a single primary process holds the
-      one listening socket and hands each accepted connection to a worker
-      round robin. shep's own <code>reuse_port</code> field is the more
-      interesting half of this contrast, because it decides how a reload
-      runs: an app that sets it is asserting it calls
-      <code>SO_REUSEPORT</code> itself, and gets its two instances
-      overlapped during a reload. An app that does not, and that has a
-      <code>readiness_probe</code>, is reloaded serially instead: the old
-      instance drains before the new one starts, because a probe against a
-      shared address cannot tell you which of two instances answered it.
+      that to its base port: four separate listeners on 19091 through
+      19094, not one port shared four ways. shep's own <code>reuse_port</code>
+      field is what decides how a reload runs: an app that sets it is
+      asserting it calls <code>SO_REUSEPORT</code> itself, and gets its two
+      instances overlapped during a reload. An app that does not, and that
+      has a <code>readiness_probe</code>, is reloaded serially instead: the
+      old instance drains before the new one starts, because a probe against
+      a shared address cannot tell you which of two instances answered it.
       This example offsets the port rather than sharing it, so the question
-      never arises: four listeners, four ports, nothing to share.
+      never arises: four listeners, four ports, nothing to share. See
+      <a href="/docs/from-pm2">Coming from pm2</a> for how this compares to
+      pm2's own cluster mode.
     </p>
 
     <h3>A venv's own python</h3>
