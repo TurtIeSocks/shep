@@ -172,13 +172,28 @@ pub fn fake_daemon_accepting_repeatedly(
     path: &Path,
     reply: Response,
 ) -> (JoinHandle<()>, Arc<AtomicU32>) {
+    fake_daemon_accepting_repeatedly_with_ack(path, sample_ack(), reply)
+}
+
+/// As [`fake_daemon_accepting_repeatedly`], but with a caller-chosen
+/// [`HelloAck`] — for a caller whose own version-skew guard would otherwise
+/// refuse [`sample_ack`]'s fixed `"9.9.9"` on every one of these repeated
+/// connections.
+///
+/// Panics if `path` cannot be bound — test scaffolding, the same failure mode
+/// [`fake_daemon`] documents.
+pub fn fake_daemon_accepting_repeatedly_with_ack(
+    path: &Path,
+    ack: HelloAck,
+    reply: Response,
+) -> (JoinHandle<()>, Arc<AtomicU32>) {
     let mut listener = Listener::bind(path).unwrap();
     let served = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&served);
     let handle = tokio::spawn(async move {
         while let Ok(stream) = listener.accept().await {
             let mut frames = Framed::new(stream, codec());
-            handshake(&mut frames, sample_ack()).await;
+            handshake(&mut frames, ack.clone()).await;
             let envelope = read_envelope(&mut frames).await;
             // `write_reply` wraps the value in `Ok` itself — its signature is
             // `(&mut Frames, u64, Response)`, testing.rs:155 — so passing an
@@ -272,7 +287,11 @@ async fn write_reply(frames: &mut Frames, id: u64, response: Response) {
 async fn write_err(frames: &mut Frames, id: u64, code: RpcErrorCode, message: String) {
     let reply = Reply {
         id,
-        result: Err(RpcError { code, message }),
+        result: Err(RpcError {
+            code,
+            message,
+            daemon_version: None,
+        }),
     };
     frames.send(encode_frame(&reply).unwrap()).await.unwrap();
 }
@@ -310,8 +329,8 @@ async fn send_sample_event(frames: &mut Frames) {
 /// enum carries the remaining scripted behaviors, each armed at most once,
 /// by the `fake_client_*` constructor or `FakeDaemon` method that needs it.
 enum ScriptCommand {
-    /// Arms the next request (of any kind) to receive
-    /// `RpcError { code, message }` instead of a normal response.
+    /// Arms the next request (of any kind) to receive an [`RpcError`] with
+    /// this `code` and `message` instead of a normal response.
     ReplyErr(RpcErrorCode, String),
     /// Arms the next request to receive a [`sample_info`]-based
     /// `BusEvent::Process` BEFORE its `Pong` reply.
@@ -889,8 +908,8 @@ pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Rece
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], and answers the one
-/// request that arrives with `RpcError { code, message }` instead of a
-/// normal response — for testing that a daemon-side error reply surfaces
+/// request that arrives with an [`RpcError`] carrying `code` and `message`
+/// instead of a normal response — for testing that a daemon-side error reply surfaces
 /// through `Client::request` as `RequestError::Rpc`.
 ///
 /// Backed by a [`FakeDaemon`] (armed with a private `ScriptCommand::ReplyErr`)

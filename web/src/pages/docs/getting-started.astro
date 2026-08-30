@@ -63,6 +63,25 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       set up, and the five commands worth knowing.
     </p>
 
+    <h3>Upgrading later</h3>
+    <p>
+      <code>cargo install shep</code> replaces the binary on disk. It does
+      not touch anything already running: the shepherd keeps the code it
+      booted with until you reload it, and each dog keeps its own until you
+      reinstall it separately.
+    </p>
+    <div class="terminal">
+      <div><span class="prompt">$</span> cargo install shep</div>
+      <div><span class="prompt">$</span> cargo install shep-log-rotate<span class="muted"> # and every other dog</span></div>
+      <div><span class="prompt">$</span> shep daemon reload</div>
+    </div>
+    <Callout variant="careful">
+      Skip <code>shep daemon reload</code> and the new binary answers
+      <code>shep --version</code> while the running shepherd is still the
+      old one. shep refuses most verbs against a version-skewed shepherd and
+      names this exact command as the fix.
+    </Callout>
+
     <h2>2. Write a Flockfile</h2>
     <p>
       Two fields is a complete one. <code>Flockfile.toml</code>,

@@ -112,6 +112,7 @@ mod tests {
             result: Err(RpcError {
                 code: RpcErrorCode::DeadlineExceeded,
                 message: "request deadline of 5000 ms expired".to_string(),
+                daemon_version: None,
             }),
         };
         let json = serde_json::to_string(&err).unwrap();

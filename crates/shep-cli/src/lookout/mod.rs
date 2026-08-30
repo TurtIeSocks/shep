@@ -88,13 +88,16 @@ pub const MIN_REDRAW: Duration = Duration::from_millis(33);
 
 /// Runs the dashboard, and returns the [`ExitCode`] to exit with.
 ///
-/// Three refusals, all of them before a single escape byte is written:
+/// Four refusals, all of them before a single escape byte is written:
 ///
 /// - [`ExitCode::Usage`] when stdout is not a terminal.
 /// - [`ExitCode::DaemonUnreachable`] (or [`ExitCode::ProtocolMismatch`]) when
 ///   the FIRST connection fails — see [`source::LinkError::exit_code`]. A
 ///   shepherd that was never running is not the case the maintainer's retry-then-freeze
 ///   ruling is about, and lookout refuses it exactly as `shep flock` would.
+/// - [`ExitCode::VersionSkew`] when that connection succeeds but the
+///   shepherd answering it is a different crate version — `lookout` is
+///   never exempt, since it drives the daemon for as long as it is open.
 /// - [`ExitCode::Failure`] when the terminal could not be put into raw mode.
 ///
 /// After that it does not exit on its own at all: the ladder and the freeze
@@ -130,6 +133,18 @@ pub async fn lookout(streams: &mut Streams<'_>, paths: &ShepPaths, args: &Lookou
             return streams.fail(code, &err.to_string());
         }
     };
+
+    // `lookout` drives the daemon for as long as the dashboard stays open —
+    // polling, subscribing, and (with `--allow-control`) acting on it — so
+    // it can never be one of `RECOVERY_VERBS`. Applied here, on the FIRST
+    // dial, rather than inside `link` itself: see `ClientFlock::client`'s
+    // own doc for why. A reconnect on the ladder is not re-checked; a
+    // shepherd cannot downgrade itself mid-run.
+    if let Err(code) =
+        crate::refuse_version_skew(streams, opened.0.client(), crate::VersionGuard::Enforce)
+    {
+        return code;
+    }
 
     let palette = Palette::detect(
         std::env::var_os("NO_COLOR").as_deref(),

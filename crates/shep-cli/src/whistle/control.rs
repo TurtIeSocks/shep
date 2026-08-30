@@ -218,6 +218,17 @@ mod tests {
     /// failed — IR-46: every await in a test needs a forcing mechanism.
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// A [`shep_core::protocol::HelloAck`] this binary's own version guard
+    /// never refuses — `shep_client::testing::sample_ack`'s fixed `"9.9.9"`
+    /// always would, now that every tool call in this file goes through
+    /// `Shepherd::call_with_ack`'s guard.
+    fn matching_ack() -> shep_core::protocol::HelloAck {
+        shep_core::protocol::HelloAck {
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            ..shep_client::testing::sample_ack()
+        }
+    }
+
     fn whistle_at(socket: std::path::PathBuf) -> Whistle {
         // None of these four tools ever reads `barks.jsonl` — that path is
         // `read::list_barks`' alone — so a nonexistent one is fine here, and
@@ -258,7 +269,7 @@ mod tests {
     async fn answer_handshake(stream: &mut UnixStream) {
         let hello_bytes = read_frame(stream).await;
         let _hello: Hello = decode_frame(&hello_bytes).unwrap();
-        let ack: HelloReply = Ok(shep_client::testing::sample_ack());
+        let ack: HelloReply = Ok(matching_ack());
         write_frame(stream, &ack).await;
     }
 
@@ -295,7 +306,11 @@ mod tests {
                 let envelope: Envelope = decode_frame(&request_bytes).unwrap();
                 let reply = Reply {
                     id: envelope.id,
-                    result: result.map_err(|(code, message)| RpcError { code, message }),
+                    result: result.map_err(|(code, message)| RpcError {
+                        code,
+                        message,
+                        daemon_version: None,
+                    }),
                 };
                 write_frame(&mut stream, &reply).await;
                 envelopes.push(envelope);
@@ -342,8 +357,9 @@ mod tests {
         let socket = shep_client::testing::control_address(dir.path());
         // sample_info() is already Online, named "web" — exactly the
         // already-running case this test needs.
-        let (daemon, served) = shep_client::testing::fake_daemon_accepting_repeatedly(
+        let (daemon, served) = shep_client::testing::fake_daemon_accepting_repeatedly_with_ack(
             &socket,
+            matching_ack(),
             Response::Described(vec![shep_client::testing::sample_info()]),
         );
 
@@ -466,8 +482,9 @@ mod tests {
         })
         .collect();
 
-        let (daemon, served) = shep_client::testing::fake_daemon_accepting_repeatedly(
+        let (daemon, served) = shep_client::testing::fake_daemon_accepting_repeatedly_with_ack(
             &socket,
+            matching_ack(),
             Response::Described(rows),
         );
 

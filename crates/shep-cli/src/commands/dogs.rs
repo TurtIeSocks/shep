@@ -35,7 +35,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use shep_client::Client;
+use shep_client::{Client, ConnectError};
 use shep_core::barks;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{DogSource, Request, Response};
@@ -98,6 +98,40 @@ fn dog_source(cfg: &ShepToml, name: &str) -> DogSource {
         })
 }
 
+/// Connects to `paths.socket`, distinguishing a genuine absence from a
+/// shepherd that IS there and refused — the `dogs.rs` spelling of the same
+/// defect `crate::flock_command` fixes for `shep flock` (Task 6 / spec G4).
+///
+/// `Ok(None)` is the only case [`enable`]/[`disable`]/[`adopt`]/[`rehome`]
+/// were ever meant to tolerate silently: [`ConnectError::Connect`],
+/// `connect(2)` itself failing because nothing is listening (decision 11 —
+/// none of the four may autostart a shepherd to act on its own config
+/// edit). Every other [`ConnectError`] variant means a connection WAS
+/// established, so a shepherd is there; folding that into `None` too is
+/// what the old `Client::connect(..).ok()` did, and it reported a live
+/// refusal as "will start with the next shepherd" — the same shape of bug
+/// as the blanket `Err(_)` [`crate::flock_command`] used to have.
+///
+/// # Errors
+/// The exit code and message [`Streams::fail`] already wrote, when the
+/// shepherd answered and refused rather than being absent.
+async fn connect_or_absent(
+    paths: &ShepPaths,
+    streams: &mut Streams<'_>,
+) -> Result<Option<Client>, ExitCode> {
+    match Client::connect(&paths.socket).await {
+        Ok(client) => Ok(Some(client)),
+        Err(ConnectError::Connect { .. }) => Ok(None),
+        Err(err) => {
+            let code = ExitCode::from(&err);
+            Err(streams.fail(
+                code,
+                &format!("{err}; run `shep {}`", crate::VERSION_SKEW_REMEDY),
+            ))
+        }
+    }
+}
+
 /// `shep enable <name>`: writes the config, and starts the dog if a
 /// shepherd is running.
 pub async fn enable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
@@ -117,7 +151,10 @@ pub async fn enable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) ->
         Ok(source) => source,
         Err(err) => return fail_config(streams, &err),
     };
-    let client = Client::connect(&paths.socket).await.ok();
+    let client = match connect_or_absent(paths, streams).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
     enable_after_config(streams, name, &source, client.as_ref()).await
 }
 
@@ -127,11 +164,14 @@ pub async fn enable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) ->
 /// [`crate::commands::lifecycle::resolve_target`] is split out of `start`
 /// for the same reason: hermetic testability of the part that has a seam.
 ///
-/// `client: None` is [`enable`]'s own `Client::connect(..).ok()` — every way
-/// a connection can fail is folded into "no shepherd running" here, matching
-/// decision 11: this verb does not distinguish a stale socket file from a
-/// genuinely absent daemon, because a provisioning script configuring a host
-/// before starting anything must not have to.
+/// `client: None` is [`enable`]'s own [`connect_or_absent`] reporting a
+/// genuine absence — matching decision 11: this verb does not distinguish a
+/// stale socket file with nothing listening from a daemon that was never
+/// started, because a provisioning script configuring a host before
+/// starting anything must not have to. A shepherd that IS there and
+/// refused is a different case ([`connect_or_absent`]'s own doc, Task 6) —
+/// that never reaches this function at all, since [`enable`] returns its
+/// refusal directly.
 async fn enable_after_config(
     streams: &mut Streams<'_>,
     name: &str,
@@ -204,7 +244,10 @@ pub async fn disable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -
         Ok(source) => source,
         Err(err) => return fail_config(streams, &err),
     };
-    let client = Client::connect(&paths.socket).await.ok();
+    let client = match connect_or_absent(paths, streams).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
     disable_after_config(streams, name, &source, client.as_ref()).await
 }
 
@@ -681,7 +724,10 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
     }) {
         return fail_config(streams, &err);
     }
-    let client = Client::connect(&paths.socket).await.ok();
+    let client = match connect_or_absent(paths, streams).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
     adopt_after_config(streams, &name, &path, client.as_ref()).await
 }
 
@@ -943,7 +989,10 @@ pub async fn rehome(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) ->
         Ok(source) => source,
         Err(err) => return fail_config(streams, &err),
     };
-    let client = Client::connect(&paths.socket).await.ok();
+    let client = match connect_or_absent(paths, streams).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
     rehome_after_config(streams, name, source, client.as_ref()).await
 }
 
@@ -1148,6 +1197,36 @@ mod tests {
             text.contains("adopted"),
             "the row must render an adopted dog as adopted: {text}"
         );
+    }
+
+    /// Task 6 / spec G4, the `dogs.rs` spelling of the same bug `shep flock`
+    /// had: `Client::connect(..).ok()` folded a handshake REFUSAL into
+    /// `None`, exactly as it folds a genuine absence into `None` — so a live
+    /// shepherd that refused was reported as "will start with the next
+    /// shepherd" instead of the refusal.
+    #[tokio::test]
+    async fn enable_reports_a_refusal_as_a_refusal_not_as_no_shepherd() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.run).unwrap();
+        let refusal = shep_core::protocol::RpcError {
+            code: RpcErrorCode::ProtocolMismatch,
+            message: "this daemon speaks protocol 1, this client speaks 2".to_string(),
+            daemon_version: Some("0.1.8".to_string()),
+        };
+        let _daemon = shep_client::testing::fake_daemon(&paths.socket, Err(refusal)).await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = enable(&mut streams(&mut out, &mut err), &paths, "metrics").await;
+
+        assert_ne!(code, ExitCode::Success);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            !text.contains(NO_SHEPHERD_ENABLE_STATUS),
+            "a refusal is not an absence: {text}"
+        );
+        assert!(text.contains("shep daemon reload"), "{text}");
     }
 
     /// fails if a `shep enable` with no shepherd running is reported as a

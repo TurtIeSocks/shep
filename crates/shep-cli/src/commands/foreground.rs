@@ -71,6 +71,17 @@ enum Ending {
 /// supervisor's own logging writes from a tokio worker thread, in this same
 /// process. `daemon`, `bleats` and `lookout` are the existing three verbs
 /// this applies to; `runtime` and `dev` make five.
+/// Refuses `client` if its shepherd disagrees with this binary's crate
+/// version — the guard [`crate::refuse_version_skew`] applies at the three
+/// seams in `lib.rs`, reused here directly because [`run`] connects on its
+/// own rather than through one of them.
+///
+/// # Errors
+/// [`ExitCode::VersionSkew`], as [`crate::refuse_version_skew`].
+fn refuse_if_skewed(streams: &mut Streams<'_>, client: &Client) -> Result<(), ExitCode> {
+    crate::refuse_version_skew(streams, client, crate::VersionGuard::Enforce)
+}
+
 pub async fn run(streams: &mut Streams<'_>, quiet: bool, options: ForegroundOptions) -> ExitCode {
     let ForegroundOptions {
         paths,
@@ -85,6 +96,7 @@ pub async fn run(streams: &mut Streams<'_>, quiet: bool, options: ForegroundOpti
     // daemon for readiness-reporting purposes, the same as `shep daemon
     // --foreground`, even though nothing here speaks the notify protocol.
     let daemon_args = DaemonArgs {
+        cmd: None,
         no_restore: true,
         foreground: true,
         log_json: None,
@@ -116,7 +128,16 @@ pub async fn run(streams: &mut Streams<'_>, quiet: bool, options: ForegroundOpti
     // The listener is bound by the time `boot_supervisor` returns, so this
     // needs no retry.
     let client = match Client::connect(&paths.socket).await {
-        Ok(client) => client,
+        Ok(client) => {
+            // `foreground` registers a sheep with the shepherd it just
+            // booted or found already up — the opposite of a way out of a
+            // skew — so it can never be one of `RECOVERY_VERBS`.
+            if let Err(code) = refuse_if_skewed(streams, &client) {
+                supervisor.abort();
+                return code;
+            }
+            client
+        }
         Err(err) => {
             supervisor.abort();
             let code = ExitCode::from(&err);
@@ -244,5 +265,65 @@ pub async fn run(streams: &mut Streams<'_>, quiet: bool, options: ForegroundOpti
         Some(Ending::Empty(Sample::Busy)) | Some(Ending::SupervisorExited { .. }) | None => {
             ExitCode::Success
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::Format;
+    use crate::exit::ExitCode;
+    use crate::output::Streams;
+    use crate::style;
+
+    fn buffered_streams<'a>(out: &'a mut Vec<u8>, err: &'a mut Vec<u8>) -> Streams<'a> {
+        Streams {
+            out,
+            err,
+            style: style::Presentation::BARE,
+            fmt: Format::Table,
+        }
+    }
+
+    /// `run`'s own connect (:118) guards the shepherd it just booted, same
+    /// as the seams in `lib.rs` guard every other verb — `foreground`
+    /// registers a sheep with that shepherd, so it can never be exempt.
+    /// This drives the guard directly against a client from a fake
+    /// shepherd, which is what Task 5 found actually works; `run` itself
+    /// boots a real supervisor and cannot be handed a scripted version.
+    #[tokio::test]
+    async fn a_version_skewed_shepherd_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let ack = shep_core::protocol::HelloAck {
+            daemon_version: "0.1.8".to_string(),
+            protocol: shep_core::protocol::PROTOCOL_VERSION,
+            pid: 4242,
+        };
+        let (client, _fake) = shep_client::testing::fake_client_with_ack(&addr, ack).await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = buffered_streams(&mut out, &mut err);
+        let code = super::refuse_if_skewed(&mut streams, &client)
+            .expect_err("a differing crate version must be refused");
+        assert_eq!(code, ExitCode::VersionSkew);
+    }
+
+    /// A shepherd of this binary's own version is not a skew.
+    #[tokio::test]
+    async fn a_matching_version_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let ack = shep_core::protocol::HelloAck {
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: shep_core::protocol::PROTOCOL_VERSION,
+            pid: 4242,
+        };
+        let (client, _fake) = shep_client::testing::fake_client_with_ack(&addr, ack).await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut streams = buffered_streams(&mut out, &mut err);
+        super::refuse_if_skewed(&mut streams, &client).expect("a matching version is not a skew");
     }
 }

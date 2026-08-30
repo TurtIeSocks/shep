@@ -194,6 +194,7 @@ async fn a_protocol_mismatch_propagates_instead_of_spawning_a_second_daemon() {
         Err(RpcError {
             code: RpcErrorCode::ProtocolMismatch,
             message: "daemon speaks protocol 2, client speaks 1".into(),
+            daemon_version: None,
         }),
     )
     .await;
@@ -239,6 +240,7 @@ async fn a_protocol_mismatch_on_a_loop_probe_propagates_instead_of_looping_to_th
                     Err(RpcError {
                         code: RpcErrorCode::ProtocolMismatch,
                         message: "daemon speaks protocol 2, client speaks 1".into(),
+                        daemon_version: None,
                     }),
                 ));
                 long_lived()

@@ -480,6 +480,12 @@ async fn handshake(
                 "daemon speaks protocol {PROTOCOL_VERSION}, client sent {}",
                 hello.protocol
             ),
+            // The refusal names our PROTOCOL, which does not say which shep
+            // is running. `shep daemon reload` chooses its mechanism by
+            // version, and this is the one path where the ack that would
+            // have carried it never arrives. Same field the ack uses, so a
+            // client cannot learn two versions for one daemon.
+            daemon_version: Some(ctx.daemon_version.clone()),
         });
         send(out, &refusal).await?;
         return Err(ConnError::ProtocolMismatch {
@@ -612,6 +618,29 @@ mod tests {
             client.closed().await,
             "the daemon must close after refusing"
         );
+    }
+
+    #[tokio::test]
+    async fn a_protocol_refusal_carries_the_daemon_version() {
+        // The refusal reports the daemon's PROTOCOL, which says nothing
+        // about which crate version is running. `shep daemon reload` picks
+        // between a handover and a stop-and-start by version, and a protocol
+        // bump is exactly when it is needed, so the refusal has to name it.
+        let h = harness(vec![]);
+        let mut client = connected(h.ctx.clone()).await;
+        client
+            .send(&Hello {
+                client_version: "9.9.9".to_string(),
+                protocol: PROTOCOL_VERSION + 1,
+            })
+            .await;
+        let refusal: HelloReply = client.recv().await;
+        let err = refusal.expect_err("skew must be refused");
+        assert_eq!(err.code, RpcErrorCode::ProtocolMismatch);
+        // The same string the ack would have carried, from the same field:
+        // a client must never learn two different versions for one daemon
+        // depending on whether its handshake was accepted.
+        assert_eq!(err.daemon_version.as_deref(), Some(&*h.ctx.daemon_version));
     }
 
     #[tokio::test]

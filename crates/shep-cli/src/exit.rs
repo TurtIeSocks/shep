@@ -79,6 +79,21 @@ pub enum ExitCode {
     /// `dev` both share, once the empty-flock watcher settles on
     /// [`crate::commands::empty::Sample::EmptyFailed`].
     FlockEmpty = 11,
+    /// This binary and the running shepherd are different versions of shep.
+    ///
+    /// Distinct from [`ExitCode::ProtocolMismatch`], and the distinction is
+    /// the whole reason this code exists. That one is the daemon refusing a
+    /// handshake because the two speak different WIRE versions, which is a
+    /// question the wire can ask itself. This one is a handshake that
+    /// SUCCEEDED, against a daemon whose crate version differs — the state
+    /// `cargo install shep` leaves behind, since it replaces the binary and
+    /// never restarts the shepherd. Nothing on the wire has to disagree for
+    /// that to be dangerous, and collapsing the two would leave an operator
+    /// reading "protocol mismatch" about a protocol that matched.
+    ///
+    /// Never returned for `kill`, `daemon reload` or `ping`: those are how
+    /// an operator gets out of the state, so they are exempt.
+    VersionSkew = 12,
 }
 
 impl ExitCode {
@@ -104,6 +119,7 @@ impl ExitCode {
             Self::Internal => "internal",
             Self::DaemonAlreadyRunning => "daemon_already_running",
             Self::FlockEmpty => "flock_empty",
+            Self::VersionSkew => "version_skew",
         }
     }
 }
@@ -252,6 +268,7 @@ mod tests {
             ExitCode::Internal,
             ExitCode::DaemonAlreadyRunning,
             ExitCode::FlockEmpty,
+            ExitCode::VersionSkew,
         ];
         let strings: Vec<&str> = all.iter().map(|c| c.code_str()).collect();
         assert!(strings.iter().all(|s| !s.is_empty()));

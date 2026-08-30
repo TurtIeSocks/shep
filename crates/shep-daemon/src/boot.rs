@@ -472,6 +472,91 @@ impl PidfileLock {
     }
 }
 
+/// What, if anything, owns this home's pidfile lock.
+///
+/// Proof of life is the pidfile LOCK, never the pidfile's contents. A live
+/// daemon holds that lock for its whole run and the kernel drops it on
+/// process death, `SIGKILL` included, so a failure to acquire it is the only
+/// evidence that cannot be faked by a stale file whose pid has since been
+/// reused.
+///
+/// Answers a question; never claims the home. A lock this acquires is
+/// released before the call returns.
+///
+/// Both platform arms of `PidfileLock` are reachable through this, and it
+/// needs no `cfg` of its own: unix contends on the pidfile's `flock` and
+/// Windows on a sibling `.lock` file's share mode, and both report a
+/// contended lock as [`BootError::AlreadyRunning`].
+///
+/// # Errors
+/// - [`BootError::Io`] — the pidfile could not be opened, created or read.
+///   A contended lock is NOT an error here; it is [`Shepherd::Running`] or
+///   [`Shepherd::Booting`].
+pub fn daemon_liveness(paths: &ShepPaths) -> Result<Shepherd, BootError> {
+    match PidfileLock::acquire(paths) {
+        // We took it, so nobody else holds it. Released by this `drop`
+        // rather than at the end of the scope, so that the window in which
+        // a question-asker holds a claim on someone else's home is as
+        // short as the type allows.
+        Ok(lock) => {
+            drop(lock);
+            Ok(Shepherd::Absent)
+        }
+        Err(BootError::AlreadyRunning { pid: Some(pid) }) => Ok(Shepherd::Running(pid)),
+        Err(BootError::AlreadyRunning { pid: None }) => Ok(Shepherd::Booting),
+        // A home whose layout was never created cannot be holding a lock, so
+        // this is an absence and not a failure. `init_dirs` makes `pids/` on
+        // every boot, so its absence means no daemon has ever run here, which
+        // is precisely what `Absent` says. Reported as an error instead, a
+        // `shep kill` against a fresh `$SHEP_HOME` exits `Failure` rather than
+        // `DaemonUnreachable`, which is a worse answer to a correct question.
+        //
+        // Narrow on purpose. Only `NotFound`, and only for a path under
+        // `pids/`. A permissions error or a corrupt lock file is a real
+        // failure and must still say so.
+        Err(BootError::Io {
+            ref path,
+            ref source,
+        }) if source.kind() == ErrorKind::NotFound && path.starts_with(&paths.pids) => {
+            Ok(Shepherd::Absent)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// What [`daemon_liveness`] found holding a home's pidfile lock.
+///
+/// Three states, not two, because "nothing is running" and "something is
+/// starting up" call for opposite actions and an `Option<u32>` cannot tell
+/// them apart. Both would read as `None`: [`boot`] takes the lock at
+/// `PidfileLock::acquire` and records its pid a few statements later, and
+/// binding the socket happens in between, stale-socket recovery included.
+/// A caller that read that window as an absence would refuse with the wrong
+/// reason, or start a second daemon that then dies unable to take the lock.
+///
+/// Deliberately NOT `#[non_exhaustive]`, unlike [`BootError`]. The set is
+/// closed by the mechanism rather than by today's implementation: the lock
+/// is either free or held, and a holder either has written its pid or has
+/// not. There is no fourth thing for a future boot step to add, and callers
+/// get exhaustiveness checking on a decision where a missed arm means
+/// signalling the wrong process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shepherd {
+    /// Nothing holds this home's pidfile lock.
+    ///
+    /// A stale pidfile naming a long-dead pid still reads as this, which is
+    /// the whole point of asking the lock rather than the file.
+    Absent,
+    /// A shepherd holds the lock and recorded this pid.
+    Running(u32),
+    /// A shepherd holds the lock but has not recorded a pid yet.
+    ///
+    /// It is alive and owns the home, so it must not be treated as absent,
+    /// but there is no pid to signal. A caller should report that a
+    /// shepherd is starting rather than guess at either.
+    Booting,
+}
+
 /// The socket this daemon binds: the layout default, or a config override
 #[must_use]
 pub(crate) fn socket_path(paths: &ShepPaths, override_path: Option<&Path>) -> PathBuf {
@@ -1394,6 +1479,13 @@ fn install_signals(
         SignalKind::terminate(),
         SignalKind::interrupt(),
         SignalKind::quit(),
+        // SIGHUP is here as a floor, not as its final meaning. It becomes
+        // the handover trigger, and until it does its kernel default is an
+        // unhandled terminate that would drop the flock's pipes rather than
+        // walk the ladder. A daemon that treats it as a graceful stop can be
+        // signalled by a newer client without the flock paying for the
+        // version gap.
+        SignalKind::hangup(),
     ] {
         // An early return here drops `signals`, whose own `Drop` aborts
         // every task already pushed — registering the 2nd or 3rd kind
@@ -1788,6 +1880,56 @@ mod tests {
         write_pidfile(&paths, 4242).unwrap();
         assert_eq!(read_pidfile(&paths).unwrap(), Some(4242));
         assert_eq!(pidfile(&paths), paths.pids.join("shepd.pid"));
+    }
+
+    #[test]
+    fn liveness_reports_none_when_no_daemon_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
+    }
+
+    #[test]
+    fn liveness_reports_none_for_a_stale_pidfile_nobody_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        std::fs::write(pidfile(&paths), "999999").unwrap();
+        // The file exists and names a pid. Nothing holds the lock, so this is
+        // NOT a live daemon and must not be reported as one.
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
+    }
+
+    #[test]
+    fn liveness_reports_the_pid_a_lock_holder_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let mut held = PidfileLock::acquire(&paths).unwrap();
+        held.record(&paths, 4242).unwrap();
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Running(4242));
+        drop(held);
+        assert_eq!(
+            daemon_liveness(&paths).unwrap(),
+            Shepherd::Absent,
+            "a released lock is not a live daemon, whatever the file still says"
+        );
+    }
+
+    #[test]
+    fn liveness_reports_booting_for_a_holder_that_has_not_recorded_a_pid_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        // `boot` takes the lock and records its pid a few statements later,
+        // binding the socket in between. A caller that read this window as
+        // an absence would start a second daemon that then dies unable to
+        // take the lock.
+        let held = PidfileLock::acquire(&paths).unwrap();
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Booting);
+        drop(held);
+        assert_eq!(daemon_liveness(&paths).unwrap(), Shepherd::Absent);
     }
 
     #[test]
@@ -2663,6 +2805,38 @@ mod tests {
         // `boot` returns — well before `run()`'s own task is ever polled.
         let run = tokio::spawn(daemon.run());
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!paths.socket.exists());
+    }
+
+    #[tokio::test]
+    async fn sighup_triggers_the_same_graceful_shutdown() {
+        // Task 3 (2026-08-29): SIGHUP's default disposition is to
+        // terminate the process, and this handler is what replaces that
+        // default. Phase 2 makes SIGHUP the handover trigger; until it
+        // does, a stray or mistaken SIGHUP must still walk the same
+        // graceful path SIGTERM does rather than drop the flock's pipes.
+        // Mirrors `sigterm_triggers_the_same_graceful_shutdown` above —
+        // see that test's own comments for why raising a real signal here
+        // is safe only because the handler is installed first, and for
+        // why `SIGNAL_TEST_LOCK` is required.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let daemon = boot(
+            ScriptedRunner::new(vec![]),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let run = tokio::spawn(daemon.run());
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP).unwrap();
         tokio::time::timeout(Duration::from_secs(5), run)
             .await
             .unwrap()

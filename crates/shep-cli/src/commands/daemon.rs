@@ -29,11 +29,12 @@
 use std::ffi::OsStr;
 use std::io::IsTerminal;
 
+use shep_client::{Client, ConnectError};
 use shep_core::config::{DaemonConfig, DaemonConfigError, DaemonOverrides};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::DogSource;
 use shep_core::values::UpDuration;
-use shep_daemon::boot::{BootError, BootOptions, RunningDaemon, boot};
+use shep_daemon::boot::{self, BootError, BootOptions, RunningDaemon, Shepherd, boot};
 use shep_daemon::dogs::DogSpec;
 #[cfg(unix)]
 use shep_daemon::notify::NOTIFY_SOCKET_ENV;
@@ -41,7 +42,9 @@ use shep_daemon::tokio_runner::TokioRunner;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::DaemonArgs;
+use crate::commands::{admin, muster};
 use crate::exit::ExitCode;
+use crate::output::Streams;
 
 /// Everything [`run_daemon`] can fail with. Per-module, per IR-18, and the
 /// same shape shep-daemon itself uses (`BootError`, `SnapshotError`,
@@ -414,10 +417,188 @@ pub fn daemon_exit_code(err: &DaemonRunError) -> ExitCode {
     }
 }
 
+/// Which mechanism a reload uses to give the flock a shepherd running this
+/// binary's code.
+///
+/// [`Self::StopAndStart`] is not scaffolding to be deleted when the
+/// handover lands. It is the permanent answer to three cases the handover
+/// cannot serve (spec H5): Windows, which has no `exec`; any shepherd
+/// predating the handover, which cannot be taught it after the fact; and a
+/// handover that fails to rehydrate, where the operator needs a reload that
+/// works rather than a wedged one.
+#[derive(Debug, PartialEq, Eq)]
+enum Arm {
+    /// Phase 2's `execve` handover: the shepherd replaces its own image and
+    /// the flock never stops.
+    ///
+    /// Nothing returns this yet, deliberately. A stub that pretended to
+    /// hand over and quietly stopped the flock instead would be worse than
+    /// a variant that is honestly unreachable, because the whole value of
+    /// the handover is the promise that a sheep keeps its pid.
+    #[expect(
+        dead_code,
+        reason = "phase 2 constructs this; phase 1 ships no handover for any version to support"
+    )]
+    Handover,
+    /// Stop the shepherd the way `kill` does, wait out its teardown, start a
+    /// successor, and muster the roll back.
+    StopAndStart,
+}
+
+impl Arm {
+    /// The arm that reloads a shepherd reporting `daemon_version`, or `None`
+    /// where the CLI could not learn it.
+    ///
+    /// Always [`Self::StopAndStart`] in phase 1, and the parameter is unused
+    /// rather than removed because it is the whole of phase 2's decision.
+    /// The handover has to exist in the OLD shepherd (spec H6), so no
+    /// version a running shepherd can report today supports it.
+    ///
+    /// **Unknown always means the safe arm, never the fast one.** `None`
+    /// arrives from a shepherd whose refusal named no version — one built
+    /// before the refusal carried the field, which no upgrade can reach
+    /// backwards to fix — and from a home where nothing answered at all.
+    /// Guessing at either would hand a flock to a mechanism the shepherd
+    /// holding it does not have.
+    fn for_daemon(_daemon_version: Option<&str>) -> Self {
+        Self::StopAndStart
+    }
+}
+
+/// The running shepherd's own crate version, as far as a failed connect can
+/// report it.
+///
+/// Only a protocol refusal names one: every other connect failure happened
+/// before the shepherd said who it is. `None` therefore means unknown, which
+/// is not the same as absent and is treated identically by
+/// [`Arm::for_daemon`].
+fn version_from_refusal(err: &ConnectError) -> Option<&str> {
+    match err {
+        ConnectError::ProtocolMismatch { daemon_version, .. } => daemon_version.as_deref(),
+        _ => None,
+    }
+}
+
+/// Replaces the running shepherd with one running this binary's code, and
+/// brings the flock back.
+///
+/// The verb a version-skew refusal names, and one of the three recovery
+/// verbs the guard exempts — so it must work against a shepherd that
+/// refuses the handshake, which is why it never needs the socket to succeed.
+///
+/// `guard` is threaded from `crate::run` rather than named here, so the
+/// exemption stays decided in one place.
+pub async fn reload(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    guard: crate::VersionGuard,
+) -> ExitCode {
+    reload_with_wait(streams, paths, guard, admin::KILL_TEARDOWN_WAIT).await
+}
+
+/// As [`reload`], but with a caller-chosen teardown wait — the same
+/// injectable-timing shape `commands::admin`'s `kill_with_wait` carries, and
+/// for the same reason.
+async fn reload_with_wait(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    guard: crate::VersionGuard,
+    wait: std::time::Duration,
+) -> ExitCode {
+    // Connected only to ask who is there, and dropped before anything is
+    // signalled: this connection is to the process about to be stopped.
+    let running_version = match Client::connect(&paths.socket).await {
+        Ok(client) => Some(client.daemon().daemon_version.clone()),
+        Err(err) => version_from_refusal(&err).map(str::to_owned),
+    };
+    match Arm::for_daemon(running_version.as_deref()) {
+        // Unreachable by construction: `Arm::for_daemon` never returns it in
+        // phase 1. Left as a panic rather than a silent fall-through to the
+        // stop arm, because a handover that quietly stopped the flock would
+        // be a lie about the one thing it promises.
+        Arm::Handover => unreachable!("the handover arm lands in phase 2"),
+        Arm::StopAndStart => stop_and_start(streams, paths, guard, wait).await,
+    }
+}
+
+/// Stops the shepherd, waits it out, starts a successor, and musters.
+///
+/// Four steps, no new mechanism in any of them: the pidfile lock proves the
+/// pid ([`boot::daemon_liveness`]), `commands::admin` owns the
+/// signal and the teardown wait, and `crate::connect_or_spawn_client` is the
+/// same autostart `shep start` and `shep muster` already use.
+async fn stop_and_start(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    guard: crate::VersionGuard,
+    wait: std::time::Duration,
+) -> ExitCode {
+    let pid = match boot::daemon_liveness(paths) {
+        Ok(Shepherd::Running(pid)) => pid,
+        // Alive and owns the home, but has not recorded a pid yet. Not an
+        // absence, and not a pid to guess at.
+        Ok(Shepherd::Booting) => {
+            let message = "a shepherd is starting up and has not recorded its pid yet; try again";
+            return streams.fail(ExitCode::DaemonUnreachable, message);
+        }
+        // Nothing to replace. Says what starts one instead, rather than
+        // starting it unasked: `reload` is how an operator makes a RUNNING
+        // system match the binary, and a home with no shepherd has no
+        // running system to make match.
+        Ok(Shepherd::Absent) => {
+            let message = format!(
+                "no shepherd is running, so there is nothing to reload (nothing holds the lock \
+                 on `{}`). `shep muster` brings the flock up from the roll",
+                boot::pidfile(paths).display()
+            );
+            return streams.fail(ExitCode::DaemonUnreachable, &message);
+        }
+        Err(err) => return streams.fail(ExitCode::Failure, &err.to_string()),
+    };
+    if let Err((code, message)) = admin::signal_graceful_stop(pid) {
+        return streams.fail(code, &message);
+    }
+    if !admin::wait_for_socket_to_disappear(&paths.socket, wait).await {
+        let message = "the shepherd was signalled, but teardown is still in progress; \
+                       nothing has been started in its place";
+        return streams.fail(ExitCode::DeadlineExceeded, message);
+    }
+    let client = match crate::connect_or_spawn_client(streams, paths, guard).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    report_reload(&client, streams).await
+}
+
+/// Reports the shepherd now serving, then what happened to each sheep.
+///
+/// The per-sheep table is the whole report on purpose (spec H4): the
+/// handover arm does not stop the flock, so nothing here may announce that
+/// it did, and nothing may assume a reload gives a sheep a new pid. The one
+/// line above the table names the SHEPHERD's version and pid, which is true
+/// under both arms and is the fact the operator ran this verb for.
+///
+/// `Request::Muster` rather than a plain list: under the stop arm the
+/// successor has already restored the roll by the time this runs, so the
+/// muster spawns nothing new and reports the flock that restore produced —
+/// see `commands::muster::muster`'s own doc on why that is idempotent.
+async fn report_reload(client: &Client, streams: &mut Streams<'_>) -> ExitCode {
+    let shepherd = client.daemon();
+    let message = format!(
+        "the shepherd is now {} (pid {})",
+        shepherd.daemon_version, shepherd.pid
+    );
+    streams.aside("reload", &message);
+    muster::muster(client, streams).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VersionGuard;
+    use crate::cli::Format;
     use shep_core::config::LogLevel;
+    use shep_core::protocol::Response;
 
     /// fails if `run_daemon` builds its overrides from the wrong fields, or
     /// drops one. Drives the config assembly, not the boot — booting a real
@@ -427,6 +608,7 @@ mod tests {
     #[test]
     fn every_daemon_flag_reaches_the_config() {
         let args = DaemonArgs {
+            cmd: None,
             no_restore: false,
             foreground: false,
             log_json: Some(true),
@@ -483,6 +665,7 @@ mod tests {
         let opts = boot_options(
             &config,
             &DaemonArgs {
+                cmd: None,
                 no_restore: false,
                 foreground: false,
                 log_json: None,
@@ -521,6 +704,7 @@ otel = "/usr/local/bin/shep-otel"
         let opts = boot_options(
             &config,
             &DaemonArgs {
+                cmd: None,
                 no_restore: false,
                 foreground: false,
                 log_json: None,
@@ -560,6 +744,7 @@ otel = "/usr/local/bin/shep-otel"
             boot_options(
                 &configured,
                 &DaemonArgs {
+                    cmd: None,
                     no_restore: false,
                     foreground: false,
                     log_json: None,
@@ -578,6 +763,7 @@ otel = "/usr/local/bin/shep-otel"
             boot_options(
                 &unset,
                 &DaemonArgs {
+                    cmd: None,
                     no_restore: false,
                     foreground: false,
                     log_json: None,
@@ -603,6 +789,7 @@ otel = "/usr/local/bin/shep-otel"
         let opts = boot_options(
             &config,
             &DaemonArgs {
+                cmd: None,
                 no_restore: true,
                 foreground: false,
                 log_json: None,
@@ -624,6 +811,7 @@ otel = "/usr/local/bin/shep-otel"
         let bare = boot_options(
             &config,
             &DaemonArgs {
+                cmd: None,
                 no_restore: false,
                 foreground: false,
                 log_json: None,
@@ -641,6 +829,7 @@ otel = "/usr/local/bin/shep-otel"
         let supervised = boot_options(
             &config,
             &DaemonArgs {
+                cmd: None,
                 no_restore: false,
                 foreground: true,
                 log_json: None,
@@ -661,6 +850,7 @@ otel = "/usr/local/bin/shep-otel"
         let unflagged = boot_options(
             &config,
             &DaemonArgs {
+                cmd: None,
                 no_restore: false,
                 foreground: true,
                 log_json: None,
@@ -675,6 +865,7 @@ otel = "/usr/local/bin/shep-otel"
         let inherited = boot_options(
             &config,
             &DaemonArgs {
+                cmd: None,
                 no_restore: false,
                 foreground: false,
                 log_json: None,
@@ -698,6 +889,7 @@ otel = "/usr/local/bin/shep-otel"
         let opts = boot_options(
             &config,
             &DaemonArgs {
+                cmd: None,
                 no_restore: false,
                 foreground: true,
                 log_json: None,
@@ -781,5 +973,126 @@ otel = "/usr/local/bin/shep-otel"
             "a run-phase failure must not still claim to be a boot failure: {run_msg:?}"
         );
         assert!(run_msg.starts_with("the daemon failed while running"));
+    }
+
+    /// A shepherd that answers cleanly and names an older version still
+    /// takes the stop arm in phase 1: the handover has to exist in the
+    /// shepherd being replaced (spec H6), and no released shep carries it.
+    #[test]
+    fn reload_picks_the_stop_arm_against_a_daemon_too_old_to_hand_over() {
+        assert_eq!(Arm::for_daemon(Some("0.1.8")), Arm::StopAndStart);
+    }
+
+    /// Not even this binary's own version selects the handover, which is
+    /// what makes the arm honest rather than a stub: phase 1 ships no
+    /// handover for any version to support.
+    #[test]
+    fn reload_picks_the_stop_arm_against_a_daemon_of_this_very_version() {
+        assert_eq!(
+            Arm::for_daemon(Some(env!("CARGO_PKG_VERSION"))),
+            Arm::StopAndStart
+        );
+    }
+
+    /// A shepherd predating Task 4's field sends no `daemon_version` at
+    /// all, and no upgrade can reach backwards to change that. Unknown must
+    /// mean the safe arm, never the fast one.
+    #[test]
+    fn reload_picks_the_stop_arm_when_the_handshake_is_refused_without_a_version() {
+        let refusal = ConnectError::ProtocolMismatch {
+            client: shep_core::protocol::PROTOCOL_VERSION,
+            daemon_version: None,
+            message: "this daemon speaks protocol 1".to_string(),
+        };
+        assert_eq!(version_from_refusal(&refusal), None);
+        assert_eq!(
+            Arm::for_daemon(version_from_refusal(&refusal)),
+            Arm::StopAndStart
+        );
+    }
+
+    /// The other half: a refusal that DOES name a version must hand it on.
+    /// This is the seam Task 4 added the field for, and dropping it here
+    /// would leave phase 2 unable to ever pick the handover after a
+    /// protocol bump -- the one case it matters most.
+    #[test]
+    fn a_refusal_that_names_a_version_yields_it_for_the_arm_choice() {
+        let refusal = ConnectError::ProtocolMismatch {
+            client: shep_core::protocol::PROTOCOL_VERSION,
+            daemon_version: Some("0.1.8".to_string()),
+            message: "this daemon speaks protocol 1".to_string(),
+        };
+        assert_eq!(version_from_refusal(&refusal), Some("0.1.8"));
+    }
+
+    /// Nothing else in a connect failure names a version: the handshake
+    /// never got far enough for the shepherd to say who it is.
+    #[test]
+    fn a_connect_failure_that_is_not_a_refusal_names_no_version() {
+        let err = ConnectError::HandshakeClosed;
+        assert_eq!(version_from_refusal(&err), None);
+    }
+
+    /// Spec H4: the report is per-sheep, because phase 2's handover does
+    /// not stop the flock and the same output shape has to be true under
+    /// both arms. Sheep DO stop under phase 1's stop arm -- this pins the
+    /// SHAPE, not the mechanism.
+    #[tokio::test]
+    async fn reload_reports_each_sheep_rather_than_announcing_the_flock_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let (client, _envelopes) = shep_client::testing::fake_client_answering(&addr, |_req| {
+            Response::Mustered(vec![shep_client::testing::sample_info()])
+        })
+        .await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            report_reload(&client, &mut streams).await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        let text = format!(
+            "{}{}",
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap()
+        );
+        assert!(text.contains("web"), "{text}");
+        assert!(!text.to_lowercase().contains("flock stopped"), "{text}");
+    }
+
+    /// A home no shepherd owns has nothing to reload, and the pidfile lock
+    /// is what proves that -- not the socket, which is exactly what a
+    /// skewed shepherd refuses over. Drives `reload` end to end, so the
+    /// connect, the arm choice and the liveness proof are all in the path.
+    #[tokio::test]
+    async fn reload_refuses_a_home_no_shepherd_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.run).unwrap();
+        std::fs::create_dir_all(&paths.pids).unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            reload(&mut streams, &paths, VersionGuard::Exempt).await
+        };
+
+        assert_eq!(code, ExitCode::DaemonUnreachable);
+        let text = String::from_utf8(err).unwrap();
+        assert!(text.contains("no shepherd"), "{text}");
     }
 }
