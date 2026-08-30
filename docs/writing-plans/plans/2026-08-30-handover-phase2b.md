@@ -134,11 +134,37 @@ The cheap fix was designed and rejected. Writing the reader's tail out verbatim 
 
 ### Task 2: a deadline on `report_fds`, and an answer that is not ambiguous
 
-A stalled pump blocks the handover AND its graceful-stop fallback, so the daemon has no way out.
+**Files:**
+- Modify: `crates/shep-daemon/src/supervisor.rs` (`handover_snapshot`)
+- Modify: `crates/shep-daemon/src/handover/mod.rs` (`fitness`, and whatever carries the answer)
+- Test: alongside
 
-The fix is not a timeout wrapper. `CarriedFds::none()` is what a STOPPED sheep reports, so collapsing a timed-out live pump into it would let the fitness gate carry a wedged sheep with its descriptors silently dropped, which is worse than the hang. The snapshot needs a third answer, and it has to reach the gate.
+A stalled pump blocks the handover AND its graceful-stop fallback, so the daemon has no way out at all.
 
-Sketch only; expand when Task 1 lands.
+**The fix is not a timeout wrapper.** `CarriedFds::none()` is what a STOPPED sheep reports. Collapsing a timed-out live pump into it would let the fitness gate carry a wedged sheep with its descriptors silently dropped, which is worse than the hang it replaces. The snapshot needs a third answer and it has to reach the gate, which is why this is a signature change rather than a local fix.
+
+**Task 1 sharpened this.** A pump that answers `ReportFds` now parks; one that times out never parked, so it is still reading while every other pump is frozen. Two things follow and neither is optional:
+
+- a timed-out pump must NOT appear in `ParkedPumps`, or the resume path will wake something that was never asleep
+- the already-parked pumps must be resumed when the snapshot refuses, exactly as the fitness refusal resumes them. A handover abandoned on a timeout leaves the rest of the flock parked otherwise, which is a silent logging stop for the life of the daemon and is worse than the wedge
+
+**The gate refuses on the third answer.** A sheep whose pump did not answer is not carryable, and the stop arm is correct for it.
+
+- [ ] **Step 1: Write the failing tests**
+
+At minimum: a pump that never answers makes the snapshot refuse rather than hang; the refusal names that sheep; a timed-out pump is not in the parked set; and every pump that DID park is resumed when the snapshot refuses.
+
+The last one is the easy one to omit and the expensive one to omit.
+
+- [ ] **Step 2: Run to verify they fail**
+
+- [ ] **Step 3: Implement**
+
+Pick the deadline deliberately and say why in the code. It bounds a flush plus a drain of at most one buffer per stream, so it is a small multiple of a disk write rather than a guess.
+
+- [ ] **Step 4: Prove non-vacuous, then task gate and commit**
+
+A real reload is not required here, since nothing about the healthy path changes. Say so rather than skipping it silently.
 
 ---
 
