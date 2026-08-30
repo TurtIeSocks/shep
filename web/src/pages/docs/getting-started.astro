@@ -51,6 +51,17 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       <code>target/release/shep</code> on your PATH, or keep typing the full
       path. Everything below works either way.
     </p>
+    <p class="fine">
+      Two more things that belong to this step.
+      <code>shep completions &lt;shell&gt;</code> prints a completion script
+      for bash, elvish, fish, powershell or zsh, to redirect wherever your
+      shell reads them from. It completes verbs and flags and stops there:
+      sheep names, fold names and anything else the shepherd knows are never
+      completed, because the script never talks to one. And
+      <code>shep welcome</code> reprints the greeting a fresh
+      <code>$SHEP_HOME</code> shows once on its own: the sheep, the home it
+      set up, and the five commands worth knowing.
+    </p>
 
     <h2>2. Write a Flockfile</h2>
     <p>

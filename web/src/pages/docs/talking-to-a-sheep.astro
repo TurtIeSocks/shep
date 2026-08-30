@@ -1,0 +1,424 @@
+---
+/*
+ * Talking to a sheep (`shep signal --help`, `shep whisper --help`,
+ * crates/shep-core/src/signals.rs, crates/shep-cli/src/commands/signal.rs,
+ * shep-daemon's `begin_signal`). Terminal output below was run for real
+ * against target/release/shep on 2026-08-29 - see this page's PR for the
+ * transcript.
+ *
+ * The three verbs the binary's own `--help` groups under "Talk to a sheep":
+ * signal, whisper, trigger. `trigger` has a page of its own (the shepherd
+ * channel) and is a pointer here; the other two had nothing anywhere on
+ * this site before this page.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
+
+const hupDemo = `$ shep signal web HUP
+ID  NAME  OUTCOME    DETAIL
+0   web   delivered
+1   web   delivered
+
+$ shep bleats web --no-follow --lines 3
+web:0 | reloaded config`;
+
+const refusals = `$ shep signal web SIGSTOP
+error[usage]: \`SIGSTOP\` is not a signal shep will send; accepted: SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH, SIGCONT, SIGKILL
+$ echo $?
+2
+
+$ shep signal nope HUP
+error[not_found]: the daemon reported NotFound: selector matched no registered sheep
+$ echo $?
+3`;
+
+const untrapped = `$ shep signal batch USR1
+ID  NAME   OUTCOME    DETAIL
+3   batch  delivered
+
+$ shep flock
+ID  NAME    STATUS   PID    RESTARTS  EXIT     CPU   MEM   UPTIME  FOLD  SMIT
+3   batch   stopped  -      0         SIGUSR1  -     -     0s      -     -
+0   web:0   online   54244  0         -        0.1%  3.0M  33s     -     -
+1   web:1   online   54338  1         -        0.1%  3.0M  26s     -     -
+2   worker  online   54639  2         -        0.1%  3.0M  10s     -     -`;
+
+const selectors = `$ shep signal web:1 usr1
+ID  NAME  OUTCOME    DETAIL
+1   web   delivered
+
+$ shep signal all WINCH
+ID  NAME    OUTCOME    DETAIL
+0   web     delivered
+1   web     delivered
+2   worker  delivered
+
+$ shep signal worker HUP
+ID  NAME    OUTCOME      DETAIL
+2   worker  not_running  no live process to signal`;
+
+const whisperDemo = `$ shep whisper echoer "reload"
+ID  NAME    OUTCOME  DETAIL
+4   echoer  sent
+
+$ shep bleats echoer --no-follow --lines 5
+echoer | got: reload
+
+$ shep whisper worker "hello"
+ID  NAME    OUTCOME   DETAIL
+2   worker  no_stdin  no stdin pipe — set stdin = true`;
+---
+
+<DocsLayout
+  title="Talking to a sheep"
+  description="Reaching an app that is already running: a unix signal, a line on its stdin, or a named action over the shepherd channel. None of the three restarts it, though a signal it does not handle can still kill it."
+  crumb="Concepts / Talking to a sheep"
+  activeSlug="talking-to-a-sheep"
+>
+  <article>
+    <h1>Talking to a sheep</h1>
+    <ReferencePills slug="talking-to-a-sheep" />
+    <p class="lede">
+      An app that re-reads its configuration on <code>SIGHUP</code> can be
+      reconfigured with <code>shep signal &lt;name&gt; HUP</code> without
+      being restarted, so it keeps every warm cache, open pool and in-flight
+      request it was holding. That is a pattern shep can reach and cannot
+      offer on its own: <code>restart</code> and <code>reload</code> both
+      replace the process. This page is the three verbs that don't.
+    </p>
+
+    <h2>Signals</h2>
+    <VerbSignature verb="signal" usage="shep signal <selector> <signal>">
+      <p>
+        Delivers one signal to each matched sheep's <strong>own</strong>{" "}
+        process, never to its process group. The lambs it forked are not
+        signalled. That is the difference between this verb and the stop
+        ladder: <code>shep stop</code> signals the whole group and then
+        escalates, and this one is a nudge to a single process with nothing
+        behind it.
+      </p>
+    </VerbSignature>
+
+    <h2>A config change is not a binary upgrade</h2>
+    <p>
+      shep prices those two identically, and your app almost certainly does
+      not. Replacing a process throws away everything it had built up in
+      memory, which is the right price for new code and a steep one for a
+      changed setting. For a process holding state that is expensive to
+      rebuild, the gap between the two is the whole reason this verb is worth
+      knowing about:
+    </p>
+    <ul>
+      <li>
+        <code>shep restart api</code> replaces the process. The new one reads
+        the new config, and also starts from nothing: caches cold, pools
+        empty, whatever was in flight gone.
+      </li>
+      <li>
+        <code>shep signal api HUP</code> leaves the process where it is. If
+        the app re-reads its config on <code>SIGHUP</code>, it picks up the
+        change and keeps everything else.
+      </li>
+    </ul>
+    <p>
+      Only the application can make the second one true. shep delivers the
+      signal and reports that it was delivered; what <code>SIGHUP</code>{" "}
+      means is the app's convention, though a widely kept one. Server
+      software has treated it as "re-read your configuration" for decades,
+      and plenty of application frameworks and long-running daemons do the
+      same. Here is a sheep that traps it, saying so in its own output:
+    </p>
+    <CodeBlock>{hupDemo}</CodeBlock>
+
+    <h2>The nine names</h2>
+    <p>
+      <code>SIGHUP</code>, <code>SIGINT</code>, <code>SIGQUIT</code>,{" "}
+      <code>SIGTERM</code>, <code>SIGUSR1</code>, <code>SIGUSR2</code>,{" "}
+      <code>SIGWINCH</code>, <code>SIGCONT</code> and <code>SIGKILL</code>.
+      The <code>SIG</code> prefix and the case are both optional, so{" "}
+      <code>hup</code>, <code>Hup</code> and <code>SIGHUP</code> are the same
+      request, and the wire carries the canonical spelling whichever you
+      typed. Anything outside the nine is refused locally, before the command
+      opens a connection at all.
+    </p>
+    <p>
+      A raw number is refused with them, deliberately. Signal numbers are not
+      portable: <code>SIGUSR1</code> is 10 on Linux and 30 on macOS, so a
+      command that took one would mean two different things on two hosts and
+      shep will not guess which you meant.
+    </p>
+    <p>
+      <code>SIGSTOP</code> is the one real, spellable, deliverable signal
+      that is missing on purpose. A stopped process still reads{" "}
+      <code>online</code> in <code>shep flock</code>, in{" "}
+      <code>describe</code>, on the bus and to every dog, because the
+      shepherd owns no mechanism that could tell the difference. Refusing it
+      keeps shep out of a flock state it cannot describe.{" "}
+      <code>SIGCONT</code> is accepted, so an operator who stopped a sheep by
+      some other route has a way back.
+    </p>
+    <CodeBlock>{refusals}</CodeBlock>
+
+    <Callout variant="careful">
+      <code>delivered</code> means the kernel took it, not that the app did
+      anything with it. A signal the app blocks or ignores reads exactly like
+      one it acts on, because there is nothing on this path that could tell
+      them apart and a supervisor inventing a distinction would be guessing.
+    </Callout>
+
+    <p>
+      That cuts the other way too, and this is the one to be careful with: a
+      signal the app does not handle still has a kernel default, and for most
+      of the nine that default is to terminate the process. A sheep that
+      never installed a <code>SIGUSR1</code> handler is killed by one, the
+      row still says <code>delivered</code>, and the exit shows up in the
+      <code>EXIT</code> column like any other:
+    </p>
+    <CodeBlock>{untrapped}</CodeBlock>
+    <p class="fine">
+      <code>batch</code> above sets <code>autorestart = false</code>, which
+      is why it stayed down. With the default <code>autorestart</code> it
+      would have come straight back with its restart counter one higher, and
+      a <code>shep signal all USR2</code> across a flock you have not checked
+      is a restart of everything in it that does not handle{" "}
+      <code>SIGUSR2</code>.
+    </p>
+
+    <h2>Which sheep the selector reaches</h2>
+    <p>
+      The same grammar every other verb takes: a name, a numeric id,{" "}
+      <code>name:slot</code> for one instance of a clustered app, a glob, a{" "}
+      <code>/regex/</code>, <code>fold:&lt;name&gt;</code>, or{" "}
+      <code>all</code>. A bare name reaches <em>every</em> instance of that
+      app, so <code>shep signal web HUP</code> against three instances is
+      three deliveries and three rows.
+    </p>
+    <p>
+      The <code>NAME</code> column carries the app's name, not the{" "}
+      <code>web:0</code> spelling <code>shep flock</code> uses, so{" "}
+      <code>ID</code> is what tells two instances apart in a reply. Dogs are
+      reached only by a selector that named one exactly:{" "}
+      <code>shep signal all HUP</code> passes every dog by, and{" "}
+      <code>shep signal metrics HUP</code> does not.
+    </p>
+    <CodeBlock>{selectors}</CodeBlock>
+    <p class="fine">
+      A sheep being drained by a reload is signalled like any other. It is a
+      live process the selector matched, and holding it back would be a
+      silent refusal with nowhere to explain itself.
+    </p>
+
+    <h2>What the rows say, and what the exit code says</h2>
+    <p>
+      Three outcomes per matched sheep. <code>delivered</code>: the kernel
+      accepted the signal for that pid. <code>not_running</code>: the sheep
+      is registered but has no live process, so it is stopped, errored, or
+      waiting out a restart backoff. <code>failed</code>: the kernel refused
+      the delivery, and <code>DETAIL</code> carries its reason, such as{" "}
+      <code>ESRCH</code> for a process reaped between the lookup and the
+      syscall or <code>EPERM</code> for one this shepherd may not signal.
+    </p>
+    <p>
+      None of the three fails the command. A selector like{" "}
+      <code>fold:backend</code> makes a mixed flock the normal case, so the
+      per-sheep answer lives in the row and the exit code answers a different
+      question: whether the <em>request</em> worked. Exit 2 for a malformed
+      selector or a signal name outside the nine, both caught locally before
+      anything reaches the shepherd. Exit 3 when the selector matched no
+      registered sheep at all.
+    </p>
+
+    <h2>What it is not</h2>
+    <p>
+      <code>shep signal &lt;name&gt; TERM</code> is not{" "}
+      <code>shep stop</code>. A stop runs the ladder: the configured{" "}
+      <code>kill_signal</code> to the whole process group, then{" "}
+      <code>kill_timeout</code>, then <code>SIGKILL</code>, and the sheep
+      ends up marked stopped. Sending <code>SIGTERM</code> here does none of
+      that. There is no ladder, no timeout, no escalation and no stopped
+      marking, so whatever the app's restart policy says happens next is what
+      happens.
+    </p>
+    <p>
+      <code>shep signal &lt;name&gt; KILL</code> is a real{" "}
+      <code>SIGKILL</code> to one process, and the restart policy reads the
+      exit as any other unexpected one: an app with <code>autorestart</code>{" "}
+      on comes back. And swapping instances is <code>shep reload</code>, not
+      a signal an app happens to interpret that way.
+    </p>
+    <Callout variant="note">
+      On Windows only <code>SIGKILL</code> is delivered, and the other eight
+      names are refused one at a time rather than the whole verb failing.
+      Seven of them have no delivery mechanism to a foreign Windows process
+      at all. <code>SIGINT</code> is the judgement call: the console control
+      event exists, but Ctrl+C is disabled by default in a process group
+      created the way shep creates every sheep's, so it would arrive nowhere
+      while reading as success.
+    </Callout>
+
+    <h2>A line on its stdin</h2>
+    <VerbSignature
+      verb="whisper"
+      aliases={["sendline"]}
+      usage="shep whisper <selector> <line>"
+    >
+      <p>
+        Writes one line to each matched sheep's stdin. Only reaches an app
+        whose Flockfile sets <code>stdin = true</code>, and nothing else
+        implies it: unlike the shepherd channel, which{" "}
+        <code>wait_ready</code> and <code>shutdown_with_message</code> both
+        turn on, nothing inside shep needs a sheep's stdin except this verb.
+        One line, and the terminator is shep's to add, so a line containing a
+        newline or a carriage return is a usage error rather than two
+        commands.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{whisperDemo}</CodeBlock>
+    <p>
+      <code>sent</code> means the bytes were written and flushed to the pipe,
+      not that the app read them. A pipe holds 64 KiB before it blocks, so a
+      short line to an app that never reads its stdin is still{" "}
+      <code>sent</code>. <code>no_stdin</code> is one outcome for two causes,
+      the field being unset and the sheep not running, because the row is
+      read to answer "why did my line not arrive" and both answers are "there
+      is no pipe here".
+    </p>
+    <p>
+      <code>not_written</code> carries which of three things happened: the
+      far end went away, the line arrived to find that sheep's queue already
+      full, or the write did not finish inside the shepherd's own bound.
+    </p>
+    <Callout variant="careful">
+      That last one does not promise the line was never written. A write that
+      timed out is a write the shepherd stopped <em>waiting</em> for: the
+      bytes may be sitting part-written in a pipe the app is not draining,
+      and they land in full the moment it drains. Lines still queued behind
+      it are dropped once their caller gives up, so a retry cannot pile
+      duplicates up and deliver them together later, but treat the retry as a
+      second command rather than a repeat of the first.
+    </Callout>
+
+    <h2>A named action</h2>
+    <p>
+      The third way in is <code>shep trigger</code>, which sends an action
+      name and optional parameters over the sheep's shepherd channel and
+      reports what the app answered. It is the only one of the three where
+      the app talks back, and it needs the channel open:{" "}
+      <code>channel = true</code>, or either of the two fields that imply it.
+      It has a page to itself.
+    </p>
+
+    <h2>Where to go next</h2>
+
+    <div class="next-grid">
+      <a href="/docs/shepherd-channel" class="next-card">
+        <div class="next-title">The shepherd channel →</div>
+        <div class="next-body">
+          <code>shep trigger</code>, the fd-3 pipe it speaks over, and what
+          an app has to answer for a reply to come back.
+        </div>
+      </a>
+      <a href="/docs/cli" class="next-card">
+        <div class="next-title">CLI reference →</div>
+        <div class="next-body">
+          Every flag on <code>signal</code>, <code>whisper</code> and{" "}
+          <code>trigger</code>, generated from the binary's own help.
+        </div>
+      </a>
+    </div>
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(36px, 4.6vw, 56px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 29px;
+    letter-spacing: -0.03em;
+    margin: 40px 0 8px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  ul {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+    padding-left: 22px;
+  }
+
+  li {
+    margin-bottom: 8px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+</style>

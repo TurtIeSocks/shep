@@ -11,6 +11,45 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
+
+const initScaffold = `# Manage your app in a Flockfile
+# Add as many apps as you would like using TOML syntax
+
+#[[app]]
+# A convenient and unique name for shep to display
+#name = "my-first-sheep"
+# The script that shep should use to launch your app
+#script = "./index.js"
+# Restarts the process automatically when it exits unexpectedly
+#autorestart = true
+# Where the process runs. Without it, the daemon's own directory
+#cwd = "/srv/app"`;
+
+const stockDemo = `$ shep stock web 4
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM     UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    3.0M    0s      -     -
+1   web:1   online  62889  0         -     -    3.0M    0s      -     -
+3   web:2   online  62936  0         -     -    176.0K  0s      -     -
+4   web:3   online  62937  0         -     -    144.0K  0s      -     -
+2   worker  online  62890  0         -     -    3.0M    0s      -     -
+
+$ shep stock web 2
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    3.0M  1s      -     -
+1   web:1   online  62889  0         -     -    3.0M  1s      -     -
+3   web:2   online  62936  0         -     -    0B    1s      -     -
+4   web:3   online  62937  0         -     -    0B    1s      -     -
+2   worker  online  62890  0         -     -    3.0M  1s      -     -
+
+$ shep flock
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    3.0M  2s      -     -
+1   web:1   online  62889  0         -     -    3.0M  2s      -     -
+2   worker  online  62890  0         -     -    3.0M  2s      -     -`;
+
+const initJsonRefusal = `$ shep init deploy.json --all
+error[usage]: JSON has no comment syntax, so a full scaffold would pin every default instead of explaining it; write a .json5 Flockfile for the same syntax with comments, or drop --all`;
 
 interface Field {
   name: string;
@@ -34,7 +73,7 @@ const fieldGroups: FieldGroup[] = [
       { name: "cwd", type: "string?", default: "the Flockfile's own directory", does: "Working directory at spawn. Unset, an app in a Flockfile runs where that Flockfile lives, so a relative script resolves the way you would read it." },
       { name: "interpreter", type: "string?", default: "none", does: "Interpreter override; \"none\" runs the script directly." },
       { name: "env", type: "map<string,string>", default: "{}", does: "Merged over the daemon's filtered environment; values support {{instance}} and {{name}}. SHEP_INSTANCE and SHEP_NAME are always set and may not be set here." },
-      { name: "instances", type: "integer", default: "1", does: "How many separate copies of this app to run (pm2's fork mode, not its cluster mode: no shared socket). SHEP_INSTANCE and SHEP_NAME are always set on every instance; other env values, args, out_file and err_file may use {{instance}} and {{name}} templates." },
+      { name: "instances", type: "integer", default: "1", does: "How many separate copies of this app to run, each its own process; shep does not share a socket between them (see reuse_port if the app does that itself). SHEP_INSTANCE and SHEP_NAME are always set on every instance; other env values, args, out_file and err_file may use {{instance}} and {{name}} templates." },
       { name: "increment_var", type: "string?", default: "removed", does: "Refused at normalize with the replacement named: set env.YOUR_VAR = \"{{instance}}\" instead." },
     ],
   },
@@ -136,6 +175,53 @@ const fieldGroups: FieldGroup[] = [
     <CodeBlock label="Flockfile.toml">{`[[app]]
 name   = "web"
 script = "./server"`}</CodeBlock>
+
+    <h2>Or start from a generated one</h2>
+    <VerbSignature verb="init" usage="shep init [path] [--all] [--force]">
+      <p>
+        Writes a commented Flockfile to fill in. With no path that's{" "}
+        <code>Flockfile.toml</code> in the current directory; give it one and
+        the extension picks the language, out of <code>.toml</code>,{" "}
+        <code>.yaml</code>, <code>.yml</code>, <code>.json</code> and{" "}
+        <code>.json5</code>.
+      </p>
+    </VerbSignature>
+    <CodeBlock label="Flockfile.toml">{initScaffold}</CodeBlock>
+    <p>
+      Almost every line is commented out, and uncommenting the ones you want
+      is the whole workflow. The generator builds a real document first and
+      comments it in a single pass afterwards, which is why the same
+      scaffold exists in four languages instead of one: the comment marker
+      never touches the structure. A test uncomments each format
+      mechanically and parses the result, so this is a Flockfile that works
+      rather than prose shaped like one.
+    </p>
+    <p>
+      <code>--all</code> writes every field the grammar has instead of the
+      handful worth meeting on day one, which is 82 lines of TOML against
+      the 12 above. <code>--force</code> replaces a Flockfile that is
+      already there, keeping <em>that</em> file's format rather than the
+      default one, so forcing over a <code>.yaml</code> writes YAML instead
+      of dropping TOML into it. Without <code>--force</code>, an existing
+      Flockfile is a refusal and nothing is written.
+    </p>
+    <Callout variant="note">
+      JSON has no comment syntax, so the thing this verb makes cannot be
+      made in it. A <code>.json</code> scaffold is a live minimal document
+      with real values and no guidance, and <code>--all</code> is refused
+      there outright rather than fudged, because a JSON document naming
+      every field would pin every default explicitly. That is a Flockfile
+      you would tell somebody not to commit.
+    </Callout>
+    <CodeBlock>{initJsonRefusal}</CodeBlock>
+    <p class="fine">
+      Writing a second Flockfile beside an existing one is legal and said out
+      loud rather than refused, since somebody naming a path explicitly may
+      well be migrating. Discovery walks the fixed order below and stops at
+      the first hit, so the new file can be one shep never reads;{" "}
+      <code>shep init</code> prints an <code>init_shadowed</code> notice
+      naming both files when it spots that.
+    </p>
 
     <h2>Formats and discovery</h2>
     <p>
@@ -320,6 +406,33 @@ Z_DEVICE_ID = "z-{{instance}}d"`}</CodeBlock>
       refused rather than silently overwritten:
     </p>
     <CodeBlock label="env sets a reserved variable">{`error[invalid_config]: the daemon reported InvalidConfig: sheep \`z-worker\` sets \`SHEP_INSTANCE\` in env, but shep injects it: use a different name, or \`{{instance}}\` in your own variable`}</CodeBlock>
+
+    <h2>Changing the count without editing the file</h2>
+    <VerbSignature verb="stock" aliases={["scale"]} usage="shep stock <name> <n>">
+      <p>
+        An absolute count, not a change: <code>shep stock web 4</code> means
+        web has four instances afterwards, whatever it had before. There is
+        no <code>+N</code> or <code>-N</code> form, so running it twice
+        leaves the same flock as running it once.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{stockDemo}</CodeBlock>
+    <p>
+      Stocking up fills the lowest free slots, and stocking down releases the
+      highest, so stocking out and back gives you the same slot numbers, the
+      same <code>SHEP_INSTANCE</code> values and the same log files you
+      started with. Slots are not ids: <code>web:2</code> above arrived with
+      id 3, because an id is handed out once per sheep and a slot describes
+      its place in the app.
+    </p>
+    <p>
+      The second command printed four instances because it answers the
+      moment the shepherd accepts, and the two on their way out were still
+      running their stop ladders at that point. They report themselves on
+      the bus under <code>process.delete</code>, and a listing a moment later
+      shows the flock settled. The new count goes into the muster roll, so{" "}
+      <a href="/docs/startup">a reboot</a> keeps it.
+    </p>
 
     <h2>The full field reference</h2>
     <p>

@@ -36,8 +36,15 @@ export interface DocsNavItem {
   /** Route is always `/docs/${slug}`. */
   label: string;
   built: boolean;
-  /** Repo-relative path this page's material is drawn from — the Source pill. */
-  source: string;
+  /**
+   * Repo-relative path this page's material is drawn from — the Source pill.
+   *
+   * An array where a page's verbs genuinely span more than one module, which
+   * renders one Source pill per file. The Logs page is the case that forced
+   * it: `bleats` lives in `commands/bleats.rs` and `reopen`/`flush` in
+   * `commands/logs.rs`, so either path alone under-represents the page.
+   */
+  source: string | string[];
   spec?: SpecRef;
   api?: ApiRef;
 }
@@ -105,6 +112,32 @@ export const docsNav: DocsNavGroup[] = [
           path: "protocol/channel/index.html",
           label: "shep_core::protocol::channel",
         },
+      },
+      {
+        slug: "talking-to-a-sheep",
+        label: "Talking to a sheep",
+        built: true,
+        source: [
+          "crates/shep-core/src/signals.rs",
+          "crates/shep-cli/src/commands/signal.rs",
+          "crates/shep-cli/src/commands/whisper.rs",
+        ],
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+        api: {
+          path: "signals/enum.OperatorSignal.html",
+          label: "shep_core::signals::OperatorSignal",
+        },
+      },
+      {
+        slug: "lifecycle",
+        label: "Stopping and replacing a sheep",
+        built: true,
+        source: [
+          "crates/shep-daemon/src/kill.rs",
+          "crates/shep-daemon/src/supervisor.rs",
+          "crates/shep-daemon/src/snapshot.rs",
+        ],
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
       },
       {
         slug: "dogs",
@@ -203,6 +236,16 @@ export const docsNav: DocsNavGroup[] = [
           path: "protocol/request/struct.ProcessInfo.html",
           label: "shep_core::protocol::request::ProcessInfo",
         },
+      },
+      {
+        slug: "logs",
+        label: "Logs",
+        built: true,
+        source: [
+          "crates/shep-cli/src/commands/bleats.rs",
+          "crates/shep-cli/src/commands/logs.rs",
+        ],
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
       },
       {
         slug: "not-built",

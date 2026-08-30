@@ -10,6 +10,35 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
 import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
+import VerbSignature from "../../components/docs/VerbSignature.astro";
+
+const rollDemo = `$ shep save
+FILE                           APPS
+/tmp/shepdocs/home/flock.json  2
+
+$ shep muster
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
+0   web:0   online  61835  0         -     -    -    0s      -     -
+1   web:1   online  61836  0         -     -    -    0s      -     -
+2   worker  online  61837  0         -     -    -    0s      -     -`;
+
+const pingDemo = `$ shep ping
+shepherd  online
+version   0.1.15
+pid       61682
+home      /tmp/shepdocs/home
+socket    /tmp/shepdocs/home/run/shep.sock
+
+$ shep kill
+PID    SOCKET_REMOVED
+61682  true
+
+$ shep ping
+shepherd  offline
+home      /tmp/shepdocs/home
+socket    /tmp/shepdocs/home/run/shep.sock
+$ echo $?
+5`;
 
 const realOutput = `$ shep startup
 error[failure]: installing the unit needs root; run: sudo /opt/shep/target/release/shep startup --user deploy --home /tmp/shep_startup_demo
@@ -18,17 +47,6 @@ $ shep unstartup
 ACTION   TARGET                                                          RESULT
 removed  /Library/LaunchDaemons/io.github.turtiesocks.shep.deploy.plist  absent`;
 
-const runbook = `1.  shep import --dry-run           # read the Flockfile before it's written
-2.  shep import                     # writes ./Flockfile.toml; starts nothing
-3.  pm2 delete all && pm2 kill      # the one destructive step, and it's pm2's
-4.  shep start ./Flockfile.toml     # the flock comes up under shep
-5.  shep flock                      # every app online, CPU and MEM populated
-6.  shep save                       # names the roll it wrote and the app count
-7.  sudo shep startup --user <you>  # writes and enables the unit
-8.  systemctl status shep-<you>     # active (running), and green
-9.  reboot
-10. systemctl status shep-<you>     # active (running) WITHOUT anyone logging in
-11. shep flock                      # the same apps, new pids, uptime near zero`;
 ---
 
 <DocsLayout
@@ -91,19 +109,93 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
       <code>startup</code> refuses to overwrite the unit it just wrote).
     </Callout>
 
-    <h2>The runbook</h2>
+    <h2>The muster roll</h2>
     <p>
-      This is the full sequence a migration from pm2 walks through (import,
-      start, save, install, reboot, verify), end to end on a Linux box:
+      The unit brings the shepherd back. What brings the <em>flock</em> back
+      is a file: <code>$SHEP_HOME/flock.json</code>, the muster roll, holding
+      every registered app's config and how many of its instances were
+      running when it was written.
     </p>
-    <CodeBlock>{runbook}</CodeBlock>
+    <VerbSignature verb="save" usage="shep save">
+      <p>
+        Writes the roll now and reports where it landed and how many apps it
+        recorded. Not the only thing that writes it: the shepherd keeps the
+        roll current on its own, folding a burst of lifecycle events into one
+        write so a restart storm costs one rewrite rather than one per event.
+        This verb exists so you can see the roll is on disk before a reboot
+        instead of trusting that it is, which is why a failed save is loud
+        rather than a quiet no-op. It refuses when no shepherd is running
+        rather than starting one, since a shepherd started to answer a{" "}
+        <code>save</code> has an empty flock, and writing <em>that</em> would
+        replace a good roll with a blank one.
+      </p>
+    </VerbSignature>
+    <VerbSignature verb="muster" usage="shep muster">
+      <p>
+        Assembles the flock from that roll, starting a shepherd first if none
+        is running. Only two verbs in the CLI will do that, this one and{" "}
+        <code>shep start</code>, and this is the one the init unit calls at
+        boot: the restore that runs unattended after a reboot is the same
+        code path you can drive by hand.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{rollDemo}</CodeBlock>
+    <p class="fine">
+      Those pids are new because that <code>muster</code> ran with no
+      shepherd at all: it started one, the boot restore brought the flock up,
+      and the request that followed reported what came back.
+    </p>
     <p>
-      Step 8's <code>active (running)</code> means something specific: the
-      generated unit is <code>Type=notify</code>, so systemd doesn't consider
-      it started until the daemon itself says so: it sends that signal
-      only once the muster restore from step 6's roll has finished, not the
-      moment the process execs. A green status at step 8 is already evidence
-      the restore path works, before the reboot ever happens.
+      An app restores if it was running when the roll was saved{" "}
+      <em>and</em> its <code>autostart</code> is still true. Being up when
+      the roll was written is the contract, and{" "}
+      <code>autostart = false</code> is the explicit opt-out of being brought
+      back. An app the flock already has is left exactly where it stands and
+      still reported as restored, which is what makes the verb safe to run
+      twice: an init system that calls it a second time gets the same honest
+      answer rather than a duplicate flock. A roll that restored nothing says
+      so on stderr rather than exiting 0 in silence.
+    </p>
+    <Callout variant="careful">
+      The roll is the one place shep writes secrets to disk. It stores each
+      app's <code>env</code> verbatim, because a restore has to reproduce it,
+      while every other surface redacts them. On unix the file is written
+      owner-only, through a temp file and a rename so a reader never sees a
+      half-written roll. It is plain JSON and editable by hand, and every
+      entry is re-validated on the way back in, with failures collected and
+      reported rather than aborting the whole muster.
+    </Callout>
+
+    <h2>Is it up, and stopping it on purpose</h2>
+    <VerbSignature verb="ping" usage="shep ping">
+      <p>
+        Asks whether a shepherd is answering, and says which one: its
+        version, its pid, the home it is serving and the socket it is
+        listening on. Offline it still names the home and the socket, since
+        the usual reason for a surprise is that <code>--home</code> or{" "}
+        <code>$SHEP_HOME</code> is pointing somewhere other than where you
+        thought, and exits 5 so a script can branch on it. It never starts a
+        shepherd.
+      </p>
+    </VerbSignature>
+    <VerbSignature verb="kill" usage="shep kill">
+      <p>
+        Shuts the shepherd down, and the flock with it. Every online sheep
+        goes through the full stop ladder first, so this is an orderly
+        shutdown rather than a rug pull, and the socket is unlinked last.
+      </p>
+    </VerbSignature>
+    <CodeBlock>{pingDemo}</CodeBlock>
+    <p>
+      A reply is not treated as success. <code>shep kill</code> waits for the
+      control address to stop answering before reporting one, which is what
+      makes <code>shep kill &amp;&amp; shep start</code> safe: without the
+      wait, the new shepherd could claim the address before the old one had
+      released it. On unix that means watching the socket file disappear,
+      since the daemon unlinks it last. On Windows the address is a named
+      pipe with no directory entry to watch, so <code>shep kill</code> probes
+      it instead, and a connect that fails because the name is gone is the
+      same proof.
     </p>
 
     <h2>Honestly: openrc and the BSDs are untested</h2>
@@ -136,8 +228,9 @@ const runbook = `1.  shep import --dry-run           # read the Flockfile before
       <a href="/docs/from-pm2" class="next-card">
         <div class="next-title">Coming from pm2 →</div>
         <div class="next-body">
-          The runbook above is the tail end of this guide: start there for
-          the import step and the env rule that precedes it.
+          The full runbook, from <code>shep import</code> through the
+          reboot check, lives there: this page covers the save and muster
+          half in more depth.
         </div>
       </a>
       <a href="/docs/containers" class="next-card">
