@@ -1588,10 +1588,15 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     /// holds: the predecessor has already `execve`d itself away by this
     /// point, and there is no image left to hand the flock back to.
     ///
-    /// # Panics
+    /// Must be called from within a Tokio runtime context, which is where
+    /// the actor task and every adopted sheep's pump have to be spawned.
     ///
-    /// Panics if called outside a Tokio runtime context, which is where the
-    /// actor task and every adopted sheep's pump have to be spawned.
+    /// Stated as a requirement rather than under a `# Panics` heading, which
+    /// is how the sibling [`Self::spawn`] states the identical one. IR-21
+    /// makes a `# Panics` section and `#[track_caller]` one decision, and
+    /// `#[track_caller]` buys nothing here: the panic is raised inside
+    /// `tokio::spawn`, which does not carry the attribute itself, so the
+    /// location reported would be tokio's either way.
     #[cfg(unix)]
     pub(crate) fn spawn_adopted(
         self,
