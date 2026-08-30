@@ -200,6 +200,37 @@ The end-to-end case is 2a's, widened: a flock containing every kind 2b now carri
 
 ---
 
+## The reload drill, exactly
+
+Every task that touches the carried path needs this, and getting it slightly wrong hides the defect. Recorded verbatim because three attempts were lost to variations of it.
+
+```sh
+printf '#!/bin/sh\nawk '"'"'BEGIN{i=1; while(1){print i; i++}}'"'"'\n' > /tmp/qc/fast.sh
+chmod +x /tmp/qc/fast.sh
+printf '[[app]]\nname = "fast"\nscript = "/tmp/qc/fast.sh"\ninterpreter = "sh"\n' > /tmp/qc/Flockfile.toml
+export SHEP_HOME=/tmp/qc/home
+```
+
+Then start, reload three times with a `sleep 1` between, `shep stop fast`, and only then count.
+
+Four things that each cost real time to learn:
+
+- **The rate is the whole point.** A sheep with a `sleep` between lines does not tear. `awk` with no sleep gives roughly 1.6M lines a second; a shell `echo` loop gives about 10k and shows nothing. A defect measured as fixed at 10k reappeared at 100x.
+- **`$SHEP_HOME` must be short.** The control socket refuses a path over 103 bytes, and the session scratchpad path is 119. Use `/tmp/<short>/home`.
+- **Stop the sheep before counting.** The teardown produces its own seam, which otherwise reads as a duplicate and sends you chasing the wrong thing.
+- **Count seam-aware.** A tear shows as a gap PLUS one part-eaten line, for example `14097652 / 7828 / 14097829`, where `7828` is the tail of `14097828`. A counter that treats a non-increasing step as a rewind reports nonsense like "32M lines lost". Count forward gaps and duplicates separately.
+
+Baselines on that drill, three reloads: `origin/main` loses about 2900 lines, 2b task 1's first attempt about 1950, the shipped version 0 to 3.
+
+## Working state, for whoever picks this up
+
+- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1 and 2 committed; task 3 folded into 1.
+- Counts after task 2: **623** daemon lib with `--skip ::slow::`, **2076** workspace.
+- The rejected buffer-carry patch is at `stash@{0}` and in this session's scratchpad as `task1-carry.patch`. Read it for plumbing, not design.
+- `handover/mod.rs`'s module header still says "Phase 2a carries only the plainest sheep", which goes wrong as tasks 4 to 7 land.
+- PR #73 has two threads left open for 2b. Both are now addressed: the `report_fds` deadline is task 2, and descriptor pinning fell out of task 1's parking. They can be closed with a pointer to those commits.
+- `spawn_handover_task` visits sheep serially, so a flock of wedged pumps waits N x 2s before the fallback. Named in `REPORT_DEADLINE`'s doc, not fixed.
+
 ## Phase gate
 
 The four per-task commands, plus:
