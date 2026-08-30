@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use shep_core::config::AppConfig;
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::ExitInfo;
 use shep_core::status::ProcStatus;
@@ -209,13 +210,35 @@ const FILE_NAME: &str = "handover.json";
 /// `handover::adopt`). It is the whole of what crosses the exec besides the
 /// descriptors themselves, which it names by number.
 ///
-/// **No environment values, ever.** A sheep's env can hold secrets, and the
-/// successor re-reads them from config, so nothing here is derived from
-/// `AppConfig::env`. That is asserted by an exact-string test over the
-/// serialized form rather than by a field check, because the risk is a
-/// future field that carries env by accident (IR-41). `Debug` is derived
-/// for the same reason: ids, pids, a name and a handful of descriptor
-/// numbers are all an operator could read out of `ps`.
+/// **It carries each sheep's whole resolved spec, environment included.**
+/// That is deliberate, and an earlier draft of this module said the
+/// opposite, so here is the argument rather than only the conclusion.
+///
+/// The muster roll already persists every sheep's environment in cleartext,
+/// permanently. [`SavedApp::app`](crate::snapshot::SavedApp::app) is a whole
+/// `AppConfig`, `AppConfig::env` is a plain `BTreeMap<String, String>` with
+/// no skip attribute, and `flock.json` is written at `0600`. That type's own
+/// doc even notes that `Debug` redacts env, so the sensitivity was
+/// understood and the value persisted anyway. A blob carrying the same
+/// values, at the same mode, on a file the successor unlinks the moment it
+/// has read it, is strictly less exposure than the file already sitting
+/// there for the life of the flock.
+///
+/// Refusing to carry it bought nothing and cost a great deal. Without a spec
+/// the successor has to rebuild one from the roll and bind carried sheep to
+/// roll apps by name and instance, except the roll records a running COUNT
+/// per app rather than which slots were up, and `muster` starts what it
+/// restores. A second source of truth that can disagree with the blob, to
+/// protect a value that is already on disk.
+///
+/// What protects it is what always did: mode `0600` set at creation rather
+/// than by a later `chmod`, inside a `0700` directory, unlinked by the
+/// successor as soon as it has read it. `Debug` stays derived and stays
+/// safe, because `AppConfig`'s own `Debug` prints `env` as a count rather
+/// than as pairs; an exact-string test pins that (IR-41), and a second one
+/// pins that the serialized form does carry the values, since a successor
+/// that silently lost them would respawn an app under an environment it was
+/// never started with.
 ///
 /// **`ProcessEntry::started_at` is deliberately absent**, and no serializer
 /// for it would help. It is a `tokio::time::Instant`, which has no epoch and
@@ -393,10 +416,10 @@ impl core::error::Error for LoadError {
 
 /// One sheep, as the successor will find it.
 ///
-/// Everything here is a fact about an instance that is already running, or
-/// already registered and not running. Nothing is re-derivable from config,
-/// which is why each field is here: config says what an app *is*, and this
-/// says what this instance currently *is doing*.
+/// Two halves. [`Self::app`] is what the sheep IS, carried whole so the
+/// successor can respawn this exact instance without asking the muster roll
+/// what it was. Every other field is what this instance is currently DOING,
+/// none of which any config could answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CarriedSheep {
     /// The supervisor's entry id, which callers already hold and selectors
@@ -428,6 +451,34 @@ pub struct CarriedSheep {
     credentials: SpawnIdentity,
     /// The descriptor numbers this instance's output travels on.
     fds: CarriedFds,
+    /// The resolved config this instance runs under, environment included.
+    ///
+    /// This is the `AppConfig` beneath [`ProcessEntry::spec`]'s
+    /// `ResolvedApp`, not the `ResolvedApp` itself. That type is a proof
+    /// token, obtainable only by passing a config through `normalize`, so
+    /// deriving `Deserialize` for it would mint the token out of arbitrary
+    /// JSON for every consumer of shep-core, which is a far wider change
+    /// than a handover needs. The value here has already been through
+    /// `normalize`, and `normalize` is pure over one of its own outputs: it
+    /// reads no filesystem, and a `~/` it expanded no longer begins with
+    /// `~`. So the successor rebuilds the token by normalizing this again.
+    ///
+    /// The roll persists an app the same way for the same reason, and doing
+    /// it differently here would be a second shape for one job:
+    /// [`SavedApp::app`](crate::snapshot::SavedApp::app) is an `AppConfig`
+    /// and `snapshot.rs` re-normalizes it on restore.
+    ///
+    /// One residual, recorded because it is real and not introduced here. A
+    /// successor whose `normalize` has tightened can refuse a config its
+    /// predecessor accepted, and after the exec there is no stop arm left to
+    /// fall back to. Carrying the resolved token instead would not buy the
+    /// escape it looks like it would: the alternative to carrying a spec at
+    /// all is the roll, which re-normalizes this identical `AppConfig` and
+    /// meets the identical refusal, with a second source of truth on top.
+    ///
+    /// Its serialized shape is part of this blob's version 1 format, as
+    /// [`SpawnIdentity`]'s is.
+    app: AppConfig,
 }
 
 impl CarriedSheep {
@@ -451,6 +502,7 @@ impl CarriedSheep {
             last_exit: entry.last_exit,
             credentials: entry.credentials,
             fds,
+            app: entry.spec.config().clone(),
         }
     }
 }
@@ -768,7 +820,6 @@ fn c_string(bytes: &[u8]) -> io::Result<CString> {
 
 #[cfg(test)]
 mod tests {
-    use shep_core::config::AppConfig;
     use shep_core::status::ProcStatus;
     use std::path::PathBuf;
 
@@ -968,11 +1019,27 @@ mod tests {
     }
 
     #[test]
-    fn the_blob_carries_no_environment_values() {
-        // A sheep's env can hold secrets. This is an exact-string assertion
-        // rather than a field check, because the risk is a future field that
-        // serializes env by accident (IR-41).
+    fn a_blob_round_trips_a_sheeps_environment_intact() {
+        // The successor respawns this sheep from what the blob carries, so
+        // an env value the blob drops is an app that comes back with a
+        // different environment than the one it was started with. Silent,
+        // and visible only as the app misbehaving.
         let text = serde_json::to_string(&sample_handover_with_secret_env()).unwrap();
+        let back: Handover = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.sheep[0].app.env.get("TOKEN").map(String::as_str),
+            Some("hunter2"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_a_carried_sheeps_environment() {
+        // The blob carries env; a log line naming the daemon's own state
+        // must not. An exact-string assertion rather than a field check,
+        // because the risk is a future field printing env by accident
+        // (IR-41).
+        let text = format!("{:?}", sample_handover_with_secret_env());
         assert!(!text.contains("hunter2"), "{text}");
     }
 

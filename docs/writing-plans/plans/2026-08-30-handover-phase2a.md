@@ -201,11 +201,15 @@ Actual: 2 passed
 - Test: same file
 
 **Interfaces:**
-- Produces: `pub struct Handover { version: u32, sheep: Vec<CarriedSheep>, listener_fd: RawFd, pidfile_fd: RawFd, next_id: u32, next_deadline: u64, next_action_stamp: u64 }` and `CarriedSheep { id, name, instance, pid, restarts, epoch, status, last_exit, credentials, out_pipe_fd, err_pipe_fd, out_log_fd, err_log_fd }`.
+- Produces: `pub struct Handover { version: u32, sheep: Vec<CarriedSheep>, listener_fd: RawFd, pidfile_fd: RawFd, next_id: u32, next_deadline: u64, next_action_stamp: u64 }` and `CarriedSheep { id, name, instance, pid, restarts, epoch, status, last_exit, credentials, fds, app }`.
 
 **`started_at` is deliberately NOT carried.** It is a `tokio::time::Instant` with no epoch, so it cannot be serialized. Re-derive it in the successor from the operating system, which is authoritative and more correct than carrying it: `sysinfo` is already a shep-daemon dependency and exposes a process start time. Read `crates/shep-daemon/src/limits/sample.rs` for how the crate already drives `sysinfo` before adding a second style.
 
-The blob carries **no environment values**. A sheep's env may hold secrets and the successor re-reads them from config.
+The blob carries **each sheep's whole resolved spec, environment included**. This reverses what this task originally specified, and the reversal is the maintainer's, recorded in the design spec's H2. The muster roll already persists every sheep's env in cleartext and permanently -- `SavedApp.app` is a whole `AppConfig`, `AppConfig.env` is a plain `BTreeMap<String, String>` with no skip attribute, and `flock.json` is written at `0600` -- so a blob carrying the same values at the same mode, on a file the successor unlinks the moment it has read it, is strictly less exposure than the file already sitting there for the life of the flock. Refusing to carry it forced the successor to rebuild each spec from the roll and bind carried sheep to roll apps by name and instance, except the roll records a running COUNT per app rather than which slots were up, and `muster` starts what it restores: a second source of truth that can disagree with the blob, to protect a value already on disk.
+
+`CarriedSheep.app` is the `AppConfig` beneath `ProcessEntry.spec`'s `ResolvedApp`, not the `ResolvedApp` itself. That type is a proof token obtainable only through `normalize`, so a `Deserialize` for it would mint the token from arbitrary JSON for every consumer of shep-core. The carried value has already been normalized, and `normalize` is pure over one of its own outputs, so the successor rebuilds the token by normalizing it again -- which is what the roll's own restore path already does at `snapshot.rs:333`.
+
+`VERSION` stays at `1`. No released image has ever written or read a handover blob, so there is no compatibility to preserve, and bumping it inside the branch that introduces the format would only mean version 1 never existed.
 
 - [x] **Step 1: Write the failing tests**
 
@@ -218,11 +222,24 @@ fn a_blob_round_trips() {
 }
 
 #[test]
-fn the_blob_carries_no_environment_values() {
-    // A sheep's env can hold secrets. This is an exact-string assertion
-    // rather than a field check, because the risk is a future field that
-    // serializes env by accident (IR-41).
+fn a_blob_round_trips_a_sheeps_environment_intact() {
+    // A successor that silently lost an env value would respawn the app
+    // under an environment it was never started with.
     let text = serde_json::to_string(&sample_handover_with_secret_env()).unwrap();
+    let back: Handover = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        back.sheep[0].app.env.get("TOKEN").map(String::as_str),
+        Some("hunter2"),
+        "{text}"
+    );
+}
+
+#[test]
+fn debug_redacts_a_carried_sheeps_environment() {
+    // The blob carries env; a log line naming the daemon's own state must
+    // not. Exact-string rather than a field check, because the risk is a
+    // future field printing env by accident (IR-41).
+    let text = format!("{:?}", sample_handover_with_secret_env());
     assert!(!text.contains("hunter2"), "{text}");
 }
 
@@ -248,7 +265,9 @@ Write with mode `0600` to `$SHEP_HOME/run/handover.json`, and have the successor
 - [x] **Step 4: Run to verify they pass**
 
 Actual: 569 passed, 18 filtered (up from 564: the plan's three, plus two over
-the file's mode that the plan did not ask for).
+the file's mode that the plan did not ask for). Amended after tasks 4 to 7,
+when the spec was carried: 595 passed, 18 filtered, the no-env test replaced
+by the two above.
 
 - [x] **Step 5: Task gate, then commit**
 

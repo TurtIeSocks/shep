@@ -246,6 +246,7 @@ mod tests {
             last_exit: None,
             credentials: SpawnIdentity::Resolved(None),
             fds,
+            app: crate::testing::app_with("web", |_| {}).into_config(),
         }
     }
 
