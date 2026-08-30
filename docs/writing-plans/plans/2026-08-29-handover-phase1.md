@@ -336,7 +336,7 @@ To choose between the handover arm and the stop arm, the CLI must know the runni
 
 This cannot help the upgrade that introduces it, since daemons already shipped will never send it. That is the same one-time cost the handover carries, and it is why the field is worth adding a phase early.
 
-- [ ] **Step 1: Confirm the codec tolerates unknown fields**
+- [x] **Step 1: Confirm the codec tolerates unknown fields**
 
 Before writing anything, prove that an OLD client deserializing a NEW `RpcError` with an extra field does not error. Write a test that serializes the new shape and deserializes it into a struct without the field.
 
@@ -357,7 +357,7 @@ fn an_old_client_ignores_a_field_it_has_never_seen() {
 
 **If this test cannot pass** because the type carries `deny_unknown_fields`, do NOT remove that attribute. Fall back to embedding the version in the refusal's `message` and have Task 7 parse it, and record the reason in the commit message.
 
-- [ ] **Step 2: Write the failing test for the refusal**
+- [x] **Step 2: Write the failing test for the refusal**
 
 ```rust
 #[tokio::test]
@@ -368,12 +368,12 @@ async fn a_protocol_refusal_carries_the_daemon_version() {
 }
 ```
 
-- [ ] **Step 3: Run to verify it fails**
+- [x] **Step 3: Run to verify it fails**
 
 Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: protocol_refusal`
 Expected: FAIL, no field `daemon_version`
 
-- [ ] **Step 4: Implement, both halves**
+- [x] **Step 4: Implement, both halves**
 
 Daemon and wire side: add the field with `#[serde(default, skip_serializing_if = "Option::is_none")]` so a daemon that has nothing to say serializes exactly as before, then populate it at `server.rs:475`, which today reads `hello.protocol` and discards the rest.
 
@@ -389,7 +389,7 @@ let ack = reply.map_err(|err| ConnectError::ProtocolMismatch {
 
 Then rewrite `ConnectError::ProtocolMismatch`'s doc at `connection.rs:77`. It says the daemon's version lives only in the prose and must not be parsed; that is exactly what this task stops being true.
 
-- [ ] **Step 4b: Test the client half separately**
+- [x] **Step 4b: Test the client half separately**
 
 The daemon-side test does not cover the flattening, which is where the field would be lost.
 
@@ -414,7 +414,7 @@ async fn an_old_daemons_refusal_still_connects_and_reports_no_version() {
 }
 ```
 
-- [ ] **Step 5: Run to verify it passes, then task gate and commit**
+- [x] **Step 5: Run to verify it passes, then task gate and commit**
 
 ---
 

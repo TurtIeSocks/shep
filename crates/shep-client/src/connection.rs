@@ -72,11 +72,19 @@ pub enum ConnectError {
     },
     /// The daemon refused the handshake on protocol-version skew. `client`
     /// is our own [`PROTOCOL_VERSION`]; `message` is the daemon's own
-    /// sentence, verbatim — do not parse it (the daemon's version exists
-    /// only inside this prose, never as a separate field).
+    /// sentence, verbatim — still not for parsing, and no longer the only
+    /// thing a caller gets: `daemon_version` carries the running daemon's
+    /// version as data.
     ProtocolMismatch {
         /// This client's own protocol version.
         client: u32,
+        /// The daemon's own crate version, when it named one.
+        ///
+        /// `None` from a daemon built before the refusal carried it, which
+        /// no upgrade can change: read it as "unknown" and take the
+        /// conservative path rather than assuming an old daemon or a new
+        /// one.
+        daemon_version: Option<String>,
         /// The daemon's refusal message, verbatim.
         message: String,
     },
@@ -96,7 +104,12 @@ impl fmt::Display for ConnectError {
             Self::HandshakeTimeout { after } => {
                 write!(f, "the handshake did not complete within {after:?}")
             }
-            Self::ProtocolMismatch { client, message } => {
+            // `daemon_version` is deliberately not rendered here: the
+            // daemon's `message` already names its side of the skew, and a
+            // caller that wants the version as data has the field.
+            Self::ProtocolMismatch {
+                client, message, ..
+            } => {
                 write!(
                     f,
                     "protocol mismatch (this client speaks {client}): {message}"
@@ -189,6 +202,10 @@ impl Connection {
         // and always sends `ProtocolMismatch` (shep-daemon/src/server.rs:387-397).
         let ack = reply.map_err(|err| ConnectError::ProtocolMismatch {
             client: PROTOCOL_VERSION,
+            // Carried through rather than dropped with the rest of the
+            // `RpcError`: this is the only rebuild between the wire and the
+            // caller, so a field lost here is lost entirely.
+            daemon_version: err.daemon_version,
             message: err.message,
         })?;
 
@@ -244,6 +261,7 @@ mod tests {
         let refusal = RpcError {
             code: RpcErrorCode::ProtocolMismatch,
             message: "daemon speaks protocol 2, client speaks 1".into(),
+            daemon_version: None,
         };
         let _served = fake_daemon(&path, Err(refusal)).await;
 
@@ -251,7 +269,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        let ConnectError::ProtocolMismatch { client, message } = err else {
+        let ConnectError::ProtocolMismatch {
+            client, message, ..
+        } = err
+        else {
             panic!("a protocol refusal must not be flattened into a generic error, got {err:?}");
         };
         assert_eq!(
@@ -261,6 +282,69 @@ mod tests {
         assert!(
             message.contains("protocol 2"),
             "the daemon's own message must survive: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_carries_the_daemon_version_past_the_flattening() {
+        // `open_inner` rebuilds the `RpcError` into a `ConnectError`, so a
+        // field the daemon sends is only useful if the rebuild carries it.
+        // The daemon-side test cannot see this half.
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::testing::control_address(dir.path());
+        let refusal = RpcError {
+            code: RpcErrorCode::ProtocolMismatch,
+            message: "daemon speaks protocol 2, client speaks 1".into(),
+            daemon_version: Some("0.1.16".into()),
+        };
+        let _served = fake_daemon(&path, Err(refusal)).await;
+
+        let err = Connection::open(&path, HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap_err();
+
+        let ConnectError::ProtocolMismatch { daemon_version, .. } = err else {
+            panic!("expected a protocol refusal, got {err:?}");
+        };
+        assert_eq!(daemon_version.as_deref(), Some("0.1.16"));
+    }
+
+    #[tokio::test]
+    async fn an_old_daemons_refusal_still_connects_and_reports_no_version() {
+        // A daemon predating this field sends no `daemon_version`, and
+        // `skip_serializing_if` means `None` puts exactly those bytes on the
+        // wire — the old daemon's frame, byte for byte. It must decode
+        // cleanly and read as `None` rather than failing the handshake, or
+        // this field breaks the one upgrade it exists to smooth.
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::testing::control_address(dir.path());
+        let refusal = RpcError {
+            code: RpcErrorCode::ProtocolMismatch,
+            message: "daemon speaks protocol 2, client speaks 1".into(),
+            daemon_version: None,
+        };
+        // That `None` really is absent from the wire, and not a `null` key,
+        // is pinned byte-for-byte next to the field itself
+        // (`shep-core/src/protocol/request.rs`); this crate has no
+        // `serde_json` to assert it with and does not need one.
+        let _served = fake_daemon(&path, Err(refusal)).await;
+
+        let err = Connection::open(&path, HANDSHAKE_TIMEOUT)
+            .await
+            .unwrap_err();
+
+        let ConnectError::ProtocolMismatch {
+            daemon_version,
+            message,
+            ..
+        } = err
+        else {
+            panic!("expected a protocol refusal, got {err:?}");
+        };
+        assert_eq!(daemon_version, None);
+        assert!(
+            message.contains("protocol 2"),
+            "the daemon's own message must still survive: {message}"
         );
     }
 

@@ -295,7 +295,11 @@ mod tests {
                 let envelope: Envelope = decode_frame(&request_bytes).unwrap();
                 let reply = Reply {
                     id: envelope.id,
-                    result: result.map_err(|(code, message)| RpcError { code, message }),
+                    result: result.map_err(|(code, message)| RpcError {
+                        code,
+                        message,
+                        daemon_version: None,
+                    }),
                 };
                 write_frame(&mut stream, &reply).await;
                 envelopes.push(envelope);

@@ -361,6 +361,7 @@ mod tests {
         let refusal = Err(shep_core::protocol::RpcError {
             code: shep_core::protocol::RpcErrorCode::ProtocolMismatch,
             message: "daemon speaks protocol 1, client sent 2".to_string(),
+            daemon_version: None,
         });
         let _daemon = shep_client::testing::fake_daemon(&paths.socket, refusal).await;
 

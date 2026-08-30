@@ -180,6 +180,7 @@ mod tests {
         let result = refusal(&RequestError::Rpc(RpcError {
             code: RpcErrorCode::Internal,
             message: "api is already being reloaded".to_string(),
+            daemon_version: None,
         }));
         assert_eq!(result.is_error, Some(true));
         let structured = result

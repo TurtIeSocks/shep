@@ -207,6 +207,7 @@ async fn with_deadline<F: Future<Output = Outcome> + Send>(
                     "the request deadline of {} ms expired before the daemon finished",
                     budget.as_millis()
                 ),
+                daemon_version: None,
             }),
         }),
     }
@@ -261,6 +262,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
                 message: err.to_string(),
+                daemon_version: None,
             })),
             Ok(resolved) => {
                 ctx.registry.record(&resolved);
@@ -283,6 +285,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
                 message: err.to_string(),
+                daemon_version: None,
             })),
             Ok(resolved) => match ctx.supervisor.config_drift(resolved).await {
                 Ok(drifted) => reply(Ok(Response::Drifted(drifted))),
@@ -347,6 +350,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                     message: "a line may not contain a newline or a carriage return; \
                               send one line per request"
                         .to_string(),
+                    daemon_version: None,
                 }));
             }
             match selector_of(selector) {
@@ -391,6 +395,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                             "scaled {name} to {achieved} of {requested} requested; \
                              the next instance would not spawn: {message}"
                         ),
+                        daemon_version: None,
                     })),
                 }
             }
@@ -420,10 +425,12 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             Ok(None) => reply(Err(RpcError {
                 code: RpcErrorCode::Internal,
                 message: "the supervisor engine has stopped; no roll was written".to_string(),
+                daemon_version: None,
             })),
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::Internal,
                 message: err.to_string(),
+                daemon_version: None,
             })),
         },
         // The same restore `boot` runs, called the same way — see
@@ -434,6 +441,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 Err(err) => reply(Err(RpcError {
                     code: RpcErrorCode::Internal,
                     message: err.to_string(),
+                    daemon_version: None,
                 })),
                 Ok(names) => match ctx.supervisor.list_checked().await {
                     Err(err) => reply(Err(rpc_error(&err))),
@@ -456,6 +464,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
                 message: err.to_string(),
+                daemon_version: None,
             })),
         },
         Request::EnableDog { name, source } => {
@@ -464,6 +473,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 Err(err) => reply(Err(RpcError {
                     code: RpcErrorCode::InvalidConfig,
                     message: err.to_string(),
+                    daemon_version: None,
                 })),
                 Ok(app) => match ctx.supervisor.start_dog(app, spec.source).await {
                     // `start_dog` is idempotent by NAME, so what comes back
@@ -480,6 +490,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                             "a sheep is already registered as `{}`; rename it or give the dog another name",
                             spec.name
                         ),
+                        daemon_version: None,
                     })),
                     Ok(info) => reply(Ok(Response::DogStarted(info))),
                     Err(err) => reply(Err(rpc_error(&err))),
@@ -508,6 +519,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
                 message: err.to_string(),
+                daemon_version: None,
             })),
         },
         Request::KillDaemon => Outcome::Shutdown(Reply {
@@ -519,6 +531,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         _ => reply(Err(RpcError {
             code: RpcErrorCode::Internal,
             message: "this daemon does not implement that request".to_string(),
+            daemon_version: None,
         })),
     }
 }
@@ -603,6 +616,7 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         SupervisorError::SpawnFailed(msg) => RpcError {
             code: RpcErrorCode::SpawnFailed,
             message: msg.clone(),
+            daemon_version: None,
         },
         // The same code as `SpawnFailed` above, on the rule this function
         // already applies twice below: `RpcErrorCode` is versioned, a client
@@ -617,6 +631,7 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         SupervisorError::CannotStart(msg) => RpcError {
             code: RpcErrorCode::SpawnFailed,
             message: msg.clone(),
+            daemon_version: None,
         },
         // `Internal` — an "unexpected daemon-side failure", which a log path
         // the daemon can no longer open, or can no longer empty, both are.
@@ -630,6 +645,7 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         SupervisorError::ReopenFailed(_) | SupervisorError::FlushFailed(_) => RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
+            daemon_version: None,
         },
         // `Internal` under protest, and the wire verb should revisit it
         // rather than inherit it: an app already being reloaded is a CONFLICT
@@ -645,6 +661,7 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         SupervisorError::ReloadInFlight(_) => RpcError {
             code: RpcErrorCode::Internal,
             message: err.to_string(),
+            daemon_version: None,
         },
         // Every `InvalidScale` is something the caller asked for that it can
         // ask differently — a count of `0`, a dog, an app whose earlier scale
@@ -661,10 +678,12 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         SupervisorError::InvalidScale(msg) => RpcError {
             code: RpcErrorCode::InvalidConfig,
             message: msg.clone(),
+            daemon_version: None,
         },
         SupervisorError::EngineStopped => RpcError {
             code: RpcErrorCode::Internal,
             message: "the supervisor engine has stopped".to_string(),
+            daemon_version: None,
         },
     }
 }
@@ -673,6 +692,7 @@ fn not_found() -> RpcError {
     RpcError {
         code: RpcErrorCode::NotFound,
         message: "selector matched no registered sheep".to_string(),
+        daemon_version: None,
     }
 }
 
@@ -680,6 +700,7 @@ fn selector_of(spec: SelectorSpec) -> Result<ProcessSelector, RpcError> {
     ProcessSelector::try_from(spec).map_err(|err| RpcError {
         code: RpcErrorCode::InvalidConfig,
         message: err.to_string(),
+        daemon_version: None,
     })
 }
 
@@ -753,6 +774,7 @@ async fn signal_request(id: u64, spec: SelectorSpec, signal: String, ctx: &RpcCo
                 "`{signal}` is not a signal shep will send; accepted: {}",
                 OperatorSignal::ACCEPTED.join(", ")
             ),
+            daemon_version: None,
         }),
         Some(sig) => match selector_of(spec) {
             Err(err) => Err(err),

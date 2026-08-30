@@ -3374,6 +3374,7 @@ mod tests {
             result: Err(RequestError::Rpc(RpcError {
                 code: RpcErrorCode::NotFound,
                 message: "selector matched no registered sheep".to_string(),
+                daemon_version: None,
             })),
         });
         let said = app.notice().map(ToString::to_string).unwrap_or_default();

@@ -370,6 +370,7 @@ impl bark::FlockSource for ClientFlockSource {
                 message: "the shepherd answered ListFlock with something other than \
                           Response::Flock"
                     .to_owned(),
+                daemon_version: None,
             })),
         }
     }

@@ -829,6 +829,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                     result: Err(RequestError::Rpc(RpcError {
                         code: RpcErrorCode::NotFound,
                         message: "selector matched no registered sheep".to_string(),
+                        daemon_version: None,
                     })),
                 });
             }

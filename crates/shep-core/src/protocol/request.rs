@@ -1334,6 +1334,23 @@ pub struct RpcError {
     pub code: RpcErrorCode,
     /// Human-readable message (plain English, no theme)
     pub message: String,
+    /// The daemon's own crate version, when it chose to name it.
+    ///
+    /// Set on a [`RpcErrorCode::ProtocolMismatch`] refusal, where it is the
+    /// only place a client can learn it: the refusal reports the daemon's
+    /// PROTOCOL, and [`HelloAck::daemon_version`] never arrives. `shep
+    /// daemon reload` picks its mechanism by version, and a protocol bump is
+    /// exactly when that choice matters.
+    ///
+    /// `None` on every other error, and on any refusal from a daemon built
+    /// before this field existed — which no upgrade can change, so a reader
+    /// must treat `None` as "unknown" and take the conservative path.
+    ///
+    /// Additive by construction: absent on the wire rather than `null`, and
+    /// ignored by a client too old to know it, so
+    /// [`crate::protocol::PROTOCOL_VERSION`] does not move for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 /// Machine-readable RPC error codes
@@ -2032,6 +2049,7 @@ mod tests {
                 result: Err(RpcError {
                     code: RpcErrorCode::NotFound,
                     message: "no sheep matches `web`".to_string(),
+                    daemon_version: None,
                 }),
             },
             // Unlike `Reopened`/`Flushed`/`Reloading` above (all wire-identical
@@ -2390,6 +2408,7 @@ mod tests {
         let refusal: HelloReply = Err(RpcError {
             code: RpcErrorCode::ProtocolMismatch,
             message: "daemon speaks protocol 1, client sent 2".to_string(),
+            daemon_version: None,
         });
         let json = serde_json::to_string(&refusal).unwrap();
         assert_eq!(
@@ -2461,6 +2480,61 @@ mod tests {
         let old: V1ProcessInfo = serde_json::from_str(&current).unwrap();
         assert_eq!(old.id, 3);
         assert_eq!(old.fold.as_deref(), Some("backend"));
+    }
+
+    #[test]
+    fn an_rpc_error_without_a_daemon_version_serializes_exactly_as_before() {
+        // `skip_serializing_if` is what makes this addition free: a daemon
+        // with nothing to say puts the same bytes on the wire it always did,
+        // not a `"daemon_version":null` key an older client would have to
+        // ignore. Pinned as an exact string, because "additive" is a claim
+        // about bytes.
+        let plain = RpcError {
+            code: RpcErrorCode::NotFound,
+            message: "no sheep".to_string(),
+            daemon_version: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"code":"not_found","message":"no sheep"}"#
+        );
+    }
+
+    #[test]
+    fn a_v1_rpc_error_fixture_deserializes_with_no_daemon_version() {
+        // Committed byte fixture from before this field existed (IR-35): the
+        // skew direction that matters, a CURRENT client reading an OLD
+        // daemon's refusal. It must read as `None` rather than failing to
+        // decode, or the field breaks the upgrade it exists to smooth.
+        let fixture =
+            r#"{"code":"protocol_mismatch","message":"daemon speaks protocol 1, client sent 2"}"#;
+        let err: RpcError = serde_json::from_str(fixture).unwrap();
+        assert_eq!(err.code, RpcErrorCode::ProtocolMismatch);
+        assert_eq!(err.daemon_version, None);
+    }
+
+    #[test]
+    fn an_old_client_ignores_an_rpc_error_field_it_has_never_seen() {
+        // Step 1 of the handover work: proof that `RpcError` may grow an
+        // optional field WITHOUT moving `PROTOCOL_VERSION`. Like
+        // `ProcessInfo` above, `RpcError` carries no `deny_unknown_fields`,
+        // so a client built before a field decodes a daemon that sends it
+        // rather than failing the handshake on it.
+        #[derive(Deserialize)]
+        struct OldRpcError {
+            code: RpcErrorCode,
+            message: String,
+        }
+
+        let current = serde_json::to_string(&RpcError {
+            code: RpcErrorCode::ProtocolMismatch,
+            message: "daemon speaks protocol 1, client sent 2".to_string(),
+            daemon_version: Some("0.1.16".to_string()),
+        })
+        .unwrap();
+        let old: OldRpcError = serde_json::from_str(&current).expect("must tolerate");
+        assert_eq!(old.code, RpcErrorCode::ProtocolMismatch);
+        assert_eq!(old.message, "daemon speaks protocol 1, client sent 2");
     }
 
     #[test]

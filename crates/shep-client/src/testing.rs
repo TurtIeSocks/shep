@@ -272,7 +272,11 @@ async fn write_reply(frames: &mut Frames, id: u64, response: Response) {
 async fn write_err(frames: &mut Frames, id: u64, code: RpcErrorCode, message: String) {
     let reply = Reply {
         id,
-        result: Err(RpcError { code, message }),
+        result: Err(RpcError {
+            code,
+            message,
+            daemon_version: None,
+        }),
     };
     frames.send(encode_frame(&reply).unwrap()).await.unwrap();
 }
@@ -310,8 +314,8 @@ async fn send_sample_event(frames: &mut Frames) {
 /// enum carries the remaining scripted behaviors, each armed at most once,
 /// by the `fake_client_*` constructor or `FakeDaemon` method that needs it.
 enum ScriptCommand {
-    /// Arms the next request (of any kind) to receive
-    /// `RpcError { code, message }` instead of a normal response.
+    /// Arms the next request (of any kind) to receive an [`RpcError`] with
+    /// this `code` and `message` instead of a normal response.
     ReplyErr(RpcErrorCode, String),
     /// Arms the next request to receive a [`sample_info`]-based
     /// `BusEvent::Process` BEFORE its `Pong` reply.
@@ -889,8 +893,8 @@ pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Rece
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], and answers the one
-/// request that arrives with `RpcError { code, message }` instead of a
-/// normal response — for testing that a daemon-side error reply surfaces
+/// request that arrives with an [`RpcError`] carrying `code` and `message`
+/// instead of a normal response — for testing that a daemon-side error reply surfaces
 /// through `Client::request` as `RequestError::Rpc`.
 ///
 /// Backed by a [`FakeDaemon`] (armed with a private `ScriptCommand::ReplyErr`)
