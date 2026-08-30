@@ -1626,6 +1626,27 @@ mod tests {
             );
         }
 
+        // Drives `keep_and_exec` directly so the clear itself is observable.
+        // Without this the case cannot fail on the regression it exists to
+        // catch: if `named_fds` yielded nothing, no descriptor would be
+        // cleared and none restored, and the before and after assertions
+        // would both still pass over untouched flags.
+        let mut cleared = Vec::new();
+        let written = Handover::path(&paths);
+        let _ = keep_and_exec(&target, &blob, &written, &mut cleared);
+        cleared.sort_unstable();
+        let mut expected = vec![
+            listener.as_raw_fd(),
+            pidfile.as_raw_fd(),
+            out_log.as_raw_fd(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            cleared, expected,
+            "every named descriptor must be cleared, from both of the two \
+             places `named_fds` draws them"
+        );
+
         let err = exec_into(&target, &blob, &paths).unwrap_err();
 
         for file in [&listener, &pidfile, &out_log] {
