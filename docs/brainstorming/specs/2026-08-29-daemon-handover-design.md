@@ -144,8 +144,9 @@ installed it as a graceful stop, deliberately: SIGHUP's default disposition
 terminates the process, so a daemon too old to hand over that is signalled
 by a newer client walks the kill ladder instead of dropping its flock with
 broken pipes. The handover replaces that meaning; it does not introduce the
-handler. Every other daemon signal
-today is a shutdown: terminate, interrupt, quit.
+handler. The daemon's other SHUTDOWN signals are terminate, interrupt and
+quit; SIGUSR2 is a daemon signal too and is not one of them, which is the
+whole reason SIGHUP rather than SIGUSR2 carries the handover.
 
 A signal carries no reply, which costs nothing here. The daemon is about to
 replace its own image, so it could not answer afterwards anyway. The CLI
