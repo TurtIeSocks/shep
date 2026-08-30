@@ -107,6 +107,17 @@ export const docsNav: DocsNavGroup[] = [
         },
       },
       {
+        slug: "talking-to-a-sheep",
+        label: "Talking to a sheep",
+        built: true,
+        source: "crates/shep-core/src/signals.rs",
+        spec: { anchor: "9-cli-surface-sheep-native", label: "§9 CLI surface" },
+        api: {
+          path: "signals/enum.OperatorSignal.html",
+          label: "shep_core::signals::OperatorSignal",
+        },
+      },
+      {
         slug: "dogs",
         label: "Dogs",
         built: true,
