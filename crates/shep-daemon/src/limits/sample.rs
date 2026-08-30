@@ -129,6 +129,70 @@ impl Default for SysinfoSampler {
     }
 }
 
+/// The refresh kind [`SysinfoSampler::sample`] asks sysinfo for.
+///
+/// Named rather than written at the call site so a test can read back what
+/// the sampler actually asks for. The behaviour the two `without`/`with`
+/// calls buy is invisible on the host this is usually developed on, so an
+/// assertion over the value is the only check that runs everywhere.
+///
+/// `.with_cpu()` is load-bearing and fails SILENTLY without it: sysinfo
+/// populates `accumulated_cpu_time` only inside a `refresh_kind.cpu()`
+/// branch, on every platform, so a memory-only refresh leaves the counter at
+/// its `0` initial value and every percentage derived from it reads a
+/// plausible, wrong `0.0`. It costs nothing extra — the macOS backend reads
+/// both out of the same `proc_pidinfo` call, and the Linux one out of the
+/// same `/proc/<pid>/stat` line.
+///
+/// `MINIMUM_CPU_UPDATE_INTERVAL` and the wait-then-refresh-twice dance
+/// sysinfo documents do NOT apply: they govern `cpu_usage()`, which is a
+/// rate sysinfo computes between two of its own refreshes.
+/// `accumulated_cpu_time` is a counter and is correct on the first read; the
+/// rate over it is `stats`' baseline subtraction, not sysinfo's.
+///
+/// `.without_tasks()` is load-bearing on Linux and a no-op everywhere else,
+/// and `ProcessRefreshKind::nothing()` does NOT already mean it:
+/// `nothing()` is `Default::default()`, and that default sets `tasks: true`
+/// — the one field `nothing()` leaves on. With it on, sysinfo's Linux
+/// backend walks `/proc/<pid>/task/` and inserts every THREAD into
+/// `processes()` as a row of its own, parented to its process. Two things
+/// then go wrong in [`tree_rss`], which cannot tell those rows from real
+/// children:
+///
+/// - **Memory is multiplied by the thread count.** A thread's
+///   `/proc/<pid>/task/<tid>/statm` reports the whole process's resident
+///   set, because the threads share one address space. Summing the process
+///   plus each of its threads reports `(1 + threads) × RSS`. Reported from a
+///   live flock: ten instances of one app, each shown at ~610 MB for a
+///   rollup of 5.9 GB, on a host whose whole memory use was 808 MB.
+/// - **CPU is doubled.** A thread's `utime`/`stime` are its own, so the
+///   threads sum to the process's total and the process row adds it a second
+///   time.
+///
+/// It is also the cheaper walk: it drops one `readdir` and one `statm` read
+/// per thread on the machine, every `MEMORY_POLL_INTERVAL`.
+fn sample_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_memory()
+        .with_cpu()
+        .without_tasks()
+}
+
+/// The refresh kind [`SysinfoSampler::identify`] asks sysinfo for.
+///
+/// Neither `.with_memory()` nor `.with_cpu()`: this walk reads only `name()`
+/// and `parent()`, and widening it would make an operator's `shep describe`
+/// cost the same syscalls as the 15-second poll for figures nobody asked
+/// this call for.
+///
+/// `.without_tasks()` for the reason [`sample_refresh_kind`] gives at
+/// length, with a different symptom at this end: a thread row is parented to
+/// its process, so `stats`' lamb index reads it as a child and
+/// `shep describe` lists every one of a sheep's threads as a lamb.
+fn identify_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing().without_tasks()
+}
+
 impl MemorySampler for SysinfoSampler {
     fn sample(&self) -> Vec<ProcessRss> {
         // A poisoned lock recovers instead of propagating the panic: the
@@ -142,27 +206,7 @@ impl MemorySampler for SysinfoSampler {
         // only what this sampler has seen before could never discover a lamb
         // the sheep forked since the last poll, which is precisely the
         // process the tree sum exists to catch.
-        //
-        // `.with_cpu()` is load-bearing and fails SILENTLY without it:
-        // sysinfo populates `accumulated_cpu_time` only inside a
-        // `refresh_kind.cpu()` branch, on every platform, so a
-        // memory-only refresh leaves the counter at its `0` initial value
-        // and every percentage derived from it reads a plausible, wrong
-        // `0.0`. It costs nothing extra here — the macOS backend reads both
-        // out of the same `proc_pidinfo` call, and the Linux one out of the
-        // same `/proc/<pid>/stat` line.
-        //
-        // `MINIMUM_CPU_UPDATE_INTERVAL` and the wait-then-refresh-twice
-        // dance sysinfo documents do NOT apply: they govern `cpu_usage()`,
-        // which is a rate sysinfo computes between two of its own refreshes.
-        // `accumulated_cpu_time` is a counter and is correct on the first
-        // read; the rate over it is `stats`' baseline subtraction, not
-        // sysinfo's.
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_memory().with_cpu(),
-        );
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, sample_refresh_kind());
         system
             .processes()
             .values()
@@ -200,15 +244,7 @@ impl MemorySampler for SysinfoSampler {
         // same one process-table walk either way — what is not shared is the
         // retention, and the lock, which this no longer takes at all.
         let mut system = System::new();
-        // Neither `.with_memory()` nor `.with_cpu()`: this walk reads only
-        // `name()` and `parent()`, and widening the refresh kind would make
-        // an operator's `shep describe` cost the same syscalls as the
-        // 15-second poll for figures nobody asked this call for.
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing(),
-        );
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, identify_refresh_kind());
         system
             .processes()
             .values()
@@ -530,6 +566,205 @@ mod tests {
         sampler.sample();
         sampler.sample();
         assert_eq!(sampler.calls(), 3);
+    }
+
+    // fails if the sampling refresh kind stops asking for memory, stops
+    // asking for CPU, or lets `tasks` back on.
+    //
+    // An assertion over the value rather than over behaviour, because two of
+    // the three have no observable effect on macOS, which is where this is
+    // developed: sysinfo's Apple backend ignores `tasks` entirely, so a
+    // regression here is invisible to every local run and shows up only as
+    // wrong numbers on an operator's Linux box. The Linux cases below cover
+    // the behaviour where it exists; this one covers the intent everywhere.
+    #[test]
+    fn the_sampling_refresh_kind_asks_for_memory_and_cpu_but_never_tasks() {
+        let kind = sample_refresh_kind();
+        assert!(kind.memory(), "the tree sum is a memory sum");
+        assert!(
+            kind.cpu(),
+            "without this `accumulated_cpu_time` stays at 0 and every \
+             percentage reads a plausible, wrong 0.0"
+        );
+        assert!(
+            !kind.tasks(),
+            "`tasks` makes sysinfo's Linux backend list every thread as a \
+             process parented to its own process, which multiplies a sheep's \
+             reported memory by its thread count"
+        );
+    }
+
+    // fails if the identify refresh kind widens to memory or CPU (an
+    // operator's `shep describe` paying the poll's syscalls for figures it
+    // does not read) or lets `tasks` back on (every thread of a sheep listed
+    // as a lamb).
+    #[test]
+    fn the_identify_refresh_kind_asks_for_neither_memory_nor_cpu_nor_tasks() {
+        let kind = identify_refresh_kind();
+        assert!(!kind.memory(), "identify reads only `name` and `parent`");
+        assert!(!kind.cpu(), "identify reads only `name` and `parent`");
+        assert!(
+            !kind.tasks(),
+            "`tasks` would make `shep describe` report every thread of a \
+             sheep as one of its lambs"
+        );
+    }
+
+    /// Cases that need `/proc` and a real thread of this process.
+    ///
+    /// Linux-only because the phenomenon is: sysinfo's Apple and Windows
+    /// backends have no notion of a task row at all, so there is nothing to
+    /// assert about them. Nothing here is slow — a thread is not a process
+    /// and none of it waits on a wall clock — but note that a green local
+    /// `cargo test` on macOS has not run one line of it. CI's Linux legs are
+    /// what execute these.
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use std::sync::mpsc;
+        use std::thread;
+
+        use super::*;
+
+        /// Every thread id this process currently has, straight out of
+        /// `/proc/self/task/`, this thread's own included.
+        fn own_thread_ids() -> Vec<u32> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("/proc/self/task exists on every Linux this daemon runs on")
+                .filter_map(|entry| {
+                    entry
+                        .ok()?
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                })
+                .collect()
+        }
+
+        /// Runs `body` with `count` extra threads of this process alive and
+        /// parked, so `/proc/self/task/` is guaranteed to hold more than one
+        /// entry while the sampler walks.
+        ///
+        /// Each thread reports in before `body` starts — a spawn that has
+        /// not reached its first instruction has no task directory yet, and
+        /// a case that walked `/proc` before then would pass for the wrong
+        /// reason. They park on a `recv` that only returns when their sender
+        /// drops, which is the end of this function.
+        fn with_extra_threads<T>(count: usize, body: impl FnOnce() -> T) -> T {
+            let (report_started, started) = mpsc::channel::<()>();
+            let mut releases = Vec::with_capacity(count);
+            let mut handles = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (release, parked) = mpsc::channel::<()>();
+                let report_started = report_started.clone();
+                releases.push(release);
+                handles.push(thread::spawn(move || {
+                    report_started
+                        .send(())
+                        .expect("the test thread outlives every thread it parks");
+                    // Returns `Err` when `releases` drops below; either way
+                    // this thread is done.
+                    let _ = parked.recv();
+                }));
+            }
+            drop(report_started);
+            for _ in 0..count {
+                started
+                    .recv()
+                    .expect("every parked thread reports in before it parks");
+            }
+
+            let out = body();
+
+            drop(releases);
+            for handle in handles {
+                handle.join().expect("a parked thread cannot panic");
+            }
+            out
+        }
+
+        // fails if the sampler's refresh kind lets sysinfo list this
+        // process's threads as processes of their own. `tree_rss` cannot
+        // tell such a row from a real child — it is parented to the process
+        // exactly as a child is — and a thread's
+        // `/proc/<pid>/task/<tid>/statm` reports the WHOLE process's
+        // resident set, so one leaked row inflates the sheep's reported
+        // memory by a full copy of its own RSS.
+        #[test]
+        fn the_sample_table_holds_no_thread_of_this_process() {
+            let own_pid = std::process::id();
+            with_extra_threads(4, || {
+                let threads: Vec<u32> = own_thread_ids()
+                    .into_iter()
+                    .filter(|tid| *tid != own_pid)
+                    .collect();
+                assert!(
+                    !threads.is_empty(),
+                    "the case says nothing unless this process really has \
+                     threads other than its main one; it did not"
+                );
+
+                let table = SysinfoSampler::new().sample();
+                let sampled: HashSet<u32> = table.iter().map(|entry| entry.pid).collect();
+                let leaked: Vec<u32> = threads
+                    .into_iter()
+                    .filter(|tid| sampled.contains(tid))
+                    .collect();
+
+                assert!(
+                    sampled.contains(&own_pid),
+                    "the walk has to see this process at all, or a clean \
+                     result below means only that the walk failed"
+                );
+                assert!(
+                    leaked.is_empty(),
+                    "the table must hold processes, not threads; these \
+                     thread ids of pid {own_pid} were sampled as processes \
+                     in their own right: {leaked:?}"
+                );
+            });
+        }
+
+        // fails if `identify`'s refresh kind lets threads into the table.
+        // Its own symptom, separate from the sum's: `stats`' lamb index
+        // reads a thread row as a child of the sheep, so `shep describe`
+        // lists every thread a sheep happens to be running as a lamb.
+        #[test]
+        fn identify_reports_no_thread_of_this_process() {
+            let own_pid = std::process::id();
+            with_extra_threads(4, || {
+                let threads: Vec<u32> = own_thread_ids()
+                    .into_iter()
+                    .filter(|tid| *tid != own_pid)
+                    .collect();
+                assert!(
+                    !threads.is_empty(),
+                    "the case says nothing unless this process really has \
+                     threads other than its main one; it did not"
+                );
+
+                let identified: HashSet<u32> = SysinfoSampler::new()
+                    .identify()
+                    .into_iter()
+                    .map(|identity| identity.pid)
+                    .collect();
+                let leaked: Vec<u32> = threads
+                    .into_iter()
+                    .filter(|tid| identified.contains(tid))
+                    .collect();
+
+                assert!(
+                    identified.contains(&own_pid),
+                    "the walk has to see this process at all, or a clean \
+                     result below means only that the walk failed"
+                );
+                assert!(
+                    leaked.is_empty(),
+                    "a lamb is a child process, never a thread; these thread \
+                     ids of pid {own_pid} were identified as processes: \
+                     {leaked:?}"
+                );
+            });
+        }
     }
 
     /// Tests that spawn a real process and wait on real elapsed time.
