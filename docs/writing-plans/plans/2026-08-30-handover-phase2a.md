@@ -573,60 +573,43 @@ child here and is expected with a reason rather than silenced: adding the
 
 ---
 
-### Task 8: wire it together, and prove a sheep never noticed
+### Task 8: SPLIT. This was mis-scoped and is now 8a through 8d
 
-**Files:**
-- Modify: `crates/shep-daemon/src/boot.rs` (the SIGHUP arm), `crates/shep-cli/src/commands/daemon.rs` (`Arm::Handover`)
-- Test: an end-to-end integration test
+**Task 8 as originally written was wrong, and the implementer refused it rather than shipping half a handover.** It read as a wiring task. Five load-bearing mechanisms it depends on do not exist, and building them is roughly 800 to 1500 lines across `supervisor.rs` (16,578 lines), `tokio_runner.rs`, `boot.rs`, `runner.rs`, `transport.rs` and `daemon.rs`, one of which changes a published trait.
 
-`Arm::Handover` is currently unreachable and carries `#[expect(dead_code)]`. Constructing it without removing that attribute is a compile error, which is deliberate; remove it here.
+Verified against the tree: `ProcessRunner` has only `spawn` and `preflight` (`crates/shep-daemon/src/runner.rs:742`), and `LogCtl` can `Reopen` and `Flush` but cannot report a descriptor (`runner.rs:102`).
 
-**Task 6 found two seams this task needs that the plan did not anticipate. Both make Task 8 a cross-crate change, so its cargo shape is `cargo test --workspace --all-features`, not the daemon-only inner loop.**
+What is genuinely missing:
 
-1. **`spawn_log_pump` cannot take an adopted log handle.** It takes `out_path: PathBuf` / `err_path: PathBuf` (`crates/shep-daemon/src/tokio_runner.rs:1339`) and calls `LogFile::open` itself, so there is no seam for a file that is already open. The fix is small because `LogFile` is already generic over its sink with only `path` and `handle`: it needs a constructor taking a `tokio::fs::File` plus the path for later reopens. Do NOT write a parallel pump. `LogFile::reopen` goes back through `open_append` by path, so rotation keeps working on an adopted handle unchanged.
+1. **No way to learn a sheep's descriptor numbers.** The four fds `CarriedFds` names are owned by the log pump task, inside `Lines<BufReader<ChildStdout>>` and `LogFile`. Needs a new `LogCtl` variant that flushes and reports raw fds, plus a supervisor command that fans it out and waits.
+2. **No way to build the blob.** `next_id`, `next_deadline` and `next_action_stamp` are private `Actor` fields with no accessor, and `epoch`, `manual` and `pending_delete` are on the private `SheepSlot`. Both the `Candidate` list and the blob have to be assembled inside the actor.
+3. **An adopted sheep has no `RunningProcess`.** `TokioProc` holds a `tokio::process::Child`, which only `Command::spawn` produces. Task 7's `AdoptedReaper` is built and tested with no route into the supervisor. Needs a defaulted trait method (IR-20), a `TokioProc` that is either spawned or adopted, and an adopted `ProcIo`.
+4. **No way to install an adopted flock.** `spawn_fresh` is the only path that inserts a `SheepSlot` with a live `ctl`. A successor needs one that inserts slots carrying the blob's ids, epochs, statuses and `last_exit`.
+5. **The blob carries no spec, deliberately**, since env is a secret surface and an exact-string test pins it. So the successor recovers each spec from the muster roll and binds carried sheep to roll apps by name and instance. The roll stores `AppConfig` per app with a running COUNT, not per-instance ids, and `muster` starts what it restores. A restore-without-spawning-then-bind path is a design decision still to make.
 
-2. **`shep_core::transport::Listener` cannot be built from an adopted listener.** Its inner `tokio::net::UnixListener` is private and the type offers only `bind(&Path)`. Adoption yields a bare `tokio::net::UnixListener`, so wiring it into the accept loop needs a constructor added in shep-core.
+The three seams Task 6 predicted are all confirmed small. They are also not the expensive part.
 
-Also from Task 6: `PidfileLock` cannot hold the adopted descriptor, because its unix field is `nix::fcntl::Flock<File>` and `nix` has no constructor for an already-locked file that does not lock it again. `Adopted` carries a plain `std::fs::File`, so this task needs a `PidfileLock` variant or enum arm that holds it. **It must not re-lock**: the descriptor crossed the exec with its `flock` intact, and re-acquiring means releasing first, which opens a window for a second daemon.
+**The fallback design changed too. See the spec's new H3a.** A daemon that refuses internally and stops gracefully leaves the CLI polling for a successor nobody started, so fitness is now asked over the socket before the CLI signals.
 
-Three `#[expect(dead_code)]` attributes come due here and will fire as unfulfilled once their items are called: the module-wide one in `handover/mod.rs` (delete it outright rather than narrowing, per Task 5), and the ones on `successor_handover` and `Successor` in `boot.rs`.
+#### Task 8a: report descriptors and build the blob
 
-SIGHUP currently runs a graceful stop (phase 1, Task 3). It now runs the fitness check and either hands over or falls through to that same graceful stop.
+`LogCtl` gains a variant that flushes and reports the four raw fds. A supervisor command fans it out over the flock, waits, and assembles both the `Candidate` list and the `Handover` blob from inside the actor, where the private counters and `SheepSlot` fields are reachable. Ends with a test that a blob built from a live flock names four open descriptors per sheep.
 
-- [ ] **Step 1: Write the failing tests**
+#### Task 8b: the adopt seam on the runner
 
-```rust
-#[tokio::test]
-async fn a_sheep_keeps_its_pid_and_its_log_across_a_handover() {
-    // The two assertions that separate a hot restart from a fast one.
-    // A version that passes neither is the stop arm phase 1 already shipped.
-    let before = flock_pids().await;
-    let log_len_before = read_log_len();
-    reload().await;
-    assert_eq!(flock_pids().await, before, "pids must not move");
-    assert!(read_log_len() >= log_len_before, "the log must not restart");
-    assert_no_gap_in_sequence(read_log());
-}
+`ProcessRunner` gains a defaulted `adopt` (IR-20, so out-of-tree implementors do not break). `TokioProc` becomes spawned-or-adopted, backed by Task 7's `AdoptedReaper` on the adopted arm. `ProcIo` is built from adopted handles. The three small seams land here: `LogFile::from_file`, `Listener`'s constructor in shep-core, and the `PidfileLock` arm that holds an already-locked descriptor without re-locking.
 
-#[tokio::test]
-async fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
-    // The gate doing its job. Not a handover, and not a failure either.
-    ...
-}
+#### Task 8c: the successor boot path
 
-#[tokio::test]
-async fn the_control_socket_accepts_throughout() { ... }
-```
+Bind carried sheep to muster-roll apps by name and instance, and install adopted slots in the actor without spawning. This is where 5's design decision gets made and written down.
 
-- [ ] **Step 2: Run to verify they fail**
+#### Task 8d: the arms, and proving a sheep never noticed
 
-- [ ] **Step 3: Implement**
+The fitness query over the socket, the CLI's arm choice, the SIGHUP handler, and the end-to-end tests. **The two assertions that define success live here**: a sheep's pid is unchanged across a reload, and its log gains no gap.
 
-- [ ] **Step 4: Run to verify they pass**
+Also here: delete the four `#[expect(dead_code)]` attributes, which fire as unfulfilled once their items are called.
 
-- [ ] **Step 5: Full phase gate, then commit**
-
----
+**One hazard for 8d, found while reviewing 8's refusal.** The pump reads through a `BufReader`, so bytes consumed but not yet a complete line die with the image, and the successor's fresh reader starts mid-line and emits the remainder as its own line. A pre-exec flush handles `LogFile`'s buffer but not that one. Under a chatty sheep the no-gap assertion would catch it as a torn line rather than a missing one.
 
 ## Phase gate
 

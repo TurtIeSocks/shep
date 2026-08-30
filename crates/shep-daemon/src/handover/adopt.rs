@@ -213,7 +213,7 @@ fn adopt_pipe(fd: Option<RawFd>, sheep: &str, stream: &str) -> io::Result<Option
 
 /// Rebuild one log handle, if the blob named one.
 ///
-/// Wrapped, never reopened, which is what preserves `O_APPEND` — see this
+/// Wrapped, never reopened, which is what preserves `O_APPEND`. See this
 /// module's own docs for why that is load-bearing rather than tidy.
 fn adopt_log(fd: Option<RawFd>, sheep: &str, stream: &str) -> io::Result<Option<tokio::fs::File>> {
     let Some(fd) = fd else { return Ok(None) };
