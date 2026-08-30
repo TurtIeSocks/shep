@@ -65,7 +65,7 @@ This gate is what makes every later stage safe to ship. Get it wrong in the perm
 
 **Refuse when ANY sheep has**: a shepherd channel, `stdin = true`, a `dog` marker, `instance` implying a multi-instance app, a non-`None` `reload` marker, or a pending manual/delete. Read the real field names off `crates/shep-daemon/src/entry.rs` before writing the match; do not trust these names.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -98,12 +98,12 @@ fn an_empty_flock_is_carryable() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p shep-daemon --lib --all-features -- --skip ::slow:: fitness`
 Expected: FAIL, unresolved `fitness`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `RefusedReason` carries the sheep's name and the feature that blocked it, and its `Display` names the fallback:
 
@@ -124,9 +124,9 @@ pub enum RefusedReason {
 
 `#[non_exhaustive]` here, unlike `Shepherd` in `boot.rs`: this set genuinely grows as 2b and 2c widen what is carryable, which is the opposite of that enum's closed-by-mechanism argument.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
-- [ ] **Step 5: Task gate, then commit**
+- [x] **Step 5: Task gate, then commit**
 
 ---
 

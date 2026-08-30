@@ -227,6 +227,7 @@ pub use bus::{Bus, SharedEvent, new_bus};
 pub(crate) mod cron;
 pub(crate) mod entry;
 pub(crate) mod extras;
+pub(crate) mod handover;
 pub(crate) mod kill;
 pub(crate) mod watch;
 
