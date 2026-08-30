@@ -2010,8 +2010,31 @@ mod tests {
         // And it is a lock rather than a descriptor nobody can ever release:
         // a successor that exits closes the only handle left, and the kernel
         // frees the home for the next daemon.
+        //
+        // Retried rather than demanded on the first attempt, for the reason
+        // `stale_socket_leftover` spells out at length a few tests below: a
+        // `fork` copies the whole descriptor table, so any child another test
+        // in this binary spawns concurrently holds a duplicate of this
+        // descriptor until its own `exec` runs — and a duplicate holds the
+        // `flock` with it. That is a lying fixture rather than a lock this
+        // arm failed to release, and it was reproducible the moment a
+        // supervisor test began spawning a real child. The assertion is
+        // unweakened: the home must become claimable, and a lock genuinely
+        // still held fails this loop just as flatly as it failed the single
+        // attempt.
         drop(adopted);
-        PidfileLock::acquire(&paths).expect("a successor that exits must leave the home claimable");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let claimed = loop {
+            match PidfileLock::acquire(&paths) {
+                Ok(claimed) => break claimed,
+                Err(error) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "a successor that exits must leave the home claimable: {error:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(claimed);
     }
 
     /// Serializes every test in this module that calls `boot()` and expects
