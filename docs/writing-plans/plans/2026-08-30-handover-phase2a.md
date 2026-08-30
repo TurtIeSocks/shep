@@ -958,5 +958,5 @@ Run by hand before the phase is called done, with two real binaries at different
 
 - Every descriptor in the spec's H2 inventory is either carried by Task 3's blob or explicitly refused by Task 1's gate. No third category.
 - No task adds a dependency, and unsafe appears only in `sys.rs` if at all.
-- `PROTOCOL_VERSION` and `SCHEMA_VERSION` do not move. This phase changes no wire type and no JSON envelope.
+- `PROTOCOL_VERSION` and `SCHEMA_VERSION` do not move. The phase DOES change a wire type: Task 8d adds a `Request::HandoverFitness` and its `Response`. Neither constant has to move for it, because the variant is additive and an older daemon is never sent it (`Arm::for_daemon` decides the arm from the running version first). No JSON envelope changes at all.
 - Tasks 1, 2, 3 and 4 are independent of one another. Task 5 needs 2, 3 and 4. Task 6 needs 3. Task 7 is independent. Task 8 needs all of them.
