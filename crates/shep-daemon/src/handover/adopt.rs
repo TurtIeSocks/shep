@@ -225,6 +225,7 @@ fn adopt_log(fd: Option<RawFd>, sheep: &str, stream: &str) -> io::Result<Option<
 mod tests {
     use std::os::fd::{IntoRawFd as _, RawFd};
     use std::path::Path;
+    use std::time::Duration;
 
     use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
@@ -281,7 +282,14 @@ mod tests {
         let listener = adopted.listener;
         let accept = tokio::spawn(async move { listener.accept().await });
         let _client = tokio::net::UnixStream::connect(&socket).await.unwrap();
-        accept.await.unwrap().expect("the adopted listener accepts");
+        // Bounded, as every await in `reap.rs` is. An adopted listener that
+        // never became readable would otherwise hang, and a hang stops the
+        // whole test binary rather than failing this one case.
+        tokio::time::timeout(Duration::from_secs(10), accept)
+            .await
+            .expect("the adopted listener must accept")
+            .unwrap()
+            .expect("the adopted listener accepts");
     }
 
     #[tokio::test]
@@ -403,7 +411,13 @@ mod tests {
 
         let out = adopted.sheep[0].out_pipe.take().expect("an adopted pipe");
         let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(out));
-        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("a line"));
+        // Bounded for the reason the listener case above is: an adopted pipe
+        // that produced nothing would hang the binary instead of failing here.
+        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("the adopted pipe must produce the line written before it")
+            .unwrap();
+        assert_eq!(line.as_deref(), Some("a line"));
     }
 
     #[tokio::test]

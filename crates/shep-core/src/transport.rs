@@ -444,11 +444,26 @@ mod tests {
             stream.write_all(b"still here\n").await.unwrap();
         });
 
-        let mut served = listener.accept().await.unwrap();
+        // Every await bounded, as `dialing_an_address_with_no_listener_
+        // fails_rather_than_hanging` above already does. An adopted listener
+        // that stopped accepting would otherwise hang this case, and a hang
+        // stops the whole test binary rather than failing one test, so CI
+        // times out with no assertion to point at.
+        let bound = std::time::Duration::from_secs(10);
+        let mut served = tokio::time::timeout(bound, listener.accept())
+            .await
+            .expect("an adopted listener must accept")
+            .unwrap();
         let mut said = [0_u8; 11];
-        served.read_exact(&mut said).await.unwrap();
+        tokio::time::timeout(bound, served.read_exact(&mut said))
+            .await
+            .expect("the bytes the client wrote must arrive")
+            .unwrap();
         assert_eq!(&said, b"still here\n");
-        client.await.unwrap();
+        tokio::time::timeout(bound, client)
+            .await
+            .expect("the client task must finish")
+            .unwrap();
     }
 
     /// fails if the transport cannot carry bytes both ways on this platform.
