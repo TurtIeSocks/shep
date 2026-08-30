@@ -238,6 +238,30 @@ back to the stop arm, which is correct rather than merely tolerable.
   containing anything else takes the stop arm.
 - **2b, the surface.** Shepherd channel, stdin, dogs, multi-instance, and
   re-arming watch, cron and memory limits.
+
+  **2a measured three more requirements into this stage, none of which the
+  fitness gate can refuse, because none is visible in an app's config.**
+
+  - **The pump's reader loses whatever it has consumed and not yet
+    emitted.** Measured during 2a with a sheep emitting as fast as the pipe
+    allows, three runs of three: after `10917` came `1916`, which is not a
+    suffix of `10918`, so roughly a thousand lines died and the successor
+    resumed mid-number. 8a's flush empties `LogFile`'s WRITE buffer; nothing
+    empties the reader's. 2b has to carry it, and until it does a busy
+    sheep's reload loses about a second of log.
+  - **`report_fds` has no deadline.** A stalled pump blocks the handover and
+    its graceful-stop fallback. The fix is not local: a timed-out live pump
+    must not collapse into `CarriedFds::none()`, since that is what a
+    STOPPED sheep reports, and the gate would then pass a wedged sheep with
+    its descriptors silently dropped. Telling the two apart changes the
+    snapshot's return type and reaches the gate.
+  - **A reported descriptor is not pinned until `execve`.** An EOF or a
+    `LogFile::reopen` can release a number the blob already names, and a
+    later open can reuse it. `adopt`'s kind check makes a pipe landing on a
+    log fail loudly; a log handle landing on a log handle stays quiet. This
+    one is an ownership design rather than a patch: either the reported
+    descriptors are duplicated into handover-owned storage, or retirement
+    and reopening are serialised against the exec.
 - **2c, the hard cases.** A handover mid-reload, `manual` and
   `pending_delete`, the counters, the reload deadline watchdog, and rollback
   when a rehydrate fails.
