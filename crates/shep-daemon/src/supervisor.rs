@@ -1639,8 +1639,23 @@ enum ReloadMode {
     /// It also fixes a failure the overlap never worked around. An app that
     /// does NOT set `SO_REUSEPORT` cannot have two instances bound to one
     /// port, so an overlapping reload of one spawns a replacement that takes
-    /// `EADDRINUSE` and crash-loops — including on macOS, where Node cannot
-    /// set the option at all (`ENOTSUP`).
+    /// `EADDRINUSE`, including on macOS, where Node cannot set the option at
+    /// all (`ENOTSUP`).
+    ///
+    /// This said "and crash-loops" until 2026-08-29, and that is not what
+    /// happens. Measured twice independently, on macOS, one instance, no
+    /// probe, `autorestart = true`: the replacement takes `EADDRINUSE` and
+    /// dies EXACTLY ONCE, the reload aborts, and the original instance is
+    /// still online afterwards on its original pid with `RESTARTS` at 0. The
+    /// ordering is why. `SpawnNew` comes before `DrainOld`, so a replacement
+    /// that never reaches `AwaitReady` means `DrainOld` never runs and the
+    /// instance being replaced was never dropped.
+    ///
+    /// That is better behaviour than the old wording claimed, and worth
+    /// stating correctly: an operator told to expect a crash loop will go
+    /// looking for a restart storm that is not there. The real gap is
+    /// quieter. The daemon logs NOTHING about the aborted reload, so the only
+    /// evidence is `EADDRINUSE` in the sheep's own stderr file.
     ///
     /// A single-instance app loses its name-group watch and cron worker for
     /// the width of the gap — they are armed per RUNNING instance, and for
