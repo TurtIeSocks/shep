@@ -1286,22 +1286,12 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
         // helper reports and gives up and this arm has a fallback to reach.
         // The version guard therefore has to be applied by hand here — the
         // one dispatch arm where it is not inherited from the helper.
-        Commands::Flock => match Client::connect(&paths.socket).await {
-            Ok(client) => match refuse_version_skew(&mut streams, &client, guard) {
-                Ok(()) => query::flock(&client, &mut streams).await,
-                // A skew is not an absence: the shepherd answered, so the
-                // roll fallback below would print a listing while hiding
-                // the reason every other verb is refusing.
-                Err(code) => code,
-            },
-            Err(_) if fmt == Format::Json => {
-                match connect_client(&mut streams, &paths, guard).await {
-                    Ok(client) => query::flock(&client, &mut streams).await,
-                    Err(code) => code,
-                }
-            }
-            Err(_) => query::flock_from_roll(&mut streams, &paths),
-        },
+        //
+        // Split into `flock_command` so a test can drive it directly against
+        // a real fixture socket without going through `run`'s own argv
+        // parsing (Task 5's own note: `run`'s dispatch arms were otherwise
+        // untested, held only by the compiler).
+        Commands::Flock => flock_command(&mut streams, &paths, guard).await,
         // The guard arm is what makes `--available` work with no shepherd
         // running at all: it never reaches `connect_client`, so a
         // community-index listing does not fail on a `$SHEP_HOME` where no
@@ -1738,6 +1728,74 @@ async fn connect_client(
             Err(streams.fail(code, &unreachable_message(&err)))
         }
     }
+}
+
+/// `shep flock`'s own dispatch, split out of [`run`] so a test can drive it
+/// directly against a real fixture socket (Task 5's own note: `run`'s
+/// dispatch arms were otherwise untested, held only by the compiler).
+///
+/// Uses its own `Client::connect`, not [`connect_client`], because that
+/// helper reports and gives up and this arm has a roll fallback to reach.
+/// The version guard therefore has to be applied by hand here — the one
+/// dispatch arm where it is not inherited from the helper.
+///
+/// # A refusal is not an absence (spec G4, Task 6)
+///
+/// The roll fallback below is for a genuine absence only —
+/// [`shep_client::ConnectError::Connect`], `connect(2)` itself failing
+/// because nothing is listening. Every other [`shep_client::ConnectError`]
+/// variant means a connection WAS established: the shepherd is there, and
+/// either refused the handshake outright ([`shep_client::ConnectError::
+/// ProtocolMismatch`]) or something went wrong reaching it cleanly after
+/// connecting ([`shep_client::ConnectError::Io`],
+/// [`shep_client::ConnectError::Wire`],
+/// [`shep_client::ConnectError::HandshakeClosed`],
+/// [`shep_client::ConnectError::HandshakeTimeout`] — that variant's own doc
+/// says outright "something is bound but not answering"). None of those
+/// five is an absence, so a blanket `Err(_) => flock_from_roll(..)`
+/// reported all of them as "no shepherd running". That is what sent the
+/// incident's operator to the muster-roll path instead of `shep daemon
+/// reload`, while the shepherd was alive and answering the refusal.
+async fn flock_command(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    guard: VersionGuard,
+) -> ExitCode {
+    match Client::connect(&paths.socket).await {
+        Ok(client) => match refuse_version_skew(streams, &client, guard) {
+            Ok(()) => query::flock(&client, streams).await,
+            // A skew is not an absence either: the shepherd answered, so
+            // the roll fallback below would print a listing while hiding
+            // the reason every other verb is refusing.
+            Err(code) => code,
+        },
+        // The roll fallback is a table-format affordance only. Under
+        // `--format json` a failed invocation must leave stdout empty and
+        // put an error envelope on stderr -- `exit_codes_and_stream_
+        // discipline` enforces that, and it is right to: a consumer that
+        // asked for machine output should not have to tell a real listing
+        // apart from a consolation prize. So JSON always reports through
+        // `connect_client`, absence included; humans get the roll below,
+        // absence only.
+        Err(_) if streams.fmt == Format::Json => {
+            match connect_client(streams, paths, guard).await {
+                Ok(client) => query::flock(&client, streams).await,
+                Err(code) => code,
+            }
+        }
+        Err(shep_client::ConnectError::Connect { .. }) => query::flock_from_roll(streams, paths),
+        Err(err) => {
+            let code = ExitCode::from(&err);
+            streams.fail(code, &flock_connect_refusal_message(&err))
+        }
+    }
+}
+
+/// Renders `err` for [`flock_command`]'s refusal arm: the shepherd IS
+/// there, so this reports what it did and names the fix rather than the
+/// roll's "no shepherd running", which would be the opposite of the truth.
+fn flock_connect_refusal_message(err: &shep_client::ConnectError) -> String {
+    format!("{err}; run `shep {VERSION_SKEW_REMEDY}`")
 }
 
 /// Resolves this invocation's own [`ShepPaths`] and runs the supervisor in
@@ -2890,6 +2948,62 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("shep daemon reload"), "{text}");
+    }
+
+    /// Task 6 / spec G4: `lib.rs`'s old blanket `Err(_) =>
+    /// query::flock_from_roll(..)` treated every connect failure as an
+    /// absence, so a daemon that answered the handshake and refused it
+    /// (the incident case) was reported as "no shepherd running" -- sending
+    /// the operator to the roll instead of `shep daemon reload`.
+    #[tokio::test]
+    async fn flock_reports_a_refusal_as_a_refusal_not_as_no_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.run).unwrap();
+        let refusal = shep_core::protocol::RpcError {
+            code: shep_core::protocol::RpcErrorCode::ProtocolMismatch,
+            message: "this daemon speaks protocol 1, this client speaks 2".to_string(),
+            daemon_version: Some("0.1.8".to_string()),
+        };
+        let _daemon = shep_client::testing::fake_daemon(&paths.socket, Err(refusal)).await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = buffered_streams(&mut out, &mut err);
+            flock_command(&mut streams, &paths, VersionGuard::Enforce).await
+        };
+
+        assert_ne!(code, ExitCode::Success);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            !text.contains("no shepherd running"),
+            "a refusal is not an absence: {text}"
+        );
+        assert!(text.contains("shep daemon reload"), "{text}");
+    }
+
+    /// The other half of Task 6: a genuinely absent daemon -- nothing
+    /// listening at all -- must still fall back to the muster roll. That
+    /// fallback is a real feature (a machine that just rebooted), not the
+    /// bug; narrowing the match must not remove it.
+    #[tokio::test]
+    async fn flock_still_falls_back_to_the_roll_for_a_genuine_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(&paths.run).unwrap();
+        // No socket bound at `paths.socket` -- `connect(2)` itself fails.
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = buffered_streams(&mut out, &mut err);
+            flock_command(&mut streams, &paths, VersionGuard::Enforce).await
+        };
+
+        assert_eq!(code, ExitCode::DaemonUnreachable);
+        let text = String::from_utf8(err).unwrap();
+        assert!(text.contains("no shepherd running"), "{text}");
     }
 
     /// A daemon of this binary's own version is not a skew, so nothing is

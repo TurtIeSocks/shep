@@ -540,7 +540,7 @@ None of the three is a recovery verb, so each passes `VersionGuard::Enforce` dir
 
 **`commands/dogs.rs` has the same defect in a different shape, at four sites.** Each does `Client::connect(&paths.socket).await.ok()`, and that `.ok()` turns a refusal into `None` exactly as the blanket `Err(_)` turns it into a roll fallback. Fix both here; they are one bug wearing two spellings. Task 5b deliberately left these alone as belonging to this task. During the incident the daemon was alive and answering; it answered the refusal. That sent the operator to the muster-roll path rather than the reload path.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[tokio::test]
@@ -552,15 +552,15 @@ async fn flock_reports_a_refusal_as_a_refusal_not_as_no_daemon() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Expected: FAIL, the output contains "no shepherd running"
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Narrow the blanket catch so it distinguishes "could not connect at all", which is genuinely no daemon and keeps the roll fallback, from "connected and was refused", which is a live daemon and must say so. Match on the error, not on `_`.
 
-- [ ] **Step 4: Run to verify it passes, then task gate and commit**
+- [x] **Step 4: Run to verify it passes, then task gate and commit**
 
 ---
 
