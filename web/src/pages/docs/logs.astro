@@ -36,14 +36,14 @@ ID  NAME   STATUS  PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
 0   web:0  online  54244  0         -     -    -    43s     -     -
 1   web:1  online  54338  1         -     -    -    37s     -     -`;
 
-const logrotate = `~/.shep/logs/*.log {
+const logrotate = `/home/shepherd/.shep/logs/*.log {
     daily
     rotate 7
     missingok
     notifempty
     sharedscripts
     postrotate
-        shep reopen
+        su shepherd -c 'shep reopen'
     endscript
 }`;
 
@@ -188,6 +188,22 @@ stderr  /tmp/shepdocs/home/logs/shepd.err.log  emptied`;
       there would be the silent failure this verb exists to end.
     </p>
     <CodeBlock label="/etc/logrotate.d/shep">{logrotate}</CodeBlock>
+    <p>
+      Both halves of that stanza are more literal than they look. logrotate
+      globs the pattern with <code>glob(3)</code> and never asks for tilde
+      expansion, so <code>~/.shep/logs/*.log</code> looks for a directory
+      actually named <code>~</code> and matches nothing even when the real one
+      is sitting there. With <code>missingok</code> set, that failure is
+      silent. Write the shepherd account's absolute log directory, and
+      substitute a custom <code>SHEP_HOME</code> if the account sets one.
+    </p>
+    <p>
+      <code>postrotate</code> then runs as whoever runs logrotate, usually
+      root, and <code>shep reopen</code> finds its shepherd through that
+      user's <code>$SHEP_HOME</code>. A root job would look under{" "}
+      <code>/root/.shep</code> and report no shepherd running, so it has to
+      become the account that owns the flock first.
+    </p>
 
     <h2>Emptying them</h2>
     <VerbSignature verb="flush" usage="shep flush <selector> | shep flush --daemon">
