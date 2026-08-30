@@ -1965,7 +1965,8 @@ type Rehydrated = (
 ///
 /// `Debug` is derived and carries nothing sensitive: two descriptor numbers,
 /// a mailbox and the home's own paths. The blob those descriptors end up in
-/// carries no environment value either (see [`crate::handover::Handover`]).
+/// is a different matter and does carry each sheep's environment; see
+/// [`crate::handover::Handover`]'s own doc for what protects it.
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct HandoverSeam {
