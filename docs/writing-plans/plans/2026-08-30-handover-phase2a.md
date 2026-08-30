@@ -791,7 +791,7 @@ fn the_adopted_pidfile_arm_does_not_release_the_lock() {
 
 **Restore the counters before installing any slot.** `next_id`, `next_deadline` and `next_action_stamp` reset to zero in every constructor, so a successor that installs sheep first and restores counters second can hand a fresh sheep an id a caller is still holding.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test]
@@ -836,15 +836,15 @@ async fn the_successor_does_not_reissue_a_live_id() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 A carried sheep with no descriptors (registered but stopped, `CarriedFds::none()`) installs as a slot with no pump and no `ctl`, which is the state it was already in. Do not try to adopt a process that is not running.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
-- [ ] **Step 5: Task gate, then commit**
+- [x] **Step 5: Task gate, then commit**
 
 #### Task 8d: the arms, and proving a sheep never noticed
 

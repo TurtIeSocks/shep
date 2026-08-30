@@ -608,6 +608,71 @@ impl CarriedSheep {
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
+
+    /// The entry id this instance keeps across the handover.
+    #[must_use]
+    pub const fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// The name an operator reaches this instance by.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The instance slot within its app.
+    #[must_use]
+    pub const fn instance(&self) -> u32 {
+        self.instance
+    }
+
+    /// The pid this instance is running under, or `None` for one that is
+    /// registered and not running.
+    ///
+    /// The one question a successor asks before adopting anything: there is
+    /// no process to take over for an instance that has none, and its
+    /// [`Self::fds`] are [`CarriedFds::none`] for the same reason.
+    #[must_use]
+    pub const fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Respawns performed so far, which the restart budget counts against.
+    #[must_use]
+    pub const fn restarts(&self) -> u32 {
+        self.restarts
+    }
+
+    /// The instance's lifecycle status.
+    #[must_use]
+    pub const fn status(&self) -> ProcStatus {
+        self.status
+    }
+
+    /// How this instance most recently stopped existing, if it has.
+    #[must_use]
+    pub const fn last_exit(&self) -> Option<ExitInfo> {
+        self.last_exit
+    }
+
+    /// The identity this instance's next spawn runs under, resolved once by
+    /// the predecessor and never looked up again.
+    #[must_use]
+    pub const fn credentials(&self) -> SpawnIdentity {
+        self.credentials
+    }
+
+    /// The config this instance runs under, as its predecessor normalized it.
+    ///
+    /// Not a [`ResolvedApp`](shep_core::config::ResolvedApp): see the field's
+    /// own doc for why the proof token is rebuilt by re-normalizing this
+    /// rather than carried, and why re-normalizing is a no-op that hands the
+    /// token back.
+    #[must_use]
+    pub const fn app(&self) -> &AppConfig {
+        &self.app
+    }
 }
 
 /// The four descriptor numbers one sheep's output travels on.
