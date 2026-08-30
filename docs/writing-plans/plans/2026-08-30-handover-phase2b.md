@@ -42,71 +42,72 @@ So: **drive a real reload by hand before pushing anything that touches the hando
 
 ---
 
-### Task 1: carry the pump's reader buffer
+### Task 1: quiesce the pump at the report
 
 **Files:**
-- Modify: `crates/shep-daemon/src/handover/mod.rs` (`CarriedSheep`)
 - Modify: `crates/shep-daemon/src/tokio_runner.rs` (the pump, `LogCtl::ReportFds`)
-- Modify: `crates/shep-daemon/src/handover/adopt.rs` (seed the successor's reader)
+- Modify: `crates/shep-daemon/src/handover/mod.rs` (an un-park path for the abort case)
 - Test: alongside
 
-**The defect, measured rather than reasoned.** The pump reads through `Lines<BufReader<ChildStdout>>`. At the exec, bytes the `BufReader` has consumed from the pipe and not yet emitted die with the image. 8a's flush empties `LogFile`'s WRITE buffer; nothing empties the reader's.
+**This task was "carry the pump's reader buffer" and that design was wrong.** It was built, measured on a real flock, and rejected. What follows replaces it, and Task 3 folds into it, because both are the same defect.
 
-2a measured it with a sheep emitting as fast as the pipe allows, three runs of three:
+#### Why carrying the buffer is not enough, measured
 
-| after | next line | expected |
-|---|---|---|
-| `7385` | `2` | `7386` |
-| `4872` | `00` | `4873` |
-| `10917` | `1916` | `10918` |
+The blob is a snapshot. The pump is live. Between `ReportFds` and the `execve` the pump keeps reading and emitting, so the bytes the successor prepends are bytes the predecessor has ALREADY written to the log file.
 
-The third is the shape of the whole thing. `1916` is not a suffix of `10918`, so what died was not one line: it was everything the reader held, and the resume landed about a thousand lines further on.
+From a real reload, with the carry in place:
 
-**The design.** The buffered bytes are just bytes. Carry them per stream in the blob, and have the successor prepend them to its fresh reader before it reads the pipe. Order is preserved because those bytes came off the pipe before anything still in the kernel buffer.
+```
+after 5082301 came 5060798, then 459 lines of old output, then 5083785
+459 lines x 8 bytes = 3672, exactly the out=3672 the report answered
+grep -c "^5060798$"  ->  2
+```
 
-Do NOT try to solve this by draining and emitting. A drain still has to do something with a trailing partial line, and writing it out as a line is a smaller tear rather than no tear.
+Once where the predecessor wrote it, once where the successor replayed it. So the carry adds duplication and reordering on top of the tear it was meant to remove.
 
-**A size bound is required.** `BufReader`'s default capacity is 8 KiB per stream, so a bounded flock's blob grows by a bounded amount. State the bound in the code and assert it, so a future capacity change cannot silently make the blob unbounded.
+#### The second loss, which was not on this plan at all
+
+A slower sheep leaves the reader empty at every report, so the carry does nothing, and **roughly 400 lines still vanish per reload**. Those are lines appended after the report's flush and killed in `LogFile`'s WRITE buffer at the exec.
+
+Read side and write side, same window.
+
+#### The design
+
+**After answering `ReportFds`, the pump stops reading its streams until the exec.** Then the snapshot, the flush and the reported descriptor numbers are all still true when the exec happens, because nothing has moved since they were taken.
+
+That is one change closing three residuals: the read-side tear, the write-side loss, and Task 3's unpinned descriptors, which cannot be pinned while their owner is still consuming.
+
+**An un-park path is required and is the sharp edge.** A handover that reports and then aborts must leave the pump reading again, or a failed reload silently stops a sheep's logging for the rest of the daemon's life. `exec_into` already has an error path that restores `FD_CLOEXEC`; the un-park belongs with it.
+
+#### What quiescing does NOT fix
+
+`tokio::io::Lines` exposes `get_ref` and `get_mut` but not its own partial-line accumulator, so a fragment in flight at the exec is still lost. That window is a pump parked mid-line with an empty `BufReader`, costing a fragment of one line rather than a block. Closing it means the pump reading through a buffer it owns rather than through `Lines`, which is a larger change and is not this task. Document the residual where the parking happens.
+
+#### What to keep from the rejected attempt
+
+A 950-line patch is preserved in this session's scratchpad as `task1-carry.patch`, and the work in it is not wasted:
+
+- `ReportFds` is served in TWO places, `LogFiles::serve` and `reserve_slot`, and neither could see the readers, which were locals in the spawned task. Threading them through as a `Streams<O, E>` struct is needed by the parking design too.
+- One borrow detail worth not rediscovering: bind `deliver_line(..).await`'s result before matching on it. A scrutinee's temporaries outlive the arms, and an arm clears the reader that future was reading.
+- `CarriedFds::MAX_BUFFERED = 8 * 1024`, asserted by a test that writes 11.6 KiB through a parked pump.
+
+Whether the blob still carries buffered bytes at all is now an open question rather than a given. A parked pump's reader may simply be empty by construction, in which case the field goes.
 
 - [ ] **Step 1: Write the failing test**
 
-```rust
-#[tokio::test]
-async fn a_carried_reader_buffer_survives_the_handover() {
-    // The regression is only visible when the reader is NOT empty at the
-    // exec, which is why the sheep has to outrun the pump rather than tick
-    // politely. A test with a sleeping writer passes without the fix.
-    let pump = PumpHarness::start_over_pipes();
-    write_fast(&pump, 1..=5_000).await;
-    let fds = report_fds(&pump).await;
-    assert!(
-        !fds.out_buffered.is_empty(),
-        "this case proves nothing unless the reader is holding bytes"
-    );
-
-    let adopted = adopt_with(fds);
-    let seen = read_all_lines(&adopted).await;
-    assert_unbroken_sequence(&seen);
-}
-```
-
-The first assertion is the important one. Without it the test silently degrades to the empty-buffer case and passes against no implementation at all, which is the failure mode three separate 2a tasks hit.
+The measurement that matters is a chatty sheep across a reload, with every line appearing exactly once, in order. The rejected attempt's harness proved a test can pass while the log is duplicating, so assert absence of duplicates as well as absence of gaps.
 
 - [ ] **Step 2: Run to verify it fails**
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement, including the un-park**
 
-- [ ] **Step 4: Run to verify it passes, and prove it non-vacuous**
+- [ ] **Step 4: Prove it non-vacuous**
 
-Drop the carried bytes on the floor in the successor and confirm the test fails with a tear. Report the mutation and its output.
+- [ ] **Step 5: Drive a real reload, on a sheep fast enough to tear**
 
-- [ ] **Step 5: Drive a real reload**
-
-Per the note above. A chatty sheep, several reloads, `shep bleats` unbroken across all of them.
+An `awk` or shell loop emitting with no sleep. The rejected design passed every suite it had and failed here, three runs of three.
 
 - [ ] **Step 6: Task gate, then commit**
-
----
 
 ### Task 2: a deadline on `report_fds`, and an answer that is not ambiguous
 
@@ -118,7 +119,11 @@ Sketch only; expand when Task 1 lands.
 
 ---
 
-### Task 3: pin a reported descriptor until the exec
+### Task 3: pin a reported descriptor until the exec (FOLDED INTO TASK 1)
+
+Quiescing the pump pins the descriptors by construction: a parked pump does not hit EOF and does not reopen, so a reported number cannot be released and reused before the exec. Keep this heading as the record of why the task disappeared, and verify the property holds once Task 1 lands rather than assuming it.
+
+The original statement follows.
 
 A reported number is not owned by anything between `ReportFds` and `Handover::write`. An EOF or a `LogFile::reopen` can release it, and a later open can reuse it. `adopt`'s kind check makes a pipe landing on a log fail loudly; a log handle landing on a log handle stays quiet.
 
