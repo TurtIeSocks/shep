@@ -723,11 +723,26 @@ async fn hand_over(
     // no way to tell a successor from a predecessor that has been signalled
     // and has not execed yet: both answer, on the same pid, at the same
     // version.
-    let witness = Client::connect(&paths.socket).await.ok();
+    let Ok(witness) = Client::connect(&paths.socket).await else {
+        // No witness, no handover. Signalling without one would leave
+        // `await_successor` with nothing to outlive, so it would accept the
+        // first answer it got, which is the predecessor's, which is the
+        // whole hole the witness exists to close.
+        //
+        // Reaching here at all is anomalous rather than informative: the
+        // fitness query a moment ago needed a connection of its own, so a
+        // daemon WAS answering. A transient failure here says something is
+        // wrong, not that nothing is running, and the stop arm is correct
+        // under either reading.
+        let message = "could not hold a connection across the handover signal; \
+                       stopping and starting instead";
+        streams.aside("reload", message);
+        return stop_and_start(streams, paths, guard, wait).await;
+    };
     if let Err((code, message)) = signal_handover(pid) {
         return streams.fail(code, &message);
     }
-    match await_successor(paths, witness, wait).await {
+    match await_successor(paths, &witness, wait).await {
         // The successor carried the flock; nothing to restore.
         Some(client) => report_reload(&client, streams, false).await,
         None => {
@@ -788,7 +803,7 @@ fn signal_handover(pid: u32) -> Result<(), (ExitCode, String)> {
 #[cfg(unix)]
 async fn await_successor(
     paths: &ShepPaths,
-    witness: Option<Client>,
+    witness: &Client,
     wait: std::time::Duration,
 ) -> Option<Client> {
     let deadline = tokio::time::Instant::now() + wait;
@@ -798,20 +813,18 @@ async fn await_successor(
     // survive its exec. Only once it stops answering is a fresh connection
     // worth trusting.
     //
-    // Skipped when no witness could be opened, which means nothing was
-    // answering before the signal either, so there is no predecessor to
-    // outlive.
-    if let Some(witness) = witness {
-        while witness
-            .request(shep_core::protocol::Request::ListFlock)
-            .await
-            .is_ok()
-        {
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(SUCCESSOR_POLL_INTERVAL).await;
+    // Never skipped. A caller without a witness must not reach here at all,
+    // because a handover with nothing to outlive accepts the predecessor's
+    // own answer as the successor's.
+    while witness
+        .request(shep_core::protocol::Request::ListFlock)
+        .await
+        .is_ok()
+    {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
         }
+        tokio::time::sleep(SUCCESSOR_POLL_INTERVAL).await;
     }
 
     // Stage two: the old image is gone. Now an answered request can only
