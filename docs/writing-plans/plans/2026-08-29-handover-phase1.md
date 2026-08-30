@@ -488,13 +488,57 @@ Put the exempt list in one named constant with a doc comment giving the reason, 
 
 ---
 
+### Task 5b: the verbs that connect on their own are guarded too
+
+**Files:**
+- Modify: `crates/shep-cli/src/lookout/source.rs` (:235)
+- Modify: `crates/shep-cli/src/whistle/shepherd.rs` (:74)
+- Modify: `crates/shep-cli/src/commands/foreground.rs` (:118)
+- Modify: `crates/shep-cli/src/lib.rs` (make the guard reachable)
+- Test: alongside each
+
+**Added after Task 5, which reported the gap rather than silently widening its own scope.** Task 5 guarded the three seams in `lib.rs` that hand back a `Client`. Three operator-facing verbs bypass those seams entirely by calling `Client::connect` inside their own module, so they connect to a version-skewed daemon and proceed as if nothing were wrong.
+
+Spec G1 says the CLI refuses any daemon whose crate version differs. It does not say most verbs do. A `shep lookout` that renders a dashboard against a daemon it cannot agree with is exactly the silent mixed state this design exists to remove.
+
+**Interfaces:**
+- Consumes: `refuse_version_skew(streams, client, guard) -> Result<(), ExitCode>` and `VersionGuard`, both currently private in `lib.rs`. Widen to `pub(crate)` rather than duplicating the check. `serve.rs` already names `crate::VersionGuard::Enforce` at its call site, so that precedent exists.
+
+**Out of scope, with reasons, so a later reader does not think they were missed:**
+
+- `crates/shep-cli/src/dog/mod.rs:186` is a DOG's own connection to the daemon, not an operator verb. The dog version axis is Phase 3's whole subject and has its own rules there, including the one-restart-then-report behaviour. Guarding it here would pre-empt that design.
+- `crates/shep-cli/src/commands/dogs.rs` calls `Client::connect(..).ok()` at four sites, deliberately tolerating an absent daemon. That `.ok()` swallows a refusal and reports it as an absence, which is the same defect as Task 6's, not this one. Task 6 covers it.
+- `status.rs:70` is `ping` and `admin.rs:61` is `kill`. Both are exempt by design; leave them.
+
+- [ ] **Step 1: Write the failing tests**
+
+One per verb, each asserting the verb refuses with `ExitCode::VersionSkew` against a daemon reporting a different version, and proceeds normally against a matching one. Use `shep_client::testing::fake_client_with_ack`, which is the fixture Task 5 found works; the plan's earlier `fake_daemon().version(..)` shape does not exist.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `cargo test -p shep --lib --bins --all-features -- --skip ::slow:: version_skew`
+
+- [ ] **Step 3: Widen the guard and call it at each site**
+
+`refuse_version_skew` and `VersionGuard` become `pub(crate)`. Each of the three sites calls it immediately after its `Client::connect` succeeds, before doing anything with the client.
+
+None of the three is a recovery verb, so each passes `VersionGuard::Enforce` directly rather than being threaded one, matching what `serve.rs` already does. Put a one-line comment at each site saying why that verb can never be exempt: `lookout` and `whistle` both drive the daemon, and `foreground` registers a sheep.
+
+- [ ] **Step 4: Run to verify they pass**
+
+- [ ] **Step 5: Task gate, then commit**
+
+---
+
 ### Task 6: a refusal is not an absence
 
 **Files:**
 - Modify: `crates/shep-cli/src/lib.rs` (:1285)
 - Test: same file
 
-`lib.rs:1285` is a blanket `Err(_) => query::flock_from_roll(&mut streams, &paths)`, so any connect failure prints "no shepherd running". During the incident the daemon was alive and answering; it answered the refusal. That sent the operator to the muster-roll path rather than the reload path.
+`lib.rs:1285` is a blanket `Err(_) => query::flock_from_roll(&mut streams, &paths)`, so any connect failure prints "no shepherd running".
+
+**`commands/dogs.rs` has the same defect in a different shape, at four sites.** Each does `Client::connect(&paths.socket).await.ok()`, and that `.ok()` turns a refusal into `None` exactly as the blanket `Err(_)` turns it into a roll fallback. Fix both here; they are one bug wearing two spellings. Task 5b deliberately left these alone as belonging to this task. During the incident the daemon was alive and answering; it answered the refusal. That sent the operator to the muster-roll path rather than the reload path.
 
 - [ ] **Step 1: Write the failing test**
 
