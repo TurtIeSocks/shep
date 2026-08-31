@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-08-31
+
+### Added
+
+- Let a dog name itself in the handshake
+- Let a daemon be asked which dogs cannot talk to it
+
+
 ## [0.1.22] - 2026-08-31
 
 

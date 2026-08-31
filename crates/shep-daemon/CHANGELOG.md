@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-08-31
+
+### Added
+
+- Let a dog name itself in the handshake
+- Restart a refused dog once, then report it stale
+- Report a stale dog after the reload, not before it
+- Carry a dog across the reload instead of refusing it
+
+
 ## [0.1.22] - 2026-08-31
 
 ### Fixed
