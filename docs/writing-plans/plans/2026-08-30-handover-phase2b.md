@@ -333,6 +333,14 @@ Eight, each applied alone and reverted afterwards.
 
 One flake was created and fixed in passing. The first version of the adopt-side case wrote four lines through two `tokio::fs::File` handles with one flush at the end, and failed once in twelve runs on `zero-1/one-1/one-2/zero-2`: a `tokio::fs::File` buffers and hands the real `write(2)` to the blocking pool, so an ordered assertion over two handles is an assertion about that pool. Flushing after every line makes each write land before the next begins. Twelve clean runs afterwards.
 
+##### Follow-up defect: the serial sweep, fixed
+
+Task 6 measured the arithmetic and did not fix it: `spawn_handover_task` visited pumps one after another, so a flock of N wedged pumps cost N times `REPORT_DEADLINE` (2s) before the caller's own fallback could even start. Past six wedged pumps that sweep already outlasted `shep-cli`'s `admin::KILL_TEARDOWN_WAIT` (10s), and reaching six had just become `instances = 6` in one stanza rather than six separate app stanzas. Worse than a slow reload: the client gave up first, fell back to `connect_or_spawn_client`, connected to the PREDECESSOR (still serving, since only the snapshot task was blocked), mustered against it, and exited 0. The sweep then finished seconds later on the actual successor, `fitness` refused on `PumpUnresponsive`, and the daemon took the graceful-stop fallback: an operator who saw exit 0 was left with no flock seconds afterward.
+
+Fixed by visiting the pumps CONCURRENTLY (`futures_util::future::join_all`, the same primitive `spawn_send_line_task` already uses for `STDIN_WRITE_TIMEOUT`) instead of a `for` loop. The worst case is now one `REPORT_DEADLINE` regardless of N. `join_all` returns its results in input order rather than completion order, so the id-sorted order `handle_handover_snapshot` establishes before spawning the task survives into both the candidates and the blob with no re-sort needed, and each pump's report still carries its own sheep's identity, so attribution (`RefusedReason::PumpUnresponsive { sheep }`) is unaffected by the race. `spawn_reopen_task` was deliberately left serial: its caller carries `rpc`'s own per-request budget rather than a fixed client-side wait, so the same trade does not apply there.
+
+Measured: six wedged pumps, serial 12s, concurrent 2s (both virtual time, under a paused tokio clock). A normal single-sheep reload (three reloads of a chatty `awk` counter, no wedged pumps) was re-run by hand to confirm the drill is unaffected: every reload exit 0, shepherd pid and sheep pid both unmoved, 25,579,208 lines with zero gaps and zero duplicates after `shep stop`.
+
 ---
 
 ### Task 8: re-arm audit, and the end-to-end case
@@ -372,7 +380,7 @@ Baselines on that drill, three reloads: `origin/main` loses about 2900 lines, 2b
 - The rejected buffer-carry patch is at `stash@{0}` and in this session's scratchpad as `task1-carry.patch`. Read it for plumbing, not design.
 - `handover/mod.rs`'s module header names the three refusals left, all of them 2c's. Task 7 has one more to strike, `Dog`, and four tests currently using it as their refusal fixture will need moving with it.
 - PR #73 has two threads left open for 2b. Both are now addressed: the `report_fds` deadline is task 2, and descriptor pinning fell out of task 1's parking. They can be closed with a pointer to those commits.
-- `spawn_handover_task` visits sheep serially, so a flock of wedged pumps waits N x 2s before the fallback. Named in `REPORT_DEADLINE`'s doc, not fixed, and task 6 added the arithmetic against the client's own 10s: six wedged pumps is where the sweep outlasts the caller, and `instances = 6` is now a way to get there.
+- `spawn_handover_task` used to visit sheep serially, so a flock of wedged pumps waited N x 2s before the fallback, and past six that outlasted the client's 10s wait and reached exit 0 with no flock. Fixed by a follow-up defect task: see "Follow-up defect: the serial sweep, fixed" under Task 6.
 
 ## Phase gate
 

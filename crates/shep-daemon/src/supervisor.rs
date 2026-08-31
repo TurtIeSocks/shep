@@ -7783,10 +7783,29 @@ struct HandoverDraft {
 /// Every await lives in here, off the actor loop — see
 /// [`Actor::handle_reopen`] for the cycle that rules out doing it inline.
 ///
-/// The sheep are visited one after another rather than concurrently, exactly
-/// as [`spawn_reopen_task`] visits them, and the same trade applies: a
-/// stalled pump delays the sheep behind it, and the request's own deadline
-/// is what bounds the caller either way.
+/// The sheep are visited CONCURRENTLY, with `join_all` rather than a `for`
+/// loop, exactly as [`spawn_send_line_task`] visits its waits and for the
+/// same reason: a bound meant to sit under a fixed caller deadline stops
+/// doing that the moment several of them are added up serially.
+/// [`spawn_reopen_task`] is the one sibling that stays a `for` loop, and the
+/// difference is which deadline is fixed. A reopen's caller carries `rpc`'s
+/// own per-request budget, which scales with what is asked of it; a
+/// reload's client-side wait is `shep-cli`'s `admin::KILL_TEARDOWN_WAIT`, a
+/// constant the daemon cannot see and does not get to lengthen. Serially, N
+/// wedged pumps cost N times [`REPORT_DEADLINE`], and past six that already
+/// outlasts the client (see `REPORT_DEADLINE`'s own doc): the client gives
+/// up, falls back to a predecessor that is still serving, musters against
+/// it, and exits 0 while the sweep is still running behind it. `join_all`
+/// bounds the whole sweep at one [`REPORT_DEADLINE`] regardless of N, which
+/// is what the fixed deadline on the other end actually needs.
+///
+/// `join_all` returns its results in the order its input futures were
+/// given, not completion order, so the sorted-by-id order `drafts` arrives
+/// in (see [`Actor::handle_handover_snapshot`]) survives into `candidates`
+/// and `carried` untouched: no re-sort is needed or performed here. Each
+/// future closes over its own `draft`, so which pump answered late is still
+/// attached to that sheep's own [`OwnedCandidate::pump_unresponsive`];
+/// racing the reports does not blur which one refused the gate.
 ///
 /// Must be called from within a Tokio runtime context.
 #[cfg(unix)]
@@ -7797,10 +7816,7 @@ fn spawn_handover_task(
     reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
 ) {
     tokio::spawn(async move {
-        let mut candidates = Vec::with_capacity(drafts.len());
-        let mut carried = Vec::with_capacity(drafts.len());
-        let mut parked = ParkedPumps::default();
-        for draft in drafts {
+        let visited = futures_util::future::join_all(drafts.into_iter().map(|draft| async move {
             // The three answers go to three different places, which is why
             // `report_fds` distinguishes them at all:
             //
@@ -7815,16 +7831,13 @@ fn spawn_handover_task(
             //   descriptors. For a wedged pump that is a value nothing ever
             //   reads: the gate refuses on the candidate, so this blob is
             //   dropped rather than written.
-            let (mut fds, pump_unresponsive) = match &draft.log_ctl {
+            let (mut fds, pump_unresponsive, parked_pump) = match &draft.log_ctl {
                 Some(log_ctl) => match report_fds(log_ctl).await {
-                    PumpReport::Parked(fds) => {
-                        parked.0.push(log_ctl.clone());
-                        (fds, false)
-                    }
-                    PumpReport::Gone => (CarriedFds::none(), false),
-                    PumpReport::Unresponsive => (CarriedFds::none(), true),
+                    PumpReport::Parked(fds) => (fds, false, Some(log_ctl.clone())),
+                    PumpReport::Gone => (CarriedFds::none(), false, None),
+                    PumpReport::Unresponsive => (CarriedFds::none(), true, None),
                 },
-                None => (CarriedFds::none(), false),
+                None => (CarriedFds::none(), false, None),
             };
             // The one number the pump can report and be wrong about. See
             // `HandoverDraft::channel_open` for why the pump cannot know,
@@ -7835,13 +7848,30 @@ fn spawn_handover_task(
             if !draft.channel_open {
                 fds.channel = None;
             }
-            carried.push(CarriedSheep::from_entry(&draft.entry, draft.epoch, fds));
-            candidates.push(OwnedCandidate {
+            let carried = CarriedSheep::from_entry(&draft.entry, draft.epoch, fds);
+            let candidate = OwnedCandidate {
                 entry: draft.entry,
                 pending_stop: draft.pending_stop,
                 pending_delete: draft.pending_delete,
                 pump_unresponsive,
-            });
+            };
+            (candidate, carried, parked_pump)
+        }))
+        .await;
+
+        // `join_all` hands `visited` back in `drafts`' own order (id-sorted,
+        // per `Actor::handle_handover_snapshot`), not completion order, so
+        // this loop reproduces the serial version's ordering without a sort
+        // of its own.
+        let mut candidates = Vec::with_capacity(visited.len());
+        let mut carried = Vec::with_capacity(visited.len());
+        let mut parked = ParkedPumps::default();
+        for (candidate, sheep, parked_pump) in visited {
+            candidates.push(candidate);
+            carried.push(sheep);
+            if let Some(log_ctl) = parked_pump {
+                parked.0.push(log_ctl);
+            }
         }
         let blob = Handover::new(carried, fds, counters);
         let _ = reply.send(Ok((candidates, blob, parked)));
@@ -7875,9 +7905,9 @@ enum PumpReport {
     Gone,
     /// The pump did not answer inside [`REPORT_DEADLINE`].
     ///
-    /// It never parked, so it is still reading its sheep's streams while
-    /// every pump before it in the sweep is frozen, and it must NOT be
-    /// resumed: a resume would wake something that was never asleep.
+    /// It never parked, so it is still reading its sheep's streams, and it
+    /// must NOT be resumed: a resume would wake something that was never
+    /// asleep.
     Unresponsive,
 }
 
@@ -7898,27 +7928,28 @@ enum PumpReport {
 /// this file: a bounded wait on an acknowledgement from a pump-tier task
 /// whose failure mode is a peer that has stopped consuming.
 ///
-/// Per pump, not per sweep, because the pumps are visited one at a time and
-/// the refusal has to name WHICH sheep went quiet. A flock of wedged pumps
-/// therefore costs N times this before the caller falls back, which is the
-/// price of that name.
+/// Per pump, but paid ONCE, not per sweep: [`spawn_handover_task`] visits
+/// every pump concurrently, exactly as [`spawn_send_line_task`] does for
+/// `STDIN_WRITE_TIMEOUT`, so a whole flock of wedged pumps still costs one
+/// [`REPORT_DEADLINE`] rather than N of them, and the refusal still names
+/// WHICH sheep went quiet. Concurrency does not cost that name, because
+/// each pump's report carries its own sheep with it regardless of how the
+/// others answer.
 ///
-/// **N is one config line now.** Since 2b carried multi-instance apps, an
-/// `instances = 10` is ten sheep with ten pumps, where reaching ten used to
-/// take ten app stanzas. Nothing about the cost changed, but the way to
-/// arrive at it got much shorter, so the arithmetic is worth having
-/// written down: `shep daemon reload` gives the successor
-/// `admin::KILL_TEARDOWN_WAIT` (10s) to answer, so six wedged pumps is
-/// where this sweep outlasts the client that asked. Past that the client
-/// reports a failed handover and musters against the PREDECESSOR, which is
-/// still serving and which then refuses and stops gracefully seconds later.
-///
-/// That is a fault path, not a slow one: a pump misses this deadline only
-/// on a filesystem that has stopped completing writes, and a healthy
-/// ten-instance app reports in microseconds. It is left as it is rather
-/// than fixed here because the fix is a different shape (visit the pumps
-/// concurrently, which still knows which one went quiet) and belongs with
-/// whoever decides what the client should do when the sweep outlasts it.
+/// **This bound used to scale with N, and does not any more; the arithmetic
+/// is worth keeping written down because reaching a large N got much
+/// shorter.** Since 2b carried multi-instance apps, an `instances = 10` is
+/// ten sheep with ten pumps, where reaching ten used to take ten app
+/// stanzas. Visited one after another, that sweep would have cost up to ten
+/// times this deadline; `shep daemon reload` only gives the successor
+/// `admin::KILL_TEARDOWN_WAIT` (10s) to answer, so six wedged pumps was
+/// already enough to outlast the client that asked. Past that the client
+/// used to report a failed handover and muster against the PREDECESSOR,
+/// which was still serving and would then refuse and stop gracefully
+/// seconds later, leaving an operator with an exit code of 0 and no flock.
+/// `join_all` closes that: the sweep's worst case is now one
+/// [`REPORT_DEADLINE`] regardless of N, comfortably inside
+/// `KILL_TEARDOWN_WAIT` for any flock size this daemon is likely to carry.
 #[cfg(unix)]
 const REPORT_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -17677,6 +17708,84 @@ mod tests {
             runner.resumes(wedged),
             0,
             "a pump that never answered never parked, so nothing may resume it"
+        );
+    }
+
+    /// Fails if the sweep costs `REPORT_DEADLINE * N` instead of
+    /// `REPORT_DEADLINE` once.
+    ///
+    /// This is the defect task 6 measured but did not fix: a `for` loop over
+    /// the pumps makes a flock of wedged pumps cost N times
+    /// [`REPORT_DEADLINE`] before the caller's own fallback can even start.
+    /// Six is the number [`REPORT_DEADLINE`]'s own doc names as where that
+    /// sweep first outlasts `shep-cli`'s `admin::KILL_TEARDOWN_WAIT` (10s):
+    /// past it, the client gives up first, falls back to a predecessor that
+    /// is still serving, musters against it, and exits 0 seconds before the
+    /// sweep this daemon is still running actually finishes and the gate
+    /// refuses for real. `instances = 6` reaches that count in one stanza.
+    ///
+    /// Asserted against `Instant`, like
+    /// `a_flock_of_wedged_sheep_is_bounded_once_and_not_once_each`: under the
+    /// paused clock the auto-advance is exact, so a serial sweep reliably
+    /// reads six [`REPORT_DEADLINE`]s (12s) and a concurrent one reliably
+    /// reads about one (2s). The bound below sits well inside that gap.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_of_six_wedged_pumps_costs_one_deadline_not_six() {
+        const WEDGED: usize = 6;
+        let names: Vec<String> = (0..WEDGED).map(|i| format!("wedged{i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); WEDGED])
+            .with_a_pump_that_never_reports(&name_refs);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(
+                names
+                    .iter()
+                    .map(|name| normalize(AppConfig::minimal(name, "./srv")).unwrap())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let started_at = tokio::time::Instant::now();
+        let (candidates, blob, _parked) =
+            tokio::time::timeout(Duration::from_secs(3600), handle.handover_snapshot(fds))
+                .await
+                .expect("a snapshot over six wedged pumps must answer rather than hang")
+                .unwrap();
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < REPORT_DEADLINE * 2,
+            "six wedged pumps swept concurrently should cost about one \
+             REPORT_DEADLINE, not six; took {elapsed:?}"
+        );
+
+        assert_eq!(candidates.len(), WEDGED);
+        for candidate in &candidates {
+            assert!(
+                candidate.pump_unresponsive,
+                "{} must still be reported unresponsive; racing the reports \
+                 must not blur which pump answered",
+                candidate.entry.spec.config().name
+            );
+        }
+        // `join_all` returns in the order its input futures were given, and
+        // `handle_handover_snapshot` sorted `drafts` by id before spawning
+        // this task, so both outputs stay id-ordered across the concurrent
+        // sweep with no re-sort in `spawn_handover_task` itself.
+        assert!(
+            candidates.windows(2).all(|w| w[0].entry.id < w[1].entry.id),
+            "candidates must stay in id order across a concurrent sweep"
+        );
+        assert!(
+            blob.sheep().windows(2).all(|w| w[0].id() < w[1].id()),
+            "the blob must stay in id order too: it is a file an operator may read"
         );
     }
 
