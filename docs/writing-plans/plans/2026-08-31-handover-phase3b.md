@@ -147,6 +147,61 @@ The rendering is the design work. A dog that has never handshook is not `online`
 - [ ] **Step 5: Drive it.** `shep flock` against a real skewed dog, in all three styles, and `--format json`.
 - [ ] **Step 6: `web/` and commit.** A STATUS value is documented surface.
 
+### Task 5: `shep lookout` stops disagreeing with `shep flock`
+
+**Files:** `crates/shep-cli/src/lookout/app.rs`, `crates/shep-cli/src/lookout/view/flock.rs`, `crates/shep-cli/src/lookout/view/detail.rs`, `crates/shep-cli/src/lookout/theme.rs`.
+
+Task 4 routed `shep flock` through `vocabulary::Reported`, so a dog that has
+never handshook prints `silent` there. It never touched the dashboard.
+`shep lookout`'s flock pane and detail pane still read `ProcessInfo::status`
+directly and still say `online`. That is worse than before task 4: an
+operator now has two shep surfaces open on the same dog, and they disagree.
+Nothing tells the operator which one to believe.
+
+`vocabulary.rs`'s own module doc already says the rule: a face or a status
+mapping decided anywhere but there is a review defect. Lookout deciding its
+own answer for the STATUS cell — which it does today, by reading
+`row.info.status` straight into `.to_string()` and into
+`Palette::status` — is exactly the defect the module doc warns about, just
+not caught at the time because task 4 had no reason to look past `output/`.
+
+`output::rows::reported` is the pattern to follow: it guards `Reported::of`
+behind `p.dog.is_none()` so a sheep, which has no handshake at all, can never
+be painted silent by a future daemon-side bug that leaves a field unset. Give
+`Row` in `lookout/app.rs` the same guarded lookup, and route both panes'
+STATUS cells through it and through `Reported`'s `word()`, `face()` is not
+used here — `theme.rs`'s own doc says lookout colours the word rather than
+growing a face — and `role()` via a new `Palette` method that takes a
+`Reported` instead of a bare `ProcStatus`.
+
+**The group/rollup row needs a decision, not a silent pass-through.**
+`output::rows::group_paint` already argued this for the table: a dog is
+never stocked to several instances, so no group row that function can see
+has a handshake to report, and it deliberately skips `Reported::of`.
+`lookout::app::App::is_grouped` has the identical shape (`instance.is_some()`
+on every member), so the identical argument applies — the group and detail
+rollups can keep reading `ProcStatus` unchanged. Write that argument down at
+each call site rather than leaving a reader to re-derive it, and confirm it
+with a test: a dog can never appear in a group row.
+
+- [ ] **Step 1: Write the failing tests.** A silent dog's row in the flock
+      pane reads `silent`, not `online`; a healthy dog is unchanged; a sheep
+      is unchanged; the detail pane's status word and colour agree with the
+      flock pane for the same dog.
+- [ ] **Step 2: Run them, watch them fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Prove each non-vacuous**, the two unchanged cases most of
+      all — they pass for the wrong reason if the new lookup path is never
+      reached.
+- [ ] **Step 5: Drive it.** A real protocol-1 dog against a current
+      shepherd, `shep lookout` open beside `shep flock`, and confirm both say
+      the same word.
+- [ ] **Step 6: `web/` and commit.** Grep the docs site for a lookout STATUS
+      description before assuming nothing needs it. Regenerate the rendered
+      frames in `crates/shep-cli/src/lookout/snapshots/` and
+      `docs/lookout/frames.txt` if the STATUS cell's own rendering changed
+      for any fixture they cover, and read the diff line by line.
+
 ---
 
 ## Out of scope
@@ -167,7 +222,9 @@ Reproduce a protocol-1 dog with `cargo update -p shep-core --precise <old>`, nev
 
 ## Gate
 
-Per `CLAUDE.md`. One cargo shape per task: `-p shep` for tasks 1 and 3, `-p shep-daemon` for task 2, `--workspace` for task 4 since it crosses three crates.
+Per `CLAUDE.md`. One cargo shape per task: `-p shep` for tasks 1, 3 and 5,
+`-p shep-daemon` for task 2, `--workspace` for task 4 since it crosses three
+crates.
 
 Inner loop is `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`. Task 4's wire change wants the full workspace run before commit.
 
