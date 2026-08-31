@@ -3451,23 +3451,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
+        // A dog: the sheep the gate still refuses. This was a shepherd
+        // channel until 2b task 5 carried one and two instances until task
+        // 6 carried those, and the case is about the gate firing at all
+        // rather than about which feature fires it. Task 7 carries dogs, so
+        // it moves again.
         let daemon = boot(
-            ScriptedRunner::new(vec![ProcScript::never_exits(); 2]),
+            ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
-            BootOptions::default(),
+            BootOptions {
+                dogs: vec![DogSpec {
+                    name: "metrics".to_string(),
+                    source: DogSource::BuiltIn,
+                }],
+                ..BootOptions::default()
+            },
         )
         .await
         .unwrap();
         let ctx = daemon.context();
-        // Two instances: a sheep the gate still refuses. It was a shepherd
-        // channel until 2b task 5 carried one, and the case is about the
-        // gate firing at all rather than about which feature fires it.
-        let mut app = AppConfig::minimal("clustered", "./srv");
-        app.instances = 2;
-        ctx.supervisor
-            .start(vec![normalize(app).unwrap()])
-            .await
-            .unwrap();
 
         let seam = HandoverSeam {
             supervisor: ctx.supervisor.clone(),
@@ -3479,9 +3481,9 @@ mod tests {
         };
         let refusal = hand_over_now(&seam)
             .await
-            .expect_err("a flock with more than one instance cannot be carried");
+            .expect_err("a flock with a dog in it cannot be carried");
         assert!(
-            refusal.contains("more than one instance"),
+            refusal.contains("being a dog"),
             "the gate must refuse before anything is exec'd: {refusal}"
         );
 
@@ -3518,25 +3520,32 @@ mod tests {
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
         let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 3]));
+        // The refusal: a dog is a sheep this daemon still cannot carry, and
+        // the gate reads it AFTER every pump has already been reported to,
+        // which is what makes the resume owed. It was a shepherd channel
+        // until 2b task 5 carried one and two instances until task 6
+        // carried those; what the case needs is any refusal at all.
+        //
+        // Spawned by `boot` rather than by the `start` below, so the dog is
+        // script 0 and the two sheep are 1 and 2.
         let daemon = boot(
             SharedRunner(Arc::clone(&runner)),
             paths.clone(),
-            BootOptions::default(),
+            BootOptions {
+                dogs: vec![DogSpec {
+                    name: "metrics".to_string(),
+                    source: DogSource::BuiltIn,
+                }],
+                ..BootOptions::default()
+            },
         )
         .await
         .unwrap();
         let ctx = daemon.context();
-        let plain = AppConfig::minimal("quiet", "./srv");
-        // The refusal: more than one instance is a sheep this daemon still
-        // cannot carry, and the gate reads it after every pump has already
-        // been reported to. It was a shepherd channel until 2b task 5
-        // carried one; what the case needs is any refusal at all.
-        let mut clustered = AppConfig::minimal("clustered", "./srv");
-        clustered.instances = 2;
         ctx.supervisor
             .start(vec![
-                normalize(plain).unwrap(),
-                normalize(clustered).unwrap(),
+                normalize(AppConfig::minimal("quiet", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("chatty", "./srv")).unwrap(),
             ])
             .await
             .unwrap();
@@ -3557,9 +3566,9 @@ mod tests {
         };
         let refusal = hand_over_now(&seam)
             .await
-            .expect_err("a flock with more than one instance cannot be carried");
+            .expect_err("a flock with a dog in it cannot be carried");
         assert!(
-            refusal.contains("more than one instance"),
+            refusal.contains("being a dog"),
             "the gate must refuse before anything is exec'd: {refusal}"
         );
 

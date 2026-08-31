@@ -351,11 +351,19 @@ mod tests {
 
     /// One carried sheep named `web`, whose descriptors are `fds`.
     fn carried(fds: CarriedFds) -> CarriedSheep {
+        carried_slot(0, fds)
+    }
+
+    /// [`carried`], for a named instance slot of `web`.
+    ///
+    /// The id and the pid move with the slot, so two of these describe two
+    /// real instances of one app rather than the same one twice.
+    fn carried_slot(instance: u32, fds: CarriedFds) -> CarriedSheep {
         CarriedSheep {
-            id: 1,
+            id: instance + 1,
             name: "web".to_owned(),
-            instance: 0,
-            pid: Some(100),
+            instance,
+            pid: Some(u32::from(100 + u16::try_from(instance).unwrap())),
             restarts: 0,
             epoch: 7,
             status: ProcStatus::Online,
@@ -476,6 +484,109 @@ mod tests {
             std::fs::read_to_string(&log).unwrap(),
             "first\nsecond\n",
             "a write at offset 0 overwrote the file, so O_APPEND was lost"
+        );
+    }
+
+    /// Fails if `merge_logs` makes a two-instance app unadoptable, or if
+    /// the two handles it carries stop being independent across the exec.
+    ///
+    /// The hazard this closes is [`refuse_repeated_fds`], which refuses the
+    /// WHOLE blob when any descriptor number appears twice. `merge_logs`
+    /// points every instance of an app at one path, and if that were one
+    /// open file description shared between them then every merged
+    /// clustered app would be refused forever, with a message blaming a
+    /// descriptor rather than the config that produced it.
+    ///
+    /// It is not one description. Each instance's pump runs its own
+    /// `open_append` on the path (`tokio_runner`'s `LogFile::open`), so one
+    /// inode is reached through two descriptions with two numbers, and
+    /// `O_APPEND` is what keeps their writes from overwriting each other.
+    /// The two numbers are what this asserts on, and the interleaved file
+    /// afterwards is what proves they were really independent rather than
+    /// merely distinct.
+    #[tokio::test]
+    async fn two_instances_sharing_one_log_file_are_both_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        // One path for both slots, which is exactly what `merge_logs` does:
+        // `assemble` drops the `-<instance>` suffix and every instance of
+        // the name lands here.
+        let merged = dir.path().join("web-out.log");
+        let zero = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&merged)
+            .unwrap();
+        let one = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&merged)
+            .unwrap();
+        let (zero_fd, one_fd) = (zero.into_raw_fd(), one.into_raw_fd());
+        assert_ne!(
+            zero_fd, one_fd,
+            "two `open`s on one path must yield two numbers, or the premise \
+             of this whole case is wrong"
+        );
+        let blob = blob_with(
+            &socket,
+            vec![
+                carried_slot(
+                    0,
+                    CarriedFds {
+                        out_pipe: None,
+                        err_pipe: None,
+                        out_log: Some(zero_fd),
+                        err_log: None,
+                        stdin: None,
+                        channel: None,
+                    },
+                ),
+                carried_slot(
+                    1,
+                    CarriedFds {
+                        out_pipe: None,
+                        err_pipe: None,
+                        out_log: Some(one_fd),
+                        err_log: None,
+                        stdin: None,
+                        channel: None,
+                    },
+                ),
+            ],
+        );
+
+        let mut adopted = adopt(&blob).expect("a merged-log clustered app must be adoptable");
+
+        assert_eq!(adopted.sheep.len(), 2, "one adopted sheep per instance");
+        let mut zero = adopted.sheep[0].out_log.take().expect("slot 0's log");
+        let mut one = adopted.sheep[1].out_log.take().expect("slot 1's log");
+        // Alternated, so a second handle that had silently become the first
+        // one's alias shows up as lost or overwritten text rather than as
+        // two clean halves.
+        //
+        // Flushed after every line, and that is not tidiness. A
+        // `tokio::fs::File` buffers and hands the real `write(2)` to the
+        // blocking pool, so two handles written in sequence with one flush
+        // at the end reach the file in whichever order that pool finished:
+        // measured, this case failed once in twelve runs on
+        // `zero-1/one-1/one-2/zero-2`. The flush is what makes each write
+        // land before the next begins, which is what an ordered assertion
+        // needs to be an assertion about `O_APPEND` rather than about a
+        // thread pool.
+        for line in ["zero-1\n", "one-1\n", "zero-2\n", "one-2\n"] {
+            let handle = if line.starts_with("zero") {
+                &mut zero
+            } else {
+                &mut one
+            };
+            handle.write_all(line.as_bytes()).await.unwrap();
+            handle.flush().await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&merged).unwrap(),
+            "zero-1\none-1\nzero-2\none-2\n",
+            "both instances append into the one file, in the order written"
         );
     }
 

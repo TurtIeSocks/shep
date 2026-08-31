@@ -2,14 +2,16 @@
 //! place, the [`Handover`] blob that describes it, and (in a later task) the
 //! exec that carries it.
 //!
-//! Four things are still not carried: a dog, more than one instance, an
-//! in-flight reload, and anything an operator has already asked to stop or
-//! delete. A sheep's stdout, stderr, log files, stdin pipe and shepherd
-//! channel all cross the exec. [`fitness`] is the gate: get it wrong in
-//! the permissive direction and a half-built handover corrupts a live
-//! flock; get it wrong in the strict direction and the caller merely falls
-//! back to the stop-and-start arm that already works. That asymmetry is why
-//! an unclear case refuses rather than guesses.
+//! Three things are still not carried: a dog, an in-flight reload, and
+//! anything an operator has already asked to stop or delete. A sheep's
+//! stdout, stderr, log files, stdin pipe and shepherd channel all cross the
+//! exec, and every one of those is per SHEEP rather than per app, so an app
+//! running several instances crosses as several sets and needs nothing of
+//! its own. [`fitness`] is the gate: get it wrong in the permissive
+//! direction and a half-built handover corrupts a live flock; get it wrong
+//! in the strict direction and the caller merely falls back to the
+//! stop-and-start arm that already works. That asymmetry is why an unclear
+//! case refuses rather than guesses.
 
 pub(crate) mod adopt;
 mod fds;
@@ -47,8 +49,8 @@ pub enum Fitness {
 
 /// Why a flock cannot be handed over in place, and what happens instead.
 ///
-/// Almost every variant is a feature phase 2a does not yet carry rather than
-/// an error, and the caller falls back to the stop arm, which is correct
+/// Almost every variant is a feature this daemon does not yet carry rather
+/// than an error, and the caller falls back to the stop arm, which is correct
 /// behaviour rather than a degraded one. [`Self::PumpUnresponsive`] is the
 /// exception and is a fault: it says a sheep's log pump did not answer in
 /// time, so nothing here knows which descriptors that sheep holds. The
@@ -57,9 +59,10 @@ pub enum Fitness {
 /// `#[non_exhaustive]`, unlike [`crate::boot::Shepherd`]: that enum is
 /// closed by its mechanism (a pidfile lock is either free, held-with-pid or
 /// held-without, and there is no fourth state). This one is closed by
-/// nothing but how much of the handover has shipped. 2b and 2c each widen
-/// what phase 2a refuses today into something a later phase carries, so a
-/// match here must keep tolerating a variant this module has not named yet.
+/// nothing but how much of the handover has shipped. Every phase so far has
+/// turned one of these into something the daemon carries, and 2c still has
+/// three to go, so a match here must keep tolerating a variant this module
+/// has not named yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RefusedReason {
@@ -68,21 +71,15 @@ pub enum RefusedReason {
     ///
     /// First in this enum and first in [`refusal`]'s order, because it is
     /// the only variant that is not a statement about the sheep's config: a
-    /// sheep can be both wedged and multi-instance, and the wedge is the
-    /// fact an operator needs, since it will still be true after every
-    /// feature below has shipped.
+    /// sheep can be both wedged and a dog, and the wedge is the fact an
+    /// operator needs, since it will still be true after every feature
+    /// below has shipped.
     PumpUnresponsive {
         /// The sheep's name.
         sheep: String,
     },
-    /// The sheep is a dog, which 2b's descriptor inventory does not cover
-    /// yet.
+    /// The sheep is a dog, whose descriptor inventory is not covered yet.
     Dog {
-        /// The sheep's name.
-        sheep: String,
-    },
-    /// The sheep's app runs more than one instance, which 2b carries.
-    MultiInstance {
         /// The sheep's name.
         sheep: String,
     },
@@ -119,7 +116,6 @@ impl core::fmt::Display for RefusedReason {
                 );
             }
             Self::Dog { sheep } => (sheep, "being a dog"),
-            Self::MultiInstance { sheep } => (sheep, "more than one instance"),
             Self::ReloadInFlight { sheep } => (sheep, "an in-flight reload"),
             Self::PendingStop { sheep } => (sheep, "a pending manual stop"),
             Self::PendingDelete { sheep } => (sheep, "a pending delete"),
@@ -221,9 +217,6 @@ fn refusal(candidate: &Candidate<'_>) -> Option<RefusedReason> {
     }
     if entry.dog.is_some() {
         return Some(RefusedReason::Dog { sheep: name() });
-    }
-    if config.instances > 1 {
-        return Some(RefusedReason::MultiInstance { sheep: name() });
     }
     if !matches!(entry.reload, crate::entry::ReloadState::None) {
         return Some(RefusedReason::ReloadInFlight { sheep: name() });
@@ -1218,9 +1211,10 @@ mod tests {
         // Not per-sheep. The blob describes one process image, so a flock is
         // carried whole or not at all.
         let plain_entry = entry_fixture(|_| {});
-        let clustered = entry_fixture(|app| app.instances = 2);
+        let mut unsupported = entry_fixture(|_| {});
+        unsupported.dog = Some(shep_core::protocol::DogSource::BuiltIn);
         assert!(matches!(
-            fitness(&[plain(&plain_entry), plain(&clustered)]),
+            fitness(&[plain(&plain_entry), plain(&unsupported)]),
             Fitness::Refused(_)
         ));
     }
@@ -1229,12 +1223,14 @@ mod tests {
     fn the_refusal_names_which_sheep_and_why() {
         // The operator sees this in `shep daemon reload`'s output, so it has
         // to say what to do about it, not just that it declined.
-        let clustered = entry_fixture(|app| app.instances = 2);
-        let Fitness::Refused(r) = fitness(&[plain(&clustered)]) else {
+        let mut unsupported = entry_fixture(|_| {});
+        unsupported.dog = Some(shep_core::protocol::DogSource::BuiltIn);
+        let Fitness::Refused(r) = fitness(&[plain(&unsupported)]) else {
             panic!("expected a refusal")
         };
         let text = r.to_string();
-        assert!(text.contains("more than one instance"), "{text}");
+        assert!(text.contains("being a dog"), "{text}");
+        assert!(text.contains("web"), "{text}");
     }
 
     /// A wedged pump refuses, and says so as a fault rather than as a
@@ -1330,13 +1326,93 @@ mod tests {
         ));
     }
 
+    /// fails if the gate still refuses an app running more than one
+    /// instance.
+    ///
+    /// Nothing about the descriptor inventory changes: a slot IS a sheep
+    /// here, with its own supervisor slot, its own log pump and its own set
+    /// of descriptors, so a two-instance app is two entries the gate reads
+    /// one at a time exactly as it reads two apps.
+    ///
+    /// Both slots, not one. The gate is whole-flock, so refusing either of
+    /// them would refuse the app, and a version that only stopped looking
+    /// at `instances` on slot 0 would pass a one-candidate case.
     #[test]
-    fn more_than_one_instance_refuses() {
-        let e = entry_fixture(|app| app.instances = 2);
-        assert!(matches!(
-            fitness(&[plain(&e)]),
-            Fitness::Refused(RefusedReason::MultiInstance { .. })
-        ));
+    fn an_app_with_more_than_one_instance_is_carried() {
+        let mut zero = entry_fixture(|app| app.instances = 2);
+        let mut one = entry_fixture(|app| app.instances = 2);
+        one.id = 2;
+        one.instance = 1;
+        one.pid = Some(101);
+        assert_eq!(fitness(&[plain(&zero), plain(&one)]), Fitness::Carryable);
+        // Order is not the fact being tested, but a gate that read only the
+        // first candidate would pass the assertion above too.
+        zero.instance = 1;
+        one.instance = 0;
+        assert_eq!(fitness(&[plain(&one), plain(&zero)]), Fitness::Carryable);
+    }
+
+    /// fails if a blob folds two instances of one app together, or lets one
+    /// slot's descriptors reach the other's row.
+    ///
+    /// The defect this exists for leaves a flock that looks entirely
+    /// healthy: two live pids, both adopted, both `Online`, and each one
+    /// writing into the other's log file under the other's
+    /// `SHEP_INSTANCE`. Nothing a pid check can see. What stops it is that
+    /// [`CarriedSheep::instance`] is carried per row rather than re-derived
+    /// from a count, and this pins that.
+    #[test]
+    fn each_instance_carries_its_own_slot_and_descriptors() {
+        let mut zero = entry_fixture(|app| app.instances = 2);
+        zero.instance = 0;
+        let mut one = entry_fixture(|app| app.instances = 2);
+        one.id = 2;
+        one.instance = 1;
+        one.pid = Some(101);
+
+        let blob = Handover::new(
+            vec![
+                CarriedSheep::from_entry(&zero, 7, fds_at(11)),
+                CarriedSheep::from_entry(&one, 8, fds_at(21)),
+            ],
+            DaemonFds {
+                listener: 3,
+                pidfile: 4,
+            },
+            Counters {
+                next_id: 9,
+                next_deadline: 5,
+                next_action_stamp: 2,
+            },
+        );
+        let back: Handover = serde_json::from_str(&serde_json::to_string(&blob).unwrap()).unwrap();
+
+        let carried = back.sheep();
+        assert_eq!(carried.len(), 2, "one row per instance, never per app");
+        // Bound by slot rather than by position, so a blob that reordered
+        // the rows still has to put each pid with its own slot.
+        let slot_zero = carried
+            .iter()
+            .find(|sheep| sheep.instance() == 0)
+            .expect("slot 0 must be carried");
+        let slot_one = carried
+            .iter()
+            .find(|sheep| sheep.instance() == 1)
+            .expect("slot 1 must be carried");
+        assert_eq!(slot_zero.id(), 1);
+        assert_eq!(slot_zero.pid(), Some(100));
+        assert_eq!(slot_zero.epoch(), 7);
+        assert_eq!(slot_zero.fds(), fds_at(11));
+        assert_eq!(slot_one.id(), 2);
+        assert_eq!(slot_one.pid(), Some(101));
+        assert_eq!(slot_one.epoch(), 8);
+        assert_eq!(slot_one.fds(), fds_at(21));
+        assert_eq!(
+            slot_zero.name(),
+            slot_one.name(),
+            "both slots are the same app, which is what makes the slot the \
+             only thing telling them apart"
+        );
     }
 
     #[test]
@@ -1364,21 +1440,27 @@ mod tests {
         ));
     }
 
+    /// The six descriptor numbers a running sheep would have, counting up
+    /// from `base`.
+    ///
+    /// Takes a base so two instances of one app can be given two disjoint
+    /// sets, which is what a merged-log app really has: one inode, two
+    /// `open`s, two numbers.
+    const fn fds_at(base: RawFd) -> CarriedFds {
+        CarriedFds {
+            out_pipe: Some(base),
+            err_pipe: Some(base + 1),
+            out_log: Some(base + 2),
+            err_log: Some(base + 3),
+            stdin: Some(base + 4),
+            channel: Some(base + 5),
+        }
+    }
+
     /// One carried sheep off `entry`, with the descriptor numbers a
     /// running sheep would have.
     fn carried(entry: &ProcessEntry) -> CarriedSheep {
-        CarriedSheep::from_entry(
-            entry,
-            7,
-            CarriedFds {
-                out_pipe: Some(11),
-                err_pipe: Some(12),
-                out_log: Some(13),
-                err_log: Some(14),
-                stdin: Some(15),
-                channel: Some(16),
-            },
-        )
+        CarriedSheep::from_entry(entry, 7, fds_at(11))
     }
 
     fn handover_over(entry: &ProcessEntry) -> Handover {

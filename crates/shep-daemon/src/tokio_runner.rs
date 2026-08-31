@@ -2530,6 +2530,96 @@ mod tests {
         assert_eq!(distinct.len(), 4, "four descriptors, four numbers: {fds:?}");
     }
 
+    /// Fails if two instances of one `merge_logs` app end up naming one
+    /// descriptor number for the file they share.
+    ///
+    /// The whole-blob refusal is what makes this worth a case of its own.
+    /// `handover::adopt::refuse_repeated_fds` rejects the ENTIRE handover
+    /// when any number appears twice, so a merged-log app whose instances
+    /// shared one open file description would not merely lose a log: it
+    /// would send every reload of every flock containing it down the
+    /// stop-and-start arm, with a message naming a descriptor rather than
+    /// the config responsible.
+    ///
+    /// One inode, two `open`s, two numbers. Each instance is its own sheep
+    /// with its own pump, and [`LogFile::open`] runs [`open_append`] per
+    /// pump rather than sharing a handle between them, which is the fact
+    /// asserted here.
+    ///
+    /// Two pumps over ONE pair of paths, which is what `merge_logs` really
+    /// produces: `assemble` drops the `-<instance>` suffix and every slot
+    /// of the name resolves to the same two files.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_pumps_on_one_log_path_report_different_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("merged-out.log");
+        let err_path = dir.path().join("merged-err.log");
+
+        // Held for the whole case: a reading end is only a valid number
+        // while its writing end is alive, and a pump that reached EOF clears
+        // the number it would otherwise report.
+        let mut writers = Vec::new();
+        let mut reports = Vec::new();
+        for _ in 0..2 {
+            let (out_writer, out_reader) = tokio::net::unix::pipe::pipe().unwrap();
+            let (err_writer, err_reader) = tokio::net::unix::pipe::pipe().unwrap();
+            let pipes = PipeFds {
+                out: Some(out_reader.as_raw_fd()),
+                err: Some(err_reader.as_raw_fd()),
+                stdin: None,
+                channel: None,
+            };
+            let (logs_tx, _logs) = mpsc::channel(CHANNEL_CAPACITY);
+            let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            spawn_log_pump(
+                Some(out_reader),
+                Some(err_reader),
+                LogSink::Path(out_path.clone()),
+                LogSink::Path(err_path.clone()),
+                logs_tx,
+                ctl_rx,
+                pipes,
+            );
+            let (done, ack) = oneshot::channel();
+            ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+            let fds = timeout(PUMP_DEADLINE, ack)
+                .await
+                .expect("a descriptor report must be acknowledged")
+                .expect("the pump must answer rather than drop the acknowledgement");
+            // `_logs` and `ctl` are kept alive alongside the writers: a pump
+            // whose control channel closed would end and close the very
+            // handles whose numbers are being compared.
+            writers.push((out_writer, err_writer, ctl, _logs));
+            reports.push(fds);
+        }
+
+        let named: Vec<RawFd> = reports
+            .iter()
+            .flat_map(|fds| fds.all().into_iter().flatten())
+            .collect();
+        assert_eq!(
+            named.len(),
+            8,
+            "two running instances, four descriptors each: {reports:?}"
+        );
+        let distinct: BTreeSet<RawFd> = named.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            8,
+            "a repeat here refuses the whole handover, not just this app: {reports:?}"
+        );
+        // The pointed half of the assertion above: the two log handles are
+        // the pair that could plausibly have been shared, since they are the
+        // only two of the eight opened on the same path.
+        assert_ne!(
+            reports[0].out_log, reports[1].out_log,
+            "two instances sharing one log file must still hold two handles"
+        );
+        assert_ne!(reports[0].err_log, reports[1].err_log);
+        drop(writers);
+    }
+
     /// Fails if a report still names a stream whose descriptor the pump has
     /// already let go of.
     ///

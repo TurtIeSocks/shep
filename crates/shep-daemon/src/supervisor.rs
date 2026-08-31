@@ -7902,6 +7902,23 @@ enum PumpReport {
 /// the refusal has to name WHICH sheep went quiet. A flock of wedged pumps
 /// therefore costs N times this before the caller falls back, which is the
 /// price of that name.
+///
+/// **N is one config line now.** Since 2b carried multi-instance apps, an
+/// `instances = 10` is ten sheep with ten pumps, where reaching ten used to
+/// take ten app stanzas. Nothing about the cost changed, but the way to
+/// arrive at it got much shorter, so the arithmetic is worth having
+/// written down: `shep daemon reload` gives the successor
+/// `admin::KILL_TEARDOWN_WAIT` (10s) to answer, so six wedged pumps is
+/// where this sweep outlasts the client that asked. Past that the client
+/// reports a failed handover and musters against the PREDECESSOR, which is
+/// still serving and which then refuses and stops gracefully seconds later.
+///
+/// That is a fault path, not a slow one: a pump misses this deadline only
+/// on a filesystem that has stopped completing writes, and a healthy
+/// ten-instance app reports in microseconds. It is left as it is rather
+/// than fixed here because the fix is a different shape (visit the pumps
+/// concurrently, which still knows which one went quiet) and belongs with
+/// whoever decides what the client should do when the sweep outlasts it.
 #[cfg(unix)]
 const REPORT_DEADLINE: Duration = Duration::from_secs(2);
 

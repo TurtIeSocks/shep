@@ -186,7 +186,7 @@ Sketch only.
 
 One refusal each, from `handover::fitness`: `Stdin`, `Channel`, `MultiInstance`, `Dog`.
 
-`Stdin` is one more descriptor through machinery that already carries four. The channel was sketched as "a socketpair with two pump tasks, structurally the log pipes again"; it is one descriptor rather than two, it needs no parking, and the work turned out to be in two places the sketch did not name — see task 5's outcome. Multi-instance is the one to distrust: `merge_logs` gives several sheep handles on ONE inode, and 8a measured that the fd count does not fall when logs are merged. Dogs survive the exec as children for free; what needs designing is their reconnect, and Phase 3 owns their version axis.
+`Stdin` is one more descriptor through machinery that already carries four. The channel was sketched as "a socketpair with two pump tasks, structurally the log pipes again"; it is one descriptor rather than two, it needs no parking, and the work turned out to be in two places the sketch did not name — see task 5's outcome. Multi-instance was called the one to distrust, on the grounds that `merge_logs` gives several sheep handles on ONE inode and that 8a measured the fd count not falling when logs are merged. Both halves are true and neither is a problem: several handles on one inode is several NUMBERS, which is what `refuse_repeated_fds` compares, and the fd count not falling is that fact stated the other way round. It was the cheapest of the four; see task 6's outcome. Dogs survive the exec as children for free; what needs designing is their reconnect, and Phase 3 owns their version axis.
 
 Sketch only. Each removes exactly one variant and its test.
 
@@ -275,6 +275,64 @@ The counter, 52,320,601 lines across those five reloads: **0 whole lines lost, 0
 
 Without the mask the successor refused to boot on the stale descriptor, the predecessor had already exec'd away, and the CLI's fallback started a fresh shepherd that restarted the flock from the roll. `shep daemon reload` still exited 0. That is the whole cost of the handover, paid silently, after one `shep trigger` at a child that closed fd 3.
 
+#### Task 6: multi-instance
+
+- [x] **Step 1: Write the failing tests**
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Prove each one non-vacuous**
+- [x] **Step 5: Drive a real reload over a merged and an unmerged clustered app**
+- [x] **Step 6: Task gate, then commit**
+
+##### Outcome
+
+**Nothing was needed but striking the refusal, and the reason is that a slot has been a sheep all along.** The supervisor keys its slots on entry id, not on name; `handle_handover_snapshot` walks `self.sheep.values()`; `CarriedSheep` has carried an `instance` field since 2a; and `install_adopted` reassembles from `carried.instance()` rather than from a count. Every descriptor the blob names is per SHEEP, and an app running three instances is three sheep with three pumps and three sets of numbers. The gate was the only thing that had ever treated the app as the unit.
+
+**The `merge_logs` hazard is not real, and here is the measurement rather than the argument.** Each instance's pump runs its own `open_append` on its own `LogFile::open`, so one inode is reached through several open file descriptions with several numbers. On a live two-instance merged app the shepherd held `merged-out.log` on fd **32 and 36**, and `merged-err.log` on **33 and 37**, all four on inode `189235633`. After five reloads it held the same file on **33 and 36**. `refuse_repeated_fds` compares numbers, sees no repeat, and needs no rethinking. Had the premise gone the other way, the failure would have been ugly out of proportion to its cause: that function refuses the WHOLE blob, so every merged clustered app would have sent every reload of its flock down the stop arm forever, with a message naming a descriptor rather than the config that produced it. That is why it now has a case of its own at both ends, `two_pumps_on_one_log_path_report_different_numbers` on the spawn side and `two_instances_sharing_one_log_file_are_both_adopted` on the adopt side.
+
+**Slot identity was already carried, and the mutation run is what says so.** Rehydrating every adopted sheep into slot 0 leaves all **644** daemon lib tests green. So does assembling every adopted sheep's log paths at slot 0. Only the new end-to-end case notices either, and it notices because it reads each `shep flock` row's own `out_file` back and requires the lines in it to name that row's slot and that row's pid. A pid check cannot make that assertion: a slot swap leaves two live processes, both adopted, both `Online`, each answering to the other's name and writing under the other's `SHEP_INSTANCE`.
+
+**Three refusals left**, all 2c's, and the module header says so: a dog, an in-flight reload, and an operator's pending stop or delete. Four existing tests moved onto `Dog` for their refusal fixture, two in `handover` and two in `boot`, which task 7 will have to move again. `instances = 2` was the fixture task 5 had moved them onto for the same reason, so the churn is the phase working rather than a mistake.
+
+**One thing found and deliberately not fixed: `REPORT_DEADLINE`'s arithmetic is now one config line away.** The sweep visits pumps serially at 2s each, and `shep daemon reload` gives the successor `admin::KILL_TEARDOWN_WAIT`, which is 10s. Six wedged pumps is therefore where the sweep outlasts the client that asked; past that the client reports a failed handover and musters against the PREDECESSOR, which is still serving and which then refuses and stops gracefully seconds later, leaving an operator with exit 0 and no flock. Reaching six used to take six app stanzas and now takes `instances = 6`. Nothing about the cost changed and the trigger is still a filesystem that has stopped completing writes, so it is recorded at the constant rather than repaired: the fix is a different shape (visit the pumps concurrently, which still knows which one went quiet) and it belongs with whoever decides what the client should do when the sweep outlasts it.
+
+##### Drill, measured
+
+Five `shep daemon reload`s over six sheep: `split` at three instances with separate logs, `merged` at two instances with `merge_logs = true`, and a single-instance `solo`. Every sheep an `awk` counter with no sleep, tagged `slot|pid|n` so a line names which instance wrote it. Every reload exit 0, shepherd unmoved at 11270, all six pids unmoved at 11291, 11292, 11293, 11294, 11295 and 11298, restarts 0.
+
+| log | lines | groups it holds | lost | duplicates | seams |
+|---|---|---|---|---|---|
+| `split-0-out.log` | 3,952,105 | `0\|11291` only | 0 | 0 | 0 |
+| `split-1-out.log` | 3,961,309 | `1\|11292` only | 0 | 0 | 0 |
+| `split-2-out.log` | 3,965,357 | `2\|11293` only | 0 | 0 | 0 |
+| `solo-0-out.log` | 3,962,322 | `0\|11298` only | 0 | 0 | 0 |
+| `merged-out.log` | 7,946,256 | `0\|11294` and `1\|11295` | 0 | 0 | 1 |
+
+**23,787,349 lines, 0 whole lines lost, 0 duplicates, 1 seam**, and the seam is task 1's known residual wearing a shape only a merged app can wear. Instance 1's line `100030` lost the newline at the end of its write, so instance 0's next line landed on the same row as `1|11295|1000300|11294|100604`, and the orphaned newline turned up 546 lines later as a blank row. Both numbers are physically in the file. Nothing is missing; two lines are fused and one is blank.
+
+**Each split log holds exactly one slot.** That is the assertion the whole task is about, and it is stronger than the pid check beside it: a successor that swapped two slots would leave every pid alive, every log growing and every status `online`, with the only evidence being that slot 0's file says slot 1.
+
+**The `name:slot` selector still reaches one instance after the exec.** On a slower second run, `shep describe split:1` answered `split 1 11899` and `shep stop split:1` stopped exactly that pid, leaving `split:0` and `split:2` online. `merged-out.log` held 40 lines from each of `0|11901` and `1|11902`, interleaved line by line, so both carried handles were still independently writable.
+
+##### Mutations
+
+Eight, each applied alone and reverted afterwards.
+
+| # | what was broken | what failed |
+|---|---|---|
+| 1 | `refusal` refuses `instances > 1` again | `an_app_with_more_than_one_instance_is_carried`, and the e2e case at its refusal assertion |
+| 2 | `CarriedSheep::from_entry` writes `instance: 0` | `each_instance_carries_its_own_slot_and_descriptors` |
+| 3 | `refuse_repeated_fds` also refuses two rows of one name | `two_instances_sharing_one_log_file_are_both_adopted` |
+| 4 | `LogFile::raw_fd` reports one number per PATH rather than per handle | `two_pumps_on_one_log_path_report_different_numbers` |
+| 5 | `refusal` drops the `Dog` check | the four tests moved onto that fixture, plus `a_dog_refuses` |
+| 6 | `install_adopted` writes `instance: 0` on every adopted entry | the e2e case ONLY; 644 daemon lib tests stay green |
+| 7 | `install_adopted` assembles every adopted sheep at slot 0 | the e2e case ONLY; 644 daemon lib tests stay green |
+| 8 | `assemble` ignores `merge_logs` | the e2e case at its fixture check |
+
+6 and 7 are the finding worth keeping. The successor's slot binding has no unit-level cover at all, in either half: not the row's `instance`, and not the log paths assembled from it. Both are reachable only by reloading a real clustered flock and reading each row's own file back, which is what the new e2e case does and what nothing did before.
+
+One flake was created and fixed in passing. The first version of the adopt-side case wrote four lines through two `tokio::fs::File` handles with one flush at the end, and failed once in twelve runs on `zero-1/one-1/one-2/zero-2`: a `tokio::fs::File` buffers and hands the real `write(2)` to the blocking pool, so an ordered assertion over two handles is an assertion about that pool. Flushing after every line makes each write land before the next begins. Twelve clean runs afterwards.
+
 ---
 
 ### Task 8: re-arm audit, and the end-to-end case
@@ -309,12 +367,12 @@ Baselines on that drill, three reloads: `origin/main` loses about 2900 lines, 2b
 
 ## Working state, for whoever picks this up
 
-- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2, 4 and 5 committed; task 3 folded into 1.
-- Counts after task 5: **641** daemon lib with `--skip ::slow::`, **2096** workspace.
+- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2, 4, 5 and 6 committed; task 3 folded into 1.
+- Counts after task 6: **644** daemon lib with `--skip ::slow::`, **2099** workspace.
 - The rejected buffer-carry patch is at `stash@{0}` and in this session's scratchpad as `task1-carry.patch`. Read it for plumbing, not design.
-- `handover/mod.rs`'s module header now names phase 2b and the three refusals left. Tasks 6 and 7 have the rest of them to strike.
+- `handover/mod.rs`'s module header names the three refusals left, all of them 2c's. Task 7 has one more to strike, `Dog`, and four tests currently using it as their refusal fixture will need moving with it.
 - PR #73 has two threads left open for 2b. Both are now addressed: the `report_fds` deadline is task 2, and descriptor pinning fell out of task 1's parking. They can be closed with a pointer to those commits.
-- `spawn_handover_task` visits sheep serially, so a flock of wedged pumps waits N x 2s before the fallback. Named in `REPORT_DEADLINE`'s doc, not fixed.
+- `spawn_handover_task` visits sheep serially, so a flock of wedged pumps waits N x 2s before the fallback. Named in `REPORT_DEADLINE`'s doc, not fixed, and task 6 added the arithmetic against the client's own 10s: six wedged pumps is where the sweep outlasts the caller, and `instances = 6` is now a way to get there.
 
 ## Phase gate
 
