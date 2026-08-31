@@ -211,26 +211,35 @@ exp_backoff_restart_delay = "0"
         app
     }
 
-    /// A moment `secs` from now, as a predecessor would have recorded it.
+    /// A fixed instant to measure every carried deadline against.
+    ///
+    /// Not `SystemTime::now()`, and the difference is the whole reason this
+    /// exists. `adopted_restart_delay` takes `now` as an argument, so a test
+    /// that builds a deadline from one `now()` and passes another reads the
+    /// clock twice and can only assert a RANGE. That range is a claim about
+    /// how long the test thread was descheduled between two lines, which on
+    /// a loaded runner is not a claim worth making (IR-26, IR-36).
+    const NOW: SystemTime = SystemTime::UNIX_EPOCH;
+
+    /// A moment `secs` after [`NOW`], as a predecessor would have recorded it.
     fn due_in(secs: u64) -> SystemTime {
-        SystemTime::now() + Duration::from_secs(secs)
+        NOW + Duration::from_secs(secs)
     }
 
     /// Fails if an adopted sheep's remaining wait is rounded up to the whole
     /// configured delay, which is what restarts the clock at every handover.
     ///
-    /// The assertion is a RANGE rather than an equality: `now` is read
-    /// inside the call and the fixture's `due` was built a moment earlier,
-    /// so the answer is a hair under the minute rather than exactly it. The
-    /// upper bound is what the case is really about -- anything at or above
-    /// the hour is the old behaviour.
+    /// Exact, because both sides come from [`NOW`] rather than from two
+    /// reads of the wall clock. What the case is really about is the upper
+    /// bound: anything at or above the hour is the old behaviour.
     #[test]
     fn an_adopted_sheep_waits_out_only_what_was_left() {
-        let left = adopted_restart_delay(&hourly(), Some(due_in(60)), SystemTime::now())
+        let left = adopted_restart_delay(&hourly(), Some(due_in(60)), NOW)
             .expect("a minute of an hour is still a wait");
-        assert!(
-            left <= Duration::from_secs(60) && left > Duration::from_secs(55),
-            "a minute left of an hour must come back as about a minute, not as an hour: {left:?}"
+        assert_eq!(
+            left,
+            Duration::from_secs(60),
+            "a minute left of an hour must come back as that minute, not as an hour"
         );
     }
 
@@ -241,11 +250,8 @@ exp_backoff_restart_delay = "0"
     /// respawn hiding behind a zero.
     #[test]
     fn a_deadline_already_past_respawns_immediately() {
-        let past = SystemTime::now() - Duration::from_secs(30);
-        assert_eq!(
-            adopted_restart_delay(&hourly(), Some(past), SystemTime::now()),
-            None
-        );
+        let past = NOW - Duration::from_secs(30);
+        assert_eq!(adopted_restart_delay(&hourly(), Some(past), NOW), None);
     }
 
     /// Fails if a wall clock that jumped backwards can make a sheep wait
@@ -259,7 +265,7 @@ exp_backoff_restart_delay = "0"
     #[test]
     fn a_clock_that_jumped_backwards_is_clamped_to_the_configured_delay() {
         assert_eq!(
-            adopted_restart_delay(&hourly(), Some(due_in(7200)), SystemTime::now()),
+            adopted_restart_delay(&hourly(), Some(due_in(7200)), NOW),
             Some(Duration::from_secs(3600))
         );
     }
@@ -274,12 +280,12 @@ exp_backoff_restart_delay = "0"
     #[test]
     fn no_carried_deadline_falls_back_to_a_first_unstable_exit() {
         assert_eq!(
-            adopted_restart_delay(&hourly(), None, SystemTime::now()),
+            adopted_restart_delay(&hourly(), None, NOW),
             Some(Duration::from_secs(3600))
         );
         let backing_off = AppConfig::minimal("p", "./p");
         assert_eq!(
-            adopted_restart_delay(&backing_off, None, SystemTime::now()),
+            adopted_restart_delay(&backing_off, None, NOW),
             Some(Duration::from_millis(100)),
             "an app on the default backoff gets its first step, not its current one"
         );
@@ -297,10 +303,7 @@ exp_backoff_restart_delay = "0"
     fn an_app_that_opted_out_of_backoff_is_never_delayed_by_a_deadline() {
         let mut app = AppConfig::minimal("p", "./p");
         app.exp_backoff_restart_delay = None;
-        assert_eq!(
-            adopted_restart_delay(&app, Some(due_in(3600)), SystemTime::now()),
-            None
-        );
-        assert_eq!(adopted_restart_delay(&app, None, SystemTime::now()), None);
+        assert_eq!(adopted_restart_delay(&app, Some(due_in(3600)), NOW), None);
+        assert_eq!(adopted_restart_delay(&app, None, NOW), None);
     }
 }
