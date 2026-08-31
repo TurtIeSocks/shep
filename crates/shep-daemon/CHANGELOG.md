@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-08-31
+
+### Added
+
+- Carry a pending delete across a handover
+- Carry a pending manual command, and re-arm its kill ladder
+- Rehearse the successor's adoption before the exec
+- Carry a swap in flight, and re-arm both of its timers
+- Carry a failed readiness verdict, and do not re-arm one
+
+### Fixed
+
+- Name the sheep and stream in every rehearsal refusal
+- Close the duplicates a failed copy already made
+
+
 ## [0.1.20] - 2026-08-31
 
 ### Added
