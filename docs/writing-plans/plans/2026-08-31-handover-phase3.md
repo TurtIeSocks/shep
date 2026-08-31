@@ -48,7 +48,19 @@ shep-client            the code, written once, in shep
 each dog's process     where the behaviour executes
 ```
 
-Shep implements the reconnect. A dog gets it by being rebuilt. No dog author writes reconnect logic, and the dog contract does not change. Confirmed: the built-ins already `use shep_client::{Client, ConnectError, EventStream, RequestError}`, and G9 establishes that a plain `cargo install <dog>` picks up a new `shep-client`.
+Shep implements the reconnect. A dog gets it by being rebuilt, and no dog
+author writes reconnect logic.
+
+**The last clause of that was "and the dog contract does not change", and
+task 1 made it false.** The shape chosen is a distinct
+`ReconnectingClient` type rather than a mode on `Client`, because that is
+what makes the CLI unaffected BY CONSTRUCTION rather than by every call
+site being read carefully. The price is that a dog rebuilt against the new
+`shep-client` still constructs a `Client` and still goes mute: its author
+has to swap one type name. One line per dog, and both dogs in the registry
+are the maintainer's, so it rides along with the two releases the carry
+already needed. But it is a line, not a rebuild, and the plan claimed
+otherwise. Confirmed: the built-ins already `use shep_client::{Client, ConnectError, EventStream, RequestError}`, and G9 establishes that a plain `cargo install <dog>` picks up a new `shep-client`.
 
 ---
 
