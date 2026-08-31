@@ -319,12 +319,250 @@ Two are worth recording:
 
 G13's rule: `daemon reload` reports dog staleness AFTER the dogs have reconnected, when the answer is a fact rather than a claim about a process being replaced.
 
-- [ ] **Step 1: Write the failing test.** After a reconnect, `daemon()` reports the successor.
-- [ ] **Step 2: Run it, watch it fail.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Prove it non-vacuous.**
-- [ ] **Step 5: Real reload**, scraping `metrics` afterwards and reading `daemon_version` back.
-- [ ] **Step 6: Commit.**
+- [x] **Step 1: Write the failing test.** After a reconnect, `daemon()` reports the successor.
+- [x] **Step 2: Run it, watch it fail.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Prove it non-vacuous.**
+- [x] **Step 5: Real reload**, scraping `metrics` afterwards and reading `daemon_version` back.
+- [x] **Step 6: Commit.**
+
+#### Outcome
+
+**Steps 1 to 4 were task 1's, and were verified rather than trusted.**
+`ReconnectingClient::daemon` reads the ack off the generation answering
+right now and returns it owned (`reconnect.rs`), the reading is pinned by
+`the_ack_follows_the_successor_rather_than_the_predecessor`, and the
+metrics dog takes it per scrape from the generation that just answered
+`ListFlock` (`dog/metrics/mod.rs`, with a comment saying why two reads
+either side of a handover would publish one daemon's version beside
+another's pid). Nothing was rebuilt. The client half of G13 is done.
+
+**The daemon half is a reading the operator asks for, not a line the
+daemon logs.** `Request::DogStaleness` answers with two lists: `stale`,
+which is `DogRefusals::stale()` and the only thing reportable, and
+`pending`, which is why the caller must ask again. `PROTOCOL_VERSION` did
+not move: both are `#[non_exhaustive]` enums gaining a variant, which is
+what the evolution rule on that constant already calls additive, and the
+one caller is `daemon reload` asking a successor it has just proven runs
+this binary's own version.
+
+**`pending` has two sources because a dog can be unheard-from in two
+ways.** A dog refused ONCE is mid-restart, so G8 has asked for its verdict
+and the verdict has not arrived. A dog the daemon supervises that has never
+handshaken has not been asked yet, which is exactly what a carried dog is
+for the whole gap between the exec and its reconnect. The second needed
+`DogRefusals` to record accepted handshakes as well as refused ones:
+"nobody has heard from that dog" and "that dog is talking happily" both
+have no refusal recorded, and telling them apart is the whole of what the
+waiting is for.
+
+**The supervisor's own rows are a sound roster, and that is a property of
+`boot` rather than an assumption.** A dog is registered before this daemon
+accepts anything: restore the flock, `spawn_enabled_dogs`, and only then
+hand the listener to `serve`. So a caller that can ask the question is
+talking to a daemon that already knows which dogs it has, and there is no
+window where an empty roster reads as "every dog answered".
+
+**One gap, measured, and task 4 closes it for free.** A CARRIED dog loses
+its `dog` marker today, so on the handover arm the roster is empty and the
+wait rests on the refused-once half alone. Confirmed under an isolated
+`SHEP_HOME` in drill C below: after a carried reload `shep dogs` prints
+nothing at all and `metrics` sits in `shep flock` beside the operator's own
+app. Nothing here can say anything FALSE as a result, because silence is
+what a clean reload prints anyway, but it can be silent about a dog that
+had not dialled back yet. Restoring the marker in `CarriedSheep` populates
+the roster and the wait covers a carried dog too, with no change to this
+task's code.
+
+**Only a dog with a PROCESS is waited on, and a real crash loop is what
+decided that.** `Starting` and `Online`, not `WaitingRestart` or `Errored`:
+a dog with no process cannot handshake, so waiting on one would make an
+operator pay a whole timeout for a dog every other listing already reports
+as broken. `shep enable bark` with no `[dog.bark.sinks]` produces exactly
+that state today (task 1 found the crash loop), and it is `waiting-restart`
+most of the time. Nothing is lost by leaving those out: a dog whose restart
+this daemon ASKED for is in the refused-once half whatever its row says.
+
+**Silent unless something is wrong, and the wait is not paid unless there
+is something to wait for.** A flock whose dogs all came back prints nothing
+about them and finds nothing pending on its first ask. Three ordinary
+reloads measured at 0.154s, 0.156s and 0.155s, against 0.935s for the one
+with a dog to wait for.
+
+**The report says what happened and never what shep did not check.** Two
+handshakes were refused with a restart from the binary on disk in between;
+what version that file holds is unread, and unreadable until a dog answers
+`--version` (G11, a later phase). So the sentence is "restarting it from
+the binary on disk did not help, so rebuild or reinstall it", never a claim
+about the file. `dog_version` is deliberately not on the wire either: task
+2 measured two builds differing only in `PROTOCOL_VERSION` both reporting
+`0.1.22`, so carrying a version here would invite the one inference it
+cannot support.
+
+**Nothing new reaches the daemon log.** Task 2's 442-line incident is the
+cautionary one, and this was checked rather than assumed: three ordinary
+reloads with a healthy dog wrote **0 lines**, and the one with a stale dog
+wrote the same **2** G8 already wrote.
+
+##### What the operator sees
+
+Ordinary reload, healthy dogs, verbatim and complete:
+
+```
+notice[reload]: sheep 'metrics' has being a dog, which this daemon cannot yet hand over; reload falls back to a stop-and-start instead
+notice[reload]: the shepherd is now 0.1.22 (pid 97375)
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
+0   fast  online  97396  0         -     -    -    0s      -     -
+```
+
+Both notices predate this task. A stale dog adds exactly one line:
+
+```
+notice[reload]: the `metrics` dog cannot talk to this shepherd; restarting it from the binary on disk did not help, so rebuild or reinstall it against shep 0.1.22
+```
+
+And a dog that never answers inside the budget adds a different one, so
+that silence never has to mean two things:
+
+```
+notice[reload]: the `metrics` dog had not answered this shepherd after 3s, so this reload cannot say whether it came back
+```
+
+##### Drill, measured
+
+Under an isolated `SHEP_HOME` at `/tmp/p3c/home`, release builds, one `awk`
+sheep plus a dog. Three binaries from this tree: `shep-old` (protocol 2),
+`shep-new` (protocol 3), and `shep-carry` (protocol 2 with `if false &&
+entry.dog.is_some()` in `handover::refusal`, route 2 of the two the brief
+offered). Both source edits reverted and proven reverted before the gate:
+`git diff --stat crates/shep-core/src/protocol/mod.rs
+crates/shep-daemon/src/handover/mod.rs` is empty.
+
+The stale dog is an adopted shim that `exec`s `shep-old dog metrics`, so
+its running image AND its binary on disk are both protocol 2 while the
+daemon speaks 3 — G12's row 4, the one a restart cannot fix.
+
+**A. The decisive one: the two answers DIFFER.** The shim sleeps 400ms
+before exec'ing, which is what a dog with work to do at startup looks like.
+One `shep daemon reload`, CLI stderr timestamped, against the daemon's own
+log:
+
+| time (UTC) | what happened | what a report taken then would say |
+|---|---|---|
+| 16:42:44.600 | CLI prints the shepherd line; the reading loop starts | **nothing — the successor had refused nobody** |
+| 16:42:44.930 | first refusal, G8 restart issued (+330ms) | nothing |
+| 16:42:45.351 | second refusal; `stale` becomes `["metrics"]` (+751ms) | `metrics` |
+| 16:42:45.380 | CLI prints the stale report (+780ms) | `metrics` |
+
+**A report taken when the loop started would have said nothing at all.**
+That is the whole of G13, measured: the answer did not exist yet at the
+moment a naive report would have been taken, and it took a restart round
+trip to come into existence. Whole verb: 0.935s, exit 0, daemon log 2
+lines.
+
+**A'. The same drill with a shim that does not sleep**, kept because it
+shows how narrow the window is without one: first refusal 16:35:21.989,
+second 16:35:22.001 (**12ms** for a whole kill ladder, spawn, connect and
+refusal), and the CLI's shepherd line at 16:35:22.067 — the answer was
+already a fact before the loop started. Correct report either way, and 12ms
+is not a margin to design a report around.
+
+**B. The ordinary case, three times, with a healthy built-in dog:**
+
+| | reload 1 | reload 2 | reload 3 |
+|---|---|---|---|
+| wall clock | 0.154s | 0.156s | 0.155s |
+| lines about dogs | **0** | **0** | **0** |
+| daemon log lines | **0** | **0** | **0** |
+| `curl /metrics` after | 200 | 200 | 200 |
+
+**C. The handover arm, dogs carried** (`shep-carry` both sides, no protocol
+skew):
+
+| | value |
+|---|---|
+| daemon pid / dog pid | 98455 / 98501 **unmoved** |
+| `curl /metrics` after | **200** — the reconnect works |
+| lines about dogs | **0**, correctly: nothing was stale |
+| wall clock | 0.055s |
+| `shep dogs` after | **empty** |
+| `shep flock` after | `metrics` listed beside `fast` |
+| daemon log | 1 line, the carry's own "already registered under this name" |
+
+The last two rows are the marker loss, reproduced. They are what bounds
+this task's guarantee on the handover arm, and what task 4 restores.
+
+**D. A handover ACROSS a protocol bump cannot be reported, and that is the
+fixture rather than the code.** The handover arm needs a CLI that can talk
+to the PREDECESSOR, and after the exec that same CLI cannot talk to the
+successor: `await_successor` ran its whole 10s budget, fell back to
+"starting one instead", and the reading never ran. The daemon did its half
+regardless (refusal 16:46:21.458, stale 16:46:21.879). Worth recording so
+nobody reads the silence as a defect: an operator upgrading shep replaces
+CLI and daemon together, which is drill A's arm.
+
+##### Mutations
+
+Fourteen, each applied, run against the three-crate lib suite with
+`--no-fail-fast`, and restored byte-for-byte from a saved copy. **No
+survivors.**
+
+| mutation | fails |
+|---|---|
+| the supervisor half never contributes | the not-handshaken test and the not-running one |
+| a handshake no longer settles a dog | `a_dog_that_has_not_handshaken_is_pending` |
+| a stale dog is also reported pending | `a_dog_being_restarted_is_pending_and_then_stale` |
+| a dog with no process is waited on | `a_dog_that_has_stopped_running_is_not_waited_on` |
+| every sheep is waited on, not only dogs | `a_flock_of_ordinary_sheep_has_nothing_stale_and_nothing_pending` |
+| a stale dog still reads as mid-restart | the `restarting` test, and the rpc ladder |
+| a refusal no longer forgets the handshake | `only_an_accepted_handshake_says_a_dog_has_answered` |
+| a handshake is never recorded | that test, plus the rpc pending one |
+| the report is taken on the first ask | both waiting tests |
+| an unanswered dog is never mentioned | `a_reload_stops_waiting_for_a_dog_that_never_answers` |
+| the report fires with nothing stale | `a_reload_whose_dogs_all_answered_says_nothing_about_them` |
+| the reload never asks about dogs | both waiting tests |
+| the report claims it read the disk | `the_stale_report_says_what_happened_and_never_reads_the_disk` |
+| the wait has no deadline | `a_reload_stops_waiting_for_a_dog_that_never_answers` |
+
+Three worth recording:
+
+- **The sheep in the no-dogs test is the point, not scenery.** The first
+  version of that case had an empty flock, and the mutation that walked
+  every row instead of every DOG row passed it. A sheep does not speak this
+  protocol at all (spec, part 4), so a reader that waited for `web` to
+  handshake would hold an operator's reload open forever. The test starts a
+  real sheep now and the mutation dies.
+- **The never-answers test hung rather than failed** when the deadline
+  mutation was applied, which is a signal nobody can read. It wraps the
+  call in a `tokio::time::timeout` now, so the same mutation fails in 5.01s
+  naming the line (IR-46: the timeout is both the forcing mechanism and the
+  assertion).
+- **The disk-claim mutation is the one only a wording test catches.**
+  Rewriting the sentence to say the binary on disk is the wrong version
+  compiles, reads plausibly, passes every behavioural test, and asserts
+  something shep cannot know until G11. Pinned as an exact string in both
+  the singular and the plural shape, because the two are written out
+  separately and a copy-paste between them is invisible.
+
+##### Gate
+
+`cargo fmt --all --check` EXIT=0. `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` EXIT=0. `cargo test --workspace
+--all-features` EXIT=0, **2190 passed**, 0 failed across 32 binaries — task
+2's 2180 plus the ten this task adds. `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --all-features` EXIT=0. Windows cross-check with its
+own `CARGO_TARGET_DIR` EXIT=0 (the four dead-code warnings are the
+`cfg(unix)` ones `CLAUDE.md` documents).
+
+**`web/` needed the hand-written half only.** `cargo build --release` then
+`./web/scripts/generate-cli-reference.sh` leaves the generated reference
+byte-identical — 2510 lines, 40 verbs — because no verb, flag or exit code
+moved, and a stale dog does not change the exit code either. Three prose
+pages did go stale: `getting-started.astro` documents the reload and said
+nothing about what it reports, and `docs/dogs.md` and
+`web/src/pages/docs/dogs.astro` both told a dog author that a `dog_name`
+gets them "reported stale" without saying where that report goes. `astro
+build` EXIT=0, `astro check` EXIT=0, 0 errors and 0 warnings.
 
 ### Task 4: strike the refusal
 
