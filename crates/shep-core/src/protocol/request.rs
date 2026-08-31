@@ -1702,6 +1702,21 @@ mod tests {
             Some("\u{25b2} main@a1b2c3"),
             "an empty `smit` setter body is invisible to the comparison above"
         );
+
+        // `handshook` is the fourth field, on the same terms as the three
+        // above: `sample_info()`'s value is `None`, which is also the
+        // builder's default, so an EMPTY `handshook` setter body would pass
+        // the `assert_eq!` above. `sample_info()` still cannot be changed to
+        // a `Some(..)` — it feeds `reply_wire_snapshots` and
+        // `bus_event_wire_snapshots`, so altering it moves pinned bytes.
+        assert_eq!(
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .handshook(Some(false))
+                .build()
+                .handshook,
+            Some(false),
+            "an empty `handshook` setter body is invisible to the comparison above"
+        );
     }
 
     /// fails if `lambs` collapses to a bare `Vec`. The three states are the point:
