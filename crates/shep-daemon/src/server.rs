@@ -592,6 +592,7 @@ mod tests {
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
                 protocol: PROTOCOL_VERSION,
+                dog_name: None,
             })
             .await;
         let ack: HelloReply = client.recv().await;
@@ -609,6 +610,7 @@ mod tests {
             .send(&Hello {
                 client_version: "9.9.9".to_string(),
                 protocol: PROTOCOL_VERSION + 1,
+                dog_name: None,
             })
             .await;
         let refusal: HelloReply = client.recv().await;
@@ -632,6 +634,7 @@ mod tests {
             .send(&Hello {
                 client_version: "9.9.9".to_string(),
                 protocol: PROTOCOL_VERSION + 1,
+                dog_name: None,
             })
             .await;
         let refusal: HelloReply = client.recv().await;
@@ -665,6 +668,7 @@ mod tests {
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
                 protocol: PROTOCOL_VERSION,
+                dog_name: None,
             })
             .await;
         let _: HelloReply = client.recv().await;
@@ -691,6 +695,7 @@ mod tests {
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
                 protocol: PROTOCOL_VERSION,
+                dog_name: None,
             })
             .await;
         let _: HelloReply = client.recv().await;
@@ -759,6 +764,7 @@ mod tests {
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
                 protocol: PROTOCOL_VERSION,
+                dog_name: None,
             })
             .await;
         let _: HelloReply = client.recv().await;
@@ -788,6 +794,7 @@ mod tests {
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
                 protocol: PROTOCOL_VERSION,
+                dog_name: None,
             })
             .await;
         let _: HelloReply = client.recv().await;
@@ -861,6 +868,7 @@ mod tests {
             .send(&Hello {
                 client_version: "0.1.0".to_string(),
                 protocol: PROTOCOL_VERSION,
+                dog_name: None,
             })
             .await;
         let _: HelloReply = client.recv().await;

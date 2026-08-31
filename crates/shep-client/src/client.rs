@@ -160,7 +160,31 @@ impl Client {
         socket: &Path,
         timeout: Duration,
     ) -> Result<Self, ConnectError> {
-        let connection = Connection::open(socket, timeout).await?;
+        Self::connect_as(socket, timeout, None).await
+    }
+
+    /// As [`Self::connect_with_timeout`], but announcing this client as the
+    /// dog registered under `dog_name`.
+    ///
+    /// Crate-private on purpose, and that is the whole reason the CLI is
+    /// safe here. A `Hello` naming a dog is what lets the daemon restart
+    /// that dog when it refuses the handshake (the handover design's G8),
+    /// so a client that can claim a name it was not spawned as can have a
+    /// dog restarted on its say-so. No `shep` verb can: the public
+    /// constructors above pass `None` and there is no other door.
+    /// [`ReconnectingClient`](crate::ReconnectingClient), the type dogs
+    /// name and the CLI does not, is this function's only caller.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::connect_with_timeout`] — every error variant it can
+    /// return, this returns unchanged.
+    pub(crate) async fn connect_as(
+        socket: &Path,
+        timeout: Duration,
+        dog_name: Option<&str>,
+    ) -> Result<Self, ConnectError> {
+        let connection = Connection::open(socket, timeout, dog_name).await?;
         let (frames, ack) = connection.into_parts();
         let commands = actor::spawn(frames);
         Ok(Self {

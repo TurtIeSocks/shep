@@ -59,6 +59,12 @@
 //! [`ReconnectingClient::link`] reports [`LinkState::Refused`]. Restarting
 //! that dog from disk is the daemon's job, not this client's — retrying
 //! here would be the spin the design's G8 exists to forbid.
+//!
+//! The daemon can only do that job if it knows WHICH dog it refused, and a
+//! refused handshake never reaches a request. So a dog connects with
+//! [`ReconnectingClient::connect_as_dog`], which carries the name the
+//! daemon spawned it under in the `Hello` itself — on the first connection
+//! and on every reconnect after it.
 
 use core::fmt;
 use std::path::{Path, PathBuf};
@@ -134,7 +140,9 @@ pub enum LinkState {
 /// use shep_client::{ReconnectingClient, shep_core::protocol::Request};
 ///
 /// # async fn dog(socket: &std::path::Path) -> Result<(), Box<dyn core::error::Error>> {
-/// let client = ReconnectingClient::connect(socket).await?;
+/// // `name` is what the daemon put in `$SHEP_DOG_NAME` when it spawned
+/// // this process; it lets the daemon act on a refusal (G8).
+/// let client = ReconnectingClient::connect_as_dog(socket, "metrics").await?;
 /// // Survives the daemon being replaced underneath it; a request that was
 /// // in flight at the moment it happened still fails rather than retrying.
 /// let _flock = client.request(Request::ListFlock).await?;
@@ -159,6 +167,7 @@ impl fmt::Debug for ReconnectingClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReconnectingClient")
             .field("socket", &self.shared.socket)
+            .field("dog_name", &self.shared.dog_name)
             .field("link", &self.link())
             .field("ack", &self.daemon())
             .finish_non_exhaustive()
@@ -170,6 +179,9 @@ impl fmt::Debug for ReconnectingClient {
 struct Shared {
     socket: PathBuf,
     handshake_timeout: Duration,
+    /// The name this client announces itself as a dog under, re-sent on
+    /// every reconnect — see [`ReconnectingClient::connect_as_dog`].
+    dog_name: Option<String>,
     state: RwLock<State>,
 }
 
@@ -251,10 +263,56 @@ impl ReconnectingClient {
         socket: &Path,
         timeout: Duration,
     ) -> Result<Self, ConnectError> {
-        let client = Client::connect_with_timeout(socket, timeout).await?;
+        Self::connect_inner(socket, timeout, None).await
+    }
+
+    /// As [`Self::connect`], but announcing this client as the dog
+    /// registered under `name` — the value the daemon put in
+    /// `$SHEP_DOG_NAME` when it spawned this process.
+    ///
+    /// **A dog should use this rather than [`Self::connect`].** The name is
+    /// what makes a refused handshake actionable: it never reaches a
+    /// request, so `Request::DogConfig`'s name is unreachable on exactly
+    /// the path where the daemon needs to know which dog to restart (the
+    /// handover design's G8). A dog that connects without it still
+    /// reconnects across a handover, and still stops rather than spinning
+    /// when a successor refuses it — but the daemon is left unable to say
+    /// which dog went stale, or to restart it from disk.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::connect_with_timeout`] — every error variant it can
+    /// return, this returns unchanged.
+    pub async fn connect_as_dog(socket: &Path, name: &str) -> Result<Self, ConnectError> {
+        Self::connect_as_dog_with_timeout(socket, HANDSHAKE_TIMEOUT, name).await
+    }
+
+    /// As [`Self::connect_as_dog`], but with a caller-supplied handshake
+    /// timeout, used for the first connection and for every reconnect after
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::connect_with_timeout`] — every error variant it can
+    /// return, this returns unchanged.
+    pub async fn connect_as_dog_with_timeout(
+        socket: &Path,
+        timeout: Duration,
+        name: &str,
+    ) -> Result<Self, ConnectError> {
+        Self::connect_inner(socket, timeout, Some(name)).await
+    }
+
+    async fn connect_inner(
+        socket: &Path,
+        timeout: Duration,
+        dog_name: Option<&str>,
+    ) -> Result<Self, ConnectError> {
+        let client = Client::connect_as(socket, timeout, dog_name).await?;
         let shared = Arc::new(Shared {
             socket: socket.to_path_buf(),
             handshake_timeout: timeout,
+            dog_name: dog_name.map(str::to_owned),
             state: RwLock::new(State {
                 client: Arc::new(client),
                 link: LinkState::Connected,
@@ -262,6 +320,13 @@ impl ReconnectingClient {
         });
         let supervisor = tokio::spawn(supervise(Arc::clone(&shared)));
         Ok(Self { shared, supervisor })
+    }
+
+    /// The name this client announces itself as a dog under, or `None` for
+    /// a caller that is not one.
+    #[must_use]
+    pub fn dog_name(&self) -> Option<&str> {
+        self.shared.dog_name.as_deref()
     }
 
     /// The handshake acknowledgement of the daemon this client is talking
@@ -378,7 +443,13 @@ async fn supervise(shared: Arc<Shared>) {
 
         let mut delay = RECONNECT_MIN_DELAY;
         loop {
-            match Client::connect_with_timeout(&shared.socket, shared.handshake_timeout).await {
+            match Client::connect_as(
+                &shared.socket,
+                shared.handshake_timeout,
+                shared.dog_name.as_deref(),
+            )
+            .await
+            {
                 Ok(fresh) => {
                     shared.install(fresh);
                     break;
@@ -557,6 +628,72 @@ mod tests {
             client.daemon().daemon_version,
             "0.0.22",
             "the version must come from the daemon now answering"
+        );
+    }
+
+    /// fails if a dog's name reaches the FIRST daemon and not its
+    /// successor. The refusal is the one that matters and it is the second
+    /// one here: a dog that named itself at boot and then reconnected
+    /// anonymously would leave the successor unable to say which dog it
+    /// just refused, which is precisely the case G8 exists for. A daemon's
+    /// predecessor is not around to be asked.
+    #[tokio::test]
+    async fn a_dogs_name_rides_every_handshake_including_the_refused_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = control_address(dir.path());
+        let shepherds = fake_daemon_across_handovers(
+            &path,
+            vec![
+                Handshake::Accept(ack_from(11)),
+                Handshake::Refuse(RpcError {
+                    code: RpcErrorCode::ProtocolMismatch,
+                    message: "daemon speaks protocol 3, client sent 2".to_string(),
+                    daemon_version: Some("0.2.0".to_string()),
+                }),
+            ],
+        );
+        let client = ReconnectingClient::connect_as_dog(&path, "metrics")
+            .await
+            .unwrap();
+        assert_eq!(client.dog_name(), Some("metrics"));
+
+        shepherds.cut().await;
+        await_refusal(&client).await;
+
+        let named: Vec<Option<String>> = shepherds
+            .hellos()
+            .into_iter()
+            .map(|hello| hello.dog_name)
+            .collect();
+        assert_eq!(
+            named,
+            vec![Some("metrics".to_string()), Some("metrics".to_string())],
+            "every generation must be told which dog is talking to it"
+        );
+    }
+
+    /// fails if a client that is not a dog claims to be one. The name is
+    /// what lets a daemon restart a dog on a refused handshake, so a
+    /// `ReconnectingClient` built without one must stay anonymous rather
+    /// than inventing a name from its environment or its path.
+    #[tokio::test]
+    async fn a_client_that_is_not_a_dog_names_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = control_address(dir.path());
+        let shepherds = fake_daemon_across_handovers(&path, vec![Handshake::Accept(ack_from(11))]);
+        let client = ReconnectingClient::connect(&path).await.unwrap();
+        assert_eq!(client.dog_name(), None);
+
+        shepherds.cut().await;
+        await_reconnect(&client, &shepherds, 2).await;
+
+        assert!(
+            shepherds
+                .hellos()
+                .iter()
+                .all(|hello| hello.dog_name.is_none()),
+            "an unnamed client must stay unnamed across a reconnect: {:?}",
+            shepherds.hellos()
         );
     }
 

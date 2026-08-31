@@ -142,7 +142,7 @@ pub async fn serve_one_request(
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, ack).await;
+        let _hello = handshake(&mut frames, ack).await;
         let envelope = read_envelope(&mut frames).await;
         write_reply(&mut frames, envelope.id, response).await;
         envelope
@@ -193,7 +193,7 @@ pub fn fake_daemon_accepting_repeatedly_with_ack(
     let handle = tokio::spawn(async move {
         while let Ok(stream) = listener.accept().await {
             let mut frames = Framed::new(stream, codec());
-            handshake(&mut frames, ack.clone()).await;
+            let _hello = handshake(&mut frames, ack.clone()).await;
             let envelope = read_envelope(&mut frames).await;
             // `write_reply` wraps the value in `Ok` itself — its signature is
             // `(&mut Frames, u64, Response)`, testing.rs:155 — so passing an
@@ -248,6 +248,7 @@ pub struct Handovers {
     cut: mpsc::Sender<()>,
     cut_on_next_request: Arc<AtomicBool>,
     accepted: Arc<AtomicU32>,
+    hellos: Arc<Mutex<Vec<Hello>>>,
     envelopes: Arc<Mutex<Vec<(u32, Envelope)>>>,
     armed_list: Arc<Mutex<Vec<ProcessInfo>>>,
     task: JoinHandle<()>,
@@ -279,6 +280,14 @@ impl Handovers {
     #[must_use]
     pub fn accepted(&self) -> u32 {
         self.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Every `Hello` this fake has read, in the order its generations read
+    /// them — including the ones it went on to REFUSE, which is the only
+    /// path where a real daemon can learn which dog it just turned away.
+    #[must_use]
+    pub fn hellos(&self) -> Vec<Hello> {
+        self.hellos.lock().unwrap().clone()
     }
 
     /// Every request envelope received so far, each paired with the 1-based
@@ -320,12 +329,14 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
     let (cut_tx, mut cut_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
     let cut_on_next_request = Arc::new(AtomicBool::new(false));
     let accepted = Arc::new(AtomicU32::new(0));
+    let hellos: Arc<Mutex<Vec<Hello>>> = Arc::new(Mutex::new(Vec::new()));
     let envelopes: Arc<Mutex<Vec<(u32, Envelope)>>> = Arc::new(Mutex::new(Vec::new()));
     let armed_list: Arc<Mutex<Vec<ProcessInfo>>> = Arc::new(Mutex::new(Vec::new()));
 
     let task = tokio::spawn({
         let cut_on_next_request = Arc::clone(&cut_on_next_request);
         let accepted = Arc::clone(&accepted);
+        let hellos = Arc::clone(&hellos);
         let envelopes = Arc::clone(&envelopes);
         let armed_list = Arc::clone(&armed_list);
         async move {
@@ -344,12 +355,21 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
                     Handshake::Refuse(err) => {
                         // The client's `Hello` is read first so the refusal
                         // is an answer rather than a race with its own write.
-                        let _first = frames.next().await;
+                        // Recorded before the refusal, not after: a real
+                        // daemon has to read the name off a `Hello` it is
+                        // about to refuse, and that is the only path where
+                        // it can learn which dog it just refused.
+                        if let Some(Ok(first)) = frames.next().await {
+                            hellos.lock().unwrap().push(decode_frame(&first).unwrap());
+                        }
                         let reply: HelloReply = Err(err);
                         let _ = frames.send(encode_frame(&reply).unwrap()).await;
                         continue;
                     }
-                    Handshake::Accept(ack) => handshake(&mut frames, ack).await,
+                    Handshake::Accept(ack) => {
+                        let hello = handshake(&mut frames, ack).await;
+                        hellos.lock().unwrap().push(hello);
+                    }
                 }
                 loop {
                     tokio::select! {
@@ -382,6 +402,7 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
         cut: cut_tx,
         cut_on_next_request,
         accepted,
+        hellos,
         envelopes,
         armed_list,
         task,
@@ -436,16 +457,17 @@ pub fn sample_info() -> ProcessInfo {
 const SCRIPT_CHANNEL_CAPACITY: usize = 8;
 
 /// Completes the handshake side of the protocol: reads the client's
-/// `Hello` (and discards it — callers that need to assert on it use
-/// [`fake_daemon`] instead) and answers with `ack`.
+/// `Hello`, answers with `ack`, and hands the `Hello` back for a caller
+/// that wants to assert on it.
 ///
 /// Panics on any accept/read/decode/write failure — test scaffolding, see
 /// [`fake_daemon`]'s own doc for why that is the right failure mode here.
-async fn handshake(frames: &mut Frames, ack: HelloAck) {
+async fn handshake(frames: &mut Frames, ack: HelloAck) -> Hello {
     let first = frames.next().await.unwrap().unwrap();
-    let _hello: Hello = decode_frame(&first).unwrap();
+    let hello: Hello = decode_frame(&first).unwrap();
     let reply: HelloReply = Ok(ack);
     frames.send(encode_frame(&reply).unwrap()).await.unwrap();
+    hello
 }
 
 /// Reads and decodes the next envelope. Panics on failure or a closed
@@ -805,7 +827,7 @@ async fn serve_scripted(
 ) {
     let stream = listener.accept().await.unwrap();
     let mut frames = Framed::new(stream, codec());
-    handshake(&mut frames, ack).await;
+    let _hello = handshake(&mut frames, ack).await;
 
     let mut armed_err: Option<(RpcErrorCode, String)> = None;
     let mut armed_event_then_reply = false;
@@ -1059,7 +1081,7 @@ pub async fn fake_daemon_answering_with_ack(
             let answer = answer.clone();
             tokio::spawn(async move {
                 let mut frames = Framed::new(stream, codec());
-                handshake(&mut frames, ack).await;
+                let _hello = handshake(&mut frames, ack).await;
                 while let Some(Ok(frame)) = frames.next().await {
                     let Ok(envelope) = decode_frame::<Envelope>(&frame) else {
                         break;
@@ -1120,7 +1142,7 @@ pub async fn fake_client_answering(
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         while let Some(Ok(frame)) = frames.next().await {
             let Ok(envelope) = decode_frame::<Envelope>(&frame) else {
                 break;
@@ -1148,7 +1170,7 @@ pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Rece
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         loop {
             let envelope = read_envelope(&mut frames).await;
             let id = envelope.id;
@@ -1233,7 +1255,7 @@ pub async fn fake_client_that_closes_after_handshake(path: &Path) -> (Client, Jo
     let task = tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         // Dropping `frames` (and the `UnixStream` it owns) here closes the
         // connection from this side.
     });
@@ -1253,7 +1275,7 @@ pub async fn fake_client_that_dies_mid_request(path: &Path) -> (Client, JoinHand
     let task = tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         let _envelope = read_envelope(&mut frames).await;
         // Dropping `frames` here — after reading, not before — closes the
         // connection only once the actor has already written the request
@@ -1279,7 +1301,7 @@ pub async fn fake_client_that_never_replies(path: &Path) -> (Client, JoinHandle<
     let task = tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         core::future::pending::<()>().await;
     });
     let client = Client::connect(path).await.unwrap();
@@ -1330,7 +1352,7 @@ pub fn start_fake_daemon_answering_on(path: &Path) {
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         core::future::pending::<()>().await;
     });
 }

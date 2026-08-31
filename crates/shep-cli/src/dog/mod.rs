@@ -192,11 +192,17 @@ impl From<RequestError> for DogRunError {
 impl DogRuntime {
     /// Connects and fetches `name`'s section.
     ///
+    /// Announces itself as the dog registered under `name`, so a daemon
+    /// that refuses this handshake on protocol skew knows which dog it just
+    /// refused and can restart it once from disk (the handover design's
+    /// G8). A refused handshake never reaches the `DogConfig` request
+    /// below, which is the only other place this name would have travelled.
+    ///
     /// # Errors
     /// - [`DogRunError::Connect`] — no shepherd answered at the socket.
     /// - [`DogRunError::Request`] — the shepherd refused the config request.
     pub async fn start(name: &str, paths: ShepPaths) -> Result<Self, DogRunError> {
-        let client = ReconnectingClient::connect(&paths.socket).await?;
+        let client = ReconnectingClient::connect_as_dog(&paths.socket, name).await?;
         let response = client
             .request(Request::DogConfig {
                 name: name.to_string(),
@@ -488,6 +494,37 @@ mod tests {
         assert_eq!(
             runtime.section,
             "webhook = \"https://example.invalid/hook\"\n"
+        );
+    }
+
+    /// fails if a dog connects anonymously. The name in the `Hello` is the
+    /// only thing a daemon that REFUSES this handshake has to work with —
+    /// the `DogConfig` request below never happens on that path — so a dog
+    /// that named itself in the request and not in the handshake would
+    /// leave the shepherd unable to say which dog went stale, or to restart
+    /// it from disk (the handover design's G8).
+    ///
+    /// The fake closes right after acking, so the `DogConfig` request that
+    /// follows fails and `start` returns an error. That is not what this
+    /// asserts on: the handshake has already happened by then, and it is
+    /// the frame under test.
+    #[tokio::test]
+    async fn a_dog_announces_its_own_name_at_the_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = shep_client::testing::control_address(dir.path());
+        let served = shep_client::testing::fake_daemon(&socket, Ok(sample_ack())).await;
+        let paths = test_paths(dir.path(), socket);
+
+        let _started = DogRuntime::start("bark", paths).await;
+
+        let hello = tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("DogRuntime::start must reach the wire; it hung instead of connecting")
+            .unwrap();
+        assert_eq!(
+            hello.dog_name.as_deref(),
+            Some("bark"),
+            "a dog must announce the name it was registered under"
         );
     }
 
