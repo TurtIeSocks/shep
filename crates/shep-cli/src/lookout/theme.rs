@@ -23,6 +23,8 @@ use std::ffi::OsStr;
 
 use shep_core::status::ProcStatus;
 
+use crate::vocabulary::Reported;
+
 /// The four semantic colours, resolved for one terminal.
 ///
 /// Constructed once at startup — by `super::mod`'s `lookout`, from
@@ -94,7 +96,9 @@ impl Palette {
         }
     }
 
-    /// The style for one sheep's STATUS cell.
+    /// The style for a group row's STATUS cell, where only a bare
+    /// `ProcStatus` is available -- see [`super::app::App::group_status_text`]'s
+    /// own doc for why a group row is never [`Reported::Silent`].
     ///
     /// `Errored` is the only status that gets `--bark`; `waiting-restart` is
     /// `--butter`, because it is a state to watch rather than damage that has
@@ -102,10 +106,23 @@ impl Palette {
     /// go and went is not a problem.
     #[must_use]
     pub fn status(self, status: ProcStatus) -> Style {
-        // The mapping lives in `crate::vocabulary`, so the CLI's table and
-        // this pane cannot drift. This method is now the ratatui BINDING of
-        // it, and nothing more.
-        Self::fg(match crate::vocabulary::role_of(status) {
+        self.role_style(crate::vocabulary::role_of(status))
+    }
+
+    /// The style for one row's STATUS cell, sheep or dog -- what
+    /// [`super::view::flock`] and [`super::view::detail`] use for every real
+    /// row, so a silent dog wears `--butter` there exactly as it does in
+    /// `shep flock`'s own table.
+    #[must_use]
+    pub fn reported(self, reported: Reported) -> Style {
+        self.role_style(reported.role())
+    }
+
+    /// The mapping lives in `crate::vocabulary`, so the CLI's table and this
+    /// pane cannot drift. This is the ratatui BINDING of it, and nothing
+    /// more.
+    fn role_style(self, role: crate::vocabulary::Role) -> Style {
+        Self::fg(match role {
             crate::vocabulary::Role::Meadow => self.meadow,
             crate::vocabulary::Role::Butter => self.butter,
             crate::vocabulary::Role::Bark => self.bark,

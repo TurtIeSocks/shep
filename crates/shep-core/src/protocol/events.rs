@@ -211,6 +211,7 @@ mod tests {
                     // the one field on this row a third party writes.
                     smit: Some("\u{25b2} main@a1b2c3".to_string()),
                     instance: None,
+                    handshook: None,
                 },
                 manually: false,
                 at_ms: 1_700_000_000_000,
@@ -360,6 +361,7 @@ mod tests {
                     last_exit: None,
                     smit: None,
                     instance: None,
+                    handshook: None,
                 },
                 manually: true,
                 at_ms: 0,

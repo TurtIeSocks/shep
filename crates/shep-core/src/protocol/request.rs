@@ -784,6 +784,32 @@ pub struct ProcessInfo {
     /// zero [`Self::dog`] warns against. A reader that finds `None` should
     /// render exactly what it rendered before this field existed.
     pub instance: Option<u32>,
+    /// Whether this dog has completed a handshake with the shepherd that is
+    /// reporting it, and not been refused since; `None` for a sheep.
+    ///
+    /// Read [`Self::dog`]'s own doc first — this field follows it rather
+    /// than [`Self::cpu_percent`], and for the same reason. `None` covers a
+    /// sheep and a peer daemon that predates the field, and collapsing the
+    /// two costs nothing: a sheep never handshakes with anything (it has no
+    /// connection to the shepherd at all, only a supervised process), so
+    /// "no handshake fact to report" is the true answer either way, and a
+    /// reader that finds `None` renders exactly what it rendered before
+    /// this field existed. Do not "fix" this into three cases.
+    ///
+    /// `Some(false)` is the one that matters and it is why this exists.
+    /// [`Self::status`] reports whether a PROCESS is alive, which for a
+    /// sheep is the whole truth and for a dog is not: a dog that cannot
+    /// talk to the shepherd is not doing its job, however alive it is. A
+    /// dog running on a protocol this shepherd refuses is exactly that, and
+    /// before this field a listing reported it `online` with zero restarts
+    /// while its own log filled with refusals.
+    ///
+    /// A fact and not a verdict, deliberately: this says whether the
+    /// handshake happened, never what a renderer should print about it. A
+    /// dog that has only just been spawned has not handshaken yet and is
+    /// perfectly healthy, so the decision about which lifecycle states that
+    /// silence is worth overriding belongs to the reader.
+    pub handshook: Option<bool>,
 }
 
 /// Orders one flock listing the way every operator-facing surface presents
@@ -855,6 +881,7 @@ impl ProcessInfo {
                 last_exit: None,
                 smit: None,
                 instance: None,
+                handshook: None,
             },
         }
     }
@@ -957,6 +984,13 @@ impl ProcessInfoBuilder {
     /// Sets the instance slot; `None` when the peer daemon predates the field.
     pub fn instance(mut self, instance: Option<u32>) -> Self {
         self.info.instance = instance;
+        self
+    }
+
+    /// Sets whether this dog has handshaken with the shepherd; `None` for a
+    /// sheep, which has no handshake to report.
+    pub fn handshook(mut self, handshook: Option<bool>) -> Self {
+        self.info.handshook = handshook;
         self
     }
 
@@ -1566,6 +1600,7 @@ mod tests {
             }),
             smit: None,
             instance: None,
+            handshook: None,
         }
     }
 
@@ -1666,6 +1701,21 @@ mod tests {
                 .as_deref(),
             Some("\u{25b2} main@a1b2c3"),
             "an empty `smit` setter body is invisible to the comparison above"
+        );
+
+        // `handshook` is the fourth field, on the same terms as the three
+        // above: `sample_info()`'s value is `None`, which is also the
+        // builder's default, so an EMPTY `handshook` setter body would pass
+        // the `assert_eq!` above. `sample_info()` still cannot be changed to
+        // a `Some(..)` — it feeds `reply_wire_snapshots` and
+        // `bus_event_wire_snapshots`, so altering it moves pinned bytes.
+        assert_eq!(
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .handshook(Some(false))
+                .build()
+                .handshook,
+            Some(false),
+            "an empty `handshook` setter body is invisible to the comparison above"
         );
     }
 
@@ -2462,6 +2512,23 @@ mod tests {
                     pending: vec!["bark".to_string()],
                 }),
             },
+            // `sample_info()` pins `handshook`'s absent shape (`None`, a
+            // sheep or an older peer); every row above reuses it, so
+            // without this row the shape that actually changes an
+            // operator's reading — a dog whose process is up and which has
+            // never answered this shepherd — is never on the wire at all.
+            Reply {
+                id: 31,
+                result: Ok(Response::Flock(vec![
+                    ProcessInfo::builder(10, "log-rotate", ProcStatus::Online)
+                        .pid(Some(208_341))
+                        .dog(Some(DogSource::Adopted {
+                            path: "/usr/local/bin/shep-log-rotate".to_string(),
+                        }))
+                        .handshook(Some(false))
+                        .build(),
+                ])),
+            },
         ];
         insta::assert_json_snapshot!("reply_wire_v2", replies);
     }
@@ -2475,6 +2542,27 @@ mod tests {
         let fixture = r#"{"id":1,"name":"web","status":"online","pid":42,"restarts":0,"uptime_ms":10,"fold":null,"out_file":null,"err_file":null,"cpu_percent":null,"memory_bytes":null,"dog":null,"lambs":null,"last_exit":null}"#;
         let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
         assert_eq!(info.smit, None);
+    }
+
+    /// fails if `handshook` breaks an older peer, on the same terms as
+    /// `smit` and `instance` before it. A daemon that predates the field
+    /// sends no `handshook` key and still announces protocol 2, so this
+    /// decoding to `None` rather than erroring is what keeps
+    /// `PROTOCOL_VERSION` at 2: the evolution rule in this module's parent
+    /// says an additive optional field keeps the version, and a required
+    /// one would make a current client unable to list against that daemon
+    /// at all.
+    ///
+    /// The fixture is a DOG's row, deliberately — that is the one row where
+    /// the missing key changes what a renderer prints, and `None` there has
+    /// to keep meaning "render this exactly as it rendered before the field
+    /// existed" rather than "this dog has never handshaken".
+    #[test]
+    fn a_process_info_without_a_handshook_key_still_deserializes() {
+        let fixture = r#"{"id":1,"name":"metrics","status":"online","pid":42,"restarts":0,"uptime_ms":10,"fold":null,"out_file":null,"err_file":null,"cpu_percent":null,"memory_bytes":null,"dog":{"kind":"built_in"},"lambs":null,"last_exit":null,"smit":null,"instance":0}"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.handshook, None);
+        assert_eq!(info.dog, Some(DogSource::BuiltIn));
     }
 
     /// fails if the daemon accepts a smit it should refuse. [`Smit`] must

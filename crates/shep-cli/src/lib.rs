@@ -1672,6 +1672,31 @@ const VERSION_SKEW_CAUSE: [&str; 2] = [
 /// what this refusal prints, and the test pinning the wording catches it.
 const VERSION_SKEW_REMEDY: &str = RECOVERY_VERBS[1];
 
+/// The imperative sentence pointing at [`VERSION_SKEW_REMEDY`], shared by
+/// The imperative naming the remedy, in the two shapes the formats need.
+///
+/// Deliberately two strings rather than one shared sentence. A `--format
+/// json` consumer gets a single-line message and needs the command inside
+/// it; the table form has layout, and printing the same sentence there
+/// would name the command twice -- once in prose and once on the indented
+/// line below it, which reads worse than the bare line it was meant to fix.
+///
+/// What must not drift is the COMMAND, and it cannot: both interpolate
+/// [`VERSION_SKEW_REMEDY`], itself read out of [`RECOVERY_VERBS`] rather
+/// than written twice. The framing around it differing per format is the
+/// point, not a leak.
+///
+/// The table label carries no blank line after it, unlike every other gap
+/// in this block. An operator hit this refusal in production and was not
+/// certain the trailing indented line was a command to run at all, so the
+/// label sits directly on top of it -- the association is the fix.
+fn version_skew_instruction(fmt: Format) -> String {
+    match fmt {
+        Format::Json => format!("Run `shep {VERSION_SKEW_REMEDY}`."),
+        Format::Table => format!("Run:\n  shep {VERSION_SKEW_REMEDY}"),
+    }
+}
+
 /// Refuses a shepherd whose crate version differs from this binary's.
 ///
 /// Any difference, not only a protocol difference. A protocol-only check
@@ -1712,10 +1737,8 @@ pub(crate) fn refuse_version_skew(
         // the layout below, and it still gets every fact in `error.message`.
         Format::Json => {
             let cause = VERSION_SKEW_CAUSE.join(" ");
-            streams.fail(
-                code,
-                &format!("{summary}. {cause} Run `shep {VERSION_SKEW_REMEDY}`."),
-            );
+            let instruction = version_skew_instruction(Format::Json);
+            streams.fail(code, &format!("{summary}. {cause} {instruction}"));
         }
         // Written straight to the stream rather than through
         // [`Streams::fail`], which routes into `output::emit_error` and so
@@ -1734,9 +1757,10 @@ pub(crate) fn refuse_version_skew(
             // multi-line layout, so it sanitises the interpolated value
             // itself. The fixed text around it is ours and needs nothing.
             let summary = crate::terminal_safe::sanitise(&summary).0;
+            let instruction = version_skew_instruction(Format::Table);
             let _ = writeln!(
                 streams.err,
-                "error[{}]: {summary}\n\n{cause}\n\n  shep {VERSION_SKEW_REMEDY}",
+                "error[{}]: {summary}\n\n{cause}\n\n{instruction}",
                 code.code_str()
             );
         }
@@ -2985,6 +3009,44 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("shep daemon reload"), "{text}");
+    }
+
+    /// The table form used to print the remedy as a bare indented line with
+    /// no imperative anywhere near it, so an operator who hit this in
+    /// production was not certain the last line was a command to run. This
+    /// pins the sentence that now points at it, and that the sentence sits
+    /// on its own line ABOVE the copyable command rather than folded into
+    /// it -- the indentation is what makes the line copyable and stays
+    /// untouched.
+    #[tokio::test]
+    async fn the_table_form_names_the_remedy_as_an_instruction_not_only_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let (client, _fake) = client_announcing(&addr, "0.1.8").await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = buffered_streams(&mut out, &mut err);
+            let _ = refuse_version_skew(&mut streams, &client, VersionGuard::Enforce);
+        }
+        let text = String::from_utf8(err).unwrap();
+
+        // The label sits DIRECTLY on the command, no blank line between:
+        // that adjacency is the whole fix, and a gap here is the shape an
+        // operator read as two unrelated things.
+        assert!(
+            text.contains("Run:\n  shep daemon reload"),
+            "the label must sit directly on the copyable line it points at: {text}"
+        );
+        // Named once, not twice. An earlier attempt printed the sentence
+        // "Run `shep daemon reload`." above the indented line, which reads
+        // worse than the bare line it was meant to fix.
+        assert_eq!(
+            text.matches("shep daemon reload").count(),
+            1,
+            "the remedy is named once, not restated in prose: {text}"
+        );
     }
 
     /// Task 6 / spec G4: `lib.rs`'s old blanket `Err(_) =>

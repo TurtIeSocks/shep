@@ -18,7 +18,8 @@
       "lambs": null,
       "last_exit": null,
       "smit": null,
-      "instance": 0
+      "instance": 0,
+      "handshook": null
     }
   ]
 }

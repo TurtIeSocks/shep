@@ -7494,6 +7494,41 @@ fn poll_slot_lines(path: &Path, want: usize) -> Vec<(u32, u32)> {
     }
 }
 
+/// Polls `path` until the lines written after the first `before` of them
+/// satisfy `ready`, or the handover deadline passes.
+///
+/// A line COUNT is the wrong wait for a `merge_logs` app, and
+/// [`poll_slot_lines`] offers nothing else. Both instances write to one
+/// file, so "two more lines" is satisfied the moment EITHER of them writes
+/// twice. The sampled window can then legitimately hold no line from the
+/// instance being asked about, and the assertion blames the handover for a
+/// race in the test's own sampling. Measured on a loaded macOS runner: both
+/// fresh lines were slot 1, and slot 0 was reported as having written
+/// nothing after a reload it had in fact survived.
+///
+/// So the caller says what it is waiting FOR, rather than how many lines it
+/// expects to read before finding it. Waiting too long is harmless here and
+/// returning early is the whole defect, which is why the deadline is the
+/// only other way out.
+#[cfg(unix)]
+fn poll_fresh_lines(
+    path: &Path,
+    before: usize,
+    ready: impl Fn(&[(u32, u32)]) -> bool,
+) -> Vec<(u32, u32)> {
+    let start = Instant::now();
+    loop {
+        let lines = slot_lines(path);
+        if lines.len() > before && ready(&lines[before..]) {
+            return lines;
+        }
+        if start.elapsed() >= HANDOVER_DEADLINE {
+            return lines;
+        }
+        std::thread::sleep(FLOCK_POLL_INTERVAL);
+    }
+}
+
 /// A clustered app is carried, and every instance comes back in its own
 /// slot.
 ///
@@ -7571,11 +7606,6 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
             "{name}:{slot} must be logging before the reload"
         );
     }
-    let counts_before: HashMap<(String, u32), usize> = rows_before
-        .iter()
-        .map(|(key, (_, out_file))| (key.clone(), slot_lines(out_file).len()))
-        .collect();
-
     let reloaded = shep(dir.path())
         .arg("daemon")
         .arg("reload")
@@ -7610,18 +7640,41 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
         "every instance keeps its pid and its own log file: {after}"
     );
 
+    // The mark is taken HERE, after the reload has returned, and not before
+    // it was issued. A pid is CARRIED across a handover -- that is the
+    // property this test exists to prove -- so a line written before the
+    // swap names the same pid as one written after it. A mark taken early
+    // therefore lets a pre-reload line satisfy "this instance wrote again",
+    // and the test passes while proving nothing about the successor. Every
+    // line past this point is unambiguously the new shepherd's.
+    let counts_before: HashMap<(String, u32), usize> = rows_after
+        .iter()
+        .map(|(key, (_, out_file))| (key.clone(), slot_lines(out_file).len()))
+        .collect();
+
     // The slot assertion, and the one a pid check cannot make. Each row is
     // asked for its own file, and every line written into that file AFTER
     // the reload has to name that row's slot and that row's pid.
     for ((name, slot), (pid, out_file)) in &rows_after {
-        let want = counts_before[&(name.clone(), *slot)] + 2;
-        let lines = poll_slot_lines(out_file, want);
+        let before = counts_before[&(name.clone(), *slot)];
+        // What this row waits for depends on who else writes into the file.
+        // A split app's file holds nobody else, so two more lines in it are
+        // two more lines from this row. A merged app's file holds both
+        // instances, so the only wait that means "this row wrote again" is
+        // this row's own pid turning up.
+        let lines = if *name == "merged" {
+            poll_fresh_lines(out_file, before, |fresh| {
+                fresh.iter().any(|(_, line_pid)| line_pid == pid)
+            })
+        } else {
+            poll_fresh_lines(out_file, before, |fresh| fresh.len() >= 2)
+        };
+        let fresh = lines.get(before..).unwrap_or(&[]);
         assert!(
-            lines.len() >= want,
-            "{name}:{slot} stopped logging across the handover: {} lines, wanted {want}",
+            !fresh.is_empty(),
+            "{name}:{slot} stopped logging across the handover: {} lines, none of them new",
             lines.len()
         );
-        let fresh = &lines[counts_before[&(name.clone(), *slot)]..];
         if *name == "merged" {
             // One file for both slots, so the row's own lines are the ones
             // carrying its pid. Both instances have to be present, or a
@@ -7638,6 +7691,11 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
                 );
             }
         } else {
+            assert!(
+                fresh.len() >= 2,
+                "{name}:{slot} stopped logging across the handover: {} fresh lines, wanted 2",
+                fresh.len()
+            );
             for (line_slot, line_pid) in fresh {
                 assert_eq!(
                     (*line_slot, *line_pid),

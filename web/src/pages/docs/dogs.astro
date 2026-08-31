@@ -105,6 +105,14 @@ $ shep disable metrics`}</CodeBlock>
       output</a>.
     </p>
     <p class="fine">
+      A dog whose <code>STATUS</code> reads <code>silent</code> is running
+      but has never spoken to the shepherd, usually because a
+      <code>cargo install</code> replaced its binary and the old process is
+      still up. <code>shep bleats &lt;dog&gt;</code> has the refusal;
+      <code>shep restart &lt;dog&gt;</code> is the fix. See <a
+      href="/docs/output#a-dog-that-never-answers">terminal output</a>.
+    </p>
+    <p class="fine">
       Running <code>enable</code> and <code>adopt</code> at once from a
       provisioning script is safe: each takes an exclusive lock on{" "}
       <code>shep.toml</code> for its whole read-edit-write, so the second

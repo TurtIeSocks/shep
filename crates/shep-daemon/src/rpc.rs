@@ -31,7 +31,6 @@ use shep_core::protocol::{
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
-use shep_core::status::ProcStatus;
 
 use crate::bus::{Bus, TopicFilter};
 use crate::dogs::DogSpec;
@@ -229,9 +228,10 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         // [`with_live_stats`] for what that costs and why every lifecycle
         // verb below goes without.
         Request::ListFlock => match ctx.supervisor.list_checked().await {
-            Ok(infos) => reply(Ok(Response::Flock(
+            Ok(infos) => reply(Ok(Response::Flock(with_dog_contact(
+                &ctx.dog_refusals,
                 with_live_stats(&ctx.stats, infos).await,
-            ))),
+            )))),
             Err(err) => reply(Err(rpc_error(&err))),
         },
         // The other one. Sampled after the selector has narrowed the
@@ -260,7 +260,11 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                         reply(Err(not_found()))
                     } else {
                         let hits = with_live_stats(&ctx.stats, hits).await;
-                        reply(Ok(Response::Described(with_lambs(&ctx.stats, hits).await)))
+                        let hits = with_lambs(&ctx.stats, hits).await;
+                        reply(Ok(Response::Described(with_dog_contact(
+                            &ctx.dog_refusals,
+                            hits,
+                        ))))
                     }
                 }
             },
@@ -586,22 +590,21 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
 /// restart this daemon ASKED for is in `restarting` above whatever the
 /// supervisor's row says about it, and a carried dog that has not dialled
 /// back yet is `Online` — its process never died, only its socket did.
+///
+/// **A pure read, and it must stay one.** The set below is also what
+/// [`crate::dogs::spawn_silent_dog_watch`] eventually acts on, and it would
+/// be tempting to drive that ladder from here instead of from a clock. It
+/// would also be wrong: `shep daemon reload` POLLS this question every 50ms
+/// while it waits, so three asks would walk a merely slow dog from restart
+/// to stale inside a second. Giving up on a dog is a claim about elapsed
+/// time, never about how often somebody asked.
 async fn dog_staleness(ctx: &RpcContext) -> (Vec<String>, Vec<String>) {
     let stale = ctx.dog_refusals.stale();
     let mut pending = ctx.dog_refusals.restarting();
     // A stopped engine has no dogs left to wait on, so its rows are not
     // worth an error: the refusal record above is still the honest answer.
     if let Ok(infos) = ctx.supervisor.list_checked().await {
-        for info in infos {
-            let running = matches!(info.status, ProcStatus::Starting | ProcStatus::Online);
-            if info.dog.is_some()
-                && running
-                && !ctx.dog_refusals.has_handshook(&info.name)
-                && !stale.contains(&info.name)
-            {
-                pending.push(info.name);
-            }
-        }
+        pending.extend(crate::dogs::silent_dogs(&infos, &ctx.dog_refusals));
     }
     pending.sort();
     pending.dedup();
@@ -677,6 +680,39 @@ async fn with_live_stats(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -
         if let Some(reading) = info.pid.and_then(|pid| sample.get(&pid)) {
             info.cpu_percent = reading.cpu_percent;
             info.memory_bytes = Some(reading.memory_bytes);
+        }
+    }
+    infos
+}
+
+/// Fills in each dog's handshake fact, which no sheep has and the supervisor
+/// does not hold.
+///
+/// The supervisor knows what a PROCESS is doing; whether a dog has ever
+/// spoken to this shepherd is connection state, and it lives in
+/// [`DogRefusals`](crate::dogs::DogRefusals) on the RPC context. So this is
+/// joined here for the same structural reason `with_live_stats` is, minus
+/// its cost: one map lookup per row under one lock, and no syscall at all.
+///
+/// **Applied to `ListFlock` and `Describe` and to nothing else**, which is
+/// the same pair `with_live_stats` covers and not a coincidence. Those are
+/// the two verbs an operator reads a listing FROM. Every other reply
+/// carrying a `ProcessInfo` is a lifecycle answer -- `start`, `restart`,
+/// `reload` -- and a dog has not had a chance to dial back by the time one
+/// of those returns, so reporting the silence there would say a dog was
+/// silent for having only just been asked to start.
+///
+/// A sheep is skipped rather than set to `Some(false)`: it has no handshake
+/// and no version relationship with this shepherd at all, so `None` is the
+/// honest answer and it is what keeps every sheep row rendering exactly as
+/// it did before this field existed.
+fn with_dog_contact(
+    refusals: &crate::dogs::DogRefusals,
+    mut infos: Vec<ProcessInfo>,
+) -> Vec<ProcessInfo> {
+    for info in &mut infos {
+        if info.dog.is_some() {
+            info.handshook = Some(refusals.has_handshook(&info.name));
         }
     }
     infos
@@ -2374,6 +2410,87 @@ mod tests {
         started.result.expect("the sheep must start");
 
         assert_eq!(staleness(&h.ctx).await, (Vec::new(), Vec::new()));
+    }
+
+    /// fails if a listing reports a dog as healthy that this shepherd has
+    /// never once heard from.
+    ///
+    /// The production defect this field exists for: `shep flock` printed
+    /// `(o.o) online`, restarts 0, for a dog whose own log was filling with
+    /// protocol refusals. `status` was not wrong — the process really was
+    /// up — but it is the answer to a question the operator was not asking.
+    /// Both halves are asserted, because reporting the silence and losing
+    /// the liveness would be the same defect pointed the other way.
+    #[tokio::test]
+    async fn a_listing_says_which_dogs_have_answered_this_shepherd() {
+        let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        start_dog(&h.ctx, "metrics").await;
+
+        let silent = list_flock(&h.ctx, 1).await;
+        let dog = silent
+            .iter()
+            .find(|info| info.name == "metrics")
+            .expect("the dog must be listed");
+        assert_eq!(dog.handshook, Some(false));
+        assert_eq!(
+            dog.status,
+            ProcStatus::Online,
+            "the process is up, and the listing still says so"
+        );
+
+        h.ctx.dog_refusals.handshook("metrics");
+        let talking = list_flock(&h.ctx, 2).await;
+        assert_eq!(
+            talking
+                .iter()
+                .find(|info| info.name == "metrics")
+                .expect("still listed")
+                .handshook,
+            Some(true)
+        );
+    }
+
+    /// fails if the join reaches a sheep.
+    ///
+    /// A sheep is an arbitrary executable and does not speak this protocol
+    /// at all (spec, part 4), so it has no handshake to report and `None`
+    /// is the only honest answer. `Some(false)` here would paint every
+    /// sheep in the flock as broken, which is a worse bug than the one this
+    /// field fixes.
+    #[tokio::test]
+    async fn a_sheep_carries_no_handshake_fact_at_all() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web(&h).await;
+
+        let infos = list_flock(&h.ctx, 1).await;
+        assert_eq!(infos[0].name, "web");
+        assert_eq!(infos[0].handshook, None);
+    }
+
+    /// fails if `describe` answers a different question from `flock` about
+    /// the same dog. It is the other verb an operator reads a listing from,
+    /// and the one `shep describe <dog>` reaches by name.
+    #[tokio::test]
+    async fn describe_carries_the_handshake_fact_too() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_dog(&h.ctx, "metrics").await;
+
+        let described = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Describe {
+                        selector: SelectorSpec::Name("metrics".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(rows)) = described.result else {
+            panic!("expected a describe listing");
+        };
+        assert_eq!(rows[0].handshook, Some(false));
     }
 
     /// fails if a registered dog that has never handshaken reads as an

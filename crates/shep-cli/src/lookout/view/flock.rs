@@ -121,7 +121,9 @@ impl Column {
         match self {
             Self::Id => 4,
             Self::Name => 0,
-            // 15: `waiting-restart`, the longest of the six statuses. A
+            // 15: `waiting-restart`, the longest word `Reported::word`
+            // returns. That vocabulary is the six lifecycle statuses plus
+            // `silent`, which is 6 columns and so does not move this. A
             // status is never truncated — it is the pane.
             Self::Status => 15,
             Self::Pid => 7,
@@ -412,6 +414,10 @@ fn group_line(app: &App, name: &str, columns: &[Column], width: u16) -> Line<'st
         };
         let text = fit(&group_cell(app, name, *column, &totals), cell_width);
         let style = if *column == Column::Status {
+            // `palette.status`, not `palette.reported`: a group row is
+            // always an app's own instances, never a dog, so it has nothing
+            // to be silent about -- see `App::group_uniform_status`'s own
+            // doc for the argument.
             app.group_uniform_status(name)
                 .map_or(Style::default(), |status| palette.status(status))
         } else {
@@ -484,7 +490,7 @@ pub fn row_line(
         };
         let text = fit(&cell(app, row, *column, grouped), cell_width);
         let style = if *column == Column::Status {
-            palette.status(row.info.status)
+            palette.reported(row.reported())
         } else {
             Style::default()
         };
@@ -515,7 +521,10 @@ fn cell(app: &App, row: &Row, column: Column, grouped: bool) -> String {
             .instance
             .map_or_else(String::new, |slot| format!(" \u{21b3} :{slot}")),
         Column::Name => info.name.clone(),
-        Column::Status => info.status.to_string(),
+        // `Row::reported`, not `info.status.to_string()`: a dog that has
+        // never handshook must not read `online` here any more than it does
+        // in `shep flock`'s own table -- see `Row::reported`'s own doc.
+        Column::Status => row.reported().word(),
         Column::Pid => info
             .pid
             .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
@@ -1001,5 +1010,109 @@ mod tests {
         assert!(rendered.contains("solo"), "got {rendered:?}");
         assert!(rendered.contains("edge"), "got {rendered:?}");
         assert!(!rendered.contains('\u{21b3}'), "got {rendered:?}");
+    }
+
+    /// fails if a dog that has never handshook reads `online` in this pane
+    /// -- the same defect task 4 fixed in `shep flock`'s own table, this
+    /// time in the dashboard that never got routed through the fix. The
+    /// process IS alive, so nothing but `handshook` can catch this.
+    #[test]
+    fn a_silent_dog_reads_silent_not_online() {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+
+        let dog = ProcessInfo::builder(9, "log-rotate", ProcStatus::Online)
+            .pid(Some(4_242))
+            .dog(Some(DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            }))
+            .handshook(Some(false))
+            .build();
+        let app = fixtures::app_with(vec![dog], fixtures::plain());
+        let row = app.row(9).unwrap();
+
+        let line = row_line(&app, row, ALL, 200, false);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains("silent"),
+            "expected silent, got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("online"),
+            "must not say online: {rendered:?}"
+        );
+    }
+
+    /// fails if this pane starts calling a dog silent once it has actually
+    /// handshook -- passing for the wrong reason is exactly what a test that
+    /// never drives the new lookup would do, so this is the guard on
+    /// [`a_silent_dog_reads_silent_not_online`] above.
+    #[test]
+    fn a_dog_that_has_handshook_still_reads_online() {
+        use shep_core::protocol::{DogSource, ProcessInfo};
+        use shep_core::status::ProcStatus;
+
+        let dog = ProcessInfo::builder(9, "log-rotate", ProcStatus::Online)
+            .pid(Some(4_242))
+            .dog(Some(DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            }))
+            .handshook(Some(true))
+            .build();
+        let app = fixtures::app_with(vec![dog], fixtures::plain());
+        let row = app.row(9).unwrap();
+
+        let line = row_line(&app, row, ALL, 200, false);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.contains("online"), "got {rendered:?}");
+        assert!(!rendered.contains("silent"), "got {rendered:?}");
+    }
+
+    /// fails if a sheep -- which has no handshake at all, `handshook` is
+    /// always `None` -- ever gets caught by the same rule. A sheep's own
+    /// STATUS cell must render exactly as it did before this task.
+    #[test]
+    fn a_sheep_still_reads_online_and_has_no_handshake() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let sheep = ProcessInfo::builder(1, "web", ProcStatus::Online)
+            .pid(Some(4_000))
+            .build();
+        assert_eq!(sheep.handshook, None, "a sheep is never sent one");
+        let app = fixtures::app_with(vec![sheep], fixtures::plain());
+        let row = app.row(1).unwrap();
+
+        let line = row_line(&app, row, ALL, 200, false);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.contains("online"), "got {rendered:?}");
+        assert!(!rendered.contains("silent"), "got {rendered:?}");
+    }
+
+    /// fails if the `dog.is_none()` guard in `Row::reported` is ever
+    /// removed. The daemon never sends a sheep `handshook: Some(false)` --
+    /// a sheep has no handshake and no version relationship with the
+    /// shepherd at all, it is a supervised process, not a peer -- so this
+    /// is an input the guard exists for and no other test drives. Same
+    /// precedent as `output::rows`' own `a_sheep_never_reads_as_silent`.
+    #[test]
+    fn a_sheep_never_reads_as_silent() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let mut impossible = ProcessInfo::builder(1, "web", ProcStatus::Online)
+            .pid(Some(4_000))
+            .build();
+        impossible.handshook = Some(false);
+        let app = fixtures::app_with(vec![impossible], fixtures::plain());
+        let row = app.row(1).unwrap();
+
+        let line = row_line(&app, row, ALL, 200, false);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains("online"),
+            "the sheep table has no dogs in it, and no silence rule either: {rendered:?}"
+        );
+        assert!(!rendered.contains("silent"), "got {rendered:?}");
     }
 }

@@ -37,6 +37,7 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 
 use super::theme::Palette;
+use crate::vocabulary::Reported;
 
 /// Whether this lookout may act on a sheep.
 ///
@@ -259,6 +260,35 @@ pub struct Row {
     /// When [`Self::info`] was received — the origin for this row's live
     /// uptime, so a value two seconds old is never rendered as current.
     pub anchor: Instant,
+}
+
+impl Row {
+    /// What this row's STATUS cell reports: [`Self::info`]'s lifecycle
+    /// status, or [`Reported::Silent`] for a dog whose process is up and
+    /// which has never handshook this shepherd.
+    ///
+    /// Mirrors `output::rows::reported` exactly, guard included: the `dog`
+    /// check is read here rather than left to [`Reported::of`] alone, so a
+    /// sheep -- which has no handshake and no version relationship with the
+    /// shepherd at all -- can never be painted silent by a future
+    /// daemon-side bug that leaves `handshook` set on a non-dog row. One
+    /// method for both panes that need it ([`super::view::flock`] and
+    /// [`super::view::detail`]), so they cannot drift on what a dog's
+    /// STATUS cell says the way the table and the dashboard did before this
+    /// existed.
+    ///
+    /// `pub(crate)` rather than `pub(super)`: `output::rows`' own test
+    /// module drives this method alongside `output::rows::reported` to pin
+    /// the agreement between the two copies (see
+    /// `the_flock_table_and_the_lookout_read_a_dogs_silence_the_same_way`),
+    /// and that test lives outside `lookout` entirely.
+    #[must_use]
+    pub(crate) fn reported(&self) -> Reported {
+        if self.info.dog.is_none() {
+            return Reported::Live(self.info.status);
+        }
+        Reported::of(self.info.status, self.info.handshook)
+    }
 }
 
 /// One app's rolled-up numbers, computed from its own instances.
@@ -1491,6 +1521,13 @@ impl App {
     /// agrees, else a count per state -- the same rule
     /// `output::rows::group_status` applies for `shep flock` (task 9), kept
     /// here so the two surfaces read a mixed group the same way.
+    ///
+    /// Reads `ProcStatus` directly, never [`Row::reported`]: `is_grouped`
+    /// requires every member's `instance` to be `Some`, and a dog is never
+    /// stocked to several instances, so no group this method can see has a
+    /// handshake to report. Same argument `output::rows::group_paint`
+    /// already makes for the table's own group row (task 5's own plan entry
+    /// spells this out rather than leaving it to be re-derived).
     #[must_use]
     pub fn group_status_text(&self, name: &str) -> String {
         let members = self.group_members(name);
@@ -1516,6 +1553,11 @@ impl App {
     /// [`view::detail`](super::view::detail)'s own status word key off,
     /// mirroring `output::rows::group_paint`'s "a mixed group's plain count
     /// text wears no colour" rule.
+    ///
+    /// `Option<ProcStatus>`, not `Option<Reported>`, for the same reason
+    /// [`Self::group_status_text`] reads `ProcStatus` directly above: a dog
+    /// is never stocked to several instances, so a group row has no
+    /// handshake to report and nothing here is ever silent.
     #[must_use]
     pub fn group_uniform_status(&self, name: &str) -> Option<ProcStatus> {
         let members = self.group_members(name);

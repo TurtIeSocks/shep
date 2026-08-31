@@ -33,6 +33,7 @@
 //! that exposure to a second surface.
 
 use core::fmt;
+use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,9 +41,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use shep_core::barks::{self, Bark};
 use shep_core::config::{AppConfig, DaemonConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{BusEvent, DogSource, ProcessEventKind};
+use shep_core::protocol::{BusEvent, DogSource, ProcessEventKind, ProcessInfo};
 use shep_core::selector::ProcessSelector;
+use shep_core::status::ProcStatus;
 use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::time::Instant;
 
 use crate::bus::SharedEvent;
 use crate::supervisor::SupervisorHandle;
@@ -535,6 +538,232 @@ async fn restart_refused_dog(supervisor: &SupervisorHandle, name: &str) {
     }
 }
 
+/// How long a registered, running dog may stay silent before this shepherd
+/// concludes it is never going to talk to it (IR-26).
+///
+/// A dog's handshake is one connect and one round trip on a local socket,
+/// measured in milliseconds, so this is not a tuned number — it is three
+/// orders of magnitude of slack. What it is actually sized against is the
+/// slowest LEGITIMATE silence: a dog carried across a handover has to notice
+/// its connection died and dial back, and a third-party dog is free to sleep
+/// a second or so before it does. Five seconds outlasts that and still fits
+/// inside the time an operator spends watching a reload.
+///
+/// **Deliberately not `shep daemon reload`'s own settle wait**, which is
+/// three seconds and lives in `shep-cli`. That budget answers how long a
+/// human's command should hold its output open before reporting; this one
+/// answers how long the shepherd should go on believing a silence. They
+/// happen to be the same order of magnitude today, and tying them together
+/// would make either one's tuning a silent change to the other's meaning.
+pub const DOG_SILENCE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Gap between two of [`spawn_silent_dog_watch`]'s looks.
+///
+/// Finer than [`DOG_SILENCE_BUDGET`] so that a dog's restart is asked for
+/// near the moment its budget runs out rather than up to a whole budget
+/// after it. One look is one message to the supervisor actor and no syscall
+/// per dog, so the cost of looking often is nearly nothing.
+const DOG_SILENCE_POLL: Duration = Duration::from_secs(1);
+
+/// Every dog the supervisor is running that has never once handshaken with
+/// this daemon, sorted — the set that both [`spawn_silent_dog_watch`] and
+/// `rpc::dog_staleness` are built on.
+///
+/// The two callers read it for different purposes and must not disagree
+/// about the population: one REPORTS these dogs as unsettled and the other
+/// eventually gives up on them, and a dog that could be in one set but not
+/// the other would be reported forever or condemned unreported.
+///
+/// Only a dog with a PROCESS counts, and a stale one is already answered
+/// for — [`crate::rpc`]'s own doc has the long form of both exclusions.
+pub(crate) fn silent_dogs(infos: &[ProcessInfo], refusals: &DogRefusals) -> Vec<String> {
+    let stale = refusals.stale();
+    let mut names: Vec<String> = infos
+        .iter()
+        .filter(|info| {
+            info.dog.is_some()
+                && matches!(info.status, ProcStatus::Starting | ProcStatus::Online)
+                && !refusals.has_handshook(&info.name)
+                && !stale.contains(&info.name)
+        })
+        .map(|info| info.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// When each currently-silent dog was first SEEN silent.
+///
+/// The elapsed-time half of [`spawn_silent_dog_watch`], and the reason that
+/// watch is a task on a clock rather than a branch inside
+/// `rpc::dog_staleness`. Staleness is a query, and `shep daemon reload`
+/// polls it in a loop: a ladder driven from there would walk a merely slow
+/// dog from restart to stale in the time it takes to ask three times. A dog
+/// here is measured against how long it has been quiet and never against
+/// how often anybody looked.
+///
+/// `Debug` is derived and needs no redaction (IR-41), for the same reason
+/// [`DogRefusals`]'s is: the map holds dog names and instants, and a dog's
+/// name is a `[dog.<name>]` KEY rather than one of its values.
+#[derive(Debug, Default)]
+struct SilentDogs {
+    /// One instant per dog currently silent. A name absent from the map is a
+    /// dog that was talking, stopped, or deleted at the last look.
+    first_seen: BTreeMap<String, Instant>,
+}
+
+impl SilentDogs {
+    /// The dogs that have now been silent for a whole [`DOG_SILENCE_BUDGET`],
+    /// given the set observed silent at `now`.
+    ///
+    /// `now` is a parameter rather than read in here so that a test can move
+    /// the clock instead of waiting on one, and so that every dog in one look
+    /// is judged against the same instant.
+    fn due(&mut self, silent: &[String], now: Instant) -> Vec<String> {
+        // A dog that answered, stopped, or was deleted is not silent any
+        // more, and starts a fresh budget if it ever falls quiet again.
+        self.first_seen.retain(|name, _| silent.contains(name));
+        let mut due = Vec::new();
+        for name in silent {
+            let since = self.first_seen.entry(name.clone()).or_insert(now);
+            if now.saturating_duration_since(*since) >= DOG_SILENCE_BUDGET {
+                // Rearmed rather than forgotten: the next rung of the ladder
+                // costs another whole budget, so a dog whose restart was just
+                // asked for gets exactly the chance to speak that it had the
+                // first time.
+                *since = now;
+                due.push(name.clone());
+            }
+        }
+        due
+    }
+}
+
+/// One look: which of this daemon's dogs have now been quiet too long, and
+/// what each of them earned.
+///
+/// Returns what it acted on, which is what its tests assert against; the
+/// loop that calls it discards the answer.
+async fn check_silent_dogs(
+    supervisor: &SupervisorHandle,
+    refusals: &DogRefusals,
+    seen: &mut SilentDogs,
+    now: Instant,
+) -> Vec<(String, Refusal)> {
+    // A stopped engine has no dogs left to wait on. `seen` is left untouched
+    // rather than cleared: a look that could not see the flock has learned
+    // nothing about it, and must not hand every dog a fresh budget.
+    let Ok(infos) = supervisor.list_checked().await else {
+        return Vec::new();
+    };
+    let silent = silent_dogs(&infos, refusals);
+    let mut acted = Vec::new();
+    for name in seen.due(&silent, now) {
+        let verdict = record_silent_dog(&name, refusals, supervisor).await;
+        acted.push((name, verdict));
+    }
+    acted
+}
+
+/// Enters a dog that has gone quiet into G8's ladder — the same ladder a
+/// named refusal enters, reached by inference rather than by the dog saying
+/// who it is.
+///
+/// **Why the inference is needed at all.** `record_refused_dog` is keyed on
+/// `Hello::dog_name`, and that field was added in phase 3. A client speaking
+/// an OLDER protocol cannot send one, so the connection it refuses is
+/// anonymous and the ladder is never entered. G8's one restart therefore
+/// reached only dogs new enough to name themselves, which is the exact
+/// complement of the dogs that need it. The set difference this rides on
+/// needs no cooperation from the client — and no peer credentials, which
+/// would have meant `SO_PEERCRED` on unix against
+/// `GetNamedPipeClientProcessId` on Windows, re-forking a transport phase 15
+/// deliberately unified into `shep_core::transport`.
+///
+/// **The tradeoff, named where the decision is.** A dog that is merely SLOW
+/// to connect is restarted once, for nothing. That is bounded by the ladder
+/// it enters — one restart, then a report, then silence — and it is cheap
+/// for a process that is by definition not yet doing its job. It also heals
+/// itself: the moment such a dog does handshake, [`DogRefusals::handshook`]
+/// clears everything held against it, including a stale mark it should never
+/// have earned. Against that, the cost of NOT inferring was measured in
+/// production: a dog `online` with zero restarts and a refusal repeating in
+/// its own log without end.
+async fn record_silent_dog(
+    name: &str,
+    refusals: &DogRefusals,
+    supervisor: &SupervisorHandle,
+) -> Refusal {
+    let verdict = refusals.refused(name);
+    match verdict {
+        Refusal::Restart => {
+            tracing::warn!(
+                dog = %name,
+                silent_for_secs = DOG_SILENCE_BUDGET.as_secs(),
+                "a dog has been running without ever answering this shepherd; restarting it once from the binary on disk"
+            );
+            // Awaited rather than spawned, which is the one difference from
+            // `record_refused_dog`: that caller is a connection handler
+            // holding a socket, and this one is a background loop with
+            // nothing to delay. Awaiting it keeps the next look from running
+            // while a kill ladder is still in flight, so a dog is never
+            // judged mid-restart.
+            restart_refused_dog(supervisor, name).await;
+        }
+        Refusal::Stale => tracing::error!(
+            dog = %name,
+            "a dog restarted for never answering this shepherd has still not answered it: the binary on disk cannot talk to this shep either, so this dog is stale and will not be restarted again. Read its own log with `shep bleats`, then rebuild or reinstall it and restart it"
+        ),
+        // Unreachable through this path, because `silent_dogs` filters a
+        // stale dog out before it can be seen quiet again. Kept as a real
+        // arm anyway: it is the honest thing to do with a rung the ladder
+        // defines, and a future caller that stops filtering would otherwise
+        // find a `todo!` here.
+        Refusal::AlreadyStale => tracing::debug!(
+            dog = %name,
+            "a silent dog that was already reported stale"
+        ),
+    }
+    verdict
+}
+
+/// Watches for dogs that are running and have never once spoken to this
+/// shepherd, and enters each into G8's ladder after
+/// [`DOG_SILENCE_BUDGET`] of silence: restarted once from the binary on
+/// disk, then reported stale, then left alone.
+///
+/// **Anchored to the daemon's BOOT, and that is load-bearing.** A handover
+/// is an `execve`: same pid, same children, new image. Every task spawned
+/// before it belonged to the predecessor's runtime and simply stops existing
+/// at the exec, while the successor installs the state that task was meant
+/// to resolve. An earlier phase found and closed six instances of exactly
+/// that bug. `boot` runs again in the successor, so the successor spawns its
+/// own watch here — whereas a per-dog one-shot timer armed at spawn time
+/// would die at the exec, which is the precise moment a carried dog's
+/// silence matters most.
+///
+/// Its `JoinHandle` is held by the caller and aborted at teardown, for the
+/// same reason [`spawn_dog_watch`]'s is: the loop has no end of its own, and
+/// nothing may restart a dog while the daemon is shutting down.
+pub fn spawn_silent_dog_watch(
+    supervisor: SupervisorHandle,
+    refusals: DogRefusals,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(DOG_SILENCE_POLL);
+        // A look missed under load is not a look owed: the budget is measured
+        // off the clock and not off a tick count, so catching up would buy
+        // nothing and cost a burst of supervisor traffic.
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut seen = SilentDogs::default();
+        loop {
+            let now = ticks.tick().await;
+            check_silent_dogs(&supervisor, &refusals, &mut seen, now).await;
+        }
+    })
+}
+
 /// Watches the bus and records, locally, every enabled dog that exhausts
 /// its restart budget.
 ///
@@ -629,6 +858,7 @@ fn record_dog_errored(barks_path: &Path, name: &str, restarts: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake::ProcScript;
     use crate::testing::test_paths;
     use shep_core::protocol::ProcessInfo;
     use shep_core::status::ProcStatus;
@@ -1007,5 +1237,286 @@ mod tests {
             !refusals.has_handshook("metrics"),
             "the handshake that earned the mark is the one that just died"
         );
+    }
+
+    /// Registers one built-in dog on `ctx`'s supervisor, exactly as
+    /// `spawn_enabled_dogs` does at boot, and hands back the harness's own
+    /// refusal record.
+    /// How long [`start_test_dog`] waits on the supervisor before calling it
+    /// a hang rather than a slow start.
+    ///
+    /// Generous on purpose: this bounds a fixture, so it is a deadlock
+    /// guard and not a timing assertion. A value tight enough to measure
+    /// anything would be a test about how fast the supervisor accepts a
+    /// request, which is not what any caller here is asking.
+    const DOG_FIXTURE_START_BUDGET: Duration = Duration::from_secs(10);
+
+    async fn start_test_dog(ctx: &crate::rpc::RpcContext, name: &str) {
+        let spec = DogSpec {
+            name: name.to_string(),
+            source: DogSource::BuiltIn,
+        };
+        let app = dog_app(&spec, &ctx.paths).expect("the dog fixture must assemble");
+        // Bounded, because the callers below run under a paused clock and
+        // this await is the one thing in them that is not already forced
+        // (IR-46). A supervisor that stopped consuming its request would
+        // otherwise hang the suite here, before any of the forcing
+        // machinery those tests set up has run. Under `start_paused` tokio
+        // auto-advances to the next deadline once every task is idle, so
+        // this timeout still fires rather than waiting on a wall clock.
+        tokio::time::timeout(
+            DOG_FIXTURE_START_BUDGET,
+            ctx.supervisor.start_dog(app, DogSource::BuiltIn),
+        )
+        .await
+        .expect("the dog fixture must start inside its budget")
+        .expect("the dog fixture must start");
+    }
+
+    /// fails if a dog that never speaks to this shepherd is left alone.
+    ///
+    /// This is the production case, and the whole of why the inference
+    /// exists: a dog on an older protocol cannot send `Hello::dog_name`, so
+    /// the refusal it earns is anonymous and `record_refused_dog` never runs
+    /// for it. The ladder is the same one a named refusal walks -- one
+    /// restart from the binary on disk, then a report, then silence -- and
+    /// the assertion is that being unable to name itself does not exempt a
+    /// dog from it.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_never_answers_is_restarted_once_and_then_marked_stale() {
+        let h = crate::testing::harness(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+        ]);
+        start_test_dog(&h.ctx, "metrics").await;
+        let refusals = &h.ctx.dog_refusals;
+        let mut seen = SilentDogs::default();
+        let t0 = Instant::now();
+
+        assert!(
+            check_silent_dogs(&h.ctx.supervisor, refusals, &mut seen, t0)
+                .await
+                .is_empty(),
+            "a dog seen quiet for the first time has not yet been quiet for any length of time"
+        );
+
+        assert_eq!(
+            check_silent_dogs(
+                &h.ctx.supervisor,
+                refusals,
+                &mut seen,
+                t0 + DOG_SILENCE_BUDGET
+            )
+            .await,
+            vec![("metrics".to_string(), Refusal::Restart)],
+            "a whole budget of silence buys the one restart from disk"
+        );
+        assert_eq!(refusals.restarting(), vec!["metrics".to_string()]);
+        assert!(
+            refusals.stale().is_empty(),
+            "one silence is a dog to restart, not a dog to give up on"
+        );
+
+        assert_eq!(
+            check_silent_dogs(
+                &h.ctx.supervisor,
+                refusals,
+                &mut seen,
+                t0 + 2 * DOG_SILENCE_BUDGET
+            )
+            .await,
+            vec![("metrics".to_string(), Refusal::Stale)],
+            "the restart ran and the dog still has not spoken: the binary on disk cannot talk to this shep either"
+        );
+        assert_eq!(refusals.stale(), vec!["metrics".to_string()]);
+
+        assert!(
+            check_silent_dogs(
+                &h.ctx.supervisor,
+                refusals,
+                &mut seen,
+                t0 + 3 * DOG_SILENCE_BUDGET
+            )
+            .await
+            .is_empty(),
+            "a dog already given up on is not laddered again, however long it stays quiet"
+        );
+    }
+
+    /// fails if a dog that answered is restarted anyway.
+    ///
+    /// The case that matters most, and the one that passes for the wrong
+    /// reason if the inference never fires at all -- so it is written
+    /// against a clock ten budgets past the point where a silent dog would
+    /// have been condemned twice over.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_answers_inside_the_budget_is_never_touched() {
+        let h = crate::testing::harness(vec![ProcScript::never_exits()]);
+        start_test_dog(&h.ctx, "metrics").await;
+        let refusals = &h.ctx.dog_refusals;
+        refusals.handshook("metrics");
+        let mut seen = SilentDogs::default();
+        let t0 = Instant::now();
+
+        for elapsed in [0, 1, 2, 10] {
+            assert!(
+                check_silent_dogs(
+                    &h.ctx.supervisor,
+                    refusals,
+                    &mut seen,
+                    t0 + elapsed * DOG_SILENCE_BUDGET
+                )
+                .await
+                .is_empty(),
+                "a dog this shepherd has heard from is not silent at any point on the clock"
+            );
+        }
+        assert!(refusals.restarting().is_empty());
+        assert!(refusals.stale().is_empty());
+    }
+
+    /// fails if a dog already reported stale is put back on the ladder.
+    ///
+    /// A stale dog goes on being quiet forever, so nothing about its silence
+    /// is news. Re-laddering it would spend a restart the record already
+    /// says was spent, and would write the same report once per budget for
+    /// as long as the daemon runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_already_stale_is_not_laddered_again() {
+        let h = crate::testing::harness(vec![ProcScript::never_exits()]);
+        start_test_dog(&h.ctx, "metrics").await;
+        let refusals = &h.ctx.dog_refusals;
+        refusals.refused("metrics");
+        refusals.refused("metrics");
+        assert_eq!(refusals.stale(), vec!["metrics".to_string()]);
+
+        let mut seen = SilentDogs::default();
+        let t0 = Instant::now();
+        for elapsed in [0, 1, 2, 5] {
+            assert!(
+                check_silent_dogs(
+                    &h.ctx.supervisor,
+                    refusals,
+                    &mut seen,
+                    t0 + elapsed * DOG_SILENCE_BUDGET
+                )
+                .await
+                .is_empty(),
+                "the ladder ends at stale; there is no rung after it to reach"
+            );
+        }
+    }
+
+    /// fails if the ladder is driven by how often somebody looks rather than
+    /// by how long a dog has been quiet.
+    ///
+    /// The regression test for the shape this fix deliberately avoids.
+    /// `Request::DogStaleness` derives the same set, and `shep daemon
+    /// reload` polls it every 50ms while it waits -- so a ladder driven from
+    /// there would restart a merely slow dog and report it stale inside a
+    /// second, before it had any chance to speak. Twenty looks inside one
+    /// budget must cost a dog nothing, and the twenty-first, one tick past
+    /// the budget, must cost it exactly one restart.
+    #[tokio::test(start_paused = true)]
+    async fn asking_repeatedly_does_not_advance_the_ladder() {
+        let h = crate::testing::harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        start_test_dog(&h.ctx, "metrics").await;
+        let refusals = &h.ctx.dog_refusals;
+        let mut seen = SilentDogs::default();
+        let t0 = Instant::now();
+
+        for look in 0..20 {
+            assert!(
+                check_silent_dogs(
+                    &h.ctx.supervisor,
+                    refusals,
+                    &mut seen,
+                    t0 + (DOG_SILENCE_BUDGET / 20) * look
+                )
+                .await
+                .is_empty(),
+                "look {look} fell inside the budget and must not have moved the dog along"
+            );
+        }
+        assert!(refusals.restarting().is_empty());
+
+        assert_eq!(
+            check_silent_dogs(
+                &h.ctx.supervisor,
+                refusals,
+                &mut seen,
+                t0 + DOG_SILENCE_BUDGET
+            )
+            .await,
+            vec![("metrics".to_string(), Refusal::Restart)],
+            "the clock is what moves the dog along, and it has now moved"
+        );
+    }
+
+    /// fails if `spawn_silent_dog_watch`'s own loop stops calling
+    /// `check_silent_dogs` at all -- the gap none of the tests above can
+    /// see, since every one of them calls `check_silent_dogs` directly and
+    /// would keep passing even if the watcher's `ticks.tick().await` path
+    /// were deleted entirely.
+    ///
+    /// IR-46: paused virtual time, advanced past one whole
+    /// [`DOG_SILENCE_BUDGET`], is the forcing mechanism -- not a real sleep,
+    /// so this stays in the fast tier rather than `mod slow`. The loop of
+    /// `yield_now` calls below is what lets the watcher's own spawned task,
+    /// and the engine task it talks to over a channel, actually run:
+    /// `tokio::time::advance` wakes a sleeper whose deadline has elapsed,
+    /// it does not itself drive the scheduler through everything that
+    /// sleeper then does.
+    #[tokio::test(start_paused = true)]
+    async fn the_watcher_restarts_a_silent_dog_after_one_budget_of_paused_time() {
+        let h = crate::testing::harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        start_test_dog(&h.ctx, "metrics").await;
+        let refusals = h.ctx.dog_refusals.clone();
+
+        let watch = spawn_silent_dog_watch(h.ctx.supervisor.clone(), refusals.clone());
+
+        // The watcher's own interval fires an immediate first tick, which
+        // records the dog as seen-silent-since-now the same way every
+        // direct-call test above seeds `seen`. That first tick has to
+        // actually run, against the PRE-advance clock, before time moves --
+        // otherwise the "first look" lands after the jump and the dog
+        // never accrues a whole budget of silence.
+        tokio::task::yield_now().await;
+
+        // `Interval::tick()` reports the DEADLINE it was scheduled for, not
+        // the clock's current instant -- so one large `advance` collapses
+        // every missed tick into a single wake whose reported time has only
+        // moved forward by one `DOG_SILENCE_POLL`, not by however far the
+        // clock actually jumped. Advancing one poll period at a time, and
+        // letting the watcher's own task run after each step, is what
+        // actually walks its reported `now` past a whole budget the way a
+        // real, un-paused clock would.
+        let ticks_in_a_budget = (DOG_SILENCE_BUDGET.as_nanos() / DOG_SILENCE_POLL.as_nanos())
+            .try_into()
+            .expect("a silence budget of a few seconds fits in a u32 tick count");
+        for _ in 0..ticks_in_a_budget {
+            tokio::time::advance(DOG_SILENCE_POLL).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..64 {
+            if !refusals.restarting().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            refusals.restarting(),
+            vec!["metrics".to_string()],
+            "one budget of silence, driven through the watcher's own tick, must earn exactly one restart"
+        );
+        assert!(
+            refusals.stale().is_empty(),
+            "one silence is a dog to restart, not a dog to give up on"
+        );
+
+        watch.abort();
     }
 }

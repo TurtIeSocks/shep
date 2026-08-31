@@ -23,7 +23,7 @@ use shep_core::status::ProcStatus;
 
 use crate::dog_index::AvailableDog;
 use crate::style::Presentation;
-use crate::vocabulary::{self, Role};
+use crate::vocabulary::{Reported, Role};
 
 use super::Render;
 
@@ -179,7 +179,8 @@ impl Render for FlockRows {
         // together — a column here would wreck the table `flock` exists to
         // print. They ride the JSON so a programmatic consumer can find a
         // sheep's logs without re-deriving paths the daemon alone resolves.
-        "out_file", "err_file",
+        "out_file",
+        "err_file",
         // No SOURCE column, because every row this table renders is a
         // sheep — `dog` is always `null` here. A dog gets its own table
         // with its own SOURCE column; this field rides the JSON only so a
@@ -190,6 +191,11 @@ impl Render for FlockRows {
         // in a later task; this list just keeps the shape consistent with
         // every other verb answering `ProcessInfo`.
         "lambs",
+        // No column, and never a value either: a handshake is a fact about
+        // a DOG, and every row this table renders is a sheep. Rides the
+        // JSON only so a consumer that switches on `ProcessInfo` shape
+        // alone still sees it, exactly as `dog` above does.
+        "handshook",
         // No column: the table now groups an app's instances under one
         // header row (`rows_for`) and labels each slot rather than adding a
         // column for it, but JSON stays flat -- one object per process,
@@ -335,7 +341,10 @@ fn slot_row(p: &ProcessInfo) -> Vec<String> {
     vec![
         p.id.to_string(),
         slot,
-        p.status.to_string(),
+        // A slot row is one instance of a multi-instance app and so never a
+        // dog, but it goes through `Reported` anyway rather than restating
+        // that argument as a second spelling of the same cell.
+        reported(p).word(),
         p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
         p.restarts.to_string(),
         exit_cell(p.pid, p.last_exit),
@@ -367,7 +376,9 @@ fn plain_row(p: &ProcessInfo, slotted: bool) -> Vec<String> {
     vec![
         p.id.to_string(),
         name,
-        p.status.to_string(),
+        // `Reported`, not `p.status`, so the plain path `bare` takes says
+        // exactly what the boxed path says -- see `process_info_paint`.
+        reported(p).word(),
         p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
         p.restarts.to_string(),
         exit_cell(p.pid, p.last_exit),
@@ -379,6 +390,29 @@ fn plain_row(p: &ProcessInfo, slotted: bool) -> Vec<String> {
         p.fold.clone().unwrap_or_else(|| "-".to_string()),
         p.smit.clone().unwrap_or_else(|| "-".to_owned()),
     ]
+}
+
+/// What one row's STATUS column reports, from the two fields that decide
+/// it: the lifecycle status always, unless this row is a DOG whose process
+/// is up and which has never answered this shepherd.
+///
+/// The dog marker is read here rather than left to [`Reported::of`], and
+/// that is the guard rather than a formality. A sheep has no handshake and
+/// no version relationship with the shepherd at all -- it is a supervised
+/// process, not a peer -- so its `handshook` is always `None` and the rule
+/// would never fire for one anyway. Keying on `dog` as well makes that a
+/// property of this function instead of a promise about what the daemon
+/// sends, so a future field-filling bug on the daemon side cannot paint the
+/// whole flock silent.
+///
+/// One function for all four cells that need it -- `plain_row`, `slot_row`,
+/// `DogRows::rows` and `process_info_paint` -- so the boxed path and the
+/// plain path `bare` takes can never disagree about a word.
+fn reported(p: &ProcessInfo) -> Reported {
+    if p.dog.is_none() {
+        return Reported::Live(p.status);
+    }
+    Reported::of(p.status, p.handshook)
 }
 
 /// The group's status: the shared word when every instance agrees, else a
@@ -416,10 +450,13 @@ fn group_status(group: &[ProcessInfo]) -> String {
 fn group_paint(header: &str, group: &[ProcessInfo], totals: &GroupTotals) -> Paint {
     match header {
         "FOLD" => Paint::Role(Role::Ink3),
+        // No `Reported::of` here, deliberately: a group row is an app's
+        // instances rolled up, a dog is never stocked to several instances,
+        // and so no group this branch can see has a handshake to report.
         "STATUS" => {
             let first = group[0].status;
             if group.iter().all(|p| p.status == first) {
-                Paint::Status(first)
+                Paint::Status(Reported::Live(first))
             } else {
                 Paint::Default
             }
@@ -443,30 +480,36 @@ fn group_paint(header: &str, group: &[ProcessInfo], totals: &GroupTotals) -> Pai
 /// sheep is, and `vocabulary.rs` stays the single source for the faces and
 /// the status-to-role mapping rather than growing a second set for dogs.
 ///
+/// The cell is decided from a [`Reported`] rather than a bare `ProcStatus`,
+/// which is what lets one dog row say something the lifecycle state does
+/// not: see [`Reported::of`], and `reported` for the guard that keeps the
+/// rule off a sheep.
+///
 /// - `presentation.level.sheep()` decides whether a face appears at all
-///   ([`vocabulary::face`], always exactly 5 columns).
+///   ([`Reported::face`], always exactly 5 columns).
 /// - `status_word` decides whether the plain status word rides beside it --
 ///   `table_of` (`output/mod.rs`) is the only caller that ever passes
 ///   `false`, on a retry once a first pass already needed to drop a whole
 ///   column.
 /// - `presentation.colour` decides whether the whole cell (face, word, or
 ///   both) is wrapped in one [`crate::output::paint::style_for`] span, keyed
-///   off [`vocabulary::role_of`] -- one span rather than two separately
+///   off [`Reported::role`] -- one span rather than two separately
 ///   styled pieces, so there is exactly one ANSI boundary for
 ///   [`crate::output::width::visible_width`] to discount, never two to keep
 ///   straight.
-fn status_cell(status: ProcStatus, presentation: Presentation, status_word: bool) -> String {
+fn status_cell(reported: Reported, presentation: Presentation, status_word: bool) -> String {
+    let word = reported.word();
     let mut text = if presentation.level.sheep() {
-        let face = vocabulary::face(status);
+        let face = reported.face();
         if status_word {
-            format!("{face} {status}")
+            format!("{face} {word}")
         } else {
             face.to_string()
         }
     } else {
-        status.to_string()
+        word
     };
-    colour_cell(&mut text, vocabulary::role_of(status), presentation);
+    colour_cell(&mut text, reported.role(), presentation);
     text
 }
 
@@ -484,7 +527,13 @@ pub(super) enum Paint {
     /// Replace the cell with [`status_cell`]: the face, the word, and the
     /// role the status wears. The only variant that changes CONTENT rather
     /// than only colour, which is why STATUS cannot be expressed as a role.
-    Status(ProcStatus),
+    ///
+    /// A [`Reported`] rather than a bare [`ProcStatus`], so that the one
+    /// row a listing can report something other than its lifecycle state
+    /// for -- a dog that has never answered this shepherd -- travels the
+    /// same single path to the cell as every other status, instead of a
+    /// fourth variant that would be a second way to paint the same column.
+    Status(Reported),
 }
 
 /// Paints one table's cells, asking `paint_of` for each by COLUMN NAME.
@@ -525,7 +574,9 @@ where
     for (index, row) in rows.iter_mut().enumerate() {
         for (cell, header) in row.iter_mut().zip(headers) {
             match paint_of(header, cell, index) {
-                Paint::Status(status) => *cell = status_cell(status, presentation, status_word),
+                Paint::Status(reported) => {
+                    *cell = status_cell(reported, presentation, status_word);
+                }
                 Paint::Role(role) => colour_cell(cell, role, presentation),
                 Paint::Default => mute_a_dash(cell, presentation),
             }
@@ -552,7 +603,13 @@ fn process_info_paint(header: &str, p: &ProcessInfo) -> Paint {
         // reads, so they are muted for the same reason: an unchanging value
         // must not draw the eye away from one that moves.
         "ID" | "FOLD" => Paint::Role(Role::Ink3),
-        "STATUS" => Paint::Status(p.status),
+        // The one column that reads TWO fields off the row: `handshook`
+        // overrides `status` for a dog that has never answered this
+        // shepherd (see `Reported::of`). A sheep's `handshook` is always
+        // `None`, so the sheep table reaches the same arm and is untouched
+        // by it -- which is why this rule can live in the function both
+        // tables share rather than in the dogs table alone.
+        "STATUS" => Paint::Status(reported(p)),
         "RESTARTS" => Paint::Role(restarts_role(p.restarts)),
         "EXIT" => Paint::Role(exit_role(p.pid, p.last_exit)),
         "CPU" => Paint::Role(cpu_role(p.cpu_percent)),
@@ -628,7 +685,12 @@ fn dog_action_paint(header: &str, cell: &str) -> Paint {
             "-" => Paint::Default,
             _ => Paint::Role(Role::Butter),
         },
-        "STATUS" => status_named_by(cell).map_or(Paint::Default, Paint::Status),
+        // `Reported::Live`: these four rows carry a status as free text and
+        // no `handshook` field at all -- `adopt` and `enable` report what
+        // the shepherd did, before any dog has had a chance to answer.
+        "STATUS" => status_named_by(cell).map_or(Paint::Default, |status| {
+            Paint::Status(Reported::Live(status))
+        }),
         _ => Paint::Default,
     }
 }
@@ -966,7 +1028,10 @@ impl Render for DogRows {
                 vec![
                     p.id.to_string(),
                     p.name.clone(),
-                    p.status.to_string(),
+                    // The row this whole field exists for: a dog whose
+                    // process is up and which has never answered this
+                    // shepherd reads `silent`, not `online`.
+                    reported(p).word(),
                     p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     p.restarts.to_string(),
                     exit_cell(p.pid, p.last_exit),
@@ -1031,7 +1096,8 @@ impl Render for DogRows {
         // Same reason `FlockRows` keeps them out of its own table: absolute
         // paths, often longer than every other column put together. They
         // ride the JSON so a programmatic consumer can still find them.
-        "out_file", "err_file",
+        "out_file",
+        "err_file",
         // Always `null` here: only `Describe` walks for lambs, and this
         // table renders `ListFlock`'s dog half. A dog is one process by
         // contract, so a lamb tree for one is not a rendering this table
@@ -1041,6 +1107,14 @@ impl Render for DogRows {
         // absent, like `fold` above, and in the JSON for the same
         // shape-consistency reason as the rest of this list.
         "smit",
+        // No column of its own, because it is not a column: it decides
+        // what the STATUS column says (`reported`), and a second column
+        // repeating that as `true`/`false` would say the same thing twice
+        // and be the less legible of the two. It rides the JSON because a
+        // consumer scripting against status needs the fact rather than the
+        // word -- `status` alone still reads `online` for a silent dog, and
+        // truthfully so.
+        "handshook",
         // Always `Some(0)` here: a dog is one process, never stocked to N
         // instances, so the slot the daemon reports is never meaningful.
         // Rides in the JSON only for the same shape-consistency reason as
@@ -1564,6 +1638,9 @@ impl Render for FlushedRows {
         // `null`. Stays in the JSON for the same shape-consistency reason
         // the rest of this list does.
         "dog",
+        // And `handshook` for the same reason `dog` is: a flush matches
+        // sheep, and a sheep has no handshake to report.
+        "handshook",
         // Always `null` here: only `Describe` walks for lambs, and `flush`
         // is not `Describe`. Same shape-consistency reason as the rest of
         // this list.
@@ -4986,5 +5063,242 @@ pub(crate) mod tests {
         // FOLD: chrome, always coloured, `-` here on both rows.
         assert!(rows[0][9].contains('\u{1b}'), "{:?}", rows[0][9]);
         assert!(rows[1][9].contains('\u{1b}'), "{:?}", rows[1][9]);
+    }
+
+    // --- A dog that has never answered the shepherd ----------------------
+    //
+    // `ProcessInfo::status` reports whether a PROCESS is alive. For a sheep
+    // that is the whole truth; for a dog it is not, and an operator read
+    // `(o.o) online`, restarts 0, for a dog whose own log was filling with
+    // protocol refusals. `handshook` is the fact that says otherwise, and
+    // these pin what the STATUS column does with it.
+
+    /// The `Presentation` for one style, at a width nothing drops at.
+    fn styled(level: crate::style::StyleLevel) -> Presentation {
+        Presentation::new(
+            level,
+            None,
+            Some(std::ffi::OsStr::new("xterm-256color")),
+            None,
+            200,
+        )
+    }
+
+    /// `sample_dog`, plus what this shepherd knows about its handshake.
+    fn dog_with_contact(handshook: Option<bool>) -> ProcessInfo {
+        let mut dog = sample_dog(ProcStatus::Online, Some(208_341));
+        dog.handshook = handshook;
+        dog
+    }
+
+    /// The cell under `header` in `T`'s only row.
+    fn cell_of<T: Render>(row: &[String], header: &str) -> String {
+        row[T::headers().iter().position(|h| *h == header).unwrap()].clone()
+    }
+
+    /// fails if a dog that has never handshaken reads as `online` — the
+    /// defect this field exists for. The process IS alive, so nothing in
+    /// `status` is wrong; what is wrong is answering the question an
+    /// operator is actually asking with the answer to a different one.
+    #[test]
+    fn a_dog_that_has_never_answered_the_shepherd_does_not_read_as_online() {
+        let rows = DogRows(vec![dog_with_contact(Some(false))]).rows();
+        assert_eq!(cell_of::<DogRows>(&rows[0], "STATUS"), "silent");
+    }
+
+    /// fails if the three styles disagree about a silent dog.
+    ///
+    /// `full` carries the face, and it must be a DIFFERENT face: a cell
+    /// reading `(o.o) silent` would keep the happy sheep that made the
+    /// original report look fine. `plain` is the word alone, coloured.
+    /// `bare` is machine-oriented and never reaches `rows_for` at all
+    /// (`StyleLevel::boxes` is false, so `table_of` takes `rows`'s plain
+    /// path), so its cell is the bare word with no escape in it.
+    #[test]
+    fn a_silent_dog_reads_the_same_in_all_three_styles() {
+        use crate::style::StyleLevel;
+        let dogs = DogRows(vec![dog_with_contact(Some(false))]);
+
+        let full = dogs.rows_for(styled(StyleLevel::Full), true);
+        assert_eq!(
+            cell_of::<DogRows>(&full[0], "STATUS"),
+            painted("(?_?) silent", Role::Butter)
+        );
+
+        let plain = dogs.rows_for(styled(StyleLevel::Plain), true);
+        assert_eq!(
+            cell_of::<DogRows>(&plain[0], "STATUS"),
+            painted("silent", Role::Butter)
+        );
+
+        let bare = dogs.rows();
+        let cell = cell_of::<DogRows>(&bare[0], "STATUS");
+        assert_eq!(cell, "silent");
+        assert!(!cell.contains('\u{1b}'), "bare carries no escape: {cell:?}");
+    }
+
+    /// fails if a dog that IS talking to this shepherd renders any
+    /// differently than it did before the field existed.
+    ///
+    /// The whole row is compared, not the STATUS cell alone: a guard keyed
+    /// on the wrong field could leave STATUS right and move something else.
+    #[test]
+    fn a_dog_that_has_answered_renders_exactly_as_before() {
+        use crate::style::StyleLevel;
+        let mut before = sample_dog(ProcStatus::Online, Some(208_341));
+        before.handshook = None;
+        let talking = dog_with_contact(Some(true));
+
+        assert_eq!(
+            DogRows(vec![talking.clone()]).rows(),
+            DogRows(vec![before.clone()]).rows()
+        );
+        assert_eq!(
+            DogRows(vec![talking]).rows_for(styled(StyleLevel::Full), true),
+            DogRows(vec![before]).rows_for(styled(StyleLevel::Full), true)
+        );
+    }
+
+    /// fails if a listing from a shepherd that predates the field renders
+    /// differently from one from a shepherd that has heard from the dog.
+    ///
+    /// `None` means "no handshake fact to report", never "this dog has
+    /// never handshaken" — the same skew rule every other optional field on
+    /// `ProcessInfo` follows. Getting this backwards would paint every dog
+    /// in an older shepherd's listing as broken.
+    #[test]
+    fn a_dog_from_a_shepherd_predating_the_field_reads_as_it_always_did() {
+        use crate::style::StyleLevel;
+        let rows = DogRows(vec![dog_with_contact(None)]).rows();
+        assert_eq!(cell_of::<DogRows>(&rows[0], "STATUS"), "online");
+
+        let full = DogRows(vec![dog_with_contact(None)]).rows_for(styled(StyleLevel::Full), true);
+        assert_eq!(
+            cell_of::<DogRows>(&full[0], "STATUS"),
+            painted("(o.o) online", Role::Meadow)
+        );
+    }
+
+    /// fails if the guard reaches a sheep.
+    ///
+    /// A sheep has no handshake and no version relationship with the
+    /// shepherd at all — it is a supervised process, not a peer — so its
+    /// `handshook` is always `None` and its row must be untouched. Driven
+    /// through a sheep carrying `Some(false)` as well, which the daemon
+    /// never sends, because "the field is always `None` for a sheep" is a
+    /// claim about the daemon and this is the renderer's own half of it.
+    #[test]
+    fn a_sheep_never_reads_as_silent() {
+        use crate::style::StyleLevel;
+        let sheep = sample_info(1, "web", 60_000);
+        assert_eq!(sheep.handshook, None, "the daemon sends nothing here");
+        let rows = FlockRows(vec![sheep.clone()]).rows();
+        assert_eq!(cell_of::<FlockRows>(&rows[0], "STATUS"), "online");
+
+        let mut impossible = sheep;
+        impossible.handshook = Some(false);
+        let full = FlockRows(vec![impossible]).rows_for(styled(StyleLevel::Full), true);
+        assert_eq!(
+            cell_of::<FlockRows>(&full[0], "STATUS"),
+            painted("(o.o) online", Role::Meadow),
+            "the sheep table has no dogs in it, and no silence rule either"
+        );
+    }
+
+    /// fails if `Row::reported` (the lookout's own copy) and this module's
+    /// `reported` land on different words for the same `ProcessInfo`.
+    ///
+    /// The two are deliberately NOT shared code -- `Row::reported`'s own
+    /// doc says why, the same reason `the_flock_table_and_the_lookout_roll_a_group_up_the_same_way`
+    /// gives for `GroupTotals` -- so this decision table is the only thing
+    /// standing between them drifting apart one edit at a time. Every axis
+    /// that decides the answer is driven together: `dog` (`None` for a
+    /// sheep, `Some` for a dog), `handshook` (`None`/`Some(false)`/
+    /// `Some(true)`), and every `ProcStatus`, so a guard reachable through
+    /// only some of those combinations cannot slip past unnoticed.
+    #[test]
+    fn the_flock_table_and_the_lookout_read_a_dogs_silence_the_same_way() {
+        use crate::lookout::app::Row;
+
+        let statuses = [
+            ProcStatus::Starting,
+            ProcStatus::Online,
+            ProcStatus::Stopping,
+            ProcStatus::Stopped,
+            ProcStatus::Errored,
+            ProcStatus::WaitingRestart,
+        ];
+        let handshooks = [None, Some(false), Some(true)];
+        let dogs = [None, Some(DogSource::BuiltIn)];
+
+        for dog in &dogs {
+            for &handshook in &handshooks {
+                for &status in &statuses {
+                    let info = ProcessInfo::builder(9, "log-rotate", status)
+                        .dog(dog.clone())
+                        .handshook(handshook)
+                        .build();
+
+                    let table = reported(&info);
+                    let dashboard = Row {
+                        info: info.clone(),
+                        anchor: std::time::Instant::now(),
+                    }
+                    .reported();
+
+                    assert_eq!(
+                        table, dashboard,
+                        "dog={dog:?} handshook={handshook:?} status={status:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// fails if only a lifecycle status a silence could not explain is
+    /// overridden.
+    ///
+    /// `online` is the one word that lies. `starting` already tells an
+    /// operator the relationship is not established yet, and a dog is
+    /// silent for a moment every single time it is spawned; `stopped` and
+    /// `errored` are honest about a process that is not there to answer.
+    /// Overriding any of those would report a fault where there is none.
+    #[test]
+    fn only_online_is_overridden_by_a_silence() {
+        for status in [
+            ProcStatus::Starting,
+            ProcStatus::Stopping,
+            ProcStatus::Stopped,
+            ProcStatus::Errored,
+            ProcStatus::WaitingRestart,
+        ] {
+            let mut dog = sample_dog(status, Some(208_341));
+            dog.handshook = Some(false);
+            let rows = DogRows(vec![dog]).rows();
+            assert_eq!(
+                cell_of::<DogRows>(&rows[0], "STATUS"),
+                status.to_string(),
+                "{status} says what it says without help"
+            );
+        }
+    }
+
+    /// fails if `--format json` cannot see what the table just said.
+    ///
+    /// The table's word is a rendering; a consumer scripting against status
+    /// needs the fact itself, and `status` alone still reads `online` for a
+    /// silent dog by design — it is a true statement about the process.
+    #[test]
+    fn the_json_form_carries_the_handshake_fact() {
+        let json = serde_json::to_value(DogRows(vec![
+            dog_with_contact(Some(false)),
+            dog_with_contact(Some(true)),
+            dog_with_contact(None),
+        ]))
+        .unwrap();
+        assert_eq!(json[0]["handshook"], serde_json::json!(false));
+        assert_eq!(json[0]["status"], "online");
+        assert_eq!(json[1]["handshook"], serde_json::json!(true));
+        assert_eq!(json[2]["handshook"], serde_json::Value::Null);
     }
 }

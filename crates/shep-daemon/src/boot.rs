@@ -1331,6 +1331,20 @@ pub async fn boot<R: ProcessRunner>(
     // carries on rather than propagating anything here.
     crate::dogs::spawn_enabled_dogs(&options.dogs, &paths, &supervisor).await;
 
+    // Built here rather than inside the `RpcContext` below because the watch
+    // on the next line shares it. Still empty, and still deliberately not
+    // carried across a handover: a successor has refused nobody yet, and a
+    // dog it can talk to is not stale by any definition it could apply.
+    let dog_refusals = crate::dogs::DogRefusals::new();
+    // Spawned at every boot, INCLUDING a successor's after an `execve` --
+    // that is why it is anchored here and not to a dog's own spawn (see
+    // `spawn_silent_dog_watch`'s doc). It restarts a dog that has been
+    // running without ever answering this shepherd, which costs a merely
+    // slow dog one restart it did not need; the tradeoff is argued at
+    // `record_silent_dog`.
+    let silent_dog_watch =
+        crate::dogs::spawn_silent_dog_watch(supervisor.clone(), dog_refusals.clone());
+
     let writer = spawn_snapshot_writer(
         paths.snapshot.clone(),
         supervisor.clone(),
@@ -1346,10 +1360,7 @@ pub async fn boot<R: ProcessRunner>(
         daemon_config: paths.daemon_config.clone(),
         paths: paths.clone(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-        // Empty, and deliberately not carried across a handover: a
-        // successor has refused nobody yet, and a dog it can talk to is not
-        // stale by any definition it could apply.
-        dog_refusals: crate::dogs::DogRefusals::new(),
+        dog_refusals,
         pid,
         shutdown,
         stats,
@@ -1387,6 +1398,7 @@ pub async fn boot<R: ProcessRunner>(
         listener,
         writer,
         dog_watch,
+        silent_dog_watch,
         paths,
         socket,
         // Held from here into `RunningDaemon` — `watch::Sender::send` is a
@@ -1465,6 +1477,11 @@ pub struct RunningDaemon {
     // step 1 alongside `writer`: both are bus subscribers with no further
     // reason to run once serving ends.
     dog_watch: JoinHandle<()>,
+    // Parks on a timer rather than on the bus, and is stopped the same way
+    // and at the same moment: nothing may ask for a dog's restart once
+    // serving has ended. See `spawn_silent_dog_watch`'s own doc for why the
+    // task is anchored to boot at all.
+    silent_dog_watch: JoinHandle<()>,
     paths: ShepPaths,
     socket: PathBuf,
     // Held from `boot` onward, not created fresh in `run`: `watch::Sender::send`
@@ -1553,6 +1570,7 @@ impl RunningDaemon {
             listener,
             writer,
             dog_watch,
+            silent_dog_watch,
             paths,
             socket,
             shutdown_rx,
@@ -1579,11 +1597,14 @@ impl RunningDaemon {
             .serve(shutdown_rx)
             .await;
 
-        // 1. Stop the snapshot writer FIRST — see this fn's doc. The dog
-        //    watch stops alongside it: both are bus subscribers with
-        //    nothing left to watch for once serving ends.
+        // 1. Stop the snapshot writer FIRST — see this fn's doc. Both dog
+        //    watches stop alongside it: one is a bus subscriber with nothing
+        //    left to watch for once serving ends, and the other is a timer
+        //    that must not ask for a dog's restart while the flock is being
+        //    torn down.
         writer.stop().await;
         dog_watch.abort();
+        silent_dog_watch.abort();
 
         // 2. Write the final roll while every sheep is still online — UNLESS
         //    this boot asked for nothing to survive here at all
