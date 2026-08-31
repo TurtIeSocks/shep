@@ -252,8 +252,11 @@ is too old to speak to. A refused handshake never reaches a request, so the
 which dog to restart. With it, the shepherd restarts you once from the
 binary on disk — which fixes the ordinary case, where the package already
 replaced your file and the running process is merely old — and reports you
-stale rather than looping if that restart is refused too. Without it you go
-quiet and nothing on either side says why.
+stale rather than looping if that restart is refused too. `shep daemon
+reload` prints that report to the operator, after your reconnect rather
+than before it: what the old image knew about you described a process that
+was about to stop existing. Without it you go quiet and nothing on either
+side says why.
 
 A dog written against `shep-client` gets both halves from
 `ReconnectingClient::connect_as_dog`, which fills the name in and also
