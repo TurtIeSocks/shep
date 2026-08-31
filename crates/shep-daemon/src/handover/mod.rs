@@ -2,8 +2,8 @@
 //! place, the [`Handover`] blob that describes it, and (in a later task) the
 //! exec that carries it.
 //!
-//! Three things are still not carried: a dog, an in-flight reload, and
-//! anything an operator has already asked to stop or delete. A sheep's
+//! Three things are still not carried: a dog, an in-flight reload, and an
+//! operator's pending stop. A sheep's
 //! stdout, stderr, log files, stdin pipe and shepherd channel all cross the
 //! exec, and every one of those is per SHEEP rather than per app, so an app
 //! running several instances crosses as several sets and needs nothing of
@@ -61,7 +61,7 @@ pub enum Fitness {
 /// held-without, and there is no fourth state). This one is closed by
 /// nothing but how much of the handover has shipped. Every phase so far has
 /// turned one of these into something the daemon carries, and 2c still has
-/// three to go, so a match here must keep tolerating a variant this module
+/// two to go, so a match here must keep tolerating a variant this module
 /// has not named yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -94,11 +94,6 @@ pub enum RefusedReason {
         /// The sheep's name.
         sheep: String,
     },
-    /// An operator's `delete` targets this sheep, which 2c carries.
-    PendingDelete {
-        /// The sheep's name.
-        sheep: String,
-    },
 }
 
 impl core::fmt::Display for RefusedReason {
@@ -118,7 +113,6 @@ impl core::fmt::Display for RefusedReason {
             Self::Dog { sheep } => (sheep, "being a dog"),
             Self::ReloadInFlight { sheep } => (sheep, "an in-flight reload"),
             Self::PendingStop { sheep } => (sheep, "a pending manual stop"),
-            Self::PendingDelete { sheep } => (sheep, "a pending delete"),
         };
         write!(
             f,
@@ -130,20 +124,23 @@ impl core::fmt::Display for RefusedReason {
 
 /// One sheep's carryability-relevant facts.
 ///
-/// Bundles a [`ProcessEntry`] with the two facts that do not live on it: a
-/// pending manual stop and a pending delete both live on the supervisor's
-/// private slot type, not on the entry it wraps, so `fitness` cannot reach
-/// them through `entry` alone. The caller, the supervisor, which owns both
-/// of them, builds this view; `fitness` stays a pure function over data it is
-/// handed rather than reaching into the registry itself.
+/// Bundles a [`ProcessEntry`] with the one fact that does not live on it: a
+/// pending manual stop lives on the supervisor's private slot type, not on
+/// the entry it wraps, so `fitness` cannot reach it through `entry` alone.
+/// The caller, the supervisor, which owns it, builds this view; `fitness`
+/// stays a pure function over data it is handed rather than reaching into
+/// the registry itself.
+///
+/// A pending delete used to live here too. It is no longer a refusal —
+/// [`CarriedSheep::pending_delete`] carries it instead — so it is no longer
+/// a carryability-relevant fact and this view has nothing left to say about
+/// it.
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate<'a> {
     /// The sheep's lifecycle entry.
     pub entry: &'a ProcessEntry,
     /// Whether an operator's `stop` is waiting on this sheep's next exit.
     pub pending_stop: bool,
-    /// Whether an operator's `delete` targets this sheep.
-    pub pending_delete: bool,
     /// Whether this sheep's log pump was asked for its descriptors and did
     /// not answer in time.
     ///
@@ -171,8 +168,6 @@ pub struct OwnedCandidate {
     pub entry: ProcessEntry,
     /// Whether an operator's command is waiting on this sheep's next exit.
     pub pending_stop: bool,
-    /// Whether an operator's `delete` targets this sheep.
-    pub pending_delete: bool,
     /// Whether this sheep's log pump missed the snapshot's deadline; see
     /// [`Candidate::pump_unresponsive`].
     pub pump_unresponsive: bool,
@@ -185,7 +180,6 @@ impl OwnedCandidate {
         Candidate {
             entry: &self.entry,
             pending_stop: self.pending_stop,
-            pending_delete: self.pending_delete,
             pump_unresponsive: self.pump_unresponsive,
         }
     }
@@ -220,9 +214,6 @@ fn refusal(candidate: &Candidate<'_>) -> Option<RefusedReason> {
     }
     if !matches!(entry.reload, crate::entry::ReloadState::None) {
         return Some(RefusedReason::ReloadInFlight { sheep: name() });
-    }
-    if candidate.pending_delete {
-        return Some(RefusedReason::PendingDelete { sheep: name() });
     }
     if candidate.pending_stop {
         return Some(RefusedReason::PendingStop { sheep: name() });
@@ -576,6 +567,17 @@ pub struct CarriedSheep {
     credentials: SpawnIdentity,
     /// The descriptor numbers this instance's output travels on.
     fds: CarriedFds,
+    /// Whether an operator's `delete` targeted this instance before the
+    /// exec.
+    ///
+    /// `Option` rather than `bool` for the reason [`CarriedFds::stdin`]
+    /// gives at length: a predecessor from before this field existed
+    /// refused to carry a sheep with a delete pending at all, so a blob it
+    /// wrote never has the key, and an absent field loads as `None` rather
+    /// than failing to parse. `None` is what that blob truthfully means —
+    /// "no" — not "unknown", so [`VERSION`] stays unmoved: nothing an older
+    /// reader must understand has changed.
+    pending_delete: Option<bool>,
     /// The resolved config this instance runs under, environment included.
     ///
     /// This is the `AppConfig` beneath [`ProcessEntry::spec`]'s
@@ -609,13 +611,19 @@ pub struct CarriedSheep {
 impl CarriedSheep {
     /// Describe `entry` for the successor.
     ///
-    /// `epoch` and `fds` are arguments rather than reads off `entry`
-    /// because neither lives there: the respawn epoch is on the
-    /// supervisor's private slot, and the descriptor numbers are known only
-    /// to whichever code holds the open descriptors. This is the same split
-    /// [`Candidate`] makes, for the same reason.
+    /// `epoch`, `fds` and `pending_delete` are arguments rather than reads
+    /// off `entry` because none of them lives there: the respawn epoch and
+    /// the pending-delete marker are on the supervisor's private slot type,
+    /// and the descriptor numbers are known only to whichever code holds
+    /// the open descriptors. This is the same split [`Candidate`] makes,
+    /// for the same reason.
     #[must_use]
-    pub fn from_entry(entry: &ProcessEntry, epoch: u64, fds: CarriedFds) -> Self {
+    pub fn from_entry(
+        entry: &ProcessEntry,
+        epoch: u64,
+        fds: CarriedFds,
+        pending_delete: bool,
+    ) -> Self {
         Self {
             id: entry.id,
             name: entry.spec.config().name.clone(),
@@ -627,6 +635,7 @@ impl CarriedSheep {
             last_exit: entry.last_exit,
             credentials: entry.credentials,
             fds,
+            pending_delete: Some(pending_delete),
             app: entry.spec.config().clone(),
         }
     }
@@ -636,6 +645,15 @@ impl CarriedSheep {
     #[allow(dead_code, reason = "read by this crate's own tests")]
     pub const fn fds(&self) -> CarriedFds {
         self.fds
+    }
+
+    /// Whether an operator's `delete` targeted this instance before the
+    /// exec, or `None` for a blob written before this field existed — which
+    /// truthfully means "no", since that predecessor refused to carry a
+    /// pending delete at all. See the field's own doc.
+    #[must_use]
+    pub const fn pending_delete(&self) -> Option<bool> {
+        self.pending_delete
     }
 
     /// The supervisor slot's respawn epoch at the moment of the handover.
@@ -1195,7 +1213,6 @@ mod tests {
         Candidate {
             entry,
             pending_stop: false,
-            pending_delete: false,
             pump_unresponsive: false,
         }
     }
@@ -1245,7 +1262,6 @@ mod tests {
         let candidate = Candidate {
             entry: &e,
             pending_stop: false,
-            pending_delete: false,
             pump_unresponsive: true,
         };
         let Fitness::Refused(r) = fitness(&[candidate]) else {
@@ -1372,8 +1388,8 @@ mod tests {
 
         let blob = Handover::new(
             vec![
-                CarriedSheep::from_entry(&zero, 7, fds_at(11)),
-                CarriedSheep::from_entry(&one, 8, fds_at(21)),
+                CarriedSheep::from_entry(&zero, 7, fds_at(11), false),
+                CarriedSheep::from_entry(&one, 8, fds_at(21), false),
             ],
             DaemonFds {
                 listener: 3,
@@ -1431,7 +1447,6 @@ mod tests {
         let candidate = Candidate {
             entry: &e,
             pending_stop: true,
-            pending_delete: false,
             pump_unresponsive: false,
         };
         assert!(matches!(
@@ -1460,7 +1475,7 @@ mod tests {
     /// One carried sheep off `entry`, with the descriptor numbers a
     /// running sheep would have.
     fn carried(entry: &ProcessEntry) -> CarriedSheep {
-        CarriedSheep::from_entry(entry, 7, fds_at(11))
+        CarriedSheep::from_entry(entry, 7, fds_at(11), false)
     }
 
     fn handover_over(entry: &ProcessEntry) -> Handover {
@@ -1627,19 +1642,35 @@ mod tests {
         );
     }
 
+    /// fails if a blob written before this daemon carried a pending delete
+    /// stops loading.
+    ///
+    /// A predecessor from before [`CarriedSheep::pending_delete`] existed
+    /// refused to hand over a sheep with a delete pending at all, so its
+    /// blobs never have the key and `None` is what that truthfully means:
+    /// "no", not "unknown". Failing to parse instead would leave the
+    /// successor refusing to boot after the predecessor had already exec'd
+    /// itself away, which is a whole flock unsupervised for one added
+    /// field.
     #[test]
-    fn a_pending_delete_refuses() {
-        let e = entry_fixture(|_| {});
-        let candidate = Candidate {
-            entry: &e,
-            pending_stop: false,
-            pending_delete: true,
-            pump_unresponsive: false,
-        };
-        assert!(matches!(
-            fitness(&[candidate]),
-            Fitness::Refused(RefusedReason::PendingDelete { .. })
-        ));
+    fn a_blob_written_before_pending_delete_was_carried_still_loads() {
+        let mut value = serde_json::to_value(sample_handover()).unwrap();
+        let sheep = value["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        assert!(
+            sheep.remove("pending_delete").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(value).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].pending_delete(), None);
+        assert_eq!(
+            loaded.sheep[0].id(),
+            sample_handover().sheep[0].id(),
+            "the rest of the row is unchanged by the one field that was absent"
+        );
     }
 
     #[test]
@@ -1728,7 +1759,7 @@ mod tests {
     ) -> Handover {
         Handover {
             version: VERSION,
-            sheep: vec![CarriedSheep::from_entry(entry, 7, fds)],
+            sheep: vec![CarriedSheep::from_entry(entry, 7, fds, false)],
             listener_fd,
             pidfile_fd,
             next_id: 9,

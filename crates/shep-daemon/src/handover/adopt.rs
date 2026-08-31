@@ -370,6 +370,7 @@ mod tests {
             last_exit: None,
             credentials: SpawnIdentity::Resolved(None),
             fds,
+            pending_delete: Some(false),
             app: crate::testing::app_with("web", |_| {}).into_config(),
         }
     }

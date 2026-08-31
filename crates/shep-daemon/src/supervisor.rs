@@ -3545,7 +3545,11 @@ impl<R: ProcessRunner> Actor<R> {
                     signals: None,
                     to_stdin: None,
                     manual: None,
-                    pending_delete: false,
+                    // The gate refuses a flock with a manual stop waiting on
+                    // an exit, so there is no `manual` marker to carry. A
+                    // pending delete is no longer refused; it is restored
+                    // from the blob below.
+                    pending_delete: carried.pending_delete().unwrap_or(false),
                     epoch: carried.epoch(),
                     ready_tx: None,
                     actions: ActionWaits::default(),
@@ -3682,10 +3686,12 @@ impl<R: ProcessRunner> Actor<R> {
                 to_child: Some(to_child),
                 signals: Some(handles.signals),
                 to_stdin: Some(to_stdin),
-                // The gate refuses a flock with a manual stop or a pending
-                // delete waiting on an exit, so there is no marker to carry.
+                // The gate refuses a flock with a manual stop waiting on an
+                // exit, so there is no `manual` marker to carry. A pending
+                // delete is no longer refused; it is restored from the blob
+                // below.
                 manual: None,
-                pending_delete: false,
+                pending_delete: carried.pending_delete().unwrap_or(false),
                 epoch: carried.epoch(),
                 // Armed above for an instance the blob reports as
                 // `Starting`, and `None` for one it reports as `Online`,
@@ -6032,7 +6038,6 @@ impl<R: ProcessRunner> Actor<R> {
                 // the same question, or a flock passes the gate and then
                 // fails it.
                 pending_stop: slot.manual.is_some(),
-                pending_delete: slot.pending_delete,
                 // Always `false` here, and it has to be: this gate awaits
                 // nothing, so it cannot ask a pump anything, and a pump that
                 // is wedged right now may well have answered by the time a
@@ -7875,11 +7880,11 @@ fn spawn_handover_task(
             if !draft.channel_open {
                 fds.channel = None;
             }
-            let carried = CarriedSheep::from_entry(&draft.entry, draft.epoch, fds);
+            let carried =
+                CarriedSheep::from_entry(&draft.entry, draft.epoch, fds, draft.pending_delete);
             let candidate = OwnedCandidate {
                 entry: draft.entry,
                 pending_stop: draft.pending_stop,
-                pending_delete: draft.pending_delete,
                 pump_unresponsive,
             };
             (candidate, carried, parked_pump)
@@ -17817,13 +17822,15 @@ mod tests {
     }
 
     /// Fails if a snapshot loses the three actor counters or the two slot
-    /// fields nothing outside the actor can see.
+    /// facts nothing outside the actor can see.
     ///
     /// These are the reason this is a command rather than a getter, and each
     /// one is load-bearing on its own: a successor that reissued a live id
     /// would collide with a caller still holding it, and a manual stop the
     /// gate never saw is a flock carried while an operator is waiting on its
-    /// exit.
+    /// exit. A pending delete used to reach the candidate the same way
+    /// `pending_stop` still does; it now reaches the successor on the blob
+    /// instead, which is what this asserts against since task 1.
     ///
     /// The sheep here has no live pump, which is also the registered-but-not
     /// -running case: it reports no descriptors, and that is not a refusal.
@@ -17846,8 +17853,9 @@ mod tests {
             candidates[0].pending_stop,
             "a pending stop must reach the gate"
         );
-        assert!(
-            !candidates[0].pending_delete,
+        assert_eq!(
+            blob.sheep()[0].pending_delete(),
+            Some(false),
             "nothing asked for this sheep to be deleted"
         );
         assert!(
@@ -18013,6 +18021,22 @@ mod tests {
         pid: Option<u32>,
         mutate: impl FnOnce(&mut ProcessEntry),
     ) -> CarriedSheep {
+        carried_with_pending_delete(name, id, pid, false, mutate)
+    }
+
+    /// [`carried`], with the blob's `pending_delete` fact set explicitly.
+    ///
+    /// A separate function rather than a sixth parameter every existing
+    /// call site would have to grow, since only the cases that are actually
+    /// about a pending delete need to say anything about it.
+    #[cfg(unix)]
+    fn carried_with_pending_delete(
+        name: &str,
+        id: u32,
+        pid: Option<u32>,
+        pending_delete: bool,
+        mutate: impl FnOnce(&mut ProcessEntry),
+    ) -> CarriedSheep {
         let mut app = AppConfig::minimal(name, "./srv");
         // Nothing in these cases wants a respawn: the install path is what
         // is under test, and an automatic restart would spawn a second
@@ -18035,7 +18059,7 @@ mod tests {
             last_exit: None,
         };
         mutate(&mut entry);
-        CarriedSheep::from_entry(&entry, 0, CarriedFds::none())
+        CarriedSheep::from_entry(&entry, 0, CarriedFds::none(), pending_delete)
     }
 
     /// A carried sheep with no descriptors to rebuild, which is every case
@@ -18204,6 +18228,75 @@ mod tests {
                 signal: Some(9)
             }),
             "the exit must be recorded, not lost"
+        );
+    }
+
+    /// Fails if a carried pending delete is dropped by the adopt path.
+    ///
+    /// `install_adopted` used to hardcode `pending_delete: false` on every
+    /// installed slot, since the gate refused to carry one at all. Now that
+    /// [`handover::fitness`] carries it instead of refusing it, a sheep
+    /// whose delete was already in flight when the predecessor exec'd must
+    /// still be deregistered on its next exit rather than left registered
+    /// (which the operator's dropped connection would then never learn) or,
+    /// worse, respawned.
+    ///
+    /// A real child and the real runner, for the same reason
+    /// [`an_adopted_sheeps_exit_flows_through_the_ordinary_path`] gives: an
+    /// adopted pid has no `Child` handle, and only the real reaper's
+    /// `Msg::Exited` proves the carried marker actually reaches
+    /// `handle_exited`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the adopted flock's reaper collects this status; a Child::wait would take it first"
+    )]
+    async fn a_carried_pending_delete_deregisters_on_the_next_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("a test host can spawn a shell");
+        let pid = child.id();
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_with_pending_delete(
+                    "web",
+                    7,
+                    Some(pid),
+                    true,
+                    |_| {},
+                ))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap()),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("the adopted child is signalable");
+
+        let info = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let info = sup.list().await;
+                if info.is_empty() {
+                    return info;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "a carried pending delete must deregister the sheep on its next exit, not merely \
+             stop it",
+        );
+
+        assert!(
+            info.is_empty(),
+            "the deleted sheep must be gone, not just stopped"
         );
     }
 

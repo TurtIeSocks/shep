@@ -71,12 +71,28 @@ Implementation proceeds on the stated assumption in each case. Say the word on a
 
 A `bool` on the blob, restored onto the entry. No timer, no linked id, no waiter beyond D1's reply.
 
-- [ ] **Step 1: Write the failing test.** A carried sheep with `pending_delete` set is adopted with it still set, and its next exit deregisters it rather than respawning it.
-- [ ] **Step 2: Run it, watch it fail** on `Refused(PendingDelete)`.
-- [ ] **Step 3: Implement.** Field on `CarriedSheep`, `Option<bool>` so an older blob loads as `None` — do NOT move `VERSION`, per tasks 4, 5 and 6's precedent.
-- [ ] **Step 4: Prove it non-vacuous.** Drop the field from the blob; that test and only that test fails.
-- [ ] **Step 5: Real reload.** `shep delete` a sheep whose exit is slow, reload mid-delete, confirm the delete still completes and the row is gone.
-- [ ] **Step 6: Commit** with the plan section updated.
+- [x] **Step 1: Write the failing test.** A carried sheep with `pending_delete` set is adopted with it still set, and its next exit deregisters it rather than respawning it.
+- [x] **Step 2: Run it, watch it fail** on `Refused(PendingDelete)`.
+- [x] **Step 3: Implement.** Field on `CarriedSheep`, `Option<bool>` so an older blob loads as `None` — do NOT move `VERSION`, per tasks 4, 5 and 6's precedent.
+- [x] **Step 4: Prove it non-vacuous.** Drop the field from the blob; that test and only that test fails.
+- [x] **Step 5: Real reload.** `shep delete` a sheep whose exit is slow, reload mid-delete, confirm the delete still completes and the row is gone.
+- [x] **Step 6: Commit** with the plan section updated.
+
+##### Outcome
+
+The mapped facts held, with one imprecision: the brief said "restored onto the entry," but `pending_delete` lives on `SheepSlot`, not on `ProcessEntry` — `install_adopted` restores it onto the slot it builds, same as `epoch` and `manual`.
+
+`Candidate` and `OwnedCandidate` lost their own `pending_delete` field entirely rather than keeping it unread. `refusal()` was its only reader; once that check comes out, a `pub` field nothing reads inside a `pub(crate)` module is `dead_code` under `-D warnings`, so dropping it was forced, not a style call. `CarriedSheep` gained a fifth non-descriptor field, `pending_delete: Option<bool>`, following stdin's and the channel's own precedent exactly: `None` is what a predecessor from before this field existed truthfully meant (it refused a pending delete outright), so `VERSION` does not move.
+
+**The finding beyond the mapped facts: `pending_delete` and `manual` are inseparable today, so task 1 alone cannot be observed end to end.** Both sites that set `SheepSlot::pending_delete = true` (`Delete`, and the failed-respawn-during-a-reload path) also call `claim_manual` in the same breath, and both `handle_handover_snapshot` and `handle_handover_fitness` derive `pending_stop` from `slot.manual.is_some()` — not from a stop-specific flag. So a flock mid-delete still refuses today, on `PendingStop` (task 2's, not yet removed) exactly where it used to refuse on `PendingDelete`. Removing `PendingDelete` alone changes nothing about whether a live `shep daemon reload` actually carries a pending-delete sheep — tasks 1 and 2 are independently steppable in the code (per the plan's own "Order" section) but not independently observable end to end. The first drill below, against the committed binary, shows this directly. To still prove task 1's own mechanism live, the second drill was run against a build with the (still-active) `PendingStop` check bypassed by one line, verified, then reverted before the gate ran; nothing from that bypass is in this diff.
+
+##### Drill, measured
+
+**Against the committed binary** (task 1 alone; `PendingStop` still refuses). `shep delete sticky` backgrounded, `shep daemon reload` fired 1s later, against a `kill_timeout = "20s"` sheep that traps `SIGTERM`. The client's own upfront fitness check refused, correctly naming the surviving reason rather than the removed one: `sheep 'sticky' has a pending manual stop, which this daemon cannot yet hand over; reload falls back to a stop-and-start instead`. `reload exit=8` (`deadline_exceeded`: teardown still in progress when the client's own wait ran out). Shepherd pid 69458, sheep pid 69480; both processes gone once the predecessor's own teardown finished on its own, past the client's wait. Out of scope for this task, but recorded rather than silently noticed: the saved roll afterward held `sticky` as `stopped`, not deleted — a delete claimed against a daemon that then takes an interrupted stop-and-start is not the carry path at all (`install_adopted` is never called on it), so this is unrelated to `pending_delete`'s carrying and pre-dates this task; flagged separately rather than fixed here.
+
+**Against a one-line, uncommitted, reverted-before-the-gate bypass of the `PendingStop` check** (to isolate task 1's own mechanism). Same script, `kill_timeout = "30s"`, delete backgrounded then reload fired 1s later. `reload exit=0`, `notice[reload]: the shepherd is now 0.1.20 (pid 67398)` — shepherd 67398 unmoved, sheep 67419 unmoved and still `online` immediately after. `shep delete`'s own client got `the connection closed before a reply arrived`, exactly D1's prediction. Sticky's own kill ladder never escalated to `SIGKILL` on its own — a second, separate stranded-timer defect in `manual`'s escalation, task 2's territory and not this one — so the `SIGKILL` was sent by hand; the successor (still pid 67398) then deregistered the sheep entirely: `shep flock` afterward listed zero rows, and the saved roll's `apps` array was empty, not `stopped`. Shepherd pid unmoved, sheep pid unmoved until deliberately killed, row gone: the carry worked.
+
+`diff` against the pre-bypass file was empty after reverting it, and the full lib suite (647/647) was re-run before any gate command.
 
 ### Task 2: `manual`
 
