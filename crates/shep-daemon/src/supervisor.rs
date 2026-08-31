@@ -1570,6 +1570,10 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     /// the `execve`. Nothing here spawns, signals or reopens anything: from
     /// each sheep's own side the shepherd was never away.
     ///
+    /// `reloads` is the apps that were mid-swap, restored once the flock is
+    /// in — see [`Actor::install_carried_reloads`] for what each one is owed
+    /// beyond its own restoration.
+    ///
     /// # Why the counters are restored before any slot is installed
     ///
     /// [`Actor::next_id`], [`Actor::next_deadline`] and
@@ -1603,6 +1607,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
         self,
         flock: Vec<AdoptedSheep>,
         counters: Counters,
+        reloads: Vec<CarriedReload>,
     ) -> Result<SupervisorHandle, AdoptError> {
         let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
         let mut actor = self.build(tx.clone());
@@ -1617,6 +1622,13 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
         for sheep in flock {
             actor.install_adopted(sheep, &reaper)?;
         }
+        // After the loop, and before the actor runs. A job names two entries
+        // and arms against one of them, so it has nowhere to go until every
+        // sheep is in; and the readiness waits `install_adopted` armed report
+        // back through the mailbox, which nothing drains until the line
+        // below — so a replacement that resolves instantly still finds its
+        // job.
+        actor.install_carried_reloads(reloads);
         tokio::spawn(actor.run(rx));
         Ok(SupervisorHandle { tx })
     }
@@ -1808,6 +1820,48 @@ struct ReloadJob {
     deadline: u64,
 }
 
+/// One app's in-flight reload, as it crosses a handover.
+///
+/// A [`ReloadJob`] minus the one field a successor must not inherit. The
+/// queue, the mode and the pair mid-swap are facts about a deploy the
+/// operator asked for and are carried unchanged; [`ReloadJob::deadline`] is a
+/// stamp on a timer that died with the predecessor's image, so the successor
+/// takes a fresh one off its own (carried) `next_deadline` when it re-arms.
+/// Carrying the old stamp would name a watchdog that no longer exists.
+///
+/// The app name rides on the row rather than keying a map, so the blob holds
+/// an array in a stable order — the same reason its sheep are sorted by id.
+///
+/// `Debug` is derived and nothing here is sensitive: an app name an operator
+/// typed, two entry ids and three closed enums (IR-41).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// The handover is a unix feature: both sites that build one of these —
+// `Actor::handle_handover_snapshot` and `Actor::install_carried_reloads` —
+// are `cfg(unix)`, while this type travels on `Handover`, which is not. So
+// on a Windows target it is a shape nothing constructs. Scoped to that
+// target rather than blanket-allowed, and an `expect` rather than an
+// `allow`, so that a Windows handover would have to delete this line rather
+// than inherit it.
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "no target without a handover ever builds one")
+)]
+pub(crate) struct CarriedReload {
+    /// The app whose reload this is — [`Actor::reloads`]' own key.
+    pub(crate) app: String,
+    /// Instances not yet taken, in slot order.
+    ///
+    /// A `Vec` rather than the [`VecDeque`] it comes off and goes back into:
+    /// the two serialize identically as a JSON array, and the queue
+    /// discipline is the actor's business rather than the blob's.
+    pub(crate) queue: Vec<u32>,
+    /// Whether this job overlaps its two instances or replaces them one
+    /// after the other.
+    pub(crate) mode: ReloadMode,
+    /// The pair mid-swap right now.
+    pub(crate) swap: ReloadSwap,
+}
+
 /// Which of two orderings a reload runs, decided from the app's config.
 ///
 /// # Why there are two
@@ -1824,8 +1878,12 @@ struct ReloadJob {
 ///
 /// The two orderings are the two ways out of that, and the app picks which by
 /// whether it can share a port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadMode {
+///
+/// Serialized because a handover carries the job it belongs to, `snake_case`
+/// on the wire for the reason [`ManualKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReloadMode {
     /// `SpawnNew → AwaitReady → DrainOld → ReapOld`. Both instances run at
     /// once, so the app is never short one.
     ///
@@ -1904,23 +1962,27 @@ impl ReloadMode {
 }
 
 /// The drainee/replacement pair a reload is working on right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReloadSwap {
+///
+/// Serialized because a handover carries the job it belongs to, `snake_case`
+/// on the wire for the reason [`ManualKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct ReloadSwap {
     /// The instance being replaced. Carries `ProcStatus::Stopping` and
     /// [`ReloadState::Drainee`] from the moment the swap starts — which under
     /// [`ReloadMode::Overlap`] is when its replacement is spawned, and under
     /// [`ReloadMode::Serial`] is a whole drain before that.
-    old_id: u32,
+    pub(crate) old_id: u32,
     /// Its replacement, in the same instance slot under a new id. Carries
     /// [`ReloadState::Replacement`] until the swap finishes.
     ///
     /// `None` exactly while the phase is [`ReloadPhase::DrainFirst`]: a
     /// serial reload has no replacement to name until the instance it is
     /// replacing has gone.
-    new_id: Option<u32>,
+    pub(crate) new_id: Option<u32>,
     /// How far along this pair is — see [`ReloadPhase`], whose variants name
     /// the steps of both orderings.
-    phase: ReloadPhase,
+    pub(crate) phase: ReloadPhase,
 }
 
 /// Where a [`ReloadSwap`] is in the spec's per-instance state machine.
@@ -1930,8 +1992,12 @@ struct ReloadSwap {
 /// `ReapOld` is the drainee's `Msg::Exited` arriving. What a handler actually
 /// has to ask is the question these two answer — is the old instance still
 /// there to go back to?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadPhase {
+///
+/// Serialized because a handover carries the swap it belongs to,
+/// `snake_case` on the wire for the reason [`ManualKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReloadPhase {
     /// [`ReloadMode::Serial`] only: the instance being replaced is on its
     /// kill ladder and nothing has been spawned yet, so `swap.new_id` is
     /// `None`.
@@ -3545,6 +3611,10 @@ impl<R: ProcessRunner> Actor<R> {
         let spec = assemble(&app, carried.instance(), &self.paths, credentials);
         let id = carried.id();
         let status = carried.status();
+        // `None` for a blob written before this daemon carried a swap at
+        // all, which said the same thing by refusing to carry one; see
+        // `CarriedSheep::reload`.
+        let reload = carried.reload().unwrap_or(ReloadState::None);
         let mut entry = ProcessEntry {
             id,
             spec: app.clone(),
@@ -3561,9 +3631,15 @@ impl<R: ProcessRunner> Actor<R> {
             // app amnesty it did not earn), while the window it is counted
             // over is a run of wall-clock this image did not observe.
             budget: RestartBudget::default(),
-            // Phase 2a's fitness gate refuses to carry a flock with a reload
-            // in flight, so there is no reload state to restore.
-            reload: ReloadState::None,
+            // Restored, and it is the marker that decides where this
+            // instance's next exit goes: `handle_exited` routes a `Drainee`
+            // to `reap_drainee` and reads a `Replacement` out of the swap,
+            // where an entry carrying `None` takes `decide_on_exit` instead
+            // — which for an `autorestart` app respawns the old code into a
+            // slot the replacement owns. The job the two halves belong to is
+            // restored separately, after every sheep is installed: see
+            // `install_carried_reloads`.
+            reload,
             credentials: carried.credentials(),
             out_file: spec.out_file.clone(),
             err_file: spec.err_file.clone(),
@@ -3702,16 +3778,24 @@ impl<R: ProcessRunner> Actor<R> {
         // to carry a `Starting` sheep at all, which restarts a whole flock
         // over one app in its first three seconds.
         //
-        // `manually` is `false` and cannot be anything else: it belongs to
-        // the spawn that armed the original wait, which is not this image's
-        // to know. It reaches only the `Online` event's own flag.
+        // `manually` reaches only the `Online` event's own flag, and it is
+        // knowable for exactly one of the two shapes that reach here. An
+        // ordinary `Starting` sheep's flag belongs to the spawn that armed
+        // the original wait, which is not this image's to know, so it is
+        // `false`. A REPLACEMENT's is knowable: `spawn_replacement` passes
+        // `true` unconditionally, because a reload is an operator's doing,
+        // so a carried `Replacement` marker is the same claim arriving by a
+        // different route. Reporting `false` there would broadcast an
+        // operator's deploy as the daemon's own doing, which is the lie the
+        // flag exists to prevent.
+        let manually = matches!(reload, ReloadState::Replacement);
         let ready_tx = (status == ProcStatus::Starting).then(|| {
             let source = ReadinessSource::of(app.config())
                 .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
             spawn_readiness_task(
                 id,
                 carried.epoch(),
-                false,
+                manually,
                 source,
                 app.config().listen_timeout.as_duration(),
                 spec_prober(&spec),
@@ -3787,14 +3871,31 @@ impl<R: ProcessRunner> Actor<R> {
         // repeated `SIGTERM` (or one repeated `{"kind":"shutdown"}`) to a
         // child that is already on its way out.
         //
-        // `LadderCap::Stop` and not the app's `graceful_timeout`, because
-        // every marker the gate can carry today was claimed under that cap:
-        // the two sites that pass `LadderCap::Drain` are a reload's drain,
-        // and both leave `ReloadState::Drainee` on the entry, which
-        // `handover::fitness` still refuses as `ReloadInFlight`. The task
-        // that removes that refusal has to revisit this line.
+        // The cap comes off the ROLE, because the role is the only record of
+        // which ask is in hand. Both sites that pass `LadderCap::Drain` are
+        // a reload's drain and both leave `ReloadState::Drainee` on the
+        // entry, so a carried drainee is an instance that was asked to
+        // finish the work it already had and go — `graceful_timeout`'s own
+        // definition — while everything else was asked under `kill_timeout`.
+        // This line read `LadderCap::Stop` unconditionally while the gate
+        // still refused a flock mid-reload, and said at the time that the
+        // task removing that refusal would have to revisit it.
+        //
+        // One residual, and it is the same unrecoverable fact as the elapsed
+        // grace above. Which cap the ladder ACTUALLY started under is not
+        // recorded anywhere: an operator's `stop` reaching a drainee during
+        // the overlap's `AwaitReady` window claims the marker first, under
+        // `LadderCap::Stop`, and the drain that follows rides that ladder
+        // rather than starting one of its own. A successor re-arming that
+        // sheep uses the drain's cap instead. The cost is bounded by
+        // whichever of the app's two timeouts is longer, and the ending is
+        // the same either way: the ladder still escalates to `SIGKILL`.
         if let Some(manual) = carried.manual() {
-            self.claim_manual(id, manual, LadderCap::Stop);
+            let cap = match reload {
+                ReloadState::Drainee { .. } => LadderCap::Drain,
+                ReloadState::None | ReloadState::Replacement => LadderCap::Stop,
+            };
+            self.claim_manual(id, manual, cap);
         }
         // The same arming a spawn gets on its way to `Online`, and for the
         // same reason: a watch, a schedule or a memory limit this image did
@@ -3805,6 +3906,111 @@ impl<R: ProcessRunner> Actor<R> {
             self.arm_extras(id);
         }
         Ok(())
+    }
+
+    /// Restores the reload jobs the blob carried, and re-arms every timer
+    /// each of them was waiting on.
+    ///
+    /// Runs after the whole flock is installed, not per sheep: a job names
+    /// two entries and reads an app's timings off one of them, so it has
+    /// nowhere to be armed until both halves are in the registry.
+    ///
+    /// # What is re-armed, and why a carried swap without this is worse than
+    /// a refused one
+    ///
+    /// Fourth and fifth instances of the class this phase exists to close: a
+    /// state whose only way forward is a `tokio::spawn`ed timer of the
+    /// predecessor's, which the `execve` takes while the successor installs
+    /// the status that timer was going to resolve.
+    ///
+    /// - **The watchdog.** [`Self::arm_reload_deadline`] is the only thing
+    ///   that ever removes a [`ReloadJob`] nothing else can finish. Without
+    ///   it a carried swap sits in its phase for the rest of this daemon's
+    ///   life, and `handle_reload` refuses on the presence of the map key —
+    ///   so that app answers `<name> is already being reloaded` forever, and
+    ///   takes `shep reload all` down with it because the refusal is
+    ///   whole-selector. The stamp is a fresh one off the carried
+    ///   `next_deadline` rather than the predecessor's, which named a timer
+    ///   that no longer exists.
+    /// - **The post-drain probe.** A swap in [`ReloadPhase::Verify`] is
+    ///   waiting on a `Msg::ReloadVerified` from
+    ///   [`Self::spawn_verify_task`], and that task went with the image too.
+    ///   Re-armed through the same [`Self::post_drain_probe`] the original
+    ///   went through, so a successor cannot answer the question differently
+    ///   from the predecessor that asked it. Without this the swap would
+    ///   reach its watchdog instead and be abandoned — the replacement left
+    ///   serving, but a `Reloaded` that never fires and a `ReloadAbandoned`
+    ///   for a deploy that actually worked.
+    ///
+    /// The readiness wait a [`ReloadPhase::AwaitReady`] swap is on is the
+    /// third, and it is re-armed a step earlier, in [`Self::install_adopted`]
+    /// with every other `Starting` sheep's.
+    ///
+    /// # Why an inherited swap is continued rather than abandoned
+    ///
+    /// `abort_reload` exists and is simpler. But a reload an operator asked
+    /// for, silently abandoned by an unrelated shepherd upgrade, is a
+    /// surprise with no notice: the flock comes back on the old code and
+    /// nothing says why. Continuing adds no failure mode the swap did not
+    /// already have, because the watchdog above IS the ending an unfinishable
+    /// swap gets with or without a handover.
+    ///
+    /// # The one job that is dropped
+    ///
+    /// A job whose swap names no registered entry at all. It cannot be
+    /// produced by a snapshot — that is taken on the actor loop, so a job and
+    /// the entries it names are read in one step — but the blob is a file,
+    /// and this is the same residual `refuse_repeated_fds` guards on the
+    /// descriptor side. Dropping it is the ending the watchdog would give it
+    /// anyway; keeping it would leave an app permanently unreloadable, and
+    /// arming against a missing entry would panic.
+    #[cfg(unix)]
+    fn install_carried_reloads(&mut self, reloads: Vec<CarriedReload>) {
+        for carried in reloads {
+            let CarriedReload {
+                app,
+                queue,
+                mode,
+                swap,
+            } = carried;
+            // The replacement first, because it is the half that exists in
+            // every phase but `DrainFirst`. Either will do — they are two
+            // instances of one app and carry the same `ResolvedApp` — so
+            // this is about which one is REGISTERED: a serial reload
+            // deregisters its drainee at `ReapOld` and keeps the job, so
+            // `old_id` is a dangling id by design from `AwaitReady` onwards.
+            let anchor = swap
+                .new_id
+                .filter(|id| self.sheep.contains_key(id))
+                .or_else(|| self.sheep.contains_key(&swap.old_id).then_some(swap.old_id));
+            let Some(anchor) = anchor else {
+                tracing::warn!(
+                    name = app,
+                    old_id = swap.old_id,
+                    new_id = swap.new_id,
+                    "a carried reload named no instance this shepherd was given, so it was                      dropped rather than left unfinishable"
+                );
+                continue;
+            };
+            self.reloads.insert(
+                app.clone(),
+                ReloadJob {
+                    queue: queue.into_iter().collect(),
+                    mode,
+                    swap,
+                    // Overwritten by the arm below, which is the one site
+                    // that stamps a live watchdog.
+                    deadline: 0,
+                },
+            );
+            self.arm_reload_deadline(&app, anchor);
+            if swap.phase == ReloadPhase::Verify
+                && let Some(new_id) = swap.new_id
+                && let Some(source) = self.post_drain_probe(new_id, mode)
+            {
+                self.spawn_verify_task(&app, new_id, source);
+            }
+        }
     }
 
     /// Respawns an already-registered id in place: reassembles from its
@@ -6097,6 +6303,27 @@ impl<R: ProcessRunner> Actor<R> {
         // a file an operator may read: id order makes two snapshots of an
         // unchanged flock identical.
         drafts.sort_unstable_by_key(|draft| draft.entry.id);
+        // Read here, on the actor loop, in the same synchronous step as the
+        // entries above: a job and the two entries it names are one picture,
+        // and reading them a moment apart would let a swap finish between
+        // the two halves of the description of it.
+        let mut reloads: Vec<CarriedReload> = self
+            .reloads
+            .iter()
+            .map(|(app, job)| CarriedReload {
+                app: app.clone(),
+                queue: job.queue.iter().copied().collect(),
+                mode: job.mode,
+                swap: job.swap,
+                // `ReloadJob::deadline` is deliberately absent: it stamps a
+                // timer that dies with this image, and the successor takes a
+                // fresh stamp off the carried `next_deadline` when it
+                // re-arms. See `CarriedReload`'s own doc.
+            })
+            .collect();
+        // `HashMap` iteration order is arbitrary, for the reason the sheep
+        // are sorted a few lines up.
+        reloads.sort_unstable_by(|left, right| left.app.cmp(&right.app));
         spawn_handover_task(
             drafts,
             fds,
@@ -6105,6 +6332,7 @@ impl<R: ProcessRunner> Actor<R> {
                 next_deadline: self.next_deadline,
                 next_action_stamp: self.next_action_stamp,
             },
+            reloads,
             reply,
         );
     }
@@ -7936,6 +8164,7 @@ fn spawn_handover_task(
     drafts: Vec<HandoverDraft>,
     fds: DaemonFds,
     counters: Counters,
+    reloads: Vec<CarriedReload>,
     reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
 ) {
     tokio::spawn(async move {
@@ -8000,7 +8229,7 @@ fn spawn_handover_task(
                 parked.0.push(log_ctl);
             }
         }
-        let blob = Handover::new(carried, fds, counters);
+        let blob = Handover::new(carried, fds, counters, reloads);
         let _ = reply.send(Ok((candidates, blob, parked)));
     });
 }
@@ -18095,6 +18324,7 @@ mod tests {
                     entry.status = ProcStatus::Starting;
                 }))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18224,6 +18454,7 @@ mod tests {
                     without_handles(carried("api", 8, Some(4243), |_| {})),
                 ],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18262,6 +18493,7 @@ mod tests {
                     });
                 }))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18311,6 +18543,7 @@ mod tests {
             .spawn_adopted(
                 vec![without_handles(carried("web", 7, Some(pid), |_| {}))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18382,6 +18615,7 @@ mod tests {
                     |_| {},
                 ))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18532,6 +18766,7 @@ mod tests {
                     respawnable(|app| app.autorestart = true),
                 ))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18627,6 +18862,7 @@ mod tests {
                     }),
                 ))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18685,6 +18921,7 @@ mod tests {
                     respawnable(|app| app.autorestart = false),
                 ))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18737,6 +18974,7 @@ mod tests {
             .spawn_adopted(
                 vec![without_handles(carried("web", 7, Some(4242), |_| {}))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18773,6 +19011,7 @@ mod tests {
                     entry.status = ProcStatus::WaitingRestart;
                 }))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18792,5 +19031,635 @@ mod tests {
             Some(STAND_IN_SPAWN_PID),
             "the restart must be a real respawn, not a status edit: {info:?}"
         );
+    }
+
+    // --- a swap in flight, carried across the exec ----------------------
+
+    /// Fails if a snapshot taken while an app is mid-swap describes the
+    /// flock as though nothing were.
+    ///
+    /// The other side of every case below, and it is a separate assertion
+    /// rather than an implied one: they all hand `spawn_adopted` a job built
+    /// by hand, so a snapshot that silently reported no reloads at all would
+    /// leave every one of them green while no live handover ever carried a
+    /// swap.
+    ///
+    /// A SERIAL drain is what holds still long enough to be snapshotted. The
+    /// app configures a `readiness_probe` and no `reuse_port`, which is the
+    /// one arrangement `ReloadMode::of` sends down the serial ordering, so
+    /// the reload's first act is to drain the instance rather than to spawn
+    /// beside it — and [`ProcScript::never_reports_its_exit`] models the one
+    /// child a kill ladder cannot end, so the swap stays in
+    /// [`ReloadPhase::DrainFirst`] instead of advancing under the snapshot.
+    ///
+    /// A real clock, unlike its neighbours: a paused one auto-advances
+    /// whenever every task is idle, and the awaits inside
+    /// `handover_snapshot` are exactly such a window — the first draft of
+    /// this case reached `DrainOld` with a replacement already spawned. The
+    /// short `listen_timeout` is what keeps the real-clock cost at a
+    /// fraction of a second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_snapshot_taken_mid_swap_carries_the_job_and_the_markers() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_reports_its_exit(); 2]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.listen_timeout = UpDuration::from_millis(200);
+        app.readiness_probe = Some(probe_config(ProbeKind::Tcp, "127.0.0.1:9"));
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        // A probed app is `Starting` until its probe answers or
+        // `listen_timeout` elapses, and `reload_eligible` refuses anything
+        // that is not serving — so without this the reload would skip the
+        // only instance there is and end before it began.
+        let online = loop {
+            let info = handle.list().await;
+            if info[0].status == ProcStatus::Online {
+                break info;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let old_id = online[0].id;
+
+        handle
+            .reload(ProcessSelector::All)
+            .await
+            .expect("an online app reloads");
+
+        let (_candidates, blob, _parked) = handle.handover_snapshot(fds).await.unwrap();
+
+        assert_eq!(
+            blob.reloads(),
+            &[CarriedReload {
+                app: "web".to_owned(),
+                queue: Vec::new(),
+                mode: ReloadMode::Serial,
+                swap: ReloadSwap {
+                    old_id,
+                    new_id: None,
+                    phase: ReloadPhase::DrainFirst,
+                },
+            }],
+            "the job the successor continues has to be in the blob, whole"
+        );
+        assert_eq!(
+            blob.sheep()[0].reload(),
+            Some(ReloadState::Drainee { new_id: None }),
+            "and the marker that routes this instance's exit with it"
+        );
+    }
+
+    /// A carried sheep that is half of a swap, with the role and the status
+    /// the predecessor's own entry carried.
+    ///
+    /// Separate from [`carried_marked`] rather than two more arguments on
+    /// it, for the reason that split already gives: the many cases that are
+    /// about neither would otherwise grow two arguments they always pass the
+    /// same values for.
+    #[cfg(unix)]
+    fn carried_in_swap(
+        name: &str,
+        id: u32,
+        pid: Option<u32>,
+        role: ReloadState,
+        status: ProcStatus,
+        manual: Option<PendingManual>,
+        mutate: impl FnOnce(&mut ProcessEntry),
+    ) -> CarriedSheep {
+        carried_marked(name, id, pid, false, manual, move |entry| {
+            mutate(entry);
+            entry.reload = role;
+            entry.status = status;
+        })
+    }
+
+    /// One app's in-flight reload, as a blob carries it, with an empty queue.
+    ///
+    /// Empty because these cases are about ONE swap surviving the exec, and
+    /// a queue behind it would let a case pass on the next instance's swap
+    /// rather than on the carried one.
+    #[cfg(unix)]
+    fn carried_job(
+        app: &str,
+        mode: ReloadMode,
+        old_id: u32,
+        new_id: Option<u32>,
+        phase: ReloadPhase,
+    ) -> CarriedReload {
+        CarriedReload {
+            app: app.to_owned(),
+            queue: Vec::new(),
+            mode,
+            swap: ReloadSwap {
+                old_id,
+                new_id,
+                phase,
+            },
+        }
+    }
+
+    /// Fails if a carried swap is left in its phase with nothing that can
+    /// ever end it.
+    ///
+    /// The watchdog is a `tokio::spawn`ed sleep of the predecessor's, and
+    /// the `execve` takes it — the same class as the readiness wait, the
+    /// pending restart and the kill ladder before it. This is the one that
+    /// makes carrying a swap safe at all: with the job restored and no timer
+    /// over it, an instance that never exits leaves a `ReloadJob` nothing can
+    /// remove, and `handle_reload` refuses on the presence of the map key. So
+    /// the app answers `web is already being reloaded` for the rest of the
+    /// daemon's life, and takes `shep reload all` down with it because the
+    /// refusal is whole-selector.
+    ///
+    /// That refusal IS the assertion, in both directions: it must be there
+    /// while the job is, and gone once the watchdog has ended it. Nothing
+    /// here ever exits — [`AdoptingRunner`]'s `wait` never resolves — so the
+    /// only thing that can produce the second half is a timer this image
+    /// armed.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_carried_swap_that_cannot_finish_is_still_abandoned_on_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried_in_swap(
+                        "web",
+                        7,
+                        Some(4242),
+                        ReloadState::Drainee { new_id: Some(8) },
+                        ProcStatus::Stopping,
+                        None,
+                        |_| {},
+                    )),
+                    without_handles(carried_in_swap(
+                        "web",
+                        8,
+                        Some(4243),
+                        ReloadState::Replacement,
+                        ProcStatus::Online,
+                        None,
+                        |_| {},
+                    )),
+                ],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::DrainOld,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        let refused = sup.reload(ProcessSelector::All).await;
+        assert!(
+            matches!(refused, Err(SupervisorError::ReloadInFlight(ref name)) if name == "web"),
+            "the carried job must be in the map, or this case proves nothing: {refused:?}"
+        );
+
+        // Parking on `recv` is what advances the paused clock, so this waits
+        // out `listen_timeout + graceful_timeout + RELOAD_DEADLINE_SLACK`
+        // (16s at the defaults) without costing the suite a millisecond.
+        // Bounded well past that, and the bound is load-bearing rather than
+        // belt-and-braces: with no timer armed at all there is nothing for
+        // the paused clock to advance TO, so an unbounded wait here would
+        // hang the whole suite instead of failing this case.
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            await_event(&mut rx, 8, ProcessEventKind::ReloadAbandoned),
+        )
+        .await
+        .expect("a carried swap must still be bounded by a watchdog this image armed");
+
+        sup.reload(ProcessSelector::All)
+            .await
+            .expect("once the watchdog has ended the job, the app must be reloadable again");
+    }
+
+    /// Fails if a carried reload naming no registered instance panics or is
+    /// kept.
+    ///
+    /// A snapshot cannot produce one: it is taken on the actor loop, so a
+    /// job and the entries it names are read in one step. The blob is a
+    /// file, though, and this is the same residual `refuse_repeated_fds`
+    /// guards on the descriptor side. Keeping such a job would leave the app
+    /// permanently unreloadable, and arming a watchdog against an entry that
+    /// is not there panics — so the reload below is the assertion, and a
+    /// build without the guard fails it by aborting rather than by refusing.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_carried_reload_naming_no_registered_instance_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, Some(4242), |_| {}))],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    98,
+                    Some(99),
+                    ReloadPhase::DrainOld,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        sup.reload(ProcessSelector::All)
+            .await
+            .expect("a job naming nothing must be dropped, not left refusing every later reload");
+    }
+
+    /// Fails if a carried swap in [`ReloadPhase::Verify`] is left to its
+    /// watchdog instead of being asked again.
+    ///
+    /// The second timer an overlapping probed reload arms, and the one a
+    /// half fix misses: `spawn_verify_task` is a task of the predecessor's
+    /// too, so a successor that re-arms only the watchdog abandons a deploy
+    /// that actually worked — the replacement stays serving, but the
+    /// `Reloaded` never fires, the rest of a clustered app's queue is
+    /// dropped, and the operator gets a `ReloadAbandoned` for a swap whose
+    /// replacement is fine.
+    ///
+    /// A real listener and a real clock. The probe answers in microseconds
+    /// where the watchdog is `listen_timeout + graceful_timeout +
+    /// RELOAD_DEADLINE_SLACK` (16s at the defaults), so the bound below
+    /// separates the two by an order of magnitude without depending on how
+    /// fast the host is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_swap_in_verify_is_asked_again_rather_than_abandoned() {
+        let probe_target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe_target.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        // Bound, never used: this case asserts on the bus rather than on the
+        // flock, and dropping the handle would take a sender off the actor's
+        // mailbox for no reason.
+        let _sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_in_swap(
+                    "web",
+                    8,
+                    Some(4243),
+                    ReloadState::Replacement,
+                    ProcStatus::Online,
+                    None,
+                    move |entry| {
+                        let mut app = AppConfig::minimal("web", "./srv");
+                        app.autorestart = false;
+                        // `Probe` readiness alone takes the serial ordering,
+                        // which has no post-drain probe to re-arm;
+                        // `reuse_port` is what puts this app on the
+                        // overlapping one, where the drainee may have
+                        // answered the first probe on the replacement's
+                        // behalf.
+                        app.reuse_port = true;
+                        app.readiness_probe = Some(probe_config(ProbeKind::Tcp, &addr.to_string()));
+                        entry.spec = normalize(app).unwrap();
+                    },
+                ))],
+                counters(9),
+                // No drainee: `Verify` is entered once the drainee is
+                // reaped, which is the whole point of asking again with one
+                // process left.
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::Verify,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            await_event(&mut rx, 8, ProcessEventKind::Reloaded),
+        )
+        .await
+        .expect("a carried swap in Verify must be probed again, not left to its watchdog");
+    }
+
+    /// Fails if a carried serial drain never spawns the replacement it was
+    /// draining for.
+    ///
+    /// [`ReloadPhase::DrainFirst`] is the one phase with no replacement yet:
+    /// the marker on the entry is `Drainee { new_id: None }`, and it is what
+    /// routes this instance's exit to `reap_drainee` — and so to
+    /// `spawn_serial_replacement` — instead of to `decide_on_exit`. A
+    /// successor that dropped it would deregister a `Stopping` sheep and
+    /// leave the instance slot empty, with the job still in the map.
+    ///
+    /// A real child and the real runner, for the reason
+    /// [`a_carried_manual_stop_stops_the_sheep_instead_of_respawning_it`]
+    /// gives: only the real reaper's `Msg::Exited` proves a carried marker
+    /// reaches `handle_exited`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_serial_drain_still_spawns_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let pid = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_in_swap(
+                    "web",
+                    7,
+                    Some(pid),
+                    ReloadState::Drainee { new_id: None },
+                    ProcStatus::Stopping,
+                    Some(PendingManual {
+                        kind: ManualKind::Stop,
+                        origin: CommandOrigin::Operator,
+                    }),
+                    swappable,
+                ))],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Serial,
+                    7,
+                    None,
+                    ReloadPhase::DrainFirst,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        let info = flock_until(
+            &sup,
+            |info| info.len() == 1 && info[0].id != 7,
+            "a carried serial drain must spawn its replacement once the instance it drained goes",
+        )
+        .await;
+
+        assert_eq!(
+            info[0].id, 9,
+            "the replacement takes the next carried id, not a reissued one"
+        );
+        assert_eq!(
+            info[0].restarts, 0,
+            "a reload is not a restart, so the count carries across the swap unchanged"
+        );
+        assert_ne!(info[0].pid, Some(pid), "the replacement is a new process");
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a carried replacement still awaiting readiness never commits
+    /// its swap.
+    ///
+    /// Three things have to survive for this to pass, and each one alone
+    /// leaves the operator worse off than the refusal it replaces:
+    ///
+    /// 1. The readiness wait is re-armed. `install_adopted` does that for
+    ///    every `Starting` sheep, and without it the replacement sits
+    ///    `Starting` forever with the drainee still serving beside it —
+    ///    two live instances of a one-instance app.
+    /// 2. The `Replacement` marker is restored, or `handle_ready_result`
+    ///    takes the ordinary path: the sheep goes `Online` and the swap
+    ///    never commits, so the drainee is never drained. The `manually`
+    ///    flag asserted below is that route's own fingerprint —
+    ///    `spawn_replacement` passes `true` because a reload is an
+    ///    operator's doing, and an adopted sheep that is not a replacement
+    ///    is armed with `false`.
+    /// 3. The job is restored, or `reload_ready_result` finds no reload to
+    ///    belong to and takes the same ordinary transition.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_replacement_awaiting_readiness_commits_its_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        let drainee = adoptable_child("sleep 30");
+        let replacement = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried_in_swap(
+                        "web",
+                        7,
+                        Some(drainee),
+                        ReloadState::Drainee { new_id: Some(8) },
+                        ProcStatus::Stopping,
+                        // No marker: an overlapping swap does not ask the
+                        // drainee to go until its replacement is serving.
+                        None,
+                        swappable,
+                    )),
+                    without_handles(carried_in_swap(
+                        "web",
+                        8,
+                        Some(replacement),
+                        ReloadState::Replacement,
+                        ProcStatus::Starting,
+                        None,
+                        swappable,
+                    )),
+                ],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::AwaitReady,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        let manually = tokio::time::timeout(
+            Duration::from_secs(20),
+            await_event(&mut rx, 8, ProcessEventKind::Online),
+        )
+        .await
+        .expect("a carried replacement must still resolve its readiness after the exec");
+        assert!(
+            manually,
+            "a replacement's Online is an operator's doing; reporting otherwise broadcasts a \
+             deploy as the daemon's own"
+        );
+
+        let info = flock_until(
+            &sup,
+            |info| info.len() == 1,
+            "committing the swap must drain the instance it replaced",
+        )
+        .await;
+        assert_eq!(info[0].id, 8, "the replacement is what is left: {info:?}");
+        assert_eq!(info[0].pid, Some(replacement));
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a carried drainee's exit does not finish the swap it was
+    /// half of.
+    ///
+    /// [`ReloadPhase::DrainOld`] is the committed phase: the replacement is
+    /// serving and the instance it replaced is on its ladder. The
+    /// `Drainee` marker is what sends that instance's exit to
+    /// `reap_drainee` rather than to `decide_on_exit`, and this app has
+    /// `autorestart` on, so a successor that dropped the marker would
+    /// respawn the OLD code into an instance slot the replacement owns —
+    /// two live processes for one instance, one of them the release the
+    /// operator was replacing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_drainee_still_finishes_its_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        let drainee = adoptable_child("sleep 30");
+        let replacement = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried_in_swap(
+                        "web",
+                        7,
+                        Some(drainee),
+                        ReloadState::Drainee { new_id: Some(8) },
+                        ProcStatus::Stopping,
+                        Some(PendingManual {
+                            kind: ManualKind::Stop,
+                            origin: CommandOrigin::Operator,
+                        }),
+                        |entry| swappable_with(entry, |app| app.autorestart = true),
+                    )),
+                    without_handles(carried_in_swap(
+                        "web",
+                        8,
+                        Some(replacement),
+                        ReloadState::Replacement,
+                        ProcStatus::Online,
+                        None,
+                        |entry| swappable_with(entry, |app| app.autorestart = true),
+                    )),
+                ],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::DrainOld,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            await_event(&mut rx, 8, ProcessEventKind::Reloaded),
+        )
+        .await
+        .expect("a carried drainee's exit must finish the swap it was half of");
+
+        let info = sup.list().await;
+        assert_eq!(
+            info.len(),
+            1,
+            "the drainee is deregistered by the swap, never respawned: {info:?}"
+        );
+        assert_eq!(info[0].id, 8);
+        assert_eq!(info[0].pid, Some(replacement));
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a carried drainee's ladder is re-armed under `kill_timeout`
+    /// rather than `graceful_timeout`.
+    ///
+    /// The cap is not recorded anywhere, so it is derived from the role: a
+    /// `Drainee` is an instance that was asked to finish the work already in
+    /// hand and go, which is `graceful_timeout`'s own definition, and both
+    /// sites that pass `LadderCap::Drain` leave that marker on the entry.
+    /// This line read `LadderCap::Stop` unconditionally while a flock
+    /// mid-reload was still refused outright.
+    ///
+    /// The child ignores `SIGTERM`, so only the escalation can end it, and
+    /// the app's two timeouts are three orders of magnitude apart: under the
+    /// drain's cap the `SIGKILL` lands a quarter of a second in, and under
+    /// the stop's it would land five minutes later — well past
+    /// [`flock_until`]'s own bound, which is what fails the case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_drainee_is_capped_by_graceful_timeout_not_kill_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let drainee = adoptable_child("trap '' TERM; sleep 300");
+        let replacement = adoptable_child("sleep 30");
+        let capped = |entry: &mut ProcessEntry| {
+            swappable_with(entry, |app| {
+                app.graceful_timeout = UpDuration::from_millis(250);
+                app.kill_timeout = UpDuration::from_millis(300_000);
+            });
+        };
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried_in_swap(
+                        "web",
+                        7,
+                        Some(drainee),
+                        ReloadState::Drainee { new_id: Some(8) },
+                        ProcStatus::Stopping,
+                        Some(PendingManual {
+                            kind: ManualKind::Stop,
+                            origin: CommandOrigin::Operator,
+                        }),
+                        capped,
+                    )),
+                    without_handles(carried_in_swap(
+                        "web",
+                        8,
+                        Some(replacement),
+                        ReloadState::Replacement,
+                        ProcStatus::Online,
+                        None,
+                        capped,
+                    )),
+                ],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::DrainOld,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        flock_until(
+            &sup,
+            |info| info.len() == 1,
+            "a carried drainee must escalate at graceful_timeout, not at kill_timeout",
+        )
+        .await;
+
+        sup.shutdown().await;
+    }
+
+    /// The app a carried swap's two halves run: a real `sleep`, so a
+    /// replacement can actually be spawned and a drainee actually signalled,
+    /// and a `listen_timeout` short enough that a real-clock case does not
+    /// wait out the 3s default.
+    #[cfg(unix)]
+    fn swappable(entry: &mut ProcessEntry) {
+        swappable_with(entry, |_| {});
+    }
+
+    /// [`swappable`], with `mutate` free to change the app first.
+    #[cfg(unix)]
+    fn swappable_with(entry: &mut ProcessEntry, mutate: impl FnOnce(&mut AppConfig)) {
+        let mut app = AppConfig::minimal("web", "/bin/sh");
+        app.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+        app.autorestart = false;
+        app.listen_timeout = UpDuration::from_millis(200);
+        mutate(&mut app);
+        entry.spec = normalize(app).unwrap();
     }
 }

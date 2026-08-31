@@ -503,6 +503,7 @@ mod tests {
             fds,
             pending_delete: Some(false),
             manual: None,
+            reload: Some(crate::entry::ReloadState::None),
             app: crate::testing::app_with("web", |_| {}).into_config(),
         }
     }
@@ -524,6 +525,7 @@ mod tests {
             next_id: 9,
             next_deadline: 5,
             next_action_stamp: 2,
+            reloads: Some(Vec::new()),
         }
     }
 
@@ -1132,6 +1134,7 @@ mod tests {
                 next_id: 9,
                 next_deadline: 5,
                 next_action_stamp: 2,
+                reloads: Some(Vec::new()),
             }
         }
     }
@@ -1186,6 +1189,40 @@ mod tests {
         let predecessor = Predecessor::new();
 
         dry_run(&predecessor.blob()).expect("every descriptor here is the kind its slot wants");
+    }
+
+    /// Fails if a blob describing a flock mid-reload stops surviving the
+    /// reparse the rehearsal runs it through.
+    ///
+    /// The rehearsal is the predecessor running the successor's OWN checks
+    /// while there is still an image to refuse back to, and one of those
+    /// checks is the parse: it reads the whole blob back through
+    /// [`Handover::load_value`] before rehearsing a single descriptor. So a
+    /// swap in flight is covered by the rehearsal for free — nothing about a
+    /// carried reload is a descriptor, and `adopt` gains no refusal for one
+    /// — but "for free" is a claim that has to be pinned rather than
+    /// asserted, because the cost of it being wrong is the successor
+    /// refusing to boot with the predecessor already gone.
+    #[tokio::test]
+    async fn a_blob_carrying_a_swap_in_flight_passes_the_rehearsal() {
+        use crate::entry::ReloadState;
+        use crate::supervisor::{CarriedReload, ReloadMode, ReloadPhase, ReloadSwap};
+
+        let predecessor = Predecessor::new();
+        let mut blob = predecessor.blob();
+        blob.sheep[0].reload = Some(ReloadState::Drainee { new_id: Some(9) });
+        blob.reloads = Some(vec![CarriedReload {
+            app: "web".to_owned(),
+            queue: vec![4, 5],
+            mode: ReloadMode::Overlap,
+            swap: ReloadSwap {
+                old_id: 1,
+                new_id: Some(9),
+                phase: ReloadPhase::DrainOld,
+            },
+        }]);
+
+        dry_run(&blob).expect("a flock mid-reload is one a successor can adopt");
     }
 
     /// The whole reason the rehearsal runs against duplicates: the

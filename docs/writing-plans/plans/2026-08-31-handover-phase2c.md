@@ -319,12 +319,12 @@ drill can stand on.
 
 Third instance of the timer-strand class. The stamp counter is already carried (2a's `Counters::next_deadline`), so this is a re-arm, not a carry.
 
-- [ ] **Step 1: Write the failing test.** A carried swap past its deadline is abandoned, rather than sitting in its phase forever.
-- [ ] **Step 2: Run it, watch it fail.**
-- [ ] **Step 3: Implement** the re-arm, from the same `listen_timeout + graceful_timeout + RELOAD_DEADLINE_SLACK` the original used. **Note the Overlap+probe case arms twice** (`:5380`); a re-arm that handles only the first is a half fix.
-- [ ] **Step 4: Prove it non-vacuous.**
-- [ ] **Step 5: Real reload,** measured the way task 8 measured the restart strand: a control daemon that was not reloaded, and a real wall clock.
-- [ ] **Step 6: Commit.**
+- [x] **Step 1: Write the failing test.** A carried swap past its deadline is abandoned, rather than sitting in its phase forever.
+- [x] **Step 2: Run it, watch it fail.**
+- [x] **Step 3: Implement** the re-arm, from the same `listen_timeout + graceful_timeout + RELOAD_DEADLINE_SLACK` the original used. **Note the Overlap+probe case arms twice** (`:5380`); a re-arm that handles only the first is a half fix.
+- [x] **Step 4: Prove it non-vacuous.**
+- [x] **Step 5: Real reload,** measured the way task 8 measured the restart strand: a control daemon that was not reloaded, and a real wall clock.
+- [x] **Step 6: Commit.**
 
 ### Task 4: a swap in flight
 
@@ -332,14 +332,312 @@ Third instance of the timer-strand class. The stamp counter is already carried (
 
 The hard one, and it depends on task 3 because a carried swap with no watchdog is worse than a refused one.
 
-Carry, per D3: each entry's `ReloadState`, and the `ReloadJob` for each app mid-swap — `queue`, `mode`, `swap { old_id, new_id, phase }`. The ids are entry ids and 2a already carries `next_id`, so they stay valid across the exec.
+Carry, per D3: each entry's `ReloadState`, and the `ReloadJob` for each app mid-swap: `queue`, `mode`, `swap { old_id, new_id, phase }`. The ids are entry ids and 2a already carries `next_id`, so they stay valid across the exec.
 
-- [ ] **Step 1: Write the failing tests**, one per `ReloadPhase`. `DrainFirst`, `AwaitReady`, `DrainOld` and `Verify` fail differently and a single case will not cover them.
-- [ ] **Step 2: Run them, watch them fail.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Prove each non-vacuous.** Report which mutations only the end-to-end tier catches; 2b found several that all 646 lib tests missed.
-- [ ] **Step 5: Real reload in each phase**, both `Serial` and `Overlap`, with pids checked on both halves of every swap.
-- [ ] **Step 6: Commit.**
+- [x] **Step 1: Write the failing tests**, one per `ReloadPhase`. `DrainFirst`, `AwaitReady`, `DrainOld` and `Verify` fail differently and a single case will not cover them.
+- [x] **Step 2: Run them, watch them fail.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Prove each non-vacuous.** Report which mutations only the end-to-end tier catches; 2b found several that all 646 lib tests missed.
+- [x] **Step 5: Real reload in each phase**, both `Serial` and `Overlap`, with pids checked on both halves of every swap.
+- [x] **Step 6: Commit.**
+
+##### Outcome
+
+**Three timers, not one, and the brief named one of them.** The mapped facts
+held (`ReloadState` on the entry, `ReloadJob` per app, the ids valid across
+the exec), but the count of what the exec strands was short. A swap is driven
+by whichever of three tasks its phase is waiting on:
+
+| phase | what ends it | where the re-arm is |
+|---|---|---|
+| `DrainFirst` | the drainee's own exit, produced by its kill ladder | task 2's `claim_manual`, now under the drain's cap |
+| `AwaitReady` | `Msg::ReadyResult` from a readiness task | `install_adopted`, already there since 2b task 5 for every `Starting` sheep |
+| `DrainOld` | the drainee's exit again | as `DrainFirst` |
+| `Verify` | `Msg::ReloadVerified` from `spawn_verify_task` | **new**, `install_carried_reloads` |
+| any of the four | `Msg::ReloadDeadline`, if none of the above ever comes | **new**, `install_carried_reloads` |
+
+So `AwaitReady` needed no new code at all: a carried replacement is a
+`Starting` sheep, and the wait 2b re-armed for those is the same wait. The
+post-drain probe is the one the brief did not name, and it is a fourth
+instance of the class rather than a detail of the third. A successor that
+re-armed only the watchdog would abandon a deploy whose replacement is fine,
+16s later, with a `ReloadAbandoned` for a swap that had already worked.
+Drill 5 below measures exactly that gap.
+
+**`ReloadJob::deadline` is deliberately not carried**, which is the one field
+of the four that does not cross. It stamps a timer that dies with the image,
+and the successor takes a fresh stamp off the carried `next_deadline` when it
+arms its own. Carrying it would name a watchdog that does not exist.
+
+**D3's "continue" held in all four phases, and two of them were not obvious.**
+`DrainFirst` and `DrainOld` both route on the `Drainee` marker, which is what
+sends the exit to `reap_drainee` rather than to `decide_on_exit`, and for an
+`autorestart` app the latter respawns the old code into a slot the
+replacement owns. `AwaitReady` routes on `Replacement`, which is what
+`handle_ready_result` reads to send the result to `reload_ready_result`
+instead of straight to `Online`. `Verify` needed the probe above. Nothing in
+any of the four turned out to be unsound, so the escape hatch was not used.
+
+**One residual is worth naming, and it is 2b task 5's own race widened.** The
+blob is a snapshot taken on the actor loop, so a `{"kind":"ready"}` that
+arrives between it and the exec flips the predecessor's slot without reaching
+the blob. For an ordinary `Starting` sheep that costs one `listen_timeout` of
+`Starting` and then `Online` anyway. For a `wait_ready` REPLACEMENT it costs
+the reload: the signal is not sent twice, the successor's re-armed wait times
+out, and `reload_ready_result` reads a `TimedOut` replacement as a failure and
+abandons: the drainee goes back to serving and the replacement is killed. The
+window is narrow (the mailbox is FIFO, so it is only the gap between the child
+writing and the readiness task reporting, plus the snapshot's own descriptor
+sweep), the ending is one the reload already has when a ready signal is
+genuinely lost, and the operator gets a `ReloadAbandoned` rather than silence.
+Recorded rather than fixed: closing it would mean carrying "readiness already
+resolved" as a fact separate from the status, which is a wider change than
+this residual is worth.
+
+**Task 2's `LadderCap::Stop` line, revisited as its call site asked.** The cap
+now comes off the role: `ReloadState::Drainee` takes `LadderCap::Drain`,
+everything else keeps `Stop`. That is the same rule the two live sites follow
+(both pass `Drain`, and both leave `Drainee` on the entry), read backwards
+from the marker, which is the only record of which ask is in hand. The
+residual is the same shape as the elapsed grace task 2 could not recover:
+which cap the ladder ACTUALLY started under is recorded nowhere, and an
+operator's `stop` reaching a drainee during the overlap's `AwaitReady` window
+claims the marker first, under `kill_timeout`, with the drain that follows
+riding that ladder. A successor re-arming that sheep uses `graceful_timeout`
+instead. The cost is bounded by whichever of the two is longer and the ending
+is the same either way. Drill 4b measures the cap live, against an app whose
+two timeouts are 8s and 120s.
+
+**`manually` is knowable for a replacement, and was `false`.**
+`install_adopted` arms a carried `Starting` sheep's readiness with
+`manually: false`, on the argument that the flag belongs to the spawn that
+armed the original wait and is not this image's to know. That is right for an
+ordinary sheep and wrong for a replacement: `spawn_replacement` passes `true`
+unconditionally, because a reload is an operator's doing, so a carried
+`Replacement` marker is the same claim arriving by a different route. Left
+alone it would have broadcast an operator's deploy as the daemon's own.
+
+**A carried job naming no registered instance is dropped rather than
+refused.** A snapshot cannot produce one, because the job and the entries it
+names are read in one synchronous step on the actor loop. But a blob is a file,
+and this is the residual `refuse_repeated_fds` already guards on the
+descriptor side. Note that "registered" is weaker than it looks: a SERIAL
+reload deregisters its drainee at `ReapOld` and keeps the job, so `swap.old_id`
+is a dangling id by design from `AwaitReady` onwards, and the anchor the
+watchdog reads its timings off is `new_id` first, `old_id` only as a fallback.
+That asymmetry is why this is a drop-with-a-warning rather than a validation:
+the invariants are mode- and phase-dependent, and a second statement of them
+in `adopt` would be exactly the drift task 5 was told not to ship.
+
+**Which is also why `handover::adopt::dry_run` needed no change, and the
+reason is not "nothing was added".** The rehearsal runs the successor's own
+checks, and the successor gains no new refusal here. What it does gain is two
+new fields in a blob it parses, and the rehearsal already covers those for
+free: `dry_run` reads the whole blob back through `Handover::load_value`
+before rehearsing a single descriptor, so a `reloads` array or a `reload`
+marker that could not survive the round trip is refused before the exec like
+anything else. `a_blob_carrying_a_swap_in_flight_passes_the_rehearsal` pins
+that claim rather than leaving it asserted.
+
+**`VERSION` unmoved**, on tasks 1 and 2's precedent exactly. Two `Option`
+fields, `CarriedSheep::reload` and `Handover::reloads`, where an absent key
+loads as `None`, and `None` is what a predecessor that refused to carry a swap
+at all truthfully meant. `ReloadState`, `ReloadMode`, `ReloadSwap` and
+`ReloadPhase` gained `Serialize`/`Deserialize` and `snake_case`, matching
+`ProcStatus`'s spelling in the same blob. Nothing on any of them is sensitive
+(an app name, two entry ids and three closed enums), so a derived `Debug` is
+the deliberate answer for IR-41.
+
+**One new Windows dead-code warning, scoped rather than blanket-allowed.**
+Both sites that build a `CarriedReload` are `cfg(unix)` while the type travels
+on `Handover`, which is not, so a Windows target reports it as never
+constructed. `#[cfg_attr(not(unix), expect(dead_code, ...))]`: an `expect`
+rather than an `allow` so a Windows handover would have to delete the line
+rather than inherit it, and scoped to the target where it is genuinely dead
+rather than hiding anything on unix.
+
+**Tasks 3 and 4 are one commit, as the plan's own correction said.** Removing
+`RefusedReason::ReloadInFlight` without the two re-arms ships a swap that sits
+in its phase for the rest of the daemon's life, taking `shep reload all` down
+with it; building the re-arms without removing the refusal leaves them with
+nothing to fire against, which is task 1's mistake for the third time. A
+bisect landing between them would find a daemon that loses reloads.
+
+##### Drills, measured
+
+Release build, isolated `SHEP_HOME` at `/tmp/rl/home`. Shepherd **34375**
+throughout every drill below: it never moved across any of the seven
+handovers, which is what says a handover happened rather than a
+stop-and-start. Every `shep daemon reload` exit 0, every one answering
+`notice[reload]: the shepherd is now 0.1.20 (pid 34375)`.
+
+**Two of the eight phase-and-mode cells are unreachable by construction, and
+the drills say which.** `DrainFirst` is `Serial`-only (an overlap spawns
+before it drains) and `Verify` is `Overlap`-only (`post_drain_probe` returns
+`None` for a serial reload, which already asked with the slot empty).
+Serial's own `AwaitReady` is a single synchronous call inside `reap_drainee`,
+which moves it to `DrainOld` before returning, so it cannot be snapshotted at
+all. That leaves five reachable cells and five drills.
+
+**1. `Serial`, `DrainFirst`.** A probed app with no `reuse_port`, whose
+script traps `SIGTERM`, `graceful_timeout = 25s`.
+
+| | |
+|---|---|
+| `shep reload sticky` | serial drain begins; the sheep goes `stopping` |
+| `shep daemon reload` | 1s in, exit 0 |
+| immediately after | shepherd 34375 unmoved, sheep 34396 unmoved, still `stopping` |
+| the drain ends | within 21s of the poll starting, which began seconds after the exec, by `SIGKILL`. The child traps `SIGTERM`, so only the escalation could have ended it |
+| the replacement | id 1, pid **34917**, `online`, `restarts=0` |
+
+The replacement is the assertion: `DrainFirst` is the one phase with no
+replacement yet, so a successor that dropped the `Drainee { new_id: None }`
+marker would have deregistered a `stopping` sheep and left the instance slot
+empty.
+
+**2. `Serial`, `DrainOld`.** The drain is over, the replacement is `starting`,
+and its probe is gated on a file. `listen_timeout = 40s`.
+
+| | |
+|---|---|
+| before | shepherd 34375, replacement id 3 pid **35158** `starting` |
+| `shep daemon reload` | exit 0 |
+| immediately after | shepherd 34375 unmoved, 35158 unmoved, still `starting` |
+| the probe allowed to pass, **after the exec** | `online` within 2s, same pid |
+| the job afterwards | gone: a second `shep reload quick` was accepted rather than refused |
+
+**3. `Overlap`, `AwaitReady`.** A `wait_ready` app whose child sleeps 20s
+before writing `{"kind":"ready"}` to fd 3.
+
+| | |
+|---|---|
+| before | drainee id 5 pid **35651** `stopping`, replacement id 6 pid **36002** `starting` |
+| `shep daemon reload` | exit 0 |
+| immediately after | shepherd 34375 unmoved, **both** pids unmoved, both statuses unchanged |
+| the replacement reports ready | **after the exec**, up the carried socketpair into the successor's re-armed wait |
+| the swap completes | once the child's own 20s delay elapsed: 36002 `online`, 35651 drained and reaped, one row left |
+
+The strongest of the five. The readiness signal was written by a child the
+successor never spawned, over a descriptor the successor inherited, into a
+wait the successor armed, and it committed a swap the successor did not start.
+
+**4. `Overlap`, `DrainOld`.** Both instances up, the drainee on its ladder
+ignoring `SIGTERM`, `graceful_timeout = 30s`.
+
+| | |
+|---|---|
+| before | drainee id 7 pid **36580** `stopping`, replacement id 8 pid **36637** `online` |
+| `shep daemon reload` | exit 0 |
+| immediately after | shepherd 34375 unmoved, both pids unmoved |
+| the drain ends | **t+31s from the exec**, which is `graceful_timeout`, by `SIGKILL` |
+| afterwards | one row, 36637, unmoved and `online` |
+
+**4b. The ladder cap.** The same drill with the app's two timeouts three
+orders of magnitude apart: `graceful_timeout = 8s`, `kill_timeout = 120s`.
+
+| | |
+|---|---|
+| before | drainee 39285 `stopping`, replacement 39311 `online` |
+| after the exec | both unmoved |
+| the drainee dies | **t+8s from the exec** |
+
+8s is `graceful_timeout`. Under task 2's unconditional `LadderCap::Stop` it
+would have been 120s.
+
+**5. `Overlap`, `Verify`.** A probed `reuse_port` app, held in `Verify` by
+removing the file its probe tests for during the drain. `listen_timeout = 90s`.
+
+| | |
+|---|---|
+| in `Verify` | replacement id 14 pid **39740** `online`; a second `shep reload verified` refused: `verified is already being reloaded` |
+| `shep daemon reload` | exit 0 |
+| immediately after | shepherd 34375 unmoved, 39740 unmoved, **still refused**, so the job crossed the exec |
+| the probe allowed to pass, after the exec | the job ends **1s** later, with `reload abandoned` nowhere in the log |
+
+Without the second re-arm the job would have ended at the watchdog instead:
+`listen_timeout + graceful_timeout + RELOAD_DEADLINE_SLACK`, 105s, with a
+`ReloadAbandoned` for a swap whose replacement was serving the whole time.
+
+**The bound, with a control.** Same app, same route into `Verify`, with the
+probe now unable to pass at all: `listen_timeout = 15s`,
+`graceful_timeout = 5s`, so the three candidate endings are 15s (the probe's
+own deadline), 25s (the watchdog) and never (nothing re-armed).
+
+| | control, no daemon reload | carried, reloaded mid-`Verify` |
+|---|---|---|
+| shepherd | 34375 | 34375 → 34375 |
+| the replacement | 40857 | 42067 → 42067 |
+| the job ended | **14.8s** after `Verify` began | **15.4s** after `Verify` began |
+| the log line | `reload abandoned: the replacement did not answer its readiness probe once the instance it replaced was gone` | the same line, `new_id=22` |
+
+The offset is what discriminates, and it lands on the probe. Across all seven
+handovers: zero panics, zero "the flock is still running and nothing is
+supervising it", no `run/handover.json` left behind, and no stray sheep
+process.
+
+**What could NOT be drilled, and why it is the unit tier's job.** The
+watchdog's own trigger is a message that never comes at all, and the only
+child that produces one is wedged in uninterruptible sleep past its own
+`SIGKILL`, which is not producible on demand on a Mac. Every other ending is
+bounded
+by `listen_timeout` or `graceful_timeout`, and the watchdog is
+`listen_timeout + graceful_timeout + 5s` by construction, so it can never
+fire first against a killable child. `ProcScript::never_reports_its_exit`
+exists for exactly this and its doc says so; mutation 1 below is what proves
+the re-arm.
+
+##### Mutations
+
+Ten, each applied alone against
+`cargo test -p shep-daemon --lib --all-features -- --skip ::slow::` and
+reverted afterwards, with the file compared against a pre-mutation copy each
+time. Baseline 671 passing.
+
+| # | what was broken | what failed |
+|---|---|---|
+| 1 | `install_carried_reloads` arms no watchdog | `a_carried_swap_that_cannot_finish_is_still_abandoned_on_time` ONLY (670 pass) |
+| 2 | the `Verify` probe re-arm dropped | `a_carried_swap_in_verify_is_asked_again_rather_than_abandoned` ONLY |
+| 3 | `install_adopted` writes `ReloadState::None` over every carried marker | four: both drain cases, the serial spawn, and the `AwaitReady` commit |
+| 4 | the ladder cap hardcoded to `LadderCap::Stop` | `a_carried_drainee_is_capped_by_graceful_timeout_not_kill_timeout` ONLY |
+| 5 | `manually` hardcoded `false` for an adopted replacement | `a_carried_replacement_awaiting_readiness_commits_its_swap` ONLY, at its flag assertion |
+| 6 | `install_carried_reloads` never called | five, every carried-swap case including the watchdog |
+| 7 | `reloads` made required on the wire | `a_blob_written_before_a_swap_was_carried_still_loads`, **plus `boot::tests::a_blob_on_disk_makes_this_process_a_successor`** |
+| 8 | `sheep[].reload` made required on the wire | `a_blob_written_before_a_swap_was_carried_still_loads` ONLY |
+| 9 | the dropped-job guard removed | `a_carried_reload_naming_no_registered_instance_is_dropped`, by PANIC inside `arm_reload_deadline` rather than by assertion |
+| 10 | the snapshot reports no reloads at all | `a_snapshot_taken_mid_swap_carries_the_job_and_the_markers` ONLY |
+
+**Nothing here is caught only by the end-to-end tier, and 10 is why.** 2b's
+lesson was that the successor's arming had no unit-level cover in either
+scope, so `install_adopted` could drop `arm_extras` with all 646 lib tests
+green. The mirror of that here would have been a snapshot that carried no job:
+every one of the nine cases below it builds a `CarriedReload` by hand and
+hands it to `spawn_adopted`, so all nine stay green with the snapshot half
+deleted. `a_snapshot_taken_mid_swap_carries_the_job_and_the_markers` is the
+case that closes it, and it is the only one that drives a real reload on a
+live actor and then takes a real snapshot of it.
+
+**Two test-infrastructure findings, each of which cost a run.** An unbounded
+`await_event` under a paused clock does not fail when the timer it is waiting
+for was never armed. It HANGS, because auto-advance has nothing to advance
+to, and mutation 1 took the whole suite down with it before the wait was
+bounded. And the paused clock auto-advances inside `handover_snapshot`'s own
+awaits, so the first draft of the snapshot case reached `DrainOld` with a
+replacement already spawned before the snapshot was taken; it runs on a real
+clock with a 200ms `listen_timeout` instead.
+
+##### Docs
+
+`web/src/pages/docs/getting-started.astro` said "A dog or anything mid-reload
+sends the reload down the older path instead". This task makes the second half
+false, so the clause is gone and a dog is named alone. The generated CLI
+reference was regenerated as the docs rule requires: the only drift is the
+version banner, `0.1.18` to `0.1.20`, which is two releases of pre-existing
+staleness rather than anything this task added: no verb, flag, key, exit code
+or payload field changed. `astro build` and `astro check` both clean.
+
+**The phase is complete.** All five tasks are in, `handover::fitness` is down
+to two refusals (a wedged log pump, which is a fault rather than a gap, and a
+dog, which is phase 3's), and every refusal 2c set out to remove is gone.
 
 ### Task 5: validate before the exec
 

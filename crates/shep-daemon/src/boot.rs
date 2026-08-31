@@ -630,10 +630,11 @@ fn rehydrate(carried: Successor, paths: &ShepPaths) -> Result<Rehydrated, BootEr
         .map_err(|source| BootError::Adopt(source.to_string()))?;
     crate::handover::adopt::discard_blob(&path);
     let _ = paths;
+    let reloads = blob.reloads().to_vec();
     Ok((
         PidfileLock::from_locked(adopted.pidfile),
         Listener::from_unix_listener(adopted.listener),
-        (adopted.sheep, counters),
+        (adopted.sheep, counters, reloads),
     ))
 }
 
@@ -1216,12 +1217,12 @@ pub async fn boot<R: ProcessRunner>(
     let inherited_flock = inherited.is_some();
     #[cfg(unix)]
     let supervisor = match inherited {
-        Some((flock, counters)) => {
+        Some((flock, counters, reloads)) => {
             // Read before the flock is moved: the registry below is rebuilt
             // from these, and the roll would otherwise be written empty.
             carried_apps.extend(flock.iter().map(|sheep| sheep.carried.app().clone()));
             builder
-                .spawn_adopted(flock, counters)
+                .spawn_adopted(flock, counters, reloads)
                 .map_err(|source| BootError::Adopt(source.to_string()))?
         }
         None => builder.spawn(),
@@ -1946,7 +1947,8 @@ type InstalledSignals = (
 );
 
 /// What [`rehydrate`] rebuilds from a blob: the home's lock, the control
-/// listener, and the flock to install with the counters it ran under.
+/// listener, and the flock to install with the counters and the in-flight
+/// reloads it ran under.
 #[cfg(unix)]
 type Rehydrated = (
     PidfileLock,
@@ -1954,6 +1956,7 @@ type Rehydrated = (
     (
         Vec<crate::handover::adopt::AdoptedSheep>,
         crate::handover::Counters,
+        Vec<crate::supervisor::CarriedReload>,
     ),
 );
 
