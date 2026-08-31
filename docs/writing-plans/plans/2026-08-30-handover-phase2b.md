@@ -341,6 +341,84 @@ Fixed by visiting the pumps CONCURRENTLY (`futures_util::future::join_all`, the 
 
 Measured: six wedged pumps, serial 12s, concurrent 2s (both virtual time, under a paused tokio clock). A normal single-sheep reload (three reloads of a chatty `awk` counter, no wedged pumps) was re-run by hand to confirm the drill is unaffected: every reload exit 0, shepherd pid and sheep pid both unmoved, 25,579,208 lines with zero gaps and zero duplicates after `shep stop`.
 
+#### Task 7: dogs (NOT DONE, and the sketch's premise is wrong)
+
+- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 2: Run to verify they fail**
+- [ ] **Step 3: Implement**
+- [ ] **Step 4: Prove each one non-vacuous**
+- [ ] **Step 5: Drive a real reload, and prove the dog still works afterwards**
+- [ ] **Step 6: Task gate, then commit**
+
+##### Why it stopped, measured
+
+The sketch says dogs "survive the exec as children for free; what needs designing is their reconnect". The first half is true and the second half is not a design, it is the whole task, and it cannot be finished inside 2b.
+
+The carry itself is four lines and was built to take the measurement: strike the `entry.dog.is_some()` check in `refusal`, give `CarriedSheep` a `dog: Option<DogSource>` field, restore it in `install_adopted`. That much works. What it produces is a live dog holding a dead socket, and the two built-in dogs answer that in two different ways, one of them silently.
+
+A real flock, release build, one `awk` sheep plus both built-in dogs, one `shep daemon reload`:
+
+| | before | after |
+|---|---|---|
+| shepherd pid | 14298 | 14298 |
+| sheep `fast` pid | 14319 | 14319 |
+| `metrics` pid / restarts | 14320 / 0 | 14320 / 0 |
+| `bark` pid / restarts | 14321 / 0 | **14468 / 1** |
+| `curl /metrics` | **HTTP 200**, 1 sheep row | **HTTP 503** |
+
+The handover worked. Every pid that mattered held. And the metrics dog was dead in the only sense that counts: six scrapes over the next 30 seconds, every one a 503, `metrics-0-err.log` still **0 bytes**, nothing in the shepherd's log, and `shep dogs` reporting it `online` with a climbing uptime and zero restarts the whole time.
+
+Five more reloads on the same flock, six in total: every one exit 0, the shepherd and `fast` unmoved the whole time (`fast` at 14319 for 6m 12s), and `metrics` still `online`, still pid 14320, still **restarts 0**, uptime 6m 22s, stderr still **0 bytes**, still answering 503. Six silent breakages with no signal on either side.
+
+That is worse than G6's mismatched dog, which at least writes a line per interval to its own stderr. This one is silent on both sides. `handle_connection` answers 503 because its `Request::ListFlock` fails, which is the honest answer to a scrape and tells the operator nothing about why.
+
+`bark` survives by accident rather than by design: `EventStream` ends when the connection dies, `run_loop`'s `None` arm breaks, the dog exits 0, and `autorestart` (a dog's default, see `dogs.rs`) starts a new one that connects to the successor. It works, and nothing in the contract asked for it.
+
+It also costs a restart per reload, and that number is carried: bark read `restarts 1, 2, 3, 4, 5, 6` across those six, coming back `online` every time. The budget is never exhausted, because `install_adopted` gives every adopted entry a fresh `RestartBudget` and says why, so each successor counts a new window. But the COUNT is carried on purpose, and a healthy dog reading `restarts 20` after twenty reloads is the thing G7 is trying not to produce.
+
+##### The spec sentence that is not true
+
+G7 reads: "So every dog sees its connection drop and reconnects, **which it already does today**."
+
+It does not. There is no reconnect anywhere: not in `DogRuntime`, which connects exactly once in `start`; not in `metrics::run`, which holds an `Arc<Client>` across an `accept_forever` loop and never re-examines it; not in `bark::run_loop`, which exits instead. G6 measured `shep-log-rotate` retrying its STARTUP handshake forever, which is a different loop from a mid-life reconnect and says nothing about this window.
+
+Nor could a dog have needed one before now. Every path that removed a shepherd also removed its dogs: the stop arm respawns them, a `shep kill` takes them with it, a crash takes them with it. A dog outliving the daemon it is connected to is a situation the handover invented, which is exactly why no dog handles it.
+
+##### Why the fix cannot be built here
+
+Muteness is a dog that is alive with a dead connection. There are two ways to break it and no third: revive the connection, or end the dog. Ending the dog is a restart, which this task's own brief puts in Phase 3.
+
+So it has to be a reconnect, and the reconnect has to reach ADOPTED dogs, not only the two built-ins. shep cannot make a third-party dog reconnect and cannot tell whether one did: `Hello` carries `client_version` and `protocol` and no dog identity, so the successor cannot map a connection back to the dog that owns it. (`Request::DogConfig` does carry the name, so a successor could notice which dogs asked again. That is a reconnect DETECTOR, which is G8's machinery, and it needs a deadline and a decision about what to do with the answer.)
+
+The one place a reconnect reaches every dog for free is `shep-client`, which every dog links and which G9 already establishes is picked up by a plain `cargo install <dog>`. The contract would not change at all. But an actor that reopens its own connection has to answer three questions, and two of them are already reserved:
+
+- **In-flight requests.** They must fail, never be retried; a re-issued `Restart` restarts twice. H2 already accepts losing these, so this one is settled.
+- **The handshake ack.** `Client::ack` is a value taken once at connect and handed out by `daemon()`. `metrics`'s own exposition prints `daemon_version` from it, so after a reconnect it would publish the predecessor's version. Fixing that is G13, which is about exactly when a dog's recorded version stops being evidence.
+- **A refused reconnect.** The successor can refuse on protocol skew, which is the entire point of the handover being a version change. What happens then is G8, word for word: restart once, then report, never loop.
+
+A reconnect cannot be built without ruling on the third one. That rule is Phase 3's, and the maintainer has said Phase 3 is not to be planned yet.
+
+##### What the two candidate designs cost
+
+Neither is free, and the second contradicts this task's brief, so both are recorded rather than chosen.
+
+**Carry every dog, put the reconnect in `shep-client`.** Delivers G7 exactly, no process restart for anyone, and builds the re-handshake that G8's detection needs rather than foreclosing it. Costs: the three questions above, one of which is G8's; and until an adopted dog is rebuilt, it is mute after a reload, which is a REGRESSION against today, where the gate refuses and everything restarts and works. Two adopted dogs are in `web/public/dogs.json` today, `shep-log-rotate` and `shep-deploy`, and the second one deploys and rolls back, so a mute one is not a monitoring gap.
+
+**Carry built-in dogs, keep refusing adopted ones.** No regression anywhere: `metrics` and `bark` stop sending the whole flock down the stop arm, and an adopted dog keeps today's behaviour until Phase 3 can vet it. The line is principled rather than arbitrary, since it is exactly the set whose connection behaviour shep controls and can fix in the same commit. Costs: a dog refusal survives, against the brief; `metrics` still needs its own fix (exiting when its shepherd connection is gone, which is what `bark` already does and what `run`'s own doc already argues for a refused bind, "worse than one `shep dogs` reports as `Errored`, because the first looks fine from the outside"); every dog then restarts on every reload and carries the count, which is the thing G7 exists to avoid; and Phase 3 has to lift the narrowed gate.
+
+The mechanism needs no proving: bark is already running it, six times over, in the table above.
+
+##### Whoever picks this up
+
+- The four tests using `RefusedReason::Dog` as their refusal fixture still need moving whenever it goes. The two in `handover/mod.rs` are one line each (`e.reload = ReloadState::Replacement`). The two in `boot.rs` are not: they boot a real daemon, and none of the three 2c refusals is reachable from `SupervisorHandle` without choreography. A pending stop needs a script that ignores signals, which then blocks the test's own 5s teardown on `kill_timeout`; a reload stuck in `AwaitReady` does not, because the kill ladder still works, so that is the one to build.
+- `VERSION` does not move for the `dog` field. An absent `Option` loads as `None`, and `None` is what a predecessor that refused to carry a dog at all truthfully meant. Same argument as stdin's and the channel's.
+- Losing the `dog` field is not cosmetic: `matching_ids` includes a dog only for an exact selector, so a carried dog without it leaves `shep dogs` and turns up in `shep flock` beside the operator's own apps.
+- `web/src/pages/docs/getting-started.astro` says "A dog or anything mid-reload sends the reload down the older path instead". It is still true, and it stops being true the moment any of this ships.
+
+##### Found in passing, unrelated and shipped
+
+`[[dog.bark.rules]]` cannot be parsed at all. The simplest possible rule makes the bark dog exit 4 with `[dog.bark] does not parse`, then crash-loop; deleting the rule brings it straight back online. Reproduced deterministically on the release build. `Rule` carries `#[serde(deny_unknown_fields)]` on the struct and `#[serde(flatten)]` on its `when` field, which serde documents as incompatible, and no test anywhere deserializes a `Rule` or a `BarkConfig` from TOML, which is how it shipped. Every test builds them in Rust. Not fixed here; it is not the handover.
+
 ---
 
 ### Task 8: re-arm audit, and the end-to-end case
@@ -375,10 +453,10 @@ Baselines on that drill, three reloads: `origin/main` loses about 2900 lines, 2b
 
 ## Working state, for whoever picks this up
 
-- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2, 4, 5 and 6 committed; task 3 folded into 1.
+- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2, 4, 5 and 6 committed; task 3 folded into 1; task 7 measured and stopped, nothing committed but its writeup.
 - Counts after task 6: **644** daemon lib with `--skip ::slow::`, **2099** workspace.
 - The rejected buffer-carry patch is at `stash@{0}` and in this session's scratchpad as `task1-carry.patch`. Read it for plumbing, not design.
-- `handover/mod.rs`'s module header names the three refusals left, all of them 2c's. Task 7 has one more to strike, `Dog`, and four tests currently using it as their refusal fixture will need moving with it.
+- `handover/mod.rs`'s module header names the three refusals left, all of them 2c's. Task 7 was going to strike `Dog` and did not: the carry works and leaves the metrics dog silently mute, so the gate still refuses. See Task 7's own section for the measurement and the two candidate designs. The four tests using `Dog` as their refusal fixture stay where they are until that decision is made.
 - PR #73 has two threads left open for 2b. Both are now addressed: the `report_fds` deadline is task 2, and descriptor pinning fell out of task 1's parking. They can be closed with a pointer to those commits.
 - `spawn_handover_task` used to visit sheep serially, so a flock of wedged pumps waited N x 2s before the fallback, and past six that outlasted the client's 10s wait and reached exit 0 with no flock. Fixed by a follow-up defect task: see "Follow-up defect: the serial sweep, fixed" under Task 6.
 
