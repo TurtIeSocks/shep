@@ -31,6 +31,7 @@ use shep_core::protocol::{
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
+use shep_core::status::ProcStatus;
 
 use crate::bus::{Bus, TopicFilter};
 use crate::dogs::DogSpec;
@@ -75,6 +76,13 @@ pub struct RpcContext {
     pub(crate) paths: ShepPaths,
     /// This daemon's crate version, echoed in the handshake.
     pub(crate) daemon_version: String,
+    /// Which dogs this daemon has refused at the handshake, and how often.
+    ///
+    /// Written by the connection layer's handshake — the one place that
+    /// knows a refusal happened — and read by it to decide whether a
+    /// refused dog earns its one restart from disk or has already had it
+    /// (the handover design's G8; [`crate::dogs::DogRefusals`]).
+    pub(crate) dog_refusals: crate::dogs::DogRefusals,
     /// This daemon's OS pid, echoed in the handshake.
     pub(crate) pid: u32,
     /// Flips to `true` to start graceful daemon shutdown; see [`Self::shutdown`].
@@ -522,6 +530,10 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 daemon_version: None,
             })),
         },
+        Request::DogStaleness => {
+            let (stale, pending) = dog_staleness(ctx).await;
+            reply(Ok(Response::DogStaleness { stale, pending }))
+        }
         Request::HandoverFitness => reply(Ok(Response::HandoverFitness {
             refusal: handover_refusal(ctx).await,
         })),
@@ -537,6 +549,63 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             daemon_version: None,
         })),
     }
+}
+
+/// The dogs this daemon has given up on, and the dogs it is still waiting
+/// to hear from — the handover design's G13, as a reading rather than a
+/// prediction.
+///
+/// **Stale** is [`DogRefusals::stale`](crate::dogs::DogRefusals::stale):
+/// refused, restarted from the binary on disk, refused again. It is the
+/// only thing here a caller may report, and it is a fact about handshakes
+/// this daemon performed rather than about a version anybody recorded.
+/// G9's point, which task 2 measured: two dog builds differing only in the
+/// protocol they speak report the same crate version, so a version cannot
+/// answer this question and a handshake can.
+///
+/// **Pending** is what stops a caller reporting too early, and it has two
+/// sources because a dog can be unheard-from in two ways. A dog refused
+/// ONCE is mid-restart, so its verdict has been asked for and has not
+/// arrived. A dog this daemon supervises that has never handshook has not
+/// been asked yet — a carried dog whose connection died with the
+/// predecessor's image is exactly that, for the whole gap between the exec
+/// and its reconnect.
+///
+/// **Why the supervisor's own rows are a sound roster.** A dog is
+/// registered before this daemon accepts anything: `boot` restores the
+/// flock, runs `spawn_enabled_dogs`, and only then hands the listener to
+/// `serve`. So a caller that can ask this question is talking to a daemon
+/// that already knows which dogs it has, and there is no window where an
+/// empty roster reads as "every dog has answered".
+///
+/// Only a dog with a PROCESS counts. A dog that has errored out of its
+/// restart budget is not going to handshake, and one parked in a backoff
+/// cannot until it is respawned — waiting on either would make an operator
+/// pay a whole timeout for a dog that is already broken in a way every
+/// other listing reports. Nothing is lost by leaving them out: a dog whose
+/// restart this daemon ASKED for is in `restarting` above whatever the
+/// supervisor's row says about it, and a carried dog that has not dialled
+/// back yet is `Online` — its process never died, only its socket did.
+async fn dog_staleness(ctx: &RpcContext) -> (Vec<String>, Vec<String>) {
+    let stale = ctx.dog_refusals.stale();
+    let mut pending = ctx.dog_refusals.restarting();
+    // A stopped engine has no dogs left to wait on, so its rows are not
+    // worth an error: the refusal record above is still the honest answer.
+    if let Ok(infos) = ctx.supervisor.list_checked().await {
+        for info in infos {
+            let running = matches!(info.status, ProcStatus::Starting | ProcStatus::Online);
+            if info.dog.is_some()
+                && running
+                && !ctx.dog_refusals.has_handshook(&info.name)
+                && !stale.contains(&info.name)
+            {
+                pending.push(info.name);
+            }
+        }
+    }
+    pending.sort();
+    pending.dedup();
+    (stale, pending)
 }
 
 /// Why this shepherd cannot hand its flock to a successor in place, or
@@ -2251,6 +2320,136 @@ mod tests {
         assert_eq!(
             rows[0].lambs,
             Some(vec![Lamb::new(FIRST_SCRIPTED_PID + 1, "node")])
+        );
+    }
+
+    /// Registers one built-in dog on `ctx`'s supervisor, the same way
+    /// `spawn_enabled_dogs` does at boot.
+    async fn start_dog(ctx: &RpcContext, name: &str) -> ProcessInfo {
+        let spec = DogSpec {
+            name: name.to_string(),
+            source: DogSource::BuiltIn,
+        };
+        let app = crate::dogs::dog_app(&spec, &ctx.paths).expect("the dog fixture must assemble");
+        ctx.supervisor
+            .start_dog(app, DogSource::BuiltIn)
+            .await
+            .expect("the dog fixture must start")
+    }
+
+    /// The two lists `Request::DogStaleness` answers with.
+    async fn staleness(ctx: &RpcContext) -> (Vec<String>, Vec<String>) {
+        let reply = reply_of(dispatch(envelope(1, Request::DogStaleness), ctx).await);
+        let Ok(Response::DogStaleness { stale, pending }) = reply.result else {
+            panic!("expected a dog staleness answer");
+        };
+        (stale, pending)
+    }
+
+    /// fails if a flock with no dogs at all is reported as having something
+    /// unsettled. This is what an ordinary reload asks, and the answer it
+    /// gets is what decides whether the operator reads a line about dogs
+    /// they do not run.
+    ///
+    /// The sheep is the point, not scenery: a reader that walked every row
+    /// instead of every DOG row would hold an operator's reload open
+    /// waiting for `web` to handshake, which it is never going to do — a
+    /// sheep is an arbitrary executable and does not speak this protocol at
+    /// all (spec, part 4).
+    #[tokio::test]
+    async fn a_flock_of_ordinary_sheep_has_nothing_stale_and_nothing_pending() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        started.result.expect("the sheep must start");
+
+        assert_eq!(staleness(&h.ctx).await, (Vec::new(), Vec::new()));
+    }
+
+    /// fails if a registered dog that has never handshaken reads as an
+    /// answer. That state is exactly what a carried dog is for the whole
+    /// gap between the exec and its reconnect, so a report taken while it
+    /// holds would be the early report G13 forbids: the dog has said
+    /// nothing, and "nothing stale" would be read as "every dog came back".
+    #[tokio::test]
+    async fn a_dog_that_has_not_handshaken_is_pending() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_dog(&h.ctx, "metrics").await;
+
+        assert_eq!(
+            staleness(&h.ctx).await,
+            (Vec::new(), vec!["metrics".to_string()])
+        );
+
+        h.ctx.dog_refusals.handshook("metrics");
+        assert_eq!(
+            staleness(&h.ctx).await,
+            (Vec::new(), Vec::new()),
+            "a dog talking to this shepherd is settled and is not worth reporting"
+        );
+    }
+
+    /// fails if the report can be taken while a dog's one restart is still
+    /// in flight. A refused dog passes THROUGH this state on its way to
+    /// being stale, so a reader that treated it as settled would report
+    /// every stale dog as healthy — the exact failure the waiting exists
+    /// for. Drives the ladder rather than asserting on the record, because
+    /// the claim is about what a caller over the wire sees.
+    #[tokio::test]
+    async fn a_dog_being_restarted_is_pending_and_then_stale() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_dog(&h.ctx, "metrics").await;
+        h.ctx.dog_refusals.handshook("metrics");
+
+        h.ctx.dog_refusals.refused("metrics");
+        assert_eq!(
+            staleness(&h.ctx).await,
+            (Vec::new(), vec!["metrics".to_string()]),
+            "one refusal buys a restart; it does not condemn the dog"
+        );
+
+        h.ctx.dog_refusals.refused("metrics");
+        assert_eq!(
+            staleness(&h.ctx).await,
+            (vec!["metrics".to_string()], Vec::new()),
+            "a stale dog is a finding, not something still to wait on"
+        );
+    }
+
+    /// fails if a dog nobody is going to hear from holds the report open. A
+    /// dog with no process — out of its restart budget, parked in a
+    /// backoff, or stopped by an operator — cannot handshake, so waiting on
+    /// one would make every later reload pay the whole budget for a dog
+    /// already reported broken everywhere else. Measured under an isolated
+    /// `SHEP_HOME`: a `bark` looping on a bad config is `waiting-restart`
+    /// most of the time, and every reload during that loop would have paid
+    /// for it.
+    #[tokio::test]
+    async fn a_dog_that_has_stopped_running_is_not_waited_on() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_dog(&h.ctx, "metrics").await;
+        assert_eq!(staleness(&h.ctx).await.1, vec!["metrics".to_string()]);
+
+        h.ctx
+            .supervisor
+            .stop(ProcessSelector::Name("metrics".to_string()))
+            .await
+            .expect("the dog must stop");
+
+        assert_eq!(
+            staleness(&h.ctx).await,
+            (Vec::new(), Vec::new()),
+            "a dog that is not running has nothing to answer with"
         );
     }
 }

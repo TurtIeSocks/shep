@@ -4731,6 +4731,231 @@ fn a_real_shepherd_runs_a_real_metrics_dog_that_answers_a_scrape() {
 }
 
 #[cfg(unix)]
+/// [`poll_metrics`], retried until the exposition CONTAINS `needle` rather
+/// than merely until it answers.
+///
+/// The distinction is the whole of what a carried dog needs proving about
+/// it. A dog that survived the exec holding a dead socket answers 503
+/// forever, so "it answered" is already worth asserting -- but a dog that
+/// answered from a cached reading, or from a connection to a shepherd that
+/// no longer exists, would answer 200 too. Only content the predecessor
+/// never saw can tell those apart.
+///
+/// Bounded exactly as [`poll_metrics`] is, and for the same reason: a dog
+/// that never comes back must fail as a named assertion on the last body
+/// it did produce, never hang the case.
+fn poll_metrics_containing(addr: std::net::SocketAddr, needle: &str) -> String {
+    let start = Instant::now();
+    let mut last = String::new();
+    loop {
+        if let Ok(body) = scrape_metrics(addr) {
+            if body.contains(needle) {
+                return body;
+            }
+            last = body;
+        }
+        if start.elapsed() >= METRICS_SCRAPE_DEADLINE {
+            return last;
+        }
+        std::thread::sleep(METRICS_SCRAPE_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+/// The whole of phase 3, at the only tier that can see it: a real dog
+/// PROCESS, carried across a real `execve`, still able to talk to the
+/// shepherd that replaced the one it handshook with.
+///
+/// **A pid check cannot see this defect, which is why every assertion below
+/// the pids is here.** Carrying a dog's process is free -- it is a child of
+/// a daemon whose pid does not change -- and carrying its accepted
+/// connection is impossible, so a carried dog was a live process holding a
+/// dead socket: pid unmoved, restarts 0, status `online`, stderr empty, and
+/// HTTP 503 to every scrape, for as long as the daemon lived. Six real
+/// reloads read exactly like a healthy dog on every column a listing has.
+///
+/// So the decisive assertion is CONTENT: a sheep started AFTER the reload
+/// has to appear in the exposition. No cached reading, no replayed body and
+/// no connection to the predecessor could produce that row.
+///
+/// Three more things this case pins, each of which was broken at some point
+/// in the phase and none of which a scrape would notice:
+///
+/// - the dog keeps its `dog` marker across the blob, so `shep dogs` still
+///   lists it and `shep flock`'s table does not (`CarriedSheep::dog`);
+/// - neither restart count moves, which is what G7 asks for and what
+///   separates a carry from the stop-and-start arm;
+/// - the reload says nothing about the dogs, because it waited for them and
+///   found nothing stale (`report_dog_staleness`).
+#[test]
+fn a_carried_dog_answers_a_scrape_after_a_real_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let port = free_port();
+    write_shep_toml(
+        &dir,
+        &format!("[dog.metrics]\nbind = \"127.0.0.1:{port}\"\n"),
+    );
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("web")
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&started);
+    let online = poll_flock(home, |info| info["status"] == "online");
+    let sheep_pid = online["pid"].as_u64().expect("an online sheep has a pid");
+
+    let enabled = shep(home).arg("enable").arg("metrics").output().unwrap();
+    assert_success(&enabled);
+    let dog_pid = wait_for_dog_pid(home, "metrics");
+    guard.adopt_dog_pid(dog_pid);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let before = poll_metrics(addr);
+    assert!(
+        before.contains("HTTP/1.1 200"),
+        "the dog must be answering BEFORE the reload, or this case proves nothing: {before}"
+    );
+
+    let reloaded = shep(home).arg("daemon").arg("reload").output().unwrap();
+    assert_success(&reloaded);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reloaded.stdout),
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    // The exact sentence `handover::RefusedReason`'s `Display` ends with. A
+    // looser probe would pass whether or not the reload was refused, which
+    // is precisely the failure this assertion exists to catch: the stop arm
+    // restarts every dog from disk and satisfies "the scrape works".
+    assert!(
+        !text.contains("falls back to a stop-and-start"),
+        "a flock with a dog in it is carried now, not refused: {text}"
+    );
+    assert!(
+        !text.contains("cannot talk to this shepherd"),
+        "the carried dog must reconnect rather than be reported stale: {text}"
+    );
+    assert!(
+        !text.contains("cannot say whether it came back"),
+        "the carried dog must answer inside the reload's own wait: {text}"
+    );
+
+    let after = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array()
+            .is_some_and(|rows| rows.len() == 2 && rows.iter().all(|row| !row["pid"].is_null()))
+    });
+    let rows = after.as_array().expect("flock data is an array");
+    let dog_row = rows
+        .iter()
+        .find(|row| row["name"] == "metrics")
+        .unwrap_or_else(|| panic!("the dog must still be registered: {after}"));
+    let sheep_row = rows
+        .iter()
+        .find(|row| row["name"] == "web")
+        .unwrap_or_else(|| panic!("the sheep must still be registered: {after}"));
+
+    assert_eq!(
+        dog_row["pid"].as_u64(),
+        Some(u64::try_from(dog_pid.as_raw()).unwrap()),
+        "the dog was restarted rather than carried: {after}"
+    );
+    assert_eq!(
+        sheep_row["pid"].as_u64(),
+        Some(sheep_pid),
+        "the sheep was restarted rather than carried: {after}"
+    );
+    assert_eq!(
+        dog_row["restarts"], 0,
+        "the dog's restart count moved: {after}"
+    );
+    assert_eq!(
+        sheep_row["restarts"], 0,
+        "the sheep's restart count moved: {after}"
+    );
+    // The marker, which is what keeps the two populations apart. JSON
+    // carries both in one undivided array (`emit_flock`'s own doc), so this
+    // is where the marker is readable; the two TABLES below are what an
+    // operator actually sees it through.
+    assert_eq!(
+        dog_row["dog"]["kind"], "built_in",
+        "a carried dog that lost its marker is one `shep dogs` has lost: {after}"
+    );
+    assert!(
+        sheep_row["dog"].is_null(),
+        "a sheep must not pick a marker up on the way across: {after}"
+    );
+
+    let dogs = shep(home).arg("dogs").output().unwrap();
+    assert_success(&dogs);
+    assert!(
+        String::from_utf8_lossy(&dogs.stdout).contains("metrics"),
+        "`shep dogs` must still list the carried dog: {}",
+        String::from_utf8_lossy(&dogs.stdout)
+    );
+    let flock = shep(home).arg("flock").output().unwrap();
+    assert_success(&flock);
+    let flock_text = String::from_utf8_lossy(&flock.stdout);
+    let (sheep_table, _dogs_table) = flock_text
+        .split_once("Dogs")
+        .unwrap_or_else(|| panic!("`shep flock` prints a dogs section: {flock_text}"));
+    assert!(
+        !sheep_table.contains("metrics"),
+        "a carried dog must not be listed beside the operator's own apps: {flock_text}"
+    );
+
+    // The decisive one. A sheep that did not exist when the predecessor was
+    // running, named by the dog that is answering now.
+    let fresh = shep(home)
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("freshsheep")
+        .output()
+        .unwrap();
+    assert_success(&fresh);
+    let body = poll_metrics_containing(addr, r#"sheep="freshsheep""#);
+    assert!(
+        body.contains("HTTP/1.1 200"),
+        "the carried dog must still answer a scrape after the exec: {body}"
+    );
+    assert!(
+        body.contains(r#"sheep="freshsheep""#),
+        "the exposition must name a sheep started AFTER the reload, which no cached reading \
+         and no connection to the predecessor could produce: {body}"
+    );
+
+    // The muster roll, which a successor rebuilds from the blob rather than
+    // from disk. A dog has never been in it -- `spawn_enabled_dogs`
+    // registers dogs straight through the supervisor and never touches
+    // `FlockRegistry` -- so carrying one would put it there for the first
+    // time, and permanently: the roll outlives the daemon, so a later cold
+    // boot would restore `metrics` as an ordinary unmarked sheep before
+    // `spawn_enabled_dogs` ran. `boot::apps_for_the_roll` has a unit case of
+    // its own; this is the only tier that reaches `boot`'s USE of it.
+    let saved = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("save")
+        .output()
+        .unwrap();
+    assert_success(&saved);
+    let roll: serde_json::Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert_eq!(
+        roll["data"]["apps"], 2,
+        "the roll holds the two sheep and no dog: {roll}"
+    );
+
+    graceful_kill(home);
+}
+
+#[cfg(unix)]
 /// Fails if `shep dogs` renders the sheep, or `shep flock` renders the dogs
 /// into the sheep table. The two-table split (`FlockRows`/`DogRows`, and
 /// `emit_flock`'s partition between them) has unit coverage of its own;
@@ -7363,9 +7588,9 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
         String::from_utf8_lossy(&reloaded.stderr)
     );
     // The exact sentence the gate prints when it refuses -- see
-    // `handover::RefusedReason`'s `Display`, which every feature variant
-    // ends with. A looser probe would pass whether or not the reload was
-    // refused, which is the failure this assertion is here to catch.
+    // `handover::RefusedReason`'s `Display`, which ends on it. A looser
+    // probe would pass whether or not the reload was refused, which is the
+    // failure this assertion is here to catch.
     assert!(
         !text.contains("falls back to a stop-and-start"),
         "a clustered flock is carried now, not refused: {text}"
@@ -8159,9 +8384,9 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
         String::from_utf8_lossy(&reloaded.stdout),
         String::from_utf8_lossy(&reloaded.stderr)
     );
-    // The exact sentence every feature variant of `handover::RefusedReason`
-    // ends with. Without this the case would pass on a stop-and-start, which
-    // restarts the flock and satisfies "everything still works".
+    // The exact sentence `handover::RefusedReason`'s `Display` ends with.
+    // Without this the case would pass on a stop-and-start, which restarts
+    // the flock and satisfies "everything still works".
     assert!(
         !text.contains("falls back to a stop-and-start"),
         "every kind in this flock is carried now, not refused: {text}"

@@ -183,6 +183,8 @@
 //!     .send(encode_frame(&Hello {
 //!         client_version: "0.1.0".to_string(),
 //!         protocol: PROTOCOL_VERSION,
+//!         // Only a dog names one; see `Hello::dog_name`.
+//!         dog_name: None,
 //!     })?)
 //!     .await?;
 //! let ack: HelloReply = decode_frame(&frames.next().await.unwrap()?)?;

@@ -151,6 +151,12 @@ impl Connection {
     /// the whole attempt — connect, send [`Hello`], read the reply — by
     /// `timeout`.
     ///
+    /// `dog_name` is the name this client was registered under as a dog, or
+    /// `None` for every client that is not one. It travels in the `Hello`
+    /// so a daemon that REFUSES this handshake knows which dog it just
+    /// refused: a refused handshake never reaches a request, so nothing
+    /// later on the connection could tell it (the handover design's G8).
+    ///
     /// # Errors
     ///
     /// - [`ConnectError::Connect`] — `connect(2)` failed; nothing is
@@ -164,18 +170,22 @@ impl Connection {
     ///   `HelloReply` (or close) arrived within `timeout`.
     /// - [`ConnectError::ProtocolMismatch`] — the daemon refused the
     ///   handshake on protocol-version skew.
-    pub(crate) async fn open(socket: &Path, timeout: Duration) -> Result<Self, ConnectError> {
+    pub(crate) async fn open(
+        socket: &Path,
+        timeout: Duration,
+        dog_name: Option<&str>,
+    ) -> Result<Self, ConnectError> {
         // `timeout` bounds `connect(2)` and the handshake together, not just
         // the handshake — intentional, but barely testable over AF_UNIX (a
         // mutant moving `connect` outside this timeout still passes all
         // five tests below). Not directly covered; don't contort a test to
         // chase it.
-        tokio::time::timeout(timeout, Self::open_inner(socket))
+        tokio::time::timeout(timeout, Self::open_inner(socket, dog_name))
             .await
             .map_err(|_elapsed| ConnectError::HandshakeTimeout { after: timeout })?
     }
 
-    async fn open_inner(socket: &Path) -> Result<Self, ConnectError> {
+    async fn open_inner(socket: &Path, dog_name: Option<&str>) -> Result<Self, ConnectError> {
         let stream = transport::connect(socket)
             .await
             .map_err(|source| ConnectError::Connect {
@@ -187,6 +197,7 @@ impl Connection {
         let hello = Hello {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol: PROTOCOL_VERSION,
+            dog_name: dog_name.map(str::to_owned),
         };
         let payload = encode_frame(&hello).map_err(ConnectError::Wire)?;
         frames.send(payload).await.map_err(ConnectError::Io)?;
@@ -238,7 +249,9 @@ mod tests {
         };
         let served = fake_daemon(&path, Ok(ack.clone())).await;
 
-        let conn = Connection::open(&path, HANDSHAKE_TIMEOUT).await.unwrap();
+        let conn = Connection::open(&path, HANDSHAKE_TIMEOUT, None)
+            .await
+            .unwrap();
 
         let (_frames, actual_ack) = conn.into_parts();
         assert_eq!(actual_ack, ack);
@@ -252,6 +265,34 @@ mod tests {
             env!("CARGO_PKG_VERSION"),
             "the client must identify its own version"
         );
+        assert_eq!(
+            hello.dog_name, None,
+            "a client that is not a dog must not claim to be one"
+        );
+    }
+
+    /// fails if a dog's name is dropped between [`Connection::open`]'s
+    /// argument and the frame that goes out. It is the whole of what the
+    /// daemon has to work with when it REFUSES this handshake, and a
+    /// refused handshake never reaches a request, so nothing later on the
+    /// connection could supply it (the handover design's G8).
+    #[tokio::test]
+    async fn a_dogs_hello_carries_the_name_it_was_registered_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::testing::control_address(dir.path());
+        let ack = HelloAck {
+            daemon_version: "9.9.9".into(),
+            protocol: PROTOCOL_VERSION,
+            pid: 4242,
+        };
+        let served = fake_daemon(&path, Ok(ack)).await;
+
+        let _conn = Connection::open(&path, HANDSHAKE_TIMEOUT, Some("metrics"))
+            .await
+            .unwrap();
+
+        let hello = served.await.unwrap();
+        assert_eq!(hello.dog_name.as_deref(), Some("metrics"));
     }
 
     #[tokio::test]
@@ -265,7 +306,7 @@ mod tests {
         };
         let _served = fake_daemon(&path, Err(refusal)).await;
 
-        let err = Connection::open(&path, HANDSHAKE_TIMEOUT)
+        let err = Connection::open(&path, HANDSHAKE_TIMEOUT, None)
             .await
             .unwrap_err();
 
@@ -299,7 +340,7 @@ mod tests {
         };
         let _served = fake_daemon(&path, Err(refusal)).await;
 
-        let err = Connection::open(&path, HANDSHAKE_TIMEOUT)
+        let err = Connection::open(&path, HANDSHAKE_TIMEOUT, None)
             .await
             .unwrap_err();
 
@@ -329,7 +370,7 @@ mod tests {
         // `serde_json` to assert it with and does not need one.
         let _served = fake_daemon(&path, Err(refusal)).await;
 
-        let err = Connection::open(&path, HANDSHAKE_TIMEOUT)
+        let err = Connection::open(&path, HANDSHAKE_TIMEOUT, None)
             .await
             .unwrap_err();
 
@@ -378,7 +419,7 @@ mod tests {
             drop(stream);
         });
 
-        let err = Connection::open(&path, HANDSHAKE_TIMEOUT)
+        let err = Connection::open(&path, HANDSHAKE_TIMEOUT, None)
             .await
             .expect_err("a peer that closed without a HelloReply is not a connection");
 
@@ -393,7 +434,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = crate::testing::control_address(dir.path());
         let ConnectError::Connect { path: reported, .. } =
-            Connection::open(&path, HANDSHAKE_TIMEOUT)
+            Connection::open(&path, HANDSHAKE_TIMEOUT, None)
                 .await
                 .unwrap_err()
         else {
@@ -419,7 +460,7 @@ mod tests {
         // timeout ends the attempt.
         let _listener = Listener::bind(&path).unwrap();
 
-        let err = Connection::open(&path, Duration::from_millis(150))
+        let err = Connection::open(&path, Duration::from_millis(150), None)
             .await
             .unwrap_err();
 

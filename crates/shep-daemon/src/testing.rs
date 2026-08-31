@@ -512,6 +512,7 @@ pub(crate) fn harness_with_extras(
             daemon_config: paths.daemon_config.clone(),
             paths: paths.clone(),
             daemon_version: "0.1.0".to_string(),
+            dog_refusals: crate::dogs::DogRefusals::new(),
             pid: 4242,
             shutdown: Arc::new(shutdown),
             stats: Arc::clone(&stats),

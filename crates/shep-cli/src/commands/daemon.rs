@@ -960,16 +960,152 @@ async fn stop_and_start(
 /// meets a daemon not yet ready to serve one. A plain `ListFlock` is what
 /// the handover arm actually wants: it reports, and asks for nothing.
 async fn report_reload(client: &Client, streams: &mut Streams<'_>, restored: bool) -> ExitCode {
+    report_reload_waiting(client, streams, restored, DOG_SETTLE_WAIT).await
+}
+
+/// As [`report_reload`], but with a caller-chosen dog wait — the same
+/// injectable-timing shape [`reload_with_wait`] carries, and for the same
+/// reason.
+async fn report_reload_waiting(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    restored: bool,
+    dog_wait: std::time::Duration,
+) -> ExitCode {
     let shepherd = client.daemon();
     let message = format!(
         "the shepherd is now {} (pid {})",
         shepherd.daemon_version, shepherd.pid
     );
     streams.aside("reload", &message);
+    report_dog_staleness(client, streams, &shepherd.daemon_version, dog_wait).await;
     if restored {
         return muster::muster(client, streams).await;
     }
     crate::commands::query::flock(client, streams).await
+}
+
+/// How long a reload waits for the flock's dogs to finish reconnecting
+/// before it reports what came back.
+///
+/// Sized against the round trip it has to outlast, which is not the
+/// reconnect: a dog refused on the handshake is restarted once from the
+/// binary on disk (G8), and only the SECOND refusal — after a full kill
+/// ladder and a fresh spawn — is what makes it stale. A budget shorter
+/// than that would report every stale dog as healthy, which is the
+/// failure this whole reading exists to avoid.
+///
+/// Only ever paid when a dog has not answered. An ordinary reload finds
+/// nothing pending on its first ask and spends none of this.
+const DOG_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Gap between [`report_dog_staleness`]'s asks. Coarser than
+/// [`SUCCESSOR_POLL_INTERVAL`], because what this waits on is a process
+/// being killed and respawned rather than an `execve`.
+const DOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Reports the dogs that could not come back, once the shepherd has heard
+/// from all of them.
+///
+/// **The waiting is the point** (spec G13). A dog's recorded crate version
+/// describes the process that was running when it connected, so before a
+/// reload it is evidence about something about to stop existing, and a
+/// report taken then is a claim rather than a finding. Afterwards the same
+/// question has a real answer — this shepherd either accepted the dog's
+/// handshake or refused it — and asking early would get the answer for the
+/// wrong daemon. So this asks, waits while anything is unsettled, and asks
+/// again.
+///
+/// **Silent unless something is wrong.** A flock whose dogs all came back
+/// prints nothing at all: the sentence an operator wants after a reload is
+/// the shepherd's version and their own flock, and a line-per-reload
+/// saying the dogs are fine would bury both.
+///
+/// **What it does not say.** That a dog is stale is a fact about two
+/// refused handshakes, not about the binary on disk — shep never reads
+/// that file's version, and cannot, until a dog answers `--version` (G11,
+/// a later phase). So the sentence reports what happened and suggests a
+/// remedy; it never promises the remedy will work.
+///
+/// A shepherd that will not answer is left alone rather than reported. The
+/// reload itself has already succeeded by the time this runs, and a dog
+/// reading that could not be taken is not a reason to say anything about
+/// the dogs.
+async fn report_dog_staleness(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    daemon_version: &str,
+    wait: std::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let Ok(shep_core::protocol::Response::DogStaleness { stale, pending }) = client
+            .request(shep_core::protocol::Request::DogStaleness)
+            .await
+        else {
+            return;
+        };
+        let out_of_time = tokio::time::Instant::now() >= deadline;
+        if pending.is_empty() || out_of_time {
+            if !stale.is_empty() {
+                streams.aside("reload", &stale_dog_report(&stale, daemon_version));
+            }
+            if out_of_time && !pending.is_empty() {
+                streams.aside("reload", &unsettled_dog_report(&pending, wait));
+            }
+            return;
+        }
+        tokio::time::sleep(DOG_POLL_INTERVAL).await;
+    }
+}
+
+/// The sentence naming the dogs this shepherd has given up on.
+///
+/// Two whole sentences rather than one with the number interpolated
+/// through it: the singular and the plural differ in four places, and a
+/// reader checking the wording should not have to run the ternaries in
+/// their head to see what either one says.
+fn stale_dog_report(stale: &[String], daemon_version: &str) -> String {
+    match stale {
+        [only] => format!(
+            "the `{only}` dog cannot talk to this shepherd; restarting it from the binary on \
+             disk did not help, so rebuild or reinstall it against shep {daemon_version}"
+        ),
+        many => format!(
+            "these dogs cannot talk to this shepherd: {}; restarting them from the binaries on \
+             disk did not help, so rebuild or reinstall them against shep {daemon_version}",
+            quoted_names(many)
+        ),
+    }
+}
+
+/// The sentence for dogs that never finished settling inside the budget.
+///
+/// Said out loud rather than folded into silence, because silence here
+/// would mean the same thing as a clean reload and this is not one: the
+/// reading was taken before these dogs had answered, so it speaks for the
+/// rest of the flock and not for them.
+fn unsettled_dog_report(pending: &[String], wait: std::time::Duration) -> String {
+    match pending {
+        [only] => format!(
+            "the `{only}` dog had not answered this shepherd after {wait:?}, so this reload \
+             cannot say whether it came back"
+        ),
+        many => format!(
+            "these dogs had not answered this shepherd after {wait:?}, so this reload cannot say \
+             whether they came back: {}",
+            quoted_names(many)
+        ),
+    }
+}
+
+/// `` `a`, `b`, `c` `` — the list shape both sentences above end on.
+fn quoted_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -1626,6 +1762,194 @@ otel = "/usr/local/bin/shep-otel"
         // No shepherd owns this home, so the stop arm it fell back to has
         // nothing to stop -- which is what proves it took that arm at all.
         assert_eq!(code, ExitCode::DaemonUnreachable, "{text}");
+    }
+
+    /// fails if the dog reading is taken before the dogs have answered —
+    /// which is the whole of G13. The shepherd here reports `metrics` as
+    /// unsettled twice and stale on the third ask, so the two answers
+    /// genuinely DIFFER: a report taken on the first ask says nothing at
+    /// all, and only one taken after the dog has finished settling names
+    /// it. Both halves are asserted, because a reload that asked once and
+    /// happened to catch the third answer would pass the output check on
+    /// its own.
+    #[tokio::test]
+    async fn a_reload_waits_for_a_pending_dog_before_it_reports_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let asks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asks);
+        let (client, _envelopes) = shep_client::testing::fake_client_answering(&addr, move |req| {
+            if !matches!(req, Request::DogStaleness) {
+                return Response::Mustered(vec![]);
+            }
+            let seen = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if seen < 2 {
+                Response::DogStaleness {
+                    stale: vec![],
+                    pending: vec!["metrics".to_string()],
+                }
+            } else {
+                Response::DogStaleness {
+                    stale: vec!["metrics".to_string()],
+                    pending: vec![],
+                }
+            }
+        })
+        .await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            report_reload_waiting(
+                &client,
+                &mut streams,
+                true,
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+        }
+
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("metrics") && text.contains("rebuild or reinstall"),
+            "the dog that could not come back must be named: {text}"
+        );
+        assert!(
+            asks.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "an answer taken on the first ask is a claim about a dog that had not spoken"
+        );
+    }
+
+    /// fails if an ordinary reload starts talking about dogs. Every reload
+    /// on a healthy flock takes this path, so a line here is a line the
+    /// operator reads every time — and the two facts they ran the verb for,
+    /// the shepherd's version and their own flock, are the ones it would
+    /// bury.
+    #[tokio::test]
+    async fn a_reload_whose_dogs_all_answered_says_nothing_about_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let (client, _envelopes) = shep_client::testing::fake_client_answering(&addr, |req| {
+            if matches!(req, Request::DogStaleness) {
+                Response::DogStaleness {
+                    stale: vec![],
+                    pending: vec![],
+                }
+            } else {
+                Response::Mustered(vec![shep_client::testing::sample_info()])
+            }
+        })
+        .await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            report_reload_waiting(
+                &client,
+                &mut streams,
+                true,
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+        }
+
+        let text = format!(
+            "{}{}",
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap()
+        );
+        assert!(
+            !text.contains("dog"),
+            "a flock whose dogs all came back has nothing to say about them: {text}"
+        );
+    }
+
+    /// fails if a dog that never answers hangs the verb, or is silently
+    /// counted as healthy. Both outcomes are wrong in opposite directions:
+    /// the reload has already succeeded, so it must finish, and the reading
+    /// it took cannot speak for a dog that never spoke.
+    #[tokio::test]
+    async fn a_reload_stops_waiting_for_a_dog_that_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = shep_client::testing::control_address(dir.path());
+        let (client, _envelopes) = shep_client::testing::fake_client_answering(&addr, |req| {
+            if matches!(req, Request::DogStaleness) {
+                Response::DogStaleness {
+                    stale: vec![],
+                    pending: vec!["metrics".to_string()],
+                }
+            } else {
+                Response::Mustered(vec![])
+            }
+        })
+        .await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            // The forcing mechanism (IR-46), and the assertion at the same
+            // time: a budget that is never consulted loops forever, and a
+            // test that waited for it would hang the suite rather than
+            // report which line is wrong.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                report_reload_waiting(
+                    &client,
+                    &mut streams,
+                    true,
+                    std::time::Duration::from_millis(150),
+                ),
+            )
+            .await
+            .expect("a dog that never answers must not hold the verb open");
+        }
+
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("metrics") && text.contains("cannot say whether it came back"),
+            "an unanswered dog is reported as unanswered, not as healthy: {text}"
+        );
+    }
+
+    /// fails if the report claims something shep did not do. It knows two
+    /// handshakes were refused and that a restart ran the binary on disk in
+    /// between; it does NOT know what version that file holds, and cannot
+    /// until a dog answers `--version` (G11, a later phase). Pinned as an
+    /// exact string in both shapes, because the singular and the plural are
+    /// written out separately and a copy-paste between them is invisible.
+    #[test]
+    fn the_stale_report_says_what_happened_and_never_reads_the_disk() {
+        let one = stale_dog_report(&["metrics".to_string()], "0.1.22");
+        assert_eq!(
+            one,
+            "the `metrics` dog cannot talk to this shepherd; restarting it from the binary on \
+             disk did not help, so rebuild or reinstall it against shep 0.1.22"
+        );
+
+        let two = stale_dog_report(&["bark".to_string(), "metrics".to_string()], "0.1.22");
+        assert_eq!(
+            two,
+            "these dogs cannot talk to this shepherd: `bark`, `metrics`; restarting them from \
+             the binaries on disk did not help, so rebuild or reinstall them against shep 0.1.22"
+        );
     }
 
     /// A [`HelloAck`] naming `version`, for the arm-selection tests.

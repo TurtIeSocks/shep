@@ -15,6 +15,32 @@ pub struct Hello {
     pub client_version: String,
     /// [`crate::protocol::PROTOCOL_VERSION`] the client speaks
     pub protocol: u32,
+    /// The name this client was registered under as a dog, when it is one.
+    ///
+    /// `None` is what every other client truthfully is, and what a dog built
+    /// before this field existed sends. The CLI never sets it: a bare
+    /// `Client` has no way to, by construction, so `shep stop` cannot
+    /// impersonate a dog however its environment is set.
+    ///
+    /// The daemon needs it on exactly one path, and it is the path where
+    /// nothing else can supply it. A handshake refused for protocol skew
+    /// never reaches a request, so `Request::DogConfig`'s name — the one
+    /// place a dog otherwise identifies itself — is unreachable precisely
+    /// when the daemon has to know WHICH dog it just refused in order to
+    /// restart it (the handover design's G8). A dog already knows its own
+    /// name: the daemon put it in `$SHEP_DOG_NAME` when it spawned it.
+    ///
+    /// Additive by construction: absent on the wire rather than `null`, and
+    /// ignored by a daemon too old to know it, so
+    /// [`crate::protocol::PROTOCOL_VERSION`] does not move for it. That
+    /// argument deserves more care here than anywhere else, because `Hello`
+    /// IS the version-negotiation frame: a daemon that rejected unknown
+    /// fields would refuse a newer client BEFORE reading `protocol`, and
+    /// that would be a hard break rather than an additive change. It does
+    /// not — this type carries no `#[serde(deny_unknown_fields)]`, and
+    /// `a_hello_without_a_dog_name_still_parses` pins both directions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dog_name: Option<String>,
 }
 
 /// Daemon's handshake answer
@@ -425,6 +451,27 @@ pub enum Request {
         /// The dog's name
         name: String,
     },
+    /// Ask which dogs this daemon has given up on, and which it is still
+    /// waiting to hear from (`shep daemon reload`, the handover design's
+    /// G13).
+    ///
+    /// Read-only, and about THIS daemon's own handshakes. A dog's recorded
+    /// crate version describes the process that was running when it
+    /// connected, so it says nothing about a dog that has since been
+    /// replaced; the only thing that knows whether a dog can talk to this
+    /// daemon is whether this daemon accepted its handshake. That is what
+    /// this answers, which is why the reading is worth taking AFTER a
+    /// reload rather than before one.
+    ///
+    /// Answers [`Response::DogStaleness`].
+    ///
+    /// # Why this variant does not move `PROTOCOL_VERSION`
+    ///
+    /// The same argument [`Self::HandoverFitness`] makes above, and the
+    /// same gate enforces it: its only caller is `shep daemon reload`, which
+    /// asks it of the successor it has just proven is running this binary's
+    /// own version. An older daemon is never sent it.
+    DogStaleness,
     /// Ask whether this daemon could hand its flock to a successor in place,
     /// rather than stopping it and starting it again (`shep daemon reload`).
     ///
@@ -1316,6 +1363,30 @@ pub enum Response {
     },
     /// Answer to `EnableDog` — the dog as it stands now
     DogStarted(ProcessInfo),
+    /// Answer to `DogStaleness` — this daemon's own handshake record, split
+    /// into the dogs it has given up on and the dogs it is still waiting on.
+    ///
+    /// Two lists rather than one because they are answers to two different
+    /// questions, and only one of them is reportable. `stale` is a
+    /// finding: those dogs were refused, restarted from the binary on disk,
+    /// and refused again. `pending` is a reason to ask again: those
+    /// dogs have not finished settling, so a reading taken now would be a
+    /// guess about them rather than a fact.
+    ///
+    /// Names only. What a stale dog's crate version is does not answer the
+    /// question a caller is asking — two builds differing only in the
+    /// protocol they speak report the same version — so carrying one here
+    /// would invite exactly the inference it cannot support.
+    DogStaleness {
+        /// Dogs this daemon has refused twice: once on the handshake that
+        /// bought them a restart from disk, and again after it. It will not
+        /// restart them a third time (the handover design's G8).
+        stale: Vec<String>,
+        /// Dogs this daemon is still waiting to hear a final answer from —
+        /// one whose restart is in flight, or one it supervises that has
+        /// not handshook yet. Neither stale nor known healthy.
+        pending: Vec<String>,
+    },
     /// Answer to `HandoverFitness`: `None` when the whole flock can be
     /// carried across a daemon handover, and otherwise the sentence saying
     /// which sheep cannot be and why.
@@ -2080,6 +2151,16 @@ mod tests {
                 deadline_ms: None,
                 body: Request::HandoverFitness,
             },
+            // The second request gated on the daemon's crate version, and
+            // pinned beside the first for that reason: the two are asked by
+            // the same verb, of the two daemons either side of the same
+            // handover, and a rename of either is a variant nothing on
+            // either side recognises.
+            Envelope {
+                id: 25,
+                deadline_ms: None,
+                body: Request::DogStaleness,
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v2", requests);
     }
@@ -2369,6 +2450,18 @@ mod tests {
                     refusal: Some("sheep 'web' has a shepherd channel".to_string()),
                 }),
             },
+            // Both lists non-empty and DIFFERENT, because the two carry the
+            // same wire shape and a reply that filled one from the other
+            // would be invisible in a fixture that used the same names
+            // twice. Empty is the shape an ordinary reload sees, and it is
+            // already proven by every `Vec`-carrying row above.
+            Reply {
+                id: 30,
+                result: Ok(Response::DogStaleness {
+                    stale: vec!["metrics".to_string()],
+                    pending: vec!["bark".to_string()],
+                }),
+            },
         ];
         insta::assert_json_snapshot!("reply_wire_v2", replies);
     }
@@ -2463,9 +2556,57 @@ mod tests {
         let hello = Hello {
             client_version: "0.1.0".to_string(),
             protocol: PROTOCOL_VERSION,
+            dog_name: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(json, r#"{"client_version":"0.1.0","protocol":2}"#);
+    }
+
+    /// fails if a non-dog client's `Hello` grows a key. The CLI is the
+    /// overwhelming majority of handshakes and sends `dog_name: None`, so
+    /// `skip_serializing_if` is what keeps this addition free on the wire
+    /// for every client that is not a dog — and what makes the bytes above
+    /// byte-identical to the ones protocol 2 shipped with.
+    #[test]
+    fn a_dogs_hello_names_the_dog_and_nothing_elses_does() {
+        let dog = Hello {
+            client_version: "0.1.0".to_string(),
+            protocol: PROTOCOL_VERSION,
+            dog_name: Some("metrics".to_string()),
+        };
+        let json = serde_json::to_string(&dog).unwrap();
+        assert_eq!(
+            json,
+            r#"{"client_version":"0.1.0","protocol":2,"dog_name":"metrics"}"#
+        );
+        assert_eq!(serde_json::from_str::<Hello>(&json).unwrap(), dog);
+    }
+
+    /// fails if `Hello` gains `#[serde(deny_unknown_fields)]`, or if
+    /// `dog_name` stops being optional — the two ways this addition could
+    /// become a wire break after the fact.
+    ///
+    /// `Hello` is the version-negotiation frame, which makes it the one
+    /// place where rejecting an unknown field would be unrecoverable: the
+    /// daemon would refuse a newer client BEFORE reading `protocol`, so
+    /// neither peer could report the skew that caused it. The fixture below
+    /// is the committed bytes a client built before this field sends
+    /// (IR-35), and the second half is the same rule in the other
+    /// direction — an older daemon parsing a newer client's frame.
+    #[test]
+    fn a_hello_without_a_dog_name_still_parses() {
+        let fixture = r#"{"client_version":"0.1.14","protocol":2}"#;
+        let hello: Hello = serde_json::from_str(fixture).unwrap();
+        assert_eq!(hello.protocol, 2);
+        assert_eq!(hello.dog_name, None);
+
+        // The other direction: whatever an older daemon does not know, it
+        // must ignore rather than refuse. `unknown_to_an_older_daemon`
+        // stands in for `dog_name` as that daemon would see it.
+        let newer = r#"{"client_version":"9.9.9","protocol":2,"dog_name":"metrics","unknown_to_an_older_daemon":true}"#;
+        let hello: Hello = serde_json::from_str(newer).unwrap();
+        assert_eq!(hello.protocol, 2);
+        assert_eq!(hello.dog_name.as_deref(), Some("metrics"));
     }
 
     #[test]

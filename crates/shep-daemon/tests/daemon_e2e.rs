@@ -126,6 +126,7 @@ impl Fixture {
             .send(&Hello {
                 client_version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol: PROTOCOL_VERSION,
+                dog_name: None,
             })
             .await;
         let ack: HelloReply = client.recv_as().await;
@@ -1463,6 +1464,7 @@ async fn protocol_skew_is_refused_over_the_real_socket() {
             encode_frame(&Hello {
                 client_version: "9.9.9".to_string(),
                 protocol: PROTOCOL_VERSION + 1,
+                dog_name: None,
             })
             .unwrap(),
         )

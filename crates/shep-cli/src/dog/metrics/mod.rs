@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use shep_client::Client;
+use shep_client::ReconnectingClient;
 use shep_core::protocol::{ProcessInfo, Request, Response};
 use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, RefreshKind, System};
 use tokio::net::{TcpListener, TcpStream};
@@ -200,7 +200,7 @@ pub async fn run(runtime: DogRuntime) -> ExitCode {
 /// Never returns on its own — [`run`] races it against the two shutdown
 /// signals, and a test drives it directly, aborting the [`tokio::task::JoinHandle`]
 /// it comes back on rather than waiting for a return that never happens.
-async fn accept_forever(listener: TcpListener, client: Arc<Client>) {
+async fn accept_forever(listener: TcpListener, client: Arc<ReconnectingClient>) {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
@@ -219,7 +219,7 @@ async fn accept_forever(listener: TcpListener, client: Arc<Client>) {
 /// who curls `/` is told where to look rather than handed the exposition
 /// from the wrong path, which is how a scrape config ends up depending on a
 /// path the next version does not serve.
-async fn handle_connection(mut stream: TcpStream, client: Arc<Client>) {
+async fn handle_connection(mut stream: TcpStream, client: Arc<ReconnectingClient>) {
     let request = match http::read_request(&mut stream, READ_TIMEOUT).await {
         Ok(request) => request,
         // A peer that never finished a request (timed out, sent garbage,
@@ -263,10 +263,15 @@ async fn handle_connection(mut stream: TcpStream, client: Arc<Client>) {
         }
     };
 
+    // Read once, from the generation that just answered `ListFlock`.
+    // `ReconnectingClient::daemon` reports the daemon answering RIGHT NOW,
+    // so two separate reads either side of a handover could publish one
+    // daemon's version beside another's pid.
+    let ack = client.daemon();
     let reading = Reading {
         flock,
-        daemon_version: client.daemon().daemon_version.clone(),
-        daemon_pid: client.daemon().pid,
+        daemon_version: ack.daemon_version,
+        daemon_pid: ack.pid,
         host: sample_host(),
     };
     let body = exposition::render(&reading);
@@ -283,8 +288,10 @@ async fn handle_connection(mut stream: TcpStream, client: Arc<Client>) {
 mod tests {
     use std::time::Duration;
 
-    use shep_client::testing::{fake_client_on, fake_client_that_dies_mid_request};
-    use shep_core::protocol::ProcessInfo;
+    use shep_client::testing::{
+        Handshake, fake_daemon_across_handovers, fake_reconnecting_client_on, sample_ack,
+    };
+    use shep_core::protocol::{HelloAck, PROTOCOL_VERSION, ProcessInfo};
     use shep_core::status::ProcStatus;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task::JoinHandle;
@@ -328,7 +335,7 @@ mod tests {
     /// port, which is how a test suite starts failing on a developer's
     /// machine for reasons unrelated to the change), reads back the
     /// OS-assigned address, and serves `client` on it in the background.
-    async fn serve_on_free_port(client: Client, config: MetricsConfig) -> RunningDog {
+    async fn serve_on_free_port(client: ReconnectingClient, config: MetricsConfig) -> RunningDog {
         let listener = TcpListener::bind(config.bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(accept_forever(listener, Arc::new(client)));
@@ -369,7 +376,7 @@ mod tests {
     async fn every_scrape_asks_the_shepherd_again() {
         let dir = tempfile::tempdir().unwrap();
         let socket = shep_client::testing::control_address(dir.path());
-        let (client, daemon) = fake_client_on(&socket).await;
+        let (client, daemon) = fake_reconnecting_client_on(&socket).await;
         daemon.reply_to_list_sequence(vec![
             vec![sample_info("web")],
             vec![sample_info("web"), sample_info("api")],
@@ -409,19 +416,89 @@ mod tests {
     /// indistinguishable from a real one; a 503 is `up == 0`, which is what
     /// happened.
     ///
-    /// `fake_client_that_dies_mid_request` reads exactly one envelope (this
-    /// dog's own `ListFlock`) and drops the connection without a reply —
-    /// the shepherd accepted the request and then never answered it, which
-    /// is "will not answer" without needing a real timeout to prove it.
+    /// `cut_on_next_request` makes the shepherd read exactly one envelope
+    /// (this dog's own `ListFlock`) and drop the connection without a reply
+    /// — the shepherd accepted the request and then never answered it,
+    /// which is "will not answer" without needing a real timeout to prove
+    /// it. It is also the exact shape a daemon handover produces, so this
+    /// pins the OTHER half of the reconnect contract: the request that was
+    /// in flight still fails. Only the connection is re-established, never
+    /// the request (the design's H2).
     #[tokio::test]
     async fn a_shepherd_that_will_not_answer_produces_a_503() {
         let dir = tempfile::tempdir().unwrap();
         let socket = shep_client::testing::control_address(dir.path());
-        let (client, _task) = fake_client_that_dies_mid_request(&socket).await;
+        let shepherds =
+            fake_daemon_across_handovers(&socket, vec![Handshake::Accept(sample_ack())]);
+        let client = ReconnectingClient::connect(&socket).await.unwrap();
         let dog = serve_on_free_port(client, MetricsConfig::default_on_port(0)).await;
+        shepherds.cut_on_next_request();
 
         let response = scrape(dog.addr(), "/metrics").await;
         assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+    }
+
+    /// fails if a reload leaves the dog mute. THE measured defect: a dog's
+    /// process crosses the shepherd's `execve` for free, but only the
+    /// listening socket crosses with it, so the accepted connection this
+    /// dog holds dies. Over six real reloads before this was supervised,
+    /// the metrics dog kept its pid, reported zero restarts, stayed
+    /// `online`, wrote nothing to stderr, and answered 503 to every scrape
+    /// for 6m 22s. A pid check cannot see any of that, which is why the
+    /// assertion here is a scrape and not a liveness probe.
+    #[tokio::test]
+    async fn a_scrape_after_a_handover_serves_the_successors_flock() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = shep_client::testing::control_address(dir.path());
+        let successor = HelloAck {
+            daemon_version: "0.2.0".into(),
+            protocol: PROTOCOL_VERSION,
+            pid: 5150,
+        };
+        let shepherds = fake_daemon_across_handovers(
+            &socket,
+            vec![
+                Handshake::Accept(sample_ack()),
+                Handshake::Accept(successor),
+            ],
+        );
+        shepherds.reply_to_list(vec![sample_info("web")]);
+        let client = ReconnectingClient::connect(&socket).await.unwrap();
+        let dog = serve_on_free_port(client, MetricsConfig::default_on_port(0)).await;
+
+        let before = scrape(dog.addr(), "/metrics").await;
+        assert!(before.starts_with("HTTP/1.1 200 "), "{before}");
+        assert!(
+            before.contains(r#"shep_daemon_up{version="9.9.9"}"#),
+            "{before}"
+        );
+
+        shepherds.cut().await;
+
+        // The dog is scraped until the successor answers, bounded — a
+        // scrape landing inside the reconnect window legitimately 503s, and
+        // the contract is that the dog RECOVERS, not that it never misses a
+        // beat. Before this task that loop ran out every time.
+        let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let body = scrape(dog.addr(), "/metrics").await;
+                if body.starts_with("HTTP/1.1 200 ") {
+                    return body;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the dog must answer 200 again after its shepherd is replaced");
+
+        assert!(
+            recovered.contains(r#"sheep="web""#),
+            "the exposition must carry the successor's flock: {recovered}"
+        );
+        assert!(
+            recovered.contains(r#"shep_daemon_up{version="0.2.0"}"#),
+            "the exposition must name the daemon now running, not the one              that was replaced: {recovered}"
+        );
     }
 
     /// fails if any path serves the exposition. A scrape config that
@@ -431,7 +508,7 @@ mod tests {
     async fn only_the_metrics_path_serves_metrics() {
         let dir = tempfile::tempdir().unwrap();
         let socket = shep_client::testing::control_address(dir.path());
-        let (client, _daemon) = fake_client_on(&socket).await;
+        let (client, _daemon) = fake_reconnecting_client_on(&socket).await;
         let dog = serve_on_free_port(client, MetricsConfig::default_on_port(0)).await;
 
         let root = scrape(dog.addr(), "/").await;

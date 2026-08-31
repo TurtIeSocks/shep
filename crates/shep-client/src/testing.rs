@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +36,7 @@ use shep_core::protocol::{
 };
 use shep_core::status::ProcStatus;
 
-use crate::Client;
+use crate::{Client, ReconnectingClient};
 
 /// A control address valid on the platform running the test, unique to
 /// `dir`.
@@ -142,7 +142,7 @@ pub async fn serve_one_request(
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, ack).await;
+        let _hello = handshake(&mut frames, ack).await;
         let envelope = read_envelope(&mut frames).await;
         write_reply(&mut frames, envelope.id, response).await;
         envelope
@@ -193,7 +193,7 @@ pub fn fake_daemon_accepting_repeatedly_with_ack(
     let handle = tokio::spawn(async move {
         while let Ok(stream) = listener.accept().await {
             let mut frames = Framed::new(stream, codec());
-            handshake(&mut frames, ack.clone()).await;
+            let _hello = handshake(&mut frames, ack.clone()).await;
             let envelope = read_envelope(&mut frames).await;
             // `write_reply` wraps the value in `Ok` itself — its signature is
             // `(&mut Frames, u64, Response)`, testing.rs:155 — so passing an
@@ -203,6 +203,210 @@ pub fn fake_daemon_accepting_repeatedly_with_ack(
         }
     });
     (handle, served)
+}
+
+/// What one generation of [`fake_daemon_across_handovers`] does with the
+/// `Hello` a client sends it.
+///
+/// The three shapes a reconnecting client has to survive, and no others:
+/// a daemon that answers, one that refuses on version skew, and one that is
+/// bound but not yet able to answer at all.
+#[derive(Debug, Clone)]
+pub enum Handshake {
+    /// Answer the `Hello` with this ack, then serve requests until the
+    /// connection is cut.
+    Accept(HelloAck),
+    /// Refuse the `Hello` with this error and close — the successor a dog
+    /// compiled against an older protocol meets.
+    Refuse(RpcError),
+    /// Close without answering the `Hello` at all — a successor that is
+    /// accepting but has not finished coming up.
+    Drop,
+}
+
+/// A fake shepherd that survives a handover: ONE listener, one accepted
+/// connection at a time, and a [`Self::cut`] that drops the accepted
+/// connection out from under the client.
+///
+/// That asymmetry is the whole fixture. A real daemon handover passes the
+/// LISTENING socket across its `execve` and cannot pass an accepted one, so
+/// the address never stops being connectable while every established
+/// connection dies — which is precisely why a carried dog ends up a live
+/// process holding a dead socket. A fake that dropped its listener too
+/// would exercise "the daemon went away", a different situation with a
+/// different answer.
+///
+/// Each connection is served by the next [`Handshake`] in the list; once
+/// they run out the last one repeats, so a test sizes the list to what it
+/// means to assert and not to how many attempts the client makes.
+///
+/// Panics if `path` cannot be bound, and on any accept/decode/encode
+/// failure — test scaffolding, the same failure mode [`fake_daemon`]
+/// documents.
+#[derive(Debug)]
+pub struct Handovers {
+    cut: mpsc::Sender<()>,
+    cut_on_next_request: Arc<AtomicBool>,
+    accepted: Arc<AtomicU32>,
+    hellos: Arc<Mutex<Vec<Hello>>>,
+    envelopes: Arc<Mutex<Vec<(u32, Envelope)>>>,
+    armed_list: Arc<Mutex<Vec<ProcessInfo>>>,
+    task: JoinHandle<()>,
+}
+
+impl Handovers {
+    /// Drops the currently accepted connection, leaving the listener bound.
+    ///
+    /// The handover, compressed: what the client sees is exactly what an
+    /// `execve` in the daemon produces for it.
+    pub async fn cut(&self) {
+        let _ = self.cut.send(()).await;
+    }
+
+    /// Arms the current connection to read its next request envelope and
+    /// then die WITHOUT answering it — a request the daemon may or may not
+    /// have acted on before the image swapped.
+    ///
+    /// Synchronous rather than `async`, so a test can arm it on the line
+    /// before the request it means to lose (an `await` here would give the
+    /// serving task a chance to run first).
+    pub fn cut_on_next_request(&self) {
+        self.cut_on_next_request.store(true, Ordering::SeqCst);
+    }
+
+    /// How many connections this fake has accepted so far, across every
+    /// generation. The number that says whether a client retried, gave up,
+    /// or spun.
+    #[must_use]
+    pub fn accepted(&self) -> u32 {
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Every `Hello` this fake has read, in the order its generations read
+    /// them — including the ones it went on to REFUSE, which is the only
+    /// path where a real daemon can learn which dog it just turned away.
+    #[must_use]
+    pub fn hellos(&self) -> Vec<Hello> {
+        self.hellos.lock().unwrap().clone()
+    }
+
+    /// Every request envelope received so far, each paired with the 1-based
+    /// generation that received it — so a test can ask what the SUCCESSOR
+    /// saw rather than only what the fake saw in total.
+    #[must_use]
+    pub fn envelopes(&self) -> Vec<(u32, Envelope)> {
+        self.envelopes.lock().unwrap().clone()
+    }
+
+    /// Arms the answer every generation gives to `Request::ListFlock`.
+    /// Unlike [`FakeDaemon::reply_to_list`] this is not consumed, because a
+    /// test that reloads under a dog asks the same question of both
+    /// generations.
+    pub fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
+        *self.armed_list.lock().unwrap() = flock;
+    }
+}
+
+impl Drop for Handovers {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Binds `path` and serves one connection per entry in `handshakes`, in
+/// order. See [`Handovers`] for what this fixture models and why the
+/// listener outlives every connection.
+///
+/// Panics if `path` cannot be bound — test scaffolding, the same failure
+/// mode [`fake_daemon`] documents.
+#[must_use]
+pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> Handovers {
+    assert!(
+        !handshakes.is_empty(),
+        "a handover fixture needs at least one generation"
+    );
+    let mut listener = Listener::bind(path).unwrap();
+    let (cut_tx, mut cut_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
+    let cut_on_next_request = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(AtomicU32::new(0));
+    let hellos: Arc<Mutex<Vec<Hello>>> = Arc::new(Mutex::new(Vec::new()));
+    let envelopes: Arc<Mutex<Vec<(u32, Envelope)>>> = Arc::new(Mutex::new(Vec::new()));
+    let armed_list: Arc<Mutex<Vec<ProcessInfo>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let task = tokio::spawn({
+        let cut_on_next_request = Arc::clone(&cut_on_next_request);
+        let accepted = Arc::clone(&accepted);
+        let hellos = Arc::clone(&hellos);
+        let envelopes = Arc::clone(&envelopes);
+        let armed_list = Arc::clone(&armed_list);
+        async move {
+            let mut generation: u32 = 0;
+            while let Ok(stream) = listener.accept().await {
+                generation += 1;
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let index = usize::try_from(generation - 1).unwrap_or(usize::MAX);
+                let script = handshakes
+                    .get(index)
+                    .unwrap_or_else(|| handshakes.last().expect("non-empty, asserted above"))
+                    .clone();
+                let mut frames = Framed::new(stream, codec());
+                match script {
+                    Handshake::Drop => continue,
+                    Handshake::Refuse(err) => {
+                        // The client's `Hello` is read first so the refusal
+                        // is an answer rather than a race with its own write.
+                        // Recorded before the refusal, not after: a real
+                        // daemon has to read the name off a `Hello` it is
+                        // about to refuse, and that is the only path where
+                        // it can learn which dog it just refused.
+                        if let Some(Ok(first)) = frames.next().await {
+                            hellos.lock().unwrap().push(decode_frame(&first).unwrap());
+                        }
+                        let reply: HelloReply = Err(err);
+                        let _ = frames.send(encode_frame(&reply).unwrap()).await;
+                        continue;
+                    }
+                    Handshake::Accept(ack) => {
+                        let hello = handshake(&mut frames, ack).await;
+                        hellos.lock().unwrap().push(hello);
+                    }
+                }
+                loop {
+                    tokio::select! {
+                        frame = frames.next() => {
+                            let Some(Ok(bytes)) = frame else { break };
+                            let envelope: Envelope = decode_frame(&bytes).unwrap();
+                            let id = envelope.id;
+                            let body = envelope.body.clone();
+                            envelopes.lock().unwrap().push((generation, envelope));
+                            if cut_on_next_request.swap(false, Ordering::SeqCst) {
+                                break;
+                            }
+                            let response = match body {
+                                Request::ListFlock => {
+                                    Response::Flock(armed_list.lock().unwrap().clone())
+                                }
+                                Request::Subscribe { .. } => Response::Subscribed,
+                                _ => Response::Pong,
+                            };
+                            write_reply(&mut frames, id, response).await;
+                        }
+                        _ = cut_rx.recv() => break,
+                    }
+                }
+            }
+        }
+    });
+
+    Handovers {
+        cut: cut_tx,
+        cut_on_next_request,
+        accepted,
+        hellos,
+        envelopes,
+        armed_list,
+        task,
+    }
 }
 
 /// A `HelloAck` with a distinctive version and pid, so a test that asserts
@@ -253,16 +457,17 @@ pub fn sample_info() -> ProcessInfo {
 const SCRIPT_CHANNEL_CAPACITY: usize = 8;
 
 /// Completes the handshake side of the protocol: reads the client's
-/// `Hello` (and discards it — callers that need to assert on it use
-/// [`fake_daemon`] instead) and answers with `ack`.
+/// `Hello`, answers with `ack`, and hands the `Hello` back for a caller
+/// that wants to assert on it.
 ///
 /// Panics on any accept/read/decode/write failure — test scaffolding, see
 /// [`fake_daemon`]'s own doc for why that is the right failure mode here.
-async fn handshake(frames: &mut Frames, ack: HelloAck) {
+async fn handshake(frames: &mut Frames, ack: HelloAck) -> Hello {
     let first = frames.next().await.unwrap().unwrap();
-    let _hello: Hello = decode_frame(&first).unwrap();
+    let hello: Hello = decode_frame(&first).unwrap();
     let reply: HelloReply = Ok(ack);
     frames.send(encode_frame(&reply).unwrap()).await.unwrap();
+    hello
 }
 
 /// Reads and decodes the next envelope. Panics on failure or a closed
@@ -622,7 +827,7 @@ async fn serve_scripted(
 ) {
     let stream = listener.accept().await.unwrap();
     let mut frames = Framed::new(stream, codec());
-    handshake(&mut frames, ack).await;
+    let _hello = handshake(&mut frames, ack).await;
 
     let mut armed_err: Option<(RpcErrorCode, String)> = None;
     let mut armed_event_then_reply = false;
@@ -769,6 +974,37 @@ pub async fn fake_client_on(path: &Path) -> (Client, FakeDaemon) {
 /// As [`fake_client_on`], but with a caller-chosen [`HelloAck`] — for a
 /// test asserting on the ack a `Client` receives.
 pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDaemon) {
+    let daemon = fake_daemon_scripted_on(path, ack);
+    let client = Client::connect(path).await.unwrap();
+    (client, daemon)
+}
+
+/// As [`fake_client_on`], but hands back a [`ReconnectingClient`] — the
+/// supervised wrapper a dog uses — instead of a bare [`Client`].
+///
+/// The [`FakeDaemon`] behind it still serves exactly ONE connection, so a
+/// test that cuts this connection leaves the supervisor retrying against a
+/// listener that is gone. That is the right fixture for a test about what
+/// the dog does over a live connection, and the wrong one for a test about
+/// the reconnect itself — use [`fake_daemon_across_handovers`] for that.
+pub async fn fake_reconnecting_client_on(path: &Path) -> (ReconnectingClient, FakeDaemon) {
+    let daemon = fake_daemon_scripted_on(path, sample_ack());
+    let client = ReconnectingClient::connect(path).await.unwrap();
+    (client, daemon)
+}
+
+/// Binds `path` and starts the scripted fake WITHOUT connecting a client of
+/// its own, for a caller that performs its own connect — which is what
+/// separates a [`Client`] fixture from a [`ReconnectingClient`] one.
+///
+/// Synchronous: binding and spawning are both immediate, and the listener is
+/// bound before this returns, so a caller can connect straight away without
+/// a sleep.
+///
+/// Panics if `path` cannot be bound — test scaffolding, the same failure
+/// mode [`fake_daemon`] documents.
+#[must_use]
+pub fn fake_daemon_scripted_on(path: &Path, ack: HelloAck) -> FakeDaemon {
     let listener = Listener::bind(path).unwrap();
     let (script_tx, script_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
     let armed_list = Arc::new(Mutex::new(None));
@@ -791,21 +1027,17 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
         Arc::clone(&armed_shutdown_never_unlink),
         Arc::clone(&list_flock_count),
     ));
-    let client = Client::connect(path).await.unwrap();
-    (
-        client,
-        FakeDaemon {
-            script: script_tx,
-            armed_list,
-            armed_list_sequence,
-            armed_describe,
-            armed_reply_then_event,
-            armed_shutdown_then_unlink,
-            armed_shutdown_never_unlink,
-            list_flock_count,
-            task,
-        },
-    )
+    FakeDaemon {
+        script: script_tx,
+        armed_list,
+        armed_list_sequence,
+        armed_describe,
+        armed_reply_then_event,
+        armed_shutdown_then_unlink,
+        armed_shutdown_never_unlink,
+        list_flock_count,
+        task,
+    }
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], and hands back a connected
@@ -849,7 +1081,7 @@ pub async fn fake_daemon_answering_with_ack(
             let answer = answer.clone();
             tokio::spawn(async move {
                 let mut frames = Framed::new(stream, codec());
-                handshake(&mut frames, ack).await;
+                let _hello = handshake(&mut frames, ack).await;
                 while let Some(Ok(frame)) = frames.next().await {
                     let Ok(envelope) = decode_frame::<Envelope>(&frame) else {
                         break;
@@ -910,7 +1142,7 @@ pub async fn fake_client_answering(
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         while let Some(Ok(frame)) = frames.next().await {
             let Ok(envelope) = decode_frame::<Envelope>(&frame) else {
                 break;
@@ -938,7 +1170,7 @@ pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Rece
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         loop {
             let envelope = read_envelope(&mut frames).await;
             let id = envelope.id;
@@ -1023,7 +1255,7 @@ pub async fn fake_client_that_closes_after_handshake(path: &Path) -> (Client, Jo
     let task = tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         // Dropping `frames` (and the `UnixStream` it owns) here closes the
         // connection from this side.
     });
@@ -1043,7 +1275,7 @@ pub async fn fake_client_that_dies_mid_request(path: &Path) -> (Client, JoinHand
     let task = tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         let _envelope = read_envelope(&mut frames).await;
         // Dropping `frames` here — after reading, not before — closes the
         // connection only once the actor has already written the request
@@ -1069,7 +1301,7 @@ pub async fn fake_client_that_never_replies(path: &Path) -> (Client, JoinHandle<
     let task = tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         core::future::pending::<()>().await;
     });
     let client = Client::connect(path).await.unwrap();
@@ -1120,7 +1352,7 @@ pub fn start_fake_daemon_answering_on(path: &Path) {
     tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
-        handshake(&mut frames, sample_ack()).await;
+        let _hello = handshake(&mut frames, sample_ack()).await;
         core::future::pending::<()>().await;
     });
 }

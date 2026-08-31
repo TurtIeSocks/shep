@@ -245,6 +245,41 @@ socket in the first place, and `$SHEP_DOG_NAME`, which is the `name` to put
 in that request. No `[dog.<name>]` value ever rides along beside them, for
 the reason given above. A section's key is not one of its values.
 
+**Put that name in the `Hello` too, as `dog_name`.** Optional, and nothing
+breaks without it right up until the shepherd is replaced by one your binary
+is too old to speak to. A refused handshake never reaches a request, so the
+`name` in `DogConfig` is unreadable at exactly the moment it is needed:
+which dog to restart. With it, the shepherd restarts you once from the
+binary on disk — which fixes the ordinary case, where the package already
+replaced your file and the running process is merely old — and reports you
+stale rather than looping if that restart is refused too. `shep daemon
+reload` prints that report to the operator, after your reconnect rather
+than before it: what the old image knew about you described a process that
+was about to stop existing. Without it you go quiet and nothing on either
+side says why.
+
+A dog written against `shep-client` gets both halves from
+`ReconnectingClient::connect_as_dog`, which fills the name in and also
+re-establishes the connection when the shepherd is replaced. `Client` does
+neither, deliberately: the CLI uses it, and a `shep stop` that silently
+retried could stop a sheep twice.
+
+That is what `shep daemon reload` asks of a dog. A dog is carried across the
+reload the way a sheep is: the process is a child of a shepherd whose pid
+does not change, so it keeps its own pid and its restart count stays where it
+was. What does not survive is the accepted connection, which dies with the
+old image — so a dog that does not dial again is a live process holding a
+dead socket, alive on every column a listing has and answering nothing. The
+metrics dog is measured holding its pid and `restarts 0` across six reloads
+while still serving a scrape.
+
+The bark dog is the exception, and it is on the list to fix. Its subscription
+belongs to one connection, so the stream ends when that connection does and
+the dog exits; autorestart replaces it, which costs one restart per reload on
+a dog that is otherwise healthy. It comes back on its own every time, and its
+restart budget starts a fresh window with each shepherd, so this is a count
+that reads wrong rather than an outage.
+
 Those two are what shep ADDS, not the whole environment. A dog is a
 supervised process like any other, so it also starts from the small base
 every sheep gets: `PATH`, plus whichever of `HOME`, `USER`, `LANG` and `TZ`
