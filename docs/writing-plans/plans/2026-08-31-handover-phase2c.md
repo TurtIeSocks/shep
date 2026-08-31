@@ -21,6 +21,11 @@
 | task 5 | `Starting`, waiting on readiness | re-arm from `listen_timeout` |
 | task 8 | `WaitingRestart`, owed a respawn | re-arm from `backoff::restart_delay` |
 | this phase | a reload waiting on its deadline | task 3 below |
+| task 1's drill | **a kill ladder's SIGTERM→SIGKILL escalation** | task 2 below |
+
+The fifth was found by task 1 driving a real reload: a sheep carried
+mid-ladder never escalated, and had to be killed by hand. That is the same
+shape again, and it is why task 2 owns it.
 
 Each was invisible to the whole suite and to a pid check, and each left the flock looking healthy. **The lesson 2c must not relearn: a green suite is not evidence here. Every task drives a real reload.**
 
@@ -61,7 +66,24 @@ Implementation proceeds on the stated assumption in each case. Say the word on a
 
 ## Order
 
-1, 2 and 5 are independent. 3 and 4 are coupled and 4 depends on 3. Nothing after 2 may start before 1 and 2 are green, because all five touch `refusal()` in `handover/mod.rs` and would conflict.
+**Corrected 2026-08-31, after task 1 shipped: tasks 1 and 2 are ONE unit,
+not two.** `pending_delete` and `manual` are inseparable in the code. Every
+site that sets `pending_delete = true` also calls `claim_manual` in the same
+breath, and `PendingStop` is derived from `manual.is_some()` rather than from
+a stop-specific flag. So removing `RefusedReason::PendingDelete` on its own
+changes nothing an operator can observe: the sheep is still refused, now on
+`PendingStop`. Task 1's carry could only be demonstrated at all through a
+temporary bypass of the `PendingStop` check, which was reverted before its
+gate. Task 2 is what makes task 1 real, and neither is finished until both
+are in.
+
+That was a defect in this plan, not in the code. It came from reading the two
+fields as two facts because they are two struct members, without checking
+whether anything ever sets one without the other.
+
+5 is independent. 3 and 4 are coupled, and 4 depends on 3. Everything touches
+`refusal()` in `handover/mod.rs`, so tasks run one at a time unless they are
+in separate worktrees.
 
 ---
 
