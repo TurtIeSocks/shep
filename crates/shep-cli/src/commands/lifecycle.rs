@@ -3363,8 +3363,11 @@ mod tests {
     /// the coverage job) while passing every local run: node took longer than
     /// that to come up, so the run hit the deadline still running and shep
     /// reported the kill it really had performed. The tier exists for exactly
-    /// this, and the budget here is 5s because a stalled read waits out
-    /// whatever is left of it, so the budget IS what the test costs.
+    /// this, and the budget here is 20s: a stalled read waits out whatever
+    /// is left of it, so the budget IS what the test costs. Raised from 5s
+    /// on 2026-08-31 after four CI failures, and the twenty seconds it now
+    /// spends every run is the price of a red board that means something.
+    /// See `HELD_PIPE_BUDGET` below for both ends of the number.
     mod slow {
         use super::*;
 
