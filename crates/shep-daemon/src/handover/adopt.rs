@@ -518,6 +518,7 @@ mod tests {
             pending_delete: Some(false),
             manual: None,
             reload: Some(crate::entry::ReloadState::None),
+            dog: None,
             ready_failed: Some(false),
             restart_due: None,
             app: crate::testing::app_with("web", |_| {}).into_config(),

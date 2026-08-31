@@ -264,6 +264,22 @@ re-establishes the connection when the shepherd is replaced. `Client` does
 neither, deliberately: the CLI uses it, and a `shep stop` that silently
 retried could stop a sheep twice.
 
+That is what `shep daemon reload` asks of a dog. A dog is carried across the
+reload the way a sheep is: the process is a child of a shepherd whose pid
+does not change, so it keeps its own pid and its restart count stays where it
+was. What does not survive is the accepted connection, which dies with the
+old image — so a dog that does not dial again is a live process holding a
+dead socket, alive on every column a listing has and answering nothing. The
+metrics dog is measured holding its pid and `restarts 0` across six reloads
+while still serving a scrape.
+
+The bark dog is the exception, and it is on the list to fix. Its subscription
+belongs to one connection, so the stream ends when that connection does and
+the dog exits; autorestart replaces it, which costs one restart per reload on
+a dog that is otherwise healthy. It comes back on its own every time, and its
+restart budget starts a fresh window with each shepherd, so this is a count
+that reads wrong rather than an outage.
+
 Those two are what shep ADDS, not the whole environment. A dog is a
 supervised process like any other, so it also starts from the small base
 every sheep gets: `PATH`, plus whichever of `HOME`, `USER`, `LANG` and `TZ`

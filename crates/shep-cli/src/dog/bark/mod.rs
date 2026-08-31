@@ -223,6 +223,28 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
                 _ = sigterm.recv() => break,
                 next = events.next() => {
                     match next {
+                        // The stream belongs to one connection generation,
+                        // so this is "the shepherd this dog handshook with
+                        // is gone" -- which since phase 3 usually means it
+                        // exec'd a successor rather than that it died. The
+                        // dog exits 0 and `autorestart` replaces it, so it
+                        // comes back, at one restart per reload; the
+                        // metrics dog beside it holds its pid and its
+                        // `restarts 0` because `ReconnectingClient` dials
+                        // again underneath it.
+                        //
+                        // Deliberate and recorded, not an oversight. The
+                        // right answer is to re-subscribe here and then
+                        // `reconcile`, because a handover gap is the same
+                        // class of loss as the `Err(dropped)` arm below and
+                        // deserves the same "ask the shepherd what things
+                        // look like now" -- but it needs an
+                        // `EventSource::resubscribe`, an await-on-connected
+                        // that `ReconnectingClient` does not expose, and a
+                        // ruling on what an ORPHANED dog does, which is a
+                        // question about every dog. See "The bark dog still
+                        // restarts once per reload" in `docs/specs/
+                        // deferred.md`.
                         None => break,
                         Some(Ok(event)) => {
                             let firings = rules.on_event(&event, now_ms());

@@ -3689,9 +3689,20 @@ impl<R: ProcessRunner> Actor<R> {
             credentials: carried.credentials(),
             out_file: spec.out_file.clone(),
             err_file: spec.err_file.clone(),
-            // The gate refuses any flock carrying a dog, so a carried sheep
-            // is never one, and the blob has no field for it to lose.
-            dog: None,
+            // Restored, and it is the marker that keeps a dog OUT of the
+            // flock rather than in it: `matching_ids` passes a marked entry
+            // over for every selector but an exact one, so an adoption that
+            // dropped it would put the dog in `shep flock` beside the
+            // operator's own apps, take it out of `shep dogs`, and let
+            // `shep restart all` reach it. `spawn_dog_watch` and
+            // `rpc::dog_staleness` read the same field, so it also decides
+            // whether an exhausted dog reaches `barks.jsonl` and whether a
+            // reload waits for this dog to dial back in.
+            //
+            // `None` for a blob written before this daemon carried a dog at
+            // all, which said the same thing by refusing to carry one; see
+            // `CarriedSheep::dog`.
+            dog: carried.dog().cloned(),
             last_exit: carried.last_exit(),
         };
 
@@ -18687,6 +18698,73 @@ mod tests {
             info.iter().map(|row| row.pid).collect::<Vec<_>>(),
             vec![Some(4242), Some(4243)],
             "a sheep whose pid moved was respawned"
+        );
+    }
+
+    /// Fails if an adopted dog comes back as an ordinary sheep.
+    ///
+    /// The marker is what tells the two populations apart everywhere it
+    /// matters, and losing it is invisible to a pid check: the dog is still
+    /// running, still `Online`, still on its own pid. What changes is that
+    /// `matching_ids` stops passing it by, so `shep restart all` reaches
+    /// it, `shep flock` lists it beside the operator's own apps and `shep
+    /// dogs` loses it entirely; `dogs::spawn_dog_watch` stops recording its
+    /// exhausted restart budget, so an outage writes nothing to
+    /// `barks.jsonl`; and `rpc::dog_staleness` loses it off the roster a
+    /// reload waits on.
+    ///
+    /// Two assertions, and the second is what an operator actually feels.
+    /// The listing proves the marker survived the blob and the install; the
+    /// wildcard proves the marker is DOING its job on the far side, which a
+    /// field asserted in isolation cannot. `a_wildcard_passes_a_dog_by_and_
+    /// its_own_name_still_reaches_it` pins the same rule against an actor
+    /// built by hand, so this one is about the adoption reaching it rather
+    /// than about the rule.
+    ///
+    /// A `stop` rather than a `restart`, and a kennel with no sheep in it,
+    /// so nothing here waits on a kill ladder: `NotFound` is the answer to
+    /// a wildcard that matched nothing, and it is returned without any
+    /// process being signalled. The timeout is the forcing mechanism
+    /// (IR-46) -- with the marker dropped the wildcard matches the dog and
+    /// the stop parks on an exit `StandInProc` never delivers, so without it
+    /// the mutation hangs the suite instead of failing this case.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_dog_keeps_its_marker_and_stays_out_of_a_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried(
+                    "log-rotate",
+                    7,
+                    Some(4242),
+                    |entry| {
+                        entry.dog = Some(DogSource::Adopted {
+                            path: "/opt/bin/shep-log-rotate".to_string(),
+                        });
+                    },
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        let info = sup.list().await;
+        assert_eq!(
+            info[0].dog,
+            Some(DogSource::Adopted {
+                path: "/opt/bin/shep-log-rotate".to_string(),
+            }),
+            "a dog adopted as an ordinary sheep is one `shep dogs` has lost"
+        );
+
+        let swept = tokio::time::timeout(Duration::from_secs(5), sup.stop(ProcessSelector::All))
+            .await
+            .expect("a wildcard over a flock of nothing but dogs must answer rather than hang");
+        assert!(
+            matches!(swept, Err(SupervisorError::NotFound)),
+            "`all` is the flock, not the kennel: {swept:?}"
         );
     }
 

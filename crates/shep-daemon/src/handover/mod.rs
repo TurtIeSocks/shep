@@ -2,11 +2,14 @@
 //! place, the [`Handover`] blob that describes it, and (in a later task) the
 //! exec that carries it.
 //!
-//! Two things are still refused, and they are not the same kind of thing. A
-//! DOG is deferred: phase 3 carries it, and the refusal goes when it does. An
-//! unresponsive log pump is PERMANENT, because it is a live sheep whose
-//! descriptors this daemon does not know, and carrying it would hand the
-//! successor a sheep it cannot read. A
+//! One thing is still refused, and it is permanent rather than deferred: a
+//! live sheep whose log pump did not report its descriptors in time is a
+//! sheep whose descriptors this daemon does not know, and carrying it would
+//! hand the successor a sheep it cannot read. Every refusal that named a
+//! FEATURE has gone -- a dog was the last of them, and phase 3 carries one
+//! by giving it a connection that re-establishes itself after the exec -- so
+//! the gate no longer says anything about how much of the handover has
+//! shipped. A
 //! sheep's stdout, stderr, log files, stdin pipe and shepherd channel all
 //! cross the exec, and every one of those is per SHEEP rather than per app,
 //! so an app running several instances crosses as several sets and needs
@@ -35,7 +38,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use shep_core::config::AppConfig;
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::ExitInfo;
+use shep_core::protocol::{DogSource, ExitInfo};
 use shep_core::status::ProcStatus;
 
 use crate::entry::{ProcessEntry, ReloadState};
@@ -54,39 +57,30 @@ pub enum Fitness {
 
 /// Why a flock cannot be handed over in place, and what happens instead.
 ///
-/// Almost every variant is a feature this daemon does not yet carry rather
-/// than an error, and the caller falls back to the stop arm, which is correct
-/// behaviour rather than a degraded one. [`Self::PumpUnresponsive`] is the
-/// exception and is a fault: it says a sheep's log pump did not answer in
-/// time, so nothing here knows which descriptors that sheep holds. The
-/// answer is still to refuse and stop, which is why it lives with the rest.
+/// One variant, and it is a fault rather than a feature this daemon has not
+/// shipped yet: a sheep's log pump did not answer in time, so nothing here
+/// knows which descriptors that sheep holds. The caller still falls back to
+/// the stop arm, which is correct behaviour rather than a degraded one.
+///
+/// **Every other variant this enum has ever had is gone**, each one turned
+/// into something the daemon carries -- a shepherd channel, a stdin pipe, a
+/// pending delete or stop, a swap in flight, more than one instance, and now
+/// a dog. That is why the wording is written as a fault: an operator who
+/// reads "cannot yet" about a stuck filesystem waits for a version that is
+/// never coming.
 ///
 /// `#[non_exhaustive]`, unlike [`crate::boot::Shepherd`]: that enum is
 /// closed by its mechanism (a pidfile lock is either free, held-with-pid or
-/// held-without, and there is no fourth state). This one is closed by
-/// nothing but how much of the handover has shipped. Every phase so far has
-/// turned one of these into something the daemon carries, and a dog is still
-/// to go, so a match here must keep tolerating a variant this module has not
-/// named yet. [`RefusedReason::PumpUnresponsive`] is the exception that will
-/// not go: it answers a question about THIS daemon's knowledge rather than
-/// about the handover's coverage.
+/// held-without, and there is no fourth state). This one is not closed by
+/// anything. A second way for a live sheep's descriptors to be unknowable
+/// would join it, and shep-daemon is a published library an out-of-tree
+/// matcher should not break for (IR-20).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RefusedReason {
     /// The sheep's log pump did not report its descriptors before the
     /// snapshot's deadline, so nothing knows which descriptors it holds.
-    ///
-    /// First in this enum and first in [`refusal`]'s order, because it is
-    /// the only variant that is not a statement about the sheep's config: a
-    /// sheep can be both wedged and a dog, and the wedge is the fact an
-    /// operator needs, since it will still be true after every feature
-    /// below has shipped.
     PumpUnresponsive {
-        /// The sheep's name.
-        sheep: String,
-    },
-    /// The sheep is a dog, whose descriptor inventory is not covered yet.
-    Dog {
         /// The sheep's name.
         sheep: String,
     },
@@ -94,25 +88,17 @@ pub enum RefusedReason {
 
 impl core::fmt::Display for RefusedReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let (sheep, feature) = match self {
-            // Its own sentence rather than a `feature` for the one below:
-            // "has a wedged log pump, which this daemon cannot yet hand
-            // over" would read as a gap a later phase closes, and this one
-            // will still be a fault when every other variant has gone.
-            Self::PumpUnresponsive { sheep } => {
-                return write!(
-                    f,
-                    "sheep '{sheep}' has a log pump that did not report its descriptors in \
-                     time; reload falls back to a stop-and-start instead"
-                );
-            }
-            Self::Dog { sheep } => (sheep, "being a dog"),
-        };
-        write!(
-            f,
-            "sheep '{sheep}' has {feature}, which this daemon cannot yet hand \
-             over; reload falls back to a stop-and-start instead"
-        )
+        // The tail is what `shep daemon reload`'s own end-to-end cases probe
+        // for to tell a carried flock from a stopped-and-started one, so it
+        // is load-bearing text rather than punctuation: see `cli_e2e`'s
+        // assertions on "falls back to a stop-and-start".
+        match self {
+            Self::PumpUnresponsive { sheep } => write!(
+                f,
+                "sheep '{sheep}' has a log pump that did not report its descriptors in \
+                 time; reload falls back to a stop-and-start instead"
+            ),
+        }
     }
 }
 
@@ -197,9 +183,6 @@ fn refusal(candidate: &Candidate<'_>) -> Option<RefusedReason> {
 
     if candidate.pump_unresponsive {
         return Some(RefusedReason::PumpUnresponsive { sheep: name() });
-    }
-    if entry.dog.is_some() {
-        return Some(RefusedReason::Dog { sheep: name() });
     }
     None
 }
@@ -685,6 +668,37 @@ pub struct CarriedSheep {
     ///
     /// Nothing on it is sensitive: one timestamp (IR-41).
     restart_due: Option<SystemTime>,
+    /// Where this instance's binary came from, for an instance that is a
+    /// dog, or `None` for an ordinary sheep.
+    ///
+    /// `Option` for the reason [`Self::pending_delete`] gives: a
+    /// predecessor from before this field existed refused to carry a dog at
+    /// all, so a blob it wrote never has the key, and `None` is what that
+    /// blob truthfully means -- "not a dog" -- rather than "unknown".
+    /// [`VERSION`] stays unmoved: nothing an older reader must understand
+    /// has changed. Serde's derive already lets an `Option` field be
+    /// absent, so there is no `#[serde(default)]`, for the reason
+    /// [`CarriedFds::stdin`] gives at length.
+    ///
+    /// **The whole [`DogSource`], not a boolean**, because `shep dogs`
+    /// reports where each dog's binary came from and a successor holding
+    /// only "yes" would have to guess that column.
+    ///
+    /// Losing it is not cosmetic, and none of what it costs is visible to a
+    /// pid check. `Actor::matching_ids` keeps a dog out of every selector
+    /// but an exact one, so an unmarked dog joins `shep flock` beside the
+    /// operator's own apps, leaves `shep dogs`, and starts answering to
+    /// `shep restart all`. `dogs::spawn_dog_watch` records an exhausted
+    /// restart budget only for a marked entry, so an unmarked dog that
+    /// burned its whole budget writes nothing to `barks.jsonl` -- the alert
+    /// an operator reads after an outage. And `rpc::dog_staleness` builds
+    /// its roster from the marker, so a reload could not tell a dog that had
+    /// not dialled back yet from one that had.
+    ///
+    /// Nothing on it is sensitive: a closed enum naming this binary or a
+    /// path the operator typed into `shep adopt`, which the blob's own
+    /// `AppConfig` already carries as the program to run (IR-41).
+    dog: Option<DogSource>,
     /// The resolved config this instance runs under, environment included.
     ///
     /// This is the `AppConfig` beneath [`ProcessEntry::spec`]'s
@@ -725,7 +739,8 @@ impl CarriedSheep {
     /// the respawn deadline are on the supervisor's private slot type, and
     /// the descriptor numbers are known only to whichever code holds the
     /// open descriptors. This is the same split [`Candidate`] makes, for the
-    /// same reason.
+    /// same reason. [`Self::reload`] and [`Self::dog`] are the two that do
+    /// live on `entry`, so they are read rather than passed.
     ///
     /// `restart_due` is the one argument this does not carry verbatim: it is
     /// gated on the entry's status, for the reason
@@ -754,8 +769,9 @@ impl CarriedSheep {
             pending_delete: Some(pending_delete),
             manual,
             // Read off the entry rather than passed in, unlike the markers
-            // either side of it: this one does live on `ProcessEntry`.
+            // either side of it: these two do live on `ProcessEntry`.
             reload: Some(entry.reload),
+            dog: entry.dog.clone(),
             ready_failed: Some(ready_failed),
             // Gated on the status rather than carried verbatim, unlike every
             // marker above. The slot's own field is written on the one
@@ -806,6 +822,18 @@ impl CarriedSheep {
     #[must_use]
     pub const fn reload(&self) -> Option<ReloadState> {
         self.reload
+    }
+
+    /// Where this instance's binary came from if it is a dog, or `None` for
+    /// an ordinary sheep — which is also what a blob written before this
+    /// field existed says, and truthfully, since that predecessor refused to
+    /// carry a dog at all. See the field's own doc for what losing it costs.
+    ///
+    /// Borrowed rather than cloned: [`DogSource::Adopted`] owns a path, and
+    /// every caller either reads it or clones it for an entry of its own.
+    #[must_use]
+    pub const fn dog(&self) -> Option<&DogSource> {
+        self.dog.as_ref()
     }
 
     /// Whether a reload's readiness verification has already failed against
@@ -1462,6 +1490,23 @@ mod tests {
         }
     }
 
+    /// The same entry as a candidate whose log pump missed the snapshot's
+    /// deadline, which is the one thing left that refuses a flock.
+    ///
+    /// Every case below that needs A refusal rather than a particular one
+    /// goes through here. Three of them used to reach for a feature the
+    /// daemon had not shipped yet -- a shepherd channel, then two instances,
+    /// then a dog -- and moved each time that feature landed. There is
+    /// nothing left for them to move to, which is the point: a wedged pump
+    /// is a fault about this daemon's own knowledge and will still refuse
+    /// when every feature has shipped.
+    fn wedged(entry: &ProcessEntry) -> Candidate<'_> {
+        Candidate {
+            entry,
+            pump_unresponsive: true,
+        }
+    }
+
     #[test]
     fn a_plain_sheep_is_carryable() {
         let e = entry_fixture(|_| {});
@@ -1472,11 +1517,10 @@ mod tests {
     fn one_unsupported_sheep_refuses_the_whole_flock() {
         // Not per-sheep. The blob describes one process image, so a flock is
         // carried whole or not at all.
-        let plain_entry = entry_fixture(|_| {});
-        let mut unsupported = entry_fixture(|_| {});
-        unsupported.dog = Some(shep_core::protocol::DogSource::BuiltIn);
+        let carryable = entry_fixture(|_| {});
+        let unsupported = entry_fixture(|_| {});
         assert!(matches!(
-            fitness(&[plain(&plain_entry), plain(&unsupported)]),
+            fitness(&[plain(&carryable), wedged(&unsupported)]),
             Fitness::Refused(_)
         ));
     }
@@ -1485,14 +1529,17 @@ mod tests {
     fn the_refusal_names_which_sheep_and_why() {
         // The operator sees this in `shep daemon reload`'s output, so it has
         // to say what to do about it, not just that it declined.
-        let mut unsupported = entry_fixture(|_| {});
-        unsupported.dog = Some(shep_core::protocol::DogSource::BuiltIn);
-        let Fitness::Refused(r) = fitness(&[plain(&unsupported)]) else {
+        let unsupported = entry_fixture(|_| {});
+        let Fitness::Refused(r) = fitness(&[wedged(&unsupported)]) else {
             panic!("expected a refusal")
         };
         let text = r.to_string();
-        assert!(text.contains("being a dog"), "{text}");
+        assert!(text.contains("did not report its descriptors"), "{text}");
         assert!(text.contains("web"), "{text}");
+        assert!(
+            text.contains("falls back to a stop-and-start"),
+            "the refusal must say what happens instead, not only that it declined: {text}"
+        );
     }
 
     /// A wedged pump refuses, and says so as a fault rather than as a
@@ -1576,14 +1623,30 @@ mod tests {
         assert_eq!(fitness(&[plain(&e)]), Fitness::Carryable);
     }
 
+    /// fails if the gate still refuses a flock because one of its sheep is
+    /// a dog.
+    ///
+    /// The last FEATURE refusal, and the one this phase exists to remove. A
+    /// dog's process crosses the exec for free, exactly as every sheep's
+    /// does; what it needed was a connection that re-establishes itself
+    /// afterwards (`shep_client::ReconnectingClient`, task 1) and a daemon
+    /// that knows what to do when a successor refuses that handshake
+    /// (`dogs::record_refused_dog`, task 2).
+    ///
+    /// Both sources, because a dog is the MARKER rather than the binary: a
+    /// gate that read `DogSource::BuiltIn` alone would pass this half and go
+    /// on refusing every flock an operator had adopted a dog into.
     #[test]
-    fn a_dog_refuses() {
-        let mut e = entry_fixture(|_| {});
-        e.dog = Some(shep_core::protocol::DogSource::BuiltIn);
-        assert!(matches!(
-            fitness(&[plain(&e)]),
-            Fitness::Refused(RefusedReason::Dog { .. })
-        ));
+    fn a_dog_is_carried_rather_than_refused() {
+        let mut built_in = entry_fixture(|_| {});
+        built_in.dog = Some(DogSource::BuiltIn);
+        assert_eq!(fitness(&[plain(&built_in)]), Fitness::Carryable);
+
+        let mut adopted = entry_fixture(|_| {});
+        adopted.dog = Some(DogSource::Adopted {
+            path: "/opt/bin/shep-log-rotate".to_string(),
+        });
+        assert_eq!(fitness(&[plain(&adopted)]), Fitness::Carryable);
     }
 
     /// fails if the gate still refuses an app running more than one
@@ -2187,6 +2250,117 @@ mod tests {
         let loaded = Handover::load_value(older).expect("an older blob must still load");
 
         assert_eq!(loaded.sheep[0].ready_failed(), None);
+        assert_eq!(
+            loaded.sheep[0].id(),
+            blob.sheep[0].id(),
+            "the rest of the row is unchanged by the one field that was absent"
+        );
+    }
+
+    /// fails if a dog crosses the blob as an ordinary sheep.
+    ///
+    /// The marker is not decoration. `Actor::matching_ids` keeps a dog out
+    /// of every selector but an exact one, so a carried dog that lost it
+    /// leaves `shep dogs` and turns up in `shep flock` beside the
+    /// operator's own apps -- and `shep restart all` reaches it.
+    /// `dogs::spawn_dog_watch` records an exhausted restart budget only for
+    /// an entry carrying it, so a dog that burned its whole budget after a
+    /// reload would write nothing to `barks.jsonl`. And `rpc::dog_staleness`
+    /// builds its roster from it, so a reload could not tell a dog that had
+    /// not dialled back yet from one that had.
+    ///
+    /// The whole `DogSource`, not a boolean: `shep dogs` reports where a
+    /// dog's binary came from, and a successor that knew only THAT a sheep
+    /// was a dog would answer that column with a guess.
+    #[test]
+    fn a_dogs_marker_crosses_the_blob() {
+        let mut entry = entry_fixture(|_| {});
+        entry.dog = Some(DogSource::Adopted {
+            path: "/opt/bin/shep-log-rotate".to_string(),
+        });
+        let mut blob = sample_handover();
+        blob.sheep[0] = CarriedSheep::from_entry(&entry, 7, fds_at(11), false, None, false, None);
+
+        let loaded = Handover::load_value(serde_json::to_value(&blob).unwrap())
+            .expect("a current blob loads");
+
+        assert_eq!(
+            loaded.sheep[0].dog(),
+            Some(&DogSource::Adopted {
+                path: "/opt/bin/shep-log-rotate".to_string(),
+            }),
+            "a dog that crossed the exec as an ordinary sheep is one `shep dogs` has lost"
+        );
+    }
+
+    /// fails if a plain sheep picks a dog marker up on the way across.
+    ///
+    /// The other direction, and it is not implied by the case above: a
+    /// `from_entry` that hardcoded a source would pass that one and turn
+    /// every carried app into a dog, which takes the whole flock out of
+    /// `shep flock` and out of `shep restart all` at once.
+    #[test]
+    fn a_plain_sheep_crosses_the_blob_without_one() {
+        let mut blob = sample_handover();
+        blob.sheep[0] = CarriedSheep::from_entry(
+            &entry_fixture(|_| {}),
+            7,
+            fds_at(11),
+            false,
+            None,
+            false,
+            None,
+        );
+
+        let loaded = Handover::load_value(serde_json::to_value(&blob).unwrap())
+            .expect("a current blob loads");
+
+        assert_eq!(loaded.sheep[0].dog(), None);
+    }
+
+    /// fails if a blob written before this daemon carried a dog stops
+    /// loading.
+    ///
+    /// Same stakes and the same argument as the four fields above it: a
+    /// predecessor from before this field existed refused to carry a dog at
+    /// ALL, so a blob it wrote never has the key and never describes one.
+    /// `None` is what that blob truthfully means rather than "unknown", so
+    /// [`VERSION`] stays unmoved -- and a hard parse failure would leave a
+    /// successor refusing to boot after its predecessor had exec'd itself
+    /// away, over a field whose absence has a correct reading.
+    ///
+    /// The current-blob half is asserted first so the removal below removes
+    /// something: a blob whose sheep was never a dog could not tell an
+    /// absent key from a present one.
+    #[test]
+    fn a_blob_written_before_a_dog_was_carried_still_loads() {
+        let mut entry = entry_fixture(|_| {});
+        entry.dog = Some(DogSource::BuiltIn);
+        let mut blob = sample_handover();
+        blob.sheep[0] = CarriedSheep::from_entry(&entry, 7, fds_at(11), false, None, false, None);
+        let value = serde_json::to_value(&blob).unwrap();
+
+        assert_eq!(
+            Handover::load_value(value.clone())
+                .expect("a current blob loads")
+                .sheep[0]
+                .dog(),
+            Some(&DogSource::BuiltIn),
+            "a marker on the wire must come back as one"
+        );
+
+        let mut older = value;
+        let sheep = older["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        assert!(
+            sheep.remove("dog").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(older).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].dog(), None);
         assert_eq!(
             loaded.sheep[0].id(),
             blob.sheep[0].id(),

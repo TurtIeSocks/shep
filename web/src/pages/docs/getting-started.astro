@@ -78,7 +78,10 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     <p>
       A flock that can be carried keeps running through the reload. The
       shepherd replaces its own image in place, so every sheep keeps the pid
-      it already had and its log carries on where it was. One that cannot is
+      it already had and its log carries on where it was. The dogs cross
+      with it rather than being stopped and started alongside the flock; the
+      dogs page says what each one does on the far side. One that cannot be
+      carried is
       stopped and started instead, which moves every pid and starts every log
       again; the note below says which flocks those are.
     </p>
@@ -88,9 +91,10 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       now running, not the one it replaced.
     </p>
     <p class="fine">
-      Not every flock can be carried yet. A dog sends the reload down the
-      older path instead: the flock is stopped and started, and the reload
-      prints which sheep held it back. Coming from 0.1.17 or earlier, the
+      One thing still sends a reload down the older path: a sheep whose log
+      pump has stopped answering. The shepherd cannot say which files that
+      sheep is writing to, so it stops and starts the flock instead and
+      names the sheep that held it back. Coming from 0.1.17 or earlier, the
       first reload always takes that path too: the shepherd being replaced
       predates the handover and has nothing to hand over with.
     </p>

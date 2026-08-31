@@ -558,6 +558,33 @@ impl PidfileLock {
     }
 }
 
+/// The apps a successor records in its own registry, which is what the
+/// muster roll on disk is written from.
+///
+/// Every carried sheep's, and **no dog's**. A dog is registered by
+/// `dogs::spawn_enabled_dogs` at every boot, from `shep.toml`'s own
+/// `enabled_dogs`/`adopted_dogs` lists, and it has never been in the roll:
+/// nothing on the dog path ever touches [`FlockRegistry::record`]. Writing
+/// one in here would put it there for the first time, and the roll outlives
+/// the daemon -- so a later cold boot would restore `metrics` as an
+/// ordinary sheep, with no marker, before `spawn_enabled_dogs` got to it,
+/// and `shep disable metrics` would not be able to take it back out.
+///
+/// The filter belongs here rather than at the `record_config` call because
+/// this is the one place that still holds the blob's own rows: the registry
+/// takes bare [`AppConfig`](shep_core::config::AppConfig)s, which carry no
+/// marker to filter on afterwards.
+#[cfg(unix)]
+fn apps_for_the_roll(
+    flock: &[crate::handover::adopt::AdoptedSheep],
+) -> Vec<shep_core::config::AppConfig> {
+    flock
+        .iter()
+        .filter(|sheep| sheep.carried.dog().is_none())
+        .map(|sheep| sheep.carried.app().clone())
+        .collect()
+}
+
 /// The handover blob this process was handed, if it is a successor.
 ///
 /// A successor is a shep image an outgoing daemon `execve`d in its own
@@ -1220,7 +1247,7 @@ pub async fn boot<R: ProcessRunner>(
         Some((flock, counters, reloads)) => {
             // Read before the flock is moved: the registry below is rebuilt
             // from these, and the roll would otherwise be written empty.
-            carried_apps.extend(flock.iter().map(|sheep| sheep.carried.app().clone()));
+            carried_apps.extend(apps_for_the_roll(&flock));
             builder
                 .spawn_adopted(flock, counters, reloads)
                 .map_err(|source| BootError::Adopt(source.to_string()))?
@@ -3469,40 +3496,45 @@ mod tests {
     /// them, meet `EBADF`, and return, rather than exec'ing this test binary
     /// into an endless re-run of the whole suite. The assertion on
     /// the message is what tells the two failures apart.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_sighup_over_a_flock_it_cannot_carry_refuses_before_it_execs() {
-        // Real time + real signal listeners. This case raises nothing
-        // itself, but `SIGNAL_TEST_LOCK`'s rule is "calls `boot()`
+        // Real signal listeners, and a PAUSED clock. This case raises
+        // nothing itself, but `SIGNAL_TEST_LOCK`'s rule is "calls `boot()`
         // successfully", not "calls `raise()`": a successful `boot()`
         // installs SIGTERM, SIGHUP and SIGUSR2 listeners that run for this
         // test's whole duration, and a concurrent `raise()` in one of the
         // shutdown cases reaches them too. This daemon would then shut down
         // ahead of its own `ctx.shutdown()` while absorbing a delivery the
         // other test needed, which is the way a real regression there gets
-        // masked.
+        // masked. The lock is about the signals; the clock is a separate
+        // question, and pausing it is what stops the refusal this case
+        // needs -- a log pump missing `REPORT_DEADLINE` -- costing the
+        // suite two real seconds. Measured: 2.0s awake, 0.03s paused.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        // A dog: the sheep the gate still refuses. This was a shepherd
-        // channel until 2b task 5 carried one and two instances until task
-        // 6 carried those, and the case is about the gate firing at all
-        // rather than about which feature fires it. Task 7 carries dogs, so
-        // it moves again.
+        // A wedged log pump: the one thing the gate still refuses, and the
+        // only one it ever will. The case is about the gate firing at all
+        // rather than about what fires it, so its fixture has moved every
+        // time a phase carried the feature it was reaching for -- a
+        // shepherd channel in 2b task 5, two instances in task 6, a dog in
+        // phase 3 task 4. There is nothing left for it to move to.
         let daemon = boot(
-            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            ScriptedRunner::new(vec![ProcScript::never_exits()])
+                .with_a_pump_that_never_reports(&["wedged"]),
             paths.clone(),
-            BootOptions {
-                dogs: vec![DogSpec {
-                    name: "metrics".to_string(),
-                    source: DogSource::BuiltIn,
-                }],
-                ..BootOptions::default()
-            },
+            BootOptions::default(),
         )
         .await
         .unwrap();
         let ctx = daemon.context();
+        ctx.supervisor
+            .start(vec![
+                normalize(AppConfig::minimal("wedged", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
 
         let seam = HandoverSeam {
             supervisor: ctx.supervisor.clone(),
@@ -3514,10 +3546,14 @@ mod tests {
         };
         let refusal = hand_over_now(&seam)
             .await
-            .expect_err("a flock with a dog in it cannot be carried");
+            .expect_err("a flock with a wedged log pump cannot be carried");
         assert!(
-            refusal.contains("being a dog"),
+            refusal.contains("did not report its descriptors in time"),
             "the gate must refuse before anything is exec'd: {refusal}"
+        );
+        assert!(
+            refusal.contains("wedged"),
+            "the refusal must name the sheep that held the flock back: {refusal}"
         );
 
         ctx.shutdown();
@@ -3618,33 +3654,29 @@ mod tests {
     /// Two sheep, because the resume has to reach every pump that was
     /// reported to rather than the one the refusal named.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_abandoned_handover_starts_every_pump_reading_again() {
         // As the sibling above: a successful `boot()` installs real signal
-        // listeners for this test's whole duration.
+        // listeners for this test's whole duration, and the clock is paused
+        // so the missed `REPORT_DEADLINE` this refusal needs costs the
+        // suite nothing to wait out.
         let _guard = SIGNAL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 3]));
-        // The refusal: a dog is a sheep this daemon still cannot carry, and
-        // the gate reads it AFTER every pump has already been reported to,
-        // which is what makes the resume owed. It was a shepherd channel
-        // until 2b task 5 carried one and two instances until task 6
-        // carried those; what the case needs is any refusal at all.
-        //
-        // Spawned by `boot` rather than by the `start` below, so the dog is
-        // script 0 and the two sheep are 1 and 2.
+        let runner = Arc::new(
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 3])
+                .with_a_pump_that_never_reports(&["wedged"]),
+        );
+        // The refusal: a wedged log pump, read AFTER every pump that
+        // answered has already been reported to and parked, which is what
+        // makes the resume owed. It was a dog until phase 3 task 4 carried
+        // one, a shepherd channel until 2b task 5 and two instances until
+        // task 6; what the case needs is any refusal at all.
         let daemon = boot(
             SharedRunner(Arc::clone(&runner)),
             paths.clone(),
-            BootOptions {
-                dogs: vec![DogSpec {
-                    name: "metrics".to_string(),
-                    source: DogSource::BuiltIn,
-                }],
-                ..BootOptions::default()
-            },
+            BootOptions::default(),
         )
         .await
         .unwrap();
@@ -3653,6 +3685,7 @@ mod tests {
             .start(vec![
                 normalize(AppConfig::minimal("quiet", "./srv")).unwrap(),
                 normalize(AppConfig::minimal("chatty", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("wedged", "./srv")).unwrap(),
             ])
             .await
             .unwrap();
@@ -3673,31 +3706,45 @@ mod tests {
         };
         let refusal = hand_over_now(&seam)
             .await
-            .expect_err("a flock with a dog in it cannot be carried");
+            .expect_err("a flock with a wedged log pump cannot be carried");
         assert!(
-            refusal.contains("being a dog"),
+            refusal.contains("did not report its descriptors in time"),
             "the gate must refuse before anything is exec'd: {refusal}"
         );
 
+        let answered: Vec<usize> = ["quiet", "chatty"]
+            .iter()
+            .map(|name| runner.spawn_index_of(name).expect("started above"))
+            .collect();
+        let wedged = runner.spawn_index_of("wedged").expect("started above");
         // Polled rather than read once: a resume carries no acknowledgement
         // (see `LogCtl::Resume`), so a send that has returned has been
         // queued rather than served. Bounded, so a pump that is never told
         // fails here instead of hanging.
         let all_resumed = async {
-            while (0..3).any(|sheep| runner.resumes(sheep) == 0) {
+            while answered.iter().any(|sheep| runner.resumes(*sheep) == 0) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
         tokio::time::timeout(Duration::from_secs(10), all_resumed)
             .await
             .expect("every pump a refused handover reported to must be reading again");
-        for sheep in 0..3 {
+        for sheep in &answered {
             assert_eq!(
-                runner.resumes(sheep),
+                runner.resumes(*sheep),
                 1,
                 "sheep {sheep} must be resumed once rather than repeatedly"
             );
         }
+        // The plural is what this case adds over its sibling, which has one
+        // answering pump: a resume that reached only the first sheep
+        // reported to would satisfy that one and fail here.
+        assert_eq!(answered.len(), 2, "two pumps must have answered the report");
+        assert_eq!(
+            runner.resumes(wedged),
+            0,
+            "a pump that never answered never parked, so nothing may resume it"
+        );
 
         ctx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), daemon.run())
@@ -4057,6 +4104,90 @@ mod tests {
     /// A blob written by hand rather than by `Handover::write`, so this
     /// module's tests pin the on-disk shape a successor has to read rather
     /// than round-tripping whatever the writer happens to emit.
+    /// One carried sheep, named, with `dog` set or not.
+    #[cfg(unix)]
+    fn carried_for_the_roll(
+        name: &str,
+        dog: Option<DogSource>,
+    ) -> crate::handover::adopt::AdoptedSheep {
+        let mut entry = crate::entry::ProcessEntry {
+            id: 1,
+            spec: normalize(AppConfig::minimal(name, "./srv")).unwrap(),
+            instance: 0,
+            status: shep_core::status::ProcStatus::Online,
+            pid: Some(4242),
+            restarts: 0,
+            started_at: None,
+            budget: crate::entry::RestartBudget::default(),
+            reload: crate::entry::ReloadState::None,
+            credentials: crate::privilege::SpawnIdentity::Resolved(None),
+            out_file: PathBuf::new(),
+            err_file: PathBuf::new(),
+            dog: None,
+            last_exit: None,
+        };
+        entry.dog = dog;
+        crate::handover::adopt::AdoptedSheep {
+            carried: crate::handover::CarriedSheep::from_entry(
+                &entry,
+                0,
+                crate::handover::CarriedFds::none(),
+                false,
+                None,
+                false,
+                None,
+            ),
+            out_pipe: None,
+            err_pipe: None,
+            out_log: None,
+            err_log: None,
+            stdin_pipe: None,
+            channel: None,
+        }
+    }
+
+    /// fails if a carried dog reaches the muster roll.
+    ///
+    /// A successor rebuilds its registry from the blob rather than from the
+    /// roll, and the registry is what the roll on disk is written from
+    /// within seconds. A dog has never been in it -- `spawn_enabled_dogs`
+    /// registers dogs straight through the supervisor and never touches
+    /// `FlockRegistry` -- so a successor that recorded one would put it
+    /// there for the first time, and permanently: the roll outlives the
+    /// daemon, so a later cold boot would restore `metrics` as an ordinary
+    /// unmarked sheep BEFORE `spawn_enabled_dogs` ran, and `shep disable
+    /// metrics` could not take it back out.
+    ///
+    /// Both rows, because a filter that dropped everything would satisfy
+    /// the negative half on its own -- and an empty registry is the failure
+    /// this whole `record_config` path exists to prevent, since it would
+    /// overwrite a good roll with an empty one.
+    #[cfg(unix)]
+    #[test]
+    fn a_carried_dog_does_not_reach_the_muster_roll() {
+        let flock = vec![
+            carried_for_the_roll("web", None),
+            carried_for_the_roll("metrics", Some(DogSource::BuiltIn)),
+            carried_for_the_roll(
+                "log-rotate",
+                Some(DogSource::Adopted {
+                    path: "/opt/bin/shep-log-rotate".to_string(),
+                }),
+            ),
+        ];
+
+        let names: Vec<String> = apps_for_the_roll(&flock)
+            .into_iter()
+            .map(|app| app.name)
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["web".to_string()],
+            "the roll is the operator's flock; a dog belongs to `shep.toml`"
+        );
+    }
+
     fn write_blob(path: &Path, version: u32) {
         std::fs::write(
             path,
