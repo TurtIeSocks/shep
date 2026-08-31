@@ -3,6 +3,7 @@
 use core::time::Duration;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use shep_core::{
     config::ResolvedApp,
     protocol::{DogSource, ExitInfo},
@@ -166,7 +167,15 @@ impl RestartBudget {
 /// drainee's direction is answered here at all: the replacement's
 /// back-reference lives on that job, in the entry ids the machinery around it
 /// navigates by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized because a handover carries it: a successor that installed a
+/// drainee or a replacement without this would route that instance's exit to
+/// `decide_on_exit` rather than to the reload machinery, which for an
+/// `autorestart` app respawns the old code into a slot the replacement owns.
+/// `snake_case` on the wire to match `ProcStatus`'s own spelling, the blob's
+/// nearest neighbour, since the blob is a JSON file an operator may read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReloadState {
     /// Not half of any swap
     None,

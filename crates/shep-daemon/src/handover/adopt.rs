@@ -49,7 +49,7 @@ use std::os::fd::{OwnedFd, RawFd};
 
 use tokio::net::unix::pipe;
 
-use super::{CarriedFds, CarriedSheep, Handover};
+use super::{CarriedFds, CarriedSheep, Handover, SheepFd, fds};
 use crate::sys;
 
 /// Everything a successor was handed, rebuilt into objects it can use.
@@ -179,6 +179,151 @@ fn refuse_repeated_fds(blob: &Handover) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run everything [`adopt`] will run, in the PREDECESSOR, while there is
+/// still an image to refuse back to.
+///
+/// # Why this exists at all
+///
+/// The `execve` is one-way. Nothing re-execs a predecessor, and its image is
+/// gone the instant the successor starts, so a successor that cannot adopt
+/// its blob has no way back: `boot::rehydrate` returns `BootError::Adopt`,
+/// the daemon exits without ever serving, and the flock it was handed keeps
+/// running with nothing supervising it. The design called that case
+/// "rollback"; there is nothing to roll back to, and this is the honest
+/// shape of the same intent. Check first, exec second, and a failure becomes
+/// the ordinary stop-and-start reload rather than an unsupervised flock.
+///
+/// # Why it runs the real adoption instead of describing one
+///
+/// A second implementation of "is this descriptor adoptable" is worse than
+/// none. If the successor's checks tighten and a hand-written copy here does
+/// not, the rehearsal passes, the exec happens, and the boot still fails —
+/// with the predecessor now gone. So nothing here re-states a check: this
+/// walks [`CarriedFds::all_kinded`], the one place a number is paired with
+/// its slot, and hands each number to the SAME function the successor will
+/// hand it to. [`refuse_repeated_fds`] is called rather than re-derived, and
+/// [`sys::adoptable_fd`] is [`sys::adopt_handover_fd`]'s own two checks,
+/// shared rather than copied.
+///
+/// The parse is part of it too. A successor does not receive this struct; it
+/// reads bytes back off disk and rebuilds one, so the version gate and the
+/// deserialize are checks it makes as surely as the descriptors are. This
+/// runs them through [`Handover::load_value`], the successor's own entry
+/// point, and then rehearses the adoption against the REPARSED blob rather
+/// than against the one it was handed.
+///
+/// One seam is not shared, and it is worth naming rather than hiding: the
+/// successor reads bytes with `serde_json::from_str` while this goes through
+/// `serde_json::to_value`. Anything that survives one and not the other
+/// would slip past. The gap is the JSON text itself, and `Handover::write`
+/// has already proved that serializes.
+///
+/// # What it does to the descriptors it checks
+///
+/// It never takes one. Every adoption here is handed a duplicate
+/// ([`fds::duplicate_raw`]), takes ownership of THAT, and closes it when the
+/// value is dropped at the end of the call. Ownership is what matters,
+/// because this runs while the predecessor is still supervising the flock:
+/// the pumps are parked, not shut down, and a refusal resumes them and
+/// stops gracefully.
+///
+/// One thing does reach the original, and it is worth naming rather than
+/// claiming a clean sweep. [`adopt_listener`], [`adopt_pipe`],
+/// [`adopt_stdin`] and [`adopt_channel`] each set `O_NONBLOCK`, which is a
+/// property of the open file description rather than of the descriptor, so
+/// a duplicate does not insulate the original from it. In this daemon that
+/// is a write of the value already there: every one of those is a tokio
+/// object, and tokio does not accept a blocking one — `UnixListener::
+/// from_std` and `UnixStream::from_std` refuse it outright, and the two
+/// `pipe` constructors set it themselves. So the flag this could change is
+/// one nothing here holds unset.
+///
+/// # Errors
+///
+/// The blob does not parse as a successor would parse it, it names one
+/// descriptor number twice, or a number it names is reserved, is not open,
+/// or is not the kind of object its slot will be adopted as. The message is
+/// the successor's own, so it names the sheep and the stream.
+///
+/// # Panics
+///
+/// Panics if called outside a tokio runtime with IO enabled, exactly as
+/// [`adopt`] does and for the same reason: the objects it builds register
+/// with the runtime's reactor, which has nowhere to happen without one.
+#[track_caller]
+pub fn dry_run(blob: &Handover) -> io::Result<()> {
+    let value = serde_json::to_value(blob).map_err(io::Error::other)?;
+    let blob = Handover::load_value(value).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a successor could not have read this blob back: {error}"),
+        )
+    })?;
+
+    // `adopt`'s own order, so a rehearsal that stops early stops where the
+    // successor would: repeats first, then the listener, then each sheep,
+    // then the pidfile.
+    refuse_repeated_fds(&blob)?;
+    rehearse(blob.listener_fd, "the control listener", adopt_listener)?;
+    for carried in &blob.sheep {
+        let name = &carried.name;
+        for (fd, slot) in carried.fds.all_kinded() {
+            let Some(fd) = fd else { continue };
+            rehearse(
+                fd,
+                &format!("sheep '{name}' {}", slot.describe()),
+                |dup| match slot {
+                    SheepFd::OutPipe => adopt_pipe(Some(dup), name, "stdout").map(drop),
+                    SheepFd::ErrPipe => adopt_pipe(Some(dup), name, "stderr").map(drop),
+                    SheepFd::OutLog => adopt_log(Some(dup), name, "stdout").map(drop),
+                    SheepFd::ErrLog => adopt_log(Some(dup), name, "stderr").map(drop),
+                    SheepFd::Stdin => adopt_stdin(Some(dup), name).map(drop),
+                    SheepFd::Channel => adopt_channel(Some(dup), name).map(drop),
+                },
+            )?;
+        }
+    }
+    rehearse(blob.pidfile_fd, "the pidfile lock", |dup| {
+        adopt_fd(dup, "the pidfile lock").map(drop)
+    })?;
+    Ok(())
+}
+
+/// Hand `adopt_one` a duplicate of `fd`, so an adoption that takes ownership
+/// can be run against a descriptor this process must keep.
+///
+/// # Errors
+///
+/// `fd` is reserved or not open, it could not be duplicated, or the adoption
+/// refused the duplicate.
+fn rehearse<T>(
+    fd: RawFd,
+    what: &str,
+    adopt_one: impl FnOnce(RawFd) -> io::Result<T>,
+) -> io::Result<()> {
+    // The BLOB's number is checked here, never the duplicate's, and the
+    // distinction is the whole reason this is not one line shorter.
+    // `sys::adopt_handover_fd` refuses a number below 3 or one that is not
+    // open, and a duplicate is always neither — so a rehearsal that only
+    // ever saw duplicates would wave through exactly the two blobs the
+    // successor is certain to refuse.
+    // Labelled, because `sys::adoptable_fd` names only the NUMBER. A blob
+    // carries six descriptors per sheep, so `fd 7 is not an open descriptor`
+    // is a refusal an operator cannot map back to a stream. `dry_run`'s doc
+    // promises the message names the sheep and the stream, and this arm is
+    // the one that would otherwise make that false.
+    sys::adoptable_fd(fd)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("{what}: {error}")))?;
+    let duplicate = fds::duplicate_raw(fd)?;
+    // `adopt_one` owns `duplicate` from here, on BOTH arms, and that is what
+    // makes this leak nothing. Every adoption in this module either builds
+    // an owner of the number or drops the `File` it had already built; the
+    // one arm that returns without consuming is `sys::adopt_handover_fd`
+    // refusing, and the check above is what rules that out for a number this
+    // call just created above the floor.
+    adopt_one(duplicate).map(drop)
 }
 
 /// Remove the blob at `path`, now that its descriptors are adopted.
@@ -344,8 +489,8 @@ mod tests {
 
     use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
-    use super::adopt;
-    use crate::handover::{CarriedFds, CarriedSheep, Handover, VERSION};
+    use super::{adopt, dry_run, fds, io};
+    use crate::handover::{CarriedFds, CarriedSheep, Handover, SheepFd, VERSION};
     use crate::privilege::SpawnIdentity;
     use shep_core::status::ProcStatus;
 
@@ -370,6 +515,10 @@ mod tests {
             last_exit: None,
             credentials: SpawnIdentity::Resolved(None),
             fds,
+            pending_delete: Some(false),
+            manual: None,
+            reload: Some(crate::entry::ReloadState::None),
+            ready_failed: Some(false),
             app: crate::testing::app_with("web", |_| {}).into_config(),
         }
     }
@@ -391,6 +540,7 @@ mod tests {
             next_id: 9,
             next_deadline: 5,
             next_action_stamp: 2,
+            reloads: Some(Vec::new()),
         }
     }
 
@@ -928,6 +1078,482 @@ mod tests {
         assert!(
             err.to_string().contains("shepherd channel"),
             "the refusal must name what could not be adopted: {err}"
+        );
+    }
+
+    /// A predecessor's live descriptors: one of everything a blob names,
+    /// still owned HERE rather than leaked into a number.
+    ///
+    /// [`blob_with`] above hands its listener and pidfile to
+    /// `into_raw_fd`, which is right for a case about `adopt`, since
+    /// `adopt` takes ownership and there is nobody left to take it from.
+    /// `dry_run` is the opposite situation and needs the opposite fixture:
+    /// its whole contract is that the caller still owns everything
+    /// afterwards, and nothing can check that against numbers no value
+    /// holds.
+    struct Predecessor {
+        dir: tempfile::TempDir,
+        listener: std::os::unix::net::UnixListener,
+        pidfile: std::fs::File,
+        out_log: std::fs::File,
+        out_read: std::io::PipeReader,
+        out_write: std::io::PipeWriter,
+        stdin_read: std::io::PipeReader,
+        stdin_write: std::io::PipeWriter,
+        channel: std::os::unix::net::UnixStream,
+        child_channel: std::os::unix::net::UnixStream,
+    }
+
+    impl Predecessor {
+        /// One of each kind, all open, all the right way round.
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let (out_read, out_write) = std::io::pipe().unwrap();
+            let (stdin_read, stdin_write) = std::io::pipe().unwrap();
+            let (channel, child_channel) = std::os::unix::net::UnixStream::pair().unwrap();
+            Self {
+                listener: std::os::unix::net::UnixListener::bind(dir.path().join("shep.sock"))
+                    .unwrap(),
+                pidfile: tempfile::tempfile().unwrap(),
+                out_log: tempfile::tempfile().unwrap(),
+                out_read,
+                out_write,
+                stdin_read,
+                stdin_write,
+                channel,
+                child_channel,
+                dir,
+            }
+        }
+
+        /// Where this fixture's listener is bound.
+        fn socket(&self) -> std::path::PathBuf {
+            self.dir.path().join("shep.sock")
+        }
+
+        /// A blob naming every one of them, for one sheep called `web`.
+        fn blob(&self) -> Handover {
+            use std::os::fd::AsRawFd as _;
+            Handover {
+                version: VERSION,
+                sheep: vec![carried(CarriedFds {
+                    out_pipe: Some(self.out_read.as_raw_fd()),
+                    err_pipe: None,
+                    out_log: Some(self.out_log.as_raw_fd()),
+                    err_log: None,
+                    stdin: Some(self.stdin_write.as_raw_fd()),
+                    channel: Some(self.channel.as_raw_fd()),
+                })],
+                listener_fd: self.listener.as_raw_fd(),
+                pidfile_fd: self.pidfile.as_raw_fd(),
+                next_id: 9,
+                next_deadline: 5,
+                next_action_stamp: 2,
+                reloads: Some(Vec::new()),
+            }
+        }
+    }
+
+    /// How many descriptors this process holds, counted the only way a
+    /// portable test can: by asking about every number up to a bound.
+    ///
+    /// The bound is generous rather than exact — this is used as a before
+    /// and after pair, so what matters is that the same numbers are asked
+    /// about both times, not that the total is the true one.
+    fn open_fd_count() -> usize {
+        (0..512)
+            .filter(|fd| crate::sys::adoptable_fd(*fd).is_ok())
+            .count()
+    }
+
+    /// Run the real [`adopt`] over DUPLICATES of `blob`'s descriptors.
+    ///
+    /// The point of the duplicates is that `adopt` takes ownership: a case
+    /// that ran it against a [`Predecessor`]'s own numbers would close the
+    /// fixture and then measure a closed one. Note the one thing this
+    /// cannot be used to compare, because duplicating renumbers: a blob
+    /// naming the same descriptor twice stops naming it twice here.
+    /// Closes every duplicate it holds, unless [`Self::release`] is called
+    /// first.
+    ///
+    /// `fds::duplicate_raw` hands back a bare number with no owner, so a `?`
+    /// part way through the copy below would leak every duplicate made
+    /// before the failing one. Nothing else would ever close them: the
+    /// numbers live in a `Handover` as plain integers, and dropping that
+    /// closes nothing.
+    ///
+    /// The release is not tidiness either. `adopt` takes ownership of the
+    /// numbers it is handed, so this must let go before that call or each
+    /// one is closed twice.
+    struct Duplicates(Vec<RawFd>);
+
+    impl Duplicates {
+        fn of(&mut self, fd: RawFd) -> io::Result<RawFd> {
+            let duplicate = fds::duplicate_raw(fd)?;
+            self.0.push(duplicate);
+            Ok(duplicate)
+        }
+
+        fn release(mut self) {
+            self.0.clear();
+        }
+    }
+
+    impl Drop for Duplicates {
+        fn drop(&mut self) {
+            for fd in self.0.drain(..) {
+                let _ = nix::unistd::close(fd);
+            }
+        }
+    }
+
+    fn adopt_a_copy(blob: &Handover) -> io::Result<()> {
+        // Propagated, never `unwrap_or(fd)`. Falling back to the original
+        // hands `adopt` the fixture's own live descriptor, which it then
+        // closes -- the exact thing the doc above says the duplicates exist
+        // to prevent, reintroduced on the one path nobody watches. A case
+        // that hit it would fail somewhere else entirely, measuring a
+        // descriptor this helper had shut.
+        let mut dups = Duplicates(Vec::new());
+        let mut copy = blob.clone();
+        copy.listener_fd = dups.of(copy.listener_fd)?;
+        copy.pidfile_fd = dups.of(copy.pidfile_fd)?;
+        for sheep in &mut copy.sheep {
+            sheep.fds = CarriedFds {
+                out_pipe: sheep.fds.out_pipe.map(|fd| dups.of(fd)).transpose()?,
+                err_pipe: sheep.fds.err_pipe.map(|fd| dups.of(fd)).transpose()?,
+                out_log: sheep.fds.out_log.map(|fd| dups.of(fd)).transpose()?,
+                err_log: sheep.fds.err_log.map(|fd| dups.of(fd)).transpose()?,
+                stdin: sheep.fds.stdin.map(|fd| dups.of(fd)).transpose()?,
+                channel: sheep.fds.channel.map(|fd| dups.of(fd)).transpose()?,
+            };
+        }
+        // Released BEFORE the fallible call, not after, and the asymmetry is
+        // deliberate. `adopt` consumes the numbers it reaches and drops the
+        // owners it had already built when it refuses, so on its error path
+        // some of these are closed and some are not, and it returns nothing
+        // that says which. Holding the guard across it would close the
+        // consumed ones a second time, and a double close can shut whatever
+        // number the kernel has since handed out. A leak bounded by a test
+        // binary is the better of those two.
+        //
+        // That the unreached ones leak is not this helper's invention: it is
+        // `adopt`'s own documented behaviour, which is why the pidfile is
+        // adopted last (see this module's header).
+        dups.release();
+        adopt(&copy).map(drop)
+    }
+
+    /// The happy path, and the property everything else rests on: a blob a
+    /// successor could adopt is not refused here.
+    ///
+    /// Without this the suite could pass with a `dry_run` that refused
+    /// everything, which would turn every handover into a stop-and-start
+    /// and lose the feature while looking safe.
+    #[tokio::test]
+    async fn a_blob_a_successor_could_adopt_passes_the_rehearsal() {
+        let predecessor = Predecessor::new();
+
+        dry_run(&predecessor.blob()).expect("every descriptor here is the kind its slot wants");
+    }
+
+    /// Fails if a blob describing a flock mid-reload stops surviving the
+    /// reparse the rehearsal runs it through.
+    ///
+    /// The rehearsal is the predecessor running the successor's OWN checks
+    /// while there is still an image to refuse back to, and one of those
+    /// checks is the parse: it reads the whole blob back through
+    /// [`Handover::load_value`] before rehearsing a single descriptor. So a
+    /// swap in flight is covered by the rehearsal for free — nothing about a
+    /// carried reload is a descriptor, and `adopt` gains no refusal for one
+    /// — but "for free" is a claim that has to be pinned rather than
+    /// asserted, because the cost of it being wrong is the successor
+    /// refusing to boot with the predecessor already gone.
+    #[tokio::test]
+    async fn a_blob_carrying_a_swap_in_flight_passes_the_rehearsal() {
+        use crate::entry::ReloadState;
+        use crate::supervisor::{CarriedReload, ReloadMode, ReloadPhase, ReloadSwap};
+
+        let predecessor = Predecessor::new();
+        let mut blob = predecessor.blob();
+        blob.sheep[0].reload = Some(ReloadState::Drainee { new_id: Some(9) });
+        blob.reloads = Some(vec![CarriedReload {
+            app: "web".to_owned(),
+            queue: vec![4, 5],
+            mode: ReloadMode::Overlap,
+            swap: ReloadSwap {
+                old_id: 1,
+                new_id: Some(9),
+                phase: ReloadPhase::DrainOld,
+            },
+        }]);
+
+        dry_run(&blob).expect("a flock mid-reload is one a successor can adopt");
+    }
+
+    /// Fails if a blob carrying a failed readiness verdict cannot be
+    /// rehearsed.
+    ///
+    /// The rehearsal reparses the whole blob through the successor's own
+    /// [`Handover::load_value`] before it touches a descriptor, so a field
+    /// added to [`CarriedSheep`] rides the parse it already runs. That is
+    /// worth a case rather than an assumption: the rehearsal is what stands
+    /// between a bad blob and an `execve` with no way back, and a field it
+    /// could not parse would be found after the predecessor was gone.
+    #[tokio::test]
+    async fn a_blob_carrying_a_failed_readiness_verdict_passes_the_rehearsal() {
+        let predecessor = Predecessor::new();
+        let mut blob = predecessor.blob();
+        blob.sheep[0].ready_failed = Some(true);
+
+        dry_run(&blob).expect("an instance a reload gave up on is one a successor can adopt");
+    }
+
+    /// The whole reason the rehearsal runs against duplicates: the
+    /// predecessor is still supervising this flock, and everything it holds
+    /// has to work afterwards.
+    ///
+    /// Each of the four is a different way `adopt` takes ownership —
+    /// `UnixListener::from_std`, `pipe::Receiver::from_file`,
+    /// `pipe::Sender::from_file`, `UnixStream::from_std` — and each would
+    /// close the fixture's own handle if the duplicate were skipped.
+    ///
+    /// The connection is queued BEFORE the rehearsal rather than after, and
+    /// that is the one place this fixture differs from a live daemon.
+    /// `adopt_listener` and `adopt_channel` each set `O_NONBLOCK`, which is
+    /// a property of the open file description and so reaches the original
+    /// through the duplicate. In the daemon every one of these is already
+    /// non-blocking because tokio owns it, so the `fcntl` writes back what
+    /// was already there; this fixture's listener is a plain `std` one and
+    /// really does change. Queueing first means the accept below has
+    /// something waiting either way.
+    #[tokio::test]
+    async fn a_rehearsal_leaves_every_descriptor_it_checked_working() {
+        use std::io::{Read as _, Write as _};
+
+        let mut predecessor = Predecessor::new();
+        predecessor.out_write.write_all(b"a bleat").unwrap();
+        let socket = predecessor.socket();
+        let connecting = tokio::task::spawn_blocking(move || {
+            std::os::unix::net::UnixStream::connect(&socket).unwrap()
+        });
+        let client = connecting.await.unwrap();
+
+        dry_run(&predecessor.blob()).expect("the fixture is adoptable");
+
+        // The listener still listens.
+        predecessor
+            .listener
+            .accept()
+            .expect("the checked listener still accepts");
+        drop(client);
+
+        // The stdout pipe still carries what was written before the check.
+        let mut buf = [0_u8; 7];
+        predecessor
+            .out_read
+            .read_exact(&mut buf)
+            .expect("the checked read end still reads");
+        assert_eq!(&buf, b"a bleat");
+
+        // The stdin pipe still carries a line the other way.
+        predecessor.stdin_write.write_all(b"whisper").unwrap();
+        let mut buf = [0_u8; 7];
+        predecessor
+            .stdin_read
+            .read_exact(&mut buf)
+            .expect("the checked write end still writes");
+        assert_eq!(&buf, b"whisper");
+
+        // The shepherd channel still has its child on the far end.
+        predecessor.channel.write_all(b"ping").unwrap();
+        let mut buf = [0_u8; 4];
+        predecessor
+            .child_channel
+            .read_exact(&mut buf)
+            .expect("the checked channel still reaches the child");
+        assert_eq!(&buf, b"ping");
+    }
+
+    /// A duplicate taken and never handed to an adoption leaks one
+    /// descriptor per named number, on a path that runs on every reload.
+    ///
+    /// Counted over a hundred passes rather than one, because the number
+    /// this can measure is the whole process's and the suite is running
+    /// other cases in other threads at the same time. A hundred passes of a
+    /// blob naming six descriptors leaks six hundred; the concurrent noise
+    /// is a few dozen either way, so the threshold sits comfortably between
+    /// them and needs no quiet machine.
+    #[tokio::test]
+    async fn a_rehearsal_leaks_no_descriptors() {
+        let predecessor = Predecessor::new();
+        let blob = predecessor.blob();
+        let before = open_fd_count();
+
+        for _ in 0..100 {
+            dry_run(&blob).expect("the fixture is adoptable");
+        }
+
+        let after = open_fd_count();
+        assert!(
+            after < before + 100,
+            "a hundred rehearsals of a blob naming six descriptors must not grow this \
+             process's descriptor table: {before} -> {after}"
+        );
+    }
+
+    /// The case with no recovery: a descriptor that is open, so the
+    /// `FD_CLOEXEC` sweep clears it without complaint, but is not the kind
+    /// its slot will be adopted as.
+    ///
+    /// This is the shape the whole task exists for. A closed number is
+    /// already refused before the exec, because clearing `FD_CLOEXEC` on it
+    /// meets `EBADF`; an OPEN one of the wrong kind sails through that,
+    /// reaches the `execve`, and is refused by a successor with no
+    /// predecessor left to hand the flock back to.
+    #[tokio::test]
+    async fn a_descriptor_that_is_open_but_not_a_pipe_is_refused_before_the_exec() {
+        use std::os::fd::AsRawFd as _;
+
+        let predecessor = Predecessor::new();
+        let not_a_pipe = std::fs::File::open("/dev/null").unwrap();
+        let mut blob = predecessor.blob();
+        blob.sheep[0].fds.out_pipe = Some(not_a_pipe.as_raw_fd());
+
+        // The premise, so the case cannot pass for the wrong reason: this
+        // number IS open, so nothing before the exec would have stopped it.
+        crate::sys::adoptable_fd(not_a_pipe.as_raw_fd())
+            .expect("the number must be open, or this proves nothing");
+        fds::keep_raw_across_exec(not_a_pipe.as_raw_fd())
+            .expect("the `FD_CLOEXEC` sweep must not refuse it either");
+
+        let err = dry_run(&blob).expect_err("/dev/null is not a readable pipe");
+
+        assert!(
+            err.to_string().contains("web") && err.to_string().contains("stdout"),
+            "the refusal must name the sheep and the stream: {err}"
+        );
+    }
+
+    /// The rehearsal and the adoption must agree, slot by slot.
+    ///
+    /// The failure this guards against is specific and is worse than not
+    /// rehearsing: a rehearsal that passes a blob the successor refuses
+    /// still reaches the `execve`, and by then there is no way back. Every
+    /// slot is walked because they are refused by four different mechanisms
+    /// — a readable-pipe check, a writable-pipe check, a `getpeername`, and
+    /// for the two log slots no kind check at all — and a pairing that put
+    /// the wrong one against a slot would pass on a narrower case.
+    #[tokio::test]
+    async fn the_rehearsal_and_the_adoption_agree_on_every_slot() {
+        use std::os::fd::AsRawFd as _;
+
+        for slot in [
+            SheepFd::OutPipe,
+            SheepFd::ErrPipe,
+            SheepFd::OutLog,
+            SheepFd::ErrLog,
+            SheepFd::Stdin,
+            SheepFd::Channel,
+        ] {
+            let predecessor = Predecessor::new();
+            let wrong = std::fs::File::open("/dev/null").unwrap();
+            let wrong = Some(wrong.as_raw_fd());
+            let mut blob = predecessor.blob();
+            let fds = &mut blob.sheep[0].fds;
+            match slot {
+                SheepFd::OutPipe => fds.out_pipe = wrong,
+                SheepFd::ErrPipe => fds.err_pipe = wrong,
+                SheepFd::OutLog => fds.out_log = wrong,
+                SheepFd::ErrLog => fds.err_log = wrong,
+                SheepFd::Stdin => fds.stdin = wrong,
+                SheepFd::Channel => fds.channel = wrong,
+            }
+
+            assert_eq!(
+                dry_run(&blob).is_err(),
+                adopt_a_copy(&blob).is_err(),
+                "the rehearsal and the adoption disagree about {slot:?}, so one of them is \
+                 checking something the other is not"
+            );
+        }
+    }
+
+    /// A repeated number is refused by the same function the successor
+    /// refuses it with, rather than by a second copy of the rule.
+    ///
+    /// It is a case the sweep before the exec cannot catch: clearing
+    /// `FD_CLOEXEC` twice on one number succeeds, deliberately and
+    /// idempotently, so a repeat reaches the successor untouched.
+    #[tokio::test]
+    async fn a_blob_naming_one_descriptor_twice_is_refused_before_the_exec() {
+        let predecessor = Predecessor::new();
+        let mut blob = predecessor.blob();
+        blob.sheep[0].fds.err_log = Some(blob.pidfile_fd);
+
+        let err = dry_run(&blob).expect_err("one number cannot have two owners");
+
+        assert!(
+            err.to_string().contains("more than once"),
+            "the refusal must be `refuse_repeated_fds`'s own: {err}"
+        );
+    }
+
+    /// A number below the stdio floor is refused here, not after the exec.
+    ///
+    /// The check runs against the BLOB's number rather than the duplicate's.
+    /// A duplicate is always open and always above the floor, so a
+    /// rehearsal that only ever inspected duplicates would wave through
+    /// exactly the two blobs `sys::adopt_handover_fd` is certain to refuse.
+    #[tokio::test]
+    async fn a_reserved_or_closed_number_is_refused_before_the_exec() {
+        let predecessor = Predecessor::new();
+
+        let mut reserved = predecessor.blob();
+        reserved.sheep[0].fds.out_log = Some(0);
+        let err = dry_run(&reserved).expect_err("stdio is owned elsewhere");
+        assert!(
+            err.to_string().contains("reserved for stdio"),
+            "the refusal must be the successor's own wording: {err}"
+        );
+
+        // `RawFd::MAX` rather than a number this case opened and closed. A
+        // closed number is the honest fixture and is also a race: the suite
+        // runs other cases in other threads of this same process, and one of
+        // them opening a file between the close and the assertion hands that
+        // number straight back. Caught once, on the unfiltered workspace run
+        // and never on the filtered one. A number above any process's
+        // descriptor limit is `EBADF` with nothing to race against, and the
+        // property under test is the same one — that the blob names no open
+        // descriptor.
+        let mut gone = predecessor.blob();
+        gone.sheep[0].fds.err_log = Some(RawFd::MAX);
+        let err = dry_run(&gone).expect_err("a number this high names nothing");
+        assert!(
+            err.to_string().contains("not an open descriptor"),
+            "the refusal must be the successor's own wording: {err}"
+        );
+    }
+
+    /// The successor reads the blob back off disk rather than being handed
+    /// this struct, so the parse is one of its checks too.
+    ///
+    /// A version it cannot read is the reachable case: a handover's whole
+    /// point is that the successor is a DIFFERENT build, and one that has
+    /// moved `VERSION` refuses the blob at `load_value` — after the exec,
+    /// with the predecessor gone.
+    #[tokio::test]
+    async fn a_blob_a_successor_could_not_read_back_is_refused_before_the_exec() {
+        let predecessor = Predecessor::new();
+        let mut blob = predecessor.blob();
+        blob.version = VERSION + 1;
+
+        let err = dry_run(&blob).expect_err("a version this image cannot read");
+
+        assert!(
+            err.to_string()
+                .contains("could not have read this blob back"),
+            "the refusal must say the parse failed, not the descriptors: {err}"
         );
     }
 }

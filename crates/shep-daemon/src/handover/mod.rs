@@ -2,12 +2,15 @@
 //! place, the [`Handover`] blob that describes it, and (in a later task) the
 //! exec that carries it.
 //!
-//! Three things are still not carried: a dog, an in-flight reload, and
-//! anything an operator has already asked to stop or delete. A sheep's
-//! stdout, stderr, log files, stdin pipe and shepherd channel all cross the
-//! exec, and every one of those is per SHEEP rather than per app, so an app
-//! running several instances crosses as several sets and needs nothing of
-//! its own. [`fitness`] is the gate: get it wrong in the permissive
+//! Two things are still refused, and they are not the same kind of thing. A
+//! DOG is deferred: phase 3 carries it, and the refusal goes when it does. An
+//! unresponsive log pump is PERMANENT, because it is a live sheep whose
+//! descriptors this daemon does not know, and carrying it would hand the
+//! successor a sheep it cannot read. A
+//! sheep's stdout, stderr, log files, stdin pipe and shepherd channel all
+//! cross the exec, and every one of those is per SHEEP rather than per app,
+//! so an app running several instances crosses as several sets and needs
+//! nothing of its own. [`fitness`] is the gate: get it wrong in the permissive
 //! direction and a half-built handover corrupts a live flock; get it wrong
 //! in the strict direction and the caller merely falls back to the
 //! stop-and-start arm that already works. That asymmetry is why an unclear
@@ -34,8 +37,9 @@ use shep_core::paths::ShepPaths;
 use shep_core::protocol::ExitInfo;
 use shep_core::status::ProcStatus;
 
-use crate::entry::ProcessEntry;
+use crate::entry::{ProcessEntry, ReloadState};
 use crate::privilege::SpawnIdentity;
+use crate::supervisor::{CarriedReload, PendingManual};
 
 /// Whether a flock can be handed over in place, or must fall back to a
 /// stop-and-start.
@@ -60,9 +64,11 @@ pub enum Fitness {
 /// closed by its mechanism (a pidfile lock is either free, held-with-pid or
 /// held-without, and there is no fourth state). This one is closed by
 /// nothing but how much of the handover has shipped. Every phase so far has
-/// turned one of these into something the daemon carries, and 2c still has
-/// three to go, so a match here must keep tolerating a variant this module
-/// has not named yet.
+/// turned one of these into something the daemon carries, and a dog is still
+/// to go, so a match here must keep tolerating a variant this module has not
+/// named yet. [`RefusedReason::PumpUnresponsive`] is the exception that will
+/// not go: it answers a question about THIS daemon's knowledge rather than
+/// about the handover's coverage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RefusedReason {
@@ -83,22 +89,6 @@ pub enum RefusedReason {
         /// The sheep's name.
         sheep: String,
     },
-    /// The sheep is mid-reload, drainee or replacement, which 2c carries.
-    ReloadInFlight {
-        /// The sheep's name.
-        sheep: String,
-    },
-    /// An operator's `stop` is waiting on this sheep's next exit, which 2c
-    /// carries.
-    PendingStop {
-        /// The sheep's name.
-        sheep: String,
-    },
-    /// An operator's `delete` targets this sheep, which 2c carries.
-    PendingDelete {
-        /// The sheep's name.
-        sheep: String,
-    },
 }
 
 impl core::fmt::Display for RefusedReason {
@@ -116,9 +106,6 @@ impl core::fmt::Display for RefusedReason {
                 );
             }
             Self::Dog { sheep } => (sheep, "being a dog"),
-            Self::ReloadInFlight { sheep } => (sheep, "an in-flight reload"),
-            Self::PendingStop { sheep } => (sheep, "a pending manual stop"),
-            Self::PendingDelete { sheep } => (sheep, "a pending delete"),
         };
         write!(
             f,
@@ -130,20 +117,21 @@ impl core::fmt::Display for RefusedReason {
 
 /// One sheep's carryability-relevant facts.
 ///
-/// Bundles a [`ProcessEntry`] with the two facts that do not live on it: a
-/// pending manual stop and a pending delete both live on the supervisor's
-/// private slot type, not on the entry it wraps, so `fitness` cannot reach
-/// them through `entry` alone. The caller, the supervisor, which owns both
-/// of them, builds this view; `fitness` stays a pure function over data it is
-/// handed rather than reaching into the registry itself.
+/// Bundles a [`ProcessEntry`] with the one fact that does not live on it:
+/// whether this sheep's log pump answered the snapshot's deadline, which
+/// only the task that asked it knows. `fitness` stays a pure function over
+/// data it is handed rather than reaching into the registry itself.
+///
+/// A pending delete, a pending manual stop and a swap in flight all used to
+/// live here too. None of them is a refusal any more —
+/// [`CarriedSheep::pending_delete`], [`CarriedSheep::manual`] and
+/// [`CarriedSheep::reload`] carry them instead — so none of them is a
+/// carryability-relevant fact and this view has nothing left to say about
+/// any of them.
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate<'a> {
     /// The sheep's lifecycle entry.
     pub entry: &'a ProcessEntry,
-    /// Whether an operator's `stop` is waiting on this sheep's next exit.
-    pub pending_stop: bool,
-    /// Whether an operator's `delete` targets this sheep.
-    pub pending_delete: bool,
     /// Whether this sheep's log pump was asked for its descriptors and did
     /// not answer in time.
     ///
@@ -169,10 +157,6 @@ pub struct Candidate<'a> {
 pub struct OwnedCandidate {
     /// The sheep's lifecycle entry, cloned off the supervisor's slot.
     pub entry: ProcessEntry,
-    /// Whether an operator's command is waiting on this sheep's next exit.
-    pub pending_stop: bool,
-    /// Whether an operator's `delete` targets this sheep.
-    pub pending_delete: bool,
     /// Whether this sheep's log pump missed the snapshot's deadline; see
     /// [`Candidate::pump_unresponsive`].
     pub pump_unresponsive: bool,
@@ -184,8 +168,6 @@ impl OwnedCandidate {
     pub fn as_candidate(&self) -> Candidate<'_> {
         Candidate {
             entry: &self.entry,
-            pending_stop: self.pending_stop,
-            pending_delete: self.pending_delete,
             pump_unresponsive: self.pump_unresponsive,
         }
     }
@@ -217,15 +199,6 @@ fn refusal(candidate: &Candidate<'_>) -> Option<RefusedReason> {
     }
     if entry.dog.is_some() {
         return Some(RefusedReason::Dog { sheep: name() });
-    }
-    if !matches!(entry.reload, crate::entry::ReloadState::None) {
-        return Some(RefusedReason::ReloadInFlight { sheep: name() });
-    }
-    if candidate.pending_delete {
-        return Some(RefusedReason::PendingDelete { sheep: name() });
-    }
-    if candidate.pending_stop {
-        return Some(RefusedReason::PendingStop { sheep: name() });
     }
     None
 }
@@ -312,6 +285,19 @@ pub struct Handover {
     next_deadline: u64,
     /// The supervisor's next action-wait stamp.
     next_action_stamp: u64,
+    /// Every app whose reload was still in flight at the exec.
+    ///
+    /// `Option` for the reason [`CarriedSheep::pending_delete`] gives at
+    /// length: a predecessor from before this field existed refused to carry
+    /// a flock with any reload in flight, so a blob it wrote never has the
+    /// key, and an absent field loads as `None` rather than failing to
+    /// parse. `None` is what that blob truthfully means — no app was
+    /// mid-reload — so [`VERSION`] stays unmoved.
+    ///
+    /// Sorted by app name by its writer, since [`HashMap`](std::collections::HashMap)
+    /// iteration order is arbitrary and the blob is a file an operator may
+    /// read.
+    reloads: Option<Vec<CarriedReload>>,
 }
 
 impl Handover {
@@ -322,7 +308,12 @@ impl Handover {
     /// slots and its pumps, `fds` from `boot`, and `counters` from the
     /// actor. Nothing in this crate can see all three.
     #[must_use]
-    pub fn new(sheep: Vec<CarriedSheep>, fds: DaemonFds, counters: Counters) -> Self {
+    pub fn new(
+        sheep: Vec<CarriedSheep>,
+        fds: DaemonFds,
+        counters: Counters,
+        reloads: Vec<CarriedReload>,
+    ) -> Self {
         Self {
             version: VERSION,
             sheep,
@@ -331,6 +322,7 @@ impl Handover {
             next_id: counters.next_id,
             next_deadline: counters.next_deadline,
             next_action_stamp: counters.next_action_stamp,
+            reloads: Some(reloads),
         }
     }
 
@@ -368,6 +360,16 @@ impl Handover {
             next_deadline: self.next_deadline,
             next_action_stamp: self.next_action_stamp,
         }
+    }
+
+    /// Every app whose reload was still in flight at the exec.
+    ///
+    /// Empty both for a flock with nothing mid-reload and for a blob written
+    /// before this daemon carried one at all, which say the same thing: see
+    /// the field's own doc.
+    #[must_use]
+    pub fn reloads(&self) -> &[CarriedReload] {
+        self.reloads.as_deref().unwrap_or_default()
     }
 
     /// Where the blob lives under `paths`: `$SHEP_HOME/run/handover.json`.
@@ -576,6 +578,70 @@ pub struct CarriedSheep {
     credentials: SpawnIdentity,
     /// The descriptor numbers this instance's output travels on.
     fds: CarriedFds,
+    /// Whether an operator's `delete` targeted this instance before the
+    /// exec.
+    ///
+    /// `Option` rather than `bool` for the reason [`CarriedFds::stdin`]
+    /// gives at length: a predecessor from before this field existed
+    /// refused to carry a sheep with a delete pending at all, so a blob it
+    /// wrote never has the key, and an absent field loads as `None` rather
+    /// than failing to parse. `None` is what that blob truthfully means —
+    /// "no" — not "unknown", so [`VERSION`] stays unmoved: nothing an older
+    /// reader must understand has changed.
+    pending_delete: Option<bool>,
+    /// The manual command that owned this instance's next exit before the
+    /// exec, and who asked for it.
+    ///
+    /// One `Option`, not the two [`Self::pending_delete`] needs, and the
+    /// difference is what "absent" means rather than a style choice. A
+    /// missing key loads as `None`, and `None` is already this field's own
+    /// word for "no command owns this exit" — the same thing a predecessor
+    /// that refused to carry a marker at all was saying. There is no third
+    /// state to distinguish, so [`VERSION`] stays unmoved here for the same
+    /// reason it did there.
+    ///
+    /// Nothing on it is sensitive: two closed enums naming which verb and
+    /// whether a person or the daemon raised it (IR-41). The blob's
+    /// `AppConfig` already carries the app's whole environment, and this
+    /// adds nothing to what a reader of that file can see.
+    manual: Option<PendingManual>,
+    /// Which half of a reload's swap this instance is, if either.
+    ///
+    /// `Option` for the reason [`Self::pending_delete`] gives: a predecessor
+    /// from before this field existed refused to carry a sheep mid-swap at
+    /// all, so a blob it wrote never has the key, and `None` is what that
+    /// blob truthfully means — [`ReloadState::None`] — rather than
+    /// "unknown". [`VERSION`] stays unmoved.
+    ///
+    /// It is the marker that ROUTES this instance's next exit. A successor
+    /// that dropped it would send a drainee's exit to `decide_on_exit`
+    /// instead of to the reload machinery, which for an `autorestart` app
+    /// respawns the old code into a slot the replacement owns.
+    reload: Option<ReloadState>,
+    /// Whether a reload's readiness verification has already failed against
+    /// this instance.
+    ///
+    /// `Option` for the same reason the three fields above are, but NOT for
+    /// the same argument, and the difference is worth stating rather than
+    /// borrowing. Each of those was a gate refusal before it was a field, so
+    /// an absent key proves the fact was false. This was never a refusal: a
+    /// predecessor from before this field existed carried such an instance
+    /// happily and simply dropped the flag, so an absent key is that
+    /// predecessor staying silent rather than saying "no". `false` is still
+    /// the right reading of the silence — it is exactly what a successor
+    /// assumed before the field existed, so an older blob adopts the way it
+    /// always did — and it is the only reading available, since a hard parse
+    /// failure would leave a successor refusing to boot after its
+    /// predecessor had exec'd itself away. [`VERSION`] stays unmoved.
+    ///
+    /// It is what keeps a failed reload's leftovers REACHABLE. A reload
+    /// replaces `Online` instances, and an abandoned one is deliberately
+    /// left `Starting` so the daemon does not report a release that never
+    /// served as serving; `reload_eligible` reads this flag beside the
+    /// status, so the reload that rolls the release back can still reach the
+    /// instance. A successor that dropped it would answer that rollback with
+    /// `Ok` and replace nothing.
+    ready_failed: Option<bool>,
     /// The resolved config this instance runs under, environment included.
     ///
     /// This is the `AppConfig` beneath [`ProcessEntry::spec`]'s
@@ -609,13 +675,22 @@ pub struct CarriedSheep {
 impl CarriedSheep {
     /// Describe `entry` for the successor.
     ///
-    /// `epoch` and `fds` are arguments rather than reads off `entry`
-    /// because neither lives there: the respawn epoch is on the
-    /// supervisor's private slot, and the descriptor numbers are known only
-    /// to whichever code holds the open descriptors. This is the same split
-    /// [`Candidate`] makes, for the same reason.
+    /// `epoch`, `fds`, `pending_delete`, `manual` and `ready_failed` are
+    /// arguments rather than reads off `entry` because none of them lives
+    /// there: the respawn epoch, the pending-delete marker, the
+    /// manual-command marker and the failed-readiness verdict are on the
+    /// supervisor's private slot type, and the descriptor numbers are known
+    /// only to whichever code holds the open descriptors. This is the same
+    /// split [`Candidate`] makes, for the same reason.
     #[must_use]
-    pub fn from_entry(entry: &ProcessEntry, epoch: u64, fds: CarriedFds) -> Self {
+    pub fn from_entry(
+        entry: &ProcessEntry,
+        epoch: u64,
+        fds: CarriedFds,
+        pending_delete: bool,
+        manual: Option<PendingManual>,
+        ready_failed: bool,
+    ) -> Self {
         Self {
             id: entry.id,
             name: entry.spec.config().name.clone(),
@@ -627,6 +702,12 @@ impl CarriedSheep {
             last_exit: entry.last_exit,
             credentials: entry.credentials,
             fds,
+            pending_delete: Some(pending_delete),
+            manual,
+            // Read off the entry rather than passed in, unlike the markers
+            // either side of it: this one does live on `ProcessEntry`.
+            reload: Some(entry.reload),
+            ready_failed: Some(ready_failed),
             app: entry.spec.config().clone(),
         }
     }
@@ -636,6 +717,44 @@ impl CarriedSheep {
     #[allow(dead_code, reason = "read by this crate's own tests")]
     pub const fn fds(&self) -> CarriedFds {
         self.fds
+    }
+
+    /// Whether an operator's `delete` targeted this instance before the
+    /// exec, or `None` for a blob written before this field existed — which
+    /// truthfully means "no", since that predecessor refused to carry a
+    /// pending delete at all. See the field's own doc.
+    #[must_use]
+    pub const fn pending_delete(&self) -> Option<bool> {
+        self.pending_delete
+    }
+
+    /// The manual command that owned this instance's next exit before the
+    /// exec, or `None` for an instance no command was waiting on — which is
+    /// also what a blob written before this field existed says, and
+    /// truthfully, since that predecessor refused to carry a marker at all.
+    /// See the field's own doc.
+    #[must_use]
+    pub const fn manual(&self) -> Option<PendingManual> {
+        self.manual
+    }
+
+    /// Which half of a reload's swap this instance is, or `None` for a blob
+    /// written before this field existed — which truthfully means
+    /// [`ReloadState::None`], since that predecessor refused to carry a
+    /// sheep mid-swap at all. See the field's own doc.
+    #[must_use]
+    pub const fn reload(&self) -> Option<ReloadState> {
+        self.reload
+    }
+
+    /// Whether a reload's readiness verification has already failed against
+    /// this instance, or `None` for a blob written before this field
+    /// existed. That `None` reads as `false` — which is not the same claim
+    /// the three getters above make about their own, and the field's own doc
+    /// says why.
+    #[must_use]
+    pub const fn ready_failed(&self) -> Option<bool> {
+        self.ready_failed
     }
 
     /// The supervisor slot's respawn epoch at the moment of the handover.
@@ -789,6 +908,51 @@ pub struct CarriedFds {
     pub channel: Option<RawFd>,
 }
 
+/// Which of a sheep's six descriptors a number is.
+///
+/// Not a description of the object — that is what the adoption itself
+/// discovers — but of the SLOT, which is what decides which adoption runs.
+/// A stdout pipe and a stdin pipe are both pipes and are refused by opposite
+/// checks, so the slot is the part a caller has to carry with the number.
+///
+/// `Debug` is derived and carries nothing: six unit variants, no descriptor
+/// number, no path, no environment (IR-41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SheepFd {
+    /// The read end of the sheep's stdout pipe ([`CarriedFds::out_pipe`]).
+    OutPipe,
+    /// The read end of the sheep's stderr pipe ([`CarriedFds::err_pipe`]).
+    ErrPipe,
+    /// The appending handle on its stdout log ([`CarriedFds::out_log`]).
+    OutLog,
+    /// The appending handle on its stderr log ([`CarriedFds::err_log`]).
+    ErrLog,
+    /// The WRITE end of its stdin pipe ([`CarriedFds::stdin`]).
+    Stdin,
+    /// The daemon's end of its shepherd channel ([`CarriedFds::channel`]).
+    Channel,
+}
+
+impl SheepFd {
+    /// What this slot is called in a refusal, in the wording the adoption
+    /// functions already use.
+    ///
+    /// Kept beside the variants rather than at the one call site so the two
+    /// cannot drift: `adopt_pipe` says "stdout pipe" and this has to say the
+    /// same, or an operator reads one name from a rehearsal and a different
+    /// one from the successor for the identical descriptor.
+    pub(crate) const fn describe(self) -> &'static str {
+        match self {
+            Self::OutPipe => "stdout pipe",
+            Self::ErrPipe => "stderr pipe",
+            Self::OutLog => "stdout log",
+            Self::ErrLog => "stderr log",
+            Self::Stdin => "stdin pipe",
+            Self::Channel => "shepherd channel",
+        }
+    }
+}
+
 impl CarriedFds {
     /// The six numbers, listener-order irrelevant but fixed: stdout's pipe,
     /// stderr's pipe, stdout's log, stderr's log, stdin's pipe, the
@@ -806,6 +970,34 @@ impl CarriedFds {
             self.err_log,
             self.stdin,
             self.channel,
+        ]
+    }
+
+    /// [`Self::all`], with each number labelled by which of the six it is,
+    /// and so by the adoption a successor will attempt on it.
+    ///
+    /// The pairing lives here rather than at either caller because there are
+    /// two callers and they must not disagree. [`adopt::adopt`] runs these
+    /// adoptions for real in the successor; [`adopt::dry_run`] runs the same
+    /// ones in the PREDECESSOR, against duplicates, so that a blob the
+    /// successor would refuse never reaches an `execve`. A number rehearsed
+    /// as the wrong kind is a rehearsal that passes and a boot that still
+    /// fails, which is worse than not rehearsing at all.
+    ///
+    /// Three things hold the two in step, and none of them is a promise to
+    /// remember. This array is the only pairing either side reads;
+    /// `every_carried_number_is_kinded_in_the_same_order` pins it against
+    /// [`Self::all`], which is what the `FD_CLOEXEC` sweep already walks; and
+    /// a seventh descriptor changes that function's return type, so this one
+    /// stops compiling until it grows a seventh entry too.
+    pub(crate) const fn all_kinded(&self) -> [(Option<RawFd>, SheepFd); 6] {
+        [
+            (self.out_pipe, SheepFd::OutPipe),
+            (self.err_pipe, SheepFd::ErrPipe),
+            (self.out_log, SheepFd::OutLog),
+            (self.err_log, SheepFd::ErrLog),
+            (self.stdin, SheepFd::Stdin),
+            (self.channel, SheepFd::Channel),
         ]
     }
 
@@ -1165,6 +1357,7 @@ mod tests {
     use super::*;
     use crate::entry::{ReloadState, RestartBudget};
     use crate::privilege::SpawnIdentity;
+    use crate::supervisor::{CommandOrigin, ManualKind, ReloadMode, ReloadPhase, ReloadSwap};
     use crate::testing::{app_with, test_paths};
 
     /// A plain, `Online` entry: no channel, not a dog, one instance, no
@@ -1194,8 +1387,6 @@ mod tests {
     fn plain(entry: &ProcessEntry) -> Candidate<'_> {
         Candidate {
             entry,
-            pending_stop: false,
-            pending_delete: false,
             pump_unresponsive: false,
         }
     }
@@ -1244,8 +1435,6 @@ mod tests {
         let e = entry_fixture(|_| {});
         let candidate = Candidate {
             entry: &e,
-            pending_stop: false,
-            pending_delete: false,
             pump_unresponsive: true,
         };
         let Fitness::Refused(r) = fitness(&[candidate]) else {
@@ -1372,8 +1561,8 @@ mod tests {
 
         let blob = Handover::new(
             vec![
-                CarriedSheep::from_entry(&zero, 7, fds_at(11)),
-                CarriedSheep::from_entry(&one, 8, fds_at(21)),
+                CarriedSheep::from_entry(&zero, 7, fds_at(11), false, None, false),
+                CarriedSheep::from_entry(&one, 8, fds_at(21), false, None, false),
             ],
             DaemonFds {
                 listener: 3,
@@ -1384,6 +1573,7 @@ mod tests {
                 next_deadline: 5,
                 next_action_stamp: 2,
             },
+            Vec::new(),
         );
         let back: Handover = serde_json::from_str(&serde_json::to_string(&blob).unwrap()).unwrap();
 
@@ -1415,29 +1605,72 @@ mod tests {
         );
     }
 
+    /// Fails if a sheep mid-swap refuses the flock again, or if the marker
+    /// that routes its next exit is lost on the way into the blob.
+    ///
+    /// The inverse of the case this replaces, in the shape
+    /// [`a_pending_manual_command_no_longer_refuses_and_reaches_the_blob`]
+    /// set. Both halves of a swap are asserted, and the drainee's linked id
+    /// with them: `Drainee { new_id }` is what tells the successor which
+    /// entry is coming to take this one's place, and a marker that arrived
+    /// as a bare "drainee" would leave the successor unable to finish the
+    /// swap it inherited.
     #[test]
-    fn an_in_flight_reload_refuses() {
-        let mut e = entry_fixture(|_| {});
-        e.reload = ReloadState::Replacement;
-        assert!(matches!(
-            fitness(&[plain(&e)]),
-            Fitness::Refused(RefusedReason::ReloadInFlight { .. })
-        ));
+    fn a_swap_in_flight_no_longer_refuses_and_reaches_the_blob() {
+        let mut drainee = entry_fixture(|_| {});
+        drainee.reload = ReloadState::Drainee { new_id: Some(9) };
+        let mut replacement = entry_fixture(|_| {});
+        replacement.id = 9;
+        replacement.reload = ReloadState::Replacement;
+        assert_eq!(
+            fitness(&[plain(&drainee), plain(&replacement)]),
+            Fitness::Carryable
+        );
+
+        assert_eq!(
+            carried(&drainee).reload(),
+            Some(ReloadState::Drainee { new_id: Some(9) }),
+            "the id linking the two halves must survive the blob, not just the role"
+        );
+        assert_eq!(
+            carried(&replacement).reload(),
+            Some(ReloadState::Replacement)
+        );
     }
 
+    /// Fails if a pending manual command refuses the flock again.
+    ///
+    /// The inverse of the case this replaces. A `stop`, `restart` or
+    /// `delete` already claimed against a sheep used to turn the whole flock
+    /// away; [`CarriedSheep::manual`] carries the marker now, and
+    /// `Actor::install_adopted` re-arms the ladder that carries it out, so
+    /// the fact is no longer carryability-relevant at all — which is why
+    /// `Candidate` has nothing left to say about it and this case asserts
+    /// through the blob instead of through the gate.
     #[test]
-    fn a_pending_manual_stop_refuses() {
+    fn a_pending_manual_command_no_longer_refuses_and_reaches_the_blob() {
         let e = entry_fixture(|_| {});
-        let candidate = Candidate {
-            entry: &e,
-            pending_stop: true,
-            pending_delete: false,
-            pump_unresponsive: false,
-        };
-        assert!(matches!(
-            fitness(&[candidate]),
-            Fitness::Refused(RefusedReason::PendingStop { .. })
-        ));
+        assert_eq!(fitness(&[plain(&e)]), Fitness::Carryable);
+
+        let marked = CarriedSheep::from_entry(
+            &e,
+            7,
+            fds_at(11),
+            false,
+            Some(PendingManual {
+                kind: ManualKind::Delete,
+                origin: CommandOrigin::Automatic,
+            }),
+            false,
+        );
+        assert_eq!(
+            marked.manual(),
+            Some(PendingManual {
+                kind: ManualKind::Delete,
+                origin: CommandOrigin::Automatic,
+            }),
+            "both halves of the marker must survive the blob, not just that one exists"
+        );
     }
 
     /// The six descriptor numbers a running sheep would have, counting up
@@ -1460,7 +1693,7 @@ mod tests {
     /// One carried sheep off `entry`, with the descriptor numbers a
     /// running sheep would have.
     fn carried(entry: &ProcessEntry) -> CarriedSheep {
-        CarriedSheep::from_entry(entry, 7, fds_at(11))
+        CarriedSheep::from_entry(entry, 7, fds_at(11), false, None, false)
     }
 
     fn handover_over(entry: &ProcessEntry) -> Handover {
@@ -1472,11 +1705,48 @@ mod tests {
             next_id: 9,
             next_deadline: 5,
             next_action_stamp: 2,
+            reloads: Some(Vec::new()),
         }
     }
 
     fn sample_handover() -> Handover {
         handover_over(&entry_fixture(|_| {}))
+    }
+
+    /// [`CarriedFds::all`] and [`CarriedFds::all_kinded`] must name the same
+    /// six numbers, in the same order, one slot each.
+    ///
+    /// `all` is what the `FD_CLOEXEC` sweep walks, and `all_kinded` is what
+    /// the pre-exec rehearsal walks. A slot paired with the wrong field
+    /// there would have the rehearsal check a stdout pipe against the stdin
+    /// check, which passes for the wrong reason on a fixture where both are
+    /// pipes and fails on a real flock. Nothing else would notice: both
+    /// arrays are six long and both are full of plausible numbers.
+    ///
+    /// Six DISTINCT numbers, so the equality below is about the pairing
+    /// rather than about the length, and a second pass over the slots, so a
+    /// copy-paste that repeated one cannot ride along behind numbers that
+    /// happen to line up.
+    #[test]
+    fn every_carried_number_is_kinded_in_the_same_order() {
+        let fds = CarriedFds {
+            out_pipe: Some(10),
+            err_pipe: Some(11),
+            out_log: Some(12),
+            err_log: Some(13),
+            stdin: Some(14),
+            channel: Some(15),
+        };
+
+        assert_eq!(
+            fds.all_kinded().map(|(fd, _)| fd),
+            fds.all(),
+            "the kinded walk and the `FD_CLOEXEC` walk must see the same numbers"
+        );
+
+        let slots: std::collections::HashSet<SheepFd> =
+            fds.all_kinded().iter().map(|(_, slot)| *slot).collect();
+        assert_eq!(slots.len(), 6, "each slot must appear exactly once");
     }
 
     fn sample_handover_with_secret_env() -> Handover {
@@ -1627,19 +1897,221 @@ mod tests {
         );
     }
 
+    /// fails if a blob written before this daemon carried a pending delete
+    /// stops loading.
+    ///
+    /// A predecessor from before [`CarriedSheep::pending_delete`] existed
+    /// refused to hand over a sheep with a delete pending at all, so its
+    /// blobs never have the key and `None` is what that truthfully means:
+    /// "no", not "unknown". Failing to parse instead would leave the
+    /// successor refusing to boot after the predecessor had already exec'd
+    /// itself away, which is a whole flock unsupervised for one added
+    /// field.
     #[test]
-    fn a_pending_delete_refuses() {
-        let e = entry_fixture(|_| {});
-        let candidate = Candidate {
-            entry: &e,
-            pending_stop: false,
-            pending_delete: true,
-            pump_unresponsive: false,
+    fn a_blob_written_before_pending_delete_was_carried_still_loads() {
+        let mut value = serde_json::to_value(sample_handover()).unwrap();
+        let sheep = value["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        assert!(
+            sheep.remove("pending_delete").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(value).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].pending_delete(), None);
+        assert_eq!(
+            loaded.sheep[0].id(),
+            sample_handover().sheep[0].id(),
+            "the rest of the row is unchanged by the one field that was absent"
+        );
+    }
+
+    /// fails if a blob written before this daemon carried a manual marker
+    /// stops loading, or if the marker does not survive one that has it.
+    ///
+    /// Same shape and same stakes as the pending-delete case above. A
+    /// predecessor from before [`CarriedSheep::manual`] existed refused to
+    /// hand over a sheep with a `stop`, `restart` or `delete` already
+    /// claimed against it, so its blobs never have the key, and `None` is
+    /// the truthful reading of that: no command owns this exit. A hard
+    /// parse failure instead would leave the successor refusing to boot
+    /// after the predecessor had already exec'd itself away.
+    ///
+    /// The sample is given a marker first, so the removal below removes
+    /// something: a blob whose `manual` was `None` all along could not tell
+    /// an absent key from a present `null`.
+    #[test]
+    fn a_blob_written_before_a_manual_marker_was_carried_still_loads() {
+        let marker = PendingManual {
+            kind: ManualKind::Restart,
+            origin: CommandOrigin::Automatic,
         };
-        assert!(matches!(
-            fitness(&[candidate]),
-            Fitness::Refused(RefusedReason::PendingDelete { .. })
-        ));
+        let mut blob = sample_handover();
+        blob.sheep[0] = CarriedSheep::from_entry(
+            &entry_fixture(|_| {}),
+            7,
+            fds_at(11),
+            false,
+            Some(marker),
+            false,
+        );
+        let value = serde_json::to_value(&blob).unwrap();
+
+        assert_eq!(
+            Handover::load_value(value.clone())
+                .expect("a current blob loads")
+                .sheep[0]
+                .manual(),
+            Some(marker),
+            "a marker on the wire must come back whole, kind and origin both"
+        );
+
+        let mut older = value;
+        let sheep = older["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        assert!(
+            sheep.remove("manual").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(older).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].manual(), None);
+        assert_eq!(
+            loaded.sheep[0].id(),
+            blob.sheep[0].id(),
+            "the rest of the row is unchanged by the one field that was absent"
+        );
+    }
+
+    /// fails if a blob written before this daemon carried a swap in flight
+    /// stops loading, or if a swap that IS carried does not survive the
+    /// wire whole.
+    ///
+    /// Same shape and same stakes as the two cases above, in both halves.
+    /// A predecessor from before this daemon carried a reload refused the
+    /// whole flock over one sheep mid-swap, so its blobs have neither
+    /// `sheep[].reload` nor the top-level `reloads` array — and `None` is
+    /// the truthful reading of both: nothing was mid-reload. A hard parse
+    /// failure instead would leave the successor refusing to boot after the
+    /// predecessor had already exec'd itself away.
+    ///
+    /// The current-blob half is asserted first so the removals below remove
+    /// something, and it asserts the JOB as well as the marker: the marker
+    /// alone tells a successor an instance is half of a swap without
+    /// telling it which swap, and a job restored without its phase or its
+    /// mode would be continued down the wrong ordering.
+    #[test]
+    fn a_blob_written_before_a_swap_was_carried_still_loads() {
+        let job = CarriedReload {
+            app: "web".to_owned(),
+            queue: vec![11, 12],
+            mode: ReloadMode::Serial,
+            swap: ReloadSwap {
+                old_id: 1,
+                new_id: Some(9),
+                phase: ReloadPhase::AwaitReady,
+            },
+        };
+        let mut blob = sample_handover();
+        let mut drainee = entry_fixture(|_| {});
+        drainee.reload = ReloadState::Drainee { new_id: Some(9) };
+        blob.sheep[0] = carried(&drainee);
+        blob.reloads = Some(vec![job.clone()]);
+        let value = serde_json::to_value(&blob).unwrap();
+
+        let current = Handover::load_value(value.clone()).expect("a current blob loads");
+        assert_eq!(
+            current.sheep[0].reload(),
+            Some(ReloadState::Drainee { new_id: Some(9) }),
+            "the marker on the wire must come back whole, role and linked id both"
+        );
+        assert_eq!(
+            current.reloads(),
+            &[job],
+            "the job must come back whole: queue, mode and every field of the swap"
+        );
+
+        let mut older = value;
+        let object = older.as_object_mut().expect("a blob is an object");
+        assert!(
+            object.remove("reloads").is_some(),
+            "the field this case removes must be there to remove"
+        );
+        let sheep = older["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        assert!(
+            sheep.remove("reload").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(older).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].reload(), None);
+        assert!(loaded.reloads().is_empty());
+        assert_eq!(
+            loaded.sheep[0].id(),
+            blob.sheep[0].id(),
+            "the rest of the row is unchanged by the two fields that were absent"
+        );
+    }
+
+    /// fails if a blob written before this daemon carried a failed
+    /// readiness verdict stops loading, or if a verdict that IS carried does
+    /// not survive the wire.
+    ///
+    /// Same stakes as the three cases above and a different argument, which
+    /// is why it is asserted rather than assumed. Each of those was a gate
+    /// refusal before it was a field, so an absent key proves the fact was
+    /// false; this was never a refusal, and a predecessor from before the
+    /// field existed carried such an instance while silently dropping the
+    /// flag. `None` is therefore that predecessor saying nothing rather than
+    /// saying "no" — and `false` is still the only reading available, since
+    /// it is what a successor of that blob assumed anyway and a hard parse
+    /// failure would leave this one refusing to boot after its predecessor
+    /// had exec'd itself away.
+    ///
+    /// The current-blob half is asserted first so the removal below removes
+    /// something: a blob whose `ready_failed` was `false` all along could
+    /// not tell an absent key from a present one.
+    #[test]
+    fn a_blob_written_before_ready_failed_was_carried_still_loads() {
+        let mut blob = sample_handover();
+        blob.sheep[0] =
+            CarriedSheep::from_entry(&entry_fixture(|_| {}), 7, fds_at(11), false, None, true);
+        let value = serde_json::to_value(&blob).unwrap();
+
+        assert_eq!(
+            Handover::load_value(value.clone())
+                .expect("a current blob loads")
+                .sheep[0]
+                .ready_failed(),
+            Some(true),
+            "a verdict on the wire must come back as one, or the rollback it keeps reachable \
+             cannot reach anything"
+        );
+
+        let mut older = value;
+        let sheep = older["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        assert!(
+            sheep.remove("ready_failed").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(older).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].ready_failed(), None);
+        assert_eq!(
+            loaded.sheep[0].id(),
+            blob.sheep[0].id(),
+            "the rest of the row is unchanged by the one field that was absent"
+        );
     }
 
     #[test]
@@ -1728,12 +2200,13 @@ mod tests {
     ) -> Handover {
         Handover {
             version: VERSION,
-            sheep: vec![CarriedSheep::from_entry(entry, 7, fds)],
+            sheep: vec![CarriedSheep::from_entry(entry, 7, fds, false, None, false)],
             listener_fd,
             pidfile_fd,
             next_id: 9,
             next_deadline: 5,
             next_action_stamp: 2,
+            reloads: Some(Vec::new()),
         }
     }
 

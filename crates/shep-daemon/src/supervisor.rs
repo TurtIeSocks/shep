@@ -42,6 +42,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use shep_core::config::{AppConfig, ResolvedApp, normalize};
@@ -1569,6 +1570,10 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
     /// the `execve`. Nothing here spawns, signals or reopens anything: from
     /// each sheep's own side the shepherd was never away.
     ///
+    /// `reloads` is the apps that were mid-swap, restored once the flock is
+    /// in — see [`Actor::install_carried_reloads`] for what each one is owed
+    /// beyond its own restoration.
+    ///
     /// # Why the counters are restored before any slot is installed
     ///
     /// [`Actor::next_id`], [`Actor::next_deadline`] and
@@ -1602,6 +1607,7 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
         self,
         flock: Vec<AdoptedSheep>,
         counters: Counters,
+        reloads: Vec<CarriedReload>,
     ) -> Result<SupervisorHandle, AdoptError> {
         let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
         let mut actor = self.build(tx.clone());
@@ -1616,6 +1622,13 @@ impl<R: ProcessRunner> SupervisorBuilder<R> {
         for sheep in flock {
             actor.install_adopted(sheep, &reaper)?;
         }
+        // After the loop, and before the actor runs. A job names two entries
+        // and arms against one of them, so it has nowhere to go until every
+        // sheep is in; and the readiness waits `install_adopted` armed report
+        // back through the mailbox, which nothing drains until the line
+        // below — so a replacement that resolves instantly still finds its
+        // job.
+        actor.install_carried_reloads(reloads);
         tokio::spawn(actor.run(rx));
         Ok(SupervisorHandle { tx })
     }
@@ -1807,6 +1820,48 @@ struct ReloadJob {
     deadline: u64,
 }
 
+/// One app's in-flight reload, as it crosses a handover.
+///
+/// A [`ReloadJob`] minus the one field a successor must not inherit. The
+/// queue, the mode and the pair mid-swap are facts about a deploy the
+/// operator asked for and are carried unchanged; [`ReloadJob::deadline`] is a
+/// stamp on a timer that died with the predecessor's image, so the successor
+/// takes a fresh one off its own (carried) `next_deadline` when it re-arms.
+/// Carrying the old stamp would name a watchdog that no longer exists.
+///
+/// The app name rides on the row rather than keying a map, so the blob holds
+/// an array in a stable order — the same reason its sheep are sorted by id.
+///
+/// `Debug` is derived and nothing here is sensitive: an app name an operator
+/// typed, two entry ids and three closed enums (IR-41).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// The handover is a unix feature: both sites that build one of these —
+// `Actor::handle_handover_snapshot` and `Actor::install_carried_reloads` —
+// are `cfg(unix)`, while this type travels on `Handover`, which is not. So
+// on a Windows target it is a shape nothing constructs. Scoped to that
+// target rather than blanket-allowed, and an `expect` rather than an
+// `allow`, so that a Windows handover would have to delete this line rather
+// than inherit it.
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "no target without a handover ever builds one")
+)]
+pub(crate) struct CarriedReload {
+    /// The app whose reload this is — [`Actor::reloads`]' own key.
+    pub(crate) app: String,
+    /// Instances not yet taken, in slot order.
+    ///
+    /// A `Vec` rather than the [`VecDeque`] it comes off and goes back into:
+    /// the two serialize identically as a JSON array, and the queue
+    /// discipline is the actor's business rather than the blob's.
+    pub(crate) queue: Vec<u32>,
+    /// Whether this job overlaps its two instances or replaces them one
+    /// after the other.
+    pub(crate) mode: ReloadMode,
+    /// The pair mid-swap right now.
+    pub(crate) swap: ReloadSwap,
+}
+
 /// Which of two orderings a reload runs, decided from the app's config.
 ///
 /// # Why there are two
@@ -1823,8 +1878,12 @@ struct ReloadJob {
 ///
 /// The two orderings are the two ways out of that, and the app picks which by
 /// whether it can share a port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadMode {
+///
+/// Serialized because a handover carries the job it belongs to, `snake_case`
+/// on the wire for the reason [`ManualKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReloadMode {
     /// `SpawnNew → AwaitReady → DrainOld → ReapOld`. Both instances run at
     /// once, so the app is never short one.
     ///
@@ -1903,23 +1962,34 @@ impl ReloadMode {
 }
 
 /// The drainee/replacement pair a reload is working on right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReloadSwap {
+///
+/// Serialized because a handover carries the job it belongs to.
+///
+/// Its `rename_all` is INERT, unlike the one on [`ReloadMode`] and
+/// [`ReloadPhase`] beside it, and that is worth a line rather than leaving a
+/// reader to work out which. Those two are enums, where the attribute
+/// renames VARIANTS and fixes their wire spelling. This is a struct, so it
+/// renames fields, and every field here is snake_case already. It stays for
+/// symmetry: the handover's types disagreeing about whether they declare
+/// their wire case costs more to read than an attribute that does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct ReloadSwap {
     /// The instance being replaced. Carries `ProcStatus::Stopping` and
     /// [`ReloadState::Drainee`] from the moment the swap starts — which under
     /// [`ReloadMode::Overlap`] is when its replacement is spawned, and under
     /// [`ReloadMode::Serial`] is a whole drain before that.
-    old_id: u32,
+    pub(crate) old_id: u32,
     /// Its replacement, in the same instance slot under a new id. Carries
     /// [`ReloadState::Replacement`] until the swap finishes.
     ///
     /// `None` exactly while the phase is [`ReloadPhase::DrainFirst`]: a
     /// serial reload has no replacement to name until the instance it is
     /// replacing has gone.
-    new_id: Option<u32>,
+    pub(crate) new_id: Option<u32>,
     /// How far along this pair is — see [`ReloadPhase`], whose variants name
     /// the steps of both orderings.
-    phase: ReloadPhase,
+    pub(crate) phase: ReloadPhase,
 }
 
 /// Where a [`ReloadSwap`] is in the spec's per-instance state machine.
@@ -1929,8 +1999,12 @@ struct ReloadSwap {
 /// `ReapOld` is the drainee's `Msg::Exited` arriving. What a handler actually
 /// has to ask is the question these two answer — is the old instance still
 /// there to go back to?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadPhase {
+///
+/// Serialized because a handover carries the swap it belongs to,
+/// `snake_case` on the wire for the reason [`ManualKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReloadPhase {
     /// [`ReloadMode::Serial`] only: the instance being replaced is on its
     /// kill ladder and nothing has been spawned yet, so `swap.new_id` is
     /// `None`.
@@ -1961,8 +2035,14 @@ enum ReloadPhase {
 
 /// Which manual command is pending against a sheep, cleared the moment its
 /// `Msg::Exited` is processed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ManualKind {
+///
+/// Serialized because a handover carries it: see [`PendingManual`], which is
+/// what actually crosses. `snake_case` on the wire to match
+/// [`ProcStatus`]'s own spelling, the blob's nearest neighbour, since the
+/// blob is a JSON file an operator may read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManualKind {
     /// A `Stop` command targeted this sheep.
     Stop,
     /// A `Restart` command targeted this sheep.
@@ -1976,7 +2056,8 @@ enum ManualKind {
 /// sheep's next exit, and the two sites that carry the command out
 /// ([`Actor::handle_exited`] and [`Actor::apply_immediate`]), which report it
 /// as the `manually` flag on every bus event the restart emits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CommandOrigin {
     /// A person asked for it: a `Stop`, `Restart` or `Delete` off the control
     /// socket, or the daemon-wide `Shutdown`. An operator is waiting on the
@@ -1996,16 +2077,41 @@ pub(crate) enum CommandOrigin {
 }
 
 /// The manual command that owns a sheep's next exit, and who asked for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingManual {
+///
+/// # Why this crosses a handover whole
+///
+/// A successor that installed the sheep without this marker would install
+/// the sheep an operator has already asked to go away and then supervise it
+/// as if nothing had been asked: `handle_exited` would read `kind` as `None`
+/// and hand an `autorestart` app its ordinary respawn, so a `shep stop`
+/// would come back as a running sheep. So [`CarriedSheep::manual`] carries
+/// it, and `Actor::install_adopted` re-claims it.
+///
+/// [`Self::origin`] crosses UNCHANGED, which is a decision rather than the
+/// obvious default. The connection behind an operator's command dies at the
+/// `execve` along with every other in-flight RPC, so it is tempting to read
+/// the far side as "nobody is waiting any more" and carry `Automatic`.
+/// That would be wrong twice. `origin` answers who CAUSED this exit, not who
+/// is still connected — both of its readers are about cause — and the reply
+/// it looks like it is tracking does not live here at all: it lives on a
+/// `PendingReply`, which is not carried, so there is nobody to answer either
+/// way. Downgrading would make the `manually` flag on this exit's own bus
+/// events say the daemon restarted the app itself, which is exactly the lie
+/// that flag exists to prevent, and it would let a later operator command
+/// take the marker off a ladder that is already running under
+/// [`Actor::claim_manual`]'s carve-out and give it a different ending.
+///
+/// [`CarriedSheep::manual`]: crate::handover::CarriedSheep::manual
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingManual {
     /// What that exit will be turned into.
-    kind: ManualKind,
+    pub(crate) kind: ManualKind,
     /// Who asked. What the command DOES once the sheep is down is decided
     /// entirely by `kind`; `origin` survives into `handle_exited` for one
     /// purpose, the `manually` flag on the events that exit produces —
     /// otherwise a cron, watch, memory-breach or liveness restart would be
     /// broadcast as a user action.
-    origin: CommandOrigin,
+    pub(crate) origin: CommandOrigin,
 }
 
 /// One action the daemon has put on a sheep's shepherd channel and has not
@@ -3458,6 +3564,15 @@ impl<R: ProcessRunner> Actor<R> {
     /// [`CarriedFds`] are `CarriedFds::none()` for that same reason; neither
     /// is a refusal, and the fitness gate does not treat it as one.
     ///
+    /// # What a sheep mid-stop installs as
+    ///
+    /// The marker AND a fresh kill ladder. A carried [`PendingManual`] says
+    /// a command already owns this sheep's next exit, and the ladder that
+    /// was going to produce that exit died with the predecessor's image, so
+    /// restoring the marker alone would leave a sheep nothing is trying to
+    /// stop. The re-arm is at the bottom of this function and makes the
+    /// argument in full.
+    ///
     /// # Why nothing is emitted on the bus
     ///
     /// A `Start` or an `Online` would announce a transition to a sheep that
@@ -3503,6 +3618,21 @@ impl<R: ProcessRunner> Actor<R> {
         let spec = assemble(&app, carried.instance(), &self.paths, credentials);
         let id = carried.id();
         let status = carried.status();
+        // `None` for a blob written before this daemon carried a swap at
+        // all, which said the same thing by refusing to carry one; see
+        // `CarriedSheep::reload`.
+        let reload = carried.reload().unwrap_or(ReloadState::None);
+        // Read here rather than at either `SheepSlot` literal below, because
+        // the readiness re-arm between them has to see it: a `ready_failed`
+        // instance is `Starting` by construction, so a gate that could not
+        // tell the two apart would arm a wait over the one shape that must
+        // not get one. See the re-arm itself for what that would cost.
+        //
+        // `false` for a blob written before this daemon carried the flag,
+        // which is what a successor of that blob's predecessor assumed
+        // anyway — the field is new, the assumption is not. See
+        // `CarriedSheep::ready_failed`.
+        let ready_failed = carried.ready_failed().unwrap_or(false);
         let mut entry = ProcessEntry {
             id,
             spec: app.clone(),
@@ -3519,9 +3649,15 @@ impl<R: ProcessRunner> Actor<R> {
             // app amnesty it did not earn), while the window it is counted
             // over is a run of wall-clock this image did not observe.
             budget: RestartBudget::default(),
-            // Phase 2a's fitness gate refuses to carry a flock with a reload
-            // in flight, so there is no reload state to restore.
-            reload: ReloadState::None,
+            // Restored, and it is the marker that decides where this
+            // instance's next exit goes: `handle_exited` routes a `Drainee`
+            // to `reap_drainee` and reads a `Replacement` out of the swap,
+            // where an entry carrying `None` takes `decide_on_exit` instead
+            // — which for an `autorestart` app respawns the old code into a
+            // slot the replacement owns. The job the two halves belong to is
+            // restored separately, after every sheep is installed: see
+            // `install_carried_reloads`.
+            reload,
             credentials: carried.credentials(),
             out_file: spec.out_file.clone(),
             err_file: spec.err_file.clone(),
@@ -3544,12 +3680,33 @@ impl<R: ProcessRunner> Actor<R> {
                     to_child: None,
                     signals: None,
                     to_stdin: None,
+                    // `None`, and not restored from the blob even though the
+                    // blob may carry one. A marker is only ever claimed
+                    // against a sheep with a live task (`begin_manual_ids`
+                    // gates on `ctl.is_some()`, and `claim_manual` sends its
+                    // `Kill` down that same `ctl`), so a carried instance
+                    // with no pid should not have one — and if it somehow
+                    // did, there is no ladder here to re-arm and no
+                    // `Msg::Exited` coming to clear it, so restoring it
+                    // would leave a marker nothing in this image can ever
+                    // consume.
                     manual: None,
-                    pending_delete: false,
+                    // A pending delete IS restored: unlike the marker above
+                    // it needs no task to act on it, and the one exit that
+                    // consumes it is whatever this slot's next spawn ends
+                    // with.
+                    pending_delete: carried.pending_delete().unwrap_or(false),
                     epoch: carried.epoch(),
                     ready_tx: None,
                     actions: ActionWaits::default(),
-                    ready_failed: false,
+                    // Restored for the reason the pending delete above is:
+                    // it needs no task to act on it, and what consumes it is
+                    // whatever this slot's next spawn or exit does. A slot
+                    // with no process can still carry it — an abandoned
+                    // replacement that then exited is `WaitingRestart` with
+                    // the verdict still standing — and `respawn` clears it
+                    // at the spawn that answers it.
+                    ready_failed,
                 },
             );
             // A sheep the blob reports as `WaitingRestart` is owed a respawn,
@@ -3646,16 +3803,40 @@ impl<R: ProcessRunner> Actor<R> {
         // to carry a `Starting` sheep at all, which restarts a whole flock
         // over one app in its first three seconds.
         //
-        // `manually` is `false` and cannot be anything else: it belongs to
-        // the spawn that armed the original wait, which is not this image's
-        // to know. It reaches only the `Online` event's own flag.
-        let ready_tx = (status == ProcStatus::Starting).then(|| {
+        // `manually` reaches only the `Online` event's own flag, and it is
+        // knowable for exactly one of the two shapes that reach here. An
+        // ordinary `Starting` sheep's flag belongs to the spawn that armed
+        // the original wait, which is not this image's to know, so it is
+        // `false`. A REPLACEMENT's is knowable: `spawn_replacement` passes
+        // `true` unconditionally, because a reload is an operator's doing,
+        // so a carried `Replacement` marker is the same claim arriving by a
+        // different route. Reporting `false` there would broadcast an
+        // operator's deploy as the daemon's own doing, which is the lie the
+        // flag exists to prevent.
+        let manually = matches!(reload, ReloadState::Replacement);
+        // `ready_failed` is the one `Starting` sheep that gets no wait, and
+        // skipping it is the faithful adoption rather than an exception to
+        // one. An abandoned reload's leftover has already had its verdict:
+        // the predecessor's wait ran, failed, and was not replaced — the
+        // instance is left `Starting` precisely because that is the one
+        // status literally true of a process that is up and not serving.
+        //
+        // Arming a fresh wait over it would invent a second chance the
+        // predecessor had ended, and `handle_ready_result` would spend it
+        // the wrong way in both directions. Its `TimedOut` arm goes `Online`
+        // ANYWAY, so a successor would promote an abandoned release to
+        // serving one `listen_timeout` after the exec — the exact false
+        // success `reload_ready_result` and `handle_reload_verified` refuse
+        // to write — and `went_online` would clear the carried flag on its
+        // way past, so the rollback this whole field exists for would find
+        // the instance `Online` for a reason that is not true.
+        let ready_tx = (status == ProcStatus::Starting && !ready_failed).then(|| {
             let source = ReadinessSource::of(app.config())
                 .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
             spawn_readiness_task(
                 id,
                 carried.epoch(),
-                false,
+                manually,
                 source,
                 app.config().listen_timeout.as_duration(),
                 spec_prober(&spec),
@@ -3682,20 +3863,88 @@ impl<R: ProcessRunner> Actor<R> {
                 to_child: Some(to_child),
                 signals: Some(handles.signals),
                 to_stdin: Some(to_stdin),
-                // The gate refuses a flock with a manual stop or a pending
-                // delete waiting on an exit, so there is no marker to carry.
+                // `None` here and re-claimed below rather than written in
+                // directly, because restoring the marker is only half of
+                // what a carried one means: see the `claim_manual` call
+                // after this insert.
                 manual: None,
-                pending_delete: false,
+                pending_delete: carried.pending_delete().unwrap_or(false),
                 epoch: carried.epoch(),
                 // Armed above for an instance the blob reports as
                 // `Starting`, and `None` for one it reports as `Online`,
                 // which has already resolved its readiness and has nothing
-                // left to wait for.
+                // left to wait for — or for one whose readiness already
+                // failed, which has nothing left to wait for either.
                 ready_tx,
                 actions: ActionWaits::default(),
-                ready_failed: false,
+                // Restored, and it is what keeps an abandoned reload's
+                // leftover reachable: `reload_eligible` reads it beside the
+                // status, so the rollback reload can replace an instance
+                // that never reached `Online`. A successor that dropped it
+                // would answer that rollback `Ok` and skip the only instance
+                // there was.
+                ready_failed,
             },
         );
+        // A sheep the blob reports a `manual` marker for is one an operator
+        // (or the daemon itself) has already asked to go away, and the kill
+        // ladder that was going to make that happen ran inside the
+        // predecessor's own sheep task — `run_sheep`'s `SheepCtl::Kill` arm,
+        // and `kill_process`'s `tokio::time::timeout` inside it. The
+        // `execve` takes both. So a successor that restored only the marker
+        // would install a sheep that is never signalled again: the operator's
+        // `shep stop` leaves a process that will never die, and the row keeps
+        // reporting `online` while nothing at all is trying to stop it.
+        // Worse than the refusal this replaces, which at least stopped the
+        // flock.
+        //
+        // Fifth member of the same class as the readiness wait and the
+        // pending restart above, and re-armed the same way. It goes through
+        // `claim_manual` rather than writing `manual` into the slot directly
+        // so that the marker and the one `Kill` that produces its exit stay
+        // in the single place that pairs them, `try_send` rule (CRITICAL-2)
+        // included.
+        //
+        // What cannot be re-armed is how much of the ladder already ran.
+        // Nothing records when it started — the remaining grace is a
+        // `tokio::time::timeout` deadline inside a task of the
+        // predecessor's, monotonic and meaningless outside the runtime that
+        // read it — so the successor runs the WHOLE ladder again, polite
+        // rung first. Erring long is deliberate, exactly as
+        // `restart_delay(config, 1)` above errs long: a re-arm that jumped
+        // straight to `kill_tree` would `SIGKILL` a child that may never
+        // have been asked politely at all, since the predecessor's `Kill`
+        // could still have been sitting unread in the ctl mailbox at the
+        // exec. The cost is one extra `kill_timeout` at worst, and one
+        // repeated `SIGTERM` (or one repeated `{"kind":"shutdown"}`) to a
+        // child that is already on its way out.
+        //
+        // The cap comes off the ROLE, because the role is the only record of
+        // which ask is in hand. Both sites that pass `LadderCap::Drain` are
+        // a reload's drain and both leave `ReloadState::Drainee` on the
+        // entry, so a carried drainee is an instance that was asked to
+        // finish the work it already had and go — `graceful_timeout`'s own
+        // definition — while everything else was asked under `kill_timeout`.
+        // This line read `LadderCap::Stop` unconditionally while the gate
+        // still refused a flock mid-reload, and said at the time that the
+        // task removing that refusal would have to revisit it.
+        //
+        // One residual, and it is the same unrecoverable fact as the elapsed
+        // grace above. Which cap the ladder ACTUALLY started under is not
+        // recorded anywhere: an operator's `stop` reaching a drainee during
+        // the overlap's `AwaitReady` window claims the marker first, under
+        // `LadderCap::Stop`, and the drain that follows rides that ladder
+        // rather than starting one of its own. A successor re-arming that
+        // sheep uses the drain's cap instead. The cost is bounded by
+        // whichever of the app's two timeouts is longer, and the ending is
+        // the same either way: the ladder still escalates to `SIGKILL`.
+        if let Some(manual) = carried.manual() {
+            let cap = match reload {
+                ReloadState::Drainee { .. } => LadderCap::Drain,
+                ReloadState::None | ReloadState::Replacement => LadderCap::Stop,
+            };
+            self.claim_manual(id, manual, cap);
+        }
         // The same arming a spawn gets on its way to `Online`, and for the
         // same reason: a watch, a schedule or a memory limit this image did
         // not arm is one the app quietly stops having. Only for an instance
@@ -3705,6 +3954,112 @@ impl<R: ProcessRunner> Actor<R> {
             self.arm_extras(id);
         }
         Ok(())
+    }
+
+    /// Restores the reload jobs the blob carried, and re-arms every timer
+    /// each of them was waiting on.
+    ///
+    /// Runs after the whole flock is installed, not per sheep: a job names
+    /// two entries and reads an app's timings off one of them, so it has
+    /// nowhere to be armed until both halves are in the registry.
+    ///
+    /// # What is re-armed, and why a carried swap without this is worse than
+    /// a refused one
+    ///
+    /// Fourth and fifth instances of the class this phase exists to close: a
+    /// state whose only way forward is a `tokio::spawn`ed timer of the
+    /// predecessor's, which the `execve` takes while the successor installs
+    /// the status that timer was going to resolve.
+    ///
+    /// - **The watchdog.** [`Self::arm_reload_deadline`] is the only thing
+    ///   that ever removes a [`ReloadJob`] nothing else can finish. Without
+    ///   it a carried swap sits in its phase for the rest of this daemon's
+    ///   life, and `handle_reload` refuses on the presence of the map key —
+    ///   so that app answers `<name> is already being reloaded` forever, and
+    ///   takes `shep reload all` down with it because the refusal is
+    ///   whole-selector. The stamp is a fresh one off the carried
+    ///   `next_deadline` rather than the predecessor's, which named a timer
+    ///   that no longer exists.
+    /// - **The post-drain probe.** A swap in [`ReloadPhase::Verify`] is
+    ///   waiting on a `Msg::ReloadVerified` from
+    ///   [`Self::spawn_verify_task`], and that task went with the image too.
+    ///   Re-armed through the same [`Self::post_drain_probe`] the original
+    ///   went through, so a successor cannot answer the question differently
+    ///   from the predecessor that asked it. Without this the swap would
+    ///   reach its watchdog instead and be abandoned — the replacement left
+    ///   serving, but a `Reloaded` that never fires and a `ReloadAbandoned`
+    ///   for a deploy that actually worked.
+    ///
+    /// The readiness wait a [`ReloadPhase::AwaitReady`] swap is on is the
+    /// third, and it is re-armed a step earlier, in [`Self::install_adopted`]
+    /// with every other `Starting` sheep's.
+    ///
+    /// # Why an inherited swap is continued rather than abandoned
+    ///
+    /// `abort_reload` exists and is simpler. But a reload an operator asked
+    /// for, silently abandoned by an unrelated shepherd upgrade, is a
+    /// surprise with no notice: the flock comes back on the old code and
+    /// nothing says why. Continuing adds no failure mode the swap did not
+    /// already have, because the watchdog above IS the ending an unfinishable
+    /// swap gets with or without a handover.
+    ///
+    /// # The one job that is dropped
+    ///
+    /// A job whose swap names no registered entry at all. It cannot be
+    /// produced by a snapshot — that is taken on the actor loop, so a job and
+    /// the entries it names are read in one step — but the blob is a file,
+    /// and this is the same residual `refuse_repeated_fds` guards on the
+    /// descriptor side. Dropping it is the ending the watchdog would give it
+    /// anyway; keeping it would leave an app permanently unreloadable, and
+    /// arming against a missing entry would panic.
+    #[cfg(unix)]
+    fn install_carried_reloads(&mut self, reloads: Vec<CarriedReload>) {
+        for carried in reloads {
+            let CarriedReload {
+                app,
+                queue,
+                mode,
+                swap,
+            } = carried;
+            // The replacement first, because it is the half that exists in
+            // every phase but `DrainFirst`. Either will do — they are two
+            // instances of one app and carry the same `ResolvedApp` — so
+            // this is about which one is REGISTERED: a serial reload
+            // deregisters its drainee at `ReapOld` and keeps the job, so
+            // `old_id` is a dangling id by design from `AwaitReady` onwards.
+            let anchor = swap
+                .new_id
+                .filter(|id| self.sheep.contains_key(id))
+                .or_else(|| self.sheep.contains_key(&swap.old_id).then_some(swap.old_id));
+            let Some(anchor) = anchor else {
+                tracing::warn!(
+                    name = app,
+                    old_id = swap.old_id,
+                    new_id = swap.new_id,
+                    "a carried reload named no instance this shepherd was given, so it was \
+                     dropped rather than left unfinishable"
+                );
+                continue;
+            };
+            self.reloads.insert(
+                app.clone(),
+                ReloadJob {
+                    queue: queue.into_iter().collect(),
+                    mode,
+                    swap,
+                    // Overwritten by the arm below, which is the one site
+                    // that stamps a live watchdog.
+                    deadline: 0,
+                },
+            );
+            self.arm_reload_deadline(&app, anchor);
+            if swap.phase == ReloadPhase::Verify
+                && let Some(new_id) = swap.new_id
+                && let Some(source) = self.post_drain_probe(new_id, mode)
+            {
+                self.spawn_verify_task(&app, new_id, source);
+            }
+        }
     }
 
     /// Respawns an already-registered id in place: reassembles from its
@@ -5980,13 +6335,16 @@ impl<R: ProcessRunner> Actor<R> {
             .values()
             .map(|slot| HandoverDraft {
                 entry: slot.entry.clone(),
-                // Any manual command owning this sheep's next exit, not just
-                // a `Stop`. A `Restart` or a `Delete` waiting on that exit
-                // is as unsafe to carry, and the gate refuses in the strict
-                // direction by design.
-                pending_stop: slot.manual.is_some(),
+                // Whole, not `is_some()`. Which command owns this exit
+                // decides what the successor's `handle_exited` turns it
+                // into, and the origin decides what its bus events say
+                // about who caused it; a boolean would collapse a carried
+                // `Delete` into a `Stop` and broadcast an automatic restart
+                // as a user action.
+                manual: slot.manual,
                 pending_delete: slot.pending_delete,
                 epoch: slot.epoch,
+                ready_failed: slot.ready_failed,
                 log_ctl: slot.log_ctl.clone(),
                 channel_open: slot.open_channel().is_some(),
             })
@@ -5995,6 +6353,27 @@ impl<R: ProcessRunner> Actor<R> {
         // a file an operator may read: id order makes two snapshots of an
         // unchanged flock identical.
         drafts.sort_unstable_by_key(|draft| draft.entry.id);
+        // Read here, on the actor loop, in the same synchronous step as the
+        // entries above: a job and the two entries it names are one picture,
+        // and reading them a moment apart would let a swap finish between
+        // the two halves of the description of it.
+        let mut reloads: Vec<CarriedReload> = self
+            .reloads
+            .iter()
+            .map(|(app, job)| CarriedReload {
+                app: app.clone(),
+                queue: job.queue.iter().copied().collect(),
+                mode: job.mode,
+                swap: job.swap,
+                // `ReloadJob::deadline` is deliberately absent: it stamps a
+                // timer that dies with this image, and the successor takes a
+                // fresh stamp off the carried `next_deadline` when it
+                // re-arms. See `CarriedReload`'s own doc.
+            })
+            .collect();
+        // `HashMap` iteration order is arbitrary, for the reason the sheep
+        // are sorted a few lines up.
+        reloads.sort_unstable_by(|left, right| left.app.cmp(&right.app));
         spawn_handover_task(
             drafts,
             fds,
@@ -6003,6 +6382,7 @@ impl<R: ProcessRunner> Actor<R> {
                 next_deadline: self.next_deadline,
                 next_action_stamp: self.next_action_stamp,
             },
+            reloads,
             reply,
         );
     }
@@ -6027,12 +6407,6 @@ impl<R: ProcessRunner> Actor<R> {
             .iter()
             .map(|slot| Candidate {
                 entry: &slot.entry,
-                // Any manual command owning this sheep's next exit, exactly
-                // as `handle_handover_snapshot` reads it: the two must answer
-                // the same question, or a flock passes the gate and then
-                // fails it.
-                pending_stop: slot.manual.is_some(),
-                pending_delete: slot.pending_delete,
                 // Always `false` here, and it has to be: this gate awaits
                 // nothing, so it cannot ask a pump anything, and a pump that
                 // is wedged right now may well have answered by the time a
@@ -7779,13 +8153,16 @@ impl ParkedPumps {
 struct HandoverDraft {
     /// The sheep's lifecycle entry, cloned off the slot.
     entry: ProcessEntry,
-    /// Whether a manual command owns this sheep's next exit.
-    pending_stop: bool,
+    /// The manual command owning this sheep's next exit, if one does.
+    manual: Option<PendingManual>,
     /// Whether a `Delete` targets this sheep.
     pending_delete: bool,
     /// The slot's respawn epoch, so a timer armed before the exec is still
     /// recognised as stale after it.
     epoch: u64,
+    /// Whether a reload's readiness verification has already failed against
+    /// this sheep. See [`SheepSlot::ready_failed`].
+    ready_failed: bool,
     /// This sheep's log pump, or `None` for a slot whose spawn never
     /// succeeded.
     log_ctl: Option<mpsc::Sender<LogCtl>>,
@@ -7840,6 +8217,7 @@ fn spawn_handover_task(
     drafts: Vec<HandoverDraft>,
     fds: DaemonFds,
     counters: Counters,
+    reloads: Vec<CarriedReload>,
     reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
 ) {
     tokio::spawn(async move {
@@ -7875,11 +8253,16 @@ fn spawn_handover_task(
             if !draft.channel_open {
                 fds.channel = None;
             }
-            let carried = CarriedSheep::from_entry(&draft.entry, draft.epoch, fds);
+            let carried = CarriedSheep::from_entry(
+                &draft.entry,
+                draft.epoch,
+                fds,
+                draft.pending_delete,
+                draft.manual,
+                draft.ready_failed,
+            );
             let candidate = OwnedCandidate {
                 entry: draft.entry,
-                pending_stop: draft.pending_stop,
-                pending_delete: draft.pending_delete,
                 pump_unresponsive,
             };
             (candidate, carried, parked_pump)
@@ -7900,7 +8283,7 @@ fn spawn_handover_task(
                 parked.0.push(log_ctl);
             }
         }
-        let blob = Handover::new(carried, fds, counters);
+        let blob = Handover::new(carried, fds, counters, reloads);
         let _ = reply.send(Ok((candidates, blob, parked)));
     });
 }
@@ -17816,14 +18199,22 @@ mod tests {
         );
     }
 
-    /// Fails if a snapshot loses the three actor counters or the two slot
-    /// fields nothing outside the actor can see.
+    /// Fails if a snapshot loses the three actor counters or the three slot
+    /// facts nothing outside the actor can see.
     ///
     /// These are the reason this is a command rather than a getter, and each
     /// one is load-bearing on its own: a successor that reissued a live id
-    /// would collide with a caller still holding it, and a manual stop the
-    /// gate never saw is a flock carried while an operator is waiting on its
-    /// exit.
+    /// would collide with a caller still holding it, and a manual command
+    /// the successor never sees is an operator's `stop` that comes back as a
+    /// running sheep.
+    ///
+    /// Two of the three slot facts used to reach the CANDIDATE, where they
+    /// were refusals. Neither is one any more, so both are asserted against
+    /// the blob instead — the marker whole rather than as a boolean, since
+    /// the kind and the origin decide different things on the far side. The
+    /// third, `ready_failed`, was never a refusal and so was never asserted
+    /// anywhere: a snapshot that silently left it behind is the quiet half
+    /// of the same loss, and it is only visible here, on the write side.
     ///
     /// The sheep here has no live pump, which is also the registered-but-not
     /// -running case: it reports no descriptors, and that is not a refusal.
@@ -17837,18 +18228,34 @@ mod tests {
             kind: ManualKind::Stop,
             origin: CommandOrigin::Operator,
         });
+        actor.sheep.get_mut(&0).unwrap().ready_failed = true;
 
         let (reply, rx) = oneshot::channel();
         actor.handle_handover_snapshot(fds, reply);
         let (candidates, blob, _parked) = rx.await.unwrap().unwrap();
 
         assert!(
-            candidates[0].pending_stop,
-            "a pending stop must reach the gate"
+            !candidates.is_empty(),
+            "the flock must still reach the gate at all"
         );
-        assert!(
-            !candidates[0].pending_delete,
+        assert_eq!(
+            blob.sheep()[0].manual(),
+            Some(PendingManual {
+                kind: ManualKind::Stop,
+                origin: CommandOrigin::Operator,
+            }),
+            "a manual stop must reach the successor, kind and origin both"
+        );
+        assert_eq!(
+            blob.sheep()[0].pending_delete(),
+            Some(false),
             "nothing asked for this sheep to be deleted"
+        );
+        assert_eq!(
+            blob.sheep()[0].ready_failed(),
+            Some(true),
+            "an earlier reload's failed verdict must reach the successor, or the rollback that \
+             follows it has nothing left to replace"
         );
         assert!(
             blob.next_id() > 0,
@@ -17981,6 +18388,7 @@ mod tests {
                     entry.status = ProcStatus::Starting;
                 }))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18013,6 +18421,46 @@ mod tests {
         pid: Option<u32>,
         mutate: impl FnOnce(&mut ProcessEntry),
     ) -> CarriedSheep {
+        carried_marked(name, id, pid, false, None, false, mutate)
+    }
+
+    /// [`carried`], for an instance an earlier reload's readiness
+    /// verification failed against.
+    ///
+    /// Separate from [`carried_marked`] for the reason [`carried_in_swap`]
+    /// is: the many cases that are about none of this would otherwise grow
+    /// an argument they always pass the same value for.
+    #[cfg(unix)]
+    fn carried_ready_failed(
+        name: &str,
+        id: u32,
+        pid: Option<u32>,
+        mutate: impl FnOnce(&mut ProcessEntry),
+    ) -> CarriedSheep {
+        carried_marked(name, id, pid, false, None, true, mutate)
+    }
+
+    /// [`carried`], with the slot facts a blob carries beside the entry set
+    /// explicitly: a pending delete, the manual command that owns this
+    /// sheep's next exit, and an earlier reload's failed readiness verdict.
+    ///
+    /// One function for the first two rather than one per fact, since a
+    /// `Delete` sets them together and a case about either usually has
+    /// something to say about the other. Separate from [`carried`] so the
+    /// many cases that are about neither do not grow two arguments they
+    /// would always pass the same values for — which is also why the third
+    /// reaches this through [`carried_ready_failed`] rather than being
+    /// spelled out at every call.
+    #[cfg(unix)]
+    fn carried_marked(
+        name: &str,
+        id: u32,
+        pid: Option<u32>,
+        pending_delete: bool,
+        manual: Option<PendingManual>,
+        ready_failed: bool,
+        mutate: impl FnOnce(&mut ProcessEntry),
+    ) -> CarriedSheep {
         let mut app = AppConfig::minimal(name, "./srv");
         // Nothing in these cases wants a respawn: the install path is what
         // is under test, and an automatic restart would spawn a second
@@ -18035,7 +18483,14 @@ mod tests {
             last_exit: None,
         };
         mutate(&mut entry);
-        CarriedSheep::from_entry(&entry, 0, CarriedFds::none())
+        CarriedSheep::from_entry(
+            &entry,
+            0,
+            CarriedFds::none(),
+            pending_delete,
+            manual,
+            ready_failed,
+        )
     }
 
     /// A carried sheep with no descriptors to rebuild, which is every case
@@ -18089,6 +18544,7 @@ mod tests {
                     without_handles(carried("api", 8, Some(4243), |_| {})),
                 ],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18127,6 +18583,7 @@ mod tests {
                     });
                 }))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18176,6 +18633,7 @@ mod tests {
             .spawn_adopted(
                 vec![without_handles(carried("web", 7, Some(pid), |_| {}))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18207,6 +18665,394 @@ mod tests {
         );
     }
 
+    /// Fails if a carried pending delete is dropped by the adopt path.
+    ///
+    /// `install_adopted` used to hardcode `pending_delete: false` on every
+    /// installed slot, since the gate refused to carry one at all. Now that
+    /// [`handover::fitness`] carries it instead of refusing it, a sheep
+    /// whose delete was already in flight when the predecessor exec'd must
+    /// still be deregistered on its next exit rather than left registered
+    /// (which the operator's dropped connection would then never learn) or,
+    /// worse, respawned.
+    ///
+    /// A real child and the real runner, for the same reason
+    /// [`an_adopted_sheeps_exit_flows_through_the_ordinary_path`] gives: an
+    /// adopted pid has no `Child` handle, and only the real reaper's
+    /// `Msg::Exited` proves the carried marker actually reaches
+    /// `handle_exited`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the adopted flock's reaper collects this status; a Child::wait would take it first"
+    )]
+    async fn a_carried_pending_delete_deregisters_on_the_next_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("a test host can spawn a shell");
+        let pid = child.id();
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_marked(
+                    "web",
+                    7,
+                    Some(pid),
+                    true,
+                    None,
+                    false,
+                    |_| {},
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap()),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("the adopted child is signalable");
+
+        let info = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let info = sup.list().await;
+                if info.is_empty() {
+                    return info;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "a carried pending delete must deregister the sheep on its next exit, not merely \
+             stop it",
+        );
+
+        assert!(
+            info.is_empty(),
+            "the deleted sheep must be gone, not just stopped"
+        );
+    }
+
+    /// A real child for the adoption cases below to take over, running
+    /// `script` under `/bin/sh`, and its pid.
+    ///
+    /// **Its own process group, which is load-bearing rather than tidiness.**
+    /// `TokioProc::signal` and `kill_tree` both address the GROUP
+    /// (`signal_group`), exactly as the real spawn path leaves them able to:
+    /// a child that inherited this test binary's group is not a group leader,
+    /// so `killpg` answers `ESRCH`, the ladder logs a warning and delivers
+    /// nothing, and a case about a stop would fail for a reason that has
+    /// nothing to do with the stop. The cases that hand-send a signal to the
+    /// pid instead do not need this and do not use it.
+    ///
+    /// The `Child` handle is dropped rather than waited on, deliberately: the
+    /// adopted flock's own reaper is what collects this status, and a
+    /// `Child::wait` here would take it first and leave the daemon's targeted
+    /// wait with nothing to find.
+    #[cfg(unix)]
+    fn adoptable_child(script: &str) -> u32 {
+        use std::os::unix::process::CommandExt as _;
+
+        std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .process_group(0)
+            // Null, not inherited, and this is not tidiness either. An
+            // inherited stdout is the TEST HARNESS's, which under
+            // `cargo test ... | <anything>` is a pipe: a child that outlives
+            // a failing case then holds that pipe open, and the reader waits
+            // on a sheep nothing is going to stop. A failed assertion turns
+            // into a hang, which is the worst way to learn a mutation
+            // worked.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a test host can spawn a shell")
+            .id()
+    }
+
+    /// The app an adopted sheep in these cases runs, respawnable for real:
+    /// `mutate` gets it before it is normalized onto the entry.
+    #[cfg(unix)]
+    fn respawnable(mutate: impl FnOnce(&mut AppConfig)) -> impl FnOnce(&mut ProcessEntry) {
+        move |entry: &mut ProcessEntry| {
+            let mut app = AppConfig::minimal("web", "/bin/sh");
+            // Real, because one of these cases lets the successor respawn
+            // the sheep and then asserts on the pid it comes back with.
+            // `./srv` would fail to spawn and land in `Errored`, which is a
+            // different assertion entirely.
+            app.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+            mutate(&mut app);
+            entry.spec = normalize(app).unwrap();
+        }
+    }
+
+    /// Polls the flock until `done` accepts it, or fails the case.
+    ///
+    /// Real children and real signals, so the clock is real too: nothing
+    /// here can advance a paused one on the child's behalf. The bound is
+    /// far past anything these cases ask for, so a sheep nothing is trying
+    /// to stop fails here rather than hanging.
+    #[cfg(unix)]
+    async fn flock_until(
+        sup: &SupervisorHandle,
+        done: impl Fn(&[ProcessInfo]) -> bool,
+        what: &str,
+    ) -> Vec<ProcessInfo> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let info = sup.list().await;
+                if done(&info) {
+                    return info;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"))
+    }
+
+    /// Fails if a carried manual stop is dropped by the adopt path, either
+    /// half of it.
+    ///
+    /// Two things have to happen for an operator's `shep stop` to survive a
+    /// handover, and this asserts both because either one alone leaves the
+    /// operator worse off than the refusal this replaces:
+    ///
+    /// 1. The ladder is re-armed. It ran inside the predecessor's own sheep
+    ///    task and the `execve` took it, so a successor that restores only
+    ///    the marker installs a sheep that is never signalled again. That is
+    ///    what the sheep reaching a terminal status at all proves; without
+    ///    the re-arm nothing here ever touches the child and this times out.
+    /// 2. The marker is restored. `decide_on_exit` reads it as
+    ///    `manual_stop`, and this app has `autorestart` on, so a successor
+    ///    that armed a ladder without the marker would kill the sheep and
+    ///    then respawn it — a `stop` that comes back as a running process.
+    ///
+    /// A real child and the real runner, for the reason
+    /// [`a_carried_pending_delete_deregisters_on_the_next_exit`] gives: only
+    /// the real reaper's `Msg::Exited` proves a carried marker reaches
+    /// `handle_exited`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_manual_stop_stops_the_sheep_instead_of_respawning_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let pid = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_marked(
+                    "web",
+                    7,
+                    Some(pid),
+                    false,
+                    Some(PendingManual {
+                        kind: ManualKind::Stop,
+                        origin: CommandOrigin::Operator,
+                    }),
+                    false,
+                    respawnable(|app| app.autorestart = true),
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        let info = flock_until(
+            &sup,
+            |info| info[0].status == ProcStatus::Stopped,
+            "a carried manual stop must still stop the sheep after the exec",
+        )
+        .await;
+
+        assert_eq!(
+            info[0].restarts, 0,
+            "a stop must not come back as a respawn"
+        );
+        assert_eq!(
+            info[0].last_exit,
+            Some(ExitInfo {
+                code: None,
+                signal: Some(15)
+            }),
+            "the re-armed ladder starts at its polite rung, not at SIGKILL"
+        );
+        assert_eq!(info[0].pid, None, "a stopped sheep holds no pid");
+    }
+
+    /// Fails if a carried kill ladder never escalates from `SIGTERM` to
+    /// `SIGKILL`.
+    ///
+    /// The fifth member of the stranded-timer class, and the one found by
+    /// driving a real reload rather than by reading code. The escalation is
+    /// a `tokio::time::timeout` inside `kill_process`, which runs on the
+    /// sheep task, which is a `tokio::spawn` of the predecessor's that the
+    /// `execve` takes. A successor that restores the marker and re-sends
+    /// only the polite signal leaves a child that traps `SIGTERM` running
+    /// forever, with an operator's `stop` outstanding and no rung left: a
+    /// strictly worse outcome than refusing the handover, which at least
+    /// stopped the flock.
+    ///
+    /// The signal in `last_exit` is the whole assertion. A pid check cannot
+    /// tell a ladder that escalated from one that merely got lucky, which is
+    /// exactly why this defect survived a green suite.
+    ///
+    /// `kill_timeout` is shortened to a second so the case does not sit out
+    /// the 1600ms default plus its own polling; the bound in
+    /// [`flock_until`] is far past both.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_manual_stop_still_escalates_to_sigkill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        // `trap "" TERM` around a sleeping loop is `tests/real_runner.rs`'s
+        // own defiant sheep, and the loop rather than a bare `sleep` is part
+        // of it: the polite rung reaches the whole GROUP, so a shell waiting
+        // on one `sleep` would exit carrying that sleep's own status and
+        // look like it had obeyed.
+        //
+        // The touchfile closes the startup race `real_runner.rs` documents
+        // and answers with a real sleep. The install below sends the polite
+        // signal within microseconds of the spawn, and a `SIGTERM` that
+        // arrives before `trap` has run kills the shell on the default
+        // disposition — a green-looking failure of exactly the assertion
+        // this case exists to make.
+        let armed = dir.path().join("trap-armed");
+        //
+        // The loop is bounded rather than `while true` so that a case which
+        // fails before the ladder reaches it still leaves a child that goes
+        // away on its own, well inside `flock_until`'s own bound.
+        let pid = adoptable_child(&format!(
+            "trap '' TERM; : > {}; i=0; while [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done",
+            armed.display()
+        ));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !armed.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the defiant child must arm its trap before anything signals it");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_marked(
+                    "web",
+                    7,
+                    Some(pid),
+                    false,
+                    Some(PendingManual {
+                        kind: ManualKind::Stop,
+                        origin: CommandOrigin::Operator,
+                    }),
+                    false,
+                    respawnable(|app| {
+                        app.autorestart = false;
+                        app.kill_timeout = "1000".parse().unwrap();
+                    }),
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        let info = flock_until(
+            &sup,
+            |info| info[0].status == ProcStatus::Stopped,
+            "a sheep carried mid-ladder must still die on its own, without a hand-sent SIGKILL",
+        )
+        .await;
+
+        assert_eq!(
+            info[0].last_exit,
+            Some(ExitInfo {
+                code: None,
+                signal: Some(9)
+            }),
+            "the ladder must escalate: this child ignores SIGTERM, so anything else means it \
+             was never killed"
+        );
+    }
+
+    /// Fails if a carried manual RESTART is read as a stop, or if its origin
+    /// is rewritten on the way across.
+    ///
+    /// The kind and the origin are two separate facts on one marker and this
+    /// is what keeps either from being defaulted. A successor that armed a
+    /// ladder under a hardcoded `Stop` would leave the sheep down when an
+    /// operator had asked for it to come back, and one that hardcoded
+    /// `Operator` would broadcast a memory breach or a cron occurrence as a
+    /// user action — the exact lie [`PendingManual::origin`] exists to
+    /// prevent, and one a subscriber cannot tell from a deploy.
+    ///
+    /// `Automatic` rather than `Operator` for that second half: the flag has
+    /// to be able to come back `false`, and an operator's own restart is
+    /// what the rest of the suite already covers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_manual_restart_respawns_and_keeps_its_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        let pid = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_marked(
+                    "web",
+                    7,
+                    Some(pid),
+                    false,
+                    Some(PendingManual {
+                        kind: ManualKind::Restart,
+                        origin: CommandOrigin::Automatic,
+                    }),
+                    false,
+                    // Off, so the respawn below can only be the carried
+                    // Restart: an `autorestart` app would come back from the
+                    // crash loop whatever the marker said.
+                    respawnable(|app| app.autorestart = false),
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        let manually = tokio::time::timeout(
+            Duration::from_secs(20),
+            await_event(&mut rx, 7, ProcessEventKind::Restart),
+        )
+        .await
+        .expect("a carried manual restart must respawn the sheep after the exec");
+        assert!(
+            !manually,
+            "an automatic restart carried across a handover must not be broadcast as a user \
+             action"
+        );
+
+        let info = flock_until(
+            &sup,
+            |info| info[0].restarts == 1,
+            "the respawn must be counted against the sheep that was carried",
+        )
+        .await;
+        assert_ne!(
+            info[0].pid,
+            Some(pid),
+            "a restart is a new process, not the adopted one"
+        );
+        assert_eq!(
+            info[0].status,
+            ProcStatus::Online,
+            "an ungated app is Online the moment it respawns"
+        );
+
+        // The respawn is a real `sleep 30` this case started; the shutdown
+        // is what stops it being left behind when the tempdir goes.
+        sup.shutdown().await;
+    }
+
     /// Fails if a successor hands a fresh sheep an id a caller is still
     /// holding.
     ///
@@ -18222,6 +19068,7 @@ mod tests {
             .spawn_adopted(
                 vec![without_handles(carried("web", 7, Some(4242), |_| {}))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18258,6 +19105,7 @@ mod tests {
                     entry.status = ProcStatus::WaitingRestart;
                 }))],
                 counters(9),
+                Vec::new(),
             )
             .expect("a carried flock installs");
 
@@ -18277,5 +19125,750 @@ mod tests {
             Some(STAND_IN_SPAWN_PID),
             "the restart must be a real respawn, not a status edit: {info:?}"
         );
+    }
+
+    // --- a swap in flight, carried across the exec ----------------------
+
+    /// Fails if a snapshot taken while an app is mid-swap describes the
+    /// flock as though nothing were.
+    ///
+    /// The other side of every case below, and it is a separate assertion
+    /// rather than an implied one: they all hand `spawn_adopted` a job built
+    /// by hand, so a snapshot that silently reported no reloads at all would
+    /// leave every one of them green while no live handover ever carried a
+    /// swap.
+    ///
+    /// A SERIAL drain is what holds still long enough to be snapshotted. The
+    /// app configures a `readiness_probe` and no `reuse_port`, which is the
+    /// one arrangement `ReloadMode::of` sends down the serial ordering, so
+    /// the reload's first act is to drain the instance rather than to spawn
+    /// beside it — and [`ProcScript::never_reports_its_exit`] models the one
+    /// child a kill ladder cannot end, so the swap stays in
+    /// [`ReloadPhase::DrainFirst`] instead of advancing under the snapshot.
+    ///
+    /// A real clock, unlike its neighbours: a paused one auto-advances
+    /// whenever every task is idle, and the awaits inside
+    /// `handover_snapshot` are exactly such a window — the first draft of
+    /// this case reached `DrainOld` with a replacement already spawned. The
+    /// short `listen_timeout` is what keeps the real-clock cost at a
+    /// fraction of a second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_snapshot_taken_mid_swap_carries_the_job_and_the_markers() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_reports_its_exit(); 2]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.listen_timeout = UpDuration::from_millis(200);
+        app.readiness_probe = Some(probe_config(ProbeKind::Tcp, "127.0.0.1:9"));
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+        // A probed app is `Starting` until its probe answers or
+        // `listen_timeout` elapses, and `reload_eligible` refuses anything
+        // that is not serving — so without this the reload would skip the
+        // only instance there is and end before it began.
+        let online = loop {
+            let info = handle.list().await;
+            if info[0].status == ProcStatus::Online {
+                break info;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let old_id = online[0].id;
+
+        handle
+            .reload(ProcessSelector::All)
+            .await
+            .expect("an online app reloads");
+
+        let (_candidates, blob, _parked) = handle.handover_snapshot(fds).await.unwrap();
+
+        assert_eq!(
+            blob.reloads(),
+            &[CarriedReload {
+                app: "web".to_owned(),
+                queue: Vec::new(),
+                mode: ReloadMode::Serial,
+                swap: ReloadSwap {
+                    old_id,
+                    new_id: None,
+                    phase: ReloadPhase::DrainFirst,
+                },
+            }],
+            "the job the successor continues has to be in the blob, whole"
+        );
+        assert_eq!(
+            blob.sheep()[0].reload(),
+            Some(ReloadState::Drainee { new_id: None }),
+            "and the marker that routes this instance's exit with it"
+        );
+    }
+
+    /// A carried sheep that is half of a swap, with the role and the status
+    /// the predecessor's own entry carried.
+    ///
+    /// Separate from [`carried_marked`] rather than two more arguments on
+    /// it, for the reason that split already gives: the many cases that are
+    /// about neither would otherwise grow two arguments they always pass the
+    /// same values for.
+    #[cfg(unix)]
+    fn carried_in_swap(
+        name: &str,
+        id: u32,
+        pid: Option<u32>,
+        role: ReloadState,
+        status: ProcStatus,
+        manual: Option<PendingManual>,
+        mutate: impl FnOnce(&mut ProcessEntry),
+    ) -> CarriedSheep {
+        carried_marked(name, id, pid, false, manual, false, move |entry| {
+            mutate(entry);
+            entry.reload = role;
+            entry.status = status;
+        })
+    }
+
+    /// One app's in-flight reload, as a blob carries it, with an empty queue.
+    ///
+    /// Empty because these cases are about ONE swap surviving the exec, and
+    /// a queue behind it would let a case pass on the next instance's swap
+    /// rather than on the carried one.
+    #[cfg(unix)]
+    fn carried_job(
+        app: &str,
+        mode: ReloadMode,
+        old_id: u32,
+        new_id: Option<u32>,
+        phase: ReloadPhase,
+    ) -> CarriedReload {
+        CarriedReload {
+            app: app.to_owned(),
+            queue: Vec::new(),
+            mode,
+            swap: ReloadSwap {
+                old_id,
+                new_id,
+                phase,
+            },
+        }
+    }
+
+    /// Fails if a carried swap is left in its phase with nothing that can
+    /// ever end it.
+    ///
+    /// The watchdog is a `tokio::spawn`ed sleep of the predecessor's, and
+    /// the `execve` takes it — the same class as the readiness wait, the
+    /// pending restart and the kill ladder before it. This is the one that
+    /// makes carrying a swap safe at all: with the job restored and no timer
+    /// over it, an instance that never exits leaves a `ReloadJob` nothing can
+    /// remove, and `handle_reload` refuses on the presence of the map key. So
+    /// the app answers `web is already being reloaded` for the rest of the
+    /// daemon's life, and takes `shep reload all` down with it because the
+    /// refusal is whole-selector.
+    ///
+    /// That refusal IS the assertion, in both directions: it must be there
+    /// while the job is, and gone once the watchdog has ended it. Nothing
+    /// here ever exits — [`AdoptingRunner`]'s `wait` never resolves — so the
+    /// only thing that can produce the second half is a timer this image
+    /// armed.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_carried_swap_that_cannot_finish_is_still_abandoned_on_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried_in_swap(
+                        "web",
+                        7,
+                        Some(4242),
+                        ReloadState::Drainee { new_id: Some(8) },
+                        ProcStatus::Stopping,
+                        None,
+                        |_| {},
+                    )),
+                    without_handles(carried_in_swap(
+                        "web",
+                        8,
+                        Some(4243),
+                        ReloadState::Replacement,
+                        ProcStatus::Online,
+                        None,
+                        |_| {},
+                    )),
+                ],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::DrainOld,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        let refused = sup.reload(ProcessSelector::All).await;
+        assert!(
+            matches!(refused, Err(SupervisorError::ReloadInFlight(ref name)) if name == "web"),
+            "the carried job must be in the map, or this case proves nothing: {refused:?}"
+        );
+
+        // Parking on `recv` is what advances the paused clock, so this waits
+        // out `listen_timeout + graceful_timeout + RELOAD_DEADLINE_SLACK`
+        // (16s at the defaults) without costing the suite a millisecond.
+        // Bounded well past that, and the bound is load-bearing rather than
+        // belt-and-braces: with no timer armed at all there is nothing for
+        // the paused clock to advance TO, so an unbounded wait here would
+        // hang the whole suite instead of failing this case.
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            await_event(&mut rx, 8, ProcessEventKind::ReloadAbandoned),
+        )
+        .await
+        .expect("a carried swap must still be bounded by a watchdog this image armed");
+
+        sup.reload(ProcessSelector::All)
+            .await
+            .expect("once the watchdog has ended the job, the app must be reloadable again");
+    }
+
+    /// Fails if a carried reload naming no registered instance panics or is
+    /// kept.
+    ///
+    /// A snapshot cannot produce one: it is taken on the actor loop, so a
+    /// job and the entries it names are read in one step. The blob is a
+    /// file, though, and this is the same residual `refuse_repeated_fds`
+    /// guards on the descriptor side. Keeping such a job would leave the app
+    /// permanently unreloadable, and arming a watchdog against an entry that
+    /// is not there panics — so the reload below is the assertion, and a
+    /// build without the guard fails it by aborting rather than by refusing.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_carried_reload_naming_no_registered_instance_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, Some(4242), |_| {}))],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    98,
+                    Some(99),
+                    ReloadPhase::DrainOld,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        sup.reload(ProcessSelector::All)
+            .await
+            .expect("a job naming nothing must be dropped, not left refusing every later reload");
+    }
+
+    /// Fails if a carried swap in [`ReloadPhase::Verify`] is left to its
+    /// watchdog instead of being asked again.
+    ///
+    /// The second timer an overlapping probed reload arms, and the one a
+    /// half fix misses: `spawn_verify_task` is a task of the predecessor's
+    /// too, so a successor that re-arms only the watchdog abandons a deploy
+    /// that actually worked — the replacement stays serving, but the
+    /// `Reloaded` never fires, the rest of a clustered app's queue is
+    /// dropped, and the operator gets a `ReloadAbandoned` for a swap whose
+    /// replacement is fine.
+    ///
+    /// A real listener and a real clock. The probe answers in microseconds
+    /// where the watchdog is `listen_timeout + graceful_timeout +
+    /// RELOAD_DEADLINE_SLACK` (16s at the defaults), so the bound below
+    /// separates the two by an order of magnitude without depending on how
+    /// fast the host is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_swap_in_verify_is_asked_again_rather_than_abandoned() {
+        let probe_target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe_target.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        // Bound, never used: this case asserts on the bus rather than on the
+        // flock, and dropping the handle would take a sender off the actor's
+        // mailbox for no reason.
+        let _sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_in_swap(
+                    "web",
+                    8,
+                    Some(4243),
+                    ReloadState::Replacement,
+                    ProcStatus::Online,
+                    None,
+                    move |entry| {
+                        let mut app = AppConfig::minimal("web", "./srv");
+                        app.autorestart = false;
+                        // `Probe` readiness alone takes the serial ordering,
+                        // which has no post-drain probe to re-arm;
+                        // `reuse_port` is what puts this app on the
+                        // overlapping one, where the drainee may have
+                        // answered the first probe on the replacement's
+                        // behalf.
+                        app.reuse_port = true;
+                        app.readiness_probe = Some(probe_config(ProbeKind::Tcp, &addr.to_string()));
+                        entry.spec = normalize(app).unwrap();
+                    },
+                ))],
+                counters(9),
+                // No drainee: `Verify` is entered once the drainee is
+                // reaped, which is the whole point of asking again with one
+                // process left.
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::Verify,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            await_event(&mut rx, 8, ProcessEventKind::Reloaded),
+        )
+        .await
+        .expect("a carried swap in Verify must be probed again, not left to its watchdog");
+    }
+
+    /// Fails if a carried serial drain never spawns the replacement it was
+    /// draining for.
+    ///
+    /// [`ReloadPhase::DrainFirst`] is the one phase with no replacement yet:
+    /// the marker on the entry is `Drainee { new_id: None }`, and it is what
+    /// routes this instance's exit to `reap_drainee` — and so to
+    /// `spawn_serial_replacement` — instead of to `decide_on_exit`. A
+    /// successor that dropped it would deregister a `Stopping` sheep and
+    /// leave the instance slot empty, with the job still in the map.
+    ///
+    /// A real child and the real runner, for the reason
+    /// [`a_carried_manual_stop_stops_the_sheep_instead_of_respawning_it`]
+    /// gives: only the real reaper's `Msg::Exited` proves a carried marker
+    /// reaches `handle_exited`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_serial_drain_still_spawns_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let pid = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_in_swap(
+                    "web",
+                    7,
+                    Some(pid),
+                    ReloadState::Drainee { new_id: None },
+                    ProcStatus::Stopping,
+                    Some(PendingManual {
+                        kind: ManualKind::Stop,
+                        origin: CommandOrigin::Operator,
+                    }),
+                    swappable,
+                ))],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Serial,
+                    7,
+                    None,
+                    ReloadPhase::DrainFirst,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        let info = flock_until(
+            &sup,
+            |info| info.len() == 1 && info[0].id != 7,
+            "a carried serial drain must spawn its replacement once the instance it drained goes",
+        )
+        .await;
+
+        assert_eq!(
+            info[0].id, 9,
+            "the replacement takes the next carried id, not a reissued one"
+        );
+        assert_eq!(
+            info[0].restarts, 0,
+            "a reload is not a restart, so the count carries across the swap unchanged"
+        );
+        assert_ne!(info[0].pid, Some(pid), "the replacement is a new process");
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a carried replacement still awaiting readiness never commits
+    /// its swap.
+    ///
+    /// Three things have to survive for this to pass, and each one alone
+    /// leaves the operator worse off than the refusal it replaces:
+    ///
+    /// 1. The readiness wait is re-armed. `install_adopted` does that for
+    ///    every `Starting` sheep, and without it the replacement sits
+    ///    `Starting` forever with the drainee still serving beside it —
+    ///    two live instances of a one-instance app.
+    /// 2. The `Replacement` marker is restored, or `handle_ready_result`
+    ///    takes the ordinary path: the sheep goes `Online` and the swap
+    ///    never commits, so the drainee is never drained. The `manually`
+    ///    flag asserted below is that route's own fingerprint —
+    ///    `spawn_replacement` passes `true` because a reload is an
+    ///    operator's doing, and an adopted sheep that is not a replacement
+    ///    is armed with `false`.
+    /// 3. The job is restored, or `reload_ready_result` finds no reload to
+    ///    belong to and takes the same ordinary transition.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_replacement_awaiting_readiness_commits_its_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        let drainee = adoptable_child("sleep 30");
+        let replacement = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried_in_swap(
+                        "web",
+                        7,
+                        Some(drainee),
+                        ReloadState::Drainee { new_id: Some(8) },
+                        ProcStatus::Stopping,
+                        // No marker: an overlapping swap does not ask the
+                        // drainee to go until its replacement is serving.
+                        None,
+                        swappable,
+                    )),
+                    without_handles(carried_in_swap(
+                        "web",
+                        8,
+                        Some(replacement),
+                        ReloadState::Replacement,
+                        ProcStatus::Starting,
+                        None,
+                        swappable,
+                    )),
+                ],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::AwaitReady,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        let manually = tokio::time::timeout(
+            Duration::from_secs(20),
+            await_event(&mut rx, 8, ProcessEventKind::Online),
+        )
+        .await
+        .expect("a carried replacement must still resolve its readiness after the exec");
+        assert!(
+            manually,
+            "a replacement's Online is an operator's doing; reporting otherwise broadcasts a \
+             deploy as the daemon's own"
+        );
+
+        let info = flock_until(
+            &sup,
+            |info| info.len() == 1,
+            "committing the swap must drain the instance it replaced",
+        )
+        .await;
+        assert_eq!(info[0].id, 8, "the replacement is what is left: {info:?}");
+        assert_eq!(info[0].pid, Some(replacement));
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a carried drainee's exit does not finish the swap it was
+    /// half of.
+    ///
+    /// [`ReloadPhase::DrainOld`] is the committed phase: the replacement is
+    /// serving and the instance it replaced is on its ladder. The
+    /// `Drainee` marker is what sends that instance's exit to
+    /// `reap_drainee` rather than to `decide_on_exit`, and this app has
+    /// `autorestart` on, so a successor that dropped the marker would
+    /// respawn the OLD code into an instance slot the replacement owns —
+    /// two live processes for one instance, one of them the release the
+    /// operator was replacing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_drainee_still_finishes_its_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        let drainee = adoptable_child("sleep 30");
+        let replacement = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried_in_swap(
+                        "web",
+                        7,
+                        Some(drainee),
+                        ReloadState::Drainee { new_id: Some(8) },
+                        ProcStatus::Stopping,
+                        Some(PendingManual {
+                            kind: ManualKind::Stop,
+                            origin: CommandOrigin::Operator,
+                        }),
+                        |entry| swappable_with(entry, |app| app.autorestart = true),
+                    )),
+                    without_handles(carried_in_swap(
+                        "web",
+                        8,
+                        Some(replacement),
+                        ReloadState::Replacement,
+                        ProcStatus::Online,
+                        None,
+                        |entry| swappable_with(entry, |app| app.autorestart = true),
+                    )),
+                ],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::DrainOld,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            await_event(&mut rx, 8, ProcessEventKind::Reloaded),
+        )
+        .await
+        .expect("a carried drainee's exit must finish the swap it was half of");
+
+        let info = sup.list().await;
+        assert_eq!(
+            info.len(),
+            1,
+            "the drainee is deregistered by the swap, never respawned: {info:?}"
+        );
+        assert_eq!(info[0].id, 8);
+        assert_eq!(info[0].pid, Some(replacement));
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a carried drainee's ladder is re-armed under `kill_timeout`
+    /// rather than `graceful_timeout`.
+    ///
+    /// The cap is not recorded anywhere, so it is derived from the role: a
+    /// `Drainee` is an instance that was asked to finish the work already in
+    /// hand and go, which is `graceful_timeout`'s own definition, and both
+    /// sites that pass `LadderCap::Drain` leave that marker on the entry.
+    /// This line read `LadderCap::Stop` unconditionally while a flock
+    /// mid-reload was still refused outright.
+    ///
+    /// The child ignores `SIGTERM`, so only the escalation can end it, and
+    /// the app's two timeouts are three orders of magnitude apart: under the
+    /// drain's cap the `SIGKILL` lands a quarter of a second in, and under
+    /// the stop's it would land five minutes later — well past
+    /// [`flock_until`]'s own bound, which is what fails the case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_drainee_is_capped_by_graceful_timeout_not_kill_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let drainee = adoptable_child("trap '' TERM; sleep 300");
+        let replacement = adoptable_child("sleep 30");
+        let capped = |entry: &mut ProcessEntry| {
+            swappable_with(entry, |app| {
+                app.graceful_timeout = UpDuration::from_millis(250);
+                app.kill_timeout = UpDuration::from_millis(300_000);
+            });
+        };
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![
+                    without_handles(carried_in_swap(
+                        "web",
+                        7,
+                        Some(drainee),
+                        ReloadState::Drainee { new_id: Some(8) },
+                        ProcStatus::Stopping,
+                        Some(PendingManual {
+                            kind: ManualKind::Stop,
+                            origin: CommandOrigin::Operator,
+                        }),
+                        capped,
+                    )),
+                    without_handles(carried_in_swap(
+                        "web",
+                        8,
+                        Some(replacement),
+                        ReloadState::Replacement,
+                        ProcStatus::Online,
+                        None,
+                        capped,
+                    )),
+                ],
+                counters(9),
+                vec![carried_job(
+                    "web",
+                    ReloadMode::Overlap,
+                    7,
+                    Some(8),
+                    ReloadPhase::DrainOld,
+                )],
+            )
+            .expect("a carried flock installs");
+
+        flock_until(
+            &sup,
+            |info| info.len() == 1,
+            "a carried drainee must escalate at graceful_timeout, not at kill_timeout",
+        )
+        .await;
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a reload can no longer reach an instance an earlier reload's
+    /// readiness verification failed against, once that instance has crossed
+    /// a handover.
+    ///
+    /// The status alone rules it out. An abandoned reload leaves its
+    /// replacement `Starting` deliberately — up, and never having proved it
+    /// can serve — and a reload replaces `Online` instances, so
+    /// `SheepSlot::ready_failed` is the whole of what keeps the leftover
+    /// reachable. A successor that dropped the flag would answer the
+    /// rollback that follows a bad release with `Ok` and replace nothing,
+    /// which is the failure the flag exists to prevent, arriving through a
+    /// door that used to be shut by refusing the flock instead.
+    ///
+    /// Asserted through a real reload rather than by reading the slot back:
+    /// what an operator meets is the reload's own answer, and `handle_reload`
+    /// replies `Ok` with the row in it either way — before its selector pass
+    /// has decided that this instance is not eligible.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_ready_failed_instance_is_still_replaceable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let pid = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_ready_failed(
+                    "web",
+                    7,
+                    Some(pid),
+                    |entry| {
+                        swappable(entry);
+                        entry.status = ProcStatus::Starting;
+                    },
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        sup.reload(ProcessSelector::All)
+            .await
+            .expect("a registered app is one a reload can name");
+
+        let info = flock_until(
+            &sup,
+            |info| info.len() == 1 && info[0].id != 7,
+            "a carried `ready_failed` instance must still be replaceable by the reload that \
+             rolls its release back",
+        )
+        .await;
+
+        assert_eq!(
+            info[0].id, 9,
+            "the replacement takes the next carried id, not a reissued one"
+        );
+        assert_ne!(info[0].pid, Some(pid), "the replacement is a new process");
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a successor arms a readiness wait over an instance whose
+    /// readiness has already failed.
+    ///
+    /// The exact inverse of
+    /// [`an_adopted_sheep_that_was_still_starting_reaches_online`], and the
+    /// two together are why `install_adopted` reads the carried flag before
+    /// it decides: both sheep are `Starting`, and only the flag tells them
+    /// apart. An ordinary one is mid-wait and owed a fresh one; this one's
+    /// wait already ran, failed, and was deliberately not replaced.
+    ///
+    /// Arming one anyway would spend it the wrong way whichever answer came
+    /// back. `handle_ready_result`'s `TimedOut` arm goes `Online` ANYWAY, so
+    /// the successor would report an abandoned release as serving one
+    /// `listen_timeout` after the exec — the false success both abandonment
+    /// arms refuse to write — and `went_online` clears `ready_failed` on its
+    /// way past, so the rollback the sibling case above asserts would arrive
+    /// to find the instance `Online` for a reason that is not true.
+    ///
+    /// The clock is paused and then run well past the app's own
+    /// `listen_timeout`, so a wait that WAS armed has fired and been handled
+    /// by the time the status is read.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_carried_ready_failed_instance_gets_no_fresh_readiness_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_ready_failed(
+                    "web",
+                    7,
+                    Some(4242),
+                    |entry| {
+                        let mut app = AppConfig::minimal("web", "./srv");
+                        app.autorestart = false;
+                        app.wait_ready = true;
+                        entry.spec = normalize(app).unwrap();
+                        entry.status = ProcStatus::Starting;
+                    },
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        tokio::time::sleep(Duration::from_secs(120)).await;
+
+        assert_eq!(
+            sup.list().await[0].status,
+            ProcStatus::Starting,
+            "an instance whose readiness already failed must not be handed a second verdict by \
+             the successor that adopted it"
+        );
+    }
+
+    /// The app a carried swap's two halves run: a real `sleep`, so a
+    /// replacement can actually be spawned and a drainee actually signalled,
+    /// and a `listen_timeout` short enough that a real-clock case does not
+    /// wait out the 3s default.
+    #[cfg(unix)]
+    fn swappable(entry: &mut ProcessEntry) {
+        swappable_with(entry, |_| {});
+    }
+
+    /// [`swappable`], with `mutate` free to change the app first.
+    #[cfg(unix)]
+    fn swappable_with(entry: &mut ProcessEntry, mutate: impl FnOnce(&mut AppConfig)) {
+        let mut app = AppConfig::minimal("web", "/bin/sh");
+        app.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+        app.autorestart = false;
+        app.listen_timeout = UpDuration::from_millis(200);
+        mutate(&mut app);
+        entry.spec = normalize(app).unwrap();
     }
 }

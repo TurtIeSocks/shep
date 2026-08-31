@@ -107,7 +107,47 @@ use std::os::unix::io::{FromRawFd, RawFd};
 /// the logger and inherited-terminal plumbing elsewhere in the process —
 /// adopting one of those into an owning [`File`] would silently steal it out
 /// from under whatever already holds it.
-const RESERVED_FD_FLOOR: RawFd = 3;
+pub(crate) const RESERVED_FD_FLOOR: RawFd = 3;
+
+/// Whether `fd` is a number this process could adopt at all: not stdio, and
+/// open right now.
+///
+/// [`adopt_fd`]'s two checks and nothing else, split out for the one caller
+/// that has to ask the question WITHOUT taking ownership. The predecessor in
+/// a handover rehearses its successor's adoption before the `execve` — see
+/// `handover::adopt::dry_run` — and a rehearsal that closed the descriptors
+/// it was checking would be worse than no rehearsal at all. It asks this
+/// rather than keeping a second copy of the same two checks: a copy that
+/// drifted lax would pass a blob the successor still refuses, and by then
+/// there is no image left to refuse back to.
+///
+/// Safe, unlike [`adopt_fd`], and the reason is that it takes nothing. That
+/// function's `# Safety` section is entirely about who owns the number
+/// afterwards, and afterwards this owns nothing, so the recycling hazard has
+/// nowhere to land. It asks a question about a number rather than making a
+/// claim on one.
+///
+/// # Errors
+/// - [`SysError::ReservedFd`]: `fd` is below 3 (stdio is owned elsewhere).
+/// - [`SysError::BadFd`]: `fd` names no open descriptor in this process,
+///   which is what a blob naming a descriptor that did not survive the exec
+///   looks like.
+pub fn adoptable_fd(fd: RawFd) -> Result<(), SysError> {
+    if fd < RESERVED_FD_FLOOR {
+        return Err(SysError::ReservedFd(fd));
+    }
+    // `F_GETFD` only succeeds on a descriptor this process actually has open
+    // right now, so a stale or never-opened number is rejected here instead
+    // of being handed to `from_raw_fd`. (This does NOT prove the number is
+    // the caller's intended inherited pipe rather than something recycled —
+    // that half of the contract is [`adopt_fd`]'s caller's, per that fn's
+    // own `# Safety` section.)
+    nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).map_err(|errno| SysError::BadFd {
+        fd,
+        errno: errno.to_string(),
+    })?;
+    Ok(())
+}
 
 /// Takes ownership of a descriptor inherited across `exec`.
 ///
@@ -136,22 +176,14 @@ const RESERVED_FD_FLOOR: RawFd = 3;
 /// [`crate::boot::BootOptions::ready_fd`] and never touches a raw fd
 /// itself — see that field's own doc for why adoption moved out of `boot`.
 pub unsafe fn adopt_fd(fd: RawFd) -> Result<File, SysError> {
-    if fd < RESERVED_FD_FLOOR {
-        return Err(SysError::ReservedFd(fd));
-    }
-    // Probe before adopting: F_GETFD only succeeds on a descriptor this
-    // process actually has open right now, so a stale or never-opened
-    // number is rejected here instead of being handed to `from_raw_fd`.
-    // (This does NOT prove the number is the caller's intended inherited
-    // pipe rather than something recycled — that half of the contract is
-    // the caller's, per this fn's own `# Safety` section above.)
-    nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).map_err(|errno| SysError::BadFd {
-        fd,
-        errno: errno.to_string(),
-    })?;
-    // SAFETY: `fd` is >= RESERVED_FD_FLOOR (checked above), so it cannot
-    // alias stdio, and the `fcntl` probe just above proved it names a
-    // descriptor genuinely open in this process. The caller's own contract
+    adoptable_fd(fd)?;
+    // SAFETY: `adoptable_fd` returned `Ok`, so `fd` is >= RESERVED_FD_FLOOR
+    // and cannot alias stdio, and the `fcntl` probe inside it proved the
+    // number names a descriptor genuinely open in this process. That check
+    // is shared with the predecessor's pre-exec rehearsal rather than
+    // inlined here, and sharing it costs this block nothing: the two
+    // conditions the `unsafe` below rests on are the two that function
+    // returns `Ok` for. The caller's own contract
     // (this fn's `# Safety` section) is what proves that open descriptor is
     // the intended inherited pipe rather than something this process opened
     // itself in the meantime. `adopt_fd` is the only place in this crate
