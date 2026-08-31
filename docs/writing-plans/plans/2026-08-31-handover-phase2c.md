@@ -21,7 +21,7 @@
 | task 5 | `Starting`, waiting on readiness | re-arm from `listen_timeout` |
 | task 8 | `WaitingRestart`, owed a respawn | re-arm from `backoff::restart_delay` |
 | this phase | a reload waiting on its deadline | task 3 below |
-| task 1's drill | **a kill ladder's SIGTERM→SIGKILL escalation** | task 2 below |
+| task 1's drill | **a kill ladder's SIGTERM→SIGKILL escalation** | task 2, done |
 
 The fifth was found by task 1 driving a real reload: a sheep carried
 mid-ladder never escalated, and had to be killed by hand. That is the same
@@ -81,6 +81,9 @@ That was a defect in this plan, not in the code. It came from reading the two
 fields as two facts because they are two struct members, without checking
 whether anything ever sets one without the other.
 
+**Both are in as of task 2, and the unit held: task 1's carry is demonstrated
+end to end there, on a plain build with nothing patched out.**
+
 5 is independent. 3 and 4 are coupled, and 4 depends on 3. Everything touches
 `refusal()` in `handover/mod.rs`, so tasks run one at a time unless they are
 in separate worktrees.
@@ -116,18 +119,185 @@ The mapped facts held, with one imprecision: the brief said "restored onto the e
 
 `diff` against the pre-bypass file was empty after reverting it, and the full lib suite (647/647) was re-run before any gate command.
 
+##### Demonstrated for real, by task 2
+
+Task 2 removed `RefusedReason::PendingStop`, so the carry above no longer
+needs a bypass to be observed. Its second drill is task 1's, run against a
+plain release build with nothing patched out: `shep delete sticky`
+backgrounded, `shep daemon reload` two seconds later, `reload exit=0`,
+shepherd 63605 unmoved, sheep 66479 unmoved and still `online` the moment the
+reload returned, the delete client answered
+`error[daemon_unreachable]: the connection closed before a reply arrived`
+(exit 5) exactly as D1 predicts, and thirty seconds later the row was GONE:
+`shep flock` listed nothing and the saved roll's `apps` array was `[]`. No
+hand-sent `SIGKILL` this time either, because the ladder task 2 re-arms
+finished the delete on its own.
+
 ### Task 2: `manual`
 
 **Files:** same two, plus `PendingManual` needs to cross the wire.
 
 `PendingManual { kind, origin }` is not `Serialize` today. Carry the `kind`; `origin` says who asked, and after the exec the answer is "a client that is gone", which D1 settles.
 
-- [ ] **Step 1: Write the failing test.** A carried sheep with a manual stop pending still stops, and does not respawn, after the exec.
-- [ ] **Step 2: Run it, watch it fail.**
-- [ ] **Step 3: Implement.** Decide what `origin` becomes on the far side and say why in the commit; do not invent a new variant without arguing for it.
-- [ ] **Step 4: Prove it non-vacuous**, including that a manual *restart* still restarts rather than being read as a stop.
-- [ ] **Step 5: Real reload.** `shep stop` a sheep with a long `kill_timeout`, reload during the ladder, confirm it still stops.
-- [ ] **Step 6: Commit.**
+**That last clause turned out to be the wrong reading, and the Outcome below
+says why.** D1 is about the reply, which lives on a `PendingReply` and is not
+carried at all; `origin` is about cause, and it crosses unchanged.
+
+- [x] **Step 1: Write the failing test.** A carried sheep with a manual stop pending still stops, and does not respawn, after the exec.
+- [x] **Step 2: Run it, watch it fail.**
+- [x] **Step 3: Implement.** Decide what `origin` becomes on the far side and say why in the commit; do not invent a new variant without arguing for it.
+- [x] **Step 4: Prove it non-vacuous**, including that a manual *restart* still restarts rather than being read as a stop.
+- [x] **Step 5: Real reload.** `shep stop` a sheep with a long `kill_timeout`, reload during the ladder, confirm it still stops.
+- [x] **Step 6: Commit.**
+
+##### Outcome
+
+**`origin` crosses unchanged, and no new variant.** The temptation is to
+read the far side as "nobody is waiting any more" and carry `Automatic`,
+since the connection behind the command dies at the exec. That is wrong
+twice. `origin` answers who CAUSED this exit rather than who is still
+connected, and both of its readers are about cause: the `manually` flag on
+the bus events the exit produces, and `claim_manual`'s carve-out. Carrying
+`Automatic` for an operator's stop would broadcast that exit as the daemon's
+own doing — the exact lie the flag exists to prevent — and would let a later
+`shep restart` take the marker off a ladder already running and give it a
+different ending. And the reply `origin` looks like it is tracking does not
+live on the marker at all: it lives on a `PendingReply`, which is not
+carried, so there is nobody to answer either way. D1 is about that reply, not
+about the origin.
+
+**The kill ladder needed a re-arm, and the elapsed portion is not
+recoverable.** `install_adopted` now ends the running-sheep branch with
+`claim_manual(id, manual, LadderCap::Stop)`, which is the one site that pairs
+a marker with the single `Kill` that produces its exit, `try_send` rule
+included. What cannot be re-armed is how much of the ladder already ran:
+nothing anywhere records when it started, and the remaining grace is a
+`tokio::time::timeout` deadline inside a task of the predecessor's —
+monotonic, and meaningless outside the runtime that read it. Unlike 2b task
+8's restart delay, it is not even a value the actor holds; making it
+carryable would need a new `SheepSlot` field. So the successor runs the WHOLE
+ladder again, polite rung first, which errs long for the same reason
+`restart_delay(config, 1)` does: a re-arm that jumped straight to
+`kill_tree` would `SIGKILL` a child that may never have been asked politely
+at all, since the predecessor's `Kill` could still have been unread in the
+ctl mailbox at the exec. The cost is one extra `kill_timeout` and one
+repeated `SIGTERM`, both measured below.
+
+`LadderCap::Stop` rather than `graceful_timeout`, because every marker the
+gate can carry today was claimed under that cap: the two sites passing
+`LadderCap::Drain` are a reload's drain, and both leave `ReloadState::Drainee`
+on the entry, which `ReloadInFlight` still refuses. **Task 4 has to revisit
+that line**, and the code says so at the call site.
+
+`Candidate` and `OwnedCandidate` lost `pending_stop` outright, the same way
+they lost `pending_delete` in task 1 and for the same forced reason:
+`refusal()` was its only reader, so a `pub` field nothing reads inside a
+`pub(crate)` module is `dead_code` under `-D warnings`. `handover::fitness`
+is down to two refusals, a dog and an in-flight reload, and
+`web/src/pages/docs/getting-started.astro` already named exactly those two
+("A dog or anything mid-reload sends the reload down the older path
+instead"). That sentence was incomplete before this task and is exact now, so
+`web/` needed no edit — the generated CLI reference is untouched too, since
+nothing here adds a verb, flag, key, exit code or payload field.
+
+`ManualKind`, `CommandOrigin` and `PendingManual` became `pub(crate)` and
+gained `Serialize`/`Deserialize`, `snake_case` on the wire to match
+`ProcStatus`'s spelling in the same file. `VERSION` does NOT move: `manual`
+is `Option<PendingManual>`, one `Option` rather than the two
+`pending_delete` needs, because a missing key and "no command owns this
+exit" are the same statement here and there is no third state. Nothing on
+the marker is sensitive — two closed enums — so a derived `Debug` is the
+deliberate answer for IR-41.
+
+**A and B are one commit, deliberately.** Removing `RefusedReason::PendingStop`
+without the re-arm ships a strictly worse outcome than the refusal it
+replaces: an operator's `shep stop` would leave a sheep that never dies. The
+marker restore and the ladder arm are also literally the same `claim_manual`
+call. A bisect landing between them would find a daemon that loses processes.
+
+##### Drill, measured
+
+Release build, isolated `SHEP_HOME` at `/tmp/mn/home`, one app: a `sh` script
+that does `trap '' TERM` and then sleeps, `kill_timeout = "30s"`,
+`autorestart = false`. Shepherd 63605 throughout — it never moved across any
+of the three reloads, which is what says a handover happened rather than a
+stop-and-start.
+
+**1. `shep stop`, reload mid-ladder.** Sheep 64440.
+
+| | |
+|---|---|
+| `shep stop sticky` (backgrounded) | t+0 |
+| `shep daemon reload` | t+2s, **exit 0**, `notice[reload]: the shepherd is now 0.1.20 (pid 63605)` |
+| immediately after the reload | shepherd 63605 unmoved, sheep 64440 unmoved, still `online` |
+| sheep terminal | **t+30s from the RELOAD** (t+32s from the stop), `stopped`, `EXIT = SIGKILL` |
+| processes left | none |
+| the stop's own client | `error[daemon_unreachable]: the connection closed before a reply arrived`, exit 5 |
+
+The child traps `SIGTERM`, so `SIGKILL` in the EXIT column is the whole
+assertion: only the escalation could have ended it, and **nothing was killed
+by hand**. Against the committed binary, task 1's drill got `exit=8` and a
+refusal naming `PendingStop`, and its bypassed build needed a hand-sent
+`SIGKILL` because this rung was missing.
+
+**The control, same drill with no reload at all:** terminal at **t+31s from
+the stop**, `EXIT = SIGKILL`. So the reloaded run's 30s is measured from the
+exec rather than from the stop — the whole ladder run again, exactly as the
+re-arm's comment claims, at a cost of the 2s already spent.
+
+**2. `shep delete`, reload mid-delete.** Sheep 66479. This is task 1's carry,
+finally observable with nothing patched out.
+
+| | |
+|---|---|
+| `shep delete sticky` (backgrounded) | t+0 |
+| `shep daemon reload` | t+2s, **exit 0** |
+| immediately after | shepherd 63605 unmoved, sheep 66479 unmoved, still `online` |
+| row gone | **t+30s from the reload**; `shep flock` lists zero rows |
+| saved roll | `apps: []` — deleted, not `stopped` |
+| the delete's own client | `daemon_unreachable`, exit 5 |
+
+**3. `shep restart`, reload mid-ladder.** Sheep 67565. The kind has to
+survive, not just the marker.
+
+| | |
+|---|---|
+| `shep daemon reload` | t+2s, exit 0, shepherd 63605 unmoved, sheep 67565 unmoved and `online` |
+| respawned | **t+30s from the reload**: `online`, pid **68487**, `restarts=1`, previous `EXIT` recorded as `SIGKILL` |
+
+Read as a stop, this row would be `stopped` with `restarts=0`. It is not.
+
+##### Mutations
+
+Five, each applied alone against the daemon lib suite (651 with
+`--skip ::slow::`) and reverted afterwards, with the file byte-compared to a
+pre-mutation copy each time.
+
+| # | what was broken | what failed |
+|---|---|---|
+| 1 | `install_adopted` drops the re-arm entirely | the three new adoption cases, **and nothing else in 651** |
+| 2 | the marker is written onto the slot but no ladder is armed | the same three, all by timeout — this is the half the plan called "worse than the refusal", and no unit case outside these three notices |
+| 3 | the ladder is armed under a hardcoded `ManualKind::Stop` | `a_carried_manual_restart_respawns_and_keeps_its_origin` ONLY (650 pass) |
+| 4 | `manual` made required on the wire (`deserialize_with = "Option::deserialize"`) | `a_blob_written_before_a_manual_marker_was_carried_still_loads` ONLY, with serde's `missing field` error naming it |
+| 5 | the ladder is armed under a hardcoded `CommandOrigin::Operator` | the restart case ONLY, at its `manually` assertion |
+
+**What only the end-to-end tier catches: nothing here, and that is the
+finding.** Unlike 2b's mutation 2 (`arm_extras`, invisible to all 646 lib
+tests), every mutation above is caught by a unit case, because a real child
+under `TokioRunner` is reachable from the lib tier: `adoptable_child` gives
+the ladder a real process, its own process group, and a real trap. What the
+lib tier could NOT have told anyone is that the defect existed at all — it
+was found by driving a reload by hand, and the tests were written afterwards
+to pin it.
+
+**Two test-infrastructure findings worth keeping**, both of which cost a run
+each. A child that inherits the test binary's process group is not a group
+leader, so `killpg` answers `ESRCH`, the ladder logs a warning and delivers
+nothing, and a case about a stop fails for a reason that has nothing to do
+with the stop; `adoptable_child` sets `process_group(0)` and says so. And a
+child that inherits the test binary's stdout holds that pipe open, so under
+`cargo test | <anything>` a mutation run turned a failing assertion into a
+hang; the same helper now uses `Stdio::null()` and bounds its loop.
 
 ### Task 3: the reload deadline watchdog
 
@@ -213,6 +383,6 @@ Unchanged from 2b's, in `docs/writing-plans/plans/2026-08-30-handover-phase2b.md
 
 Per `CLAUDE.md`. Inner loop `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::`. One cargo shape per task. The Windows cross-check gets its own `CARGO_TARGET_DIR`.
 
-Counts at the branch point: **647** daemon lib, roughly **2110** workspace. A shape, not a checksum.
+Counts at the branch point: **647** daemon lib, roughly **2110** workspace. A shape, not a checksum. After task 2: **651** daemon lib with `--skip ::slow::`, **2125** workspace.
 
 **CI's `slow` tier flaked three times on 2b's night** — a macOS `EIO` on a pidfile, and the Windows node-pipe budget test twice. Both are documented as machine-speed-sensitive. Read a `slow` failure against `main`'s own history before treating it as yours.

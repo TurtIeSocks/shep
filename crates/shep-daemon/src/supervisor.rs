@@ -42,6 +42,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use shep_core::config::{AppConfig, ResolvedApp, normalize};
@@ -1961,8 +1962,14 @@ enum ReloadPhase {
 
 /// Which manual command is pending against a sheep, cleared the moment its
 /// `Msg::Exited` is processed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ManualKind {
+///
+/// Serialized because a handover carries it: see [`PendingManual`], which is
+/// what actually crosses. `snake_case` on the wire to match
+/// [`ProcStatus`]'s own spelling, the blob's nearest neighbour, since the
+/// blob is a JSON file an operator may read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManualKind {
     /// A `Stop` command targeted this sheep.
     Stop,
     /// A `Restart` command targeted this sheep.
@@ -1976,7 +1983,8 @@ enum ManualKind {
 /// sheep's next exit, and the two sites that carry the command out
 /// ([`Actor::handle_exited`] and [`Actor::apply_immediate`]), which report it
 /// as the `manually` flag on every bus event the restart emits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CommandOrigin {
     /// A person asked for it: a `Stop`, `Restart` or `Delete` off the control
     /// socket, or the daemon-wide `Shutdown`. An operator is waiting on the
@@ -1996,16 +2004,41 @@ pub(crate) enum CommandOrigin {
 }
 
 /// The manual command that owns a sheep's next exit, and who asked for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingManual {
+///
+/// # Why this crosses a handover whole
+///
+/// A successor that installed the sheep without this marker would install
+/// the sheep an operator has already asked to go away and then supervise it
+/// as if nothing had been asked: `handle_exited` would read `kind` as `None`
+/// and hand an `autorestart` app its ordinary respawn, so a `shep stop`
+/// would come back as a running sheep. So [`CarriedSheep::manual`] carries
+/// it, and `Actor::install_adopted` re-claims it.
+///
+/// [`Self::origin`] crosses UNCHANGED, which is a decision rather than the
+/// obvious default. The connection behind an operator's command dies at the
+/// `execve` along with every other in-flight RPC, so it is tempting to read
+/// the far side as "nobody is waiting any more" and carry `Automatic`.
+/// That would be wrong twice. `origin` answers who CAUSED this exit, not who
+/// is still connected — both of its readers are about cause — and the reply
+/// it looks like it is tracking does not live here at all: it lives on a
+/// `PendingReply`, which is not carried, so there is nobody to answer either
+/// way. Downgrading would make the `manually` flag on this exit's own bus
+/// events say the daemon restarted the app itself, which is exactly the lie
+/// that flag exists to prevent, and it would let a later operator command
+/// take the marker off a ladder that is already running under
+/// [`Actor::claim_manual`]'s carve-out and give it a different ending.
+///
+/// [`CarriedSheep::manual`]: crate::handover::CarriedSheep::manual
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingManual {
     /// What that exit will be turned into.
-    kind: ManualKind,
+    pub(crate) kind: ManualKind,
     /// Who asked. What the command DOES once the sheep is down is decided
     /// entirely by `kind`; `origin` survives into `handle_exited` for one
     /// purpose, the `manually` flag on the events that exit produces —
     /// otherwise a cron, watch, memory-breach or liveness restart would be
     /// broadcast as a user action.
-    origin: CommandOrigin,
+    pub(crate) origin: CommandOrigin,
 }
 
 /// One action the daemon has put on a sheep's shepherd channel and has not
@@ -3458,6 +3491,15 @@ impl<R: ProcessRunner> Actor<R> {
     /// [`CarriedFds`] are `CarriedFds::none()` for that same reason; neither
     /// is a refusal, and the fitness gate does not treat it as one.
     ///
+    /// # What a sheep mid-stop installs as
+    ///
+    /// The marker AND a fresh kill ladder. A carried [`PendingManual`] says
+    /// a command already owns this sheep's next exit, and the ladder that
+    /// was going to produce that exit died with the predecessor's image, so
+    /// restoring the marker alone would leave a sheep nothing is trying to
+    /// stop. The re-arm is at the bottom of this function and makes the
+    /// argument in full.
+    ///
     /// # Why nothing is emitted on the bus
     ///
     /// A `Start` or an `Online` would announce a transition to a sheep that
@@ -3544,11 +3586,21 @@ impl<R: ProcessRunner> Actor<R> {
                     to_child: None,
                     signals: None,
                     to_stdin: None,
+                    // `None`, and not restored from the blob even though the
+                    // blob may carry one. A marker is only ever claimed
+                    // against a sheep with a live task (`begin_manual_ids`
+                    // gates on `ctl.is_some()`, and `claim_manual` sends its
+                    // `Kill` down that same `ctl`), so a carried instance
+                    // with no pid should not have one — and if it somehow
+                    // did, there is no ladder here to re-arm and no
+                    // `Msg::Exited` coming to clear it, so restoring it
+                    // would leave a marker nothing in this image can ever
+                    // consume.
                     manual: None,
-                    // The gate refuses a flock with a manual stop waiting on
-                    // an exit, so there is no `manual` marker to carry. A
-                    // pending delete is no longer refused; it is restored
-                    // from the blob below.
+                    // A pending delete IS restored: unlike the marker above
+                    // it needs no task to act on it, and the one exit that
+                    // consumes it is whatever this slot's next spawn ends
+                    // with.
                     pending_delete: carried.pending_delete().unwrap_or(false),
                     epoch: carried.epoch(),
                     ready_tx: None,
@@ -3686,10 +3738,10 @@ impl<R: ProcessRunner> Actor<R> {
                 to_child: Some(to_child),
                 signals: Some(handles.signals),
                 to_stdin: Some(to_stdin),
-                // The gate refuses a flock with a manual stop waiting on an
-                // exit, so there is no `manual` marker to carry. A pending
-                // delete is no longer refused; it is restored from the blob
-                // below.
+                // `None` here and re-claimed below rather than written in
+                // directly, because restoring the marker is only half of
+                // what a carried one means: see the `claim_manual` call
+                // after this insert.
                 manual: None,
                 pending_delete: carried.pending_delete().unwrap_or(false),
                 epoch: carried.epoch(),
@@ -3702,6 +3754,48 @@ impl<R: ProcessRunner> Actor<R> {
                 ready_failed: false,
             },
         );
+        // A sheep the blob reports a `manual` marker for is one an operator
+        // (or the daemon itself) has already asked to go away, and the kill
+        // ladder that was going to make that happen ran inside the
+        // predecessor's own sheep task — `run_sheep`'s `SheepCtl::Kill` arm,
+        // and `kill_process`'s `tokio::time::timeout` inside it. The
+        // `execve` takes both. So a successor that restored only the marker
+        // would install a sheep that is never signalled again: the operator's
+        // `shep stop` leaves a process that will never die, and the row keeps
+        // reporting `online` while nothing at all is trying to stop it.
+        // Worse than the refusal this replaces, which at least stopped the
+        // flock.
+        //
+        // Fifth member of the same class as the readiness wait and the
+        // pending restart above, and re-armed the same way. It goes through
+        // `claim_manual` rather than writing `manual` into the slot directly
+        // so that the marker and the one `Kill` that produces its exit stay
+        // in the single place that pairs them, `try_send` rule (CRITICAL-2)
+        // included.
+        //
+        // What cannot be re-armed is how much of the ladder already ran.
+        // Nothing records when it started — the remaining grace is a
+        // `tokio::time::timeout` deadline inside a task of the
+        // predecessor's, monotonic and meaningless outside the runtime that
+        // read it — so the successor runs the WHOLE ladder again, polite
+        // rung first. Erring long is deliberate, exactly as
+        // `restart_delay(config, 1)` above errs long: a re-arm that jumped
+        // straight to `kill_tree` would `SIGKILL` a child that may never
+        // have been asked politely at all, since the predecessor's `Kill`
+        // could still have been sitting unread in the ctl mailbox at the
+        // exec. The cost is one extra `kill_timeout` at worst, and one
+        // repeated `SIGTERM` (or one repeated `{"kind":"shutdown"}`) to a
+        // child that is already on its way out.
+        //
+        // `LadderCap::Stop` and not the app's `graceful_timeout`, because
+        // every marker the gate can carry today was claimed under that cap:
+        // the two sites that pass `LadderCap::Drain` are a reload's drain,
+        // and both leave `ReloadState::Drainee` on the entry, which
+        // `handover::fitness` still refuses as `ReloadInFlight`. The task
+        // that removes that refusal has to revisit this line.
+        if let Some(manual) = carried.manual() {
+            self.claim_manual(id, manual, LadderCap::Stop);
+        }
         // The same arming a spawn gets on its way to `Online`, and for the
         // same reason: a watch, a schedule or a memory limit this image did
         // not arm is one the app quietly stops having. Only for an instance
@@ -5986,11 +6080,13 @@ impl<R: ProcessRunner> Actor<R> {
             .values()
             .map(|slot| HandoverDraft {
                 entry: slot.entry.clone(),
-                // Any manual command owning this sheep's next exit, not just
-                // a `Stop`. A `Restart` or a `Delete` waiting on that exit
-                // is as unsafe to carry, and the gate refuses in the strict
-                // direction by design.
-                pending_stop: slot.manual.is_some(),
+                // Whole, not `is_some()`. Which command owns this exit
+                // decides what the successor's `handle_exited` turns it
+                // into, and the origin decides what its bus events say
+                // about who caused it; a boolean would collapse a carried
+                // `Delete` into a `Stop` and broadcast an automatic restart
+                // as a user action.
+                manual: slot.manual,
                 pending_delete: slot.pending_delete,
                 epoch: slot.epoch,
                 log_ctl: slot.log_ctl.clone(),
@@ -6033,11 +6129,6 @@ impl<R: ProcessRunner> Actor<R> {
             .iter()
             .map(|slot| Candidate {
                 entry: &slot.entry,
-                // Any manual command owning this sheep's next exit, exactly
-                // as `handle_handover_snapshot` reads it: the two must answer
-                // the same question, or a flock passes the gate and then
-                // fails it.
-                pending_stop: slot.manual.is_some(),
                 // Always `false` here, and it has to be: this gate awaits
                 // nothing, so it cannot ask a pump anything, and a pump that
                 // is wedged right now may well have answered by the time a
@@ -7784,8 +7875,8 @@ impl ParkedPumps {
 struct HandoverDraft {
     /// The sheep's lifecycle entry, cloned off the slot.
     entry: ProcessEntry,
-    /// Whether a manual command owns this sheep's next exit.
-    pending_stop: bool,
+    /// The manual command owning this sheep's next exit, if one does.
+    manual: Option<PendingManual>,
     /// Whether a `Delete` targets this sheep.
     pending_delete: bool,
     /// The slot's respawn epoch, so a timer armed before the exec is still
@@ -7880,11 +7971,15 @@ fn spawn_handover_task(
             if !draft.channel_open {
                 fds.channel = None;
             }
-            let carried =
-                CarriedSheep::from_entry(&draft.entry, draft.epoch, fds, draft.pending_delete);
+            let carried = CarriedSheep::from_entry(
+                &draft.entry,
+                draft.epoch,
+                fds,
+                draft.pending_delete,
+                draft.manual,
+            );
             let candidate = OwnedCandidate {
                 entry: draft.entry,
-                pending_stop: draft.pending_stop,
                 pump_unresponsive,
             };
             (candidate, carried, parked_pump)
@@ -17826,11 +17921,14 @@ mod tests {
     ///
     /// These are the reason this is a command rather than a getter, and each
     /// one is load-bearing on its own: a successor that reissued a live id
-    /// would collide with a caller still holding it, and a manual stop the
-    /// gate never saw is a flock carried while an operator is waiting on its
-    /// exit. A pending delete used to reach the candidate the same way
-    /// `pending_stop` still does; it now reaches the successor on the blob
-    /// instead, which is what this asserts against since task 1.
+    /// would collide with a caller still holding it, and a manual command
+    /// the successor never sees is an operator's `stop` that comes back as a
+    /// running sheep.
+    ///
+    /// Both slot facts used to reach the CANDIDATE, where they were
+    /// refusals. Neither is one any more, so both are asserted against the
+    /// blob instead — the marker whole rather than as a boolean, since the
+    /// kind and the origin decide different things on the far side.
     ///
     /// The sheep here has no live pump, which is also the registered-but-not
     /// -running case: it reports no descriptors, and that is not a refusal.
@@ -17850,8 +17948,16 @@ mod tests {
         let (candidates, blob, _parked) = rx.await.unwrap().unwrap();
 
         assert!(
-            candidates[0].pending_stop,
-            "a pending stop must reach the gate"
+            !candidates.is_empty(),
+            "the flock must still reach the gate at all"
+        );
+        assert_eq!(
+            blob.sheep()[0].manual(),
+            Some(PendingManual {
+                kind: ManualKind::Stop,
+                origin: CommandOrigin::Operator,
+            }),
+            "a manual stop must reach the successor, kind and origin both"
         );
         assert_eq!(
             blob.sheep()[0].pending_delete(),
@@ -18021,20 +18127,25 @@ mod tests {
         pid: Option<u32>,
         mutate: impl FnOnce(&mut ProcessEntry),
     ) -> CarriedSheep {
-        carried_with_pending_delete(name, id, pid, false, mutate)
+        carried_marked(name, id, pid, false, None, mutate)
     }
 
-    /// [`carried`], with the blob's `pending_delete` fact set explicitly.
+    /// [`carried`], with the two slot facts a blob carries beside the entry
+    /// set explicitly: a pending delete, and the manual command that owns
+    /// this sheep's next exit.
     ///
-    /// A separate function rather than a sixth parameter every existing
-    /// call site would have to grow, since only the cases that are actually
-    /// about a pending delete need to say anything about it.
+    /// One function for both rather than one per fact, since a `Delete`
+    /// sets them together and a case about either usually has something to
+    /// say about the other. Separate from [`carried`] so the many cases that
+    /// are about neither do not grow two arguments they would always pass
+    /// the same values for.
     #[cfg(unix)]
-    fn carried_with_pending_delete(
+    fn carried_marked(
         name: &str,
         id: u32,
         pid: Option<u32>,
         pending_delete: bool,
+        manual: Option<PendingManual>,
         mutate: impl FnOnce(&mut ProcessEntry),
     ) -> CarriedSheep {
         let mut app = AppConfig::minimal(name, "./srv");
@@ -18059,7 +18170,7 @@ mod tests {
             last_exit: None,
         };
         mutate(&mut entry);
-        CarriedSheep::from_entry(&entry, 0, CarriedFds::none(), pending_delete)
+        CarriedSheep::from_entry(&entry, 0, CarriedFds::none(), pending_delete, manual)
     }
 
     /// A carried sheep with no descriptors to rebuild, which is every case
@@ -18262,11 +18373,12 @@ mod tests {
         let pid = child.id();
         let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
             .spawn_adopted(
-                vec![without_handles(carried_with_pending_delete(
+                vec![without_handles(carried_marked(
                     "web",
                     7,
                     Some(pid),
                     true,
+                    None,
                     |_| {},
                 ))],
                 counters(9),
@@ -18298,6 +18410,316 @@ mod tests {
             info.is_empty(),
             "the deleted sheep must be gone, not just stopped"
         );
+    }
+
+    /// A real child for the adoption cases below to take over, running
+    /// `script` under `/bin/sh`, and its pid.
+    ///
+    /// **Its own process group, which is load-bearing rather than tidiness.**
+    /// `TokioProc::signal` and `kill_tree` both address the GROUP
+    /// (`signal_group`), exactly as the real spawn path leaves them able to:
+    /// a child that inherited this test binary's group is not a group leader,
+    /// so `killpg` answers `ESRCH`, the ladder logs a warning and delivers
+    /// nothing, and a case about a stop would fail for a reason that has
+    /// nothing to do with the stop. The cases that hand-send a signal to the
+    /// pid instead do not need this and do not use it.
+    ///
+    /// The `Child` handle is dropped rather than waited on, deliberately: the
+    /// adopted flock's own reaper is what collects this status, and a
+    /// `Child::wait` here would take it first and leave the daemon's targeted
+    /// wait with nothing to find.
+    #[cfg(unix)]
+    fn adoptable_child(script: &str) -> u32 {
+        use std::os::unix::process::CommandExt as _;
+
+        std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .process_group(0)
+            // Null, not inherited, and this is not tidiness either. An
+            // inherited stdout is the TEST HARNESS's, which under
+            // `cargo test ... | <anything>` is a pipe: a child that outlives
+            // a failing case then holds that pipe open, and the reader waits
+            // on a sheep nothing is going to stop. A failed assertion turns
+            // into a hang, which is the worst way to learn a mutation
+            // worked.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a test host can spawn a shell")
+            .id()
+    }
+
+    /// The app an adopted sheep in these cases runs, respawnable for real:
+    /// `mutate` gets it before it is normalized onto the entry.
+    #[cfg(unix)]
+    fn respawnable(mutate: impl FnOnce(&mut AppConfig)) -> impl FnOnce(&mut ProcessEntry) {
+        move |entry: &mut ProcessEntry| {
+            let mut app = AppConfig::minimal("web", "/bin/sh");
+            // Real, because one of these cases lets the successor respawn
+            // the sheep and then asserts on the pid it comes back with.
+            // `./srv` would fail to spawn and land in `Errored`, which is a
+            // different assertion entirely.
+            app.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+            mutate(&mut app);
+            entry.spec = normalize(app).unwrap();
+        }
+    }
+
+    /// Polls the flock until `done` accepts it, or fails the case.
+    ///
+    /// Real children and real signals, so the clock is real too: nothing
+    /// here can advance a paused one on the child's behalf. The bound is
+    /// far past anything these cases ask for, so a sheep nothing is trying
+    /// to stop fails here rather than hanging.
+    #[cfg(unix)]
+    async fn flock_until(
+        sup: &SupervisorHandle,
+        done: impl Fn(&[ProcessInfo]) -> bool,
+        what: &str,
+    ) -> Vec<ProcessInfo> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let info = sup.list().await;
+                if done(&info) {
+                    return info;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"))
+    }
+
+    /// Fails if a carried manual stop is dropped by the adopt path, either
+    /// half of it.
+    ///
+    /// Two things have to happen for an operator's `shep stop` to survive a
+    /// handover, and this asserts both because either one alone leaves the
+    /// operator worse off than the refusal this replaces:
+    ///
+    /// 1. The ladder is re-armed. It ran inside the predecessor's own sheep
+    ///    task and the `execve` took it, so a successor that restores only
+    ///    the marker installs a sheep that is never signalled again. That is
+    ///    what the sheep reaching a terminal status at all proves; without
+    ///    the re-arm nothing here ever touches the child and this times out.
+    /// 2. The marker is restored. `decide_on_exit` reads it as
+    ///    `manual_stop`, and this app has `autorestart` on, so a successor
+    ///    that armed a ladder without the marker would kill the sheep and
+    ///    then respawn it — a `stop` that comes back as a running process.
+    ///
+    /// A real child and the real runner, for the reason
+    /// [`a_carried_pending_delete_deregisters_on_the_next_exit`] gives: only
+    /// the real reaper's `Msg::Exited` proves a carried marker reaches
+    /// `handle_exited`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_manual_stop_stops_the_sheep_instead_of_respawning_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let pid = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_marked(
+                    "web",
+                    7,
+                    Some(pid),
+                    false,
+                    Some(PendingManual {
+                        kind: ManualKind::Stop,
+                        origin: CommandOrigin::Operator,
+                    }),
+                    respawnable(|app| app.autorestart = true),
+                ))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        let info = flock_until(
+            &sup,
+            |info| info[0].status == ProcStatus::Stopped,
+            "a carried manual stop must still stop the sheep after the exec",
+        )
+        .await;
+
+        assert_eq!(
+            info[0].restarts, 0,
+            "a stop must not come back as a respawn"
+        );
+        assert_eq!(
+            info[0].last_exit,
+            Some(ExitInfo {
+                code: None,
+                signal: Some(15)
+            }),
+            "the re-armed ladder starts at its polite rung, not at SIGKILL"
+        );
+        assert_eq!(info[0].pid, None, "a stopped sheep holds no pid");
+    }
+
+    /// Fails if a carried kill ladder never escalates from `SIGTERM` to
+    /// `SIGKILL`.
+    ///
+    /// The fifth member of the stranded-timer class, and the one found by
+    /// driving a real reload rather than by reading code. The escalation is
+    /// a `tokio::time::timeout` inside `kill_process`, which runs on the
+    /// sheep task, which is a `tokio::spawn` of the predecessor's that the
+    /// `execve` takes. A successor that restores the marker and re-sends
+    /// only the polite signal leaves a child that traps `SIGTERM` running
+    /// forever, with an operator's `stop` outstanding and no rung left: a
+    /// strictly worse outcome than refusing the handover, which at least
+    /// stopped the flock.
+    ///
+    /// The signal in `last_exit` is the whole assertion. A pid check cannot
+    /// tell a ladder that escalated from one that merely got lucky, which is
+    /// exactly why this defect survived a green suite.
+    ///
+    /// `kill_timeout` is shortened to a second so the case does not sit out
+    /// the 1600ms default plus its own polling; the bound in
+    /// [`flock_until`] is far past both.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_manual_stop_still_escalates_to_sigkill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        // `trap "" TERM` around a sleeping loop is `tests/real_runner.rs`'s
+        // own defiant sheep, and the loop rather than a bare `sleep` is part
+        // of it: the polite rung reaches the whole GROUP, so a shell waiting
+        // on one `sleep` would exit carrying that sleep's own status and
+        // look like it had obeyed.
+        //
+        // The touchfile closes the startup race `real_runner.rs` documents
+        // and answers with a real sleep. The install below sends the polite
+        // signal within microseconds of the spawn, and a `SIGTERM` that
+        // arrives before `trap` has run kills the shell on the default
+        // disposition — a green-looking failure of exactly the assertion
+        // this case exists to make.
+        let armed = dir.path().join("trap-armed");
+        //
+        // The loop is bounded rather than `while true` so that a case which
+        // fails before the ladder reaches it still leaves a child that goes
+        // away on its own, well inside `flock_until`'s own bound.
+        let pid = adoptable_child(&format!(
+            "trap '' TERM; : > {}; i=0; while [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done",
+            armed.display()
+        ));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !armed.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the defiant child must arm its trap before anything signals it");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_marked(
+                    "web",
+                    7,
+                    Some(pid),
+                    false,
+                    Some(PendingManual {
+                        kind: ManualKind::Stop,
+                        origin: CommandOrigin::Operator,
+                    }),
+                    respawnable(|app| {
+                        app.autorestart = false;
+                        app.kill_timeout = "1000".parse().unwrap();
+                    }),
+                ))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        let info = flock_until(
+            &sup,
+            |info| info[0].status == ProcStatus::Stopped,
+            "a sheep carried mid-ladder must still die on its own, without a hand-sent SIGKILL",
+        )
+        .await;
+
+        assert_eq!(
+            info[0].last_exit,
+            Some(ExitInfo {
+                code: None,
+                signal: Some(9)
+            }),
+            "the ladder must escalate: this child ignores SIGTERM, so anything else means it \
+             was never killed"
+        );
+    }
+
+    /// Fails if a carried manual RESTART is read as a stop, or if its origin
+    /// is rewritten on the way across.
+    ///
+    /// The kind and the origin are two separate facts on one marker and this
+    /// is what keeps either from being defaulted. A successor that armed a
+    /// ladder under a hardcoded `Stop` would leave the sheep down when an
+    /// operator had asked for it to come back, and one that hardcoded
+    /// `Operator` would broadcast a memory breach or a cron occurrence as a
+    /// user action — the exact lie [`PendingManual::origin`] exists to
+    /// prevent, and one a subscriber cannot tell from a deploy.
+    ///
+    /// `Automatic` rather than `Operator` for that second half: the flag has
+    /// to be able to come back `false`, and an operator's own restart is
+    /// what the rest of the suite already covers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_manual_restart_respawns_and_keeps_its_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, mut rx) = crate::bus::test_bus(64);
+        let pid = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_marked(
+                    "web",
+                    7,
+                    Some(pid),
+                    false,
+                    Some(PendingManual {
+                        kind: ManualKind::Restart,
+                        origin: CommandOrigin::Automatic,
+                    }),
+                    // Off, so the respawn below can only be the carried
+                    // Restart: an `autorestart` app would come back from the
+                    // crash loop whatever the marker said.
+                    respawnable(|app| app.autorestart = false),
+                ))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        let manually = tokio::time::timeout(
+            Duration::from_secs(20),
+            await_event(&mut rx, 7, ProcessEventKind::Restart),
+        )
+        .await
+        .expect("a carried manual restart must respawn the sheep after the exec");
+        assert!(
+            !manually,
+            "an automatic restart carried across a handover must not be broadcast as a user \
+             action"
+        );
+
+        let info = flock_until(
+            &sup,
+            |info| info[0].restarts == 1,
+            "the respawn must be counted against the sheep that was carried",
+        )
+        .await;
+        assert_ne!(
+            info[0].pid,
+            Some(pid),
+            "a restart is a new process, not the adopted one"
+        );
+        assert_eq!(
+            info[0].status,
+            ProcStatus::Online,
+            "an ungated app is Online the moment it respawns"
+        );
+
+        // The respawn is a real `sleep 30` this case started; the shutdown
+        // is what stops it being left behind when the tempdir goes.
+        sup.shutdown().await;
     }
 
     /// Fails if a successor hands a fresh sheep an id a caller is still
