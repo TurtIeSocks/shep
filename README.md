@@ -2,9 +2,9 @@
 
 [![Crates.io Version](https://img.shields.io/crates/v/shep.svg)](https://crates.io/crates/shep)
 [![docs.rs](https://img.shields.io/docsrs/shep)](https://docs.rs/shep)
-[![License](https://img.shields.io/crates/l/shep.svg)](https://github.com/TurtIeSocks/shep#license)
+[![License](https://img.shields.io/crates/l/shep.svg)](https://github.com/shep-pm/shep#license)
 [![MSRV](https://img.shields.io/crates/msrv/shep.svg)](https://crates.io/crates/shep)
-[![CI](https://github.com/TurtIeSocks/shep/actions/workflows/test.yml/badge.svg)](https://github.com/TurtIeSocks/shep/actions/workflows/test.yml)
+[![CI](https://github.com/shep-pm/shep/actions/workflows/test.yml/badge.svg)](https://github.com/shep-pm/shep/actions/workflows/test.yml)
 
 A process manager written in Rust. One binary runs a daemon called the
 shepherd, which keeps a flock of your long-running processes alive, restarts
@@ -216,7 +216,7 @@ than being narrowed the way `0700` narrows it on unix.
 ## Building
 
 ```bash
-git clone https://github.com/TurtIeSocks/shep
+git clone https://github.com/shep-pm/shep
 cd shep
 cargo build --release
 cargo test --workspace --all-features

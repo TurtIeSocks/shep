@@ -10,7 +10,7 @@ cargo install shep
 
 `shep`'s CLI binary was originally packaged under the name `shep-cli`. It was
 renamed to `shep` before the first publish (see
-[docs/releasing.md](https://github.com/TurtIeSocks/shep/blob/main/docs/releasing.md)
+[docs/releasing.md](https://github.com/shep-pm/shep/blob/main/docs/releasing.md)
 in the main repository) so the install command and the binary name match.
 
 Nothing was ever published under `shep-cli` — no version of it exists on

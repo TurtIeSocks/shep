@@ -7,7 +7,7 @@ This package downloads its binaries at install time rather than embedding
 them. They come from the shep project's own GitHub release, which is the
 official distribution point:
 
-  https://github.com/TurtIeSocks/shep/releases
+  https://github.com/shep-pm/shep/releases
 
 The archive is shep-x86_64-pc-windows-msvc.zip, and the SHA256 checked at
 install time is the one in chocolateyinstall.ps1. To verify it yourself,
@@ -23,7 +23,7 @@ The binaries are built from tagged source by
 .github/workflows/release-artifacts.yml, which also records Sigstore build
 provenance for each archive. That attestation can be checked with:
 
-  gh attestation verify shep-x86_64-pc-windows-msvc.zip --repo TurtIeSocks/shep
+  gh attestation verify shep-x86_64-pc-windows-msvc.zip --repo shep-pm/shep
 
-shep's source is at https://github.com/TurtIeSocks/shep and is licensed
+shep's source is at https://github.com/shep-pm/shep and is licensed
 MIT OR Apache-2.0. See LICENSE.txt beside this file.

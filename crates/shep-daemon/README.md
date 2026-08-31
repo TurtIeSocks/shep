@@ -1,6 +1,6 @@
 # shep-daemon
 
-The supervision engine of [shep](https://github.com/TurtIeSocks/shep), a
+The supervision engine of [shep](https://github.com/shep-pm/shep), a
 process manager written in Rust. This crate is the shepherd: the part that
 spawns your processes, watches them, and restarts them when they die.
 

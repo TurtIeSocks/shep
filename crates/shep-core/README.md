@@ -1,6 +1,6 @@
 # shep-core
 
-The shared tier of [shep](https://github.com/TurtIeSocks/shep), a process
+The shared tier of [shep](https://github.com/shep-pm/shep), a process
 manager written in Rust. One binary runs a daemon called the shepherd, which
 keeps a flock of your long-running processes alive.
 

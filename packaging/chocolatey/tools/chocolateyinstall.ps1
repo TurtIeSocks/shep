@@ -16,7 +16,7 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 # workflow replaces it and then fails the build if any sentinel survives.
 $checksum64 = '__CHECKSUM64__'
 
-$url64 = "https://github.com/TurtIeSocks/shep/releases/download/shep-v$version/shep-x86_64-pc-windows-msvc.zip"
+$url64 = "https://github.com/shep-pm/shep/releases/download/shep-v$version/shep-x86_64-pc-windows-msvc.zip"
 
 $packageArgs = @{
   packageName    = $packageName

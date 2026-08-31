@@ -381,7 +381,7 @@ jobs:
           checksum=''
           for attempt in $(seq 1 10); do
             checksum="$(curl -fsSL \
-              -H 'User-Agent: shep-release-workflow (https://github.com/TurtIeSocks/shep)' \
+              -H 'User-Agent: shep-release-workflow (https://github.com/shep-pm/shep)' \
               "https://crates.io/api/v1/crates/shep/${version}" \
               | jq -r '.version.checksum // empty')" || checksum=''
             if [ -n "$checksum" ]; then break; fi
