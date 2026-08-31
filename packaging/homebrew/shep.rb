@@ -1,4 +1,4 @@
-# The formula published to the tap at TurtIeSocks/homebrew-shep, where it
+# The formula published to the tap at shep-pm/homebrew-shep, where it
 # lives as Formula/shep.rb. This copy is the source of truth; the `homebrew`
 # job in .github/workflows/release-artifacts.yml rewrites the two version
 # lines and pushes the result to the tap on every release.
@@ -10,7 +10,7 @@
 # against a real release. docs/distribution.md records when to switch.
 class Shep < Formula
   desc "Process manager that keeps a flock of long-running processes alive"
-  homepage "https://shep.turtlesocks.dev"
+  homepage "https://shep-pm.com"
   # The crate tarball rather than a GitHub tag archive. Its sha256 is
   # published by the crates.io API as the version's `checksum`, so the bump
   # job reads the hash instead of downloading and computing one. GitHub

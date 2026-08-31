@@ -12,7 +12,7 @@ Three connected pages for **shep**, a process manager written in Rust (a pm2 rew
 
 The files in `design-files/` are **design references created in HTML** — prototypes showing intended look and behavior, not production code to copy directly. They are authored in a small in-house component format (`.dc.html`, driven by `support.js`), which exists only in the design tool. Do not try to port `support.js`, `<x-dc>`, `<sc-for>`, `<sc-if>` or `{{ }}` holes.
 
-**The task is to recreate these designs in the target codebase's existing environment**, using its established patterns and libraries. If no web environment exists yet, this is a static marketing site + docs — Astro or Next.js with plain CSS (or Tailwind, if preferred) is a good fit. The repo itself (`pm2-rs` / `github.com/TurtIeSocks/shep`) is a Rust workspace, so the site likely lives in its own directory or its own repo.
+**The task is to recreate these designs in the target codebase's existing environment**, using its established patterns and libraries. If no web environment exists yet, this is a static marketing site + docs — Astro or Next.js with plain CSS (or Tailwind, if preferred) is a good fit. The repo itself (`pm2-rs` / `github.com/shep-pm/shep`) is a Rust workspace, so the site likely lives in its own directory or its own repo.
 
 Read the files as: the template markup between `<x-dc>` and `</x-dc>` is the DOM; the `class Component` block at the bottom is the data and the event handlers. Anything referenced as `{{ name }}` in markup is defined by the `renderVals()` return at the bottom of the same file. `style-hover="…"` means a `:hover` rule with those declarations.
 
@@ -117,7 +117,7 @@ Google Fonts, one link:
 **Nav.** Sticky, `margin-bottom:-91px` so it overlaps the hero. Pill-shaped logo lockup (`paper-2`, 3px ink border, `4px 4px 0` shadow) + three pills: Lexicon (`paper-2`), Docs (`butter`), GitHub (ink fill, cream text, barn-colored shadow).
 
 **Scene copy** (verbatim):
-1. Eyebrow pill `pm2, rewritten in Rust`; h1 `shep keeps / your flock / alive.` in cream with `text-shadow:5px 5px 0 rgba(14,23,48,.45)`; paragraph in a fleece card; primary button `Get started →` (grass-deep) + a mono copy-to-clipboard button showing `$ git clone github.com/TurtIeSocks/shep` with a `copy`/`copied` label that reverts after 1800ms; a scroll hint pill `scroll — the sun comes up ↓`.
+1. Eyebrow pill `pm2, rewritten in Rust`; h1 `shep keeps / your flock / alive.` in cream with `text-shadow:5px 5px 0 rgba(14,23,48,.45)`; paragraph in a fleece card; primary button `Get started →` (grass-deep) + a mono copy-to-clipboard button showing `$ git clone github.com/shep-pm/shep` with a `copy`/`copied` label that reverts after 1800ms; a scroll hint pill `scroll — the sun comes up ↓`.
 2. `the flock, listed` — a terminal window (mac dots, `~/apps` title) showing `shep ls` output, then a note card about the CPU column printing `-` instead of `0.0%`.
 3. Fleece card, `rotate(-1.2deg)`, heading `A typo fails at load, not at 3am.` with a small TOML block.
 4. Barn-red card, `rotate(1deg)`, heading `Dogs work for the shepherd.` with a dark terminal block.
@@ -171,7 +171,7 @@ Do not add a second animal — one sheep and one dog is the whole cast. Never dr
 
 ## Interactions
 
-- **Copy button** (landing hero): writes `git clone https://github.com/TurtIeSocks/shep.git` to the clipboard, label flips `copy` → `copied`, reverts after 1800ms.
+- **Copy button** (landing hero): writes `git clone https://github.com/shep-pm/shep.git` to the clipboard, label flips `copy` → `copied`, reverts after 1800ms.
 - **Anchor nav:** `html { scroll-behavior: smooth }` on the landing page; `#pasture`, `#chalkboard`, `#scene-1` targets.
 - **Docs nav:** page state + scroll to top; `#terminology` deep link.
 - **Theme toggle:** docs and design language, `localStorage` key `shep-theme`.

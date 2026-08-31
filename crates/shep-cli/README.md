@@ -1,6 +1,6 @@
 # shep
 
-The `shep` binary. [shep](https://github.com/TurtIeSocks/shep) is a process
+The `shep` binary. [shep](https://github.com/shep-pm/shep) is a process
 manager written in Rust: one binary runs a daemon called the shepherd, which
 keeps a flock of your long-running processes alive, captures what they print,
 and says plainly when something is wrong.

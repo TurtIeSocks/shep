@@ -64,9 +64,9 @@ One match prints the whole entry, which is where `adopt_as` earns its place:
 ```
 Spot . shep-log-rotate . logs
 Rotates grown log files and asks the shepherd to reopen them.
-MIT OR Apache-2.0 . https://github.com/TurtIeSocks/shep-log-rotate
+MIT OR Apache-2.0 . https://github.com/shep-pm/shep-log-rotate
 
-  $ cargo install --git https://github.com/TurtIeSocks/shep-log-rotate
+  $ cargo install --git https://github.com/shep-pm/shep-log-rotate
   $ shep adopt log-rotate ~/.cargo/bin/shep-log-rotate
 ```
 
@@ -84,7 +84,7 @@ that is not there. A wrong name is silent.
 
 ## 2. The fetch
 
-`GET https://shep.turtlesocks.dev/dogs.json`, hardcoded, overridable with
+`GET https://shep-pm.com/dogs.json`, hardcoded, overridable with
 `SHEP_DOG_INDEX` for testing and self-hosting. Without an override the
 integration tests cannot point at a local server, and an environment variable
 is trusted input by the project's own threat model.

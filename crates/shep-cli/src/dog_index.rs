@@ -86,7 +86,7 @@ use crate::terminal_safe::sanitise;
 /// this file verbatim, and `/dogs.json` is an exact file path that answers
 /// 200 rather than redirecting, which is what lets [`crate::fetch::get`]
 /// refuse redirects outright.
-pub const DEFAULT_INDEX_URL: &str = "https://shep.turtlesocks.dev/dogs.json";
+pub const DEFAULT_INDEX_URL: &str = "https://shep-pm.com/dogs.json";
 
 /// The environment variable that overrides [`DEFAULT_INDEX_URL`], for
 /// self-hosting an index and for pointing the integration tests at a local
@@ -581,12 +581,12 @@ mod tests {
             "package": "shep-log-rotate",
             "adopt_as": "log-rotate",
             "description": "Rotates grown log files and asks the shepherd to reopen them.",
-            "repo": "https://github.com/TurtIeSocks/shep-log-rotate",
+            "repo": "https://github.com/shep-pm/shep-log-rotate",
             "license": "MIT OR Apache-2.0",
             "category": "logs",
             "source": {
                 "kind": "cargo-git",
-                "url": "https://github.com/TurtIeSocks/shep-log-rotate"
+                "url": "https://github.com/shep-pm/shep-log-rotate"
             }
         })
     }
@@ -605,7 +605,7 @@ mod tests {
     /// refuses now.
     fn wrap_index(entries: Vec<Value>) -> String {
         serde_json::json!({
-            "$schema": "https://shep.turtlesocks.dev/dogs.schema.json",
+            "$schema": "https://shep-pm.com/dogs.schema.json",
             "version": SUPPORTED_INDEX_VERSION,
             "dogs": entries,
         })
@@ -656,7 +656,7 @@ mod tests {
     /// absence is silent everywhere else, since a dog adopted under the
     /// wrong name loses its whole config section without saying so.
     const THREE_ENTRIES_MIDDLE_BROKEN: &[u8] = br#"{
-      "$schema": "https://shep.turtlesocks.dev/dogs.schema.json",
+      "$schema": "https://shep-pm.com/dogs.schema.json",
       "version": 1,
       "dogs": [
       {
@@ -664,10 +664,10 @@ mod tests {
         "package": "shep-log-rotate",
         "adopt_as": "log-rotate",
         "description": "Rotates grown log files.",
-        "repo": "https://github.com/TurtIeSocks/shep-log-rotate",
+        "repo": "https://github.com/shep-pm/shep-log-rotate",
         "license": "MIT OR Apache-2.0",
         "category": "logs",
-        "source": { "kind": "cargo-git", "url": "https://github.com/TurtIeSocks/shep-log-rotate" }
+        "source": { "kind": "cargo-git", "url": "https://github.com/shep-pm/shep-log-rotate" }
       },
       {
         "name": "Nameless",

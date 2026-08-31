@@ -24,23 +24,23 @@
     ],
     "version": "0.0.0",
     "description": "Process manager that keeps a flock of long-running processes alive, with logs, watch and cron restarts, and webhook alerts",
-    "homepage": "https://shep.turtlesocks.dev",
+    "homepage": "https://shep-pm.com",
     "license": "MIT|Apache-2.0",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/TurtIeSocks/shep/releases/download/shep-v0.0.0/shep-x86_64-pc-windows-msvc.zip",
+            "url": "https://github.com/shep-pm/shep/releases/download/shep-v0.0.0/shep-x86_64-pc-windows-msvc.zip",
             "hash": "0000000000000000000000000000000000000000000000000000000000000000"
         }
     },
     "bin": "shep.exe",
     "checkver": {
-        "github": "https://github.com/TurtIeSocks/shep",
+        "github": "https://github.com/shep-pm/shep",
         "regex": "shep-v([\\d.]+)"
     },
     "autoupdate": {
         "architecture": {
             "64bit": {
-                "url": "https://github.com/TurtIeSocks/shep/releases/download/shep-v$version/shep-x86_64-pc-windows-msvc.zip"
+                "url": "https://github.com/shep-pm/shep/releases/download/shep-v$version/shep-x86_64-pc-windows-msvc.zip"
             }
         },
         "hash": {

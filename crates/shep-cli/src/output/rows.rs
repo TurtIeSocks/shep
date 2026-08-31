@@ -4142,11 +4142,11 @@ pub(crate) mod tests {
             adopt_as: "log-rotate".to_string(),
             description: "Rotates grown log files and asks the shepherd to reopen them."
                 .to_string(),
-            repo: "https://github.com/TurtIeSocks/shep-log-rotate".to_string(),
+            repo: "https://github.com/shep-pm/shep-log-rotate".to_string(),
             license: "MIT OR Apache-2.0".to_string(),
             category: "logs".to_string(),
             source: crate::dog_index::DogSourceKind::CargoGit {
-                url: "https://github.com/TurtIeSocks/shep-log-rotate".to_string(),
+                url: "https://github.com/shep-pm/shep-log-rotate".to_string(),
             },
         }
     }

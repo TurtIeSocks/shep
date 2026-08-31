@@ -16,7 +16,7 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 # workflow replaces it and then fails the build if any sentinel survives.
 $checksum64 = '__CHECKSUM64__'
 
-$url64 = "https://github.com/TurtIeSocks/shep/releases/download/shep-v$version/shep-x86_64-pc-windows-msvc.zip"
+$url64 = "https://github.com/shep-pm/shep/releases/download/shep-v$version/shep-x86_64-pc-windows-msvc.zip"
 
 $packageArgs = @{
   packageName    = $packageName
@@ -34,4 +34,4 @@ Install-ChocolateyZipPackage @packageArgs
 # entrypoint aliases with no desktop use case, and three shims on PATH for one
 # tool is noise.
 Write-Host "shep $version installed. Run 'shep welcome' for the tour."
-Write-Host "Boot-time supervision is not built on Windows: 'shep startup' refuses. See https://shep.turtlesocks.dev/docs/not-built"
+Write-Host "Boot-time supervision is not built on Windows: 'shep startup' refuses. See https://shep-pm.com/docs/not-built"

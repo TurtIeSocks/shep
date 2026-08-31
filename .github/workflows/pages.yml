@@ -1,6 +1,6 @@
 name: pages
 # Builds `web/` and publishes it to GitHub Pages, served at
-# https://shep.turtlesocks.dev. The Pages source is set to "GitHub Actions"
+# https://shep-pm.com. The Pages source is set to "GitHub Actions"
 # in the repository settings, and the custom domain lives there too — with
 # an Actions-based deploy there is no `CNAME` file in the artifact.
 #

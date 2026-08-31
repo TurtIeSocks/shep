@@ -1,6 +1,6 @@
 # shep-client
 
-The async client for [shep](https://github.com/TurtIeSocks/shep), a process
+The async client for [shep](https://github.com/shep-pm/shep), a process
 manager written in Rust. Use this crate to talk to a running shepherd from
 your own program instead of shelling out to the `shep` binary.
 

@@ -174,7 +174,7 @@ The "it is already on crates.io" objection does not apply. Homebrew's
 language-specific formulae policy excludes libraries, and welcomes
 command-line applications.
 
-So: `TurtIeSocks/homebrew-shep`, giving `brew install turtiesocks/shep/shep`,
+So: `shep-pm/homebrew-shep`, giving `brew install turtiesocks/shep/shep`,
 with `Formula/shep.rb`.
 
 The formula is written and lives at `packaging/homebrew/shep.rb`, which is

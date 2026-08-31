@@ -47,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Carry stdin, the shepherd channel and clustered apps across a handover ([#77](https://github.com/TurtIeSocks/shep/pull/77))
+- Carry stdin, the shepherd channel and clustered apps across a handover ([#77](https://github.com/shep-pm/shep/pull/77))
 
 
 ## [0.1.19] - 2026-08-31

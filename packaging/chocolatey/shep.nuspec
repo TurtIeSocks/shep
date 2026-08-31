@@ -9,12 +9,12 @@
     <version>0.0.0</version>
     <authors>TurtIeSocks</authors>
     <owners>TurtIeSocks</owners>
-    <projectUrl>https://shep.turtlesocks.dev</projectUrl>
-    <projectSourceUrl>https://github.com/TurtIeSocks/shep</projectSourceUrl>
-    <packageSourceUrl>https://github.com/TurtIeSocks/shep/tree/main/packaging/chocolatey</packageSourceUrl>
-    <docsUrl>https://shep.turtlesocks.dev/docs/getting-started</docsUrl>
-    <bugTrackerUrl>https://github.com/TurtIeSocks/shep/issues</bugTrackerUrl>
-    <licenseUrl>https://github.com/TurtIeSocks/shep#license</licenseUrl>
+    <projectUrl>https://shep-pm.com</projectUrl>
+    <projectSourceUrl>https://github.com/shep-pm/shep</projectSourceUrl>
+    <packageSourceUrl>https://github.com/shep-pm/shep/tree/main/packaging/chocolatey</packageSourceUrl>
+    <docsUrl>https://shep-pm.com/docs/getting-started</docsUrl>
+    <bugTrackerUrl>https://github.com/shep-pm/shep/issues</bugTrackerUrl>
+    <licenseUrl>https://github.com/shep-pm/shep#license</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <!-- No iconUrl yet. It is a validator Guideline (CPMR0033) rather than a
          Requirement, so the package is approvable without one, and shep has
@@ -70,7 +70,7 @@ case, so they are installed without shims.
 `choco uninstall` refuses while a shepherd is still running, rather than
 stopping your processes on your behalf. Run `shep kill` first.
 ]]></description>
-    <releaseNotes>https://github.com/TurtIeSocks/shep/releases</releaseNotes>
+    <releaseNotes>https://github.com/shep-pm/shep/releases</releaseNotes>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />
