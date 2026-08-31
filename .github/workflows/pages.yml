@@ -10,7 +10,7 @@ name: pages
 # single ubuntu job of a couple of minutes at 1x, so the arithmetic that
 # keeps the Rust CI manual does not reach it.
 #
-# The paths filter names two files outside `web/` on purpose: the site parses
+# The paths filter names three files outside `web/` on purpose: the site parses
 # them at build time (see `web/src/data/*.ts`) rather than restating them, so
 # that a stale claim fails the build instead of shipping. docs/specs/deferred.md
 # feeds the "not built yet" chalkboard through web/src/data/chalkboard.ts, and
@@ -19,11 +19,22 @@ name: pages
 # web/src/data/docsRules.ts. Editing either file without redeploying would leave
 # the site asserting something the repo no longer says.
 #
-# The terminology page's TABLE is a third thing and is not in this filter,
+# Cargo.toml is the newest of the three and is here for a sharper reason than
+# the other two: it is the ONLY build input that a release changes. The CLI
+# reference page prints the workspace version through
+# web/src/data/workspaceVersion.ts, and a release commit touches nothing under
+# `web/` -- so without this entry the release that bumps the version deploys
+# nothing, and the published page goes on naming the version before it. That is
+# the exact staleness the version was moved out of cli-reference.generated.txt
+# to end, so leaving it out here would rebuild the defect one level up. The
+# cost is that a dependency edit redeploys too: one ubuntu job, a couple of
+# minutes, 1x.
+#
+# The terminology page's TABLE is a different thing and is not in this filter,
 # because it comes from web/src/data/lexiconTable.md through
 # web/src/data/docsLexicon.ts, and `web/**` already covers it.
 #
-# README.md was the third until the lexicon table moved to
+# README.md was in this list too, until the lexicon table moved to
 # web/src/data/lexiconTable.md, which happened because the README was rewritten
 # as a landing page and the parser was left reading a heading that had gone.
 # Nothing imports README.md now -- grep web/src for `?raw` for the real list --
@@ -35,6 +46,7 @@ on:
       - "web/**"
       - "docs/specs/deferred.md"
       - "docs/terminology.md"
+      - "Cargo.toml"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 

@@ -29,7 +29,6 @@ export interface CliVerb {
 }
 
 export interface CliReferenceData {
-  version: string;
   /** `shep --help`, byte-for-byte, for the page's own top-level block. */
   topLevelHelp: string;
   verbs: CliVerb[];
@@ -188,22 +187,23 @@ function parseAliasesFromTopLevel(topLevelHelp: string, names: readonly string[]
   return result;
 }
 
+// The generator emits nothing ahead of it, so this marker opens the file
+// rather than being something to search for. There is deliberately no
+// version section any more — see the generator's own comment for why, and
+// web/src/data/workspaceVersion.ts for where the page reads the version now.
+const TOP_LEVEL_MARKER = "@@TOPLEVEL@@\n";
+
 function parse(source: string): CliReferenceData {
-  const versionIndex = source.indexOf("@@VERSION@@\n");
-  const topLevelIndex = source.indexOf("\n@@TOPLEVEL@@\n");
-  if (versionIndex === -1 || topLevelIndex === -1) {
-    fail("missing @@VERSION@@ or @@TOPLEVEL@@ marker — re-run generate-cli-reference.sh.");
+  if (!source.startsWith(TOP_LEVEL_MARKER)) {
+    fail("does not open with the @@TOPLEVEL@@ marker — re-run generate-cli-reference.sh.");
   }
-  const version = source.slice(versionIndex + "@@VERSION@@\n".length, topLevelIndex).trim();
 
   const firstVerbMarker = `\n@@VERB:${VERB_NAMES[0]}@@\n`;
   const firstVerbIndex = source.indexOf(firstVerbMarker);
   if (firstVerbIndex === -1) {
     fail(`missing marker for the first verb "${VERB_NAMES[0]}" — re-run generate-cli-reference.sh.`);
   }
-  const topLevelHelp = source
-    .slice(topLevelIndex + "\n@@TOPLEVEL@@\n".length, firstVerbIndex)
-    .trim();
+  const topLevelHelp = source.slice(TOP_LEVEL_MARKER.length, firstVerbIndex).trim();
 
   const aliasesByVerb = parseAliasesFromTopLevel(topLevelHelp, VERB_NAMES);
 
@@ -222,7 +222,7 @@ function parse(source: string): CliReferenceData {
     return verb;
   });
 
-  return { version, topLevelHelp, verbs };
+  return { topLevelHelp, verbs };
 }
 
 export const cliReference: CliReferenceData = parse(generatedSource);
