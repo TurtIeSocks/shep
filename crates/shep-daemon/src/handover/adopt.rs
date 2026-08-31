@@ -1228,6 +1228,18 @@ mod tests {
                 channel: sheep.fds.channel.map(|fd| dups.of(fd)).transpose()?,
             };
         }
+        // Released BEFORE the fallible call, not after, and the asymmetry is
+        // deliberate. `adopt` consumes the numbers it reaches and drops the
+        // owners it had already built when it refuses, so on its error path
+        // some of these are closed and some are not, and it returns nothing
+        // that says which. Holding the guard across it would close the
+        // consumed ones a second time, and a double close can shut whatever
+        // number the kernel has since handed out. A leak bounded by a test
+        // binary is the better of those two.
+        //
+        // That the unreached ones leak is not this helper's invention: it is
+        // `adopt`'s own documented behaviour, which is why the pidfile is
+        // adopted last (see this module's header).
         dups.release();
         adopt(&copy).map(drop)
     }
