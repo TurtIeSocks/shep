@@ -66,6 +66,23 @@ Note the tension this creates with a comment already in `dog_app`: *"an argv she
 
 ---
 
+## Measured on 2026-08-31, and it strengthens the case
+
+Both published dogs were found shipping lockfiles that pinned a protocol-1 `shep-core`: `shep-log-rotate` at 0.1.0 and `shep-deploy` at 0.1.10, against a current 0.1.24. Both repositories' CI had been red since 2026-08-30, failing on the exact sentence an operator hit in production, and nobody had connected a red dog repository to a stale dog in a flock.
+
+The install semantics are what this phase turns on, and they are not intuitive:
+
+| how the dog is built | which `shep-core` | so which protocol |
+|---|---|---|
+| `cargo install <dog>` | re-resolved, newest compatible | current |
+| `cargo install --locked`, and CI | whatever the shipped lockfile pins | whatever was pinned that day |
+
+Measured rather than reasoned: installing `shep-log-rotate` 0.1.3 to a throwaway root compiled `shep-core v0.1.24`, so the packaged lockfile was ignored. The same crate built `--locked` produced a protocol-1 dog, which is what CI had been doing for two days.
+
+**So a dog's crate version tells you nothing about its protocol, and neither does knowing that somebody installed it.** You would also need to know which flags they used and what the lockfile said at publish time. None of that is visible from outside the binary, which is the strongest argument available for G11: the binary is the only thing that can answer, so ask it.
+
+One more thing to carry into task 3. `RpcError` gained a public `daemon_version` field somewhere inside the 0.1.x range. Its fields are public and it has no constructor, so every literal built outside `shep-client` stopped compiling, and `shep-deploy` had eleven of them. Protocol equality is therefore necessary but not sufficient for "this dog still works", and a `--version` answer carrying only the protocol answers a narrower question than the operator is asking. Decide deliberately whether to close that gap here or defer it, and say which.
+
 ## The bug this found
 
 `dog_app` calls `std::env::current_exe()` unguarded (`dogs.rs:147`) and hands the result straight to `AppConfig::minimal`.
