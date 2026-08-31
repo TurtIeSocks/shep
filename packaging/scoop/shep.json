@@ -24,7 +24,7 @@
     ],
     "version": "0.0.0",
     "description": "Process manager that keeps a flock of long-running processes alive, with logs, watch and cron restarts, and webhook alerts",
-    "homepage": "https://shep.turtlesocks.dev",
+    "homepage": "https://shep-pm.com",
     "license": "MIT|Apache-2.0",
     "architecture": {
         "64bit": {

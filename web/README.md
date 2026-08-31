@@ -40,7 +40,7 @@ Node version is pinned in `.nvmrc` (`nvm use` picks it up automatically).
 
 ## Deploy
 
-**Target: GitHub Pages**, at `https://shep.turtlesocks.dev`. The Pages source
+**Target: GitHub Pages**, at `https://shep-pm.com`. The Pages source
 is set to **GitHub Actions** in the repository settings, and the custom domain
 is configured there too — so there is no `CNAME` file in `public/`, which is a
 branch-deploy mechanism and would only be dead weight here. If the domain ever

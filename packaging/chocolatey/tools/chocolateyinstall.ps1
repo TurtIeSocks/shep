@@ -34,4 +34,4 @@ Install-ChocolateyZipPackage @packageArgs
 # entrypoint aliases with no desktop use case, and three shims on PATH for one
 # tool is noise.
 Write-Host "shep $version installed. Run 'shep welcome' for the tour."
-Write-Host "Boot-time supervision is not built on Windows: 'shep startup' refuses. See https://shep.turtlesocks.dev/docs/not-built"
+Write-Host "Boot-time supervision is not built on Windows: 'shep startup' refuses. See https://shep-pm.com/docs/not-built"

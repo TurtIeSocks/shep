@@ -1168,7 +1168,7 @@ whoever controls that repository to publish arbitrary content on shep's own
 domain, under shep's own styling, forever and unreviewed.
 
 **A disclaimer does not fix it, because the failure mode is trust, not
-confusion.** Nobody who lands on `shep.turtlesocks.dev/dogs/whatever` reads
+confusion.** Nobody who lands on `shep-pm.com/dogs/whatever` reads
 it as a stranger's unmoderated page; they read it as shep's docs, reviewed
 the way shep's docs are reviewed. That trust is the entire reason the feature
 would be worth building, and it is exactly what turns a compromised or

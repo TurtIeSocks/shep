@@ -84,7 +84,7 @@ that is not there. A wrong name is silent.
 
 ## 2. The fetch
 
-`GET https://shep.turtlesocks.dev/dogs.json`, hardcoded, overridable with
+`GET https://shep-pm.com/dogs.json`, hardcoded, overridable with
 `SHEP_DOG_INDEX` for testing and self-hosting. Without an override the
 integration tests cannot point at a local server, and an environment variable
 is trusted input by the project's own threat model.

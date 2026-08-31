@@ -8,5 +8,5 @@ export default defineConfig({
   // (`href="/docs/terminology"`), and at a domain root those resolve as
   // written. A GitHub Pages *project* URL would serve from `/shep/` instead
   // and 404 every one of them; the custom domain is what makes them correct.
-  site: 'https://shep.turtlesocks.dev',
+  site: 'https://shep-pm.com',
 });

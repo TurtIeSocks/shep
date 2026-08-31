@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "os", "development-tools"]
 # The docs site, not docs.rs: this crate ships a CLI, and its three [[bin]]
 # targets are what somebody installs. docs.rs would render the thin library
 # underneath them, which is not what a reader of this package came for.
-documentation = "https://shep.turtlesocks.dev"
+documentation = "https://shep-pm.com"
 
 [lib]
 name = "shep"

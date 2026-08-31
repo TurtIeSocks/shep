@@ -9,10 +9,10 @@
     <version>0.0.0</version>
     <authors>TurtIeSocks</authors>
     <owners>TurtIeSocks</owners>
-    <projectUrl>https://shep.turtlesocks.dev</projectUrl>
+    <projectUrl>https://shep-pm.com</projectUrl>
     <projectSourceUrl>https://github.com/shep-pm/shep</projectSourceUrl>
     <packageSourceUrl>https://github.com/shep-pm/shep/tree/main/packaging/chocolatey</packageSourceUrl>
-    <docsUrl>https://shep.turtlesocks.dev/docs/getting-started</docsUrl>
+    <docsUrl>https://shep-pm.com/docs/getting-started</docsUrl>
     <bugTrackerUrl>https://github.com/shep-pm/shep/issues</bugTrackerUrl>
     <licenseUrl>https://github.com/shep-pm/shep#license</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>

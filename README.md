@@ -181,7 +181,7 @@ Help             welcome init help completions style
 </details>
 
 Full documentation, including a generated reference for every flag of every
-verb, is at [shep.turtlesocks.dev](https://shep.turtlesocks.dev).
+verb, is at [shep-pm.com](https://shep-pm.com).
 
 ## Windows
 

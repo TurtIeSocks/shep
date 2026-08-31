@@ -1515,7 +1515,7 @@ fn serve_dog_index(body: &str) -> String {
 /// on the accepted side of that line to test anything else.
 fn two_entry_index_json() -> String {
     serde_json::json!({
-        "$schema": "https://shep.turtlesocks.dev/dogs.schema.json",
+        "$schema": "https://shep-pm.com/dogs.schema.json",
         "version": 1,
         "dogs": [
             {
