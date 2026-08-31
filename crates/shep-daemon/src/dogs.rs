@@ -1435,4 +1435,69 @@ mod tests {
             "the clock is what moves the dog along, and it has now moved"
         );
     }
+
+    /// fails if `spawn_silent_dog_watch`'s own loop stops calling
+    /// `check_silent_dogs` at all -- the gap none of the tests above can
+    /// see, since every one of them calls `check_silent_dogs` directly and
+    /// would keep passing even if the watcher's `ticks.tick().await` path
+    /// were deleted entirely.
+    ///
+    /// IR-46: paused virtual time, advanced past one whole
+    /// [`DOG_SILENCE_BUDGET`], is the forcing mechanism -- not a real sleep,
+    /// so this stays in the fast tier rather than `mod slow`. The loop of
+    /// `yield_now` calls below is what lets the watcher's own spawned task,
+    /// and the engine task it talks to over a channel, actually run:
+    /// `tokio::time::advance` wakes a sleeper whose deadline has elapsed,
+    /// it does not itself drive the scheduler through everything that
+    /// sleeper then does.
+    #[tokio::test(start_paused = true)]
+    async fn the_watcher_restarts_a_silent_dog_after_one_budget_of_paused_time() {
+        let h = crate::testing::harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        start_test_dog(&h.ctx, "metrics").await;
+        let refusals = h.ctx.dog_refusals.clone();
+
+        let watch = spawn_silent_dog_watch(h.ctx.supervisor.clone(), refusals.clone());
+
+        // The watcher's own interval fires an immediate first tick, which
+        // records the dog as seen-silent-since-now the same way every
+        // direct-call test above seeds `seen`. That first tick has to
+        // actually run, against the PRE-advance clock, before time moves --
+        // otherwise the "first look" lands after the jump and the dog
+        // never accrues a whole budget of silence.
+        tokio::task::yield_now().await;
+
+        // `Interval::tick()` reports the DEADLINE it was scheduled for, not
+        // the clock's current instant -- so one large `advance` collapses
+        // every missed tick into a single wake whose reported time has only
+        // moved forward by one `DOG_SILENCE_POLL`, not by however far the
+        // clock actually jumped. Advancing one poll period at a time, and
+        // letting the watcher's own task run after each step, is what
+        // actually walks its reported `now` past a whole budget the way a
+        // real, un-paused clock would.
+        let ticks_in_a_budget = (DOG_SILENCE_BUDGET.as_nanos() / DOG_SILENCE_POLL.as_nanos())
+            .try_into()
+            .expect("a silence budget of a few seconds fits in a u32 tick count");
+        for _ in 0..ticks_in_a_budget {
+            tokio::time::advance(DOG_SILENCE_POLL).await;
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..64 {
+            if !refusals.restarting().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            refusals.restarting(),
+            vec!["metrics".to_string()],
+            "one budget of silence, driven through the watcher's own tick, must earn exactly one restart"
+        );
+        assert!(
+            refusals.stale().is_empty(),
+            "one silence is a dog to restart, not a dog to give up on"
+        );
+
+        watch.abort();
+    }
 }
