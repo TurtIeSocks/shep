@@ -44,8 +44,21 @@ fn default_debounce() -> UpDuration {
 }
 
 /// One entry under `[dog.bark.rules]`.
+///
+/// NOT `#[serde(deny_unknown_fields)]` on this struct, even though a
+/// misspelled key here must still be a startup error — see
+/// [`BarkConfig`](super::BarkConfig)'s own doc for why that posture
+/// matters. `serde` does not support `deny_unknown_fields` together with
+/// `#[serde(flatten)]` on the same struct: the flattened field needs to
+/// collect whatever keys the outer struct's own named fields do not claim,
+/// and `deny_unknown_fields` rejects exactly those before the flattened
+/// field ever sees them — every key of a real rule, `on` included, is
+/// "unknown" from `Rule`'s own point of view. [`Trigger`] carries the
+/// attribute instead: everything this struct's own fields (`sinks`,
+/// `debounce`) do not consume flows into `Trigger`'s deserialize, so its
+/// `deny_unknown_fields` still catches a typo anywhere in a rule, just one
+/// level down from where the old attribute sat.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Rule {
     /// What fires it.
     #[serde(flatten)]
@@ -62,8 +75,12 @@ pub struct Rule {
 }
 
 /// What makes a rule fire.
+///
+/// `deny_unknown_fields` lives here rather than on [`Rule`] — see that
+/// type's own doc for why the combination with `#[serde(flatten)]` forced
+/// the move.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "on", rename_all = "snake_case")]
+#[serde(tag = "on", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Trigger {
     /// Any of these bus event kinds, by their wire spelling
     /// (`exit`, `errored`, `online`, ...).
@@ -76,7 +93,21 @@ pub enum Trigger {
     /// missed — the app is down and staying down — and because it cannot
     /// disagree with the shepherd: it is keyed to the shepherd's own
     /// decision rather than to a threshold bark chose.
-    GaveUp,
+    ///
+    /// An empty struct variant, `GaveUp {}`, rather than a bare unit
+    /// variant — deliberately, and load-bearing for `deny_unknown_fields`
+    /// above. An internally tagged unit variant deserializes through a
+    /// path that never visits the rest of the map, so a stray key next to
+    /// `on = "gave_up"` (a misspelled `debounce`, say) parsed silently
+    /// even with `deny_unknown_fields` set — confirmed empirically before
+    /// this fix, and covered by
+    /// `tests::a_misspelled_field_next_to_gave_up_is_still_refused` below.
+    /// A struct variant, even an empty one, goes through the same
+    /// field-checking visitor every other variant here already used, so
+    /// the typo is refused like any other. Wire-compatible: `on =
+    /// "gave_up"` alone still parses to this variant, unchanged — nothing
+    /// an operator types needs to change.
+    GaveUp {},
     /// The early warning: `restarts` restarts within `within`. Opt-in,
     /// because it is the one that pages at 3am for a blip, and the
     /// threshold should be one the operator chose.
@@ -102,7 +133,7 @@ pub enum Trigger {
 fn trigger_name(when: &Trigger) -> &'static str {
     match when {
         Trigger::Event { .. } => "event",
-        Trigger::GaveUp => "gave_up",
+        Trigger::GaveUp {} => "gave_up",
         Trigger::RestartRate { .. } => "restart_rate",
         Trigger::MemoryAbove { .. } => "memory_above",
     }
@@ -269,7 +300,7 @@ impl Rules {
     #[must_use]
     pub fn default_rules(sinks: &BTreeMap<String, Sink>) -> Vec<Rule> {
         vec![Rule {
-            when: Trigger::GaveUp,
+            when: Trigger::GaveUp {},
             sinks: sinks.keys().cloned().collect(),
             debounce: default_debounce(),
         }]
@@ -341,7 +372,7 @@ impl Rules {
                 Trigger::Event { kinds } if kinds.iter().any(|k| k == &kind_wire) => {
                     Some(format!("{} {kind_wire}", info.name))
                 }
-                Trigger::GaveUp if kind == ProcessEventKind::Errored => {
+                Trigger::GaveUp {} if kind == ProcessEventKind::Errored => {
                     Some(format!("{} gave up: restart budget exhausted", info.name))
                 }
                 _ => None,
@@ -382,7 +413,7 @@ impl Rules {
                 let trigger = self.rules[idx].when.clone();
                 let message = match &trigger {
                     Trigger::Event { .. } => None,
-                    Trigger::GaveUp => (info.status == ProcStatus::Errored).then(|| {
+                    Trigger::GaveUp {} => (info.status == ProcStatus::Errored).then(|| {
                         format!("{} gave up: restart budget exhausted", info.name)
                     }),
                     Trigger::RestartRate { restarts, within } => self
@@ -497,7 +528,7 @@ mod tests {
         let sinks = one_sink("ops");
         Rules::new(
             vec![Rule {
-                when: Trigger::GaveUp,
+                when: Trigger::GaveUp {},
                 sinks: vec!["ops".to_owned()],
                 debounce: default_debounce(),
             }],
@@ -521,7 +552,7 @@ mod tests {
 
     fn rule_to(sink: &str) -> Rule {
         Rule {
-            when: Trigger::GaveUp,
+            when: Trigger::GaveUp {},
             sinks: vec![sink.to_owned()],
             debounce: default_debounce(),
         }
@@ -601,7 +632,7 @@ mod tests {
         let sinks = one_sink("ops");
         let rules = Rules::default_rules(&sinks);
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].when, Trigger::GaveUp);
+        assert_eq!(rules[0].when, Trigger::GaveUp {});
         assert_eq!(rules[0].sinks, vec!["ops"]);
     }
 
@@ -612,7 +643,7 @@ mod tests {
     #[test]
     fn a_rule_with_no_sinks_at_all_is_refused_at_startup() {
         let rule = Rule {
-            when: Trigger::GaveUp,
+            when: Trigger::GaveUp {},
             sinks: Vec::new(),
             debounce: default_debounce(),
         };
@@ -784,8 +815,8 @@ mod tests {
     /// `GaveUp` is on by default with no configuration at all; a rule that
     /// fires on every event kind is as useless as one that never fires,
     /// because it trains an operator to ignore it. Proven by mutating the
-    /// `on_event` match arm from `Trigger::GaveUp if kind ==
-    /// ProcessEventKind::Errored` to an unconditional `Trigger::GaveUp`:
+    /// `on_event` match arm from `Trigger::GaveUp {} if kind ==
+    /// ProcessEventKind::Errored` to an unconditional `Trigger::GaveUp {}`:
     /// before this test existed, all 14 other `rules::` tests stayed green
     /// under that mutation because none of them fed `gave_up_rules()`
     /// anything but an `Errored` event or status.
@@ -828,6 +859,211 @@ mod tests {
             rules.on_event(&errored_event("web"), debounce_ms).len(),
             1,
             "exactly at the debounce it may fire again"
+        );
+    }
+
+    // The tests above all build `Rule`/`Trigger` as Rust values, which
+    // never runs `Deserialize` at all and is exactly how the shipped bug
+    // passed every one of them: `Rule`'s `#[serde(flatten)]` combined with
+    // `#[serde(deny_unknown_fields)]` made every `[[dog.bark.rules]]` entry
+    // refuse to parse, and nothing here noticed. The tests below parse
+    // real TOML strings instead — see `Rule`'s and `Trigger`'s own docs
+    // for the fix these prove.
+
+    /// fails if the docs' own `on = "gave_up"` rule cannot be parsed from
+    /// TOML — the exact shape `docs/dogs.md` and
+    /// `web/src/pages/docs/dogs.astro` publish as copy-pasteable.
+    #[test]
+    fn the_docs_gave_up_rule_parses_from_toml() {
+        let rule: Rule = toml::from_str(
+            r#"
+on = "gave_up"
+sinks = ["oncall", "audit"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(rule.when, Trigger::GaveUp {});
+        assert_eq!(rule.sinks, vec!["oncall", "audit"]);
+        assert_eq!(rule.debounce, default_debounce(), "no override in the TOML");
+    }
+
+    /// fails if the docs' own `on = "restart_rate"` rule cannot be parsed
+    /// from TOML, or if `within`'s `"2m"` string form (the same
+    /// [`UpDuration`] grammar every other duration field in `shep.toml`
+    /// accepts) is not honored inside a flattened [`Trigger`].
+    #[test]
+    fn the_docs_restart_rate_rule_parses_from_toml() {
+        let rule: Rule = toml::from_str(
+            r#"
+on = "restart_rate"
+restarts = 5
+within = "2m"
+sinks = ["oncall"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rule.when,
+            Trigger::RestartRate {
+                restarts: 5,
+                within: UpDuration::from_millis(2 * 60_000),
+            }
+        );
+    }
+
+    /// fails if an `event` rule cannot be parsed from TOML — not shown in
+    /// the published docs, but a real `Trigger` variant a `[[dog.bark.
+    /// rules]]` entry can name, and the same flatten mechanism the docs'
+    /// two forms exercise.
+    #[test]
+    fn an_event_rule_parses_from_toml() {
+        let rule: Rule = toml::from_str(
+            r#"
+on = "event"
+kinds = ["exit", "errored"]
+sinks = ["oncall"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rule.when,
+            Trigger::Event {
+                kinds: vec!["exit".to_owned(), "errored".to_owned()],
+            }
+        );
+    }
+
+    /// fails if a `memory_above` rule cannot be parsed from TOML, or if
+    /// `bytes`'s `"512M"` string form ([`MemSize`]'s own grammar) is not
+    /// honored inside a flattened [`Trigger`] — the fourth and last
+    /// variant, rounding out coverage of every rule form this parser
+    /// accepts.
+    #[test]
+    fn a_memory_above_rule_parses_from_toml() {
+        let rule: Rule = toml::from_str(
+            r#"
+on = "memory_above"
+bytes = "512M"
+sinks = ["oncall"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rule.when,
+            Trigger::MemoryAbove {
+                // Binary units — MemSize's grammar is MiB, not MB.
+                bytes: MemSize::from_bytes(512 * 1024 * 1024),
+            }
+        );
+    }
+
+    /// fails if a rule's own `debounce` override does not survive parsing
+    /// alongside a flattened `Trigger` — [`Rule`]'s one other field beyond
+    /// `sinks`, and the one most likely to silently regress if a future
+    /// change reshuffles which fields `Rule` claims directly versus
+    /// forwards to `Trigger`.
+    #[test]
+    fn a_rule_s_debounce_override_parses_from_toml() {
+        let rule: Rule = toml::from_str(
+            r#"
+on = "gave_up"
+sinks = ["oncall"]
+debounce = "10m"
+"#,
+        )
+        .unwrap();
+        assert_eq!(rule.debounce, UpDuration::from_millis(10 * 60_000));
+    }
+
+    /// fails if a misspelled key inside a trigger with its own fields
+    /// (`restarts` typo'd as `retsarts`) is silently accepted rather than
+    /// refused with the bad key named — the protection
+    /// `#[serde(deny_unknown_fields)]` exists for, now living on
+    /// [`Trigger`] rather than [`Rule`]. See [`Rule`]'s own doc for why.
+    #[test]
+    fn a_misspelled_trigger_field_is_refused_with_the_bad_key_named() {
+        let err = toml::from_str::<Rule>(
+            r#"
+on = "restart_rate"
+retsarts = 5
+within = "2m"
+sinks = ["oncall"]
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("retsarts"),
+            "the error must name the misspelled key, not just fail: {err}"
+        );
+    }
+
+    /// fails if a misspelled key sitting next to `on = "gave_up"` is
+    /// silently accepted — the exact gap a bare `Trigger::GaveUp` unit
+    /// variant left even with `deny_unknown_fields` set, because `serde`
+    /// deserializes an internally tagged unit variant through a path that
+    /// never inspects the rest of the map. Proven by mutating `GaveUp {}`
+    /// (an empty *struct* variant) back to a bare `GaveUp` unit variant:
+    /// every other test in this file still passes, since none of them
+    /// parses a misspelled field next to `on = "gave_up"` — this is the
+    /// one that would have caught the exact way the shipped fix's own
+    /// protection could still leak.
+    #[test]
+    fn a_misspelled_field_next_to_gave_up_is_still_refused() {
+        let err = toml::from_str::<Rule>(
+            r#"
+on = "gave_up"
+sinks = ["oncall"]
+debuonce = "10m"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("debuonce"),
+            "the error must name the misspelled key, not just fail: {err}"
+        );
+    }
+
+    /// fails if a misspelled `sinks` is accepted rather than refused. The
+    /// error names the field that is now missing (`sinks`, required with
+    /// no default) rather than the typo'd key itself (`sinsk` never
+    /// matches any field `Rule` or `Trigger` know about, so it is simply
+    /// absent from both) — still a startup refusal an operator can act on,
+    /// just phrased from the other direction than the trigger-field and
+    /// `GaveUp`-neighbor cases above.
+    #[test]
+    fn a_misspelled_sinks_field_is_refused_as_a_missing_field() {
+        let err = toml::from_str::<Rule>(
+            r#"
+on = "gave_up"
+sinsk = ["oncall"]
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("sinks"),
+            "the error must name the missing field: {err}"
+        );
+    }
+
+    /// fails if an unknown `on` variant is accepted rather than refused
+    /// with the bad value and the known ones both named.
+    #[test]
+    fn an_unknown_on_variant_is_refused_with_the_bad_value_named() {
+        let err = toml::from_str::<Rule>(
+            r#"
+on = "gav_up"
+sinks = ["oncall"]
+"#,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("gav_up"),
+            "the error must name the bad value: {message}"
+        );
+        assert!(
+            message.contains("gave_up"),
+            "the error must also name a real variant, so a typo suggests its own fix: {message}"
         );
     }
 }

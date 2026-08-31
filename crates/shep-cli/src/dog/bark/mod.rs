@@ -583,7 +583,7 @@ mod tests {
         );
         Rules::new(
             vec![rules::Rule {
-                when: rules::Trigger::GaveUp,
+                when: rules::Trigger::GaveUp {},
                 sinks: vec!["ops".to_owned()],
                 debounce: UpDuration::from_millis(5 * 60_000),
             }],
@@ -788,7 +788,7 @@ mod tests {
         let rules = Rules::new(
             vec![
                 rules::Rule {
-                    when: rules::Trigger::GaveUp,
+                    when: rules::Trigger::GaveUp {},
                     sinks: vec!["slow".to_owned()],
                     debounce: UpDuration::from_millis(0),
                 },
@@ -846,5 +846,57 @@ mod tests {
             barks::DEFAULT_MAX_BYTES
         );
         assert_eq!(BarkConfig::default().sink_timeout.as_millis(), 10_000);
+    }
+
+    /// fails if `[dog.bark]` cannot parse the exact `shep.toml` fragment
+    /// `docs/dogs.md` and `web/src/pages/docs/dogs.astro` publish as the
+    /// worked example — copy-pasted here relative to `[dog.bark]` the way
+    /// `runtime.config::<BarkConfig>()` sees it (that section already
+    /// stripped, so `[sinks]`/`[[rules]]` rather than
+    /// `[dog.bark.sinks]`/`[[dog.bark.rules]]`).
+    ///
+    /// This is the regression test for the shipped bug: `on_empty_section`
+    /// above is the only other test in this module that calls
+    /// `toml::from_str::<BarkConfig>`, and an empty document never
+    /// deserializes a single [`rules::Rule`], so it passed on v0.1.18 even
+    /// though `[[dog.bark.rules]]` could not parse at all — `Rule`'s
+    /// `#[serde(flatten)]` field and its (then) `deny_unknown_fields`
+    /// rejected `on` itself as an unknown key. See `rules.rs`'s own
+    /// `Rule`/[`rules::Trigger`] docs for the fix.
+    #[test]
+    fn the_documented_bark_config_parses_from_toml() {
+        let toml_str = r#"
+[sinks]
+oncall = { kind = "discord", url = "https://discord.com/api/webhooks/..." }
+audit = { kind = "json", url = "https://example.internal/hook" }
+
+[[rules]]
+on = "gave_up"
+sinks = ["oncall", "audit"]
+
+[[rules]]
+on = "restart_rate"
+restarts = 5
+within = "2m"
+sinks = ["oncall"]
+"#;
+        let config: BarkConfig =
+            toml::from_str(toml_str).expect("the documented [dog.bark] example must parse");
+        assert_eq!(config.sinks.len(), 2);
+        assert_eq!(config.rules.len(), 2);
+        assert_eq!(config.rules[0].when, rules::Trigger::GaveUp {});
+        assert_eq!(config.rules[0].sinks, vec!["oncall", "audit"]);
+        assert_eq!(
+            config.rules[1].when,
+            rules::Trigger::RestartRate {
+                restarts: 5,
+                within: UpDuration::from_millis(2 * 60_000),
+            }
+        );
+        assert_eq!(config.rules[1].sinks, vec!["oncall"]);
+        // Both rules must also survive `Rules::new`'s own validation
+        // against the sinks parsed alongside them — the parse succeeding
+        // is necessary but not sufficient for the dog to actually start.
+        Rules::new(config.rules, &config.sinks).expect("both documented rules route to real sinks");
     }
 }
