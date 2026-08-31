@@ -245,6 +245,22 @@ socket in the first place, and `$SHEP_DOG_NAME`, which is the `name` to put
 in that request. No `[dog.<name>]` value ever rides along beside them, for
 the reason given above. A section's key is not one of its values.
 
+**Put that name in the `Hello` too, as `dog_name`.** Optional, and nothing
+breaks without it right up until the shepherd is replaced by one your binary
+is too old to speak to. A refused handshake never reaches a request, so the
+`name` in `DogConfig` is unreadable at exactly the moment it is needed:
+which dog to restart. With it, the shepherd restarts you once from the
+binary on disk — which fixes the ordinary case, where the package already
+replaced your file and the running process is merely old — and reports you
+stale rather than looping if that restart is refused too. Without it you go
+quiet and nothing on either side says why.
+
+A dog written against `shep-client` gets both halves from
+`ReconnectingClient::connect_as_dog`, which fills the name in and also
+re-establishes the connection when the shepherd is replaced. `Client` does
+neither, deliberately: the CLI uses it, and a `shep stop` that silently
+retried could stop a sheep twice.
+
 Those two are what shep ADDS, not the whole environment. A dog is a
 supervised process like any other, so it also starts from the small base
 every sheep gets: `PATH`, plus whichever of `HOME`, `USER`, `LANG` and `TZ`

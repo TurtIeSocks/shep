@@ -335,6 +335,27 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       beside them.
     </p>
     <p>
+      Put that name in the <code>Hello</code> too, as{" "}
+      <code>dog_name</code>. It is optional, and nothing breaks without it
+      right up until the shepherd is replaced by one your binary is too old
+      to speak to. A refused handshake never reaches a request, so the name
+      in <code>DogConfig</code> is unreadable at exactly the moment it is
+      needed: which dog to restart. With it, the shepherd restarts you once
+      from the binary on disk, which fixes the ordinary case where the
+      package already replaced your file and the running process is merely
+      old, and reports you stale rather than looping if that restart is
+      refused too. Without it you go quiet and nothing on either side says
+      why.
+    </p>
+    <p>
+      A dog written against <code>shep-client</code> gets both halves from{" "}
+      <code>ReconnectingClient::connect_as_dog</code>, which fills the name
+      in and also re-establishes the connection when the shepherd is
+      replaced. <code>Client</code> does neither, deliberately: the CLI uses
+      it, and a <code>shep stop</code> that silently retried could stop a
+      sheep twice.
+    </p>
+    <p>
       Those two are what shep adds, not the whole environment. A dog is a
       supervised process like any other, so it also starts from the small
       base every sheep gets: <code>PATH</code>, plus whichever of{" "}
