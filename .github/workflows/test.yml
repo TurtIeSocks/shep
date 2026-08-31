@@ -280,7 +280,25 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+      # `--test-threads=2`, and the reason is musl rather than this job's
+      # own tests. `cli_e2e` spawns a real shepherd and real sheep per case,
+      # roughly ninety of them, and libtest runs them at one thread per core.
+      # musl's allocator is markedly slower than glibc's under exactly that
+      # load, so a suite that fits its budgets everywhere else does not fit
+      # them here: a case that waits twenty seconds for a line its child
+      # never got scheduled to write reports as a product failure.
+      #
+      # Twice now, and both times the triage cost more than the fix. The
+      # second was worse, because the branch it failed on was changing
+      # restart timing and the failure could not be dismissed until the log
+      # arrived.
+      #
+      # Two rather than one: this is a contention problem, not a wall-clock
+      # tier like `slow`, so the storm wants capping rather than the suite
+      # serialising. The number is a judgement call and the headroom is
+      # large, since this job has been running 132 to 185 seconds against a
+      # twenty-minute timeout. If it flakes here again, one is affordable.
+      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --test-threads=2 --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
   # CLAUDE.md's phase-gate cross-check
   # (`cargo check --workspace --all-targets --all-features --target
   # x86_64-pc-windows-gnu`) had no workflow behind it, so it only ran when a
