@@ -174,8 +174,9 @@ reviews:
 
     - path: "**/*.md"
       instructions: >-
-        Prose here is hand-written and hand-wrapped in a deliberate voice. Do
-        not suggest rewording, tightening, or rewrapping. Flag only factual
+        Except where a more-specific Markdown rule sets terminology, prose
+        here is hand-written and hand-wrapped in a deliberate voice. Do not
+        suggest rewording, tightening, or rewrapping. Flag only factual
         drift: a claim about behaviour that the diff makes false, a command
         that no longer exists, a sample that will not parse.
 
