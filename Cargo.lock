@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "shep"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "anstyle",
  "assert_cmd",
@@ -2096,11 +2096,11 @@ dependencies = [
 
 [[package]]
 name = "shep-cli"
-version = "0.1.19"
+version = "0.1.20"
 
 [[package]]
 name = "shep-client"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "futures-util",
  "nix 0.29.0",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "shep-core"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "annotate-snippets",
  "anstyle",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "shep-daemon"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "bytes",
  "chrono",
@@ -2172,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "shep-examples"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "nix 0.29.0",
 ]
