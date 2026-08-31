@@ -3481,6 +3481,7 @@ impl<R: ProcessRunner> Actor<R> {
             out_log,
             err_log,
             stdin_pipe,
+            channel,
         } = sheep;
         let app = normalize(carried.app().clone()).map_err(|source| AdoptError::Spec {
             sheep: carried.name().to_string(),
@@ -3565,6 +3566,7 @@ impl<R: ProcessRunner> Actor<R> {
                 out_log,
                 err_log,
                 stdin_pipe,
+                channel,
                 reaper: Arc::clone(reaper),
             })
             .map_err(|source| AdoptError::Runner {
@@ -3591,6 +3593,48 @@ impl<R: ProcessRunner> Actor<R> {
         // that has been up three days reporting three days in `shep flock`'s
         // UPTIME column instead of `0s` the moment a successor takes over.
         entry.started_at = Some(crate::handover::uptime::started_at_of(proc.pid()));
+        // A sheep the blob reports as `Starting` is one whose readiness has
+        // not resolved, and the wait that was going to resolve it was a task
+        // of the predecessor's that the exec took with it. Without a fresh
+        // one it stays `Starting` for the rest of this daemon's life:
+        // `handle_exited` is the only other thing that moves it off, so the
+        // sheep sits outside `listen_timeout` and outside every status an
+        // operator acts on.
+        //
+        // Re-armed rather than carried, because there is nothing to carry.
+        // The deadline is a `tokio::time::Instant` in a runtime that no
+        // longer exists, exactly as `started_at` is, and a probe's next
+        // attempt is a future rather than a value. So the successor starts
+        // the app's own `listen_timeout` again.
+        //
+        // What that costs is bounded and it is worth naming, because the
+        // race is not closeable from here. The blob is a snapshot taken on
+        // the actor loop, and a `{"kind":"ready"}` that arrives between it
+        // and the exec flips the predecessor's slot without reaching the
+        // blob, so the successor waits for a signal that has already been
+        // sent and will not come again. That wait ends at `listen_timeout`
+        // and `handle_ready_result` puts the sheep `Online` anyway, with a
+        // warning, so the worst case is one `listen_timeout` of `Starting`
+        // on a sheep that was already serving. The alternative is refusing
+        // to carry a `Starting` sheep at all, which restarts a whole flock
+        // over one app in its first three seconds.
+        //
+        // `manually` is `false` and cannot be anything else: it belongs to
+        // the spawn that armed the original wait, which is not this image's
+        // to know. It reaches only the `Online` event's own flag.
+        let ready_tx = (status == ProcStatus::Starting).then(|| {
+            let source = ReadinessSource::of(app.config())
+                .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
+            spawn_readiness_task(
+                id,
+                carried.epoch(),
+                false,
+                source,
+                app.config().listen_timeout.as_duration(),
+                spec_prober(&spec),
+                self.tx.clone(),
+            )
+        });
         let log_ctl = io.log_ctl.clone();
         let to_child = io.to_child.clone();
         let to_stdin = io.to_stdin.clone();
@@ -3616,12 +3660,11 @@ impl<R: ProcessRunner> Actor<R> {
                 manual: None,
                 pending_delete: false,
                 epoch: carried.epoch(),
-                // A readiness wait that was still running belonged to the
-                // predecessor's own task, which the exec took with it. An
-                // instance the blob reports as `Online` has already resolved
-                // one; one it reports as `Starting` has not, and stays
-                // `Starting` until it next exits — see this phase's residuals.
-                ready_tx: None,
+                // Armed above for an instance the blob reports as
+                // `Starting`, and `None` for one it reports as `Online`,
+                // which has already resolved its readiness and has nothing
+                // left to wait for.
+                ready_tx,
                 actions: ActionWaits::default(),
                 ready_failed: false,
             },
@@ -5918,6 +5961,7 @@ impl<R: ProcessRunner> Actor<R> {
                 pending_delete: slot.pending_delete,
                 epoch: slot.epoch,
                 log_ctl: slot.log_ctl.clone(),
+                channel_open: slot.open_channel().is_some(),
             })
             .collect();
         // `HashMap` iteration order is arbitrary, and the blob is written to
@@ -7718,6 +7762,19 @@ struct HandoverDraft {
     /// This sheep's log pump, or `None` for a slot whose spawn never
     /// succeeded.
     log_ctl: Option<mpsc::Sender<LogCtl>>,
+    /// Whether this sheep's shepherd channel is still one the daemon can
+    /// write to.
+    ///
+    /// Read here rather than taken from the pump's report, and the two are
+    /// not the same claim. The pump reports the number it was told at the
+    /// spawn and has no way to learn that the channel died: the writer task
+    /// ends on a write that fails, which is what a child that has closed its
+    /// fd 3 produces, and the socketpair's last reference goes with it. The
+    /// number then names whatever the kernel has since handed to the next
+    /// `open`. [`SheepSlot::open_channel`] is the fact that actually decides
+    /// delivery, and it is only reachable from the actor loop, which is
+    /// where this is read.
+    channel_open: bool,
 }
 
 /// Spawns the task that assembles one handover snapshot and answers its
@@ -7758,7 +7815,7 @@ fn spawn_handover_task(
             //   descriptors. For a wedged pump that is a value nothing ever
             //   reads: the gate refuses on the candidate, so this blob is
             //   dropped rather than written.
-            let (fds, pump_unresponsive) = match &draft.log_ctl {
+            let (mut fds, pump_unresponsive) = match &draft.log_ctl {
                 Some(log_ctl) => match report_fds(log_ctl).await {
                     PumpReport::Parked(fds) => {
                         parked.0.push(log_ctl.clone());
@@ -7769,6 +7826,15 @@ fn spawn_handover_task(
                 },
                 None => (CarriedFds::none(), false),
             };
+            // The one number the pump can report and be wrong about. See
+            // `HandoverDraft::channel_open` for why the pump cannot know,
+            // and `PipeFds::channel` for what it costs to carry a number
+            // the kernel has already reissued: `UnixStream::from(OwnedFd)`
+            // checks nothing, so the successor would write a shepherd
+            // message into whatever that descriptor is now.
+            if !draft.channel_open {
+                fds.channel = None;
+            }
             carried.push(CarriedSheep::from_entry(&draft.entry, draft.epoch, fds));
             candidates.push(OwnedCandidate {
                 entry: draft.entry,
@@ -17389,6 +17455,12 @@ mod tests {
     /// cannot adopt is not a gap it can repair: losing a sheep's stdout read
     /// end blocks the child on `write()` once the pipe buffer fills, which
     /// reads as an application hang rather than as a shep bug.
+    ///
+    /// One of the two sheep has a shepherd channel and the other does not,
+    /// which is the case below's subject and this one's precondition: the
+    /// channel is the one number a snapshot may drop, so a case with only
+    /// channelled sheep in it could not tell "every number is open" from
+    /// "every number is present".
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn a_blob_from_a_live_flock_names_open_descriptors_per_sheep() {
@@ -17398,10 +17470,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (fds, _held) = daemon_fds(&dir);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut talkative = AppConfig::minimal("api", "./srv");
+        talkative.channel = true;
         handle
             .start(vec![
                 normalize(AppConfig::minimal("web", "./srv")).unwrap(),
-                normalize(AppConfig::minimal("api", "./srv")).unwrap(),
+                normalize(talkative).unwrap(),
             ])
             .await
             .unwrap();
@@ -17411,11 +17485,61 @@ mod tests {
         assert_eq!(candidates.len(), 2, "both sheep must reach the gate");
         assert_eq!(blob.sheep().len(), 2);
         for sheep in blob.sheep() {
-            for fd in sheep.fds().all() {
-                let fd = fd.expect("the fake reports every descriptor a blob can carry");
+            for fd in sheep.fds().all().into_iter().flatten() {
                 assert!(is_open(fd), "blob names a closed descriptor: {fd}");
             }
         }
+    }
+
+    /// Fails if a snapshot names a shepherd-channel descriptor for a sheep
+    /// that has no shepherd channel.
+    ///
+    /// The pump reports the number it was told at the spawn and has no way
+    /// to learn that the channel is gone: the writer task ends on a write
+    /// that fails, which is what a child that has closed its fd 3 produces,
+    /// and the socketpair's last reference goes with it. So the number can
+    /// name whatever the kernel has since handed to the next `open`, and
+    /// `UnixStream::from(OwnedFd)` checks nothing — the successor would
+    /// write a shepherd message into a log file. `SheepSlot::open_channel`
+    /// is the fact that decides delivery, and the snapshot masks the field
+    /// with it.
+    ///
+    /// The fake reports a number for every field unconditionally, which is
+    /// what makes this case able to fail: without the mask it would see one.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_names_no_channel_for_a_sheep_that_has_none() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner =
+            ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut talkative = AppConfig::minimal("api", "./srv");
+        talkative.channel = true;
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("web", "./srv")).unwrap(),
+                normalize(talkative).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let (_candidates, blob, _parked) = handle.handover_snapshot(fds).await.unwrap();
+
+        let named: Vec<(&str, bool)> = blob
+            .sheep()
+            .iter()
+            .map(|sheep| (sheep.name(), sheep.fds().channel.is_some()))
+            .collect();
+        assert!(
+            named.contains(&("web", false)),
+            "a sheep with no channel must carry no channel descriptor: {named:?}"
+        );
+        assert!(
+            named.contains(&("api", true)),
+            "a sheep with a live channel must carry its descriptor: {named:?}"
+        );
     }
 
     /// Fails if a wedged log pump hangs the snapshot instead of refusing it.
@@ -17671,6 +17795,62 @@ mod tests {
         }
     }
 
+    /// fails if a sheep adopted mid-readiness is left `Starting` forever.
+    ///
+    /// The wait that was going to resolve it belonged to a task of the
+    /// predecessor's, and the `execve` took that with it. Nothing else in
+    /// the daemon moves a sheep off `Starting` except its own exit, so a
+    /// successor that adopts one without re-arming leaves it there for the
+    /// rest of that daemon's life: outside `listen_timeout`, outside every
+    /// status an operator acts on, and with none of `arm_extras`'s watch,
+    /// cron or memory limits, which fire at the `Online` transition.
+    ///
+    /// The readiness here is `wait_ready`, the case 2b task 5 opened the
+    /// gate to: its signal comes over the shepherd channel, so a sheep can
+    /// still be waiting for one at the moment of the exec. The assertion is
+    /// deliberately the TIMEOUT arm rather than the signal arm, since
+    /// nothing here writes `{"kind":"ready"}` — `handle_ready_result` puts a
+    /// timed-out sheep `Online` anyway rather than erroring, so reaching
+    /// `Online` at all is proof a wait was armed. Without one the clock can
+    /// advance as far as it likes and nothing happens.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_sheep_that_was_still_starting_reaches_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, Some(4242), |entry| {
+                    let mut app = AppConfig::minimal("web", "./srv");
+                    app.autorestart = false;
+                    app.wait_ready = true;
+                    entry.spec = normalize(app).unwrap();
+                    entry.status = ProcStatus::Starting;
+                }))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        assert_eq!(
+            sup.list().await[0].status,
+            ProcStatus::Starting,
+            "the blob said this sheep was still starting, so the successor must agree"
+        );
+
+        // Polled rather than advanced by a fixed amount: the wait runs on a
+        // task, so its result reaches the actor a message later than the
+        // deadline. Bounded well past the app's own 3s `listen_timeout`, so
+        // a sheep that is never armed fails here rather than hanging.
+        let goes_online = async {
+            while sup.list().await[0].status != ProcStatus::Online {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), goes_online)
+            .await
+            .expect("an adopted sheep left `Starting` must still have a readiness wait over it");
+    }
+
     /// One sheep as a blob describes it, with `mutate` free to give it a
     /// history no fresh registration could have.
     #[cfg(unix)]
@@ -17716,6 +17896,7 @@ mod tests {
             out_log: None,
             err_log: None,
             stdin_pipe: None,
+            channel: None,
         }
     }
 

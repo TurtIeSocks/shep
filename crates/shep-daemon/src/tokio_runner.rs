@@ -656,17 +656,17 @@ impl ProcessRunner for TokioRunner {
     /// the one the sheep has been running under all along. From the sheep's
     /// side the shepherd was never away.
     ///
-    /// The shepherd channel's two are closed here rather than left
-    /// dangling, exactly as a spawn closes the ones its own spec did not ask
-    /// for: the fitness gate refuses to carry a sheep with a shepherd
-    /// channel, so a carried sheep has none, and a caller's `is_closed()`
-    /// says so at once instead of a send buffering into a channel nobody
-    /// drains.
+    /// Stdin and the shepherd channel are both carried. A sheep whose blob
+    /// named a stdin write end gets a stdin pump on it again, so `shep
+    /// whisper` reaches the same fd 0 the child has had open all along; one
+    /// whose blob named a channel gets the same pair of pumps a spawn wires
+    /// put back on the same socketpair, so the child's fd 3 is undisturbed
+    /// in both directions.
     ///
-    /// Stdin is the one a handover does carry. A sheep whose blob named a
-    /// write end gets a stdin pump on it again, so `shep whisper` reaches
-    /// the same fd 0 the child has had open all along; one that named none
-    /// is closed like the two above.
+    /// What a blob named neither of is closed here rather than left
+    /// dangling, exactly as a spawn closes the ends its own spec did not
+    /// ask for: a caller's `is_closed()` then says so at once, instead of a
+    /// send buffering into a channel nobody drains.
     #[cfg(unix)]
     fn adopt(&self, spec: AdoptSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         let AdoptSpec {
@@ -678,6 +678,7 @@ impl ProcessRunner for TokioRunner {
             out_log,
             err_log,
             stdin_pipe,
+            channel,
             reaper,
         } = spec;
 
@@ -691,6 +692,7 @@ impl ProcessRunner for TokioRunner {
             out: out_pipe.as_ref().map(AsRawFd::as_raw_fd),
             err: err_pipe.as_ref().map(AsRawFd::as_raw_fd),
             stdin: stdin_pipe.as_ref().map(AsRawFd::as_raw_fd),
+            channel: channel.as_ref().map(AsRawFd::as_raw_fd),
         };
         spawn_log_pump(
             out_pipe,
@@ -703,9 +705,13 @@ impl ProcessRunner for TokioRunner {
         );
 
         let (from_child_tx, from_child) = mpsc::channel(CHANNEL_CAPACITY);
-        drop(from_child_tx);
         let (to_child, to_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        drop(to_child_rx);
+        if let Some(channel) = channel {
+            spawn_channel_pumps(channel, from_child_tx, to_child_rx);
+        } else {
+            drop(from_child_tx);
+            drop(to_child_rx);
+        }
         let (to_stdin, to_stdin_rx) = mpsc::channel(CHANNEL_CAPACITY);
         if let Some(stdin_pipe) = stdin_pipe {
             spawn_stdin_pump(Some(stdin_pipe), to_stdin_rx);
@@ -915,6 +921,11 @@ impl ProcessRunner for TokioRunner {
             drop(to_child_rx);
         }
 
+        // Declared out here because the block below moves `daemon_end` into
+        // its pumps, and `PipeFds` is assembled after the spawn: this is the
+        // one moment the number is in reach.
+        #[cfg(unix)]
+        let mut channel_fd: Option<RawFd> = None;
         #[cfg(unix)]
         if spec.channel {
             command.env("SHEP_CHANNEL_FD", "3");
@@ -957,6 +968,7 @@ impl ProcessRunner for TokioRunner {
                 .map_err(|error| {
                     RunnerError::SpawnFailed(format!("shepherd channel fd mapping: {error}"))
                 })?;
+            channel_fd = Some(daemon_end.as_raw_fd());
             spawn_channel_pumps(daemon_end, from_child_tx, to_child_rx);
         } else {
             // No channel requested: close both ends immediately rather than
@@ -1023,6 +1035,10 @@ impl ProcessRunner for TokioRunner {
             // the same reason the two above are read here: after it, there
             // is nothing left on `child` to read a number off.
             stdin: child.stdin.as_ref().map(AsRawFd::as_raw_fd),
+            // Read further up still, before the socketpair's daemon end was
+            // moved into its pumps. Nothing on `child` names it: the child's
+            // side is fd 3 over there, and this is the other end.
+            channel: channel_fd,
         };
         #[cfg(not(unix))]
         let pipes = PipeFds;
@@ -1315,6 +1331,31 @@ struct PipeFds {
     /// Unlike those two, it is never cleared as a stream ends. It has no
     /// EOF to reach, and the pump that could observe one is not this pump.
     stdin: Option<RawFd>,
+    /// The daemon's end of the child's shepherd-channel socketpair, held by
+    /// that channel's two pump tasks rather than by this one.
+    ///
+    /// Reported here for the reason [`Self::stdin`] gives: this pump is the
+    /// only party a snapshot asks, and a second seam for one number would
+    /// be a second thing to keep in step with the first.
+    ///
+    /// # What pins it, and the one thing that does not
+    ///
+    /// The writer task ends only when the last `to_child` sender drops, and
+    /// the supervisor's own slot holds one for as long as a process is
+    /// running under this id, so the socket cannot be closed and its number
+    /// handed to the next `open` while the sheep is up. That is the same
+    /// ownership argument stdin makes.
+    ///
+    /// It is weaker in one place, and the supervisor closes the gap rather
+    /// than this pump. The writer ALSO ends on a write that fails, which is
+    /// what a child that has closed its fd 3 produces, and this pump never
+    /// hears about it: the number here would go on naming a descriptor the
+    /// kernel has already reissued. `Actor::handle_handover_snapshot` reads
+    /// `SheepSlot::open_channel` in the same breath as it reads the slot,
+    /// and a snapshot masks this field when that says the channel is gone.
+    /// So this number is only ever as true as the pump can make it, and the
+    /// supervisor is what makes it true.
+    channel: Option<RawFd>,
 }
 
 /// See the unix definition above; there is nothing to carry here.
@@ -1543,6 +1584,7 @@ impl LogFiles {
                     out_log: self.out.raw_fd(),
                     err_log: self.err.raw_fd(),
                     stdin: self.pipes.stdin,
+                    channel: self.pipes.channel,
                 });
             }
             // No acknowledgement to send, and nothing to undo but the flag:
@@ -2297,6 +2339,7 @@ mod tests {
                 out: Some(out_reader.as_raw_fd()),
                 err: Some(err_reader.as_raw_fd()),
                 stdin: None,
+                channel: None,
             };
             let (logs_tx, logs) = mpsc::channel(CHANNEL_CAPACITY);
             let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -2724,6 +2767,7 @@ mod tests {
             out: Some(reader.as_raw_fd()),
             err: None,
             stdin: None,
+            channel: None,
         };
         spawn_log_pump(
             Some(reader),
@@ -3711,6 +3755,7 @@ mod tests {
             out: None,
             err: None,
             stdin: Some(daemon_end.as_raw_fd()),
+            channel: None,
         };
         spawn_log_pump(
             Some(out_reader),
@@ -3750,7 +3795,7 @@ mod tests {
         .expect("the daemon's end of a stdin pipe is writable");
 
         let (_proc, io) = TokioRunner::new()
-            .adopt(adopt_spec(&dir, Some(daemon_end)))
+            .adopt(adopt_spec(&dir, Some(daemon_end), None))
             .expect("the real runner must be able to adopt");
 
         let (done, ack) = oneshot::channel();
@@ -3785,13 +3830,132 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let (_proc, io) = TokioRunner::new()
-            .adopt(adopt_spec(&dir, None))
+            .adopt(adopt_spec(&dir, None, None))
             .expect("the real runner must be able to adopt");
 
         assert!(io.to_stdin.is_closed());
     }
 
-    /// The plainest adoption, with `stdin_pipe` the only handle it carries.
+    /// fails if a descriptor report leaves out the sheep's shepherd
+    /// channel.
+    ///
+    /// The number belongs to that channel's two pump tasks rather than to
+    /// this one, exactly as the stdin number belongs to the stdin pump, and
+    /// the log pump is told it for the same reason: it is the only party a
+    /// snapshot asks. A report that dropped it would hand the successor a
+    /// sheep whose fd 3 the exec closed, so a `shep trigger` reaches
+    /// nothing and the app sees its channel end for no reason it can
+    /// observe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_names_the_shepherd_channel_it_was_told_about() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real socketpair, held for the length of the case exactly as the
+        // channel's own pumps hold it in production.
+        let (daemon_end, _child_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_out_writer, out_reader) = tokio::io::duplex(STREAM_BUFFER);
+        let (logs_tx, _logs) = mpsc::channel(CHANNEL_CAPACITY);
+        let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let pipes = PipeFds {
+            out: None,
+            err: None,
+            stdin: None,
+            channel: Some(daemon_end.as_raw_fd()),
+        };
+        spawn_log_pump(
+            Some(out_reader),
+            None::<DuplexStream>,
+            LogSink::Path(dir.path().join("out.log")),
+            LogSink::Path(dir.path().join("err.log")),
+            logs_tx,
+            ctl_rx,
+            pipes,
+        );
+
+        let (done, ack) = oneshot::channel();
+        ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+        let fds = timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a descriptor report must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        assert_eq!(fds.channel, Some(daemon_end.as_raw_fd()));
+    }
+
+    /// fails if an adopted shepherd channel is not wired back to both
+    /// `to_child` and `from_child`.
+    ///
+    /// Both directions in one case, because the failure to catch is a
+    /// successor that rebuilt one pump and not the other, and either half
+    /// alone looks healthy from the other side. Writing proves
+    /// `shutdown_with_message` and `shep trigger` still land; reading proves
+    /// `{"kind":"ready"}` and every action reply still come back, which is
+    /// what a `wait_ready` sheep's whole lifecycle turns on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_shepherd_channel_carries_both_directions() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        // `child_end` is what an app holds on fd 3, unmoved by the handover.
+        // Both ends are async here rather than one of each: the write below
+        // is served by a task the adoption spawned, so a blocking read on
+        // this thread would park the runtime before that task ever ran.
+        let (daemon_end, child_end) = tokio::net::UnixStream::pair().unwrap();
+        let (child_read, mut child_write) = tokio::io::split(child_end);
+        let mut child = tokio::io::BufReader::new(child_read);
+
+        let (_proc, mut io) = TokioRunner::new()
+            .adopt(adopt_spec(&dir, None, Some(daemon_end)))
+            .expect("the real runner must be able to adopt");
+
+        io.to_child
+            .send(ShepherdMessage::Shutdown)
+            .await
+            .expect("an adopted sheep must still have a channel writer");
+        let mut line = String::new();
+        timeout(PUMP_DEADLINE, child.read_line(&mut line))
+            .await
+            .expect("the shepherd's message must reach the child's end")
+            .expect("the child end must read");
+        assert_eq!(line.trim_end(), r#"{"kind":"shutdown"}"#);
+
+        child_write
+            .write_all(b"{\"kind\":\"ready\"}\n")
+            .await
+            .unwrap();
+        let back = timeout(PUMP_DEADLINE, io.from_child.recv())
+            .await
+            .expect("an adopted sheep must still have a channel reader")
+            .expect("the reader must forward what the child said");
+        assert_eq!(back, ChildMessage::Ready);
+    }
+
+    /// fails if an adopted sheep that never had a channel is given ends
+    /// nothing drains.
+    ///
+    /// `is_closed()` is the one question the supervisor asks about
+    /// `to_child` (see `SheepSlot::open_channel`), so a dangling receiver
+    /// would have a `shep trigger` against a sheep with no fd 3 wait out its
+    /// whole `action_timeout` instead of answering `NoChannel` at once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_sheep_without_a_channel_has_closed_channel_ends() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (_proc, mut io) = TokioRunner::new()
+            .adopt(adopt_spec(&dir, None, None))
+            .expect("the real runner must be able to adopt");
+
+        assert!(io.to_child.is_closed());
+        assert!(
+            io.from_child.recv().await.is_none(),
+            "a sheep with no channel must report one that is over, not one that is quiet"
+        );
+    }
+
+    /// The plainest adoption, with `stdin_pipe` and `channel` the only
+    /// handles it carries.
     ///
     /// Every other handle is `None`, which is the shape a sheep whose log
     /// opens had failed arrives in; nothing here reads them. The pid is this
@@ -3801,6 +3965,7 @@ mod tests {
     fn adopt_spec(
         dir: &tempfile::TempDir,
         stdin_pipe: Option<tokio::net::unix::pipe::Sender>,
+        channel: Option<tokio::net::UnixStream>,
     ) -> AdoptSpec {
         AdoptSpec {
             pid: std::process::id(),
@@ -3811,6 +3976,7 @@ mod tests {
             out_log: None,
             err_log: None,
             stdin_pipe,
+            channel,
             reaper: Arc::new(crate::runner::AdoptedReaper::new()),
         }
     }

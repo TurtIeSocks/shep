@@ -3452,15 +3452,18 @@ mod tests {
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
         let daemon = boot(
-            ScriptedRunner::new(vec![ProcScript::never_exits()]),
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 2]),
             paths.clone(),
             BootOptions::default(),
         )
         .await
         .unwrap();
         let ctx = daemon.context();
-        let mut app = AppConfig::minimal("chatty", "./srv");
-        app.channel = true;
+        // Two instances: a sheep the gate still refuses. It was a shepherd
+        // channel until 2b task 5 carried one, and the case is about the
+        // gate firing at all rather than about which feature fires it.
+        let mut app = AppConfig::minimal("clustered", "./srv");
+        app.instances = 2;
         ctx.supervisor
             .start(vec![normalize(app).unwrap()])
             .await
@@ -3476,9 +3479,9 @@ mod tests {
         };
         let refusal = hand_over_now(&seam)
             .await
-            .expect_err("a flock with a shepherd channel cannot be carried");
+            .expect_err("a flock with more than one instance cannot be carried");
         assert!(
-            refusal.contains("shepherd channel"),
+            refusal.contains("more than one instance"),
             "the gate must refuse before anything is exec'd: {refusal}"
         );
 
@@ -3514,7 +3517,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
-        let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 2]));
+        let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 3]));
         let daemon = boot(
             SharedRunner(Arc::clone(&runner)),
             paths.clone(),
@@ -3524,18 +3527,20 @@ mod tests {
         .unwrap();
         let ctx = daemon.context();
         let plain = AppConfig::minimal("quiet", "./srv");
-        // The refusal: a shepherd channel is a sheep 2a cannot carry, and
-        // the gate reads it after every pump has already been reported to.
-        let mut talkative = AppConfig::minimal("chatty", "./srv");
-        talkative.channel = true;
+        // The refusal: more than one instance is a sheep this daemon still
+        // cannot carry, and the gate reads it after every pump has already
+        // been reported to. It was a shepherd channel until 2b task 5
+        // carried one; what the case needs is any refusal at all.
+        let mut clustered = AppConfig::minimal("clustered", "./srv");
+        clustered.instances = 2;
         ctx.supervisor
             .start(vec![
                 normalize(plain).unwrap(),
-                normalize(talkative).unwrap(),
+                normalize(clustered).unwrap(),
             ])
             .await
             .unwrap();
-        for sheep in 0..2 {
+        for sheep in 0..3 {
             assert!(
                 runner.log_ctl_live(sheep),
                 "sheep {sheep} must have a live log pump before the report, or this case                  proves nothing"
@@ -3552,9 +3557,9 @@ mod tests {
         };
         let refusal = hand_over_now(&seam)
             .await
-            .expect_err("a flock with a shepherd channel cannot be carried");
+            .expect_err("a flock with more than one instance cannot be carried");
         assert!(
-            refusal.contains("shepherd channel"),
+            refusal.contains("more than one instance"),
             "the gate must refuse before anything is exec'd: {refusal}"
         );
 
@@ -3562,15 +3567,15 @@ mod tests {
         // (see `LogCtl::Resume`), so a send that has returned has been
         // queued rather than served. Bounded, so a pump that is never told
         // fails here instead of hanging.
-        let both_resumed = async {
-            while runner.resumes(0) == 0 || runner.resumes(1) == 0 {
+        let all_resumed = async {
+            while (0..3).any(|sheep| runner.resumes(sheep) == 0) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        tokio::time::timeout(Duration::from_secs(10), both_resumed)
+        tokio::time::timeout(Duration::from_secs(10), all_resumed)
             .await
             .expect("every pump a refused handover reported to must be reading again");
-        for sheep in 0..2 {
+        for sheep in 0..3 {
             assert_eq!(
                 runner.resumes(sheep),
                 1,

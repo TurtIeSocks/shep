@@ -186,7 +186,7 @@ Sketch only.
 
 One refusal each, from `handover::fitness`: `Stdin`, `Channel`, `MultiInstance`, `Dog`.
 
-`Stdin` is one more descriptor through machinery that already carries four. The channel is a socketpair with two pump tasks, structurally the log pipes again. Multi-instance is the one to distrust: `merge_logs` gives several sheep handles on ONE inode, and 8a measured that the fd count does not fall when logs are merged. Dogs survive the exec as children for free; what needs designing is their reconnect, and Phase 3 owns their version axis.
+`Stdin` is one more descriptor through machinery that already carries four. The channel was sketched as "a socketpair with two pump tasks, structurally the log pipes again"; it is one descriptor rather than two, it needs no parking, and the work turned out to be in two places the sketch did not name — see task 5's outcome. Multi-instance is the one to distrust: `merge_logs` gives several sheep handles on ONE inode, and 8a measured that the fd count does not fall when logs are merged. Dogs survive the exec as children for free; what needs designing is their reconnect, and Phase 3 owns their version axis.
 
 Sketch only. Each removes exactly one variant and its test.
 
@@ -216,6 +216,64 @@ One residual, not closed and not new. A pump inside `write_all` at the exec leav
 ##### Drill, measured
 
 Six `shep daemon reload`s over a flock of two, one of them `/bin/cat` with `stdin = true`. Every reload exit 0, the shepherd's pid unmoved at 97553, both sheep unmoved at 97575 and 97576, uptime continuous. A `shep whisper` after each reload reached the same never-restarted `cat`, whose echo landed in its own log file in order, no gaps and no duplicates.
+
+#### Task 5: the shepherd channel
+
+- [x] **Step 1: Write the failing tests**
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Prove each one non-vacuous**
+- [x] **Step 5: Drive a real reload, and trigger the sheep afterwards**
+- [x] **Step 6: Task gate, then commit**
+
+##### Outcome
+
+**One descriptor, not two, and no parking.** The sketch called it the log pipes again; it is neither shape. A socketpair is ONE open file description that is read and written at once, so `CarriedFds` grew a sixth field rather than a pair, and `tokio::io::split`'s two halves share it. And the read side needs no quiescence, for three reasons worth keeping:
+
+- the framing is newline-delimited and the reader's error arm warns and continues rather than breaking, so a frame torn at the exec costs one message and resynchronises at the next newline. There is no permanent desync to prevent.
+- every message the window can lose is already bounded. A lost `ready` is absorbed by the successor's re-armed wait, which puts the sheep `Online` at its deadline anyway; a lost `action-reply` had no client left to reach, because the exec dropped that connection; a `metric` is a debug log line.
+- parking a channel reader has a failure mode parking a log pump does not. A missed un-park stops draining fd 3, the socket fills, and the APP blocks on write. The log-pump version of that mistake stops logging.
+
+**The work was in two places the sketch did not name, and neither is about descriptors.**
+
+**The first is `wait_ready`, and it was a real bug rather than a new feature.** A sheep gated on readiness is `Starting`, and the wait that would resolve it is a task of the predecessor's that the `execve` takes away. Nothing else moves a sheep off `Starting` except its own exit, so a successor that adopted one left it there for the rest of that daemon's life: outside `listen_timeout`, outside every status an operator acts on, and without `arm_extras`'s watch, cron and memory limits, which fire at the `Online` transition. `install_adopted` now re-arms the wait from the app's own `listen_timeout`.
+
+That bug was NOT new to this task. `readiness_probe` gates a sheep the same way and the gate has never refused one, so a probe-gated sheep caught mid-start has been carried and stranded since 2a. The `Starting` comment in `install_adopted` recorded the behaviour as a residual; it was reachable on `main`.
+
+One race is not closeable from the successor's side and is documented at the re-arm. The blob is a snapshot taken on the actor loop, so a `{"kind":"ready"}` arriving between it and the exec flips the predecessor's slot without reaching the blob, and the successor then waits for a signal already sent. That wait ends at `listen_timeout` and `handle_ready_result` puts the sheep `Online` anyway, with a warning, so the cost is bounded at one `listen_timeout` of `Starting` on a sheep that was already serving. The alternative was refusing to carry a `Starting` sheep at all, which restarts a whole flock over one app in its first three seconds.
+
+**The second is that the log pump can report a channel number and be wrong about it.** The pump is told the number at the spawn, exactly as it is told stdin's, and stdin's pinning argument does not transfer. The stdin pump ends only when the last sender drops; the channel's WRITER also ends on a write that fails, which is what a child that has closed its fd 3 produces, and the socketpair's last reference goes with it. The number then names whatever the kernel has since handed to the next `open`, and `UnixStream::from(OwnedFd)` checks nothing, so the successor would write a shepherd message into a log file.
+
+`SheepSlot::open_channel` is the fact that actually decides delivery and it is only reachable from the actor loop, so `handle_handover_snapshot` reads it alongside the slot and the snapshot masks the field with it. `adopt_channel` adds the kind check the two pipe fields get free from `from_file`: `getpeername` refuses anything that is not a socket (`ENOTSOCK`) and anything listening rather than connected (`ENOTCONN`, which is what this daemon's own control listener answers).
+
+The drill below measures what that mask is worth, because a build without it was measured too.
+
+**Three refusals left**, and the module header says so now instead of naming 2a: a dog, more than one instance, an in-flight reload, and an operator's pending stop or delete. Two existing tests moved off `channel = true` onto `instances = 2`, since what they are about is the gate firing at all.
+
+##### Drill, measured
+
+Five `shep daemon reload`s over a flock of three: a `wait_ready` + `channel` sheep that answers a `ping` action with its own pid, an `awk` counter with no sleep, and a `shutdown_with_message` sheep.
+
+| | before | after 5 reloads |
+|---|---|---|
+| shepherd pid | 57775 | 57775 |
+| chatty / fast / bye pids | 57796 / 57797 / 57798 | 57796 / 57797 / 57798 |
+| `shep trigger chatty ping` | `replied pong-57796` | `replied pong-57796` after every one |
+
+Every reload exit 0. The reply body carries the CHILD's own pid, which is the assertion a pid check cannot make: a socketpair that survived as a number but was attached to the wrong end, or re-paired by the successor, answers nothing at all. `shep stop bye` afterwards put `told: {"kind":"shutdown"}` in that sheep's log, so the writer direction still reached a child five execs later.
+
+The counter, 52,320,601 lines across those five reloads: **0 whole lines lost, 0 duplicates, 4 seams.** Each seam is task 1's known residual and nothing else, for example `28182606 / 8182607 / 28182608`, where `8182607` is the tail of `28182607`. One of the five reloads produced no seam at all. So carrying the channel did not disturb the log path.
+
+**`wait_ready` across the exec, its own run.** An app that sleeps 8s before writing `{"kind":"ready"}`, with `listen_timeout = "60s"`, reloaded at t+2 while `starting`: shepherd unmoved at 58570, sheep unmoved at 58591, still `starting` at t+8, `online` at t+10, and a `trigger` afterwards answered `pong-58591`. The readiness signal was written AFTER the exec and came up the carried socketpair into a wait the successor armed.
+
+**The mask, measured both ways.** An app that does `exec 3>&-` and keeps running, then two `shep trigger`s (`timed_out`, then `no_channel` once the writer task had broken), then one reload:
+
+| build | reload | shepherd pid | sheep pid |
+|---|---|---|---|
+| shipped | exit 0, handover | 58954 unmoved | 58975 unmoved |
+| mask removed | exit 0, and `the shepherd did not come back on this version after the handover signal; starting one instead` | 59335 → 59461 | 59356 → 59483 |
+
+Without the mask the successor refused to boot on the stale descriptor, the predecessor had already exec'd away, and the CLI's fallback started a fresh shepherd that restarted the flock from the roll. `shep daemon reload` still exited 0. That is the whole cost of the handover, paid silently, after one `shep trigger` at a child that closed fd 3.
 
 ---
 
@@ -251,10 +309,10 @@ Baselines on that drill, three reloads: `origin/main` loses about 2900 lines, 2b
 
 ## Working state, for whoever picks this up
 
-- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2 and 4 committed; task 3 folded into 1.
-- Counts after task 4: **631** daemon lib with `--skip ::slow::`, **2084** workspace.
+- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2, 4 and 5 committed; task 3 folded into 1.
+- Counts after task 5: **641** daemon lib with `--skip ::slow::`, **2096** workspace.
 - The rejected buffer-carry patch is at `stash@{0}` and in this session's scratchpad as `task1-carry.patch`. Read it for plumbing, not design.
-- `handover/mod.rs`'s module header still says "Phase 2a carries only the plainest sheep". Task 4 struck stdin from its list; tasks 5 to 7 have the rest of it to strike.
+- `handover/mod.rs`'s module header now names phase 2b and the three refusals left. Tasks 6 and 7 have the rest of them to strike.
 - PR #73 has two threads left open for 2b. Both are now addressed: the `report_fds` deadline is task 2, and descriptor pinning fell out of task 1's parking. They can be closed with a pointer to those commits.
 - `spawn_handover_task` visits sheep serially, so a flock of wedged pumps waits N x 2s before the fallback. Named in `REPORT_DEADLINE`'s doc, not fixed.
 

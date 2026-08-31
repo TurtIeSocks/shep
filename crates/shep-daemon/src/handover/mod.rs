@@ -2,9 +2,10 @@
 //! place, the [`Handover`] blob that describes it, and (in a later task) the
 //! exec that carries it.
 //!
-//! Phase 2a carries only the plainest sheep: no shepherd channel, no dog,
-//! one instance, no in-flight reload, and nothing an operator has
-//! already asked to stop or delete. [`fitness`] is the gate: get it wrong in
+//! Four things are still not carried: a dog, more than one instance, an
+//! in-flight reload, and anything an operator has already asked to stop or
+//! delete. A sheep's stdout, stderr, log files, stdin pipe and shepherd
+//! channel all cross the exec. [`fitness`] is the gate: get it wrong in
 //! the permissive direction and a half-built handover corrupts a live
 //! flock; get it wrong in the strict direction and the caller merely falls
 //! back to the stop-and-start arm that already works. That asymmetry is why
@@ -74,12 +75,6 @@ pub enum RefusedReason {
         /// The sheep's name.
         sheep: String,
     },
-    /// The sheep holds a shepherd channel: `channel`, `wait_ready` or
-    /// `shutdown_with_message`, whose socketpair 2b carries.
-    Channel {
-        /// The sheep's name.
-        sheep: String,
-    },
     /// The sheep is a dog, which 2b's descriptor inventory does not cover
     /// yet.
     Dog {
@@ -123,7 +118,6 @@ impl core::fmt::Display for RefusedReason {
                      time; reload falls back to a stop-and-start instead"
                 );
             }
-            Self::Channel { sheep } => (sheep, "a shepherd channel"),
             Self::Dog { sheep } => (sheep, "being a dog"),
             Self::MultiInstance { sheep } => (sheep, "more than one instance"),
             Self::ReloadInFlight { sheep } => (sheep, "an in-flight reload"),
@@ -224,9 +218,6 @@ fn refusal(candidate: &Candidate<'_>) -> Option<RefusedReason> {
 
     if candidate.pump_unresponsive {
         return Some(RefusedReason::PumpUnresponsive { sheep: name() });
-    }
-    if config.channel || config.wait_ready || config.shutdown_with_message {
-        return Some(RefusedReason::Channel { sheep: name() });
     }
     if entry.dog.is_some() {
         return Some(RefusedReason::Dog { sheep: name() });
@@ -726,10 +717,11 @@ impl CarriedSheep {
     }
 }
 
-/// The descriptor numbers one sheep's output travels on, and the one its
-/// input travels back through.
+/// The descriptor numbers one sheep's output travels on, the one its input
+/// travels back through, and the one that carries both directions of its
+/// shepherd channel.
 ///
-/// Grouped rather than spelled as five fields on [`CarriedSheep`] for two
+/// Grouped rather than spelled as six fields on [`CarriedSheep`] for two
 /// reasons: they are all `Option<RawFd>`, so a constructor taking them
 /// positionally would let a caller swap two of them silently, and four of
 /// them share one fact, which is that a running instance has all four and a
@@ -742,10 +734,10 @@ impl CarriedSheep {
 /// pipe buffer fills, which reads as an application hang rather than as a
 /// shep bug.
 ///
-/// [`Self::stdin`] is the exception on both counts, and it is the only
-/// field here whose direction is the other way round: it is a WRITE end the
-/// daemon holds, and it is present only for a running sheep whose app asked
-/// for one.
+/// [`Self::stdin`] and [`Self::channel`] are the exceptions on both counts.
+/// Each is present only for a running sheep whose app asked for it, and
+/// neither is a read end the daemon drains one way: stdin is a WRITE end,
+/// and the channel is one socket the daemon reads and writes at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CarriedFds {
     /// The read end of the sheep's stdout pipe.
@@ -782,23 +774,45 @@ pub struct CarriedFds {
     /// `a_blob_written_before_stdin_was_carried_still_loads`, which loads a
     /// blob with the key removed.
     pub stdin: Option<RawFd>,
+    /// The daemon's end of the sheep's shepherd-channel socketpair, whose
+    /// other end is the child's fd 3.
+    ///
+    /// One number for both directions, unlike every other field here: a
+    /// socketpair is one descriptor that is read and written at the same
+    /// time, so `spawn_channel_pumps` splits it into two tasks over one
+    /// open file description rather than into two descriptors.
+    ///
+    /// `None` for a sheep whose app set none of `channel`, `wait_ready` or
+    /// `shutdown_with_message` (`assemble` folds all three into one flag),
+    /// for a sheep that is not running, and for one whose child has closed
+    /// its fd 3 and left the daemon's writer nothing to write to. The last
+    /// of those is why the snapshot masks this field rather than reporting
+    /// whatever number a pump last saw: see `SheepSlot::open_channel`.
+    ///
+    /// An absent field loads as `None` for the reason [`Self::stdin`] gives
+    /// at length, and [`VERSION`] is unmoved for the same reason. A
+    /// predecessor from before this field existed refused to carry a sheep
+    /// with a channel at all, so `None` is what its blobs truthfully mean.
+    pub channel: Option<RawFd>,
 }
 
 impl CarriedFds {
-    /// The five numbers, listener-order irrelevant but fixed: stdout's pipe,
-    /// stderr's pipe, stdout's log, stderr's log, stdin's pipe.
+    /// The six numbers, listener-order irrelevant but fixed: stdout's pipe,
+    /// stderr's pipe, stdout's log, stderr's log, stdin's pipe, the
+    /// shepherd channel.
     ///
-    /// One array rather than five field reads, so a caller that walks all of
+    /// One array rather than six field reads, so a caller that walks all of
     /// them — clearing `FD_CLOEXEC`, checking each is open — cannot walk
-    /// four by mistake.
+    /// five by mistake.
     #[must_use]
-    pub const fn all(&self) -> [Option<RawFd>; 5] {
+    pub const fn all(&self) -> [Option<RawFd>; 6] {
         [
             self.out_pipe,
             self.err_pipe,
             self.out_log,
             self.err_log,
             self.stdin,
+            self.channel,
         ]
     }
 
@@ -814,6 +828,7 @@ impl CarriedFds {
             out_log: None,
             err_log: None,
             stdin: None,
+            channel: None,
         }
     }
 }
@@ -1203,9 +1218,9 @@ mod tests {
         // Not per-sheep. The blob describes one process image, so a flock is
         // carried whole or not at all.
         let plain_entry = entry_fixture(|_| {});
-        let channelled = entry_fixture(|app| app.channel = true);
+        let clustered = entry_fixture(|app| app.instances = 2);
         assert!(matches!(
-            fitness(&[plain(&plain_entry), plain(&channelled)]),
+            fitness(&[plain(&plain_entry), plain(&clustered)]),
             Fitness::Refused(_)
         ));
     }
@@ -1214,12 +1229,12 @@ mod tests {
     fn the_refusal_names_which_sheep_and_why() {
         // The operator sees this in `shep daemon reload`'s output, so it has
         // to say what to do about it, not just that it declined.
-        let channelled = entry_fixture(|app| app.channel = true);
-        let Fitness::Refused(r) = fitness(&[plain(&channelled)]) else {
+        let clustered = entry_fixture(|app| app.instances = 2);
+        let Fitness::Refused(r) = fitness(&[plain(&clustered)]) else {
             panic!("expected a refusal")
         };
         let text = r.to_string();
-        assert!(text.contains("shepherd channel"), "{text}");
+        assert!(text.contains("more than one instance"), "{text}");
     }
 
     /// A wedged pump refuses, and says so as a fault rather than as a
@@ -1256,22 +1271,42 @@ mod tests {
         assert_eq!(fitness(&[]), Fitness::Carryable);
     }
 
+    /// fails if the gate still refuses a sheep that asked for a shepherd
+    /// channel by its own name.
+    ///
+    /// One socketpair, carried by number in [`CarriedFds::channel`]. What
+    /// the successor rebuilds on it is the same pair of pumps a spawn
+    /// wires, so the child's fd 3 is the fd 3 it has had all along.
     #[test]
-    fn wait_ready_alone_refuses_as_a_channel() {
-        let e = entry_fixture(|app| app.wait_ready = true);
-        assert!(matches!(
-            fitness(&[plain(&e)]),
-            Fitness::Refused(RefusedReason::Channel { .. })
-        ));
+    fn a_sheep_with_a_channel_is_carried() {
+        let e = entry_fixture(|app| app.channel = true);
+        assert_eq!(fitness(&[plain(&e)]), Fitness::Carryable);
     }
 
+    /// fails if the gate still refuses a sheep gated on `{"kind":"ready"}`.
+    ///
+    /// Its own case rather than a variant of the one above, because
+    /// `wait_ready` reaches machinery `channel` alone does not: the sheep
+    /// may be `Starting` at the exec, and a successor that adopts it with
+    /// nothing waiting leaves it `Starting` outside any timeout. See
+    /// `Actor::install_adopted`, which re-arms the wait.
     #[test]
-    fn shutdown_with_message_alone_refuses_as_a_channel() {
+    fn wait_ready_alone_is_carried() {
+        let e = entry_fixture(|app| app.wait_ready = true);
+        assert_eq!(fitness(&[plain(&e)]), Fitness::Carryable);
+    }
+
+    /// fails if the gate still refuses a sheep that is told before it is
+    /// killed.
+    ///
+    /// Its own case for the same reason: `shutdown_with_message` is the one
+    /// of the three whose channel traffic runs the other way, from the
+    /// shepherd to the child, so it is the writer half of the rebuilt pair
+    /// that has to work.
+    #[test]
+    fn shutdown_with_message_alone_is_carried() {
         let e = entry_fixture(|app| app.shutdown_with_message = true);
-        assert!(matches!(
-            fitness(&[plain(&e)]),
-            Fitness::Refused(RefusedReason::Channel { .. })
-        ));
+        assert_eq!(fitness(&[plain(&e)]), Fitness::Carryable);
     }
 
     /// fails if the gate still refuses a sheep whose app asked for a stdin
@@ -1341,6 +1376,7 @@ mod tests {
                 out_log: Some(13),
                 err_log: Some(14),
                 stdin: Some(15),
+                channel: Some(16),
             },
         )
     }
@@ -1474,7 +1510,38 @@ mod tests {
         assert_eq!(
             loaded.sheep[0].fds.out_pipe,
             sample_handover().sheep[0].fds.out_pipe,
-            "the other four are unchanged by the one that was absent"
+            "the other five are unchanged by the one that was absent"
+        );
+    }
+
+    /// fails if a blob written before this daemon carried a shepherd
+    /// channel stops loading.
+    ///
+    /// The same argument the case above makes for stdin, and it has to be
+    /// made again rather than assumed: `channel` is a second `Option` field
+    /// added after [`VERSION`] was fixed at 1, and a reader that refused an
+    /// absent one would leave a successor unable to boot after its
+    /// predecessor had exec'd itself away. A predecessor from before this
+    /// field existed refused to carry a channelled sheep at all, so `None`
+    /// is not a guess: it is what that blob means.
+    #[test]
+    fn a_blob_written_before_the_channel_was_carried_still_loads() {
+        let mut value = serde_json::to_value(sample_handover()).unwrap();
+        let fds = value["sheep"][0]["fds"]
+            .as_object_mut()
+            .expect("a carried sheep names its descriptors");
+        assert!(
+            fds.remove("channel").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(value).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].fds.channel, None);
+        assert_eq!(
+            loaded.sheep[0].fds.stdin,
+            sample_handover().sheep[0].fds.stdin,
+            "the other five are unchanged by the one that was absent"
         );
     }
 
@@ -1669,6 +1736,7 @@ mod tests {
                 out_log: None,
                 err_log: None,
                 stdin: None,
+                channel: None,
             },
         );
 
@@ -1711,6 +1779,7 @@ mod tests {
                 out_log: None,
                 err_log: None,
                 stdin: None,
+                channel: None,
             },
         );
 
@@ -1747,10 +1816,11 @@ mod tests {
         let listener = tempfile::tempfile().unwrap();
         let pidfile = tempfile::tempfile().unwrap();
         let out_log = tempfile::tempfile().unwrap();
-        // The stdin write end rides along, because it is the newest of the
-        // five and the one a `named_fds` that still yielded four would
-        // silently leave close-on-exec.
+        // The stdin write end and the channel's daemon end ride along,
+        // because they are the two newest and are what a `named_fds` that
+        // still yielded four, or five, would silently leave close-on-exec.
         let (_child_end, stdin) = std::io::pipe().unwrap();
+        let (channel, _child_channel) = std::os::unix::net::UnixStream::pair().unwrap();
         let blob = handover_with_fds(
             &entry_fixture(|_| {}),
             listener.as_raw_fd(),
@@ -1761,6 +1831,7 @@ mod tests {
                 out_log: Some(out_log.as_raw_fd()),
                 err_log: None,
                 stdin: Some(stdin.as_raw_fd()),
+                channel: Some(channel.as_raw_fd()),
             },
         );
 
@@ -1771,6 +1842,7 @@ mod tests {
             pidfile.as_fd(),
             out_log.as_fd(),
             stdin.as_fd(),
+            channel.as_fd(),
         ] {
             assert!(
                 !fds::is_kept(fd).unwrap(),
@@ -1792,6 +1864,7 @@ mod tests {
             pidfile.as_raw_fd(),
             out_log.as_raw_fd(),
             stdin.as_raw_fd(),
+            channel.as_raw_fd(),
         ];
         expected.sort_unstable();
         assert_eq!(
@@ -1807,6 +1880,7 @@ mod tests {
             pidfile.as_fd(),
             out_log.as_fd(),
             stdin.as_fd(),
+            channel.as_fd(),
         ] {
             assert!(
                 !fds::is_kept(fd).unwrap(),

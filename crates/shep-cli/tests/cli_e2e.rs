@@ -7206,13 +7206,16 @@ fn a_sheep_keeps_its_pid_and_its_log_across_a_daemon_reload() {
 /// moved pid is what proves the stop arm was the one taken.
 #[cfg(unix)]
 #[test]
-fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
+fn a_flock_with_a_multi_instance_sheep_takes_the_stop_arm() {
     let dir = tempfile::tempdir().unwrap();
     let script = write_test_script(&dir);
+    // More than one instance, which is still a sheep no handover carries. It
+    // was a shepherd channel until 2b task 5 carried one; what this case is
+    // about is the gate refusing at all, and the operator being told.
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"chatty\"\nscript = '{}'\nchannel = true\n",
+            "[[app]]\nname = \"clustered\"\nscript = '{}'\ninstances = 2\n",
             script.display()
         ),
     );
@@ -7243,11 +7246,11 @@ fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
         String::from_utf8_lossy(&reloaded.stderr)
     );
     assert!(
-        text.contains("shepherd channel"),
+        text.contains("more than one instance"),
         "the refusal must name the feature that blocked the handover: {text}"
     );
     assert!(
-        text.contains("chatty"),
+        text.contains("clustered"),
         "and the sheep it blocked on: {text}"
     );
 
@@ -7259,6 +7262,131 @@ fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
         pid_before,
         "the stop arm restarts the flock, so the pid must move: {after}"
     );
+
+    graceful_kill(dir.path());
+}
+
+/// A `/bin/sh` sheep that signals readiness on fd 3 and answers every
+/// shepherd message with the same reply.
+///
+/// Three features in one script, because they share one socketpair and the
+/// case below is about that socket surviving an `execve`. The `ready` line
+/// is what `wait_ready` holds the sheep at `starting` for; the loop is what
+/// `shep trigger` gets an answer from; and `read -r line <&3` is a plain
+/// blocking read, which is what an app author writes and what a channel that
+/// came back non-blocking would break.
+///
+/// The reply names the action verbatim rather than echoing what it was sent:
+/// extracting a JSON field in POSIX sh would be its own source of failure,
+/// and `ActionWaits` correlates on the action name when the app echoes no
+/// dispatch id.
+#[cfg(unix)]
+fn write_channel_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "chatty.sh",
+        &format!(
+            "{}{}printf '{{\"kind\":\"ready\"}}\\n' >&3\nwhile read -r line <&3; do\n  \
+             printf '{{\"kind\":\"action-reply\",\"action\":\"ping\",\"body\":\"pong\"}}\\n' \
+             >&3\ndone\n",
+            script_header(),
+            record_pid_line(dir),
+        ),
+    )
+}
+
+/// Runs `shep trigger chatty ping` and returns the one row's outcome.
+///
+/// Its own helper because the case below asks the identical question twice,
+/// once either side of the reload, and the whole point is that the two
+/// answers are the same.
+#[cfg(unix)]
+fn trigger_ping(home: &Path) -> serde_json::Value {
+    let triggered = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("trigger")
+        .arg("chatty")
+        .arg("ping")
+        .output()
+        .unwrap();
+    assert_success(&triggered);
+    let envelope: serde_json::Value = serde_json::from_slice(&triggered.stdout)
+        .unwrap_or_else(|e| panic!("trigger stdout was not JSON: {e}"));
+    envelope["data"][0]["outcome"].clone()
+}
+
+/// A sheep's shepherd channel survives `shep daemon reload`, in both
+/// directions and against a real app.
+///
+/// The end-to-end case for what 2b task 5 carries, and the one a pid check
+/// cannot stand in for. A socketpair can survive as a NUMBER and be attached
+/// to the wrong end, or be adopted with only one of its two pumps rebuilt,
+/// and every one of those leaves the flock healthy and the pid unmoved. What
+/// separates them is whether the app still answers.
+///
+/// `wait_ready` is on as well as `channel`, so `online` before the reload is
+/// itself proof that the child's `{"kind":"ready"}` came up the channel, and
+/// the second `trigger` is proof that both directions still work over the
+/// same socket afterwards.
+#[cfg(unix)]
+#[test]
+fn a_channel_sheep_still_answers_a_trigger_across_a_daemon_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_channel_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"chatty\"\nscript = '{}'\nchannel = true\nwait_ready = true\n",
+            script.display()
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    // `online` rather than `starting`, which only the child's own readiness
+    // line over fd 3 can produce.
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
+    let answered = trigger_ping(dir.path());
+    assert_eq!(
+        answered["kind"], "replied",
+        "the channel must work before the reload, or this case proves nothing: {answered}"
+    );
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+
+    let after = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    assert_eq!(
+        after["pid"].as_u64(),
+        Some(pid_before),
+        "a moved pid means the sheep was respawned, which is the stop arm: {after}"
+    );
+
+    let still = trigger_ping(dir.path());
+    assert_eq!(
+        still["kind"], "replied",
+        "the successor must reach the same fd 3 the child has had all along: {still}"
+    );
+    assert_eq!(still["body"], "pong", "{still}");
 
     graceful_kill(dir.path());
 }

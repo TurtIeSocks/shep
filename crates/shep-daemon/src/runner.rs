@@ -944,6 +944,15 @@ pub struct AdoptSpec {
     /// sheep, which has `/dev/null` on fd 0, and an adoption puts a stdin
     /// pump back only when there is an end for it to write to.
     pub stdin_pipe: Option<tokio::net::unix::pipe::Sender>,
+    /// The daemon's end of its shepherd-channel socketpair, still the one
+    /// whose other end is the child's fd 3.
+    ///
+    /// The one handle here that goes both ways, so an adoption puts BOTH
+    /// pumps back on it: an app that writes `{"kind":"ready"}` or an action
+    /// reply is read again, and a `shep trigger` or a
+    /// `shutdown_with_message` reaches it again. `None` for a sheep whose
+    /// app asked for no channel, and for one whose child has closed fd 3.
+    pub channel: Option<tokio::net::UnixStream>,
     /// The one reaper this successor waits every adopted pid through.
     ///
     /// Shared rather than owned per sheep: a status can be collected once,
