@@ -890,6 +890,26 @@ pub(crate) enum SheepFd {
     Channel,
 }
 
+impl SheepFd {
+    /// What this slot is called in a refusal, in the wording the adoption
+    /// functions already use.
+    ///
+    /// Kept beside the variants rather than at the one call site so the two
+    /// cannot drift: `adopt_pipe` says "stdout pipe" and this has to say the
+    /// same, or an operator reads one name from a rehearsal and a different
+    /// one from the successor for the identical descriptor.
+    pub(crate) const fn describe(self) -> &'static str {
+        match self {
+            Self::OutPipe => "stdout pipe",
+            Self::ErrPipe => "stderr pipe",
+            Self::OutLog => "stdout log",
+            Self::ErrLog => "stderr log",
+            Self::Stdin => "stdin pipe",
+            Self::Channel => "shepherd channel",
+        }
+    }
+}
+
 impl CarriedFds {
     /// The six numbers, listener-order irrelevant but fixed: stdout's pipe,
     /// stderr's pipe, stdout's log, stderr's log, stdin's pipe, the

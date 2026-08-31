@@ -3988,7 +3988,8 @@ impl<R: ProcessRunner> Actor<R> {
                     name = app,
                     old_id = swap.old_id,
                     new_id = swap.new_id,
-                    "a carried reload named no instance this shepherd was given, so it was                      dropped rather than left unfinishable"
+                    "a carried reload named no instance this shepherd was given, so it was \
+                     dropped rather than left unfinishable"
                 );
                 continue;
             };

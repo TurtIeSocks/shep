@@ -266,22 +266,26 @@ pub fn dry_run(blob: &Handover) -> io::Result<()> {
     // successor would: repeats first, then the listener, then each sheep,
     // then the pidfile.
     refuse_repeated_fds(&blob)?;
-    rehearse(blob.listener_fd, adopt_listener)?;
+    rehearse(blob.listener_fd, "the control listener", adopt_listener)?;
     for carried in &blob.sheep {
         let name = &carried.name;
         for (fd, slot) in carried.fds.all_kinded() {
             let Some(fd) = fd else { continue };
-            rehearse(fd, |dup| match slot {
-                SheepFd::OutPipe => adopt_pipe(Some(dup), name, "stdout").map(drop),
-                SheepFd::ErrPipe => adopt_pipe(Some(dup), name, "stderr").map(drop),
-                SheepFd::OutLog => adopt_log(Some(dup), name, "stdout").map(drop),
-                SheepFd::ErrLog => adopt_log(Some(dup), name, "stderr").map(drop),
-                SheepFd::Stdin => adopt_stdin(Some(dup), name).map(drop),
-                SheepFd::Channel => adopt_channel(Some(dup), name).map(drop),
-            })?;
+            rehearse(
+                fd,
+                &format!("sheep '{name}' {}", slot.describe()),
+                |dup| match slot {
+                    SheepFd::OutPipe => adopt_pipe(Some(dup), name, "stdout").map(drop),
+                    SheepFd::ErrPipe => adopt_pipe(Some(dup), name, "stderr").map(drop),
+                    SheepFd::OutLog => adopt_log(Some(dup), name, "stdout").map(drop),
+                    SheepFd::ErrLog => adopt_log(Some(dup), name, "stderr").map(drop),
+                    SheepFd::Stdin => adopt_stdin(Some(dup), name).map(drop),
+                    SheepFd::Channel => adopt_channel(Some(dup), name).map(drop),
+                },
+            )?;
         }
     }
-    rehearse(blob.pidfile_fd, |dup| {
+    rehearse(blob.pidfile_fd, "the pidfile lock", |dup| {
         adopt_fd(dup, "the pidfile lock").map(drop)
     })?;
     Ok(())
@@ -294,14 +298,24 @@ pub fn dry_run(blob: &Handover) -> io::Result<()> {
 ///
 /// `fd` is reserved or not open, it could not be duplicated, or the adoption
 /// refused the duplicate.
-fn rehearse<T>(fd: RawFd, adopt_one: impl FnOnce(RawFd) -> io::Result<T>) -> io::Result<()> {
+fn rehearse<T>(
+    fd: RawFd,
+    what: &str,
+    adopt_one: impl FnOnce(RawFd) -> io::Result<T>,
+) -> io::Result<()> {
     // The BLOB's number is checked here, never the duplicate's, and the
     // distinction is the whole reason this is not one line shorter.
     // `sys::adopt_handover_fd` refuses a number below 3 or one that is not
     // open, and a duplicate is always neither — so a rehearsal that only
     // ever saw duplicates would wave through exactly the two blobs the
     // successor is certain to refuse.
-    sys::adoptable_fd(fd).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // Labelled, because `sys::adoptable_fd` names only the NUMBER. A blob
+    // carries six descriptors per sheep, so `fd 7 is not an open descriptor`
+    // is a refusal an operator cannot map back to a stream. `dry_run`'s doc
+    // promises the message names the sheep and the stream, and this arm is
+    // the one that would otherwise make that false.
+    sys::adoptable_fd(fd)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("{what}: {error}")))?;
     let duplicate = fds::duplicate_raw(fd)?;
     // `adopt_one` owns `duplicate` from here, on BOTH arms, and that is what
     // makes this leak nothing. Every adoption in this module either builds
