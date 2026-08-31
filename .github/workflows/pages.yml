@@ -4,6 +4,15 @@ name: pages
 # in the repository settings, and the custom domain lives there too — with
 # an Actions-based deploy there is no `CNAME` file in the artifact.
 #
+# A transfer to another owner CARRIES that setting verbatim, which is worse
+# than dropping it. Moving to the shep-pm org kept `shep.turtlesocks.dev`,
+# a domain whose DNS still aimed at the previous owner's Pages host, so the
+# site was unreachable while every setting looked populated and every
+# workflow ran green. Changing the owner means re-setting the domain by
+# hand, and a `CNAME` file committed under `web/public` does NOT do it: it
+# reaches `web/dist` exactly as you would expect and GitHub then ignores it,
+# which is a convincing way to believe the problem is solved.
+#
 # Unlike test.yml, this one runs on every push rather than by dispatch only.
 # test.yml is gated because one run is 19 jobs, five of them on the macOS
 # and Windows runners that bill at 10x and 2x on a private repo. This is a
