@@ -67,6 +67,7 @@ mod tests {
                 last_exit: None,
                 smit: None,
                 instance: None,
+                handshook: None,
             },
             manually: false,
             at_ms: 1_700_000_000_000,

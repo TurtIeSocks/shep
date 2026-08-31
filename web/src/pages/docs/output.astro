@@ -73,7 +73,12 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       <div class="row"><span><code>(&gt;_&lt;)</code> flinching</span><span>waiting to restart</span></div>
       <div class="row"><span><code>(-.-)</code> asleep</span><span>stopping, stopped</span></div>
       <div class="row"><span><code>(x.x)</code> startled</span><span>errored</span></div>
+      <div class="row"><span><code>(?_?)</code> puzzled</span><span>silent, dogs only</span></div>
     </div>
+    <p class="fine">
+      <code>silent</code> is not a lifecycle status and no sheep ever wears
+      it. See <a href="#a-dog-that-never-answers">the dogs table</a>.
+    </p>
     <p class="fine">
       They are ASCII rather than emoji on purpose. An emoji is double-width,
       inconsistently so across terminals, and cannot take a foreground
@@ -173,6 +178,29 @@ Dogs
       <code>EXIT</code>. So the same dog reads the same way under
       <code>shep dogs</code>, under <code>shep flock</code>, and after
       <code>shep restart log-rotate</code>.
+    </p>
+
+    <h3 id="a-dog-that-never-answers">A dog that never answers reads <code>silent</code></h3>
+    <p>
+      A dog is a peer as well as a process. It dials back to the shepherd
+      and keeps a connection open, and one that never manages it is not
+      doing its job however alive it looks. So <code>online</code> becomes
+      <code>silent</code>, in amber, with a puzzled face instead of a
+      grazing one.
+    </p>
+    <p>
+      The usual cause is a version skew: <code>cargo install</code> replaced
+      the binary on disk and the process still running is the old one. Read
+      <code>shep bleats &lt;dog&gt;</code> for the refusal, then
+      <code>shep restart &lt;dog&gt;</code>.
+    </p>
+    <p class="fine">
+      Only <code>online</code> is replaced. <code>starting</code> already
+      says the connection is not up yet, and a dog is silent for a moment
+      every time it starts. <code>--format json</code> carries the fact as
+      <code>handshook</code>, beside a <code>status</code> that still reads
+      <code>online</code> — true of the process, which is what that field
+      has always described.
     </p>
 
     <h3 id="source-says-whose-code-is-running">SOURCE says whose code is running</h3>

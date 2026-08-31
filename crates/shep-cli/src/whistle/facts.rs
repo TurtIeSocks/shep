@@ -93,6 +93,14 @@ pub struct SheepRow {
     /// Which instance slot of its app this sheep occupies, counting from 0;
     /// absent when the peer daemon predates the field.
     pub instance: Option<u32>,
+    /// Whether this DOG has completed a handshake with the shepherd;
+    /// absent for a sheep, which has none to complete.
+    ///
+    /// `false` is the one worth acting on: the dog's process is running and
+    /// the shepherd has never heard from it, so it is not doing its job
+    /// however healthy `status` looks. `status` still reads `online` there,
+    /// truthfully — it describes the process, not the relationship.
+    pub handshook: Option<bool>,
 }
 
 /// Where a dog came from. Mirrors `DogSource`'s tagged wire shape exactly.
@@ -158,6 +166,7 @@ impl From<&ProcessInfo> for SheepRow {
             last_exit: info.last_exit.as_ref().map(ExitInfoRow::from),
             smit: info.smit.clone(),
             instance: info.instance,
+            handshook: info.handshook,
         }
     }
 }

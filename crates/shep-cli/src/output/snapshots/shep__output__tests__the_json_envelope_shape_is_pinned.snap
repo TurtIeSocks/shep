@@ -25,7 +25,8 @@ expression: out
         "signal": null
       },
       "smit": "▲ main@a1b2c3",
-      "instance": null
+      "instance": null,
+      "handshook": null
     },
     {
       "id": 2,
@@ -46,7 +47,8 @@ expression: out
         "signal": null
       },
       "smit": "▲ main@a1b2c3",
-      "instance": null
+      "instance": null,
+      "handshook": null
     },
     {
       "id": 3,
@@ -67,7 +69,8 @@ expression: out
         "signal": null
       },
       "smit": "▲ main@a1b2c3",
-      "instance": null
+      "instance": null,
+      "handshook": null
     }
   ]
 }

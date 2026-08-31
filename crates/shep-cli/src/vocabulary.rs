@@ -70,6 +70,106 @@ pub(crate) const fn face(status: ProcStatus) -> &'static str {
     }
 }
 
+/// What a STATUS cell reports: the lifecycle status the shepherd holds, or
+/// the one fact that overrides it.
+///
+/// `ProcStatus` answers "is the process alive". For a sheep that is the
+/// whole of what STATUS means, and this type collapses to [`Self::Live`].
+/// For a dog it is not: a dog is a PEER as well as a process, and one that
+/// has never completed a handshake is not doing its job however alive it
+/// is. `shep flock` reported such a dog as `(o.o) online` with zero
+/// restarts while its own log filled with protocol refusals, which is the
+/// case [`Self::Silent`] exists to stop.
+///
+/// Deliberately not a seventh `ProcStatus` variant: `ProcStatus` is the wire
+/// contract for what the supervisor knows about a PROCESS, and silence is a
+/// fact about a CONNECTION that only a reader joining two fields can see.
+/// A variant would also be a protocol break, where
+/// [`ProcessInfo::handshook`](shep_core::protocol::ProcessInfo::handshook)
+/// is additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reported {
+    /// What the shepherd's own lifecycle state says.
+    Live(ProcStatus),
+    /// A dog whose process is up and which has never answered this
+    /// shepherd.
+    Silent,
+}
+
+impl Reported {
+    /// What one row reports, from the two fields that decide it.
+    ///
+    /// # Why only `Online` is overridden
+    ///
+    /// `online` is the one word that lies here. Every other status is
+    /// already honest about a dog that is not answering: `starting` says
+    /// the relationship is not established yet — and a dog is silent for a
+    /// moment every single time it is spawned, so overriding that would
+    /// report a fault on every healthy start — while `stopped`, `errored`
+    /// and `waiting-restart` describe a process that is not there to
+    /// answer. Narrowing to `Online` is what keeps this a correction rather
+    /// than a second opinion.
+    ///
+    /// `handshook` is `None` for a sheep AND for a listing from a shepherd
+    /// that predates the field, and both must render exactly as they did
+    /// before it existed — see the field's own doc for why collapsing those
+    /// two costs nothing.
+    pub(crate) const fn of(status: ProcStatus, handshook: Option<bool>) -> Self {
+        match (status, handshook) {
+            (ProcStatus::Online, Some(false)) => Self::Silent,
+            _ => Self::Live(status),
+        }
+    }
+
+    /// The word this cell shows.
+    ///
+    /// A `String` because [`ProcStatus`]'s own spelling lives in its
+    /// `Display` impl, in shep-core, and restating those six words here to
+    /// hand back a `&'static str` would be a second source for the wire
+    /// contract's own vocabulary.
+    pub(crate) fn word(self) -> String {
+        match self {
+            Self::Live(status) => status.to_string(),
+            // One word, matching `dogs.rs`'s own `silent_dogs` /
+            // `DOG_SILENCE_BUDGET` / `record_silent_dog`: the shepherd
+            // already calls this population silent, and a surface that
+            // called it something else would make an operator reading a
+            // reload's report and a flock listing think they were two
+            // things.
+            Self::Silent => "silent".to_string(),
+        }
+    }
+
+    /// The sheep wearing it. Same five-column ASCII rule as [`face`].
+    pub(crate) const fn face(self) -> &'static str {
+        match self {
+            Self::Live(status) => face(status),
+            // Not a happy face, which is the whole point: a status that
+            // looks fine while being a problem is the defect being fixed,
+            // so `(o.o)` here would undo it. Not `(x.x)` either — that is
+            // `errored`, a process that failed, and this process has not.
+            // The dog is confused rather than dead, and it is exactly what
+            // the operator watching it was.
+            Self::Silent => "(?_?)",
+        }
+    }
+
+    /// The colour role it wears.
+    pub(crate) const fn role(self) -> Role {
+        match self {
+            Self::Live(status) => role_of(status),
+            // `Butter`, the "a gap the operator can close" tier
+            // `outcome_role` and `source_role` already use, and NOT
+            // `Bark`. Bark is reserved for a failure, and painting a
+            // running process the same red as a crashed one would send an
+            // operator looking for a crash that never happened. The gap
+            // here is real and closable — reinstall the dog and restart it
+            // — which is what Butter says everywhere else in this crate.
+            Self::Silent => Role::Butter,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,7 +187,7 @@ mod tests {
             ProcStatus::Stopped,
             ProcStatus::Errored,
         ] {
-            let face = face(status);
+            let face = Reported::Live(status).face();
             assert_eq!(
                 face.chars().count(),
                 5,
@@ -99,6 +199,55 @@ mod tests {
                  double-width, inconsistently so, and cannot take a colour"
             );
         }
+
+        // The sixth face, which no `ProcStatus` reaches: it is decided by
+        // `handshook` rather than by a lifecycle state, so the loop above
+        // cannot enumerate it and it would otherwise be the one face
+        // nothing measured.
+        let silent = Reported::Silent.face();
+        assert_eq!(silent.chars().count(), 5, "silent face {silent:?}");
+        assert!(silent.is_ascii(), "silent face {silent:?}");
+    }
+
+    /// fails if a silence stops overriding `online`, or starts overriding a
+    /// status that was already honest about it.
+    #[test]
+    fn a_silence_overrides_online_and_nothing_else() {
+        assert_eq!(
+            Reported::of(ProcStatus::Online, Some(false)),
+            Reported::Silent
+        );
+        for status in [
+            ProcStatus::Starting,
+            ProcStatus::Stopping,
+            ProcStatus::Stopped,
+            ProcStatus::Errored,
+            ProcStatus::WaitingRestart,
+        ] {
+            assert_eq!(Reported::of(status, Some(false)), Reported::Live(status));
+        }
+        // A dog that is talking, and a sheep or an older shepherd's row.
+        assert_eq!(
+            Reported::of(ProcStatus::Online, Some(true)),
+            Reported::Live(ProcStatus::Online)
+        );
+        assert_eq!(
+            Reported::of(ProcStatus::Online, None),
+            Reported::Live(ProcStatus::Online)
+        );
+    }
+
+    /// fails if `silent` stops being one word, or stops being the word the
+    /// shepherd's own `silent_dogs` population is named for.
+    #[test]
+    fn a_silent_row_says_silent_in_butter() {
+        assert_eq!(Reported::Silent.word(), "silent");
+        assert_eq!(Reported::Silent.role(), Role::Butter);
+        assert_eq!(
+            Reported::Live(ProcStatus::Online).word(),
+            ProcStatus::Online.to_string(),
+            "a live row still spells its status exactly as the wire does"
+        );
     }
 
     /// The mapping is the one `lookout` already shipped. Changing it here
@@ -126,6 +275,10 @@ mod tests {
             face(ProcStatus::WaitingRestart),
             face(ProcStatus::Stopped),
             face(ProcStatus::Errored),
+            // `Silent` is not a `ProcStatus` and so cannot be reached by the
+            // loop above, but it is a sixth face in the same column of the
+            // same table and has to be distinct from all five.
+            Reported::Silent.face(),
         ];
         // `dedup` is a `Vec` method, not a slice one -- it shrinks the
         // length, which a fixed-size array cannot do -- so the faces are

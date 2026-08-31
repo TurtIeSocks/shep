@@ -54,7 +54,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       "lambs": null,
       "last_exit": null,
       "smit": null,
-      "instance": 0
+      "instance": 0,
+      "handshook": null
     },
     {
       "id": 1,
@@ -72,7 +73,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       "lambs": null,
       "last_exit": null,
       "smit": null,
-      "instance": 0
+      "instance": 0,
+      "handshook": null
     }
   ]
 }`}</CodeBlock>
@@ -152,6 +154,14 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
         a few hundred milliseconds old, most often. Table format prints the
         same case as <code>-</code>, for the same reason: a confident zero
         would be a claim shep can't back up.
+      </li>
+      <li>
+        <code>handshook</code> is about dogs and is <code>null</code> for
+        every sheep. <code>false</code> is the one to act on: the dog's
+        process is up and the shepherd has never heard from it, so it is
+        not doing its job. <code>status</code> still reads
+        <code>online</code> there, truthfully — it describes the process.
+        Table format shows this row as <code>silent</code>.
       </li>
       <li>
         <code>smit</code> is <code>null</code> until a dog attaches one over
