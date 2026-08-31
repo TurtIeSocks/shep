@@ -70,7 +70,29 @@ for whoever implements task 2.
 
 **Recommendation: option 1.** It is the only one that makes the refusal itself informative rather than inferred, it costs one optional field, and it is the same additive-`Option` shape the handover blob has used five times without moving a version. Option 2 puts a platform gate above the transport, which CLAUDE.md calls a design decision rather than a shrug. Option 3 answers a different question than the one asked.
 
-**Open for the maintainer: does `Hello` gaining an optional field move `PROTOCOL_VERSION`?** My reading is no, on the blob's own precedent: an absent optional field is not a wire break, and a daemon reading `None` from an older client is correct rather than degraded. But `Hello` IS the version-negotiation frame, so this is the one place that argument deserves a second look before it is relied on.
+**ANSWERED 2026-08-31: no bump.** `Hello` carries no
+`#[serde(deny_unknown_fields)]`, so serde ignores fields it does not know
+and an older daemon parses a newer client's `Hello` cleanly. That was the
+whole worry: `Hello` IS the version-negotiation frame, so a daemon that
+rejected unknown fields would refuse a newer client BEFORE reading
+`protocol`, and that would be a hard break. It does not.
+
+The change is additive in both directions and meets none of this project's
+own bar for a bump, which is a change an older peer cannot deserialize
+(`PROTOCOL_VERSION` moved 1 to 2 because `SelectorSpec` gained a variant an
+older daemon could not parse). Bumping would refuse every CLI invocation
+and every dog until upgraded, which is worse here than anywhere: it forces
+a mass dog refusal at exactly the moment G8's graceful handling does not
+exist yet.
+
+**Task 2 must pin this**, with a case proving an older-shaped `Hello`
+still parses, so nobody adds `deny_unknown_fields` later without seeing
+what it breaks.
+
+The reasoning that led there, kept because the question is worth being able
+to re-ask:
+
+**Was open for the maintainer: does `Hello` gaining an optional field move `PROTOCOL_VERSION`?** My reading is no, on the blob's own precedent: an absent optional field is not a wire break, and a daemon reading `None` from an older client is correct rather than degraded. But `Hello` IS the version-negotiation frame, so this is the one place that argument deserves a second look before it is relied on.
 
 ---
 
