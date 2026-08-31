@@ -172,12 +172,18 @@ reviews:
         one that has already shipped broken is Callout, whose prop is
         `variant` with values "careful" or "note".
 
+    # CodeRabbit applies EVERY matching path instruction, not the most
+    # specific one, so these four blocks are additive rather than a
+    # precedence chain. That is why the generic block below carries only
+    # what is true of every markdown file in the repository: a restriction
+    # placed there would reach the published pages too, and "flag only
+    # factual drift" sitting beside the terminology rule would tell a
+    # reviewer to ignore the terminology rule. Each restriction therefore
+    # lives on the paths that want it.
     - path: "**/*.md"
       instructions: >-
         Prose here is hand-written and hand-wrapped in a deliberate voice. Do
-        not suggest rewording, tightening, or rewrapping. Flag only factual
-        drift: a claim about behaviour that the diff makes false, a command
-        that no longer exists, a sample that will not parse.
+        not suggest rewording, tightening, or rewrapping.
 
         A residual the same diff already documents as a known limitation has
         been considered. Raise it once if the reasoning looks wrong, and not
@@ -185,16 +191,19 @@ reviews:
 
     - path: "docs/writing-plans/**/*.md"
       instructions: >-
-        Working documents, not published prose. The terminology rule below
-        does not apply here: these name a feature after the verb an operator
-        types, so "daemon handover" tracks `shep daemon reload` and matches
-        the sibling plans deliberately. Flag factual drift only.
+        Working documents, not published prose. Flag factual drift only: a
+        claim about behaviour the diff makes false, a command that no longer
+        exists, a sample that will not parse.
+
+        The terminology rule does not apply here. These name a feature after
+        the verb an operator types, so "daemon handover" tracks `shep daemon
+        reload` and matches the sibling plans deliberately.
 
     - path: "docs/brainstorming/**/*.md"
       instructions: >-
         Design documents under revision, held to the same standard as the
-        plans above: factual drift only, and the terminology rule does not
-        reach them.
+        plans: factual drift only, and the terminology rule does not reach
+        them either.
 
     - path: "web/**/*.md"
       instructions: >-
