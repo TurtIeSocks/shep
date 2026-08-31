@@ -3552,6 +3552,33 @@ impl<R: ProcessRunner> Actor<R> {
                     ready_failed: false,
                 },
             );
+            // A sheep the blob reports as `WaitingRestart` is owed a respawn,
+            // and the timer that owed it was a `tokio::spawn` of the
+            // predecessor's that the exec took with it. Nothing else raises
+            // `Msg::RestartDue`, so without a fresh one the sheep sits
+            // `WaitingRestart` for the rest of this daemon's life: down,
+            // never coming back, and reporting a status an operator reads as
+            // about to. Same shape as the `Starting` strand the readiness
+            // re-arm above closes, and the same reason for closing it here.
+            //
+            // Not a narrow race, either. The default backoff climbs to 15s,
+            // so a crash-looping app spends most of its time in this status,
+            // and upgrading the shepherd is exactly what an operator does
+            // about a crash-looping app.
+            //
+            // Re-armed rather than carried, for the reason the readiness wait
+            // is: what elapsed is a `tokio::time::Instant` from a runtime
+            // that no longer exists. The delay is the one an app in its FIRST
+            // unstable exit would get, which is what the fresh
+            // `RestartBudget` above already says this image believes: an
+            // explicit `restart_delay` is honoured in full (an operator's
+            // pacing is never shortened by a reload), an exponential-backoff
+            // app gets its initial step, and one that opted out of both
+            // restarts at once.
+            if status == ProcStatus::WaitingRestart {
+                let delay = crate::backoff::restart_delay(app.config(), 1);
+                self.schedule_restart(id, carried.epoch(), delay);
+            }
             return Ok(());
         };
 
@@ -18204,5 +18231,51 @@ mod tests {
             .expect("a fresh app starts under a successor");
 
         assert!(fresh[0].id >= 9, "reissued a live id: {}", fresh[0].id);
+    }
+
+    /// Fails if an adopted sheep owed a respawn never gets one.
+    ///
+    /// The strand this closes is silent and permanent. `schedule_restart`
+    /// spawns a task that sleeps and then sends `Msg::RestartDue`, and that
+    /// task dies with the process image; `handle_restart_due` is the only
+    /// thing that moves a sheep off [`ProcStatus::WaitingRestart`]. So a
+    /// successor that installs the status without re-arming the timer leaves
+    /// the sheep down for the rest of its life while `shep flock` prints a
+    /// status an operator reads as "coming back".
+    ///
+    /// The pid is the assertion, not the status: [`STAND_IN_SPAWN_PID`] is
+    /// what [`AdoptingRunner`] hands anything it spawns fresh, and it is
+    /// deliberately not a pid any carried sheep here holds, so a row
+    /// reporting it can only have been respawned by the re-armed timer.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_sheep_owed_a_restart_still_gets_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, None, |entry| {
+                    entry.status = ProcStatus::WaitingRestart;
+                }))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        // Virtual, and instant: the paused clock advances itself once every
+        // task is idle, so this waits out the re-armed backoff without
+        // costing the suite a millisecond.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let info = sup.list().await;
+        assert_eq!(
+            info[0].status,
+            ProcStatus::Online,
+            "a sheep owed a respawn was left waiting for a timer that died with the exec: {info:?}"
+        );
+        assert_eq!(
+            info[0].pid,
+            Some(STAND_IN_SPAWN_PID),
+            "the restart must be a real respawn, not a status edit: {info:?}"
+        );
     }
 }

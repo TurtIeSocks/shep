@@ -438,6 +438,121 @@ The mechanism needs no proving: bark is already running it, six times over, in t
 
 The end-to-end case is 2a's, widened: a flock containing every kind 2b now carries, reloaded, with pids unchanged and no gap in any sheep's log.
 
+- [x] **Step 1: Audit every H2 row against the code, and prove each by behaviour**
+- [x] **Step 2: Widen 2a's end-to-end case to every kind 2b carries**
+- [x] **Step 3: Prove each test non-vacuous**
+- [x] **Step 4: Drive the reload drill by hand, on a flock of all six kinds**
+- [x] **Step 5: Task gate, then commit**
+
+#### The audit
+
+Every row read off the code, then proved by watching the daemon do it. Reading `arm_extras` and finding a call is not the proof this phase accepts: an un-armed cron and a dead watch debouncer are both *alive but silently not working*, which is the shape that has now cost three separate defects. So every arm below was tripped AFTER the exec and the restart it produced was observed.
+
+| H2 row | what re-arms it | how it was proved | verdict |
+|---|---|---|---|
+| log file handles, pipe read ends | carried by number, `install_adopted` | 112,619,085 lines over 3 reloads of an 8-sheep flock: 0 lost, 0 duplicates, 0 seams | carried |
+| stdin pipe | carried (task 4) | `shep whisper` after 3 reloads, echo in the sheep's own log from the unmoved pid | carried |
+| shepherd channel | carried (task 5) | `shep trigger` answered `pong-21415`, the CHILD's own pid, after 3 reloads | carried |
+| readiness wait (`wait_ready`, `readiness_probe`) | re-armed in `install_adopted` from `listen_timeout` (task 5) | the channel sheep is `online` and answering after 3 reloads | re-armed |
+| per-instance sampling (`StatsState::watch`) | `arm_extras` -> `arm_instance` | `memory_bytes` non-null on every row immediately after the reload; it is filled only from a WATCHED root | re-armed |
+| memory limit | `arm_extras` -> `arm_instance` | a gated balloon opened after the exec: `greedy` 66614 -> 68846, and the daemon's record names `pid=66614`, the adopted pid | re-armed |
+| liveness probe | `arm_extras` -> `arm_instance` | a probe tripped after the exec: `probed` 69719 -> 70118 | re-armed |
+| cron schedule | `arm_extras` -> `arm_cron` (per name) | a `* * * * *` occurrence 50s after the exec: `scheduled` 69715 -> 70780 | re-armed |
+| filesystem watch | `arm_extras` -> `arm_watch` (per name) | a file written under the watched tree after the exec: `watched` 69714 -> 70101 | re-armed |
+| watch debouncer | nothing, and H2 says so | the debounce window lives inside a third-party thread; the watch above is rebuilt, the in-flight window is not | lost, accepted |
+| CPU% baseline | nothing; the next periodic tick rebuilds it | `cpu_percent` null on every row immediately after the reload, real figures back within one `MEMORY_POLL_INTERVAL` | lost, accepted |
+| in-flight RPCs | nothing | the exec drops every accepted connection | lost, accepted |
+| bus subscriptions | nothing | `lookout` repairs drift on its own two-second poll | lost, accepted |
+| pending action waiters | nothing; `actions: ActionWaits::default()` | each carries its own `action_timeout` | lost, accepted |
+| smits | nothing; `smits: Smits::new()` | not an H2 row, and consistent with one: a smit belongs to the connection that painted it, and every connection drops | lost, consistent |
+| the three counters | carried by the blob, restored before any slot (2a) | `the_successor_does_not_reissue_a_live_id` | carried |
+| **pending restart timer** | **nothing, and this is the finding** | see below | **was lost; now re-armed** |
+
+Five of the six things `ExtrasRegistry::arm` builds are covered by that one `arm_extras` call, and the sixth (the debouncer) is the row H2 already gives up. `arm` is name-aware, so a clustered app's instances join one `NameExtras` group and its cron and watch are built once (task 6). Nothing in H2's own list is unaccounted for.
+
+#### The finding: a sheep owed a restart never got one
+
+`Actor::schedule_restart` spawns a task that sleeps and then sends `Msg::RestartDue`. That task is a `tokio::spawn` of the predecessor's, and the `execve` takes it. `handle_restart_due` is the only thing that moves a sheep off `WaitingRestart`. So a successor installed the status and nothing was left to act on it.
+
+Measured on the release build before the fix, an app exiting immediately with `restart_delay = "45s"`:
+
+| | shepherd pid | sheep status | restarts |
+|---|---|---|---|
+| before the reload | 17353 | `waiting-restart` | 0 |
+| after, t+10s to t+70s | 17353 unmoved | `waiting-restart` | **0, every reading** |
+| control, no reload at all | - | `waiting-restart` -> respawned at t+45s | **1** |
+
+Seventy seconds past a forty-five second delay, on a shepherd whose pid proves the handover ran. The control is the attribution: the same app under the same daemon, not reloaded, restarts on time.
+
+**Not a narrow race.** The default `exp_backoff_restart_delay` climbs to 15s, so a crash-looping app spends most of its life in this status, and upgrading the shepherd is exactly what an operator does about a crash-looping app. The status is the worst part: `shep flock` keeps printing `waiting-restart`, which reads as *coming back*.
+
+Same shape as the `Starting` strand task 5 closed, and closed the same way. `install_adopted` re-arms from `crate::backoff::restart_delay(app.config(), 1)`: the elapsed part of the wait is a `tokio::time::Instant` from a runtime that no longer exists, so what is re-armed is the delay a FIRST unstable exit would get, which is what the fresh `RestartBudget` beside it already asserts this image believes. An explicit `restart_delay` is honoured in full (an operator's pacing is never shortened by a reload), an exponential-backoff app gets its initial step, and one that opted out of both restarts at once.
+
+One unit case and one end-to-end case. A second unit case was written, could not be made non-vacuous, and was deleted -- see the mutations below.
+
+#### The end-to-end cases
+
+Three added to `crates/shep-cli/tests/cli_e2e.rs`.
+
+`a_flock_of_every_carried_kind_survives_a_daemon_reload` is 2a's, widened to six apps and eight rows: a counter, a `stdin = true` echoer, a `channel` + `wait_ready` sheep, a `shutdown_with_message` sheep, a clustered app with separate logs and a clustered app with `merge_logs`. One flock rather than five, because the descriptor rules are whole-flock rules: `refuse_repeated_fds` refuses the ENTIRE blob over one repeated number, and a mixed flock is the only place six kinds of descriptor are ever numbered together. 2.5s.
+
+`every_lifecycle_extra_is_re_armed_across_a_daemon_reload` reloads first and only then writes the file, opens the balloon gates and trips the probe, because a watch armed by the predecessor and one armed by the successor are indistinguishable if the trigger fires before the exec. `control` runs the same ballooning script through its own gate and configures no extra at all, so a restart it shares is the case restarting sheep rather than an arm firing. 33s, dominated by the cron minute.
+
+`a_sheep_owed_a_restart_still_gets_one_after_a_daemon_reload` is the finding's case. Its precondition is asserted twice, and the second one is load-bearing: if the delay had elapsed while `daemon reload` was running, the predecessor would have respawned the sheep before the exec and the final assertion would pass without proving anything. 9.6s.
+
+**One fixture bug found while writing the third arm, worth recording because it cost an hour.** The probe was first written as `test ! -f <trip>` with the sheep's own script clearing `<trip>` on the way up, so a restart would heal itself. It never fired. The script's `rm` does not run when the sheep is spawned; it runs when the shell is first scheduled, which under a loaded debug build was **half a second after `shep flock` already reported the sheep `online`** -- and it deleted the file the case had just written. Inverted to `test -f <healthy>`, tripped by deleting and healed by the case rather than by the script. The same lag does not touch the other three arms: none of them has a script that consumes its own trigger.
+
+#### Drill, measured
+
+Eight sheep, all six kinds, three `shep daemon reload`s. `awk` with no sleep at roughly 1.6M lines a second for the four counters, `shep stop all` before counting.
+
+Every reload exit 0, shepherd unmoved at 21392, all eight pids unmoved at 21413, 21414, 21415, 21416, 21418, 21419, 21420 and 21421, restarts 0 throughout.
+
+| log | lines | groups it holds | lost | duplicates | seams |
+|---|---|---|---|---|---|
+| `fast-0-out.log` | 22,872,640 | plain counter | 0 | 0 | 0 |
+| `split-0-out.log` | 22,470,627 | `0\|21418` only | 0 | 0 | 0 |
+| `split-1-out.log` | 22,373,113 | `1\|21419` only | 0 | 0 | 0 |
+| `merged-out.log` | 44,902,705 | `0\|21420` and `1\|21421` | 0 | 0 | 0 |
+
+**112,619,085 lines, 0 whole lines lost, 0 duplicates, 0 seams, 0 unparsable.** Better than task 5 (4 seams in 52.3M) and task 6 (1 in 23.8M) measured, which is the residual behaving like the residual it is rather than anything changing.
+
+Afterwards, on the same never-restarted processes:
+
+- `shep whisper echoer after-reload` -> `heard: after-reload` in `echoer-0-out.log`, pid 21414, uptime continuous at 1m 25s.
+- `shep trigger chatty ping` -> `pong-21415`, the child's own pid.
+- `shep stop bye` -> `told: {"kind":"shutdown"}` in the log and a clean exit 0, so the write direction still reached a child three execs later.
+- `memory_bytes` non-null on every row the moment the reload returned; `cpu_percent` null on every row and back to real figures (5.9% to 10.7%) within one sampling window.
+
+The re-arm drill is its own flock and its own run: five apps, one reload, every trigger fired after the exec, shepherd unmoved at 69693.
+
+| arm | before | after the trigger | control |
+|---|---|---|---|
+| watch | `watched` 69714, restarts 0 | 70101, restarts 1, at t+5s | `control` unmoved |
+| liveness probe | `probed` 69719, restarts 0 | 70118, at t+5s | `control` unmoved |
+| memory limit | `greedy` 69716, restarts 0 | 70195, restarts 1, at t+15s | `control` ballooned identically, restarts 0 |
+| cron | `scheduled` 69715, restarts 0 | 70780, restarts 1, at t+50s | `control` unmoved |
+
+#### Mutations
+
+Five, each applied alone and reverted afterwards.
+
+| # | what was broken | what failed |
+|---|---|---|
+| 1 | `install_adopted` drops the `WaitingRestart` re-arm | `an_adopted_sheep_owed_a_restart_still_gets_one`, and nothing else in 647 daemon lib tests; plus the e2e case |
+| 2 | `install_adopted` drops `arm_extras` for an adopted `Online` sheep | **the e2e re-arm case ONLY**, at its sampling assertion, in 3.3s; all 646 daemon lib tests stay green, and so do the other four handover e2e cases |
+| 3 | `install_adopted` writes `instance: 0` on every adopted entry | **the two clustered e2e cases ONLY**; 646 daemon lib tests stay green |
+| 4 | the spawn side reports no stdin descriptor | `a_spawn_reports_the_write_end_it_put_on_the_childs_stdin`, and the widened e2e case at its pid assertion -- a stdin sheep the blob cannot number sends the whole flock down the stop arm |
+| 5 | `handle_restart_due` drops its status guard | `a_stopping_sheep_rejects_a_restart_due`, which is how the deleted case below was found |
+
+**Mutation 2 is the finding worth keeping.** The successor's extras arming has no unit-level cover at all, in either scope: not the per-instance half (sampling, memory limit, liveness) and not the name-group half (cron, watch). `ExtrasRegistry`'s own tier arms the registry by hand, so it can never see whether `install_adopted` calls it, and every daemon lib test stays green with the call deleted. The only thing that notices is a real flock, reloaded, with a real file written under a real watched tree afterwards.
+
+**One case was written and then deleted, which is the honest outcome of the exercise.** `an_adopted_stopped_sheep_is_not_respawned` asserted that the new re-arm does not reach a slot an operator had stopped. No mutation could redden it: making the re-arm unconditional leaves it green, because `handle_restart_due`'s own status guard refuses a `Stopped` slot, and that guard is already pinned by `a_stopping_sheep_rejects_a_restart_due`. A test nothing can break is noise in a file whose convention is a "fails if" line per case, so it went. The guard in `install_adopted` stays -- it is what stops a pointless timer task per registered-and-stopped slot -- but it is belt to `handle_restart_due`'s braces, not the only thing holding.
+
+#### Docs
+
+`web/src/pages/docs/getting-started.astro` said "The first reload after upgrading to this version always takes that path, because the shepherd being replaced predates the handover." That was written while the handover was unreleased. v0.1.18 shipped with it, so the sentence is now only true coming from 0.1.17 or earlier, and it reads to a 0.1.18 user as a promise that their first reload will restart their flock. Reworded to name 0.1.17 explicitly. The generated CLI reference is unchanged: this task added no verb, flag, key or exit code.
+
 ---
 
 ## The reload drill, exactly
@@ -464,8 +579,8 @@ Baselines on that drill, three reloads: `origin/main` loses about 2900 lines, 2b
 
 ## Working state, for whoever picks this up
 
-- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2, 4, 5 and 6 committed; task 3 folded into 1; task 7 measured and stopped, nothing committed but its writeup.
-- Counts after task 6: **644** daemon lib with `--skip ::slow::`, **2099** workspace.
+- Branch `feat/handover-2b`, unpushed, no PR. Tasks 1, 2, 4, 5, 6 and 8 committed; task 3 folded into 1; task 7 measured and stopped, nothing committed but its writeup.
+- Counts after task 8: **646** daemon lib with `--skip ::slow::`. The branch is based on 0.1.17 and `main` has since moved to 0.1.19; rebasing is the maintainer's, not a task's.
 - The rejected buffer-carry patch is at `stash@{0}` and in this session's scratchpad as `task1-carry.patch`. Read it for plumbing, not design.
 - `handover/mod.rs`'s module header names the three refusals left, all of them 2c's. Task 7 was going to strike `Dog` and did not: the carry works and leaves the metrics dog silently mute, so the gate still refuses. See Task 7's own section for the measurement and the two candidate designs. The four tests using `Dog` as their refusal fixture stay where they are until that decision is made.
 - PR #73 has two threads left open for 2b. Both are now addressed: the `report_fds` deadline is task 2, and descriptor pinning fell out of task 1's parking. They can be closed with a pointer to those commits.
