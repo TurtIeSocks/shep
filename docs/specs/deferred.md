@@ -411,6 +411,39 @@ True of the daemon's `Request::Start`, false of the `shep start` an operator
 types: the CLI sorts apps into resumed and fresh, and only fresh ones reach
 that request. The sentence describes something no terminal can produce.
 
+### The handover blob's compatibility tests never load an old blob
+
+Raised in review on #84, 2026-08-31, and agreed rather than argued away.
+
+Seven cases are named `a_blob_written_before_<field>_was_carried_still_loads`
+-- stdin, the channel, `pending_delete`, the manual marker, a swap in flight,
+`ready_failed`, and the restart deadline. Every one of them builds a blob from
+today's `Handover`, serialises it, removes one key, and loads the result.
+
+That proves the thing each field's carry actually needs: an absent key loads
+as `None` rather than refusing, so a successor boots against a predecessor
+that never wrote the field. It is not nothing.
+
+**What it cannot prove is that a blob written by an older binary still
+parses**, because it round-trips through today's serialiser. Rename a field
+and every one of these follows the rename and keeps passing, while a real
+blob on disk from v0.1.18 fails. IR-35 asks for exactly the missing half:
+"committed byte-fixtures from the previous protocol version that must still
+deserialize".
+
+**One wrinkle stops this being a straight IR-35 application, and it needs
+deciding rather than inferring.** The rule says fixtures from the PREVIOUS
+protocol version, and the blob's `VERSION` has never moved from 1. Every
+format worth pinning -- v0.1.18 through v0.1.21, and each phase's additions
+inside them -- is version 1 with fewer optional fields. So the fixture policy
+has to answer what a fixture is keyed to when the version does not move: a
+release, a phase, or every shape that ever shipped.
+
+Not done in #84 because it is not that PR's test. Covering only the newest
+field would leave one case in a different style from six siblings and barely
+reduce the risk, since the exposure is the whole blob rather than any one
+key.
+
 ## Ideas, recorded but not designed
 
 Not debt, not deferred spec surface, and not promised to anybody. Things worth

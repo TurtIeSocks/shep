@@ -30,6 +30,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use shep_core::config::AppConfig;
@@ -642,6 +643,48 @@ pub struct CarriedSheep {
     /// instance. A successor that dropped it would answer that rollback with
     /// `Ok` and replace nothing.
     ready_failed: Option<bool>,
+    /// When this instance's owed respawn falls due, in wall-clock terms, or
+    /// `None` for an instance that is not owed one at all.
+    ///
+    /// The one thing on this row that is deliberately NOT a monotonic value,
+    /// and the reason is the `execve`. A [`tokio::time::Instant`] has no
+    /// epoch and means nothing outside the runtime that read it -- which is
+    /// exactly why `started_at` cannot be carried and is re-derived from the
+    /// process table instead (see [`uptime`](super::uptime)). A wall-clock
+    /// moment has an epoch, so it crosses the exec intact, and the successor
+    /// can re-arm for what is LEFT of the delay rather than for the whole of
+    /// it. An app with `restart_delay = "1h"` reloaded at minute 59 waits the
+    /// remaining minute; a flock reloaded four times inside that hour still
+    /// comes back at the original moment, because an absolute deadline
+    /// absorbs each handover's own duration where a carried remainder would
+    /// add it back on every hop.
+    ///
+    /// The cost is a clock that can move under it, where a monotonic one
+    /// cannot: an NTP correction or a suspend changes when a down sheep
+    /// comes back. That is bounded rather than open-ended --
+    /// [`adopted_restart_delay`](crate::backoff::adopted_restart_delay)
+    /// clamps the remainder to the app's own configured delay, so a backward
+    /// jump can at worst give back the behaviour that shipped in v0.1.20 --
+    /// and it corrupts nothing: a restart delay is pacing, not state.
+    ///
+    /// `Option` for the reason [`Self::ready_failed`] gives rather than the
+    /// one the three fields above it give, and it is the same distinction.
+    /// Each of those was a gate refusal before it was a field, so an absent
+    /// key proves the fact was false. This was never a refusal: a
+    /// predecessor from before this field existed carried a
+    /// [`ProcStatus::WaitingRestart`] sheep happily and re-armed the whole
+    /// delay on the far side. So an absent key is that predecessor staying
+    /// silent, and the successor falls back to exactly what it did.
+    /// [`VERSION`] stays unmoved: nothing an older reader must understand
+    /// has changed, and a hard parse failure would leave a successor
+    /// refusing to boot after its predecessor had exec'd itself away.
+    ///
+    /// Written only for a row this blob reports as `WaitingRestart` -- see
+    /// [`Self::from_entry`], which gates it -- so it never appears on a row
+    /// an operator reading the blob would be surprised to find it on.
+    ///
+    /// Nothing on it is sensitive: one timestamp (IR-41).
+    restart_due: Option<SystemTime>,
     /// The resolved config this instance runs under, environment included.
     ///
     /// This is the `AppConfig` beneath [`ProcessEntry::spec`]'s
@@ -675,13 +718,18 @@ pub struct CarriedSheep {
 impl CarriedSheep {
     /// Describe `entry` for the successor.
     ///
-    /// `epoch`, `fds`, `pending_delete`, `manual` and `ready_failed` are
-    /// arguments rather than reads off `entry` because none of them lives
-    /// there: the respawn epoch, the pending-delete marker, the
-    /// manual-command marker and the failed-readiness verdict are on the
-    /// supervisor's private slot type, and the descriptor numbers are known
-    /// only to whichever code holds the open descriptors. This is the same
-    /// split [`Candidate`] makes, for the same reason.
+    /// `epoch`, `fds`, `pending_delete`, `manual`, `ready_failed` and
+    /// `restart_due` are arguments rather than reads off `entry` because
+    /// none of them lives there: the respawn epoch, the pending-delete
+    /// marker, the manual-command marker, the failed-readiness verdict and
+    /// the respawn deadline are on the supervisor's private slot type, and
+    /// the descriptor numbers are known only to whichever code holds the
+    /// open descriptors. This is the same split [`Candidate`] makes, for the
+    /// same reason.
+    ///
+    /// `restart_due` is the one argument this does not carry verbatim: it is
+    /// gated on the entry's status, for the reason
+    /// [`Self::restart_due`]'s own doc gives.
     #[must_use]
     pub fn from_entry(
         entry: &ProcessEntry,
@@ -690,6 +738,7 @@ impl CarriedSheep {
         pending_delete: bool,
         manual: Option<PendingManual>,
         ready_failed: bool,
+        restart_due: Option<SystemTime>,
     ) -> Self {
         Self {
             id: entry.id,
@@ -708,6 +757,18 @@ impl CarriedSheep {
             // either side of it: this one does live on `ProcessEntry`.
             reload: Some(entry.reload),
             ready_failed: Some(ready_failed),
+            // Gated on the status rather than carried verbatim, unlike every
+            // marker above. The slot's own field is written on the one
+            // transition INTO `WaitingRestart` and never cleared -- the two
+            // ways out of that status (a respawn, and an operator's `stop`
+            // on a waiting sheep) both land somewhere this value has no
+            // meaning -- so gating here is what stops a moment that expired
+            // three restarts ago riding out on an `Online` row, where the
+            // successor would ignore it and an operator reading the blob
+            // would not.
+            restart_due: (entry.status == ProcStatus::WaitingRestart)
+                .then_some(restart_due)
+                .flatten(),
             app: entry.spec.config().clone(),
         }
     }
@@ -755,6 +816,16 @@ impl CarriedSheep {
     #[must_use]
     pub const fn ready_failed(&self) -> Option<bool> {
         self.ready_failed
+    }
+
+    /// When this instance's owed respawn falls due, or `None` for one that
+    /// is not owed a respawn -- and for a blob written before this field
+    /// existed, whose predecessor re-armed the whole delay instead. See the
+    /// field's own doc for why those two read the same and what the
+    /// successor does about it.
+    #[must_use]
+    pub const fn restart_due(&self) -> Option<SystemTime> {
+        self.restart_due
     }
 
     /// The supervisor slot's respawn epoch at the moment of the handover.
@@ -1561,8 +1632,8 @@ mod tests {
 
         let blob = Handover::new(
             vec![
-                CarriedSheep::from_entry(&zero, 7, fds_at(11), false, None, false),
-                CarriedSheep::from_entry(&one, 8, fds_at(21), false, None, false),
+                CarriedSheep::from_entry(&zero, 7, fds_at(11), false, None, false, None),
+                CarriedSheep::from_entry(&one, 8, fds_at(21), false, None, false, None),
             ],
             DaemonFds {
                 listener: 3,
@@ -1662,6 +1733,7 @@ mod tests {
                 origin: CommandOrigin::Automatic,
             }),
             false,
+            None,
         );
         assert_eq!(
             marked.manual(),
@@ -1693,7 +1765,7 @@ mod tests {
     /// One carried sheep off `entry`, with the descriptor numbers a
     /// running sheep would have.
     fn carried(entry: &ProcessEntry) -> CarriedSheep {
-        CarriedSheep::from_entry(entry, 7, fds_at(11), false, None, false)
+        CarriedSheep::from_entry(entry, 7, fds_at(11), false, None, false, None)
     }
 
     fn handover_over(entry: &ProcessEntry) -> Handover {
@@ -1956,6 +2028,7 @@ mod tests {
             false,
             Some(marker),
             false,
+            None,
         );
         let value = serde_json::to_value(&blob).unwrap();
 
@@ -2081,8 +2154,15 @@ mod tests {
     #[test]
     fn a_blob_written_before_ready_failed_was_carried_still_loads() {
         let mut blob = sample_handover();
-        blob.sheep[0] =
-            CarriedSheep::from_entry(&entry_fixture(|_| {}), 7, fds_at(11), false, None, true);
+        blob.sheep[0] = CarriedSheep::from_entry(
+            &entry_fixture(|_| {}),
+            7,
+            fds_at(11),
+            false,
+            None,
+            true,
+            None,
+        );
         let value = serde_json::to_value(&blob).unwrap();
 
         assert_eq!(
@@ -2111,6 +2191,131 @@ mod tests {
             loaded.sheep[0].id(),
             blob.sheep[0].id(),
             "the rest of the row is unchanged by the one field that was absent"
+        );
+    }
+
+    /// One entry owed a respawn, which is the only status the deadline is
+    /// carried for.
+    fn owed_a_restart() -> ProcessEntry {
+        let mut entry = entry_fixture(|_| {});
+        entry.status = ProcStatus::WaitingRestart;
+        entry.pid = None;
+        entry
+    }
+
+    /// fails if a blob written before this daemon carried a respawn deadline
+    /// stops loading, or if a deadline that IS carried does not survive the
+    /// wire.
+    ///
+    /// Same shape as `ready_failed` above and the same argument: this was
+    /// never a gate refusal, so an absent key is a predecessor staying
+    /// silent rather than saying "no". What it does about that silence is
+    /// different, though, and is what makes the case worth having — it falls
+    /// back to re-arming the whole delay, which is exactly what v0.1.20 did
+    /// for every sheep. A hard parse failure instead would leave a successor
+    /// refusing to boot after its predecessor had exec'd itself away, over a
+    /// field whose absence has a correct reading.
+    ///
+    /// The current-blob half is asserted first so the removal below removes
+    /// something.
+    ///
+    /// A whole second of slack on the round trip: serde carries a
+    /// `SystemTime` as seconds plus nanoseconds, so this pins the value
+    /// rather than the precision, and an exact equality would be asserting
+    /// something about serde rather than about the blob.
+    #[test]
+    fn a_blob_written_before_a_restart_deadline_was_carried_still_loads() {
+        let due = SystemTime::now() + core::time::Duration::from_secs(600);
+        let mut blob = sample_handover();
+        blob.sheep[0] = CarriedSheep::from_entry(
+            &owed_a_restart(),
+            7,
+            fds_at(11),
+            false,
+            None,
+            false,
+            Some(due),
+        );
+        let value = serde_json::to_value(&blob).unwrap();
+
+        let carried = Handover::load_value(value.clone())
+            .expect("a current blob loads")
+            .sheep[0]
+            .restart_due()
+            .expect("a deadline on the wire must come back as one");
+        let drift = carried
+            .duration_since(due)
+            .or_else(|_| due.duration_since(carried))
+            .unwrap();
+        assert!(
+            drift < core::time::Duration::from_secs(1),
+            "a moment that does not survive the wire is a moment the successor cannot re-arm \
+             from: {drift:?} of drift"
+        );
+
+        let mut older = value;
+        let sheep = older["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        assert!(
+            sheep.remove("restart_due").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(older).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].restart_due(), None);
+        assert_eq!(
+            loaded.sheep[0].id(),
+            blob.sheep[0].id(),
+            "the rest of the row is unchanged by the one field that was absent"
+        );
+    }
+
+    /// fails if a deadline reaches the blob on a row that is not owed a
+    /// respawn.
+    ///
+    /// The slot's own field is written on the transition into
+    /// `WaitingRestart` and never cleared, so a sheep that has since been
+    /// respawned still holds the moment its previous exit was due back at.
+    /// Nothing would act on it — `install_adopted` re-arms only for a
+    /// `WaitingRestart` row — but the blob is a file an operator may read,
+    /// and a stale deadline on an `Online` row is a claim about the flock
+    /// that is not true.
+    ///
+    /// Both halves, because a gate that dropped the field unconditionally
+    /// would pass the second assertion on its own.
+    #[test]
+    fn a_deadline_is_carried_only_for_a_sheep_owed_a_respawn() {
+        let due = SystemTime::now() + core::time::Duration::from_secs(600);
+
+        let waiting = CarriedSheep::from_entry(
+            &owed_a_restart(),
+            7,
+            fds_at(11),
+            false,
+            None,
+            false,
+            Some(due),
+        );
+        assert!(
+            waiting.restart_due().is_some(),
+            "a sheep that IS owed a respawn must carry its deadline, or there is nothing to gate"
+        );
+
+        let online = CarriedSheep::from_entry(
+            &entry_fixture(|_| {}),
+            7,
+            fds_at(11),
+            false,
+            None,
+            false,
+            Some(due),
+        );
+        assert_eq!(
+            online.restart_due(),
+            None,
+            "a running sheep must not carry a deadline left over from an earlier exit"
         );
     }
 
@@ -2200,7 +2405,9 @@ mod tests {
     ) -> Handover {
         Handover {
             version: VERSION,
-            sheep: vec![CarriedSheep::from_entry(entry, 7, fds, false, None, false)],
+            sheep: vec![CarriedSheep::from_entry(
+                entry, 7, fds, false, None, false, None,
+            )],
             listener_fd,
             pidfile_fd,
             next_id: 9,

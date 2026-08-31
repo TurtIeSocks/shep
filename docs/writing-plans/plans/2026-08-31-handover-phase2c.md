@@ -841,36 +841,71 @@ it is handed, so nothing short of a hand-written refusal reddens it. It is a
 regression guard on the reparse, the same shape and the same worth as
 `a_blob_carrying_a_swap_in_flight_passes_the_rehearsal`.
 
-## Inherited from 2b, for a second look
+## Inherited from 2b — DECIDED AND CLOSED
 
-**The re-armed restart delay is a judgement call, and it shipped in v0.1.20.**
-2b's task 8 re-arms a carried `WaitingRestart` sheep with
-`backoff::restart_delay(config, 1)`, which is the delay a FIRST unstable exit
-would get. So an app with `restart_delay = "1h"` reloaded at minute 59 waits
-another full hour rather than the minute it had left.
+**The re-armed restart delay was a judgement call, it shipped in v0.1.20, and
+the maintainer's ruling has replaced it.** The delay is now anchored to the
+sheep's own exit: a sheep that exited at T comes back at T plus its delay,
+however many handovers happen in between. Built on
+`feat/handover-restart-deadline`, not in 2c itself.
 
-The reasoning is sound as far as it goes: what elapsed is a
-`tokio::time::Instant` from a runtime that no longer exists, and erring long
-respects an operator's pacing where erring short could hammer whatever the
-delay exists to protect. Restarting immediately is the other obvious option
-and is worse for the same reason.
+What this section recorded, and what came of it. 2b's task 8 re-armed a
+carried `WaitingRestart` sheep with `backoff::restart_delay(config, 1)`, the
+delay a FIRST unstable exit would get, so an app with `restart_delay = "1h"`
+reloaded at minute 59 waited another full hour. The third option this section
+named is what was built: a `SystemTime` deadline, which survives the exec
+where the monotonic `Instant` cannot. The predecessor records the moment the
+respawn falls due, carries it on `CarriedSheep::restart_due`, and the
+successor arms for what is left.
 
-**But there is a third option neither considered, and it is better than
-both.** The elapsed time is unrecoverable only because it was recorded as a
-monotonic `Instant`. A `SystemTime` deadline survives the exec, so the
-predecessor could carry `now + remaining` and the successor re-arm for
-exactly what was left. That honours the operator's schedule instead of
-approximating it in either direction.
+Two things this section did not have, settled by building it:
 
-The cost is that a wall clock can jump under it — NTP, a suspend — where the
-monotonic one cannot. For a restart delay that seems an acceptable trade,
-since a jump changes when a down sheep comes back rather than corrupting
-anything, but it is the maintainer's call and it is not urgent: today's
-behaviour is safe, merely blunt.
+- **An absolute moment, not a carried remainder.** Subtracting at snapshot
+  time and carrying a `Duration` is the other way to make a monotonic
+  deadline cross the exec, and it is immune to the clock jump this section
+  worried about. Rejected anyway, because each hop would add its own handover
+  duration back on: four reloads inside one delay would drift by four
+  handovers. An absolute moment absorbs each handover rather than
+  accumulating it, which is what "however many handovers" actually asks for.
+- **The clock jump is clamped, not simply accepted.** `adopted_restart_delay`
+  bounds the remainder by `restart_delay(config, 1)` — the value the old code
+  used — so a backward jump can at worst give back exactly v0.1.20's
+  behaviour. That turns this section's "acceptable trade" into a bounded one.
 
-Not scoped into 2c. Recorded here because it was found while auditing 2c's
-own timer-strand class, and because the class is exactly what makes it
-fixable.
+The three cases (elapsed, clock-jumped, absent) and their rulings live in that
+function's own doc and in the commit message.
+
+Measured under an isolated `$SHEP_HOME`, an app with `restart_delay = "45s"`
+that exits immediately, reloaded 15s into the wait, with a never-reloaded
+control alongside. The shepherd's pid was unchanged across every reload, so
+each one was a carry rather than a fallback stop-and-start.
+
+| binary | reloads | exit-to-respawn |
+|---|---|---|
+| v0.1.21 | none (control) | 45.0s |
+| v0.1.21 | one, at t+15s | **60.1s** |
+| v0.1.21 | one, at t+15s (repeat) | **60.1s** |
+| this branch | none (control) | 45.0s |
+| this branch | one, at t+15s | **45.0s** |
+| this branch | two, at t+15s and t+30s | **45.0s** |
+
+The 15.1s excess before is exactly the reload offset: the clock restarted. The
+two-reload row is the chain staying flat.
+
+**One residual, and it is a tradeoff rather than an oversight.** All six
+mutations are caught by the daemon lib tier, so nothing here is e2e-only --
+but that also means no permanent test drives the deadline through a REAL
+`execve`. `a_sheep_owed_a_restart_still_gets_one_after_a_daemon_reload` in
+`crates/shep-cli/tests/cli_e2e.rs` reloads a real `WaitingRestart` sheep and
+would be the place for it; it asserts that the sheep comes back, not that it
+comes back on time. Adding the timing half needs a delay long enough to
+separate "what was left" from "the whole thing" on a loaded runner, plus a
+deliberate wait before the reload, which is roughly +20s on the slowest suite
+and makes the assertion a claim about the machine's speed as much as about
+shep -- the exact shape that has already cost this project four red CI runs
+and put three test groups in `mod slow`. The drill above covers it instead,
+twice per side with a control and a shepherd-pid check. Buying the permanent
+guard is the maintainer's call.
 
 ## The reload drill
 
