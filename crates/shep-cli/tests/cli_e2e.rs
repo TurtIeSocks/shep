@@ -7606,11 +7606,6 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
             "{name}:{slot} must be logging before the reload"
         );
     }
-    let counts_before: HashMap<(String, u32), usize> = rows_before
-        .iter()
-        .map(|(key, (_, out_file))| (key.clone(), slot_lines(out_file).len()))
-        .collect();
-
     let reloaded = shep(dir.path())
         .arg("daemon")
         .arg("reload")
@@ -7644,6 +7639,18 @@ fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
         rows_after, rows_before,
         "every instance keeps its pid and its own log file: {after}"
     );
+
+    // The mark is taken HERE, after the reload has returned, and not before
+    // it was issued. A pid is CARRIED across a handover -- that is the
+    // property this test exists to prove -- so a line written before the
+    // swap names the same pid as one written after it. A mark taken early
+    // therefore lets a pre-reload line satisfy "this instance wrote again",
+    // and the test passes while proving nothing about the successor. Every
+    // line past this point is unambiguously the new shepherd's.
+    let counts_before: HashMap<(String, u32), usize> = rows_after
+        .iter()
+        .map(|(key, (_, out_file))| (key.clone(), slot_lines(out_file).len()))
+        .collect();
 
     // The slot assertion, and the one a pid check cannot make. Each row is
     // asked for its own file, and every line written into that file AFTER

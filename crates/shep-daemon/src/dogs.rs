@@ -1242,16 +1242,35 @@ mod tests {
     /// Registers one built-in dog on `ctx`'s supervisor, exactly as
     /// `spawn_enabled_dogs` does at boot, and hands back the harness's own
     /// refusal record.
+    /// How long [`start_test_dog`] waits on the supervisor before calling it
+    /// a hang rather than a slow start.
+    ///
+    /// Generous on purpose: this bounds a fixture, so it is a deadlock
+    /// guard and not a timing assertion. A value tight enough to measure
+    /// anything would be a test about how fast the supervisor accepts a
+    /// request, which is not what any caller here is asking.
+    const DOG_FIXTURE_START_BUDGET: Duration = Duration::from_secs(10);
+
     async fn start_test_dog(ctx: &crate::rpc::RpcContext, name: &str) {
         let spec = DogSpec {
             name: name.to_string(),
             source: DogSource::BuiltIn,
         };
         let app = dog_app(&spec, &ctx.paths).expect("the dog fixture must assemble");
-        ctx.supervisor
-            .start_dog(app, DogSource::BuiltIn)
-            .await
-            .expect("the dog fixture must start");
+        // Bounded, because the callers below run under a paused clock and
+        // this await is the one thing in them that is not already forced
+        // (IR-46). A supervisor that stopped consuming its request would
+        // otherwise hang the suite here, before any of the forcing
+        // machinery those tests set up has run. Under `start_paused` tokio
+        // auto-advances to the next deadline once every task is idle, so
+        // this timeout still fires rather than waiting on a wall clock.
+        tokio::time::timeout(
+            DOG_FIXTURE_START_BUDGET,
+            ctx.supervisor.start_dog(app, DogSource::BuiltIn),
+        )
+        .await
+        .expect("the dog fixture must start inside its budget")
+        .expect("the dog fixture must start");
     }
 
     /// fails if a dog that never speaks to this shepherd is left alone.
