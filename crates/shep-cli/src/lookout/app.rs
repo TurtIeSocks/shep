@@ -276,8 +276,14 @@ impl Row {
     /// [`super::view::detail`]), so they cannot drift on what a dog's
     /// STATUS cell says the way the table and the dashboard did before this
     /// existed.
+    ///
+    /// `pub(crate)` rather than `pub(super)`: `output::rows`' own test
+    /// module drives this method alongside `output::rows::reported` to pin
+    /// the agreement between the two copies (see
+    /// `the_flock_table_and_the_lookout_read_a_dogs_silence_the_same_way`),
+    /// and that test lives outside `lookout` entirely.
     #[must_use]
-    pub(super) fn reported(&self) -> Reported {
+    pub(crate) fn reported(&self) -> Reported {
         if self.info.dog.is_none() {
             return Reported::Live(self.info.status);
         }

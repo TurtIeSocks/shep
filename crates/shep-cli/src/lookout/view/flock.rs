@@ -121,7 +121,9 @@ impl Column {
         match self {
             Self::Id => 4,
             Self::Name => 0,
-            // 15: `waiting-restart`, the longest of the six statuses. A
+            // 15: `waiting-restart`, the longest word `Reported::word`
+            // returns. That vocabulary is the six lifecycle statuses plus
+            // `silent`, which is 6 columns and so does not move this. A
             // status is never truncated — it is the pane.
             Self::Status => 15,
             Self::Pid => 7,
@@ -1084,6 +1086,33 @@ mod tests {
         let line = row_line(&app, row, ALL, 200, false);
         let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(rendered.contains("online"), "got {rendered:?}");
+        assert!(!rendered.contains("silent"), "got {rendered:?}");
+    }
+
+    /// fails if the `dog.is_none()` guard in `Row::reported` is ever
+    /// removed. The daemon never sends a sheep `handshook: Some(false)` --
+    /// a sheep has no handshake and no version relationship with the
+    /// shepherd at all, it is a supervised process, not a peer -- so this
+    /// is an input the guard exists for and no other test drives. Same
+    /// precedent as `output::rows`' own `a_sheep_never_reads_as_silent`.
+    #[test]
+    fn a_sheep_never_reads_as_silent() {
+        use shep_core::protocol::ProcessInfo;
+        use shep_core::status::ProcStatus;
+
+        let mut impossible = ProcessInfo::builder(1, "web", ProcStatus::Online)
+            .pid(Some(4_000))
+            .build();
+        impossible.handshook = Some(false);
+        let app = fixtures::app_with(vec![impossible], fixtures::plain());
+        let row = app.row(1).unwrap();
+
+        let line = row_line(&app, row, ALL, 200, false);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains("online"),
+            "the sheep table has no dogs in it, and no silence rule either: {rendered:?}"
+        );
         assert!(!rendered.contains("silent"), "got {rendered:?}");
     }
 }

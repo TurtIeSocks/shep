@@ -5205,6 +5205,56 @@ pub(crate) mod tests {
         );
     }
 
+    /// fails if `Row::reported` (the lookout's own copy) and this module's
+    /// `reported` land on different words for the same `ProcessInfo`.
+    ///
+    /// The two are deliberately NOT shared code -- `Row::reported`'s own
+    /// doc says why, the same reason `the_flock_table_and_the_lookout_roll_a_group_up_the_same_way`
+    /// gives for `GroupTotals` -- so this decision table is the only thing
+    /// standing between them drifting apart one edit at a time. Every axis
+    /// that decides the answer is driven together: `dog` (`None` for a
+    /// sheep, `Some` for a dog), `handshook` (`None`/`Some(false)`/
+    /// `Some(true)`), and every `ProcStatus`, so a guard reachable through
+    /// only some of those combinations cannot slip past unnoticed.
+    #[test]
+    fn the_flock_table_and_the_lookout_read_a_dogs_silence_the_same_way() {
+        use crate::lookout::app::Row;
+
+        let statuses = [
+            ProcStatus::Starting,
+            ProcStatus::Online,
+            ProcStatus::Stopping,
+            ProcStatus::Stopped,
+            ProcStatus::Errored,
+            ProcStatus::WaitingRestart,
+        ];
+        let handshooks = [None, Some(false), Some(true)];
+        let dogs = [None, Some(DogSource::BuiltIn)];
+
+        for dog in &dogs {
+            for &handshook in &handshooks {
+                for &status in &statuses {
+                    let info = ProcessInfo::builder(9, "log-rotate", status)
+                        .dog(dog.clone())
+                        .handshook(handshook)
+                        .build();
+
+                    let table = reported(&info);
+                    let dashboard = Row {
+                        info: info.clone(),
+                        anchor: std::time::Instant::now(),
+                    }
+                    .reported();
+
+                    assert_eq!(
+                        table, dashboard,
+                        "dog={dog:?} handshook={handshook:?} status={status:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// fails if only a lifecycle status a silence could not explain is
     /// overridden.
     ///
