@@ -1173,6 +1173,40 @@ mod tests {
     /// fixture and then measure a closed one. Note the one thing this
     /// cannot be used to compare, because duplicating renumbers: a blob
     /// naming the same descriptor twice stops naming it twice here.
+    /// Closes every duplicate it holds, unless [`Self::release`] is called
+    /// first.
+    ///
+    /// `fds::duplicate_raw` hands back a bare number with no owner, so a `?`
+    /// part way through the copy below would leak every duplicate made
+    /// before the failing one. Nothing else would ever close them: the
+    /// numbers live in a `Handover` as plain integers, and dropping that
+    /// closes nothing.
+    ///
+    /// The release is not tidiness either. `adopt` takes ownership of the
+    /// numbers it is handed, so this must let go before that call or each
+    /// one is closed twice.
+    struct Duplicates(Vec<RawFd>);
+
+    impl Duplicates {
+        fn of(&mut self, fd: RawFd) -> io::Result<RawFd> {
+            let duplicate = fds::duplicate_raw(fd)?;
+            self.0.push(duplicate);
+            Ok(duplicate)
+        }
+
+        fn release(mut self) {
+            self.0.clear();
+        }
+    }
+
+    impl Drop for Duplicates {
+        fn drop(&mut self) {
+            for fd in self.0.drain(..) {
+                let _ = nix::unistd::close(fd);
+            }
+        }
+    }
+
     fn adopt_a_copy(blob: &Handover) -> io::Result<()> {
         // Propagated, never `unwrap_or(fd)`. Falling back to the original
         // hands `adopt` the fixture's own live descriptor, which it then
@@ -1180,22 +1214,21 @@ mod tests {
         // to prevent, reintroduced on the one path nobody watches. A case
         // that hit it would fail somewhere else entirely, measuring a
         // descriptor this helper had shut.
-        fn dup_or_fail(fd: RawFd) -> io::Result<RawFd> {
-            fds::duplicate_raw(fd)
-        }
+        let mut dups = Duplicates(Vec::new());
         let mut copy = blob.clone();
-        copy.listener_fd = dup_or_fail(copy.listener_fd)?;
-        copy.pidfile_fd = dup_or_fail(copy.pidfile_fd)?;
+        copy.listener_fd = dups.of(copy.listener_fd)?;
+        copy.pidfile_fd = dups.of(copy.pidfile_fd)?;
         for sheep in &mut copy.sheep {
             sheep.fds = CarriedFds {
-                out_pipe: sheep.fds.out_pipe.map(dup_or_fail).transpose()?,
-                err_pipe: sheep.fds.err_pipe.map(dup_or_fail).transpose()?,
-                out_log: sheep.fds.out_log.map(dup_or_fail).transpose()?,
-                err_log: sheep.fds.err_log.map(dup_or_fail).transpose()?,
-                stdin: sheep.fds.stdin.map(dup_or_fail).transpose()?,
-                channel: sheep.fds.channel.map(dup_or_fail).transpose()?,
+                out_pipe: sheep.fds.out_pipe.map(|fd| dups.of(fd)).transpose()?,
+                err_pipe: sheep.fds.err_pipe.map(|fd| dups.of(fd)).transpose()?,
+                out_log: sheep.fds.out_log.map(|fd| dups.of(fd)).transpose()?,
+                err_log: sheep.fds.err_log.map(|fd| dups.of(fd)).transpose()?,
+                stdin: sheep.fds.stdin.map(|fd| dups.of(fd)).transpose()?,
+                channel: sheep.fds.channel.map(|fd| dups.of(fd)).transpose()?,
             };
         }
+        dups.release();
         adopt(&copy).map(drop)
     }
 
