@@ -41,11 +41,11 @@ Phase 3's task 2 measured the first half directly: two builds differing only in 
 
 **A `--version` answer carries both.** Neither is sufficient, which is precisely why `Hello` has carried both since before this phase.
 
-### 2. `shep-log-rotate` is not in this workspace
+### 2. `shep-log-rotate` is real, and is not in this workspace
 
-G11 argues from `shep-log-rotate` accepting `--print-config` and `--help` and refusing `--version`. No such binary exists here — `grep` finds the name nowhere outside the spec. The built-in dogs are `metrics` and `bark`, and they are `BUILT_IN_DOGS` in `crates/shep-cli/src/dog/mod.rs:46`.
+G11 argues from `shep-log-rotate` accepting `--print-config` and `--help` and refusing `--version`. `grep` finds the name nowhere in this tree outside the spec, and the built-in dogs are `metrics` and `bark` (`BUILT_IN_DOGS`, `crates/shep-cli/src/dog/mod.rs:46`).
 
-The argument survives; only its example is external. Do not go looking for that crate, and do not invent it.
+It is nonetheless a real published crate, at 0.1.3 as of 2026-08-31, and it is the adopted dog running against a production flock. So it is not a hypothetical to reason around — it is the reference third-party dog this phase should be driven against, and the one that exposed phase 3b's reporting defects. Expect to install it rather than to find it.
 
 ### 3. The two dog populations have opposite properties, and the spec treats them as one
 
