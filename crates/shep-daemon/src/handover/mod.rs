@@ -2,7 +2,11 @@
 //! place, the [`Handover`] blob that describes it, and (in a later task) the
 //! exec that carries it.
 //!
-//! One thing is still not carried: a dog. A
+//! Two things are still refused, and they are not the same kind of thing. A
+//! DOG is deferred: phase 3 carries it, and the refusal goes when it does. An
+//! unresponsive log pump is PERMANENT, because it is a live sheep whose
+//! descriptors this daemon does not know, and carrying it would hand the
+//! successor a sheep it cannot read. A
 //! sheep's stdout, stderr, log files, stdin pipe and shepherd channel all
 //! cross the exec, and every one of those is per SHEEP rather than per app,
 //! so an app running several instances crosses as several sets and needs
@@ -62,7 +66,9 @@ pub enum Fitness {
 /// nothing but how much of the handover has shipped. Every phase so far has
 /// turned one of these into something the daemon carries, and a dog is still
 /// to go, so a match here must keep tolerating a variant this module has not
-/// named yet.
+/// named yet. [`RefusedReason::PumpUnresponsive`] is the exception that will
+/// not go: it answers a question about THIS daemon's knowledge rather than
+/// about the handover's coverage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RefusedReason {
