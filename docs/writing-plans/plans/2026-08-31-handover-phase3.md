@@ -110,12 +110,91 @@ A dog's connection has to re-establish itself when the daemon it was talking to 
 
 **Not on `Client` itself.** The CLI is the other consumer and must NOT gain transparent reconnect: a `shep stop` whose connection dropped mid-request and silently retried could stop a sheep twice. H2 already rules that in-flight requests fail rather than retry, and that ruling is what keeps the CLI's one-shot semantics intact. So this is a wrapper, or a mode, that dogs opt into and the CLI does not.
 
-- [ ] **Step 1: Write the failing test.** A client whose connection is closed under it re-establishes and serves the next request.
-- [ ] **Step 2: Run it, watch it fail.**
-- [ ] **Step 3: Implement.** In-flight requests fail, never retry. Say in the commit why the CLI is not affected.
-- [ ] **Step 4: Prove it non-vacuous.**
-- [ ] **Step 5: Point `DogRuntime::start` at it** (`crates/shep-cli/src/dog/mod.rs:186` connects once today).
-- [ ] **Step 6: Commit.**
+- [x] **Step 1: Write the failing test.** A client whose connection is closed under it re-establishes and serves the next request.
+- [x] **Step 2: Run it, watch it fail.**
+- [x] **Step 3: Implement.** In-flight requests fail, never retry. Say in the commit why the CLI is not affected.
+- [x] **Step 4: Prove it non-vacuous.**
+- [x] **Step 5: Point `DogRuntime::start` at it** (`crates/shep-cli/src/dog/mod.rs:186` connects once today).
+- [x] **Step 6: Commit.**
+
+#### Outcome
+
+**A distinct type, `shep_client::ReconnectingClient`, not a mode on `Client`.** Three shapes were available: a wrapper dogs name and the CLI does not; a flag on `Client::connect`; or inferring dog-ness from `$SHEP_DOG_NAME`, which `dogs.rs` already puts in every dog's environment. The CLI decides it. A flag makes "does this client retry?" a property of a CALL SITE rather than of a type, so every verb has to be read carefully to trust. Env-sniffing makes it a property of ambient state, so `SHEP_DOG_NAME=x shep stop web` would quietly acquire it and the question stops being provable at all. A distinct type makes the CLI unaffected BY CONSTRUCTION: no `shep` verb names it, so none can acquire the behaviour by accident or by a later edit to a shared constructor. `Client` gains one method — `closed()`, a query that resolves when the actor's command channel drops — and loses nothing.
+
+**One claim in this plan is now false, and it is the wrapper's price.** Line 51 says a dog gets the reconnect by being rebuilt and the dog contract does not change. That is true of the two shapes that were rejected and not of the one that shipped: an adopted dog rebuilt against a newer `shep-client` still constructs a `Client` and still goes mute. Its author has to swap one type name. Both dogs in `web/public/dogs.json` are the maintainer's own, so the cost is one line in each on top of the two releases the decision section already accepted — but it is a line, not a rebuild.
+
+**Supervised, not lazy, and that was forced by tasks 2 and 3 rather than chosen for elegance.** A background task waits on the current connection's death and dials again immediately. Reconnecting on next use would have been cheaper and is wrong twice over: a metrics dog scraped once a minute would spend that minute unreconnected, so G8's refusal would not surface until something happened to ask; and G13 wants `daemon reload` reporting staleness AFTER the dogs have reconnected, which is only immediate if the reconnect is driven by the disconnection. Measured below: the first scrape after `daemon reload` returned was already 200, six times out of six.
+
+**A refused reconnect stops, and that is the seam task 2 hooks into.** `ConnectError::ProtocolMismatch` ends the supervisor and sets `LinkState::Refused`, carrying the daemon's own version and message. Everything else is treated as a successor that is not ready yet and retried with backoff (50ms doubling to a 5s ceiling), because across a handover the listening socket never stops being bound — `connect(2)` succeeds into the backlog and only the handshake waits.
+
+**G13's client half falls out for free; its daemon half does not.** `ReconnectingClient::daemon()` reads the ack off the generation answering right now, returned owned rather than borrowed. That is the only correct answer for a type whose generation changes underneath it — a cached ack would describe the predecessor, which is exactly what the metrics dog must not publish. Task 3 still owns the reporting side.
+
+**Bark is unchanged and this is the gap task 4 will meet.** Its `EventStream` belongs to one generation and ends when that connection dies, so `run_loop`'s `None` arm breaks, the dog exits 0, and autorestart replaces it — survival by accident, at one restart per reload, exactly as 2b recorded. Re-arming the subscription inside `ReconnectingClient` would silently swallow the gap between the connection dying and the successor accepting a new `Subscribe`, and an event stream that hides a gap is worse than one that ends, so `subscribe` documents the boundary instead. **Task 4's step 5 asks that neither dog's restart count move. That is a decision about the gap, not a line of plumbing, and it is not in this task's commit.**
+
+##### Drill, measured
+
+Route 2 of the two the brief offered: a temporary local bypass of `RefusedReason::Dog` (`if false && entry.dog.is_some()`), reverted before the gate and proven reverted — `git diff --stat crates/shep-daemon/` is empty and the branch's only daemon change is none at all. Release build, isolated `$SHEP_HOME` at `/tmp/p3/home`, one `awk` sheep plus the metrics dog, `curl 127.0.0.1:9615/metrics`.
+
+The before-state was re-measured on this machine rather than quoted from 2b, by neutering the supervisor's wake-up (`core::future::pending()` in place of `closed().await`) and rebuilding:
+
+| | before (no reconnect) | after (this task) |
+|---|---|---|
+| pre-reload scrape | HTTP 200 | HTTP 200 |
+| scrapes after 1 reload | **503, 503, 503, 503, 503, 503** | 200 |
+| six reloads, three scrapes each | — | **18 of 18 HTTP 200** |
+| dog pid | 83876 unmoved | 85698 unmoved |
+| dog restarts | 0 | 0 |
+| dog status | online | online |
+| dog stderr | 0 bytes | 0 bytes |
+| `shep daemon reload` exit | 0 | 0 every time |
+
+Every column except the scrape reads identically in both builds, which is the whole point of this defect: **a pid check cannot see it.** Restarts 0, status online, stderr 0 bytes and an unmoved pid describe a dog that has been answering 503 to everything for six reloads just as well as they describe a healthy one.
+
+**The decisive check is content, not status.** A `freshsheep` started AFTER the six reloads appears in the exposition:
+
+```
+shep_sheep_status{sheep="freshsheep",id="2",fold="",status="online"} 1
+```
+
+A cached reading, a replayed exposition, or a connection to a predecessor could not produce that row. The dog is holding a live connection to the daemon that is running now.
+
+**Bark, same drill, with a valid `[dog.bark.sinks]` entry:**
+
+| | before reload | after 1 | after 2 |
+|---|---|---|---|
+| bark pid / restarts | 86973 / 25 | 87096 / **26** | 87191 / **27** |
+| metrics pid / restarts | 85698 / 0 | 85698 / 0 | 85698 / 0 |
+
+One restart per reload, pid moving each time. 2b's measurement, reproduced.
+
+**Found in passing, unrelated and not fixed.** `shep enable bark` with no `[dog.bark.sinks]` at all produces a crash loop, not a refusal: `shep dog bark: rule 0 routes to no sink at all`, once per restart, restarts climbing about 6 per 2s. The default rule set is built from a sinks map that is empty, so the dog cannot start on the configuration `enable` leaves behind. Sibling of the `[[dog.bark.rules]]` parse defect 2b recorded, and like it, not the handover.
+
+##### Mutations
+
+Each test broken deliberately, run, restored. The blast radius is per-mutation and stated because two of them started out over-broad:
+
+| mutation | fails |
+|---|---|
+| supervisor never spawned | all six `reconnect` tests + the metrics end-to-end |
+| ack cached at construction | the two ack tests, and only those |
+| in-flight request retried against the successor | `an_in_flight_request_fails_and_is_never_re_sent_to_the_successor` |
+| retry after a refusal instead of returning | `a_refused_reconnect_stops_rather_than_spinning` |
+| give up on a transient failure | `a_reconnect_retries_past_a_successor_that_is_not_accepting_yet` |
+| `Drop` no longer aborts the supervisor | `dropping_the_handle_stops_the_supervisor` |
+| supervisor never observes the death | the metrics end-to-end, alone among the dog tests |
+
+Two of those needed the tests strengthening before they died, and both are worth recording because the first attempt looked green:
+
+- **The refusal test passed the spin mutation.** It asserted `accepted() == 2` immediately after `link()` reached `Refused`, and a supervisor that recorded the refusal and then slept 50ms before going round again satisfies that. Fixed by adding a bounded negative — the count must NOT reach 3 within 8x `RECONNECT_MIN_DELAY`. A negative assertion is only as good as its window, so the window is stated against the delay it has to outrun.
+- **The wait helper conflated the reconnect with the ack.** It polled `daemon().pid`, so caching the ack killed four tests instead of the two that are about the ack. Rewritten to poll the fake's accept count AND `link() == Connected`; neither alone is sound (the count rises before the handshake completes, and the link still reads `Connected` in the instant after a cut), and together they are, because the supervisor sets `Reconnecting` before it dials.
+
+**One mutation survives and is reported rather than chased.** Retrying an in-flight `Closed` against the SAME dead generation passes every test. It is equivalent in effect — both attempts meet the same closed channel and return `Closed` — and killing it would need a test asserting how many times `request` consults the current generation, which is implementation shape rather than behaviour. The dangerous version, waiting for the fresh generation and then re-sending, is caught.
+
+##### Gate
+
+`cargo fmt --all --check` EXIT=0. `cargo clippy --workspace --all-targets --all-features -- -D warnings` EXIT=0. `cargo test --workspace --all-features` EXIT=0, **2167 passed**, 0 failed. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features` EXIT=0. Windows cross-check with its own `CARGO_TARGET_DIR` EXIT=0.
+
+`web/` needs nothing and this was checked rather than assumed: `cargo build --release` then `./web/scripts/generate-cli-reference.sh` leaves `git status --porcelain web/` empty, 2510 lines and 40 verbs, unchanged.
 
 ### Task 2: what a refused reconnect does (G8)
 
