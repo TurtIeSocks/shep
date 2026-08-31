@@ -71,6 +71,9 @@ fn group_lines(app: &App, name: &str, width: u16, palette: Palette) -> Vec<Line<
         totals.memory.map_or_else(|| "-".to_string(), human_bytes),
     );
     let used = head.chars().count() + status.chars().count();
+    // `palette.status`, not `palette.reported`: a selected group is always
+    // an app's own instances, never a dog -- see
+    // `App::group_uniform_status`'s own doc.
     let status_style = app
         .group_uniform_status(name)
         .map_or(Style::default(), |status| palette.status(status));
@@ -105,7 +108,10 @@ fn sheep_lines(app: &App, width: u16, palette: Palette) -> Vec<Line<'static>> {
     // Everything except the status word, which is the one coloured cell —
     // exactly the table's rule, for exactly the table's reason.
     let head = format!("sheep {}  {}   ", info.id, info.name);
-    let status = info.status.to_string();
+    // `Row::reported`, not `info.status.to_string()`: this pane must agree
+    // with the flock table's own STATUS cell for the same row, and a dog
+    // that has never handshook reads `silent` there.
+    let status = row.reported().word();
     let rest = format!(
         "   pid {}   restarts {}   uptime {}   cpu {}   mem {}   fold {}{}",
         info.pid
@@ -135,7 +141,7 @@ fn sheep_lines(app: &App, width: u16, palette: Palette) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
             Span::raw(head),
-            Span::styled(status, palette.status(info.status)),
+            Span::styled(status, palette.reported(row.reported())),
             Span::raw(fit(
                 &rest,
                 width.saturating_sub(u16::try_from(used).unwrap_or(width)),
@@ -449,5 +455,53 @@ mod tests {
             !rendered.contains("web-0-out.log"),
             "no arbitrarily-chosen instance's log path: {rendered:?}"
         );
+    }
+
+    /// fails if this pane and the flock table disagree about the same dog --
+    /// which is exactly what happened before this task: the table said
+    /// `silent` (task 4) and this pane still said `online`. Drives both
+    /// panes off the same [`App`] built from the same row, the way an
+    /// operator with both open sees them.
+    #[test]
+    fn a_silent_dogs_status_word_and_colour_agree_with_the_flock_pane() {
+        use shep_core::protocol::DogSource;
+        use shep_core::status::ProcStatus;
+
+        use super::super::flock::{columns_for, row_line};
+
+        let dog = ProcessInfo::builder(9, "log-rotate", ProcStatus::Online)
+            .pid(Some(4_242))
+            .dog(Some(DogSource::Adopted {
+                path: "/usr/local/bin/shep-log-rotate".to_string(),
+            }))
+            .handshook(Some(false))
+            .build();
+        let app = with_selection_and_palette(dog, coloured());
+        let palette = app.palette();
+
+        let detail_rendered = render_all(&detail_lines(&app, 200));
+        assert!(
+            detail_rendered.contains("silent"),
+            "detail pane must say silent: {detail_rendered:?}"
+        );
+        assert!(!detail_rendered.contains("online"), "{detail_rendered:?}");
+
+        let row = app.row(9).unwrap();
+        let flock_line = row_line(&app, row, columns_for(200), 200, false);
+        let flock_rendered: String = flock_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(flock_rendered.contains("silent"), "{flock_rendered:?}");
+
+        // Both panes colour the word `--butter`, the "gap the operator can
+        // close" role -- see `Reported::role`'s own doc for why not `--bark`.
+        let detail_colour = detail_lines(&app, 200)[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "silent")
+            .map(|span| span.style.fg);
+        assert_eq!(detail_colour, Some(palette.attention().fg));
     }
 }
