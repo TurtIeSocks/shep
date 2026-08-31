@@ -26,6 +26,7 @@ mod actor;
 mod client;
 mod connection;
 mod events;
+mod reconnect;
 // `spawn` stays a public module rather than a flattened re-export: the
 // exit-code contract (`spawn::DAEMON_ALREADY_RUNNING`) reads better
 // qualified, a cross-crate agreement rather than a convenience import.
@@ -71,6 +72,7 @@ pub use events::{EventStream, Lagged};
 /// ```
 #[doc(inline)]
 pub use futures_util::Stream;
+pub use reconnect::{LinkState, RECONNECT_MAX_DELAY, RECONNECT_MIN_DELAY, ReconnectingClient};
 
 // Portable for the same reason as `connection` above: every fake here binds
 // a `shep_core::transport::Listener` rather than a `UnixListener`.

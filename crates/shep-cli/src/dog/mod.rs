@@ -22,15 +22,15 @@
 //! same connection. [`ClientFlockSource`] and the [`bark::EventSource`]
 //! impl for [`shep_client::EventStream`] both live here rather than in
 //! `bark::mod` itself, because both are thin adapters over
-//! [`shep_client::Client`], the type this module already owns through
-//! [`DogRuntime`].
+//! [`shep_client::ReconnectingClient`], the type this module already owns
+//! through [`DogRuntime`].
 
 pub mod bark;
 pub mod metrics;
 
 use core::fmt;
 
-use shep_client::{Client, ConnectError, EventStream, RequestError};
+use shep_client::{ConnectError, EventStream, ReconnectingClient, RequestError};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{BusEvent, ProcessInfo, Request, Response, RpcError, RpcErrorCode};
 
@@ -56,7 +56,20 @@ const BUILT_IN_DOGS: [&str; 2] = ["metrics", "bark"];
 /// here is deferred or made optional.
 pub struct DogRuntime {
     /// The connected client. A dog IS a client; there is no second protocol.
-    pub client: Client,
+    ///
+    /// A [`ReconnectingClient`] rather than a bare
+    /// [`Client`](shep_client::Client), and that is the difference between
+    /// a dog that crosses a daemon handover and one that does not. A dog's
+    /// process survives the shepherd's `execve` for free — it is a child of
+    /// a daemon whose pid does not change — but only the LISTENING socket
+    /// crosses that exec, so the accepted connection underneath this field
+    /// dies every time an operator reloads. Measured over six real reloads
+    /// before this was supervised: the metrics dog kept its pid, reported
+    /// zero restarts, stayed `online`, wrote nothing to stderr, and
+    /// answered HTTP 503 to every scrape. The CLI keeps the bare `Client`
+    /// deliberately; see `shep_client`'s own `reconnect` module docs for
+    /// why one-shot verbs must not gain this.
+    pub client: ReconnectingClient,
     /// This dog's `[dog.<name>]` section, exactly as the shepherd rendered
     /// it, for the dog to parse into its own shape. Empty when the file has
     /// no such section.
@@ -183,7 +196,7 @@ impl DogRuntime {
     /// - [`DogRunError::Connect`] — no shepherd answered at the socket.
     /// - [`DogRunError::Request`] — the shepherd refused the config request.
     pub async fn start(name: &str, paths: ShepPaths) -> Result<Self, DogRunError> {
-        let client = Client::connect(&paths.socket).await?;
+        let client = ReconnectingClient::connect(&paths.socket).await?;
         let response = client
             .request(Request::DogConfig {
                 name: name.to_string(),
@@ -350,11 +363,11 @@ impl bark::EventSource for EventStream {
     }
 }
 
-/// Wraps [`Client`] as [`bark::FlockSource`]: `Request::ListFlock`, mapped
+/// Wraps [`ReconnectingClient`] as [`bark::FlockSource`]: `Request::ListFlock`, mapped
 /// into the shape [`bark::run_loop`] can poll without a socket of its own —
 /// the same reason [`bark::EventSource`] exists for the subscription side.
 struct ClientFlockSource {
-    client: Client,
+    client: ReconnectingClient,
 }
 
 impl bark::FlockSource for ClientFlockSource {
@@ -381,7 +394,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use shep_client::testing::{fake_client_on, sample_ack, serve_one_request};
+    use shep_client::testing::{fake_reconnecting_client_on, sample_ack, serve_one_request};
 
     use super::*;
 
@@ -407,7 +420,7 @@ mod tests {
     /// Builds a [`DogRuntime`] carrying `section`, backed by a real (if
     /// otherwise unused) connection — [`DogRuntime::config`] never touches
     /// `client`, but the field has to hold a real one, so this reaches for
-    /// the lightest fixture that produces one ([`fake_client_on`]) rather
+    /// the lightest fixture that produces one ([`fake_reconnecting_client_on`]) rather
     /// than growing a second connection double. Bridges into its own fresh
     /// Tokio runtime rather than being `async` itself, so call sites stay
     /// plain `#[test]`s — matching `config`, which is sync.
@@ -415,7 +428,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = shep_client::testing::control_address(dir.path());
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (client, _daemon) = fake_client_on(&socket).await;
+            let (client, _daemon) = fake_reconnecting_client_on(&socket).await;
             DogRuntime {
                 client,
                 section: section.to_string(),

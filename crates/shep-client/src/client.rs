@@ -176,6 +176,25 @@ impl Client {
         &self.ack
     }
 
+    /// Resolves once this connection has ended — daemon exit, crash,
+    /// `execve`, a write failure, or a prior [`Self::close`].
+    ///
+    /// The actor task owns the receiving half of this client's command
+    /// channel and drops it when its loop ends, which is exactly the set of
+    /// conditions above, so awaiting the sender's own closure reports the
+    /// connection's death without a poll, a timer, or a probe request.
+    ///
+    /// Resolves immediately, not once, if the connection is already gone: a
+    /// caller may await it as many times as it likes.
+    ///
+    /// This is a *query*, not a recovery. Nothing here reconnects, and
+    /// [`Self::request`] does not retry — see
+    /// [`ReconnectingClient`](crate::ReconnectingClient) for the supervised
+    /// wrapper dogs use and the CLI deliberately does not.
+    pub async fn closed(&self) {
+        self.commands.closed().await;
+    }
+
     /// The path this client is connected through.
     ///
     /// `HelloAck` carries `daemon_version`, `protocol` and `pid` and
