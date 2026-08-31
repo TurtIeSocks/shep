@@ -1523,12 +1523,12 @@ fn two_entry_index_json() -> String {
                 "package": "shep-log-rotate",
                 "adopt_as": "log-rotate",
                 "description": "Rotates grown log files and asks the shepherd to reopen them.",
-                "repo": "https://github.com/TurtIeSocks/shep-log-rotate",
+                "repo": "https://github.com/shep-pm/shep-log-rotate",
                 "license": "MIT OR Apache-2.0",
                 "category": "logs",
                 "source": {
                     "kind": "cargo-git",
-                    "url": "https://github.com/TurtIeSocks/shep-log-rotate"
+                    "url": "https://github.com/shep-pm/shep-log-rotate"
                 }
             },
             {
@@ -5815,7 +5815,7 @@ fn available_dogs_detail_view_uses_adopt_as_never_name() {
         "detail header line: {stdout}"
     );
     assert!(
-        stdout.contains("$ cargo install --git https://github.com/TurtIeSocks/shep-log-rotate"),
+        stdout.contains("$ cargo install --git https://github.com/shep-pm/shep-log-rotate"),
         "install command: {stdout}"
     );
     assert!(

@@ -283,7 +283,7 @@ are up.
 
 ## `shep-log-rotate` publishes after this, not alongside it
 
-`github.com/TurtIeSocks/shep-log-rotate` is the first external dog and it
+`github.com/shep-pm/shep-log-rotate` is the first external dog and it
 depends on `shep-client`. Until `shep-client` is on the index, that crate
 cannot be published at all, so the order across the two repositories is:
 everything here first, then the dog.

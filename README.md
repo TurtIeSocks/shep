@@ -154,9 +154,9 @@ a config file has a diff and an mtime somebody can audit.
 
 A dog is a plugin process the shepherd supervises alongside your flock.
 
-- [shep-log-rotate](https://github.com/TurtIeSocks/shep-log-rotate) rotates
+- [shep-log-rotate](https://github.com/shep-pm/shep-log-rotate) rotates
   and compresses bleat logs.
-- [shep-deploy](https://github.com/TurtIeSocks/shep-deploy) redeploys a sheep
+- [shep-deploy](https://github.com/shep-pm/shep-deploy) redeploys a sheep
   when a watched git branch moves.
 
 `shep dogs` lists them, `shep adopt` takes one on.

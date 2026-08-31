@@ -1,4 +1,4 @@
-# The formula published to the tap at TurtIeSocks/homebrew-shep, where it
+# The formula published to the tap at shep-pm/homebrew-shep, where it
 # lives as Formula/shep.rb. This copy is the source of truth; the `homebrew`
 # job in .github/workflows/release-artifacts.yml rewrites the two version
 # lines and pushes the result to the tap on every release.

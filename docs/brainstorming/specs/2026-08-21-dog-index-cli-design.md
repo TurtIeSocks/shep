@@ -64,9 +64,9 @@ One match prints the whole entry, which is where `adopt_as` earns its place:
 ```
 Spot . shep-log-rotate . logs
 Rotates grown log files and asks the shepherd to reopen them.
-MIT OR Apache-2.0 . https://github.com/TurtIeSocks/shep-log-rotate
+MIT OR Apache-2.0 . https://github.com/shep-pm/shep-log-rotate
 
-  $ cargo install --git https://github.com/TurtIeSocks/shep-log-rotate
+  $ cargo install --git https://github.com/shep-pm/shep-log-rotate
   $ shep adopt log-rotate ~/.cargo/bin/shep-log-rotate
 ```
 
