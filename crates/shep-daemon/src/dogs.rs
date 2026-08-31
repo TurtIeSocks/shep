@@ -33,7 +33,7 @@
 //! that exposure to a second surface.
 
 use core::fmt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -321,9 +321,30 @@ pub enum Refusal {
 /// VALUES, and no value ever reaches this type.
 #[derive(Debug, Clone, Default)]
 pub struct DogRefusals {
+    /// Both halves under one lock, because every caller that changes one
+    /// changes the other in the same breath and a dog seen as refused and
+    /// handshook at once is a state no reader should be able to observe.
+    seen: Arc<Mutex<Links>>,
+}
+
+/// What [`DogRefusals`] holds: how often each dog has been refused, and
+/// which dogs have ever got in.
+///
+/// Private, and only ever reached under the one lock above.
+#[derive(Debug, Default)]
+struct Links {
     /// Refusals per dog name since that dog last handshook. A name absent
     /// from the map has not been refused since it last got in.
-    seen: Arc<Mutex<BTreeMap<String, u32>>>,
+    refusals: BTreeMap<String, u32>,
+    /// Dogs whose handshake this daemon has accepted and not refused
+    /// since.
+    ///
+    /// Not derivable from the absence of a refusal, which is why it is
+    /// kept: a dog that has never connected at all and a dog that is
+    /// talking happily both have no entry in [`Self::refusals`], and
+    /// telling those two apart is the whole of what G13's reporting waits
+    /// on.
+    handshook: BTreeSet<String>,
 }
 
 impl DogRefusals {
@@ -342,7 +363,11 @@ impl DogRefusals {
     /// [`Refusal::AlreadyStale`]. There is no fourth case and no dial.
     pub fn refused(&self, name: &str) -> Refusal {
         let mut seen = self.lock();
-        let count = seen.entry(name.to_string()).or_insert(0);
+        // A dog this daemon was talking to a moment ago is no longer one it
+        // can vouch for. The connection that earned the mark is gone, and
+        // the process behind the name may not be the one that made it.
+        seen.handshook.remove(name);
+        let count = seen.refusals.entry(name.to_string()).or_insert(0);
         *count = count.saturating_add(1);
         match *count {
             1 => Refusal::Restart,
@@ -357,7 +382,35 @@ impl DogRefusals {
     /// A dog that is talking to this daemon is not stale by any definition
     /// this daemon can apply, whatever happened before.
     pub fn handshook(&self, name: &str) {
-        self.lock().remove(name);
+        let mut seen = self.lock();
+        seen.refusals.remove(name);
+        seen.handshook.insert(name.to_string());
+    }
+
+    /// Whether `name` has handshook with this daemon and not been refused
+    /// since.
+    ///
+    /// The question G13's reporting asks of every dog before it reports
+    /// anything: a dog that has answered is one whose state is a fact, and
+    /// a dog that has not is one the answer would be a guess about.
+    #[must_use]
+    pub fn has_handshook(&self, name: &str) -> bool {
+        self.lock().handshook.contains(name)
+    }
+
+    /// Every dog whose one restart from disk is in flight, sorted.
+    ///
+    /// Exactly the dogs refused ONCE. The restart G8 owes them has been
+    /// asked for and its outcome has not arrived, so neither answer is
+    /// available yet: they are not stale, and they are not talking.
+    #[must_use]
+    pub fn restarting(&self) -> Vec<String> {
+        self.lock()
+            .refusals
+            .iter()
+            .filter(|(_, count)| **count == 1)
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Every dog this daemon has given up on, sorted.
@@ -370,20 +423,21 @@ impl DogRefusals {
     #[must_use]
     pub fn stale(&self) -> Vec<String> {
         self.lock()
+            .refusals
             .iter()
             .filter(|(_, count)| **count >= 2)
             .map(|(name, _)| name.clone())
             .collect()
     }
 
-    /// The map, treating a poisoned lock as ordinary data.
+    /// The record, treating a poisoned lock as ordinary data.
     ///
     /// Every critical section here is a lookup or an increment on a plain
-    /// `BTreeMap`, so a panic elsewhere cannot leave a torn value, and
-    /// taking down a daemon whose whole job is staying up would be the
-    /// worse failure — the same argument
+    /// `BTreeMap` and a `BTreeSet`, so a panic elsewhere cannot leave a torn
+    /// value, and taking down a daemon whose whole job is staying up would
+    /// be the worse failure — the same argument
     /// [`FlockRegistry`](crate::snapshot) already makes for its own map.
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, u32>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Links> {
         self.seen.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -901,6 +955,57 @@ mod tests {
             refusals.stale(),
             vec!["bark".to_string()],
             "one dog getting in says nothing about another"
+        );
+    }
+
+    /// fails if a dog mid-restart reads as an answer. G13's report is taken
+    /// once every dog has settled, and a dog refused ONCE has not: the
+    /// restart G8 owes it has been asked for and its verdict has not come
+    /// back. Reading that as "not stale" is exactly the early report the
+    /// whole rule exists to prevent — it is the state a stale dog passes
+    /// through on its way to being stale.
+    #[test]
+    fn a_dog_mid_restart_is_neither_stale_nor_settled() {
+        let refusals = DogRefusals::new();
+        assert!(refusals.restarting().is_empty());
+
+        refusals.refused("metrics");
+        assert_eq!(refusals.restarting(), vec!["metrics".to_string()]);
+        assert!(refusals.stale().is_empty());
+
+        refusals.refused("metrics");
+        assert!(
+            refusals.restarting().is_empty(),
+            "a dog that has been given up on is settled, not still being restarted"
+        );
+        assert_eq!(refusals.stale(), vec!["metrics".to_string()]);
+    }
+
+    /// fails if "this daemon has heard from that dog" is inferred from the
+    /// absence of a refusal. A dog that has never connected and a dog
+    /// talking happily both have no refusal recorded, and telling those two
+    /// apart is the whole of what G13's report waits on: the first is a
+    /// carried dog that has not dialled back yet.
+    ///
+    /// The refusal half is the other direction. A dog this daemon accepted
+    /// and has since refused is not one it can vouch for any more — the
+    /// connection that earned the mark is gone.
+    #[test]
+    fn only_an_accepted_handshake_says_a_dog_has_answered() {
+        let refusals = DogRefusals::new();
+        assert!(
+            !refusals.has_handshook("metrics"),
+            "a dog nobody has heard from has not answered"
+        );
+
+        refusals.handshook("metrics");
+        assert!(refusals.has_handshook("metrics"));
+        assert!(!refusals.has_handshook("bark"), "one dog answers for one");
+
+        refusals.refused("metrics");
+        assert!(
+            !refusals.has_handshook("metrics"),
+            "the handshake that earned the mark is the one that just died"
         );
     }
 }
