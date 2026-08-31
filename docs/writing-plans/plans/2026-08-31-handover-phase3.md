@@ -2,7 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use `superpowers:subagent-driven-development` to implement this task-by-task. Steps use `- [ ]` for tracking.
 
-**Goal:** Carry every dog across the handover with no restart, which means giving a dog a connection that survives its daemon being replaced.
+**Goal:** Carry every dog across the handover, giving it a connection that
+survives the shepherd it was talking to being replaced.
+
+**Amended after task 4**, which measured what shipped rather than what was
+planned. This said "with no restart", and that holds for `metrics` and not
+for `bark`: bark's event stream belongs to one connection generation, so it
+still exits and is replaced once per reload. Closing that needs a ruling on
+what an orphaned dog does, which is a question about every dog rather than
+about bark, and is recorded rather than left as a quietly unmet step.
 
 **Spec:** `docs/brainstorming/specs/2026-08-29-daemon-handover-design.md`, sections G6 through G13.
 

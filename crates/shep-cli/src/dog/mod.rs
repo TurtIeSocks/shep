@@ -201,6 +201,10 @@ impl DogRuntime {
     /// # Errors
     /// - [`DogRunError::Connect`] — no shepherd answered at the socket.
     /// - [`DogRunError::Request`] — the shepherd refused the config request.
+    /// - [`DogRunError::UnexpectedReply`] — the shepherd answered
+    ///   `Request::DogConfig` with something other than
+    ///   `Response::DogSection`. Its own doc explains why a same-version
+    ///   shepherd never sends it.
     pub async fn start(name: &str, paths: ShepPaths) -> Result<Self, DogRunError> {
         let client = ReconnectingClient::connect_as_dog(&paths.socket, name).await?;
         let response = client

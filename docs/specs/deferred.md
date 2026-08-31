@@ -441,7 +441,7 @@ has to answer what a fixture is keyed to when the version does not move: a
 release, a phase, or every shape that ever shipped.
 
 Not done in #84 because it is not that PR's test. Covering only the newest
-field would leave one case in a different style from six siblings and barely
+field would leave one case in a different style from seven siblings and barely
 reduce the risk, since the exposure is the whole blob rather than any one
 key.
 
@@ -497,7 +497,8 @@ in phase 3 task 4:**
 - **And it needs a ruling on the ORPHANED dog, which is about every dog and
   not about bark.** Today bark exits when its shepherd goes away for any
   reason; a dog that re-subscribed instead would linger, and would attach
-  itself to whatever daemon next binds that socket -- beside that daemon's
+  itself to whatever shepherd next binds that socket -- beside that
+  shepherd's
   own bark dog, double-alerting quietly. The metrics dog already has that
   hazard through `ReconnectingClient`'s own supervisor, which retries
   forever, and nobody has ruled on it.

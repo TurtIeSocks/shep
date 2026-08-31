@@ -4101,9 +4101,6 @@ mod tests {
             .unwrap();
     }
 
-    /// A blob written by hand rather than by `Handover::write`, so this
-    /// module's tests pin the on-disk shape a successor has to read rather
-    /// than round-tripping whatever the writer happens to emit.
     /// One carried sheep, named, with `dog` set or not.
     #[cfg(unix)]
     fn carried_for_the_roll(
@@ -4188,6 +4185,9 @@ mod tests {
         );
     }
 
+    /// A blob written by hand rather than by `Handover::write`, so this
+    /// module's tests pin the on-disk shape a successor has to read rather
+    /// than round-tripping whatever the writer happens to emit.
     fn write_blob(path: &Path, version: u32) {
         std::fs::write(
             path,
