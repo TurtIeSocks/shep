@@ -58,9 +58,13 @@ Two claims were made against this incident and then measured false. Recorded so 
 
 Task 1 is unrelated to the other three and can ship alone.
 
-**Task 2 must precede task 3, and the reason is not obvious.** Today `log-rotate` lands in `pending`, so it reaches `unsettled_dog_report`. Once task 2 drives the ladder by inference, the same dog is restarted once, fails again, and is marked stale — so it reaches `stale_dog_report`, which already carries advice. Task 2 therefore *changes which sentence the motivating case hits*, and rewording `unsettled_dog_report` first would tune it for a population task 2 removes.
+**Task 2 must precede task 3.** The reason written here first was wrong, and task 2's drill measured it: this said the ladder would move the motivating case out of `unsettled_dog_report` and into `stale_dog_report`, which already carries advice. It does not. Task 2's `DOG_SILENCE_BUDGET` is 5s, so the first rung lands at +5s and the second at +10s, while the reload's own `DOG_SETTLE_WAIT` is 3s. At the moment the reload reports, neither rung has fired, and a live reload printed the unsettled sentence exactly as before.
 
-Two earlier phases in this series split tasks on a seam no drill could stand on. This is the same shape, caught before dispatch rather than after.
+Tuning cannot reconcile them either. Landing the second rung inside a 3s wait needs a sub-1.5s budget, which would restart a dog for being briefly slow.
+
+**So the dependency holds and the consequence inverts.** Task 3 must be written for a population that still contains the skewed dog at reload time — not for the transient remnant this plan originally predicted. What task 2 actually gives task 3 is the timing to be honest about: at reload time the shepherd does not yet know the verdict, but it does know a restart is coming and when. A report saying that is worth more than one saying nothing.
+
+Two earlier phases in this series split tasks on a seam no drill could stand on. This one had a sound seam and a wrong rationale, which a drill caught and reading never would have.
 
 ---
 
