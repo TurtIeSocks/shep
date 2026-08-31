@@ -41,6 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -2448,6 +2449,30 @@ struct SheepSlot {
     /// [`Actor::respawn`]'s success arm and [`Actor::went_online`]. Both are
     /// the moment the fact stops being true rather than a tidy-up.
     ready_failed: bool,
+    /// When this slot's owed respawn falls due, in wall-clock terms.
+    ///
+    /// Written on the one transition INTO [`ProcStatus::WaitingRestart`],
+    /// beside the [`Actor::schedule_restart`] that sleeps for the same
+    /// interval. The two are the same fact in the two clocks that can hold
+    /// it: the timer's is monotonic, which is what an interval should be
+    /// measured in and is why it stays the thing that actually fires; this
+    /// one is wall-clock, which is the only kind of moment that survives an
+    /// `execve`. A handover carries this one and re-arms a fresh timer from
+    /// it, so the respawn lands when the sheep's own exit said it would
+    /// rather than a full delay after whenever the shepherd was last
+    /// upgraded. See [`CarriedSheep::restart_due`](crate::handover::CarriedSheep)
+    /// for the argument in full, and
+    /// [`backoff::adopted_restart_delay`](crate::backoff::adopted_restart_delay)
+    /// for what a successor does with it.
+    ///
+    /// `None` on every other status, and NOT cleared on the way out of
+    /// `WaitingRestart`, which needs saying because the fields above it are.
+    /// Nothing reads it without the status: `CarriedSheep::from_entry` gates
+    /// the carry, and `install_adopted` gates the re-arm. So a moment left
+    /// behind by a respawn, or by an operator's `stop` on a waiting sheep,
+    /// is unreachable rather than wrong -- and a clear in three places would
+    /// be three chances to miss one, for a value none of them can expose.
+    restart_due: Option<SystemTime>,
 }
 
 impl SheepSlot {
@@ -3293,6 +3318,7 @@ impl<R: ProcessRunner> Actor<R> {
                 ready_tx: None,
                 actions: ActionWaits::default(),
                 ready_failed: false,
+                restart_due: None,
             },
         );
         Registration::Fresh(info)
@@ -3435,6 +3461,7 @@ impl<R: ProcessRunner> Actor<R> {
                         ready_tx,
                         actions: ActionWaits::default(),
                         ready_failed: false,
+                        restart_due: None,
                     },
                 );
                 self.emit(ProcessEventKind::Start, info.clone(), true);
@@ -3482,6 +3509,7 @@ impl<R: ProcessRunner> Actor<R> {
                         ready_tx: None,
                         actions: ActionWaits::default(),
                         ready_failed: false,
+                        restart_due: None,
                     },
                 );
                 self.emit(ProcessEventKind::Errored, info, true);
@@ -3707,6 +3735,16 @@ impl<R: ProcessRunner> Actor<R> {
                     // the verdict still standing — and `respawn` clears it
                     // at the spawn that answers it.
                     ready_failed,
+                    // Restored verbatim, and it is what makes the deadline
+                    // survive MORE THAN ONE handover. The re-arm below
+                    // computes a fresh timer from it; without the moment
+                    // itself back on the slot, a second reload during the
+                    // same wait would snapshot a sheep with no deadline and
+                    // the successor would start the delay over — which is
+                    // the whole defect, moved one exec along. An absolute
+                    // moment is what makes the chain flat: four reloads
+                    // inside the hour still respawn at the original minute.
+                    restart_due: carried.restart_due(),
                 },
             );
             // A sheep the blob reports as `WaitingRestart` is owed a respawn,
@@ -3723,17 +3761,29 @@ impl<R: ProcessRunner> Actor<R> {
             // and upgrading the shepherd is exactly what an operator does
             // about a crash-looping app.
             //
-            // Re-armed rather than carried, for the reason the readiness wait
-            // is: what elapsed is a `tokio::time::Instant` from a runtime
-            // that no longer exists. The delay is the one an app in its FIRST
-            // unstable exit would get, which is what the fresh
-            // `RestartBudget` above already says this image believes: an
-            // explicit `restart_delay` is honoured in full (an operator's
-            // pacing is never shortened by a reload), an exponential-backoff
-            // app gets its initial step, and one that opted out of both
-            // restarts at once.
+            // The timer is re-armed, but the DEADLINE is carried, and that
+            // distinction is the whole of this behaviour. What cannot cross
+            // the exec is the `tokio::time::Instant` the original timer slept
+            // against, exactly as the readiness wait's cannot; what can is a
+            // wall-clock moment, which the predecessor recorded beside that
+            // timer for this one purpose. So the successor sleeps out what is
+            // LEFT rather than starting the delay again, and an app with
+            // `restart_delay = "1h"` reloaded at minute 59 comes back in a
+            // minute rather than in another hour.
+            //
+            // This shipped as `restart_delay(config, 1)` in v0.1.20 -- the
+            // delay a FIRST unstable exit would get -- which restarted the
+            // clock at every handover. That is still the fallback, and still
+            // for its own reason: a blob from before the deadline existed
+            // carries none, and erring long is the safe reading of a
+            // predecessor's silence. `adopted_restart_delay` owns all three
+            // cases (elapsed, clock-jumped, absent) and argues each.
             if status == ProcStatus::WaitingRestart {
-                let delay = crate::backoff::restart_delay(app.config(), 1);
+                let delay = crate::backoff::adopted_restart_delay(
+                    app.config(),
+                    carried.restart_due(),
+                    SystemTime::now(),
+                );
                 self.schedule_restart(id, carried.epoch(), delay);
             }
             return Ok(());
@@ -3884,6 +3934,12 @@ impl<R: ProcessRunner> Actor<R> {
                 // would answer that rollback `Ok` and skip the only instance
                 // there was.
                 ready_failed,
+                // Restored verbatim, as the branch above does, though this
+                // one is always `None` in practice: a sheep with a pid is
+                // not `WaitingRestart`, and `CarriedSheep::from_entry` gates
+                // the field on that status. Reading it anyway keeps one rule
+                // for the field rather than a rule and an exception.
+                restart_due: carried.restart_due(),
             },
         );
         // A sheep the blob reports a `manual` marker for is one an operator
@@ -5322,6 +5378,7 @@ impl<R: ProcessRunner> Actor<R> {
                         ready_tx: Some(ready_tx),
                         actions: ActionWaits::default(),
                         ready_failed: false,
+                        restart_due: None,
                     },
                 );
                 // The instance being replaced announces itself BEFORE its
@@ -6345,6 +6402,7 @@ impl<R: ProcessRunner> Actor<R> {
                 pending_delete: slot.pending_delete,
                 epoch: slot.epoch,
                 ready_failed: slot.ready_failed,
+                restart_due: slot.restart_due,
                 log_ctl: slot.log_ctl.clone(),
                 channel_open: slot.open_channel().is_some(),
             })
@@ -6879,6 +6937,24 @@ impl<R: ProcessRunner> Actor<R> {
                 // schedules can tell, when it fires, whether it's still the
                 // authoritative one for this id (see `respawn`/`SheepSlot`).
                 let epoch = self.sheep.get(&id).expect("checked above").epoch;
+                // The same interval as the timer below, in the one clock
+                // that survives an `execve`. Recorded here rather than
+                // inside `schedule_restart` because the other caller is
+                // `install_adopted`, which is re-arming a deadline this
+                // already produced and must not stamp a new one over it.
+                //
+                // `checked_add` rather than `+`: `restart_delay` is an
+                // operator's `Duration` and `SystemTime`'s `Add` panics on
+                // overflow. The `filter` is the same refusal for the other
+                // end of the range -- serde cannot serialize a `SystemTime`
+                // before the Unix epoch, and a whole blob that fails to
+                // write would drop a live flock down the stop-and-start arm
+                // over one field. Either way the successor gets `None` and
+                // falls back to the whole delay, which is what shipped in
+                // v0.1.20.
+                self.sheep.get_mut(&id).expect("checked above").restart_due = SystemTime::now()
+                    .checked_add(delay.unwrap_or(Duration::ZERO))
+                    .filter(|due| due.duration_since(SystemTime::UNIX_EPOCH).is_ok());
                 self.schedule_restart(id, epoch, delay);
                 info
             }
@@ -8163,6 +8239,10 @@ struct HandoverDraft {
     /// Whether a reload's readiness verification has already failed against
     /// this sheep. See [`SheepSlot::ready_failed`].
     ready_failed: bool,
+    /// When this sheep's owed respawn falls due, so the successor re-arms
+    /// for what is left of the delay rather than for the whole of it. See
+    /// [`SheepSlot::restart_due`].
+    restart_due: Option<SystemTime>,
     /// This sheep's log pump, or `None` for a slot whose spawn never
     /// succeeded.
     log_ctl: Option<mpsc::Sender<LogCtl>>,
@@ -8260,6 +8340,7 @@ fn spawn_handover_task(
                 draft.pending_delete,
                 draft.manual,
                 draft.ready_failed,
+                draft.restart_due,
             );
             let candidate = OwnedCandidate {
                 entry: draft.entry,
@@ -10648,6 +10729,7 @@ mod tests {
             ready_tx: None,
             actions: ActionWaits::default(),
             ready_failed: false,
+            restart_due: None,
         };
         let mut sheep = HashMap::new();
         sheep.insert(0, slot);
@@ -11360,6 +11442,7 @@ mod tests {
                 ready_tx: None,
                 actions: ActionWaits::default(),
                 ready_failed: false,
+                restart_due: None,
             },
         );
         let (events, _events_rx) = crate::bus::test_bus(64);
@@ -11422,6 +11505,7 @@ mod tests {
                     ready_tx: None,
                     actions: ActionWaits::default(),
                     ready_failed: false,
+                    restart_due: None,
                 },
             );
         }
@@ -11618,6 +11702,7 @@ mod tests {
                     ready_tx: None,
                     actions: ActionWaits::default(),
                     ready_failed: false,
+                    restart_due: None,
                 },
             );
         }
@@ -15082,6 +15167,7 @@ mod tests {
                 ready_tx: None,
                 actions: ActionWaits::default(),
                 ready_failed: false,
+                restart_due: None,
             },
         );
         id
@@ -18490,7 +18576,49 @@ mod tests {
             pending_delete,
             manual,
             ready_failed,
+            None,
         )
+    }
+
+    /// One sheep as a blob describes it, owed a respawn at a named moment.
+    ///
+    /// Its own function rather than a seventh argument to
+    /// [`carried_marked`]: that one is already at the edge of
+    /// `clippy::too_many_arguments`, and every case there passes the same
+    /// values for the markers these cases are not about. It also needs
+    /// something `carried_marked` does not offer at all — a `restart_delay`
+    /// on the app itself, since a deadline means nothing without a
+    /// configured delay to be shorter than.
+    ///
+    /// `autorestart` is left ON, unlike [`carried_marked`]'s: these cases
+    /// are about a respawn happening, so suppressing it would suppress the
+    /// thing under test.
+    #[cfg(unix)]
+    fn carried_owed_a_restart(
+        name: &str,
+        id: u32,
+        delay: shep_core::values::UpDuration,
+        due: Option<SystemTime>,
+    ) -> CarriedSheep {
+        let mut app = AppConfig::minimal(name, "./srv");
+        app.restart_delay = Some(delay);
+        let entry = ProcessEntry {
+            id,
+            spec: normalize(app).unwrap(),
+            instance: 0,
+            status: ProcStatus::WaitingRestart,
+            pid: None,
+            restarts: 1,
+            started_at: None,
+            budget: RestartBudget::default(),
+            reload: ReloadState::None,
+            credentials: SpawnIdentity::Resolved(None),
+            out_file: PathBuf::new(),
+            err_file: PathBuf::new(),
+            dog: None,
+            last_exit: None,
+        };
+        CarriedSheep::from_entry(&entry, 0, CarriedFds::none(), false, None, false, due)
     }
 
     /// A carried sheep with no descriptors to rebuild, which is every case
@@ -19124,6 +19252,200 @@ mod tests {
             info[0].pid,
             Some(STAND_IN_SPAWN_PID),
             "the restart must be a real respawn, not a status edit: {info:?}"
+        );
+    }
+
+    /// Fails if an adopted sheep waits out its WHOLE restart delay again
+    /// instead of the part of it that was left.
+    ///
+    /// The case above proves a respawn happens at all; this one proves it
+    /// happens WHEN the sheep's own exit said it would. Both sheep here are
+    /// paced by a fixed hour and both are owed a respawn. The only
+    /// difference is that one carries the moment its predecessor recorded
+    /// the respawn as falling due, two seconds out, and the other carries
+    /// nothing — which is what a blob written before v0.1.22 looks like.
+    ///
+    /// The control is the attribution, and it is what makes the first
+    /// assertion mean something. A re-arm that ignored the deadline and
+    /// slept for a hundred milliseconds would satisfy "it came back" just as
+    /// well; only the pair can tell "it waited out what was left" from "it
+    /// did not wait at all". They share one paused clock and one advance, so
+    /// there is no second run to differ.
+    ///
+    /// Ten virtual seconds is the forcing mechanism (IR-46): it is past the
+    /// carried deadline by a factor of five and short of the configured hour
+    /// by a factor of three hundred and sixty, so each sheep's status after
+    /// it can only have come from one of the two behaviours. The paused
+    /// clock advances itself once every task is idle, so it costs the suite
+    /// nothing.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_sheep_waits_out_only_what_is_left_of_its_delay() {
+        let hour = "1h".parse().unwrap();
+        let anchored_dir = tempfile::tempdir().unwrap();
+        let (anchored_events, _anchored_rx) = crate::bus::test_bus(64);
+        let anchored =
+            SupervisorBuilder::new(AdoptingRunner, test_paths(&anchored_dir), anchored_events)
+                .spawn_adopted(
+                    vec![without_handles(carried_owed_a_restart(
+                        "web",
+                        7,
+                        hour,
+                        Some(SystemTime::now() + Duration::from_secs(2)),
+                    ))],
+                    counters(9),
+                    Vec::new(),
+                )
+                .expect("a carried flock installs");
+
+        let control_dir = tempfile::tempdir().unwrap();
+        let (control_events, _control_rx) = crate::bus::test_bus(64);
+        let control =
+            SupervisorBuilder::new(AdoptingRunner, test_paths(&control_dir), control_events)
+                .spawn_adopted(
+                    vec![without_handles(carried_owed_a_restart(
+                        "web", 7, hour, None,
+                    ))],
+                    counters(9),
+                    Vec::new(),
+                )
+                .expect("a carried flock installs");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let anchored = anchored.list().await;
+        assert_eq!(
+            anchored[0].status,
+            ProcStatus::Online,
+            "a sheep two seconds from its own due time must not be made to wait another hour by \
+             the handover: {anchored:?}"
+        );
+        assert_eq!(
+            anchored[0].pid,
+            Some(STAND_IN_SPAWN_PID),
+            "the restart must be a real respawn, not a status edit: {anchored:?}"
+        );
+
+        let control = control.list().await;
+        assert_eq!(
+            control[0].status,
+            ProcStatus::WaitingRestart,
+            "with no carried deadline the whole delay is re-armed, so an hourly app must still \
+             be waiting ten seconds in — a control that respawned would mean the case above \
+             proved nothing: {control:?}"
+        );
+    }
+
+    /// Fails if a snapshot of a sheep owed a respawn does not carry the
+    /// moment that respawn falls due.
+    ///
+    /// The other end of the case above, and a separate assertion rather than
+    /// an implied one: that case hands `spawn_adopted` a blob built by hand,
+    /// so a predecessor that recorded no deadline at all would leave it
+    /// green while no live handover ever carried one. This drives a real
+    /// exit through `decide_on_exit` instead, which is the only thing that
+    /// writes the moment.
+    ///
+    /// The assertion is a window rather than an equality. The deadline is
+    /// wall-clock — that is the whole point of it, since a monotonic instant
+    /// cannot cross an `execve` — and a paused tokio clock does not pause
+    /// the wall clock, so what is pinned is that the moment is about an hour
+    /// out rather than exactly one.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_of_a_waiting_sheep_carries_the_moment_its_respawn_falls_due() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::const_exit(1)]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut app = AppConfig::minimal("web", "./srv");
+        // An hour, so the sheep is still waiting when the snapshot is taken
+        // rather than racing its own respawn, and so the window below is
+        // wide enough to be unambiguous.
+        app.restart_delay = Some("1h".parse().unwrap());
+        handle.start(vec![normalize(app).unwrap()]).await.unwrap();
+
+        // A transition rather than a state (IR-46): the sheep starts
+        // `Online` and the snapshot is only meaningful after the exit, so
+        // waiting for `WaitingRestart` is what stops this passing on the
+        // state before the crash under test. Bounded well past the exit,
+        // which is immediate.
+        let waits = async {
+            while handle.list().await[0].status != ProcStatus::WaitingRestart {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), waits)
+            .await
+            .expect("an app that exits immediately with autorestart on must reach WaitingRestart");
+
+        let (_candidates, blob, _parked) = handle.handover_snapshot(fds).await.unwrap();
+
+        let due = blob.sheep()[0]
+            .restart_due()
+            .expect("a sheep owed a respawn must carry the moment it is owed at");
+        let left = due
+            .duration_since(SystemTime::now())
+            .expect("a deadline an hour out has not passed");
+        assert!(
+            left > Duration::from_secs(3595) && left <= Duration::from_secs(3600),
+            "the carried moment must be this sheep's own exit plus its own delay: {left:?}"
+        );
+    }
+
+    /// Fails if the second handover inside one restart delay loses the
+    /// moment the first one carried.
+    ///
+    /// The deadline is only worth carrying if it survives a CHAIN of them:
+    /// an operator upgrading a shepherd twice inside an hourly delay must
+    /// still get the sheep back at the original minute. That needs the
+    /// successor to restore the moment onto its own slot, not merely to read
+    /// it once on the way past — a successor that armed a correct timer and
+    /// then forgot the moment would pass every other case here and move the
+    /// whole defect one exec along, where it is harder to see.
+    ///
+    /// An absolute moment is what makes the chain flat rather than
+    /// compounding. A carried REMAINDER would have each hop add its own
+    /// handover duration back on, so four reloads would drift by four
+    /// handovers; this drifts by none, which is what the window asserts.
+    ///
+    /// The adopt-then-snapshot pair IS the second handover: `spawn_adopted`
+    /// is what a successor runs, and `handover_snapshot` is what it hands to
+    /// its own successor.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_second_handover_inside_one_delay_still_names_the_original_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let (events, _rx) = crate::bus::test_bus(64);
+        let due = SystemTime::now() + Duration::from_secs(3000);
+        let handle = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_owed_a_restart(
+                    "web",
+                    7,
+                    "1h".parse().unwrap(),
+                    Some(due),
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        let (_candidates, blob, _parked) = handle.handover_snapshot(fds).await.unwrap();
+
+        let carried = blob.sheep()[0]
+            .restart_due()
+            .expect("a successor must hand its own successor the moment it was given");
+        let drift = carried
+            .duration_since(due)
+            .or_else(|_| due.duration_since(carried))
+            .unwrap();
+        assert!(
+            drift < Duration::from_secs(1),
+            "the second hop must name the same moment as the first, not a fresh one: {drift:?} \
+             of drift"
         );
     }
 

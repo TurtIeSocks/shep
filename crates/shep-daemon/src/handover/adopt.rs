@@ -519,6 +519,7 @@ mod tests {
             manual: None,
             reload: Some(crate::entry::ReloadState::None),
             ready_failed: Some(false),
+            restart_due: None,
             app: crate::testing::app_with("web", |_| {}).into_config(),
         }
     }
