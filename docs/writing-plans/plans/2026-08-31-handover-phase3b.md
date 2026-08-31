@@ -117,7 +117,9 @@ Decide what "has had long enough" means here and give it a named constant (IR-26
 
 **Files:** `crates/shep-cli/src/commands/daemon.rs`.
 
-After task 2, `unsettled_dog_report` describes a smaller and genuinely transient population — dogs mid-restart inside the budget. Reword it for who actually lands there now.
+After task 2, `unsettled_dog_report` describes a UNION of two populations, and neither of them is what this plan first predicted. `dog_staleness` seeds `pending` from `DogRefusals::restarting()`, dogs whose restart the shepherd has already asked for, then adds every running dog that has not handshook and is not yet stale. So one entry may be mid-restart and the next may be merely silent inside the budget, and the skewed dog from the incident is still in there at reload time.
+
+That rules out any wording promising a restart is coming, since for half the population it has already been requested. State the rule instead of this dog's future: what the shepherd does with a dog that stays silent is true of every entry regardless of which half it is in.
 
 It still needs a call to action, because "cannot say whether it came back" leaves an operator with no next move, and the next move that worked in production was reading the dog's own log. `shep bleats <dog>` is where the answer was.
 

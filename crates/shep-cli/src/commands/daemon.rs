@@ -1117,14 +1117,14 @@ fn unsettled_dog_report(pending: &[String], wait: std::time::Duration) -> String
     let budget = shep_daemon::dogs::DOG_SILENCE_BUDGET;
     match pending {
         [only] => format!(
-            "the `{only}` dog has not answered this shepherd after {wait:?}; if it is still \
-             silent at {budget:?} it will be restarted from the binary on disk, and `shep \
-             bleats {only}` shows why"
+            "the `{only}` dog has not answered this shepherd after {wait:?}; a dog silent \
+             past {budget:?} is restarted once from the binary on disk and then reported \
+             stale, and `shep bleats {only}` shows why"
         ),
         many => format!(
-            "these dogs have not answered this shepherd after {wait:?}: {}; if they are still \
-             silent at {budget:?} they will be restarted from the binaries on disk, and `shep \
-             bleats <dog>` shows why for each",
+            "these dogs have not answered this shepherd after {wait:?}: {}; a dog silent past \
+             {budget:?} is restarted once from the binary on disk and then reported stale, and \
+             `shep bleats <dog>` shows why for each",
             quoted_names(many)
         ),
     }
@@ -1994,9 +1994,9 @@ otel = "/usr/local/bin/shep-otel"
         let one = unsettled_dog_report(&["metrics".to_string()], std::time::Duration::from_secs(3));
         assert_eq!(
             one,
-            "the `metrics` dog has not answered this shepherd after 3s; if it is still silent \
-             at 5s it will be restarted from the binary on disk, and `shep bleats metrics` \
-             shows why"
+            "the `metrics` dog has not answered this shepherd after 3s; a dog silent past 5s \
+             is restarted once from the binary on disk and then reported stale, and `shep \
+             bleats metrics` shows why"
         );
 
         let two = unsettled_dog_report(
@@ -2005,9 +2005,9 @@ otel = "/usr/local/bin/shep-otel"
         );
         assert_eq!(
             two,
-            "these dogs have not answered this shepherd after 3s: `bark`, `metrics`; if they \
-             are still silent at 5s they will be restarted from the binaries on disk, and \
-             `shep bleats <dog>` shows why for each"
+            "these dogs have not answered this shepherd after 3s: `bark`, `metrics`; a dog \
+             silent past 5s is restarted once from the binary on disk and then reported \
+             stale, and `shep bleats <dog>` shows why for each"
         );
     }
 
