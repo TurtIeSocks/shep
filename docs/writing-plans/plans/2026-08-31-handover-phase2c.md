@@ -136,6 +136,37 @@ A failure here is not an error the operator sees. It is the stop-and-start arm, 
 
 ---
 
+## Inherited from 2b, for a second look
+
+**The re-armed restart delay is a judgement call, and it shipped in v0.1.20.**
+2b's task 8 re-arms a carried `WaitingRestart` sheep with
+`backoff::restart_delay(config, 1)`, which is the delay a FIRST unstable exit
+would get. So an app with `restart_delay = "1h"` reloaded at minute 59 waits
+another full hour rather than the minute it had left.
+
+The reasoning is sound as far as it goes: what elapsed is a
+`tokio::time::Instant` from a runtime that no longer exists, and erring long
+respects an operator's pacing where erring short could hammer whatever the
+delay exists to protect. Restarting immediately is the other obvious option
+and is worse for the same reason.
+
+**But there is a third option neither considered, and it is better than
+both.** The elapsed time is unrecoverable only because it was recorded as a
+monotonic `Instant`. A `SystemTime` deadline survives the exec, so the
+predecessor could carry `now + remaining` and the successor re-arm for
+exactly what was left. That honours the operator's schedule instead of
+approximating it in either direction.
+
+The cost is that a wall clock can jump under it — NTP, a suspend — where the
+monotonic one cannot. For a restart delay that seems an acceptable trade,
+since a jump changes when a down sheep comes back rather than corrupting
+anything, but it is the maintainer's call and it is not urgent: today's
+behaviour is safe, merely blunt.
+
+Not scoped into 2c. Recorded here because it was found while auditing 2c's
+own timer-strand class, and because the class is exactly what makes it
+fixable.
+
 ## The reload drill
 
 Unchanged from 2b's, in `docs/writing-plans/plans/2026-08-30-handover-phase2b.md` under "The reload drill, exactly". Every constraint there still binds: the `awk` rate, `$SHEP_HOME` under 103 bytes, stopping the sheep before counting, seam-aware counting.
