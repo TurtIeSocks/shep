@@ -998,6 +998,8 @@ fn adopt_spec(dir: &tempfile::TempDir, pid: u32, reaper: &Arc<AdoptedReaper>) ->
         err_pipe: None,
         out_log: None,
         err_log: None,
+        stdin_pipe: None,
+        channel: None,
         reaper: Arc::clone(reaper),
     }
 }
@@ -1141,4 +1143,98 @@ async fn an_adopted_pump_appends_the_carried_pipes_lines_through_the_carried_han
         .await
         .expect("the adopted pid must be reaped within the budget");
     assert_eq!(outcome.code, Some(0));
+}
+
+/// A `/bin/sh` child that holds the far end of a socketpair on fd 3 and
+/// echoes each shepherd message back once, exactly as
+/// [`channel_echo_script`] does for a spawned sheep.
+///
+/// Spawned with `command-fds` rather than through `TokioRunner::spawn`,
+/// which is the whole point of the fixture: the case below is about the
+/// SUCCESSOR's half, so the socketpair has to be one this test owns the
+/// daemon side of. A child the runner spawned would keep its half inside the
+/// pumps the runner wired, where nothing here can reach it.
+///
+/// A `std::process::Command`, so tokio holds no `Child` and the reaper is
+/// the only thing that will ever wait it — the same reason
+/// [`adopted_child`] uses one.
+fn child_holding_a_channel(child_end: std::os::fd::OwnedFd, rounds: u32) -> std::process::Child {
+    use command_fds::{CommandFdExt as _, FdMapping};
+
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", &channel_echo_script(rounds)]);
+    command
+        .fd_mappings(vec![FdMapping {
+            parent_fd: child_end,
+            child_fd: 3,
+        }])
+        .expect("map the socketpair onto the child's fd 3");
+    command.spawn().expect("spawn a shell holding fd 3")
+}
+
+/// fails if an adopted shepherd channel does not reach a real app that is
+/// blocking on `read -r line <&3`.
+///
+/// The successor's half of what 2b task 5 carries, against a real process
+/// rather than a socket pair with a test on both ends. Two things can only
+/// be checked here. The child is a separate open file description, so the
+/// `set_nonblocking(true)` the adoption puts on the daemon's end must not
+/// reach it: a plain shell `read` on a non-blocking fd 3 gets `EAGAIN` and
+/// the child dies with status 3 rather than waiting. And the reply has to
+/// come back up through the reader task the adoption rebuilt, which is what
+/// `{"kind":"ready"}` and every action reply ride.
+#[tokio::test]
+#[expect(
+    clippy::zombie_processes,
+    reason = "the reaper collects this status; a Child::wait would take it first"
+)]
+async fn an_adopted_channel_reaches_a_real_child_that_blocks_on_fd_3() {
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon_end, child_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    // Cleared for the child's end exactly as the spawn path clears it: both
+    // ends come back non-blocking from `pair()`, and a shell `read` on one
+    // fails instead of parking.
+    child_end.set_nonblocking(false).unwrap();
+    let child = child_holding_a_channel(std::os::fd::OwnedFd::from(child_end), 1);
+    let pid = child.id();
+
+    daemon_end.set_nonblocking(true).unwrap();
+    let daemon_end = tokio::net::UnixStream::from_std(daemon_end).unwrap();
+    let reaper = Arc::new(AdoptedReaper::new());
+    let mut spec = adopt_spec(&dir, pid, &reaper);
+    spec.channel = Some(daemon_end);
+
+    let (mut proc, mut io) = TokioRunner::new()
+        .adopt(spec)
+        .expect("the real runner must be able to adopt");
+
+    io.to_child
+        .send(ShepherdMessage::Action {
+            name: "round-1".to_string(),
+            params: None,
+            id: 1,
+        })
+        .await
+        .expect("an adopted sheep must still have a channel writer");
+    let reply = tokio::time::timeout(CHANNEL_DEADLINE, io.from_child.recv())
+        .await
+        .expect("the child must answer over the adopted channel")
+        .expect("the adopted reader must forward the reply");
+    assert_eq!(
+        reply,
+        ChildMessage::ActionReply {
+            action: "round-1".to_string(),
+            body: "ok".to_string(),
+            id: None,
+        }
+    );
+
+    let outcome = tokio::time::timeout(REAP_DEADLINE, proc.wait())
+        .await
+        .expect("the adopted pid must be reaped within the budget");
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "status 3 is the child's own `read` failing, which is a non-blocking fd 3"
+    );
 }

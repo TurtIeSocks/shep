@@ -3480,6 +3480,8 @@ impl<R: ProcessRunner> Actor<R> {
             err_pipe,
             out_log,
             err_log,
+            stdin_pipe,
+            channel,
         } = sheep;
         let app = normalize(carried.app().clone()).map_err(|source| AdoptError::Spec {
             sheep: carried.name().to_string(),
@@ -3550,6 +3552,33 @@ impl<R: ProcessRunner> Actor<R> {
                     ready_failed: false,
                 },
             );
+            // A sheep the blob reports as `WaitingRestart` is owed a respawn,
+            // and the timer that owed it was a `tokio::spawn` of the
+            // predecessor's that the exec took with it. Nothing else raises
+            // `Msg::RestartDue`, so without a fresh one the sheep sits
+            // `WaitingRestart` for the rest of this daemon's life: down,
+            // never coming back, and reporting a status an operator reads as
+            // about to. Same shape as the `Starting` strand the readiness
+            // re-arm above closes, and the same reason for closing it here.
+            //
+            // Not a narrow race, either. The default backoff climbs to 15s,
+            // so a crash-looping app spends most of its time in this status,
+            // and upgrading the shepherd is exactly what an operator does
+            // about a crash-looping app.
+            //
+            // Re-armed rather than carried, for the reason the readiness wait
+            // is: what elapsed is a `tokio::time::Instant` from a runtime
+            // that no longer exists. The delay is the one an app in its FIRST
+            // unstable exit would get, which is what the fresh
+            // `RestartBudget` above already says this image believes: an
+            // explicit `restart_delay` is honoured in full (an operator's
+            // pacing is never shortened by a reload), an exponential-backoff
+            // app gets its initial step, and one that opted out of both
+            // restarts at once.
+            if status == ProcStatus::WaitingRestart {
+                let delay = crate::backoff::restart_delay(app.config(), 1);
+                self.schedule_restart(id, carried.epoch(), delay);
+            }
             return Ok(());
         };
 
@@ -3563,6 +3592,8 @@ impl<R: ProcessRunner> Actor<R> {
                 err_pipe,
                 out_log,
                 err_log,
+                stdin_pipe,
+                channel,
                 reaper: Arc::clone(reaper),
             })
             .map_err(|source| AdoptError::Runner {
@@ -3589,6 +3620,48 @@ impl<R: ProcessRunner> Actor<R> {
         // that has been up three days reporting three days in `shep flock`'s
         // UPTIME column instead of `0s` the moment a successor takes over.
         entry.started_at = Some(crate::handover::uptime::started_at_of(proc.pid()));
+        // A sheep the blob reports as `Starting` is one whose readiness has
+        // not resolved, and the wait that was going to resolve it was a task
+        // of the predecessor's that the exec took with it. Without a fresh
+        // one it stays `Starting` for the rest of this daemon's life:
+        // `handle_exited` is the only other thing that moves it off, so the
+        // sheep sits outside `listen_timeout` and outside every status an
+        // operator acts on.
+        //
+        // Re-armed rather than carried, because there is nothing to carry.
+        // The deadline is a `tokio::time::Instant` in a runtime that no
+        // longer exists, exactly as `started_at` is, and a probe's next
+        // attempt is a future rather than a value. So the successor starts
+        // the app's own `listen_timeout` again.
+        //
+        // What that costs is bounded and it is worth naming, because the
+        // race is not closeable from here. The blob is a snapshot taken on
+        // the actor loop, and a `{"kind":"ready"}` that arrives between it
+        // and the exec flips the predecessor's slot without reaching the
+        // blob, so the successor waits for a signal that has already been
+        // sent and will not come again. That wait ends at `listen_timeout`
+        // and `handle_ready_result` puts the sheep `Online` anyway, with a
+        // warning, so the worst case is one `listen_timeout` of `Starting`
+        // on a sheep that was already serving. The alternative is refusing
+        // to carry a `Starting` sheep at all, which restarts a whole flock
+        // over one app in its first three seconds.
+        //
+        // `manually` is `false` and cannot be anything else: it belongs to
+        // the spawn that armed the original wait, which is not this image's
+        // to know. It reaches only the `Online` event's own flag.
+        let ready_tx = (status == ProcStatus::Starting).then(|| {
+            let source = ReadinessSource::of(app.config())
+                .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
+            spawn_readiness_task(
+                id,
+                carried.epoch(),
+                false,
+                source,
+                app.config().listen_timeout.as_duration(),
+                spec_prober(&spec),
+                self.tx.clone(),
+            )
+        });
         let log_ctl = io.log_ctl.clone();
         let to_child = io.to_child.clone();
         let to_stdin = io.to_stdin.clone();
@@ -3614,12 +3687,11 @@ impl<R: ProcessRunner> Actor<R> {
                 manual: None,
                 pending_delete: false,
                 epoch: carried.epoch(),
-                // A readiness wait that was still running belonged to the
-                // predecessor's own task, which the exec took with it. An
-                // instance the blob reports as `Online` has already resolved
-                // one; one it reports as `Starting` has not, and stays
-                // `Starting` until it next exits — see this phase's residuals.
-                ready_tx: None,
+                // Armed above for an instance the blob reports as
+                // `Starting`, and `None` for one it reports as `Online`,
+                // which has already resolved its readiness and has nothing
+                // left to wait for.
+                ready_tx,
                 actions: ActionWaits::default(),
                 ready_failed: false,
             },
@@ -5916,6 +5988,7 @@ impl<R: ProcessRunner> Actor<R> {
                 pending_delete: slot.pending_delete,
                 epoch: slot.epoch,
                 log_ctl: slot.log_ctl.clone(),
+                channel_open: slot.open_channel().is_some(),
             })
             .collect();
         // `HashMap` iteration order is arbitrary, and the blob is written to
@@ -5960,6 +6033,13 @@ impl<R: ProcessRunner> Actor<R> {
                 // fails it.
                 pending_stop: slot.manual.is_some(),
                 pending_delete: slot.pending_delete,
+                // Always `false` here, and it has to be: this gate awaits
+                // nothing, so it cannot ask a pump anything, and a pump that
+                // is wedged right now may well have answered by the time a
+                // SIGHUP arrives. The snapshot's own gate is the one that
+                // knows (see `spawn_handover_task`), which is why that one
+                // is load-bearing and this one is a courtesy to the client.
+                pump_unresponsive: false,
             })
             .collect();
         let _ = reply.send(Ok(fitness(&candidates)));
@@ -7648,11 +7728,46 @@ fn spawn_send_line_task(
 /// What a [`Command::HandoverSnapshot`] answers with: one candidate per
 /// registered sheep for the fitness gate, and the blob a successor reads.
 ///
-/// A pair rather than one type because the two go to different places and
-/// only one of them crosses the exec — the candidates decide whether there
-/// is to be an exec at all, and are then done with.
+/// Three types rather than one because they go to three different places
+/// and only one of them crosses the exec: the candidates decide whether
+/// there is to be an exec at all and are then done with, and the parked
+/// pumps matter only if there is not.
 #[cfg(unix)]
-type Snapshot = (Vec<OwnedCandidate>, Handover);
+type Snapshot = (Vec<OwnedCandidate>, Handover, ParkedPumps);
+
+/// The log pumps a snapshot stopped, so a handover that is then abandoned
+/// can start them reading again.
+///
+/// Taking the snapshot parks every pump that ANSWERS it, because a report
+/// is only true while nothing moves behind it (see `LogFiles::reading`). A
+/// pump that missed [`REPORT_DEADLINE`] is deliberately not in here: it
+/// never parked, so a resume would wake something that was never asleep.
+/// The
+/// exec is what normally ends that park, by replacing the whole image.
+/// Every other way out leaves this daemon running with pumps that have
+/// stopped reading, and nothing else ever starts one again. See
+/// [`LogCtl::Resume`] for what that costs.
+///
+/// The party that parked them hands them back, rather than the abort path
+/// re-reading the actor's slots: the flock can have changed by then, and
+/// what is owed a resume is what was reported, not what is registered now.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct ParkedPumps(Vec<mpsc::Sender<LogCtl>>);
+
+#[cfg(unix)]
+impl ParkedPumps {
+    /// Lets every pump this snapshot parked read its sheep's streams again.
+    ///
+    /// A send that fails is a pump that has ended since the report, which
+    /// is nothing to repair: the sheep it belonged to is no longer being
+    /// read by anything either way.
+    pub(crate) async fn resume(&self) {
+        for pump in &self.0 {
+            let _ = pump.send(LogCtl::Resume).await;
+        }
+    }
+}
 
 /// One sheep on its way from the actor to the handover task.
 ///
@@ -7674,6 +7789,19 @@ struct HandoverDraft {
     /// This sheep's log pump, or `None` for a slot whose spawn never
     /// succeeded.
     log_ctl: Option<mpsc::Sender<LogCtl>>,
+    /// Whether this sheep's shepherd channel is still one the daemon can
+    /// write to.
+    ///
+    /// Read here rather than taken from the pump's report, and the two are
+    /// not the same claim. The pump reports the number it was told at the
+    /// spawn and has no way to learn that the channel died: the writer task
+    /// ends on a write that fails, which is what a child that has closed its
+    /// fd 3 produces, and the socketpair's last reference goes with it. The
+    /// number then names whatever the kernel has since handed to the next
+    /// `open`. [`SheepSlot::open_channel`] is the fact that actually decides
+    /// delivery, and it is only reachable from the actor loop, which is
+    /// where this is read.
+    channel_open: bool,
 }
 
 /// Spawns the task that assembles one handover snapshot and answers its
@@ -7682,10 +7810,29 @@ struct HandoverDraft {
 /// Every await lives in here, off the actor loop — see
 /// [`Actor::handle_reopen`] for the cycle that rules out doing it inline.
 ///
-/// The sheep are visited one after another rather than concurrently, exactly
-/// as [`spawn_reopen_task`] visits them, and the same trade applies: a
-/// stalled pump delays the sheep behind it, and the request's own deadline
-/// is what bounds the caller either way.
+/// The sheep are visited CONCURRENTLY, with `join_all` rather than a `for`
+/// loop, exactly as [`spawn_send_line_task`] visits its waits and for the
+/// same reason: a bound meant to sit under a fixed caller deadline stops
+/// doing that the moment several of them are added up serially.
+/// [`spawn_reopen_task`] is the one sibling that stays a `for` loop, and the
+/// difference is which deadline is fixed. A reopen's caller carries `rpc`'s
+/// own per-request budget, which scales with what is asked of it; a
+/// reload's client-side wait is `shep-cli`'s `admin::KILL_TEARDOWN_WAIT`, a
+/// constant the daemon cannot see and does not get to lengthen. Serially, N
+/// wedged pumps cost N times [`REPORT_DEADLINE`], and past six that already
+/// outlasts the client (see `REPORT_DEADLINE`'s own doc): the client gives
+/// up, falls back to a predecessor that is still serving, musters against
+/// it, and exits 0 while the sweep is still running behind it. `join_all`
+/// bounds the whole sweep at one [`REPORT_DEADLINE`] regardless of N, which
+/// is what the fixed deadline on the other end actually needs.
+///
+/// `join_all` returns its results in the order its input futures were
+/// given, not completion order, so the sorted-by-id order `drafts` arrives
+/// in (see [`Actor::handle_handover_snapshot`]) survives into `candidates`
+/// and `carried` untouched: no re-sort is needed or performed here. Each
+/// future closes over its own `draft`, so which pump answered late is still
+/// attached to that sheep's own [`OwnedCandidate::pump_unresponsive`];
+/// racing the reports does not blur which one refused the gate.
 ///
 /// Must be called from within a Tokio runtime context.
 #[cfg(unix)]
@@ -7696,41 +7843,168 @@ fn spawn_handover_task(
     reply: oneshot::Sender<Result<Snapshot, SupervisorError>>,
 ) {
     tokio::spawn(async move {
-        let mut candidates = Vec::with_capacity(drafts.len());
-        let mut carried = Vec::with_capacity(drafts.len());
-        for draft in drafts {
-            let fds = match &draft.log_ctl {
-                Some(log_ctl) => report_fds(log_ctl).await,
-                None => CarriedFds::none(),
+        let visited = futures_util::future::join_all(drafts.into_iter().map(|draft| async move {
+            // The three answers go to three different places, which is why
+            // `report_fds` distinguishes them at all:
+            //
+            // - only a pump that ANSWERED parked, so only that one is owed a
+            //   resume. A wedged pump never stopped reading, and one that is
+            //   gone is reading nothing.
+            // - only a wedged pump refuses the flock. It is the one case
+            //   where a live sheep's descriptors are unknown, and the gate
+            //   below is the only thing standing between that and a
+            //   successor adopting a sheep with no stdout.
+            // - the blob gets `none()` for both of the answers without
+            //   descriptors. For a wedged pump that is a value nothing ever
+            //   reads: the gate refuses on the candidate, so this blob is
+            //   dropped rather than written.
+            let (mut fds, pump_unresponsive, parked_pump) = match &draft.log_ctl {
+                Some(log_ctl) => match report_fds(log_ctl).await {
+                    PumpReport::Parked(fds) => (fds, false, Some(log_ctl.clone())),
+                    PumpReport::Gone => (CarriedFds::none(), false, None),
+                    PumpReport::Unresponsive => (CarriedFds::none(), true, None),
+                },
+                None => (CarriedFds::none(), false, None),
             };
-            carried.push(CarriedSheep::from_entry(&draft.entry, draft.epoch, fds));
-            candidates.push(OwnedCandidate {
+            // The one number the pump can report and be wrong about. See
+            // `HandoverDraft::channel_open` for why the pump cannot know,
+            // and `PipeFds::channel` for what it costs to carry a number
+            // the kernel has already reissued: `UnixStream::from(OwnedFd)`
+            // checks nothing, so the successor would write a shepherd
+            // message into whatever that descriptor is now.
+            if !draft.channel_open {
+                fds.channel = None;
+            }
+            let carried = CarriedSheep::from_entry(&draft.entry, draft.epoch, fds);
+            let candidate = OwnedCandidate {
                 entry: draft.entry,
                 pending_stop: draft.pending_stop,
                 pending_delete: draft.pending_delete,
-            });
+                pump_unresponsive,
+            };
+            (candidate, carried, parked_pump)
+        }))
+        .await;
+
+        // `join_all` hands `visited` back in `drafts`' own order (id-sorted,
+        // per `Actor::handle_handover_snapshot`), not completion order, so
+        // this loop reproduces the serial version's ordering without a sort
+        // of its own.
+        let mut candidates = Vec::with_capacity(visited.len());
+        let mut carried = Vec::with_capacity(visited.len());
+        let mut parked = ParkedPumps::default();
+        for (candidate, sheep, parked_pump) in visited {
+            candidates.push(candidate);
+            carried.push(sheep);
+            if let Some(log_ctl) = parked_pump {
+                parked.0.push(log_ctl);
+            }
         }
         let blob = Handover::new(carried, fds, counters);
-        let _ = reply.send(Ok((candidates, blob)));
+        let _ = reply.send(Ok((candidates, blob, parked)));
     });
 }
 
-/// Asks one sheep's log pump to flush what it is holding and report the four
-/// descriptors it owns, and waits for the answer.
+/// What one log pump answered a snapshot's [`LogCtl::ReportFds`] with.
 ///
-/// Not reaching a pump at all is [`CarriedFds::none`], not an error, and both
-/// shapes of it mean the same thing that [`reopen_logs`] documents: there is
-/// no pump, so there are no descriptors. A stopped sheep has nothing to
-/// carry and nothing to lose, and the fitness gate does not refuse it.
+/// Three answers rather than two, and the third is the point. A pump that
+/// cannot be reached and a pump that is wedged both have no descriptors to
+/// give, but they mean opposite things: the first is a sheep that has
+/// stopped and has nothing to lose, and the second is a live sheep whose
+/// four descriptors this daemon simply does not know. Folding the second
+/// into [`CarriedFds::none`] would carry it, silently dropping its stdout,
+/// stderr and both log handles.
 ///
 /// [`CarriedFds::none`]: CarriedFds::none
 #[cfg(unix)]
-async fn report_fds(log_ctl: &mpsc::Sender<LogCtl>) -> CarriedFds {
+#[derive(Debug)]
+enum PumpReport {
+    /// The pump answered, and has stopped reading its streams until the
+    /// exec. It is owed a [`LogCtl::Resume`] if the handover is abandoned.
+    Parked(CarriedFds),
+    /// There is no pump on the other end any more: the send found a closed
+    /// mailbox, or the answer channel dropped unanswered. Either way the
+    /// task is over, so it is reading nothing and is owed nothing.
+    ///
+    /// Not a refusal. A registered sheep that is not running reaches the
+    /// gate exactly like this, and carrying it is correct: there is nothing
+    /// to carry.
+    Gone,
+    /// The pump did not answer inside [`REPORT_DEADLINE`].
+    ///
+    /// It never parked, so it is still reading its sheep's streams, and it
+    /// must NOT be resumed: a resume would wake something that was never
+    /// asleep.
+    Unresponsive,
+}
+
+/// How long a snapshot waits for ONE log pump to report its descriptors.
+///
+/// The work it bounds is small and known (IR-26): the pump drains at most
+/// one bufferful per stream into that stream's log file and flushes both, so
+/// this covers a handful of `write(2)`s of at most 8 KiB each. That is
+/// microseconds on a healthy filesystem and single-digit milliseconds on a
+/// busy one, which puts two seconds three orders of magnitude clear of the
+/// work. The margin is deliberate and the asymmetry is why: firing early
+/// costs the WHOLE flock its handover, while firing late costs a few seconds
+/// before the same fallback. So this fires only for a pump that is genuinely
+/// stuck, on a filesystem that has stopped completing writes, rather than
+/// for one that is merely slow.
+///
+/// Two seconds also matches [`STDIN_WRITE_TIMEOUT`], the closest sibling in
+/// this file: a bounded wait on an acknowledgement from a pump-tier task
+/// whose failure mode is a peer that has stopped consuming.
+///
+/// Per pump, but paid ONCE, not per sweep: [`spawn_handover_task`] visits
+/// every pump concurrently, exactly as [`spawn_send_line_task`] does for
+/// `STDIN_WRITE_TIMEOUT`, so a whole flock of wedged pumps still costs one
+/// [`REPORT_DEADLINE`] rather than N of them, and the refusal still names
+/// WHICH sheep went quiet. Concurrency does not cost that name, because
+/// each pump's report carries its own sheep with it regardless of how the
+/// others answer.
+///
+/// **This bound used to scale with N, and does not any more; the arithmetic
+/// is worth keeping written down because reaching a large N got much
+/// shorter.** Since 2b carried multi-instance apps, an `instances = 10` is
+/// ten sheep with ten pumps, where reaching ten used to take ten app
+/// stanzas. Visited one after another, that sweep would have cost up to ten
+/// times this deadline; `shep daemon reload` only gives the successor
+/// `admin::KILL_TEARDOWN_WAIT` (10s) to answer, so six wedged pumps was
+/// already enough to outlast the client that asked. Past that the client
+/// used to report a failed handover and muster against the PREDECESSOR,
+/// which was still serving and would then refuse and stop gracefully
+/// seconds later, leaving an operator with an exit code of 0 and no flock.
+/// `join_all` closes that: the sweep's worst case is now one
+/// [`REPORT_DEADLINE`] regardless of N, comfortably inside
+/// `KILL_TEARDOWN_WAIT` for any flock size this daemon is likely to carry.
+#[cfg(unix)]
+const REPORT_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Asks one sheep's log pump to write out everything it is holding, report
+/// the four descriptors it owns, and stop reading until the exec; and waits
+/// up to [`REPORT_DEADLINE`] for the answer.
+///
+/// Not reaching a pump at all is [`PumpReport::Gone`], not an error, and
+/// both shapes of it mean the same thing that [`reopen_logs`] documents:
+/// there is no pump, so there are no descriptors. A stopped sheep has
+/// nothing to carry and nothing to lose, and the fitness gate does not
+/// refuse it.
+///
+/// The deadline covers the send as well as the answer. A pump that has
+/// stopped serving its mailbox fills it and blocks the send instead, which
+/// is the same stall arriving one step earlier.
+#[cfg(unix)]
+async fn report_fds(log_ctl: &mpsc::Sender<LogCtl>) -> PumpReport {
     let (done, ack) = oneshot::channel();
-    if log_ctl.send(LogCtl::ReportFds { done }).await.is_err() {
-        return CarriedFds::none();
-    }
-    ack.await.unwrap_or_else(|_| CarriedFds::none())
+    let answer = async {
+        if log_ctl.send(LogCtl::ReportFds { done }).await.is_err() {
+            return PumpReport::Gone;
+        }
+        ack.await.map_or(PumpReport::Gone, PumpReport::Parked)
+    };
+    tokio::time::timeout(REPORT_DEADLINE, answer)
+        .await
+        .unwrap_or(PumpReport::Unresponsive)
 }
 
 /// Spawns the task that carries out one `Reopen` and answers its caller.
@@ -15199,6 +15473,11 @@ mod tests {
                         LogCtl::ReportFds { done } => {
                             let _ = done.send(CarriedFds::none());
                         }
+                        // Nothing to start reading again: this runner reads
+                        // no streams, and never reported anything to park
+                        // for.
+                        #[cfg(unix)]
+                        LogCtl::Resume => {}
                     }
                 }
             });
@@ -15756,6 +16035,11 @@ mod tests {
                         LogCtl::ReportFds { done } => {
                             let _ = done.send(CarriedFds::none());
                         }
+                        // Nothing to start reading again: this runner reads
+                        // no streams, and never reported anything to park
+                        // for.
+                        #[cfg(unix)]
+                        LogCtl::Resume => {}
                     }
                 }
             });
@@ -17239,40 +17523,297 @@ mod tests {
         nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).is_ok()
     }
 
-    /// Fails if a snapshot of a live flock does not name four open
-    /// descriptors for every sheep in it.
+    /// Fails if a snapshot of a live flock does not name an open
+    /// descriptor for everything the fake pump reports.
     ///
     /// The blob is what the successor adopts by number, and a number it
     /// cannot adopt is not a gap it can repair: losing a sheep's stdout read
     /// end blocks the child on `write()` once the pipe buffer fills, which
     /// reads as an application hang rather than as a shep bug.
+    ///
+    /// One of the two sheep has a shepherd channel and the other does not,
+    /// which is the case below's subject and this one's precondition: the
+    /// channel is the one number a snapshot may drop, so a case with only
+    /// channelled sheep in it could not tell "every number is open" from
+    /// "every number is present".
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
-    async fn a_blob_from_a_live_flock_names_four_open_descriptors_per_sheep() {
+    async fn a_blob_from_a_live_flock_names_open_descriptors_per_sheep() {
         let (events, _rx) = crate::bus::test_bus(64);
         let runner =
             ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         let dir = tempfile::tempdir().unwrap();
         let (fds, _held) = daemon_fds(&dir);
         let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut talkative = AppConfig::minimal("api", "./srv");
+        talkative.channel = true;
         handle
             .start(vec![
                 normalize(AppConfig::minimal("web", "./srv")).unwrap(),
-                normalize(AppConfig::minimal("api", "./srv")).unwrap(),
+                normalize(talkative).unwrap(),
             ])
             .await
             .unwrap();
 
-        let (candidates, blob) = handle.handover_snapshot(fds).await.unwrap();
+        let (candidates, blob, _parked) = handle.handover_snapshot(fds).await.unwrap();
 
         assert_eq!(candidates.len(), 2, "both sheep must reach the gate");
         assert_eq!(blob.sheep().len(), 2);
         for sheep in blob.sheep() {
-            for fd in sheep.fds().all() {
-                let fd = fd.expect("a running sheep has all four descriptors");
+            for fd in sheep.fds().all().into_iter().flatten() {
                 assert!(is_open(fd), "blob names a closed descriptor: {fd}");
             }
         }
+    }
+
+    /// Fails if a snapshot names a shepherd-channel descriptor for a sheep
+    /// that has no shepherd channel.
+    ///
+    /// The pump reports the number it was told at the spawn and has no way
+    /// to learn that the channel is gone: the writer task ends on a write
+    /// that fails, which is what a child that has closed its fd 3 produces,
+    /// and the socketpair's last reference goes with it. So the number can
+    /// name whatever the kernel has since handed to the next `open`, and
+    /// `UnixStream::from(OwnedFd)` checks nothing — the successor would
+    /// write a shepherd message into a log file. `SheepSlot::open_channel`
+    /// is the fact that decides delivery, and the snapshot masks the field
+    /// with it.
+    ///
+    /// The fake reports a number for every field unconditionally, which is
+    /// what makes this case able to fail: without the mask it would see one.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_names_no_channel_for_a_sheep_that_has_none() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner =
+            ScriptedRunner::new(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        let mut talkative = AppConfig::minimal("api", "./srv");
+        talkative.channel = true;
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("web", "./srv")).unwrap(),
+                normalize(talkative).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let (_candidates, blob, _parked) = handle.handover_snapshot(fds).await.unwrap();
+
+        let named: Vec<(&str, bool)> = blob
+            .sheep()
+            .iter()
+            .map(|sheep| (sheep.name(), sheep.fds().channel.is_some()))
+            .collect();
+        assert!(
+            named.contains(&("web", false)),
+            "a sheep with no channel must carry no channel descriptor: {named:?}"
+        );
+        assert!(
+            named.contains(&("api", true)),
+            "a sheep with a live channel must carry its descriptor: {named:?}"
+        );
+    }
+
+    /// Fails if a wedged log pump hangs the snapshot instead of refusing it.
+    ///
+    /// A pump that never answers has no deadline above it but this one: the
+    /// SIGHUP path awaits the snapshot before it can fall back, so the same
+    /// stall takes out the handover AND the graceful stop it would have
+    /// fallen back to, and the daemon has no way out at all.
+    ///
+    /// The refusal has to name the sheep, and it has to be its own reason
+    /// rather than an empty `CarriedFds`: `none()` is what a STOPPED sheep
+    /// reports, so collapsing a wedged live pump into it would pass the gate
+    /// and carry that sheep with its descriptors dropped.
+    ///
+    /// Two sheep, one of each kind, so a gate that refused every flock with
+    /// a pump in it would pass here for the wrong reason.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_that_never_reports_refuses_the_snapshot_instead_of_hanging() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); 2])
+            .with_a_pump_that_never_reports(&["wedged"]);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("answering", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("wedged", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        // Far longer than the deadline under test, and never actually
+        // waited: the clock is paused, so it advances only once every task
+        // is blocked. What it buys is a FAILURE rather than a hung suite if
+        // the snapshot has no deadline of its own.
+        let snapshot =
+            tokio::time::timeout(Duration::from_secs(3600), handle.handover_snapshot(fds))
+                .await
+                .expect("a snapshot over a wedged pump must answer rather than hang")
+                .unwrap();
+        let (candidates, _blob, _parked) = snapshot;
+
+        let borrowed: Vec<crate::handover::Candidate<'_>> = candidates
+            .iter()
+            .map(crate::handover::OwnedCandidate::as_candidate)
+            .collect();
+        assert_eq!(
+            crate::handover::fitness(&borrowed),
+            crate::handover::Fitness::Refused(crate::handover::RefusedReason::PumpUnresponsive {
+                sheep: "wedged".to_string(),
+            }),
+            "the gate must refuse, and must name the sheep whose pump went quiet"
+        );
+        for candidate in &candidates {
+            assert_eq!(
+                candidate.pump_unresponsive,
+                candidate.entry.spec.config().name == "wedged",
+                "exactly the wedged sheep is unresponsive, not its neighbour"
+            );
+        }
+    }
+
+    /// Fails if the snapshot puts a pump it never heard from into the set it
+    /// owes a resume to.
+    ///
+    /// A report parks the pump that answers it, and only that one: a pump
+    /// that missed the deadline is still reading its streams. Resuming it
+    /// would wake something that was never asleep, and the counter it lands
+    /// on is the one an abandoned handover is audited by, so a spurious
+    /// resume reads as a repaired pump forever after.
+    ///
+    /// Asserted by sending the resumes rather than by counting the set, so
+    /// this is a claim about which pump is told rather than about how many
+    /// senders are held.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_pump_that_missed_the_deadline_is_not_in_the_parked_set() {
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = Arc::new(
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 2])
+                .with_a_pump_that_never_reports(&["wedged"]),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(SharedRunner(Arc::clone(&runner)), test_paths(&dir), events);
+        handle
+            .start(vec![
+                normalize(AppConfig::minimal("answering", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("wedged", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let (_candidates, _blob, parked) =
+            tokio::time::timeout(Duration::from_secs(3600), handle.handover_snapshot(fds))
+                .await
+                .expect("a snapshot over a wedged pump must answer rather than hang")
+                .unwrap();
+        parked.resume().await;
+
+        // By name, because spawn order is the supervisor's business and
+        // every counter here is indexed by it.
+        let answering = runner.spawn_index_of("answering").expect("started above");
+        let wedged = runner.spawn_index_of("wedged").expect("started above");
+        // A resume carries no acknowledgement, so a send that has returned
+        // has only been queued. Bounded, and instant under the paused clock.
+        let delivered = async {
+            while runner.resumes(answering) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), delivered)
+            .await
+            .expect("the pump that answered was parked, and is owed a resume");
+        assert_eq!(
+            runner.resumes(wedged),
+            0,
+            "a pump that never answered never parked, so nothing may resume it"
+        );
+    }
+
+    /// Fails if the sweep costs `REPORT_DEADLINE * N` instead of
+    /// `REPORT_DEADLINE` once.
+    ///
+    /// This is the defect task 6 measured but did not fix: a `for` loop over
+    /// the pumps makes a flock of wedged pumps cost N times
+    /// [`REPORT_DEADLINE`] before the caller's own fallback can even start.
+    /// Six is the number [`REPORT_DEADLINE`]'s own doc names as where that
+    /// sweep first outlasts `shep-cli`'s `admin::KILL_TEARDOWN_WAIT` (10s):
+    /// past it, the client gives up first, falls back to a predecessor that
+    /// is still serving, musters against it, and exits 0 seconds before the
+    /// sweep this daemon is still running actually finishes and the gate
+    /// refuses for real. `instances = 6` reaches that count in one stanza.
+    ///
+    /// Asserted against `Instant`, like
+    /// `a_flock_of_wedged_sheep_is_bounded_once_and_not_once_each`: under the
+    /// paused clock the auto-advance is exact, so a serial sweep reliably
+    /// reads six [`REPORT_DEADLINE`]s (12s) and a concurrent one reliably
+    /// reads about one (2s). The bound below sits well inside that gap.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_of_six_wedged_pumps_costs_one_deadline_not_six() {
+        const WEDGED: usize = 6;
+        let names: Vec<String> = (0..WEDGED).map(|i| format!("wedged{i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = ScriptedRunner::new(vec![ProcScript::never_exits(); WEDGED])
+            .with_a_pump_that_never_reports(&name_refs);
+        let dir = tempfile::tempdir().unwrap();
+        let (fds, _held) = daemon_fds(&dir);
+        let handle = spawn_supervisor(runner, test_paths(&dir), events);
+        handle
+            .start(
+                names
+                    .iter()
+                    .map(|name| normalize(AppConfig::minimal(name, "./srv")).unwrap())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let started_at = tokio::time::Instant::now();
+        let (candidates, blob, _parked) =
+            tokio::time::timeout(Duration::from_secs(3600), handle.handover_snapshot(fds))
+                .await
+                .expect("a snapshot over six wedged pumps must answer rather than hang")
+                .unwrap();
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < REPORT_DEADLINE * 2,
+            "six wedged pumps swept concurrently should cost about one \
+             REPORT_DEADLINE, not six; took {elapsed:?}"
+        );
+
+        assert_eq!(candidates.len(), WEDGED);
+        for candidate in &candidates {
+            assert!(
+                candidate.pump_unresponsive,
+                "{} must still be reported unresponsive; racing the reports \
+                 must not blur which pump answered",
+                candidate.entry.spec.config().name
+            );
+        }
+        // `join_all` returns in the order its input futures were given, and
+        // `handle_handover_snapshot` sorted `drafts` by id before spawning
+        // this task, so both outputs stay id-ordered across the concurrent
+        // sweep with no re-sort in `spawn_handover_task` itself.
+        assert!(
+            candidates.windows(2).all(|w| w[0].entry.id < w[1].entry.id),
+            "candidates must stay in id order across a concurrent sweep"
+        );
+        assert!(
+            blob.sheep().windows(2).all(|w| w[0].id() < w[1].id()),
+            "the blob must stay in id order too: it is a file an operator may read"
+        );
     }
 
     /// Fails if a snapshot loses the three actor counters or the two slot
@@ -17299,7 +17840,7 @@ mod tests {
 
         let (reply, rx) = oneshot::channel();
         actor.handle_handover_snapshot(fds, reply);
-        let (candidates, blob) = rx.await.unwrap().unwrap();
+        let (candidates, blob, _parked) = rx.await.unwrap().unwrap();
 
         assert!(
             candidates[0].pending_stop,
@@ -17407,6 +17948,62 @@ mod tests {
         }
     }
 
+    /// fails if a sheep adopted mid-readiness is left `Starting` forever.
+    ///
+    /// The wait that was going to resolve it belonged to a task of the
+    /// predecessor's, and the `execve` took that with it. Nothing else in
+    /// the daemon moves a sheep off `Starting` except its own exit, so a
+    /// successor that adopts one without re-arming leaves it there for the
+    /// rest of that daemon's life: outside `listen_timeout`, outside every
+    /// status an operator acts on, and with none of `arm_extras`'s watch,
+    /// cron or memory limits, which fire at the `Online` transition.
+    ///
+    /// The readiness here is `wait_ready`, the case 2b task 5 opened the
+    /// gate to: its signal comes over the shepherd channel, so a sheep can
+    /// still be waiting for one at the moment of the exec. The assertion is
+    /// deliberately the TIMEOUT arm rather than the signal arm, since
+    /// nothing here writes `{"kind":"ready"}` — `handle_ready_result` puts a
+    /// timed-out sheep `Online` anyway rather than erroring, so reaching
+    /// `Online` at all is proof a wait was armed. Without one the clock can
+    /// advance as far as it likes and nothing happens.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_sheep_that_was_still_starting_reaches_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, Some(4242), |entry| {
+                    let mut app = AppConfig::minimal("web", "./srv");
+                    app.autorestart = false;
+                    app.wait_ready = true;
+                    entry.spec = normalize(app).unwrap();
+                    entry.status = ProcStatus::Starting;
+                }))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        assert_eq!(
+            sup.list().await[0].status,
+            ProcStatus::Starting,
+            "the blob said this sheep was still starting, so the successor must agree"
+        );
+
+        // Polled rather than advanced by a fixed amount: the wait runs on a
+        // task, so its result reaches the actor a message later than the
+        // deadline. Bounded well past the app's own 3s `listen_timeout`, so
+        // a sheep that is never armed fails here rather than hanging.
+        let goes_online = async {
+            while sup.list().await[0].status != ProcStatus::Online {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), goes_online)
+            .await
+            .expect("an adopted sheep left `Starting` must still have a readiness wait over it");
+    }
+
     /// One sheep as a blob describes it, with `mutate` free to give it a
     /// history no fresh registration could have.
     #[cfg(unix)]
@@ -17451,6 +18048,8 @@ mod tests {
             err_pipe: None,
             out_log: None,
             err_log: None,
+            stdin_pipe: None,
+            channel: None,
         }
     }
 
@@ -17632,5 +18231,51 @@ mod tests {
             .expect("a fresh app starts under a successor");
 
         assert!(fresh[0].id >= 9, "reissued a live id: {}", fresh[0].id);
+    }
+
+    /// Fails if an adopted sheep owed a respawn never gets one.
+    ///
+    /// The strand this closes is silent and permanent. `schedule_restart`
+    /// spawns a task that sleeps and then sends `Msg::RestartDue`, and that
+    /// task dies with the process image; `handle_restart_due` is the only
+    /// thing that moves a sheep off [`ProcStatus::WaitingRestart`]. So a
+    /// successor that installs the status without re-arming the timer leaves
+    /// the sheep down for the rest of its life while `shep flock` prints a
+    /// status an operator reads as "coming back".
+    ///
+    /// The pid is the assertion, not the status: [`STAND_IN_SPAWN_PID`] is
+    /// what [`AdoptingRunner`] hands anything it spawns fresh, and it is
+    /// deliberately not a pid any carried sheep here holds, so a row
+    /// reporting it can only have been respawned by the re-armed timer.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_adopted_sheep_owed_a_restart_still_gets_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried("web", 7, None, |entry| {
+                    entry.status = ProcStatus::WaitingRestart;
+                }))],
+                counters(9),
+            )
+            .expect("a carried flock installs");
+
+        // Virtual, and instant: the paused clock advances itself once every
+        // task is idle, so this waits out the re-armed backoff without
+        // costing the suite a millisecond.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let info = sup.list().await;
+        assert_eq!(
+            info[0].status,
+            ProcStatus::Online,
+            "a sheep owed a respawn was left waiting for a timer that died with the exec: {info:?}"
+        );
+        assert_eq!(
+            info[0].pid,
+            Some(STAND_IN_SPAWN_PID),
+            "the restart must be a real respawn, not a status edit: {info:?}"
+        );
     }
 }

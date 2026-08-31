@@ -359,6 +359,16 @@ impl RunningProcess for FakeProc {
 struct SpawnedProc {
     state: Arc<ProcState>,
     io: Option<FakeIo>,
+    /// The sheep name this spawn carried, copied off [`SpawnSpec::name`] and
+    /// read back via [`ScriptedRunner::spawn_index_of`].
+    ///
+    /// Every other accessor here is indexed by spawn ORDER, which a test
+    /// that starts several apps at once cannot predict without asserting on
+    /// the very ordering it is trying to be independent of. This is how a
+    /// case that picked one app by name (see
+    /// [`ScriptedRunner::with_a_pump_that_never_reports`]) then reads that
+    /// app's counters back.
+    name: String,
     /// `false` once this spawn's log-control task has ended — read back via
     /// [`ScriptedRunner::log_ctl_live`].
     log_ctl_live: Arc<AtomicBool>,
@@ -368,6 +378,10 @@ struct SpawnedProc {
     /// How many [`LogCtl::Flush`] requests it has answered — read back via
     /// [`ScriptedRunner::flushes`].
     flushes: Arc<AtomicU32>,
+    /// How many [`LogCtl::Resume`] requests it has been sent — read back via
+    /// [`ScriptedRunner::resumes`].
+    #[cfg(unix)]
+    resumes: Arc<AtomicU32>,
     /// Every line written to this spawn's stdin, in write order — read back
     /// via [`ScriptedRunner::stdin_lines`].
     stdin_lines: Arc<Mutex<Vec<String>>>,
@@ -415,6 +429,22 @@ pub struct ScriptedRunner {
     /// otherwise unreachable from a unit test, and a test written against
     /// the default cannot fail no matter what that pass does.
     refuse: Mutex<Vec<String>>,
+    /// Sheep names whose log-control task accepts a [`LogCtl::ReportFds`]
+    /// and never answers it, by name for the same reason as its two
+    /// siblings above: a case needs ONE named app of several to go silent
+    /// while its neighbours answer, and script order cannot say that.
+    ///
+    /// Models the pump a handover has no other way to meet: one wedged on a
+    /// filesystem that has stopped completing writes, where the request is
+    /// delivered and it is the acknowledgement that never comes. The
+    /// counterpart of [`ProcScript::never_reports_its_exit`] for the
+    /// handover path.
+    ///
+    /// Only this one variant goes unanswered. The task stays live and still
+    /// serves [`LogCtl::Resume`], which is what lets a case tell "this pump
+    /// was never parked" apart from "this pump is gone".
+    #[cfg(unix)]
+    deaf_pump: Mutex<Vec<String>>,
     /// State + IO for every spawn, indexed by spawn order, behind ONE lock.
     /// Two separate `Mutex`es here (one for state, one for IO) would let
     /// concurrent spawns interleave their critical sections and desync a
@@ -438,7 +468,37 @@ impl ScriptedRunner {
             spawned: Mutex::new(Vec::new()),
             refuse: Mutex::new(Vec::new()),
             fail_spawn: Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            deaf_pump: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Makes these sheep's pumps accept a [`LogCtl::ReportFds`] and never
+    /// answer it.
+    ///
+    /// For reaching the handover's own deadline, which nothing else in this
+    /// fake can arm: every other pump here answers instantly, so a snapshot
+    /// taken over them can never be the one that waits.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_a_pump_that_never_reports(self, names: &[&str]) -> Self {
+        *self.deaf_pump.lock().unwrap() = names.iter().map(|n| (*n).to_string()).collect();
+        self
+    }
+
+    /// The spawn index the sheep named `name` was given, or `None` if this
+    /// runner never spawned it.
+    ///
+    /// Every counter here is indexed by spawn order, and a test that starts
+    /// several apps in one call would otherwise have to assume which order
+    /// the supervisor spawned them in to read one app's counter back.
+    #[must_use]
+    pub fn spawn_index_of(&self, name: &str) -> Option<usize> {
+        self.spawned
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|p| p.name == name)
     }
 
     /// Makes `spawn` fail for these sheep, without consuming a script.
@@ -612,6 +672,26 @@ impl ScriptedRunner {
             .load(Ordering::SeqCst)
     }
 
+    /// How many [`LogCtl::Resume`] requests the proc spawned at
+    /// `spawn_index` has been sent.
+    ///
+    /// The counter an abandoned handover is asserted against: a report
+    /// parks a real pump, so a handover that reported and then refused owes
+    /// one of these to every pump it reported to, or that sheep's log stops
+    /// for the life of the daemon.
+    ///
+    /// # Panics
+    ///
+    /// If `spawn_index` is out of range.
+    #[cfg(unix)]
+    #[must_use]
+    #[track_caller]
+    pub fn resumes(&self, spawn_index: usize) -> u32 {
+        self.spawned.lock().unwrap()[spawn_index]
+            .resumes
+            .load(Ordering::SeqCst)
+    }
+
     /// Every line the daemon has written to the stdin of the proc spawned at
     /// `spawn_index`, in write order.
     ///
@@ -650,31 +730,36 @@ impl ScriptedRunner {
     }
 }
 
-/// Four real, distinct, open descriptors for a fake pump to report, and the
+/// Five real, distinct, open descriptors for a fake pump to report, and the
 /// handles that keep them open.
 ///
 /// `/dev/null` because the fake never writes anything to them: what a caller
 /// asserts about a handover blob is that the numbers in it name something
-/// open, not what is on the far side.
+/// open, not what is on the far side. Six rather than four so a fake sheep
+/// stands in for one with a stdin pipe and a shepherd channel too, which is
+/// the widest shape a blob carries and so the one that catches a caller
+/// walking only part of it.
 ///
 /// # Panics
 ///
-/// If `/dev/null` cannot be opened four times, which on any unix a test
+/// If `/dev/null` cannot be opened six times, which on any unix a test
 /// suite runs on means the process is out of descriptors.
 #[cfg(unix)]
 #[track_caller]
-fn open_reportable_fds() -> ([std::fs::File; 4], crate::handover::CarriedFds) {
+fn open_reportable_fds() -> ([std::fs::File; 6], crate::handover::CarriedFds) {
     use std::os::fd::AsRawFd as _;
 
     let files = core::array::from_fn(|_| {
         std::fs::File::open("/dev/null").expect("a test host must be able to open /dev/null")
     });
-    let files: [std::fs::File; 4] = files;
+    let files: [std::fs::File; 6] = files;
     let fds = crate::handover::CarriedFds {
         out_pipe: Some(files[0].as_raw_fd()),
         err_pipe: Some(files[1].as_raw_fd()),
         out_log: Some(files[2].as_raw_fd()),
         err_log: Some(files[3].as_raw_fd()),
+        stdin: Some(files[4].as_raw_fd()),
+        channel: Some(files[5].as_raw_fd()),
     };
     (files, fds)
 }
@@ -775,14 +860,26 @@ impl ProcessRunner for ScriptedRunner {
         let reopen_count = Arc::clone(&reopens);
         let flushes = Arc::new(AtomicU32::new(0));
         let flush_count = Arc::clone(&flushes);
+        #[cfg(unix)]
+        let resumes = Arc::new(AtomicU32::new(0));
+        #[cfg(unix)]
+        let resume_count = Arc::clone(&resumes);
         let lamb_holds_the_pipe = script.lamb_holds_the_pipe;
         let logs_for_pump = logs_tx.clone();
+        #[cfg(unix)]
+        let deaf = self.deaf_pump.lock().unwrap().contains(&spec.name);
         tokio::spawn(async move {
             #[cfg(unix)]
             let mut reportable_fds: Option<(
-                [std::fs::File; 4],
+                [std::fs::File; 6],
                 crate::handover::CarriedFds,
             )> = None;
+            // Every unanswered report, kept alive rather than dropped — see
+            // the `ReportFds` arm below for why the two differ.
+            #[cfg(unix)]
+            let mut held_reports: Vec<
+                tokio::sync::oneshot::Sender<crate::handover::CarriedFds>,
+            > = Vec::new();
             loop {
                 tokio::select! {
                     ctl = log_ctl_rx.recv() => match ctl {
@@ -809,16 +906,37 @@ impl ProcessRunner for ScriptedRunner {
                         // The fake writes no files, so it holds no
                         // descriptors of its own. A caller assembling a
                         // handover still asserts that the numbers it gets
-                        // are really open, so four `/dev/null` handles stand
+                        // are really open, so six `/dev/null` handles stand
                         // in — opened on the first request and held for the
                         // rest of this task's life, so a suite full of tests
                         // that never ask for a handover opens nothing. That
                         // the numbers are the PUMP's own is
                         // `tokio_runner`'s tier, against a real pipe.
+                        //
+                        // A pump named to
+                        // `ScriptedRunner::with_a_pump_that_never_reports`
+                        // keeps `done` instead, and holds it for the rest of
+                        // this task's life: dropping it would answer the
+                        // request with a closed channel, which is what a
+                        // pump that has ENDED looks like and is a different
+                        // case entirely.
                         #[cfg(unix)]
                         Some(LogCtl::ReportFds { done }) => {
-                            let fds = reportable_fds.get_or_insert_with(open_reportable_fds);
-                            let _ = done.send(fds.1);
+                            if deaf {
+                                held_reports.push(done);
+                            } else {
+                                let fds = reportable_fds.get_or_insert_with(open_reportable_fds);
+                                let _ = done.send(fds.1);
+                            }
+                        }
+                        // Counted rather than acted on: the fake reads no
+                        // streams, so it has none to start reading again.
+                        // What a caller asserts here is that an abandoned
+                        // handover sent one at all, which is the half that
+                        // lives above the pump.
+                        #[cfg(unix)]
+                        Some(LogCtl::Resume) => {
+                            resume_count.fetch_add(1, Ordering::SeqCst);
                         }
                         None => break, // nothing holds ProcIo::log_ctl
                     },
@@ -930,9 +1048,12 @@ impl ProcessRunner for ScriptedRunner {
                 from_child_tx: fake_from_child_tx,
                 to_child_rx: fake_to_child_rx,
             }),
+            name: spec.name.clone(),
             log_ctl_live,
             reopens,
             flushes,
+            #[cfg(unix)]
+            resumes,
             stdin_lines,
             credentials: spec.credentials,
         });

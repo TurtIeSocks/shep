@@ -1600,7 +1600,7 @@ otel = "/usr/local/bin/shep-otel"
             &paths.socket,
             ack_naming("9.9.9"),
             |_| Response::HandoverFitness {
-                refusal: Some("sheep 'chatty' has a shepherd channel".to_string()),
+                refusal: Some("sheep 'clustered' has more than one instance".to_string()),
             },
         )
         .await;
@@ -1622,7 +1622,7 @@ otel = "/usr/local/bin/shep-otel"
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap()
         );
-        assert!(text.contains("shepherd channel"), "{text}");
+        assert!(text.contains("more than one instance"), "{text}");
         // No shepherd owns this home, so the stop arm it fell back to has
         // nothing to stop -- which is what proves it took that arm at all.
         assert_eq!(code, ExitCode::DaemonUnreachable, "{text}");

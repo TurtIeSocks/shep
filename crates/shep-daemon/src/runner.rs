@@ -188,8 +188,8 @@ pub enum LogCtl {
         done: oneshot::Sender<Result<(), FlushError>>,
     },
     /// Write out whatever the pump has buffered, wait for it to reach the
-    /// files, then acknowledge with the four descriptor numbers the pump is
-    /// holding. Sent while assembling a daemon handover.
+    /// files, then acknowledge with the descriptor numbers a blob is to
+    /// name for this sheep. Sent while assembling a daemon handover.
     ///
     /// # Why the flush and the report are one request
     ///
@@ -234,6 +234,38 @@ pub enum LogCtl {
         /// exactly a runner nothing hands over.
         done: oneshot::Sender<crate::handover::CarriedFds>,
     },
+    /// Read the sheep's streams again after a [`Self::ReportFds`] that no
+    /// exec followed. Sent when a handover is abandoned.
+    ///
+    /// A report parks the pump, because a snapshot only stays true while
+    /// nothing moves behind it. The exec is what normally ends that park,
+    /// and it ends it by replacing the whole image. Every other way out of
+    /// a handover leaves this daemon running with a pump that has stopped
+    /// reading, and it stays stopped for the rest of that daemon's life. So
+    /// an abandoned handover owes every pump it reported one of these.
+    ///
+    /// Today that life is short: both aborts fall back to a graceful stop,
+    /// so what a missing resume costs is every line the flock writes while
+    /// it is being stopped, which is the stretch an operator asking why
+    /// reads first. It is not bounded by that, though, and should not be
+    /// reasoned about as if it were: anything that ever abandons a handover
+    /// without also stopping makes the same omission permanent.
+    ///
+    /// # Why there is no acknowledgement
+    ///
+    /// Nobody is ordered against it. The caller is on its way to a graceful
+    /// stop or back to normal service, and neither reads the pump's files
+    /// or its descriptors, which is what [`Self::Flush`] and
+    /// [`Self::Reopen`] have callers waiting on. Sending one to a pump that
+    /// was never parked is a no-op, so this is safe to send widely rather
+    /// than exactly.
+    ///
+    /// # Why this variant is unix-only when the rest of the enum is not
+    ///
+    /// As [`Self::ReportFds`]: there is no handover to abandon on a
+    /// platform with no `execve`, so there is no park to end.
+    #[cfg(unix)]
+    Resume,
 }
 
 /// A [`LogCtl::Reopen`] that could not open one or both of a sheep's log
@@ -877,7 +909,7 @@ pub trait ProcessRunner: Send + Sync + 'static {
 /// One inherited sheep, and everything a runner needs to supervise it again.
 ///
 /// Produced by the successor's `handover::adopt` and consumed by
-/// [`ProcessRunner::adopt`]. The four handles are owned, because adopting is
+/// [`ProcessRunner::adopt`]. The handles are owned, because adopting is
 /// exactly the act of taking ownership of them; `None` on a pair means the
 /// predecessor had no handle to carry, which is what a sheep whose log open
 /// had failed, or one with no live pump, looks like.
@@ -905,6 +937,22 @@ pub struct AdoptSpec {
     pub out_log: Option<tokio::fs::File>,
     /// The appending handle on its stderr log, likewise.
     pub err_log: Option<tokio::fs::File>,
+    /// The write end of its stdin pipe, still the one the child reads from,
+    /// for a sheep whose app asked for one.
+    ///
+    /// The one handle here the daemon writes to. `None` is the commoner
+    /// sheep, which has `/dev/null` on fd 0, and an adoption puts a stdin
+    /// pump back only when there is an end for it to write to.
+    pub stdin_pipe: Option<tokio::net::unix::pipe::Sender>,
+    /// The daemon's end of its shepherd-channel socketpair, still the one
+    /// whose other end is the child's fd 3.
+    ///
+    /// The one handle here that goes both ways, so an adoption puts BOTH
+    /// pumps back on it: an app that writes `{"kind":"ready"}` or an action
+    /// reply is read again, and a `shep trigger` or a
+    /// `shutdown_with_message` reaches it again. `None` for a sheep whose
+    /// app asked for no channel, and for one whose child has closed fd 3.
+    pub channel: Option<tokio::net::UnixStream>,
     /// The one reaper this successor waits every adopted pid through.
     ///
     /// Shared rather than owned per sheep: a status can be collected once,

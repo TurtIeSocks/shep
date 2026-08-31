@@ -1995,11 +1995,45 @@ pub(crate) struct HandoverSeam {
 /// a graceful stop.
 #[cfg(unix)]
 async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible, String> {
-    let (candidates, blob) = seam
+    let (candidates, blob, parked) = seam
         .supervisor
         .handover_snapshot(seam.fds)
         .await
         .map_err(|err| format!("the supervisor could not describe its flock: {err}"))?;
+    let refusal = match hand_over_carrying(&candidates, &blob, seam) {
+        Ok(never) => match never {},
+        Err(refusal) => refusal,
+    };
+    // Taking the snapshot stopped every pump it reached, and this process
+    // is the one that owes them a resume: there is no successor image to do
+    // it, and nothing else in the daemon ever sends one. The caller falls
+    // back to a graceful stop, which is a stretch of seconds during which
+    // the flock is being told to exit and is writing exactly the lines an
+    // operator will reach for. A refusal that changes nothing else must not
+    // silently cost them.
+    //
+    // Here rather than inside `exec_into`'s own error path, which restores
+    // `FD_CLOEXEC` on the same failure: the gate below refuses BEFORE
+    // anything is exec'd, so a resume that lived with the descriptors would
+    // miss the abort that happens most often. This is where every way out
+    // meets.
+    parked.resume().await;
+    Err(refusal)
+}
+
+/// [`hand_over_now`]'s body, split out so a single resume can cover every
+/// way it refuses.
+///
+/// # Errors
+///
+/// The flock cannot be carried, or the exec itself failed. Both leave this
+/// process still itself, with no blob on disk.
+#[cfg(unix)]
+fn hand_over_carrying(
+    candidates: &[crate::handover::OwnedCandidate],
+    blob: &crate::handover::Handover,
+    seam: &HandoverSeam,
+) -> Result<core::convert::Infallible, String> {
     let borrowed: Vec<crate::handover::Candidate<'_>> = candidates
         .iter()
         .map(crate::handover::OwnedCandidate::as_candidate)
@@ -2007,7 +2041,7 @@ async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible,
     if let crate::handover::Fitness::Refused(reason) = crate::handover::fitness(&borrowed) {
         return Err(reason.to_string());
     }
-    crate::handover::hand_over(&blob, &seam.paths).map_err(|err| err.to_string())
+    crate::handover::hand_over(blob, &seam.paths).map_err(|err| err.to_string())
 }
 
 /// Error type returned from this module's boot steps
@@ -3417,20 +3451,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         init_dirs(&paths).unwrap();
+        // A dog: the sheep the gate still refuses. This was a shepherd
+        // channel until 2b task 5 carried one and two instances until task
+        // 6 carried those, and the case is about the gate firing at all
+        // rather than about which feature fires it. Task 7 carries dogs, so
+        // it moves again.
         let daemon = boot(
             ScriptedRunner::new(vec![ProcScript::never_exits()]),
             paths.clone(),
-            BootOptions::default(),
+            BootOptions {
+                dogs: vec![DogSpec {
+                    name: "metrics".to_string(),
+                    source: DogSource::BuiltIn,
+                }],
+                ..BootOptions::default()
+            },
         )
         .await
         .unwrap();
         let ctx = daemon.context();
-        let mut app = AppConfig::minimal("chatty", "./srv");
-        app.channel = true;
-        ctx.supervisor
-            .start(vec![normalize(app).unwrap()])
-            .await
-            .unwrap();
 
         let seam = HandoverSeam {
             supervisor: ctx.supervisor.clone(),
@@ -3442,9 +3481,9 @@ mod tests {
         };
         let refusal = hand_over_now(&seam)
             .await
-            .expect_err("a flock with a shepherd channel cannot be carried");
+            .expect_err("a flock with a dog in it cannot be carried");
         assert!(
-            refusal.contains("shepherd channel"),
+            refusal.contains("being a dog"),
             "the gate must refuse before anything is exec'd: {refusal}"
         );
 
@@ -3456,6 +3495,193 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// The sharp edge of parking a pump: a handover that reports and then
+    /// refuses has to leave every pump reading again.
+    ///
+    /// Taking the snapshot stops each pump where it stands, which is what
+    /// makes the report still true at the exec. There is no exec here, and
+    /// nothing else in the daemon ever sends a resume, so a missing one is
+    /// not a slow log or a lost line: it is a flock that logs nothing more,
+    /// through the graceful stop this refusal falls back to and for as long
+    /// as the daemon lives after it, having reported no failure beyond the
+    /// refusal itself.
+    ///
+    /// Two sheep, because the resume has to reach every pump that was
+    /// reported to rather than the one the refusal named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_handover_starts_every_pump_reading_again() {
+        // As the sibling above: a successful `boot()` installs real signal
+        // listeners for this test's whole duration.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let runner = Arc::new(ScriptedRunner::new(vec![ProcScript::never_exits(); 3]));
+        // The refusal: a dog is a sheep this daemon still cannot carry, and
+        // the gate reads it AFTER every pump has already been reported to,
+        // which is what makes the resume owed. It was a shepherd channel
+        // until 2b task 5 carried one and two instances until task 6
+        // carried those; what the case needs is any refusal at all.
+        //
+        // Spawned by `boot` rather than by the `start` below, so the dog is
+        // script 0 and the two sheep are 1 and 2.
+        let daemon = boot(
+            SharedRunner(Arc::clone(&runner)),
+            paths.clone(),
+            BootOptions {
+                dogs: vec![DogSpec {
+                    name: "metrics".to_string(),
+                    source: DogSource::BuiltIn,
+                }],
+                ..BootOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+        ctx.supervisor
+            .start(vec![
+                normalize(AppConfig::minimal("quiet", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("chatty", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+        for sheep in 0..3 {
+            assert!(
+                runner.log_ctl_live(sheep),
+                "sheep {sheep} must have a live log pump before the report, or this case                  proves nothing"
+            );
+        }
+
+        let seam = HandoverSeam {
+            supervisor: ctx.supervisor.clone(),
+            fds: crate::handover::DaemonFds {
+                listener: -1,
+                pidfile: -1,
+            },
+            paths: paths.clone(),
+        };
+        let refusal = hand_over_now(&seam)
+            .await
+            .expect_err("a flock with a dog in it cannot be carried");
+        assert!(
+            refusal.contains("being a dog"),
+            "the gate must refuse before anything is exec'd: {refusal}"
+        );
+
+        // Polled rather than read once: a resume carries no acknowledgement
+        // (see `LogCtl::Resume`), so a send that has returned has been
+        // queued rather than served. Bounded, so a pump that is never told
+        // fails here instead of hanging.
+        let all_resumed = async {
+            while (0..3).any(|sheep| runner.resumes(sheep) == 0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), all_resumed)
+            .await
+            .expect("every pump a refused handover reported to must be reading again");
+        for sheep in 0..3 {
+            assert_eq!(
+                runner.resumes(sheep),
+                1,
+                "sheep {sheep} must be resumed once rather than repeatedly"
+            );
+        }
+
+        ctx.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), daemon.run())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The second refusal path, and the one nothing else covers: a snapshot
+    /// abandoned because a pump went quiet still owes a resume to every pump
+    /// that DID answer.
+    ///
+    /// Its sibling above proves the resume for a refusal the gate reads off
+    /// a sheep's config. A missed deadline is a different way in, and it
+    /// arrives with one pump already parked and one that never was. Miss it
+    /// and a handover abandoned on a wedged pump leaves the REST of the
+    /// flock parked, which is a silent logging stop for the life of the
+    /// daemon and strictly worse than the stall this deadline exists to end.
+    ///
+    /// No `boot()` and no signal here, unlike its sibling: this is about
+    /// what `hand_over_now` does with a snapshot, and building the
+    /// supervisor directly is what lets the clock be paused, so the deadline
+    /// costs the suite nothing to wait out.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_handover_abandoned_on_a_wedged_pump_resumes_the_pumps_that_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let runner = Arc::new(
+            ScriptedRunner::new(vec![ProcScript::never_exits(); 2])
+                .with_a_pump_that_never_reports(&["wedged"]),
+        );
+        let supervisor = crate::supervisor::spawn_supervisor(
+            SharedRunner(Arc::clone(&runner)),
+            paths.clone(),
+            events,
+        );
+        supervisor
+            .start(vec![
+                normalize(AppConfig::minimal("answering", "./srv")).unwrap(),
+                normalize(AppConfig::minimal("wedged", "./srv")).unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        // Deliberately invalid, as its sibling above explains: if the gate
+        // ever stopped refusing, `hand_over` would meet `EBADF` and return
+        // rather than exec this test binary into a re-run of the whole
+        // suite. The assertion on the message is what tells those apart.
+        let seam = HandoverSeam {
+            supervisor: supervisor.clone(),
+            fds: crate::handover::DaemonFds {
+                listener: -1,
+                pidfile: -1,
+            },
+            paths: paths.clone(),
+        };
+        let refusal = hand_over_now(&seam)
+            .await
+            .expect_err("a flock with a pump that never reported cannot be carried");
+        assert!(
+            refusal.contains("did not report its descriptors in time"),
+            "the refusal must say the pump went quiet, not something else: {refusal}"
+        );
+        assert!(
+            refusal.contains("wedged"),
+            "the refusal must name the sheep whose pump went quiet: {refusal}"
+        );
+
+        let answering = runner.spawn_index_of("answering").expect("started above");
+        let wedged = runner.spawn_index_of("wedged").expect("started above");
+        // Polled rather than read once: a resume carries no acknowledgement
+        // (see `LogCtl::Resume`), so a send that has returned has been
+        // queued rather than served. Instant under the paused clock, and
+        // bounded so a pump that is never told fails here instead of
+        // hanging.
+        let delivered = async {
+            while runner.resumes(answering) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), delivered)
+            .await
+            .expect("the pump that answered was parked, and a refusal owes it a resume");
+        assert_eq!(
+            runner.resumes(wedged),
+            0,
+            "a pump that never answered never parked, so nothing may resume it"
+        );
     }
 
     #[tokio::test]

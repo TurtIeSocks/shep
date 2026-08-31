@@ -38,7 +38,7 @@ is one class of test.
 cargo test -p shep-daemon --lib --all-features -- --skip ::slow::
 ```
 
-**~1.7s, 548 of 566 lib tests as of 2026-08-29** — the exact counts drift
+**~1.9s, 619 of 638 lib tests as of 2026-08-30** — the exact counts drift
 every time a task adds one, so treat them as a shape, not a checksum. Three
 briefs have now shipped a stale figure, and this file carried "437 of 454"
 for long enough to be wrong by fifty. The 18 tests this skips live in a nested `mod slow`

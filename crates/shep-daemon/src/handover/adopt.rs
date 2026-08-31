@@ -69,12 +69,12 @@ pub struct Adopted {
     pub pidfile: File,
 }
 
-/// One sheep's output plumbing, rebuilt.
+/// One sheep's output plumbing, rebuilt, and its input plumbing with it.
 ///
-/// `None` on all four means an instance that is registered and not running,
-/// which is the only reason a blob names no descriptor for it. A descriptor
-/// that is named and missing is a refusal, not a `None`; see this module's
-/// own docs.
+/// `None` on all of the first four means an instance that is registered and
+/// not running, which is the only reason a blob names no descriptor for
+/// them. A descriptor that is named and missing is a refusal, not a `None`;
+/// see this module's own docs.
 #[derive(Debug)]
 pub struct AdoptedSheep {
     /// What the blob said about this sheep.
@@ -87,6 +87,19 @@ pub struct AdoptedSheep {
     pub out_log: Option<tokio::fs::File>,
     /// The appending handle on its stderr log file.
     pub err_log: Option<tokio::fs::File>,
+    /// The write end of its stdin pipe, for a sheep whose app asked for one.
+    ///
+    /// The only handle here the daemon writes to rather than reads from,
+    /// and `None` for the commoner sheep that has `/dev/null` on fd 0.
+    pub stdin_pipe: Option<pipe::Sender>,
+    /// The daemon's end of its shepherd-channel socketpair, whose other end
+    /// is the child's fd 3.
+    ///
+    /// The only handle here that goes both ways: the successor splits it
+    /// into the same reader and writer a spawn wires, over one open file
+    /// description. `None` for a sheep whose app asked for no channel, one
+    /// that is not running, and one whose child has already closed fd 3.
+    pub channel: Option<tokio::net::UnixStream>,
 }
 
 /// Rebuild everything `blob` describes, around descriptors this process
@@ -99,8 +112,8 @@ pub struct AdoptedSheep {
 ///
 /// The blob names one descriptor number twice, or any descriptor it names is
 /// not open in this process, is not the kind of object it was named as (a
-/// read end that is not a pipe), or could not be registered with the
-/// runtime. The error names the sheep and the stream, because that is what
+/// read end that is not a pipe, a stdin end that is not writable), or could
+/// not be registered with the runtime. The error names the sheep and the stream, because that is what
 /// an operator needs in order to know which process is now unsupervised.
 ///
 /// There is no partial success and no fallback. By the time this runs the
@@ -212,13 +225,15 @@ fn adopt_listener(fd: RawFd) -> io::Result<tokio::net::UnixListener> {
     tokio::net::UnixListener::from_std(listener)
 }
 
-/// Rebuild one sheep's four handles.
+/// Rebuild one sheep's six handles.
 fn adopt_sheep(carried: &CarriedSheep) -> io::Result<AdoptedSheep> {
     let CarriedFds {
         out_pipe,
         err_pipe,
         out_log,
         err_log,
+        stdin,
+        channel,
     } = carried.fds;
     let name = &carried.name;
     Ok(AdoptedSheep {
@@ -226,8 +241,49 @@ fn adopt_sheep(carried: &CarriedSheep) -> io::Result<AdoptedSheep> {
         err_pipe: adopt_pipe(err_pipe, name, "stderr")?,
         out_log: adopt_log(out_log, name, "stdout")?,
         err_log: adopt_log(err_log, name, "stderr")?,
+        stdin_pipe: adopt_stdin(stdin, name)?,
+        channel: adopt_channel(channel, name)?,
         carried: carried.clone(),
     })
+}
+
+/// Rebuild one shepherd channel's daemon end as an async socket, if the
+/// blob named one.
+///
+/// # Why the kind check is `peer_addr` and not a `from_file`
+///
+/// [`adopt_pipe`] and [`adopt_stdin`] get theirs for free, because
+/// `pipe::Receiver::from_file` and `pipe::Sender::from_file` each refuse a
+/// descriptor that is not a pipe of the right direction. There is no
+/// equivalent for a socket: `std::os::unix::net::UnixStream::from(OwnedFd)`
+/// is infallible and checks nothing, so a number that had been closed and
+/// handed to the next `open` would be adopted as a socket and written to as
+/// one. `getpeername` is what refuses that, and it refuses both ways a
+/// wrong number can be wrong: `ENOTSOCK` for anything that is not a socket
+/// at all, and `ENOTCONN` for a socket that is listening rather than
+/// connected, which is what this daemon's own control listener is.
+///
+/// Non-blocking is set here rather than assumed, for the reason
+/// [`adopt_listener`] gives: it is a file status flag and does cross the
+/// exec, but `tokio::net::UnixStream::from_std` refuses a blocking socket
+/// rather than fixing one, and one `fcntl` is cheaper than depending on an
+/// inherited flag.
+///
+/// Nothing is opened and nothing is paired again. The child's fd 3 is the
+/// other end of this same socketpair and has been throughout, so a
+/// successor that made a new pair would be talking to itself.
+fn adopt_channel(fd: Option<RawFd>, sheep: &str) -> io::Result<Option<tokio::net::UnixStream>> {
+    let Some(fd) = fd else { return Ok(None) };
+    let file = adopt_fd(fd, &format!("sheep '{sheep}' shepherd channel"))?;
+    let socket = std::os::unix::net::UnixStream::from(OwnedFd::from(file));
+    socket.peer_addr().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("sheep '{sheep}' shepherd channel is not a connected socket: {error}"),
+        )
+    })?;
+    socket.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(socket).map(Some)
 }
 
 /// Rebuild one pipe read end as an async reader, if the blob named one.
@@ -243,6 +299,29 @@ fn adopt_pipe(fd: Option<RawFd>, sheep: &str, stream: &str) -> io::Result<Option
         io::Error::new(
             error.kind(),
             format!("sheep '{sheep}' {stream} pipe is not a readable pipe: {error}"),
+        )
+    })
+}
+
+/// Rebuild one stdin write end as an async writer, if the blob named one.
+///
+/// The mirror of [`adopt_pipe`], and the check is what makes it worth its
+/// own function: `pipe::Sender::from_file` refuses a descriptor that is not
+/// a pipe OR is not open for writing, so a blob that named the end the child
+/// reads from is refused here rather than adopted into a `shep whisper` that
+/// can never land.
+///
+/// Nothing is opened and nothing is reopened, exactly as everywhere else in
+/// this module: the child's fd 0 is the other end of this same pipe and has
+/// been throughout, so a successor that recreated the pair would be writing
+/// to a pipe the app is not reading.
+fn adopt_stdin(fd: Option<RawFd>, sheep: &str) -> io::Result<Option<pipe::Sender>> {
+    let Some(fd) = fd else { return Ok(None) };
+    let file = adopt_fd(fd, &format!("sheep '{sheep}' stdin pipe"))?;
+    pipe::Sender::from_file(file).map(Some).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("sheep '{sheep}' stdin is not a writable pipe: {error}"),
         )
     })
 }
@@ -272,11 +351,19 @@ mod tests {
 
     /// One carried sheep named `web`, whose descriptors are `fds`.
     fn carried(fds: CarriedFds) -> CarriedSheep {
+        carried_slot(0, fds)
+    }
+
+    /// [`carried`], for a named instance slot of `web`.
+    ///
+    /// The id and the pid move with the slot, so two of these describe two
+    /// real instances of one app rather than the same one twice.
+    fn carried_slot(instance: u32, fds: CarriedFds) -> CarriedSheep {
         CarriedSheep {
-            id: 1,
+            id: instance + 1,
             name: "web".to_owned(),
-            instance: 0,
-            pid: Some(100),
+            instance,
+            pid: Some(u32::from(100 + u16::try_from(instance).unwrap())),
             restarts: 0,
             epoch: 7,
             status: ProcStatus::Online,
@@ -350,6 +437,8 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
+                channel: None,
             })],
         );
         blob.sheep[0].fds.out_log = Some(blob.listener_fd);
@@ -380,6 +469,8 @@ mod tests {
                 err_pipe: None,
                 out_log: Some(handle.into_raw_fd()),
                 err_log: None,
+                stdin: None,
+                channel: None,
             })],
         );
 
@@ -393,6 +484,109 @@ mod tests {
             std::fs::read_to_string(&log).unwrap(),
             "first\nsecond\n",
             "a write at offset 0 overwrote the file, so O_APPEND was lost"
+        );
+    }
+
+    /// Fails if `merge_logs` makes a two-instance app unadoptable, or if
+    /// the two handles it carries stop being independent across the exec.
+    ///
+    /// The hazard this closes is [`refuse_repeated_fds`], which refuses the
+    /// WHOLE blob when any descriptor number appears twice. `merge_logs`
+    /// points every instance of an app at one path, and if that were one
+    /// open file description shared between them then every merged
+    /// clustered app would be refused forever, with a message blaming a
+    /// descriptor rather than the config that produced it.
+    ///
+    /// It is not one description. Each instance's pump runs its own
+    /// `open_append` on the path (`tokio_runner`'s `LogFile::open`), so one
+    /// inode is reached through two descriptions with two numbers, and
+    /// `O_APPEND` is what keeps their writes from overwriting each other.
+    /// The two numbers are what this asserts on, and the interleaved file
+    /// afterwards is what proves they were really independent rather than
+    /// merely distinct.
+    #[tokio::test]
+    async fn two_instances_sharing_one_log_file_are_both_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        // One path for both slots, which is exactly what `merge_logs` does:
+        // `assemble` drops the `-<instance>` suffix and every instance of
+        // the name lands here.
+        let merged = dir.path().join("web-out.log");
+        let zero = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&merged)
+            .unwrap();
+        let one = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&merged)
+            .unwrap();
+        let (zero_fd, one_fd) = (zero.into_raw_fd(), one.into_raw_fd());
+        assert_ne!(
+            zero_fd, one_fd,
+            "two `open`s on one path must yield two numbers, or the premise \
+             of this whole case is wrong"
+        );
+        let blob = blob_with(
+            &socket,
+            vec![
+                carried_slot(
+                    0,
+                    CarriedFds {
+                        out_pipe: None,
+                        err_pipe: None,
+                        out_log: Some(zero_fd),
+                        err_log: None,
+                        stdin: None,
+                        channel: None,
+                    },
+                ),
+                carried_slot(
+                    1,
+                    CarriedFds {
+                        out_pipe: None,
+                        err_pipe: None,
+                        out_log: Some(one_fd),
+                        err_log: None,
+                        stdin: None,
+                        channel: None,
+                    },
+                ),
+            ],
+        );
+
+        let mut adopted = adopt(&blob).expect("a merged-log clustered app must be adoptable");
+
+        assert_eq!(adopted.sheep.len(), 2, "one adopted sheep per instance");
+        let mut zero = adopted.sheep[0].out_log.take().expect("slot 0's log");
+        let mut one = adopted.sheep[1].out_log.take().expect("slot 1's log");
+        // Alternated, so a second handle that had silently become the first
+        // one's alias shows up as lost or overwritten text rather than as
+        // two clean halves.
+        //
+        // Flushed after every line, and that is not tidiness. A
+        // `tokio::fs::File` buffers and hands the real `write(2)` to the
+        // blocking pool, so two handles written in sequence with one flush
+        // at the end reach the file in whichever order that pool finished:
+        // measured, this case failed once in twelve runs on
+        // `zero-1/one-1/one-2/zero-2`. The flush is what makes each write
+        // land before the next begins, which is what an ordered assertion
+        // needs to be an assertion about `O_APPEND` rather than about a
+        // thread pool.
+        for line in ["zero-1\n", "one-1\n", "zero-2\n", "one-2\n"] {
+            let handle = if line.starts_with("zero") {
+                &mut zero
+            } else {
+                &mut one
+            };
+            handle.write_all(line.as_bytes()).await.unwrap();
+            handle.flush().await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&merged).unwrap(),
+            "zero-1\none-1\nzero-2\none-2\n",
+            "both instances append into the one file, in the order written"
         );
     }
 
@@ -415,6 +609,8 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
+                channel: None,
             })],
         );
 
@@ -449,6 +645,8 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
+                channel: None,
             })],
         );
         let pidfile_fd = blob.pidfile_fd;
@@ -475,6 +673,8 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
+                channel: None,
             })],
         );
 
@@ -489,6 +689,83 @@ mod tests {
             .expect("the adopted pipe must produce the line written before it")
             .unwrap();
         assert_eq!(line.as_deref(), Some("a line"));
+    }
+
+    /// fails if a carried stdin write end does not reach the end the child
+    /// reads.
+    ///
+    /// The direction is the whole case. Every other descriptor a sheep
+    /// carries is one the daemon reads from; this is the one it writes to,
+    /// and a blob that named the wrong end of the pair would still adopt,
+    /// still be a pipe, and still never reach the app.
+    #[tokio::test]
+    async fn an_adopted_stdin_pipe_writes_to_the_end_the_child_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        // The child's fd 0 stays here, exactly as it does across a real
+        // exec: the daemon carries only the write end.
+        let (mut child_end, daemon_end) = std::io::pipe().unwrap();
+        let blob = blob_with(
+            &socket,
+            vec![carried(CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+                stdin: Some(daemon_end.into_raw_fd()),
+                channel: None,
+            })],
+        );
+
+        let mut adopted = adopt(&blob).unwrap();
+
+        let mut stdin = adopted.sheep[0]
+            .stdin_pipe
+            .take()
+            .expect("an adopted stdin pipe");
+        stdin.write_all(b"whisper\n").await.unwrap();
+        stdin.flush().await.unwrap();
+        // A blocking read of bytes already written, so there is nothing to
+        // wait for and nothing to time out.
+        let mut buf = [0_u8; 8];
+        std::io::Read::read_exact(&mut child_end, &mut buf).expect("the child end must read");
+        assert_eq!(&buf, b"whisper\n");
+    }
+
+    /// fails if the stdin number is adopted without checking which end of
+    /// the pipe it is.
+    ///
+    /// A read end passes `is_pipe` and would be adopted as a writer, so
+    /// every `shep whisper` after the handover would fail on a descriptor
+    /// the successor was told was fine.
+    #[tokio::test]
+    async fn a_pipe_read_end_offered_as_stdin_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let blob = blob_with(
+            &socket,
+            vec![carried(CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+                stdin: Some(reader.into_raw_fd()),
+                channel: None,
+            })],
+        );
+
+        let err = adopt(&blob).expect_err("a read end is not something to write to");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("web"),
+            "the refusal must name the sheep: {text}"
+        );
+        assert!(
+            text.contains("stdin"),
+            "the refusal must name what could not be adopted: {text}"
+        );
     }
 
     #[tokio::test]
@@ -509,11 +786,148 @@ mod tests {
                 err_pipe: None,
                 out_log: None,
                 err_log: None,
+                stdin: None,
+                channel: None,
             })],
         );
 
         let err = adopt(&blob).expect_err("a file is not a pipe");
 
         assert!(err.to_string().contains("web"), "{err}");
+    }
+
+    /// fails if an adopted shepherd channel does not still reach the same
+    /// child on the same socket, in both directions.
+    ///
+    /// Both directions in one case rather than two, because the failure
+    /// this exists to catch is one number naming the wrong end of the pair,
+    /// and a case that only wrote would pass on a socket the child cannot
+    /// answer. `child_end` here is what an app holds on fd 3.
+    #[tokio::test]
+    async fn an_adopted_channel_carries_both_directions() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        let (daemon_end, child_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        child_end.set_nonblocking(true).unwrap();
+        let child_end = tokio::net::UnixStream::from_std(child_end).unwrap();
+        let blob = blob_with(
+            &socket,
+            vec![carried(CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+                stdin: None,
+                channel: Some(daemon_end.into_raw_fd()),
+            })],
+        );
+
+        let mut adopted = adopt(&blob).unwrap();
+        let channel = adopted.sheep[0]
+            .channel
+            .take()
+            .expect("an adopted shepherd channel");
+        let (read_half, mut write_half) = tokio::io::split(channel);
+
+        // Shepherd to child, which is what `shutdown_with_message` and a
+        // `shep trigger` both ride.
+        let (child_read, mut child_write) = tokio::io::split(child_end);
+        let mut child = tokio::io::BufReader::new(child_read);
+        write_half
+            .write_all(b"{\"kind\":\"shutdown\"}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        child
+            .read_line(&mut line)
+            .await
+            .expect("the child end must read");
+        assert_eq!(line, "{\"kind\":\"shutdown\"}\n");
+
+        // Child to shepherd, which is what `{"kind":"ready"}` and every
+        // action reply ride.
+        child_write
+            .write_all(b"{\"kind\":\"ready\"}\n")
+            .await
+            .unwrap();
+        let mut back = String::new();
+        tokio::io::BufReader::new(read_half)
+            .read_line(&mut back)
+            .await
+            .expect("the daemon end must read");
+        assert_eq!(back, "{\"kind\":\"ready\"}\n");
+    }
+
+    /// fails if a channel number is adopted without checking that it still
+    /// names a connected socket.
+    ///
+    /// `UnixStream::from(OwnedFd)` is infallible and checks nothing, unlike
+    /// the two `from_file` constructors the pipes go through, so a number
+    /// that had been closed and handed to the next `open` would be adopted
+    /// as a socket and written to as one. A plain file is the cheapest
+    /// stand-in for that.
+    #[tokio::test]
+    async fn a_file_offered_as_a_shepherd_channel_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        let file = tempfile::tempfile().unwrap();
+        let blob = blob_with(
+            &socket,
+            vec![carried(CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+                stdin: None,
+                channel: Some(file.into_raw_fd()),
+            })],
+        );
+
+        let err = adopt(&blob).expect_err("a file is not a connected socket");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("web"),
+            "the refusal must name the sheep: {text}"
+        );
+        assert!(
+            text.contains("shepherd channel"),
+            "the refusal must name what could not be adopted: {text}"
+        );
+    }
+
+    /// fails if a LISTENING socket offered as a channel is adopted.
+    ///
+    /// The one number in a blob that really is a socket and really is not a
+    /// channel is this daemon's own control listener, so this is the wrong
+    /// number the kind check most plausibly meets. `getpeername` answers
+    /// `ENOTCONN` for it, which a check that only asked "is it a socket"
+    /// would miss.
+    #[tokio::test]
+    async fn a_listening_socket_offered_as_a_shepherd_channel_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("shep.sock");
+        let other = dir.path().join("other.sock");
+        let listening = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        let blob = blob_with(
+            &socket,
+            vec![carried(CarriedFds {
+                out_pipe: None,
+                err_pipe: None,
+                out_log: None,
+                err_log: None,
+                stdin: None,
+                channel: Some(listening.into_raw_fd()),
+            })],
+        );
+
+        let err = adopt(&blob).expect_err("a listener is not a connected socket");
+
+        assert!(
+            err.to_string().contains("shepherd channel"),
+            "the refusal must name what could not be adopted: {err}"
+        );
     }
 }

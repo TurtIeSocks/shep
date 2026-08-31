@@ -365,6 +365,52 @@ tell it apart from a shep bug.
 The full postmortem, including the wrong diagnosis it took to get here, is in
 [deferred-history.md](deferred-history.md).
 
+### A config edit reaches nothing, and the warning about it is wrong
+
+Found 2026-08-30, from the maintainer's question: an app running four
+instances, `instances = 5` edited into the Flockfile, and no way to get the
+fifth without restarting the other four.
+
+For `instances` alone there is a way. `shep stock web 5` fills the lowest free
+slot and leaves 0 through 3 running, writing the new count onto the stored
+spec and into the muster roll. For every other field there is nothing.
+`handle_reload` and the restart path both say so in as many words --
+*"Nothing here re-reads configuration."* The only route is `shep delete`
+followed by `shep start`, which restarts every instance.
+
+`Request::ConfigDrift` closed half of this: an edit that will not apply is
+reported rather than vanishing without a word. Applying it was left open
+deliberately, in the code -- *"Whether `start` should reconcile by default, or
+grow an `--update` flag, is the maintainer's call and neither is taken here."*
+
+**The fields split three ways, and the first group is larger than "a config
+change needs a restart" suggests.**
+
+- **Read at decision time, so nothing need be restarted.** `autorestart`,
+  `max_restarts`, `min_uptime`, `restart_delay`, `exp_backoff_restart_delay`
+  and `stop_exit_codes` are read by `brain::decide` when a sheep exits;
+  `kill_signal`, `kill_timeout` and `graceful_timeout` when a kill ladder
+  runs; `max_memory`, `cron_restart`, `cron_timezone`, `watch` and the
+  liveness probe when `extras` arms a worker, which it already does through
+  `arm_instance`/`disarm_instance`. A write-back takes effect at the next such
+  decision with no disruption at all.
+- **Consumed at spawn, so they reach the next process rather than the running
+  one.** `listen_timeout` and `readiness_probe`.
+- **Baked into the child, so one instance swap each.** `script`, `args`,
+  `cwd`, `interpreter`, `env`, `user`, `group`, `out_file`, `err_file`,
+  `merge_logs`, `channel`, `stdin`, `wait_ready`.
+
+**`shep stock` already proves every mechanism a wider verb needs**: normalize
+before write, write-back onto the stored spec, partial-failure handling, and
+muster-roll persistence. `AppConfig::drifted_fields` already computes which
+fields moved. What is missing is the routing between the three groups.
+
+**One part of this is a bug rather than a gap.** The drift warning tells the
+operator that "`shep start` adds instances to a sheep the flock already has".
+True of the daemon's `Request::Start`, false of the `shep start` an operator
+types: the CLI sorts apps into resumed and fresh, and only fresh ones reach
+that request. The sentence describes something no terminal can produce.
+
 ## Ideas, recorded but not designed
 
 Not debt, not deferred spec surface, and not promised to anybody. Things worth
@@ -440,6 +486,44 @@ the restart, and the ordering across a flock. A design that cannot point at
 something `just` plus three lines of shell does not already do should stop
 there.
 
+
+### Shepherd-channel libraries for the languages apps are written in
+
+The maintainer's, 2026-08-30, after asking whether an app could speak fd 3
+using something that already exists. Wanted, in her own list: **node, go,
+rust, python**.
+
+**Today an app can, badly.** `shep_core::protocol::channel` exports
+`ChildMessage`, `ShepherdMessage` and `CHANNEL_VERSION`, all serde-derived,
+and shep-core is published. But it is a daemon's core rather than a client:
+an app that wants two enums also gets toml, serde-saphyr, json5, regex,
+tokio, croner, chrono, chrono-tz, globset, tempfile and nix. Hand-rolling
+against [shepherd-channel.md](../shepherd-channel.md) is about forty lines
+and the better trade, which is an odd thing to have to say about one's own
+published crate. The other three languages have nothing at all.
+
+**There is no example anywhere.** `examples/` holds seven Rust binaries and
+four polyglot apps in Go, Node, Python and static HTML, and not one of them
+speaks fd 3. The contract doc has two code blocks and one of them is JSON.
+The wire is specified in prose and demonstrated nowhere, which is the real
+barrier for anyone deciding whether to adopt it.
+
+**Three things a hand-roll gets wrong**, each named in `channel.rs`'s own
+module doc: an app must reply to a `ShepherdMessage::Action` even when it
+does not recognise the name; it should echo the `id` so the reply is matched
+to its exact trigger, and the name-and-order fallback costs something when
+it does not; and there is a `params` quoting gap. Those are what a library
+encodes once and prose asks every author to get right separately. Windows is
+a fourth, since fd 3 is a named pipe there and every client needs two arms.
+
+**Sequencing, offered as a recommendation rather than a decision.** Working
+examples first, because the repository already has an app in every one of
+the four languages: Rust under `examples/src/bin/`, and Go, Node and Python
+under `examples/polyglot/`. Teaching those four to speak fd 3 is a small
+diff against files that already exist, and it gives every community app
+something to copy. A library second, for whichever language earns one. The
+four chosen are also the ones the surrounding ecosystem is written in, so
+the examples serve the whole audience on their own.
 
 ## A readiness probe cannot verify a reload's replacement
 

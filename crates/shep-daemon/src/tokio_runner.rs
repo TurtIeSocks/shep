@@ -91,6 +91,19 @@ const LOG_BUFFER: usize = 8 * 1024;
 /// buffer until its next one, which for some sheep is never.
 const IDLE_FLUSH: Duration = Duration::from_millis(50);
 
+/// Bytes each stream's reader may hold ahead of the lines it has emitted.
+///
+/// Asked for explicitly rather than left to `BufReader`'s default, which is
+/// the same 8 KiB, because this number is load-bearing twice over and a
+/// default is a poor place to keep a bound someone has to reason about.
+/// It is the whole of what a handover can find stranded in userspace: bytes
+/// taken off the pipe and not yet written are behind the descriptor the
+/// blob carries rather than in it, and the `execve` destroys them. It is
+/// also the whole of what [`drain_ready`] can write, which is what keeps a
+/// descriptor report answerable while a chatty sheep runs.
+#[cfg(unix)]
+const READ_BUFFER: usize = 8 * 1024;
+
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
 #[derive(Debug, Default)]
 pub struct TokioRunner;
@@ -643,12 +656,17 @@ impl ProcessRunner for TokioRunner {
     /// the one the sheep has been running under all along. From the sheep's
     /// side the shepherd was never away.
     ///
-    /// The three channels a spawn may wire are all closed here rather than
-    /// left dangling, exactly as a spawn closes the ones its own spec did
-    /// not ask for. Phase 2a's fitness gate refuses to carry any sheep with
-    /// a shepherd channel or a stdin pipe, so a carried sheep has neither,
-    /// and a caller's `is_closed()` says so at once instead of a send
-    /// buffering into a channel nobody drains.
+    /// Stdin and the shepherd channel are both carried. A sheep whose blob
+    /// named a stdin write end gets a stdin pump on it again, so `shep
+    /// whisper` reaches the same fd 0 the child has had open all along; one
+    /// whose blob named a channel gets the same pair of pumps a spawn wires
+    /// put back on the same socketpair, so the child's fd 3 is undisturbed
+    /// in both directions.
+    ///
+    /// What a blob named neither of is closed here rather than left
+    /// dangling, exactly as a spawn closes the ends its own spec did not
+    /// ask for: a caller's `is_closed()` then says so at once, instead of a
+    /// send buffering into a channel nobody drains.
     #[cfg(unix)]
     fn adopt(&self, spec: AdoptSpec) -> Result<(Self::Proc, ProcIo), RunnerError> {
         let AdoptSpec {
@@ -659,18 +677,22 @@ impl ProcessRunner for TokioRunner {
             err_pipe,
             out_log,
             err_log,
+            stdin_pipe,
+            channel,
             reaper,
         } = spec;
 
         let (logs_tx, logs_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (log_ctl_tx, log_ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        // Read off the readers before they are moved into the pump, as the
-        // spawn path does: these are the numbers the NEXT handover carries,
-        // and a successor that reported its predecessor's would be naming
-        // descriptors this process does not have.
+        // Read off the handles before they are moved into their pumps, as
+        // the spawn path does: these are the numbers the NEXT handover
+        // carries, and a successor that reported its predecessor's would be
+        // naming descriptors this process does not have.
         let pipes = PipeFds {
             out: out_pipe.as_ref().map(AsRawFd::as_raw_fd),
             err: err_pipe.as_ref().map(AsRawFd::as_raw_fd),
+            stdin: stdin_pipe.as_ref().map(AsRawFd::as_raw_fd),
+            channel: channel.as_ref().map(AsRawFd::as_raw_fd),
         };
         spawn_log_pump(
             out_pipe,
@@ -683,11 +705,19 @@ impl ProcessRunner for TokioRunner {
         );
 
         let (from_child_tx, from_child) = mpsc::channel(CHANNEL_CAPACITY);
-        drop(from_child_tx);
         let (to_child, to_child_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        drop(to_child_rx);
+        if let Some(channel) = channel {
+            spawn_channel_pumps(channel, from_child_tx, to_child_rx);
+        } else {
+            drop(from_child_tx);
+            drop(to_child_rx);
+        }
         let (to_stdin, to_stdin_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        drop(to_stdin_rx);
+        if let Some(stdin_pipe) = stdin_pipe {
+            spawn_stdin_pump(Some(stdin_pipe), to_stdin_rx);
+        } else {
+            drop(to_stdin_rx);
+        }
 
         Ok((
             TokioProc {
@@ -891,6 +921,11 @@ impl ProcessRunner for TokioRunner {
             drop(to_child_rx);
         }
 
+        // Declared out here because the block below moves `daemon_end` into
+        // its pumps, and `PipeFds` is assembled after the spawn: this is the
+        // one moment the number is in reach.
+        #[cfg(unix)]
+        let mut channel_fd: Option<RawFd> = None;
         #[cfg(unix)]
         if spec.channel {
             command.env("SHEP_CHANNEL_FD", "3");
@@ -933,6 +968,7 @@ impl ProcessRunner for TokioRunner {
                 .map_err(|error| {
                     RunnerError::SpawnFailed(format!("shepherd channel fd mapping: {error}"))
                 })?;
+            channel_fd = Some(daemon_end.as_raw_fd());
             spawn_channel_pumps(daemon_end, from_child_tx, to_child_rx);
         } else {
             // No channel requested: close both ends immediately rather than
@@ -995,6 +1031,14 @@ impl ProcessRunner for TokioRunner {
         let pipes = PipeFds {
             out: child.stdout.as_ref().map(AsRawFd::as_raw_fd),
             err: child.stderr.as_ref().map(AsRawFd::as_raw_fd),
+            // Before the `take` below hands it to the stdin pump, which is
+            // the same reason the two above are read here: after it, there
+            // is nothing left on `child` to read a number off.
+            stdin: child.stdin.as_ref().map(AsRawFd::as_raw_fd),
+            // Read further up still, before the socketpair's daemon end was
+            // moved into its pumps. Nothing on `child` names it: the child's
+            // side is fd 3 over there, and this is the other end.
+            channel: channel_fd,
         };
         #[cfg(not(unix))]
         let pipes = PipeFds;
@@ -1250,7 +1294,7 @@ impl<W: AsyncWrite + Unpin> LogFile<W> {
     }
 }
 
-/// The descriptor numbers of a pump's two stream readers.
+/// The descriptor numbers a handover carries for one sheep's pipes.
 ///
 /// Told to the pump rather than read off its readers, because the pump is
 /// generic over them and an in-memory stream has no descriptor at all. The
@@ -1266,6 +1310,52 @@ struct PipeFds {
     out: Option<RawFd>,
     /// The read end of the child's stderr, while the pump still holds it.
     err: Option<RawFd>,
+    /// The write end of the child's stdin, held by the stdin pump rather
+    /// than by this one.
+    ///
+    /// # Why the log pump reports a number it does not own
+    ///
+    /// It is the only party a snapshot asks. `LogCtl::ReportFds` is the one
+    /// request the supervisor sends per sheep, and a second seam for one
+    /// number would be a second thing to keep in step with the first.
+    ///
+    /// What makes that sound is who pins the descriptor. The stdin pump
+    /// ends when the last `to_stdin` sender drops, and the supervisor's own
+    /// slot holds one for as long as the sheep is registered, so the write
+    /// end cannot be closed and its number handed to the next `open`
+    /// between the report and the exec. That is the same guarantee parking
+    /// buys for [`Self::out`] and [`Self::err`], reached by ownership
+    /// instead: a pump that never stops reading needs to be parked, and a
+    /// pump that only ever writes what an operator hands it does not.
+    ///
+    /// Unlike those two, it is never cleared as a stream ends. It has no
+    /// EOF to reach, and the pump that could observe one is not this pump.
+    stdin: Option<RawFd>,
+    /// The daemon's end of the child's shepherd-channel socketpair, held by
+    /// that channel's two pump tasks rather than by this one.
+    ///
+    /// Reported here for the reason [`Self::stdin`] gives: this pump is the
+    /// only party a snapshot asks, and a second seam for one number would
+    /// be a second thing to keep in step with the first.
+    ///
+    /// # What pins it, and the one thing that does not
+    ///
+    /// The writer task ends only when the last `to_child` sender drops, and
+    /// the supervisor's own slot holds one for as long as a process is
+    /// running under this id, so the socket cannot be closed and its number
+    /// handed to the next `open` while the sheep is up. That is the same
+    /// ownership argument stdin makes.
+    ///
+    /// It is weaker in one place, and the supervisor closes the gap rather
+    /// than this pump. The writer ALSO ends on a write that fails, which is
+    /// what a child that has closed its fd 3 produces, and this pump never
+    /// hears about it: the number here would go on naming a descriptor the
+    /// kernel has already reissued. `Actor::handle_handover_snapshot` reads
+    /// `SheepSlot::open_channel` in the same breath as it reads the slot,
+    /// and a snapshot masks this field when that says the channel is gone.
+    /// So this number is only ever as true as the pump can make it, and the
+    /// supervisor is what makes it true.
+    channel: Option<RawFd>,
 }
 
 /// See the unix definition above; there is nothing to carry here.
@@ -1280,19 +1370,75 @@ struct PipeFds;
 struct LogFiles {
     out: LogFile,
     err: LogFile,
-    /// The stream read ends the pump still holds, cleared per stream as
-    /// each one ends.
+    /// The descriptors a blob names for this sheep, with the two stream
+    /// read ends cleared per stream as each one ends.
     ///
     /// Cleared rather than left standing because the reader is dropped at
     /// the same moment, which closes the descriptor: a number the kernel is
     /// free to hand to the next `open` must never reach a handover blob.
     pipes: PipeFds,
+    /// Whether this pump has answered a [`LogCtl::ReportFds`] that no
+    /// [`LogCtl::Resume`] has ended, and so has stopped reading its
+    /// sheep's streams.
+    ///
+    /// See [`LogFiles::reading`] for why a report parks a pump at all.
+    #[cfg(unix)]
+    parked: bool,
 }
 
 impl LogFiles {
     /// The file a line from this stream is appended to (`err` picks stderr).
     fn stream(&mut self, err: bool) -> &mut LogFile {
         if err { &mut self.err } else { &mut self.out }
+    }
+
+    /// Whether the pump should still be reading its sheep's streams.
+    ///
+    /// False between a [`LogCtl::ReportFds`] and the exec that consumes it,
+    /// which is the whole of what parking means and the reason the variant
+    /// is more than a question.
+    ///
+    /// A report is a SNAPSHOT: two descriptor numbers the successor will
+    /// adopt, and a flush that empties the write buffer behind them. The
+    /// exec happens later. A pump that goes on reading in between appends
+    /// lines that the `execve` then destroys in the write buffer, and takes
+    /// bytes off the pipe that the successor can no longer find there, so
+    /// the same window loses a sheep's output twice over. Parking makes
+    /// every part of the snapshot still true when it is used, rather than
+    /// true when it was taken.
+    ///
+    /// It also pins the two stream numbers. A pump that is not reading
+    /// cannot reach EOF, so it cannot drop a reader, so a number in the
+    /// blob cannot be closed and handed to the next `open` before the
+    /// successor adopts it.
+    ///
+    /// # The residual, measured
+    ///
+    /// One line per reload at most, and often none. The line the sheep was
+    /// part-way through at the exec is split between the tail of the
+    /// reader's buffer and [`tokio::io::Lines`]' own accumulator, which is
+    /// private, and its head dies with the image: the successor picks the
+    /// pipe up mid-line and writes the tail as a line of its own. Three
+    /// reloads of a sheep emitting about 1.6M lines/second lost 3, 1 and 2
+    /// lines across three runs (2026-08-30), against 2872 for the same
+    /// drill on the pump this replaced.
+    ///
+    /// Closing it means the pump reading through a buffer it owns rather
+    /// than through `Lines`, so that it can write the whole line. Writing
+    /// the reader's tail out verbatim instead is NOT the cheap version of
+    /// that: every write this pump makes is a whole line today, and several
+    /// sheep can share one file (`merge_logs`), where a partial write and
+    /// its continuation are two `write(2)`s that another instance's line
+    /// can land between. That would trade one torn line for two.
+    fn reading(&self) -> bool {
+        #[cfg(unix)]
+        {
+            !self.parked
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
     }
 
     /// When the pump owes the older of the two buffers a flush, or `None`
@@ -1344,7 +1490,18 @@ impl LogFiles {
     /// OF THESE PER SHEEP (reopen) or PER PATH (flush) with `"; "`, so one
     /// separator at both levels would punctuate a single sheep that failed on
     /// both streams exactly like two that failed on one each.
-    async fn serve(&mut self, ctl: LogCtl) {
+    #[cfg_attr(
+        not(unix),
+        allow(
+            unused_variables,
+            reason = "`streams` is read only by `ReportFds`, and that variant is unix-only"
+        )
+    )]
+    async fn serve<O, E>(&mut self, ctl: LogCtl, streams: &mut Streams<O, E>)
+    where
+        O: AsyncRead + Unpin,
+        E: AsyncRead + Unpin,
+    {
         match ctl {
             LogCtl::Reopen { done } => {
                 let mut failures = Vec::new();
@@ -1392,8 +1549,30 @@ impl LogFiles {
             // for one, and the descriptor is still the one to carry, since
             // the successor inherits the same handle on the same file and is
             // the only party left that could write to it.
+            //
+            // The drain comes first, and for the same reason. What a reader
+            // has taken off its pipe and not yet emitted is on the far side
+            // of the descriptor the blob carries: the successor inherits
+            // the pipe, not this process's memory, so those bytes reach no
+            // file unless this one writes them. Draining them beats
+            // carrying them in the blob, which was tried and measured. A
+            // blob is a snapshot and a pump is live, so bytes copied at the
+            // report are bytes the predecessor then writes to the log
+            // ANYWAY before the exec, and the successor replays them: one
+            // real reload produced a duplicated line and 459 lines of
+            // reordered output. Parking is what makes the drain sound, and
+            // it is the same fix.
             #[cfg(unix)]
             LogCtl::ReportFds { done } => {
+                // First, though nothing between here and the answer could
+                // read a stream anyway: `serve` runs to completion inside
+                // the pump's own task, which is the only reader either
+                // stream has. Setting it here makes that invariant local
+                // instead of something to re-derive from the task
+                // structure.
+                self.parked = true;
+                drain_ready(&mut streams.out, &mut self.out).await;
+                drain_ready(&mut streams.err, &mut self.err).await;
                 for file in [&mut self.out, &mut self.err] {
                     if let Err(error) = file.flush().await {
                         tracing::error!(%error, "log flush before a handover report failed");
@@ -1404,8 +1583,15 @@ impl LogFiles {
                     err_pipe: self.pipes.err,
                     out_log: self.out.raw_fd(),
                     err_log: self.err.raw_fd(),
+                    stdin: self.pipes.stdin,
+                    channel: self.pipes.channel,
                 });
             }
+            // No acknowledgement to send, and nothing to undo but the flag:
+            // the drain above emptied the reader rather than copying it, so
+            // a resumed pump picks its sheep up wherever the pipe left off.
+            #[cfg(unix)]
+            LogCtl::Resume => self.parked = false,
         }
     }
 }
@@ -1425,17 +1611,22 @@ enum AfterLine {
 ///
 /// The wait for room on `logs_tx` keeps serving `ctl_rx` — see
 /// [`reserve_slot`] for the cycle that would otherwise close.
-async fn deliver_line(
+async fn deliver_line<O, E>(
     result: io::Result<Option<String>>,
     err: bool,
     files: &mut LogFiles,
     logs_tx: &mpsc::Sender<LogLine>,
     ctl_rx: &mut mpsc::Receiver<LogCtl>,
-) -> AfterLine {
+    streams: &mut Streams<O, E>,
+) -> AfterLine
+where
+    O: AsyncRead + Unpin,
+    E: AsyncRead + Unpin,
+{
     match result {
         Ok(Some(line)) => {
             files.stream(err).append(&line).await;
-            let Some(slot) = reserve_slot(logs_tx, files, ctl_rx).await else {
+            let Some(slot) = reserve_slot(logs_tx, files, ctl_rx, streams).await else {
                 return AfterLine::LogsClosed;
             };
             slot.send(LogLine { err, line });
@@ -1471,11 +1662,16 @@ async fn deliver_line(
 /// runs, the sheep task waits on the acknowledgement, and the pump cannot
 /// look at the request that would produce it. Serving control requests from
 /// inside the wait breaks that cycle by construction rather than by timing.
-async fn reserve_slot<'tx>(
+async fn reserve_slot<'tx, O, E>(
     logs_tx: &'tx mpsc::Sender<LogLine>,
     files: &mut LogFiles,
     ctl_rx: &mut mpsc::Receiver<LogCtl>,
-) -> Option<mpsc::Permit<'tx, LogLine>> {
+    streams: &mut Streams<O, E>,
+) -> Option<mpsc::Permit<'tx, LogLine>>
+where
+    O: AsyncRead + Unpin,
+    E: AsyncRead + Unpin,
+{
     loop {
         // Recomputed every iteration from the STORED mark, so losing the
         // race never extends the window (`snapshot::run_writer`'s debounce
@@ -1488,7 +1684,7 @@ async fn reserve_slot<'tx>(
         tokio::select! {
             slot = logs_tx.reserve() => return slot.ok(),
             ctl = ctl_rx.recv() => match ctl {
-                Some(ctl) => files.serve(ctl).await,
+                Some(ctl) => files.serve(ctl, streams).await,
                 // Nothing can reach the pump any more, but the line in hand
                 // is still owed to the receiver. Waiting for it outside the
                 // `select!` rather than looping avoids spinning on a closed
@@ -1522,6 +1718,107 @@ where
     match lines {
         Some(lines) => lines.next_line().await,
         None => core::future::pending().await,
+    }
+}
+
+/// One stream's reader, at the capacity a handover reasons about.
+///
+/// A free function rather than an inline `BufReader::with_capacity` at each
+/// of the two call sites, so the two cannot drift: [`drain_ready`]'s bound
+/// is this capacity, and a stream built at some other one would strand more
+/// than the bound says.
+#[cfg(unix)]
+fn with_read_buffer<R: AsyncRead>(reader: R) -> BufReader<R> {
+    BufReader::with_capacity(READ_BUFFER, reader)
+}
+
+/// See the unix definition above; nothing here reasons about the capacity.
+#[cfg(not(unix))]
+fn with_read_buffer<R: AsyncRead>(reader: R) -> BufReader<R> {
+    BufReader::new(reader)
+}
+
+/// A pump's two line readers, held in one place so a control request can
+/// reach them.
+///
+/// They were two locals in the pump's own task until a handover had to
+/// drain them: [`LogCtl::ReportFds`] is served from two places, the pump's
+/// own `select!` and [`reserve_slot`]'s, and only one of those could see a
+/// local. Nothing else about them changed, and neither reader is touched
+/// here between lines.
+///
+/// `None` per stream is one that has reached EOF or failed. The pump drops
+/// the reader at that moment, which closes the descriptor, so a stream with
+/// no reader has neither a number nor bytes left to write.
+struct Streams<O, E> {
+    /// The stdout reader, until stdout ends.
+    out: Option<Lines<BufReader<O>>>,
+    /// The stderr reader, until stderr ends.
+    err: Option<Lines<BufReader<E>>>,
+}
+
+/// Writes out the whole lines one stream's reader is already holding, and
+/// touches the pipe behind it not at all.
+///
+/// This is what a descriptor report owes the successor. The reader has
+/// taken up to [`READ_BUFFER`] off the pipe that the successor will never
+/// see there, and the `execve` destroys it: those bytes reach a file only
+/// if this image writes them.
+///
+/// # Why it must not read the pipe
+///
+/// Measured, at about 1.6M lines/second (2026-08-30). A drain that reads
+/// while it writes refills the reader as fast as it empties it, so any
+/// budget it stops at leaves a reader holding bytes it has JUST taken out
+/// of the pipe. The loss is then buffer-shaped rather than rate-shaped and
+/// does not shrink with a larger budget, because a bigger budget reads more
+/// as well as writing more: three reloads at that rate lost 1954 lines
+/// through a drain bounded by an emitted-byte count.
+///
+/// Stopping at "no whole line is buffered" instead has neither problem. The
+/// buffer strictly shrinks, since a `read_line` that finds its delimiter
+/// already buffered returns without a syscall, so the loop cannot follow a
+/// sheep however fast it writes and needs no budget at all. What it leaves
+/// is bounded by [`READ_BUFFER`] because that is the reader's whole
+/// capacity.
+///
+/// # What it still leaves
+///
+/// The partial line at the end of the buffer, plus anything
+/// [`tokio::io::Lines`] is holding in the private accumulator it does not
+/// expose. Those are the same line: the one the sheep had not finished
+/// writing. It reaches the log as its own tail, since the successor picks
+/// the pipe up mid-line, so a reload's seam costs one line rather than a
+/// block. Closing that means the pump reading through a buffer it owns
+/// rather than through `Lines`.
+///
+/// EOF and a read failure both end the drain and are left for the pump's
+/// own loop to see when it resumes. A report that met one still names that
+/// stream's descriptor: the reader has not been dropped, so the number is
+/// still this process's, and the successor adopts a pipe at EOF exactly as
+/// this pump would have found it.
+///
+/// Nothing drained here is forwarded on `logs_tx`, deliberately. That
+/// channel feeds live `log.*` bus subscribers, and every one of them is
+/// about to go with the image; a wait for room on it would put the whole
+/// handover behind whoever is draining the bus. The file is the record, and
+/// the file gets every line.
+#[cfg(unix)]
+async fn drain_ready<R>(lines: &mut Option<Lines<BufReader<R>>>, file: &mut LogFile)
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(reader) = lines.as_mut() else {
+        return;
+    };
+    while reader.get_ref().buffer().contains(&b'\n') {
+        // Ready on the first poll, and that is the loop's whole argument: a
+        // delimiter already in the buffer means no `read(2)`, so nothing
+        // new arrives to replace what is written.
+        let Ok(Some(line)) = reader.next_line().await else {
+            return;
+        };
+        file.append(&line).await;
     }
 }
 
@@ -1608,24 +1905,35 @@ fn spawn_log_pump<O, E>(
             out: LogFile::from_sink(out_sink).await,
             err: LogFile::from_sink(err_sink).await,
             pipes,
+            #[cfg(unix)]
+            parked: false,
         };
-        let mut out_lines = stdout.map(|reader| BufReader::new(reader).lines());
-        let mut err_lines = stderr.map(|reader| BufReader::new(reader).lines());
+        let mut streams = Streams {
+            out: stdout.map(|reader| with_read_buffer(reader).lines()),
+            err: stderr.map(|reader| with_read_buffer(reader).lines()),
+        };
 
-        while out_lines.is_some() || err_lines.is_some() {
+        while streams.out.is_some() || streams.err.is_some() {
             // Recomputed every iteration from the STORED mark; see
             // `reserve_slot`, which carries the same branch for the window
             // this loop cannot see.
             let flush_at = files.flush_deadline();
             tokio::select! {
-                result = next_line(&mut out_lines) => {
-                    match deliver_line(result, false, &mut files, &logs_tx, &mut ctl_rx).await {
+                result = next_line(&mut streams.out), if files.reading() => {
+                    // Bound before the `match` rather than matched on
+                    // directly: the future borrows `streams`, and a
+                    // scrutinee's temporaries outlive the arms, so an arm
+                    // could not clear the reader that future was reading.
+                    let after =
+                        deliver_line(result, false, &mut files, &logs_tx, &mut ctl_rx, &mut streams)
+                            .await;
+                    match after {
                         AfterLine::KeepReading => {}
                         // Dropping the reader closes the descriptor, so the
                         // number stops being ours in the same statement it
                         // stops being readable.
                         AfterLine::StreamEnded => {
-                            out_lines = None;
+                            streams.out = None;
                             #[cfg(unix)]
                             {
                                 files.pipes.out = None;
@@ -1634,12 +1942,15 @@ fn spawn_log_pump<O, E>(
                         AfterLine::LogsClosed => break,
                     }
                 }
-                result = next_line(&mut err_lines) => {
-                    match deliver_line(result, true, &mut files, &logs_tx, &mut ctl_rx).await {
+                result = next_line(&mut streams.err), if files.reading() => {
+                    let after =
+                        deliver_line(result, true, &mut files, &logs_tx, &mut ctl_rx, &mut streams)
+                            .await;
+                    match after {
                         AfterLine::KeepReading => {}
                         // As above: the number goes with the reader.
                         AfterLine::StreamEnded => {
-                            err_lines = None;
+                            streams.err = None;
                             #[cfg(unix)]
                             {
                                 files.pipes.err = None;
@@ -1650,7 +1961,7 @@ fn spawn_log_pump<O, E>(
                 }
                 ctl = ctl_rx.recv() => {
                     match ctl {
-                        Some(ctl) => files.serve(ctl).await,
+                        Some(ctl) => files.serve(ctl, &mut streams).await,
                         None => break, // nothing holds a `log_ctl` sender
                     }
                 }
@@ -2027,6 +2338,8 @@ mod tests {
             let pipes = PipeFds {
                 out: Some(out_reader.as_raw_fd()),
                 err: Some(err_reader.as_raw_fd()),
+                stdin: None,
+                channel: None,
             };
             let (logs_tx, logs) = mpsc::channel(CHANNEL_CAPACITY);
             let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -2050,8 +2363,16 @@ mod tests {
                 pipes,
             }
         }
+    }
 
+    impl<W: AsyncWrite + Unpin> PumpHarness<W> {
         /// Sends a [`LogCtl::ReportFds`] and waits for the answer.
+        ///
+        /// Generic over the writing side rather than living with the
+        /// descriptor cases, because what a report does to the pump is not
+        /// about descriptors at all: it flushes, it drains, and it parks.
+        /// The cases about those three run over the cheaper in-memory pair.
+        #[cfg(unix)]
         async fn report_fds(&self) -> CarriedFds {
             let (done, ack) = oneshot::channel();
             self.ctl
@@ -2063,9 +2384,20 @@ mod tests {
                 .expect("a descriptor report must be acknowledged")
                 .expect("the pump must answer rather than drop the acknowledgement")
         }
-    }
 
-    impl<W: AsyncWrite + Unpin> PumpHarness<W> {
+        /// Sends a [`LogCtl::Resume`], which carries no acknowledgement.
+        ///
+        /// Nothing to wait for by design (see the variant): every case that
+        /// resumes a pump then waits on what the pump does next, which is a
+        /// stronger barrier than an answer would be.
+        #[cfg(unix)]
+        async fn resume(&self) {
+            self.ctl
+                .send(LogCtl::Resume)
+                .await
+                .expect("a parked pump must still be reading its control channel");
+        }
+
         /// Writes one line into the chosen stream and waits for the pump to
         /// hand it back on `logs` — which is proof the pump read it and
         /// issued its file write, and orders the two streams against each
@@ -2198,6 +2530,96 @@ mod tests {
         assert_eq!(distinct.len(), 4, "four descriptors, four numbers: {fds:?}");
     }
 
+    /// Fails if two instances of one `merge_logs` app end up naming one
+    /// descriptor number for the file they share.
+    ///
+    /// The whole-blob refusal is what makes this worth a case of its own.
+    /// `handover::adopt::refuse_repeated_fds` rejects the ENTIRE handover
+    /// when any number appears twice, so a merged-log app whose instances
+    /// shared one open file description would not merely lose a log: it
+    /// would send every reload of every flock containing it down the
+    /// stop-and-start arm, with a message naming a descriptor rather than
+    /// the config responsible.
+    ///
+    /// One inode, two `open`s, two numbers. Each instance is its own sheep
+    /// with its own pump, and [`LogFile::open`] runs [`open_append`] per
+    /// pump rather than sharing a handle between them, which is the fact
+    /// asserted here.
+    ///
+    /// Two pumps over ONE pair of paths, which is what `merge_logs` really
+    /// produces: `assemble` drops the `-<instance>` suffix and every slot
+    /// of the name resolves to the same two files.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_pumps_on_one_log_path_report_different_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("merged-out.log");
+        let err_path = dir.path().join("merged-err.log");
+
+        // Held for the whole case: a reading end is only a valid number
+        // while its writing end is alive, and a pump that reached EOF clears
+        // the number it would otherwise report.
+        let mut writers = Vec::new();
+        let mut reports = Vec::new();
+        for _ in 0..2 {
+            let (out_writer, out_reader) = tokio::net::unix::pipe::pipe().unwrap();
+            let (err_writer, err_reader) = tokio::net::unix::pipe::pipe().unwrap();
+            let pipes = PipeFds {
+                out: Some(out_reader.as_raw_fd()),
+                err: Some(err_reader.as_raw_fd()),
+                stdin: None,
+                channel: None,
+            };
+            let (logs_tx, _logs) = mpsc::channel(CHANNEL_CAPACITY);
+            let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            spawn_log_pump(
+                Some(out_reader),
+                Some(err_reader),
+                LogSink::Path(out_path.clone()),
+                LogSink::Path(err_path.clone()),
+                logs_tx,
+                ctl_rx,
+                pipes,
+            );
+            let (done, ack) = oneshot::channel();
+            ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+            let fds = timeout(PUMP_DEADLINE, ack)
+                .await
+                .expect("a descriptor report must be acknowledged")
+                .expect("the pump must answer rather than drop the acknowledgement");
+            // `_logs` and `ctl` are kept alive alongside the writers: a pump
+            // whose control channel closed would end and close the very
+            // handles whose numbers are being compared.
+            writers.push((out_writer, err_writer, ctl, _logs));
+            reports.push(fds);
+        }
+
+        let named: Vec<RawFd> = reports
+            .iter()
+            .flat_map(|fds| fds.all().into_iter().flatten())
+            .collect();
+        assert_eq!(
+            named.len(),
+            8,
+            "two running instances, four descriptors each: {reports:?}"
+        );
+        let distinct: BTreeSet<RawFd> = named.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            8,
+            "a repeat here refuses the whole handover, not just this app: {reports:?}"
+        );
+        // The pointed half of the assertion above: the two log handles are
+        // the pair that could plausibly have been shared, since they are the
+        // only two of the eight opened on the same path.
+        assert_ne!(
+            reports[0].out_log, reports[1].out_log,
+            "two instances sharing one log file must still hold two handles"
+        );
+        assert_ne!(reports[0].err_log, reports[1].err_log);
+        drop(writers);
+    }
+
     /// Fails if a report still names a stream whose descriptor the pump has
     /// already let go of.
     ///
@@ -2277,6 +2699,293 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&pump.err_path).unwrap(),
             "and-on-stderr\n"
+        );
+    }
+
+    /// How long a case watches a parked pump before believing it.
+    ///
+    /// Several [`IDLE_FLUSH`] windows, because that is what turns a pump
+    /// that read a line into a file that shows one: a pump still reading
+    /// appends within microseconds and the idle flush writes it through
+    /// 50ms later, so a file unchanged across six of those windows is a
+    /// pump that never read.
+    #[cfg(unix)]
+    const STILL_WINDOWS: u32 = 6;
+
+    /// Lines a case writes straight into a stream, bypassing
+    /// [`PumpHarness::feed`], when the point is a pump that has fallen
+    /// behind rather than one keeping up.
+    ///
+    /// More than `CHANNEL_CAPACITY`, so the pump fills `logs`, parks in
+    /// [`reserve_slot`], and holds the rest in its reader.
+    #[cfg(unix)]
+    const BURST: u32 = 60;
+
+    /// Fails if `path` changes at all over the next few flush windows.
+    ///
+    /// The negative half of the parking case, and the reason it is a window
+    /// rather than a single read: a pump that is still reading loses this
+    /// on its first poll, while a parked one cannot lose it at any length.
+    #[cfg(unix)]
+    async fn assert_file_holds_still(path: &Path, expected: &str) {
+        for window in 1..=STILL_WINDOWS {
+            tokio::time::sleep(IDLE_FLUSH).await;
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                expected,
+                "{}: a parked pump wrote during flush window {window}",
+                path.display()
+            );
+        }
+    }
+
+    /// Waits until nothing more will fit on `logs`, which is the state a
+    /// handover finds a chatty sheep's pump in.
+    ///
+    /// The forcing mechanism (IR-46) for both cases below: with the channel
+    /// full the pump is parked inside [`reserve_slot`], so everything it has
+    /// read past that point is in its reader and nothing but a report can
+    /// get it out.
+    #[cfg(unix)]
+    async fn wait_for_a_full_logs_channel(logs: &mpsc::Receiver<LogLine>) {
+        let filled = timeout(PUMP_DEADLINE, async {
+            while logs.len() < CHANNEL_CAPACITY {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            filled.is_ok(),
+            "the pump must fall behind a burst it cannot forward"
+        );
+    }
+
+    /// Fails if a pump goes on reading its sheep's streams after it has
+    /// reported.
+    ///
+    /// This is the whole of the handover's read side. A report is a
+    /// SNAPSHOT — descriptors, and a flush that empties the write buffer
+    /// behind them — and the exec that consumes it happens later. Anything
+    /// the pump reads in between is written to the log file by an image
+    /// that is about to be replaced, and is then in neither the pipe the
+    /// successor inherits nor the buffer it could have been handed: a gap.
+    /// Parking makes the snapshot still true when it is used.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pump_that_has_reported_stops_reading_until_it_is_resumed() {
+        let mut pump = PumpHarness::start();
+        pump.feed(false, "before-the-report").await;
+
+        let _ = pump.report_fds().await;
+
+        // The sheep does not stop writing because its shepherd is being
+        // replaced. Every one of these has to still be in the pipe at the
+        // exec, which is the same claim as the file not growing.
+        pump.out_writer
+            .write_all(b"after-1\nafter-2\n")
+            .await
+            .unwrap();
+        assert_file_holds_still(&pump.out_path, "before-the-report\n").await;
+
+        pump.resume().await;
+        assert_file_settles(&pump.out_path, "before-the-report\nafter-1\nafter-2\n").await;
+    }
+
+    /// Fails if a report leaves lines stranded in the pump's reader.
+    ///
+    /// The read side's other half, and the one a polite sheep hides: a
+    /// stream that emits a line and waits leaves the reader empty at every
+    /// instant a report could land, so a case built on one passes against
+    /// no implementation at all. A busy sheep fills `logs`, and everything
+    /// the pump has pulled off the pipe past that sits in a userspace
+    /// buffer that the exec destroys and no descriptor carries.
+    ///
+    /// Asserted with no settling: the report's own flush is the barrier.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_lands_what_the_reader_was_holding() {
+        let mut pump = PumpHarness::start();
+        let burst: String = (1..=BURST).map(|n| format!("{n}\n")).collect();
+        pump.out_writer.write_all(burst.as_bytes()).await.unwrap();
+        wait_for_a_full_logs_channel(&pump.logs).await;
+
+        let _ = pump.report_fds().await;
+
+        assert_eq!(
+            fs::read_to_string(&pump.out_path).unwrap(),
+            burst,
+            "every line the reader held must be on disk once, in order, \
+             before the report is answered"
+        );
+    }
+
+    /// Fails if a report takes bytes off a pipe that it does not write.
+    ///
+    /// The invariant the successor depends on, and the one no other case
+    /// here can see. Every byte the sheep wrote has to be in one of two
+    /// places when the report is answered: in the log file, because this
+    /// pump wrote it, or still in the pipe, because the successor inherits
+    /// the pipe by descriptor number. A byte in neither is a byte the
+    /// `execve` destroys.
+    ///
+    /// A drain that reads the pipe while it writes produces those by the
+    /// bufferful, and nothing else in this module notices, because on this
+    /// side of an exec the stranded bytes are still in the reader and a
+    /// resumed pump emits them quite happily. It took a real reload at
+    /// about 1.6M lines/second to find, at 2872 lines lost across three
+    /// reloads. Hence the second handle: a `try_clone` shares one open file
+    /// description, so what it can still read is exactly what the successor
+    /// would have found.
+    ///
+    /// The one line of slack is [`drain_ready`]'s documented residual: the
+    /// line the sheep was part-way through is split between the reader's
+    /// buffer and `Lines`' private accumulator, and its head is not
+    /// reachable from here. Slack, not silence: this fails at two.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_leaves_in_the_pipe_everything_it_did_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("out.log");
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        // The successor's view, taken before the pump owns the reader.
+        let inherited = reader.try_clone().unwrap();
+        let reader =
+            tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap();
+        let (logs_tx, logs) = mpsc::channel(CHANNEL_CAPACITY);
+        let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let pipes = PipeFds {
+            out: Some(reader.as_raw_fd()),
+            err: None,
+            stdin: None,
+            channel: None,
+        };
+        spawn_log_pump(
+            Some(reader),
+            None::<DuplexStream>,
+            LogSink::Path(out_path.clone()),
+            LogSink::Path(dir.path().join("err.log")),
+            logs_tx,
+            ctl_rx,
+            pipes,
+        );
+
+        // More than one `READ_BUFFER`, so the reader is full and the pipe
+        // still holds the rest; under `SMALLEST_PIPE`, so this write does
+        // not park against a pump that has stopped draining.
+        let lines = u32::try_from(SMALLEST_PIPE * 3 / 4 / RUN_LINE).unwrap();
+        let run: String = (1..=lines).map(|n| format!("{n:07}\n")).collect();
+        assert!(run.len() > READ_BUFFER, "the reader must fill");
+        std::io::Write::write_all(&mut writer, run.as_bytes()).unwrap();
+        wait_for_a_full_logs_channel(&logs).await;
+
+        let (done, ack) = oneshot::channel();
+        ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+        timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a descriptor report must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        // The sheep goes quiet, so the inherited handle reaches EOF rather
+        // than waiting for a writer that outlives the test.
+        drop(writer);
+        let rest = read_to_eof(inherited).await;
+        let written = fs::read_to_string(&out_path).unwrap();
+        assert!(
+            run.starts_with(&written),
+            "the pump must write the run's own bytes, in order"
+        );
+        assert!(
+            run.ends_with(&rest),
+            "what is left in the pipe must be the run's own tail"
+        );
+        assert!(
+            written.len() + rest.len() >= run.len() - RUN_LINE,
+            "{} of {} bytes reached neither the file ({}) nor the pipe ({}): the report read \
+             them out of the pipe and then dropped them",
+            run.len() - written.len() - rest.len(),
+            run.len(),
+            written.len(),
+            rest.len()
+        );
+    }
+
+    /// Everything still readable from a pipe handle, to EOF.
+    ///
+    /// `WouldBlock` is retried rather than treated as the end: the handle
+    /// shares its open file description with a `tokio` reader, which put
+    /// the description in non-blocking mode, so an empty moment reads as an
+    /// error rather than as a wait.
+    #[cfg(unix)]
+    async fn read_to_eof(handle: std::io::PipeReader) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let drained = timeout(PUMP_DEADLINE, async {
+            loop {
+                match std::io::Read::read(&mut &handle, &mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("the successor's handle must be readable: {error}"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the pipe must reach EOF once the sheep is gone"
+        );
+        String::from_utf8(out).expect("a pipe of ASCII lines")
+    }
+
+    /// The smallest buffer a pipe starts with on any host these cases run
+    /// on: macOS opens one at 16 KiB, Linux at 64.
+    ///
+    /// The case below writes its whole run in one go into a pipe whose
+    /// reader has stopped draining it, so the run has to fit under this or
+    /// the writing side parks and the test deadlocks instead of failing.
+    #[cfg(unix)]
+    const SMALLEST_PIPE: usize = 16 * 1024;
+
+    /// One line of the run below, sized so the arithmetic in it is exact.
+    #[cfg(unix)]
+    const RUN_LINE: usize = 8;
+
+    /// Fails if a report follows a sheep that is still writing instead of
+    /// rescuing what its reader already held.
+    ///
+    /// A reader can strand at most one [`READ_BUFFER`], and the drain
+    /// writes whole lines out of that buffer without reading the pipe
+    /// behind it, so it cannot write more than the buffer held however fast
+    /// the sheep is writing. The slack is one line: [`tokio::io::Lines`]
+    /// may have been part-way through one before the buffer was filled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_drains_at_most_one_bufferful() {
+        let mut pump = PumpHarness::start_over_pipes();
+        // Three quarters of the smallest pipe: over `MAX_DRAIN`, so the
+        // bound is really reached, and under the pipe, so the writer never
+        // parks.
+        let lines = u32::try_from(SMALLEST_PIPE * 3 / 4 / RUN_LINE).unwrap();
+        let run: String = (1..=lines).map(|n| format!("{n:07}\n")).collect();
+        assert!(run.len() > READ_BUFFER, "the run must reach the bound");
+        pump.out_writer.write_all(run.as_bytes()).await.unwrap();
+        wait_for_a_full_logs_channel(&pump.logs).await;
+        pump.flush().await;
+        let before = fs::metadata(&pump.out_path).unwrap().len();
+
+        let _ = pump.report_fds().await;
+
+        let drained = fs::metadata(&pump.out_path).unwrap().len() - before;
+        assert!(
+            drained > 0,
+            "the report must rescue what the reader was holding"
+        );
+        assert!(
+            drained <= u64::try_from(READ_BUFFER + RUN_LINE).unwrap(),
+            "the report drained {drained} bytes, which is more than one \
+             bufferful: it is following the sheep rather than catching up"
         );
     }
 
@@ -2437,6 +3146,8 @@ mod tests {
             out: LogFile::open(dir.path().join("out.log")).await,
             err: LogFile::open(dir.path().join("err.log")).await,
             pipes: PipeFds::default(),
+            #[cfg(unix)]
+            parked: false,
         };
         assert_eq!(
             files.flush_deadline(),
@@ -3109,6 +3820,356 @@ mod tests {
                 .expect("its sender must outlive the write")
                 .is_ok()
         );
+    }
+
+    /// fails if a descriptor report leaves out the sheep's stdin write end.
+    ///
+    /// The number belongs to the stdin pump rather than to this one, which
+    /// is why the log pump is TOLD it exactly as it is told its two reader
+    /// numbers. A report that dropped it would hand the successor a sheep
+    /// whose `shep whisper` writes into a descriptor the exec closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_names_the_stdin_write_end_it_was_told_about() {
+        let dir = tempfile::tempdir().unwrap();
+        // Held for the length of the case, as the stdin pump holds it in
+        // production: a number whose owner has dropped it is a number the
+        // next `open` may be handed.
+        let (_child_end, daemon_end) = std::io::pipe().unwrap();
+        // One live stream, so the pump has something to be reading. A pump
+        // handed no streams at all ends before it can answer anything.
+        let (_out_writer, out_reader) = tokio::io::duplex(STREAM_BUFFER);
+        let (logs_tx, _logs) = mpsc::channel(CHANNEL_CAPACITY);
+        let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let pipes = PipeFds {
+            out: None,
+            err: None,
+            stdin: Some(daemon_end.as_raw_fd()),
+            channel: None,
+        };
+        spawn_log_pump(
+            Some(out_reader),
+            None::<DuplexStream>,
+            LogSink::Path(dir.path().join("out.log")),
+            LogSink::Path(dir.path().join("err.log")),
+            logs_tx,
+            ctl_rx,
+            pipes,
+        );
+
+        let (done, ack) = oneshot::channel();
+        ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+        let fds = timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a descriptor report must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        assert_eq!(fds.stdin, Some(daemon_end.as_raw_fd()));
+    }
+
+    /// fails if an adopted sheep's stdin write end is not wired back to
+    /// `to_stdin`.
+    ///
+    /// The read half of this feature. Carrying the descriptor is only half
+    /// of it: the successor has to put a pump back on the daemon's end, or
+    /// every `shep whisper` after a handover answers on a channel with
+    /// nothing behind it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_stdin_pipe_carries_a_line_to_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut child_end, daemon_end) = std::io::pipe().unwrap();
+        let daemon_end = tokio::net::unix::pipe::Sender::from_file(std::fs::File::from(
+            std::os::fd::OwnedFd::from(daemon_end),
+        ))
+        .expect("the daemon's end of a stdin pipe is writable");
+
+        let (_proc, io) = TokioRunner::new()
+            .adopt(adopt_spec(&dir, Some(daemon_end), None))
+            .expect("the real runner must be able to adopt");
+
+        let (done, ack) = oneshot::channel();
+        io.to_stdin
+            .send(StdinWrite {
+                line: "whisper".to_string(),
+                done,
+            })
+            .await
+            .expect("an adopted sheep must still have a stdin pump");
+        timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("the write must be acknowledged")
+            .expect("the pump must outlive the write")
+            .expect("the write must succeed");
+
+        let mut buf = [0_u8; 8];
+        std::io::Read::read_exact(&mut child_end, &mut buf).expect("the child end must read");
+        assert_eq!(&buf, b"whisper\n");
+    }
+
+    /// fails if an adopted sheep that never had a stdin pipe is given a
+    /// channel nothing drains.
+    ///
+    /// `is_closed()` is the one question a caller asks about `to_stdin`
+    /// (see [`ProcIo::to_stdin`]), so a dangling receiver would have the
+    /// supervisor wait out its whole `STDIN_WRITE_TIMEOUT` on a sheep that
+    /// has no fd 0 at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_sheep_without_a_stdin_pipe_has_a_closed_channel() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (_proc, io) = TokioRunner::new()
+            .adopt(adopt_spec(&dir, None, None))
+            .expect("the real runner must be able to adopt");
+
+        assert!(io.to_stdin.is_closed());
+    }
+
+    /// fails if a descriptor report leaves out the sheep's shepherd
+    /// channel.
+    ///
+    /// The number belongs to that channel's two pump tasks rather than to
+    /// this one, exactly as the stdin number belongs to the stdin pump, and
+    /// the log pump is told it for the same reason: it is the only party a
+    /// snapshot asks. A report that dropped it would hand the successor a
+    /// sheep whose fd 3 the exec closed, so a `shep trigger` reaches
+    /// nothing and the app sees its channel end for no reason it can
+    /// observe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_names_the_shepherd_channel_it_was_told_about() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real socketpair, held for the length of the case exactly as the
+        // channel's own pumps hold it in production.
+        let (daemon_end, _child_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_out_writer, out_reader) = tokio::io::duplex(STREAM_BUFFER);
+        let (logs_tx, _logs) = mpsc::channel(CHANNEL_CAPACITY);
+        let (ctl, ctl_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let pipes = PipeFds {
+            out: None,
+            err: None,
+            stdin: None,
+            channel: Some(daemon_end.as_raw_fd()),
+        };
+        spawn_log_pump(
+            Some(out_reader),
+            None::<DuplexStream>,
+            LogSink::Path(dir.path().join("out.log")),
+            LogSink::Path(dir.path().join("err.log")),
+            logs_tx,
+            ctl_rx,
+            pipes,
+        );
+
+        let (done, ack) = oneshot::channel();
+        ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+        let fds = timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a descriptor report must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        assert_eq!(fds.channel, Some(daemon_end.as_raw_fd()));
+    }
+
+    /// fails if an adopted shepherd channel is not wired back to both
+    /// `to_child` and `from_child`.
+    ///
+    /// Both directions in one case, because the failure to catch is a
+    /// successor that rebuilt one pump and not the other, and either half
+    /// alone looks healthy from the other side. Writing proves
+    /// `shutdown_with_message` and `shep trigger` still land; reading proves
+    /// `{"kind":"ready"}` and every action reply still come back, which is
+    /// what a `wait_ready` sheep's whole lifecycle turns on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_shepherd_channel_carries_both_directions() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        // `child_end` is what an app holds on fd 3, unmoved by the handover.
+        // Both ends are async here rather than one of each: the write below
+        // is served by a task the adoption spawned, so a blocking read on
+        // this thread would park the runtime before that task ever ran.
+        let (daemon_end, child_end) = tokio::net::UnixStream::pair().unwrap();
+        let (child_read, mut child_write) = tokio::io::split(child_end);
+        let mut child = tokio::io::BufReader::new(child_read);
+
+        let (_proc, mut io) = TokioRunner::new()
+            .adopt(adopt_spec(&dir, None, Some(daemon_end)))
+            .expect("the real runner must be able to adopt");
+
+        io.to_child
+            .send(ShepherdMessage::Shutdown)
+            .await
+            .expect("an adopted sheep must still have a channel writer");
+        let mut line = String::new();
+        timeout(PUMP_DEADLINE, child.read_line(&mut line))
+            .await
+            .expect("the shepherd's message must reach the child's end")
+            .expect("the child end must read");
+        assert_eq!(line.trim_end(), r#"{"kind":"shutdown"}"#);
+
+        child_write
+            .write_all(b"{\"kind\":\"ready\"}\n")
+            .await
+            .unwrap();
+        let back = timeout(PUMP_DEADLINE, io.from_child.recv())
+            .await
+            .expect("an adopted sheep must still have a channel reader")
+            .expect("the reader must forward what the child said");
+        assert_eq!(back, ChildMessage::Ready);
+    }
+
+    /// fails if an adopted sheep that never had a channel is given ends
+    /// nothing drains.
+    ///
+    /// `is_closed()` is the one question the supervisor asks about
+    /// `to_child` (see `SheepSlot::open_channel`), so a dangling receiver
+    /// would have a `shep trigger` against a sheep with no fd 3 wait out its
+    /// whole `action_timeout` instead of answering `NoChannel` at once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_sheep_without_a_channel_has_closed_channel_ends() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (_proc, mut io) = TokioRunner::new()
+            .adopt(adopt_spec(&dir, None, None))
+            .expect("the real runner must be able to adopt");
+
+        assert!(io.to_child.is_closed());
+        assert!(
+            io.from_child.recv().await.is_none(),
+            "a sheep with no channel must report one that is over, not one that is quiet"
+        );
+    }
+
+    /// The plainest adoption, with `stdin_pipe` and `channel` the only
+    /// handles it carries.
+    ///
+    /// Every other handle is `None`, which is the shape a sheep whose log
+    /// opens had failed arrives in; nothing here reads them. The pid is this
+    /// process's own because nothing below ever waits it: an adoption
+    /// records a number, and the reaper is what would go looking for it.
+    #[cfg(unix)]
+    fn adopt_spec(
+        dir: &tempfile::TempDir,
+        stdin_pipe: Option<tokio::net::unix::pipe::Sender>,
+        channel: Option<tokio::net::UnixStream>,
+    ) -> AdoptSpec {
+        AdoptSpec {
+            pid: std::process::id(),
+            out_file: dir.path().join("out.log"),
+            err_file: dir.path().join("err.log"),
+            out_pipe: None,
+            err_pipe: None,
+            out_log: None,
+            err_log: None,
+            stdin_pipe,
+            channel,
+            reaper: Arc::new(crate::runner::AdoptedReaper::new()),
+        }
+    }
+
+    /// A spec for a real child, whose fd 0 is the point of the two cases
+    /// below.
+    ///
+    /// A real child rather than a harness, because the question is what the
+    /// SPAWN reads off the handle it is about to give away: an in-memory
+    /// stand-in has no descriptor to read. `reap.rs` spawns real children
+    /// from the library tier for the same reason.
+    ///
+    /// The program is the caller's, and the choice matters more than it
+    /// looks: a child that exits before the report is answered takes its
+    /// log pump with it, and the case then fails on a dropped
+    /// acknowledgement rather than on anything about descriptors.
+    #[cfg(unix)]
+    fn child_spec(dir: &tempfile::TempDir, program: &str, args: &[&str], stdin: bool) -> SpawnSpec {
+        SpawnSpec {
+            name: "web".to_string(),
+            program: program.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            cwd: None,
+            env: BTreeMap::new(),
+            out_file: dir.path().join("out.log"),
+            err_file: dir.path().join("err.log"),
+            channel: false,
+            stdin,
+            credentials: None,
+        }
+    }
+
+    /// fails if a spawn does not report the descriptor it put on the child's
+    /// fd 0.
+    ///
+    /// The number is read off `child.stdin` before the spawn hands it to the
+    /// stdin pump, which is the only moment it is knowable, and getting that
+    /// order wrong reports `None` for every sheep an operator can whisper
+    /// to. Checked as a write end of a pipe rather than merely as some
+    /// number: a report that named the wrong one of the five handles a spawn
+    /// holds would still be `Some`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spawn_reports_the_write_end_it_put_on_the_childs_stdin() {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+        let dir = tempfile::tempdir().unwrap();
+        // `cat` with a real pipe on fd 0 waits on it, so it is still there
+        // to be reported on, and it exits when `io` is dropped below.
+        let (_proc, io) = TokioRunner::new()
+            .spawn(&child_spec(&dir, "/bin/cat", &[], true))
+            .unwrap();
+
+        let (done, ack) = oneshot::channel();
+        io.log_ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+        let fds = timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a descriptor report must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        let stdin = fds
+            .stdin
+            .expect("a sheep spawned with a stdin pipe carries its write end");
+        let flags = OFlag::from_bits_truncate(fcntl(stdin, FcntlArg::F_GETFL).unwrap());
+        assert_eq!(
+            flags & OFlag::O_ACCMODE,
+            OFlag::O_WRONLY,
+            "the number reported for stdin must be the end the daemon writes"
+        );
+        assert_ne!(Some(stdin), fds.out_pipe);
+        assert_ne!(Some(stdin), fds.err_pipe);
+        drop(io);
+    }
+
+    /// fails if a sheep that never asked for a pipe on fd 0 carries a
+    /// descriptor for one.
+    ///
+    /// `/dev/null` is what such a child has there, and it belongs to the
+    /// child alone: naming a number here would have the successor adopt
+    /// something no `shep whisper` will ever reach.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spawn_without_stdin_reports_no_descriptor_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not `cat` here: with `/dev/null` on fd 0 it reads EOF and exits at
+        // once, which ends its log pump and leaves this case racing a
+        // report against a pump that is already gone.
+        let (mut proc, io) = TokioRunner::new()
+            .spawn(&child_spec(&dir, "/bin/sleep", &["30"], false))
+            .unwrap();
+
+        let (done, ack) = oneshot::channel();
+        io.log_ctl.send(LogCtl::ReportFds { done }).await.unwrap();
+        let fds = timeout(PUMP_DEADLINE, ack)
+            .await
+            .expect("a descriptor report must be acknowledged")
+            .expect("the pump must answer rather than drop the acknowledgement");
+
+        assert_eq!(fds.stdin, None);
+        // Killed rather than waited out: nothing here reads the child, and
+        // a `sleep` left behind outlives the test binary.
+        proc.signal_process(OperatorSignal::Kill).unwrap();
+        drop(io);
     }
 
     /// A [`SpawnSpec`] carrying only what [`what_exec_will_find`] reads. Every

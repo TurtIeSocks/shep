@@ -35,6 +35,8 @@
 // over sixty more items.
 #![cfg_attr(windows, allow(dead_code))]
 
+#[cfg(unix)]
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
@@ -7040,6 +7042,15 @@ const HANDOVER_DEADLINE: Duration = Duration::from_secs(20);
 #[cfg(unix)]
 const HANDOVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long [`a_sheep_owed_a_restart_still_gets_one_after_a_daemon_reload`]
+/// waits for a re-armed backoff to fire.
+///
+/// Its app's `restart_delay` is 8s and the successor re-arms with that same
+/// figure, so the honest wait is 8s plus a respawn. Four times that is a
+/// loaded runner's margin rather than a second schedule.
+#[cfg(unix)]
+const RESTARTED_DEADLINE: Duration = Duration::from_secs(40);
+
 /// Writes a script that counts from 1 upwards on stdout, one number per
 /// line, forever.
 ///
@@ -7197,22 +7208,332 @@ fn a_sheep_keeps_its_pid_and_its_log_across_a_daemon_reload() {
     graceful_kill(dir.path());
 }
 
-/// A flock carrying something this phase cannot move takes the stop arm, and
-/// the operator is told which sheep and why.
+/// A script that says which slot it is and which process it is, on every
+/// line.
 ///
-/// The gate doing its job, and not a failure: the reload still happens, the
-/// flock still comes back, and the refusal is a sentence in front of the
-/// person who typed the verb rather than a line in the daemon's log. The
-/// moved pid is what proves the stop arm was the one taken.
+/// `$SHEP_INSTANCE` is injected by the daemon at the spawn and is fixed for
+/// the life of the process, so a line naming a slot is the CHILD's own claim
+/// about which instance it is rather than the shepherd's. That is what makes
+/// a slot swap visible: a successor that rehydrated two instances into each
+/// other's rows leaves every pid alive and every log growing, and the only
+/// evidence is that the row for slot 0 names a file whose lines say slot 1.
+#[cfg(unix)]
+fn write_slot_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "slot.sh",
+        &format!(
+            "{}{}while :; do\n  echo \"slot=$SHEP_INSTANCE pid=$$\"\n  sleep 0.2\ndone\n",
+            script_header(),
+            record_pid_line(dir),
+        ),
+    )
+}
+
+/// Every line of `path` that names a slot, as `(slot, pid)` pairs.
+///
+/// Panics on a line it cannot parse rather than skipping it: a torn line is
+/// the failure these cases are looking for, and silently dropping it would
+/// turn a lost write into a shorter list.
+#[cfg(unix)]
+fn slot_lines(path: &Path) -> Vec<(u32, u32)> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let (slot, pid) = line
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("a torn line in {}: {line:?}", path.display()));
+            let parse = |field: &str, prefix: &str| {
+                field
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.parse::<u32>().ok())
+                    .unwrap_or_else(|| panic!("a torn line in {}: {line:?}", path.display()))
+            };
+            (parse(slot, "slot="), parse(pid, "pid="))
+        })
+        .collect()
+}
+
+/// Waits until `path` holds at least `want` slot lines, or
+/// [`HANDOVER_DEADLINE`] expires, and returns what it held on the last read.
+#[cfg(unix)]
+fn poll_slot_lines(path: &Path, want: usize) -> Vec<(u32, u32)> {
+    let start = Instant::now();
+    loop {
+        let lines = slot_lines(path);
+        if lines.len() >= want || start.elapsed() >= HANDOVER_DEADLINE {
+            return lines;
+        }
+        std::thread::sleep(FLOCK_POLL_INTERVAL);
+    }
+}
+
+/// A clustered app is carried, and every instance comes back in its own
+/// slot.
+///
+/// Two apps, because `merge_logs` is the whole reason multi-instance was the
+/// one to distrust. It points every instance of an app at ONE log file, and
+/// `handover::adopt::refuse_repeated_fds` refuses the entire blob when a
+/// descriptor number appears twice. Sharing one inode does not share a
+/// number, since each instance's pump runs its own `open`, but the failure
+/// that would follow if it did is a permanent refusal of every merged
+/// clustered app, blaming a descriptor rather than the config that produced
+/// it. So both shapes are exercised here rather than only the one with
+/// separate files.
+///
+/// The pid check is not the assertion. Every handover defect measured so far
+/// left the flock healthy and the pids intact, and a slot swap is exactly
+/// that shape: two live processes, both adopted, each answering to the
+/// other's name and writing under the other's `SHEP_INSTANCE`. So each row's
+/// own `out_file` is read back and the lines in it have to agree with the
+/// row about which slot and which pid they came from.
 #[cfg(unix)]
 #[test]
-fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
+fn a_clustered_flock_keeps_every_pid_and_every_slot_across_a_daemon_reload() {
     let dir = tempfile::tempdir().unwrap();
-    let script = write_test_script(&dir);
+    let script = write_slot_script(&dir);
     let flockfile = write_flockfile(
         &dir,
         &format!(
-            "[[app]]\nname = \"chatty\"\nscript = '{}'\nchannel = true\n",
+            "[[app]]\nname = \"split\"\nscript = '{}'\ninstances = 2\n\n\
+             [[app]]\nname = \"merged\"\nscript = '{}'\ninstances = 2\nmerge_logs = true\n",
+            script.display(),
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock_data(dir.path(), FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| {
+            rows.len() == 4
+                && rows
+                    .iter()
+                    .all(|row| row["status"] == "online" && !row["pid"].is_null())
+        })
+    });
+    let rows_before = rows_by_slot(&before);
+    assert_eq!(
+        rows_before.len(),
+        4,
+        "two apps at two instances each: {before}"
+    );
+    // The fixture check. `merge_logs` collapsing both instances onto one
+    // path is the premise of half this case, and a version where it had
+    // quietly stopped applying would pass every assertion below for the
+    // wrong reason.
+    assert_eq!(
+        rows_before[&("merged".to_owned(), 0)].1,
+        rows_before[&("merged".to_owned(), 1)].1,
+        "merge_logs must really point both instances at one file"
+    );
+    assert_ne!(
+        rows_before[&("split".to_owned(), 0)].1,
+        rows_before[&("split".to_owned(), 1)].1,
+        "without merge_logs each instance must have its own file"
+    );
+    for ((name, slot), (_, out_file)) in &rows_before {
+        assert!(
+            !poll_slot_lines(out_file, 1).is_empty(),
+            "{name}:{slot} must be logging before the reload"
+        );
+    }
+    let counts_before: HashMap<(String, u32), usize> = rows_before
+        .iter()
+        .map(|(key, (_, out_file))| (key.clone(), slot_lines(out_file).len()))
+        .collect();
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reloaded.stdout),
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    // The exact sentence the gate prints when it refuses -- see
+    // `handover::RefusedReason`'s `Display`, which every feature variant
+    // ends with. A looser probe would pass whether or not the reload was
+    // refused, which is the failure this assertion is here to catch.
+    assert!(
+        !text.contains("falls back to a stop-and-start"),
+        "a clustered flock is carried now, not refused: {text}"
+    );
+
+    let after = poll_flock_data(dir.path(), FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| {
+            rows.len() == 4
+                && rows
+                    .iter()
+                    .all(|row| row["status"] == "online" && !row["pid"].is_null())
+        })
+    });
+    let rows_after = rows_by_slot(&after);
+    assert_eq!(
+        rows_after, rows_before,
+        "every instance keeps its pid and its own log file: {after}"
+    );
+
+    // The slot assertion, and the one a pid check cannot make. Each row is
+    // asked for its own file, and every line written into that file AFTER
+    // the reload has to name that row's slot and that row's pid.
+    for ((name, slot), (pid, out_file)) in &rows_after {
+        let want = counts_before[&(name.clone(), *slot)] + 2;
+        let lines = poll_slot_lines(out_file, want);
+        assert!(
+            lines.len() >= want,
+            "{name}:{slot} stopped logging across the handover: {} lines, wanted {want}",
+            lines.len()
+        );
+        let fresh = &lines[counts_before[&(name.clone(), *slot)]..];
+        if *name == "merged" {
+            // One file for both slots, so the row's own lines are the ones
+            // carrying its pid. Both instances have to be present, or a
+            // handle was lost rather than carried.
+            assert!(
+                fresh.iter().any(|(_, line_pid)| line_pid == pid),
+                "merged:{slot} wrote nothing after the reload: {fresh:?}"
+            );
+            for (line_slot, line_pid) in fresh {
+                assert_eq!(
+                    rows_after[&("merged".to_owned(), *line_slot)].0,
+                    *line_pid,
+                    "a merged line's slot and pid disagree with the flock: {fresh:?}"
+                );
+            }
+        } else {
+            for (line_slot, line_pid) in fresh {
+                assert_eq!(
+                    (*line_slot, *line_pid),
+                    (*slot, *pid),
+                    "{name}:{slot}'s own log holds another instance's output: {fresh:?}"
+                );
+            }
+        }
+    }
+
+    graceful_kill(dir.path());
+}
+
+/// `shep flock`'s JSON rows as `(name, instance) -> (pid, out_file)`.
+///
+/// Keyed on the pair rather than on the name, because a name now matches as
+/// many rows as the app has instances.
+#[cfg(unix)]
+fn rows_by_slot(data: &serde_json::Value) -> BTreeMap<(String, u32), (u32, PathBuf)> {
+    data.as_array()
+        .unwrap_or_else(|| panic!("flock data is an array: {data}"))
+        .iter()
+        .map(|row| {
+            let name = row["name"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a row names its app: {row}"))
+                .to_owned();
+            let instance = u32::try_from(
+                row["instance"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("a row names its slot: {row}")),
+            )
+            .unwrap();
+            let pid = u32::try_from(
+                row["pid"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("an online row names its pid: {row}")),
+            )
+            .unwrap();
+            let out_file = PathBuf::from(
+                row["out_file"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a row names its out file: {row}")),
+            );
+            ((name, instance), (pid, out_file))
+        })
+        .collect()
+}
+
+/// A `/bin/sh` sheep that signals readiness on fd 3 and answers every
+/// shepherd message with the same reply.
+///
+/// Three features in one script, because they share one socketpair and the
+/// case below is about that socket surviving an `execve`. The `ready` line
+/// is what `wait_ready` holds the sheep at `starting` for; the loop is what
+/// `shep trigger` gets an answer from; and `read -r line <&3` is a plain
+/// blocking read, which is what an app author writes and what a channel that
+/// came back non-blocking would break.
+///
+/// The reply names the action verbatim rather than echoing what it was sent:
+/// extracting a JSON field in POSIX sh would be its own source of failure,
+/// and `ActionWaits` correlates on the action name when the app echoes no
+/// dispatch id.
+#[cfg(unix)]
+fn write_channel_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "chatty.sh",
+        &format!(
+            "{}{}printf '{{\"kind\":\"ready\"}}\\n' >&3\nwhile read -r line <&3; do\n  \
+             printf '{{\"kind\":\"action-reply\",\"action\":\"ping\",\"body\":\"pong\"}}\\n' \
+             >&3\ndone\n",
+            script_header(),
+            record_pid_line(dir),
+        ),
+    )
+}
+
+/// Runs `shep trigger chatty ping` and returns the one row's outcome.
+///
+/// Its own helper because the case below asks the identical question twice,
+/// once either side of the reload, and the whole point is that the two
+/// answers are the same.
+#[cfg(unix)]
+fn trigger_ping(home: &Path) -> serde_json::Value {
+    let triggered = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("trigger")
+        .arg("chatty")
+        .arg("ping")
+        .output()
+        .unwrap();
+    assert_success(&triggered);
+    let envelope: serde_json::Value = serde_json::from_slice(&triggered.stdout)
+        .unwrap_or_else(|e| panic!("trigger stdout was not JSON: {e}"));
+    envelope["data"][0]["outcome"].clone()
+}
+
+/// A sheep's shepherd channel survives `shep daemon reload`, in both
+/// directions and against a real app.
+///
+/// The end-to-end case for what 2b task 5 carries, and the one a pid check
+/// cannot stand in for. A socketpair can survive as a NUMBER and be attached
+/// to the wrong end, or be adopted with only one of its two pumps rebuilt,
+/// and every one of those leaves the flock healthy and the pid unmoved. What
+/// separates them is whether the app still answers.
+///
+/// `wait_ready` is on as well as `channel`, so `online` before the reload is
+/// itself proof that the child's `{"kind":"ready"}` came up the channel, and
+/// the second `trigger` is proof that both directions still work over the
+/// same socket afterwards.
+#[cfg(unix)]
+#[test]
+fn a_channel_sheep_still_answers_a_trigger_across_a_daemon_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_channel_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"chatty\"\nscript = '{}'\nchannel = true\nwait_ready = true\n",
             script.display()
         ),
     );
@@ -7226,10 +7547,606 @@ fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
     guard.adopt_home(dir.path());
     assert_success(&started);
 
+    // `online` rather than `starting`, which only the child's own readiness
+    // line over fd 3 can produce.
     let before = poll_flock(dir.path(), |info| {
         info["status"] == "online" && !info["pid"].is_null()
     });
-    let pid_before = before["pid"].as_u64();
+    let pid_before = before["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
+    let answered = trigger_ping(dir.path());
+    assert_eq!(
+        answered["kind"], "replied",
+        "the channel must work before the reload, or this case proves nothing: {answered}"
+    );
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_success(&reloaded);
+
+    let after = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    assert_eq!(
+        after["pid"].as_u64(),
+        Some(pid_before),
+        "a moved pid means the sheep was respawned, which is the stop arm: {after}"
+    );
+
+    let still = trigger_ping(dir.path());
+    assert_eq!(
+        still["kind"], "replied",
+        "the successor must reach the same fd 3 the child has had all along: {still}"
+    );
+    assert_eq!(still["body"], "pong", "{still}");
+
+    graceful_kill(dir.path());
+}
+
+/// Rows [`a_flock_of_every_carried_kind_survives_a_daemon_reload`] expects:
+/// four single-instance apps and two clustered ones at two instances each.
+#[cfg(unix)]
+const ROWS_IN_THE_MIXED_FLOCK: usize = 8;
+
+/// Writes one line to `sheep`'s stdin and asserts shep accepted it.
+///
+/// `sent` says the bytes reached the pipe, never that the app read them, so
+/// the caller still has to look in the sheep's own log for the echo. This
+/// helper covers only the half that can fail loudly.
+#[cfg(unix)]
+fn whisper(home: &Path, sheep: &str, line: &str) {
+    let sent = shep(home)
+        .arg("whisper")
+        .arg(sheep)
+        .arg(line)
+        .output()
+        .unwrap();
+    assert_success(&sent);
+}
+
+/// Reads `path` until it holds a line equal to `want`, or
+/// [`HANDOVER_DEADLINE`] expires.
+///
+/// Equality rather than `contains`, so a prefix of a longer line cannot
+/// answer for the line itself. Returns rather than panicking, for
+/// [`counting_lines`]' reason: the failure that reaches CI should be the
+/// caller's own assertion naming what it wanted.
+#[cfg(unix)]
+fn await_log_line(path: &Path, want: &str) -> bool {
+    let start = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.lines().any(|line| line == want) {
+            return true;
+        }
+        if start.elapsed() >= HANDOVER_DEADLINE {
+            return false;
+        }
+        std::thread::sleep(HANDOVER_POLL_INTERVAL);
+    }
+}
+
+/// A `/bin/sh` sheep that waits for `gate` to appear, deletes it, and then
+/// grows its resident set past [`BALLOON_BYTES`].
+///
+/// [`write_ballooning_script`] with a trigger in front of it, and the
+/// trigger is the whole reason this is a second script rather than that one.
+/// A sheep already over its ceiling before the reload proves nothing about
+/// the successor: the predecessor armed that enforcer. Growing only after
+/// the exec is what makes the breach attributable to an arming the
+/// successor performed.
+///
+/// It deletes the gate as it passes, so the breach happens exactly once. A
+/// restarted instance waits at a gate that is not there, which keeps the
+/// restart count a fact the assertion can pin rather than a race with the
+/// enforcer's next tick.
+#[cfg(unix)]
+fn write_gated_ballooning_script(dir: &TempDir, name: &str, gate: &Path) -> PathBuf {
+    write_script(
+        dir,
+        name,
+        &format!(
+            "{header}{pid}while [ ! -f '{gate}' ]; do\n  sleep 0.1\ndone\nrm -f '{gate}'\n\
+             s=x\nwhile [ ${{#s}} -lt {BALLOON_BYTES} ]; do s=\"$s$s\"; done\n{sleep}",
+            header = script_header(),
+            pid = record_pid_line(dir),
+            gate = gate.display(),
+            sleep = sleep_line(SLOW_SCRIPT_SLEEP_SECS),
+        ),
+    )
+}
+
+/// Every lifecycle extra is armed again by the successor, and each one is
+/// proved by the behaviour rather than by a handle existing.
+///
+/// The spec's H2 stages "re-arming watch, cron and memory limits" into this
+/// phase, and `Actor::install_adopted` does it in one line: `arm_extras` for
+/// an adopted sheep that is already `Online`. What that line covers is not
+/// self-evident, because [`ExtrasRegistry::arm`] fans out to five separate
+/// mechanisms across two scopes -- sampling, the memory limit and the
+/// liveness loop per instance, the cron worker and the filesystem watch per
+/// name -- and a successor that armed four of them would look identical from
+/// the outside to one that armed five.
+///
+/// **Every trigger here fires after the exec, and that ordering is the case.**
+/// A watch armed by the predecessor and a watch armed by the successor are
+/// indistinguishable if the file is written before the reload; the same goes
+/// for a resident set already over its ceiling and a probe already failing.
+/// So the reload happens first, on a flock where nothing has yet been asked
+/// to do anything, and only then does the case write the file, open the
+/// balloon gates and trip the probe.
+///
+/// `control` is what makes the memory restart attributable. It runs the same
+/// ballooning script, grows the same resident set through the same gate, and
+/// differs only in naming no `max_memory`, so a restart caused by the shell
+/// dying under its own allocation would move both counters. It doubles as
+/// the control for the other three: it configures no watch, no schedule and
+/// no probe, and a `restarts` of 0 at the end says nothing in this case
+/// restarts sheep in general.
+///
+/// What a broken implementation this would catch: an `install_adopted` that
+/// never calls `arm_extras` (all four counters stay 0 and nothing in
+/// `shep flock` says why); one that arms the per-instance extras and skips
+/// the name group, or the reverse (two of the four); an `arm_watch` given
+/// the entry before its log paths were assembled, which would leave the
+/// watch ignoring the wrong files; and an enforcer armed against the sheep's
+/// id where its pid belongs, which the pid guard in `handle_extra_restart`
+/// would then drop silently for the rest of the daemon's life.
+#[cfg(unix)]
+#[test]
+fn every_lifecycle_extra_is_re_armed_across_a_daemon_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Its own tempdir, never `$SHEP_HOME`: every fixture script appends its
+    // pid to `<home>/`[`FIXTURE_PIDS`] on each spawn, so a watch rooted at
+    // the home would restart on its own sheep's restart, forever.
+    let watched = tempfile::tempdir().unwrap();
+    let greedy_gate = dir.path().join("greedy.gate");
+    let control_gate = dir.path().join("control.gate");
+    // A file the probe REQUIRES, so the test trips it by DELETING and
+    // heals it by writing. The opposite polarity raced the fixture: a
+    // script that clears its own trigger on the way up does so whenever
+    // the shell is first scheduled, which under a loaded debug build was
+    // half a second after `shep flock` already called the sheep `online`,
+    // and it deleted the file this case had just written.
+    let healthy = dir.path().join("probe.healthy");
+    std::fs::write(&healthy, "ok").unwrap();
+    let sleeper = write_slow_script(&dir);
+    let greedy = write_gated_ballooning_script(&dir, "greedy.sh", &greedy_gate);
+    let control = write_gated_ballooning_script(&dir, "control.sh", &control_gate);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"watched\"\nscript = '{sleeper}'\ncwd = '{root}'\nwatch = true\n\n\
+             [[app]]\nname = \"scheduled\"\nscript = '{sleeper}'\ncron_restart = \"* * * * *\"\n\n\
+             [[app]]\nname = \"greedy\"\nscript = '{greedy}'\nmax_memory = \"{BREACH_LIMIT}\"\n\n\
+             [[app]]\nname = \"probed\"\nscript = '{sleeper}'\n\
+             liveness_probe = {{ kind = \"exec\", target = \"test -f {healthy}\", \
+             interval = \"1s\", timeout = \"2s\", failure_threshold = 2 }}\n\n\
+             [[app]]\nname = \"control\"\nscript = '{control}'\n",
+            sleeper = sleeper.display(),
+            root = watched.path().display(),
+            greedy = greedy.display(),
+            control = control.display(),
+            healthy = healthy.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let before = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| {
+            rows.len() == 5
+                && rows
+                    .iter()
+                    .all(|row| row["status"] == "online" && !row["pid"].is_null())
+        })
+    });
+    let pids_before: BTreeMap<String, u64> = restart_counts(&before)
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                sheep_named(&before, name)["pid"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        restart_counts(&before),
+        BTreeMap::from([
+            ("control".to_owned(), 0),
+            ("greedy".to_owned(), 0),
+            ("probed".to_owned(), 0),
+            ("scheduled".to_owned(), 0),
+            ("watched".to_owned(), 0),
+        ]),
+        "precondition: nothing has restarted yet: {before}"
+    );
+
+    let reloaded = shep(home).arg("daemon").arg("reload").output().unwrap();
+    assert_success(&reloaded);
+    let after = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        data.as_array()
+            .is_some_and(|rows| rows.len() == 5 && rows.iter().all(|row| row["status"] == "online"))
+    });
+    // The handover really happened, which every assertion below depends on:
+    // a stop-and-start would re-arm everything from a fresh spawn and prove
+    // nothing about `install_adopted`.
+    for (name, pid) in &pids_before {
+        assert_eq!(
+            sheep_named(&after, name)["pid"].as_u64(),
+            Some(*pid),
+            "{name} was respawned, so this reload took the stop arm: {after}"
+        );
+    }
+    // The sampling arm, and the cheapest of the five to lose silently.
+    // `StatsState::sample_now` reports only WATCHED roots and
+    // `with_live_stats` fills a row only from a reading it finds, so a
+    // successor that never called `stats.watch` leaves this null for the
+    // life of the daemon while every other column looks right.
+    for name in pids_before.keys() {
+        assert!(
+            !sheep_named(&after, name)["memory_bytes"].is_null(),
+            "{name} is no longer sampled after the handover: {after}"
+        );
+    }
+
+    // Every trigger, fired only now.
+    std::fs::write(watched.path().join("app.txt"), "changed").unwrap();
+    std::fs::write(&greedy_gate, "go").unwrap();
+    std::fs::write(&control_gate, "go").unwrap();
+    std::fs::remove_file(&healthy).unwrap();
+    // One wait for the three fast arms. The memory limit is the slow one of
+    // the three: the enforcer's ticks are phased off daemon boot rather than
+    // off the breach, so the honest worst case is a whole
+    // `MEMORY_POLL_INTERVAL` after the resident set moves.
+    let fired = poll_flock_data(home, BREACH_DEADLINE, |data| {
+        ["watched", "probed", "greedy"]
+            .iter()
+            .all(|name| sheep_named(data, name)["restarts"].as_u64().unwrap_or(0) >= 1)
+    });
+    assert!(
+        sheep_named(&fired, "watched")["restarts"].as_u64().unwrap() >= 1,
+        "a write under the watched tree after the exec must restart the sheep: {fired}"
+    );
+    assert!(
+        sheep_named(&fired, "probed")["restarts"].as_u64().unwrap() >= 1,
+        "a liveness probe failing after the exec must restart the sheep: {fired}"
+    );
+    assert!(
+        sheep_named(&fired, "greedy")["restarts"].as_u64().unwrap() >= 1,
+        "a resident set crossing max_memory after the exec must restart the sheep: {fired}"
+    );
+    // Healed now that the restart is on the books, so the probe stops
+    // failing and `probed` cannot spend its `max_restarts` while the case
+    // waits out the cron minute below.
+    std::fs::write(&healthy, "ok").unwrap();
+
+    // The cron worker, and the slow one. A `* * * * *` pattern armed at an
+    // arbitrary moment is a uniform draw on the minute it lands in, so the
+    // only bound worth stating is a minute plus the restart's round trip.
+    let cronned = poll_flock_data(home, CRON_DEADLINE, |data| {
+        sheep_named(data, "scheduled")["restarts"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    });
+    assert!(
+        sheep_named(&cronned, "scheduled")["restarts"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "a cron occurrence after the exec must restart the sheep: {cronned}"
+    );
+    assert_eq!(
+        sheep_named(&cronned, "control")["restarts"].as_u64(),
+        Some(0),
+        "the control ballooned through the same gate and configures no extra at all; \
+         a restart it shares is this case restarting sheep rather than an extra firing: \
+         {cronned}"
+    );
+
+    // The daemon's own log, which is the only place the observed resident
+    // set and the ceiling it crossed are ever stated. Read rather than
+    // polled: `spawn_extras_reporter` writes the record before it asks for
+    // the restart, so the counter above reaching 1 has already ordered it.
+    let daemon_log = std::fs::read_to_string(home.join("logs").join("shepd.err.log")).unwrap();
+    assert!(
+        daemon_log.contains("exceeded its max_memory"),
+        "the successor's own log must say why the sheep was restarted: {daemon_log:?}"
+    );
+
+    graceful_kill(home);
+}
+
+/// `restarts` per sheep name, for the two observations this case compares.
+#[cfg(unix)]
+fn restart_counts(data: &serde_json::Value) -> BTreeMap<String, u64> {
+    data.as_array()
+        .unwrap_or_else(|| panic!("flock data is an array: {data}"))
+        .iter()
+        .map(|row| {
+            (
+                row["name"].as_str().unwrap().to_owned(),
+                row["restarts"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+/// A sheep already owed a respawn when the shepherd is replaced still gets
+/// it.
+///
+/// The strand this pins is silent, permanent and reachable on a released
+/// build. `Actor::schedule_restart` spawns a task that sleeps and then
+/// sends `Msg::RestartDue`, and that task dies with the process image;
+/// `handle_restart_due` is the only thing that moves a sheep off
+/// `WaitingRestart`. A successor that installs the status without re-arming
+/// the timer therefore leaves the sheep down for the rest of its life while
+/// `shep flock` keeps printing `waiting-restart`, which an operator reads as
+/// "coming back".
+///
+/// Not a narrow race either, which is why it earns its own case rather than
+/// a line in the mixed flock above. The default backoff climbs to 15s, so a
+/// crash-looping app spends most of its time in this status -- and upgrading
+/// the shepherd is exactly what an operator does about a crash-looping app.
+///
+/// The precondition is asserted twice, before and immediately after the
+/// reload, and the second one is load-bearing. If the delay elapsed while
+/// `daemon reload` was running, the predecessor would have respawned the
+/// sheep before the exec and the final assertion would pass without proving
+/// anything.
+///
+/// `steady` is what says the reload was a handover at all: it never exits,
+/// so a moved pid means the stop arm ran and restarted the whole flock,
+/// which would bring `flapper` back for a reason this case is not about.
+#[cfg(unix)]
+#[test]
+fn a_sheep_owed_a_restart_still_gets_one_after_a_daemon_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let steady = write_slow_script(&dir);
+    let flapper = write_script(
+        &dir,
+        "flapper.sh",
+        &format!("{}{}exit 1\n", script_header(), record_pid_line(&dir)),
+    );
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            // Long enough that a loaded runner cannot let the wait expire
+            // between the observation below and the reload after it, and
+            // short enough that the case then waits it out once.
+            "[[app]]\nname = \"flapper\"\nscript = '{flapper}'\nrestart_delay = \"8s\"\n\n\
+             [[app]]\nname = \"steady\"\nscript = '{steady}'\n",
+            flapper = flapper.display(),
+            steady = steady.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+
+    let before = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        sheep_named(data, "flapper")["status"] == "waiting-restart"
+            && sheep_named(data, "steady")["status"] == "online"
+    });
+    assert_eq!(
+        sheep_named(&before, "flapper")["status"],
+        "waiting-restart",
+        "precondition: the sheep must be owed a respawn when the shepherd is replaced: {before}"
+    );
+    let steady_pid = sheep_named(&before, "steady")["pid"].as_u64().unwrap();
+
+    let reloaded = shep(home).arg("daemon").arg("reload").output().unwrap();
+    assert_success(&reloaded);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reloaded.stdout),
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    assert!(
+        !text.contains("falls back to a stop-and-start"),
+        "a sheep in its restart backoff is carried, not refused: {text}"
+    );
+
+    let carried = poll_flock_data(home, FLOCK_DEADLINE, |data| {
+        !sheep_named(data, "steady")["pid"].is_null()
+    });
+    assert_eq!(
+        sheep_named(&carried, "steady")["pid"].as_u64(),
+        Some(steady_pid),
+        "a moved pid means the stop arm ran, which restarts everything: {carried}"
+    );
+    assert_eq!(
+        sheep_named(&carried, "flapper")["status"],
+        "waiting-restart",
+        "the wait must still have been pending at the exec, or this case proves nothing: \
+         {carried}"
+    );
+    assert_eq!(
+        sheep_named(&carried, "flapper")["restarts"].as_u64(),
+        Some(0),
+        "ditto: the predecessor must not have respawned it first: {carried}"
+    );
+
+    let restarted = poll_flock_data(home, RESTARTED_DEADLINE, |data| {
+        sheep_named(data, "flapper")["restarts"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    });
+    assert!(
+        sheep_named(&restarted, "flapper")["restarts"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "the sheep was left waiting for a timer that died with the exec: {restarted}"
+    );
+
+    graceful_kill(home);
+}
+
+/// A `/bin/sh` sheep that echoes every line it is whispered, prefixed.
+///
+/// `stdin = true` is the only thing that gives a sheep a readable fd 0, and
+/// the loop is what makes a whisper observable: the line comes back in the
+/// sheep's own log, from the same process, so a pipe that survived as a
+/// number but was attached to the wrong end delivers nothing.
+///
+/// No trailing `sleep`. The `read` parks the script for as long as the
+/// daemon holds the write end open, which is exactly as long as the sheep is
+/// registered, so this fixture stays alive on the descriptor under test
+/// rather than on a timer.
+#[cfg(unix)]
+fn write_echoing_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "echoer.sh",
+        &format!(
+            "{}{}while read -r line; do\n  echo \"heard $line\"\n done\n",
+            script_header(),
+            record_pid_line(dir),
+        ),
+    )
+}
+
+/// A `/bin/sh` sheep that writes down whatever the shepherd tells it and
+/// then exits cleanly.
+///
+/// For `shutdown_with_message`, which is the third feature routed through
+/// the channel refusal and the one neither of the other two channel cases
+/// reaches: `wait_ready` is the child writing UP the socket and a `trigger`
+/// is a round trip, while this is the daemon writing down it on the stop
+/// path, with no reply to correlate. The line in the log is the whole of the
+/// evidence, and the clean `exit 0` beside it is what says the message
+/// arrived rather than the kill ladder.
+#[cfg(unix)]
+fn write_farewell_script(dir: &TempDir) -> PathBuf {
+    write_script(
+        dir,
+        "bye.sh",
+        &format!(
+            "{}{}while read -r line <&3; do\n  echo \"told $line\"\n  exit 0\ndone\n",
+            script_header(),
+            record_pid_line(dir),
+        ),
+    )
+}
+
+/// Every kind of sheep phase 2b carries, in one flock, across one reload.
+///
+/// 2a's case widened, and the reason it is one flock rather than five is
+/// that the descriptor rules are whole-flock rules.
+/// `handover::adopt::refuse_repeated_fds` refuses the ENTIRE blob over one
+/// repeated number, and the blob a mixed flock produces is the only place
+/// six kinds of descriptor -- two log files, two pipe read ends, a stdin
+/// pipe and a socketpair, times seven sheep -- are ever numbered together.
+///
+/// Every assertion here is one a pid check cannot make, which is the lesson
+/// of this whole phase: three separate defects have now been found that left
+/// the flock healthy, every pid intact and the suite green.
+///
+/// - `counter` is the log plane. Its sequence is unbroken or it is not.
+/// - `echoer` answers a whisper, so its stdin pipe is still the end the
+///   child reads from and still attached to that child.
+/// - `chatty` reaches `online` only by writing `{"kind":"ready"}` up fd 3,
+///   and answers a `trigger` afterwards with the CHILD's own reply.
+/// - `bye` is told `{"kind":"shutdown"}` down the same kind of socket at the
+///   end, which is the direction a `trigger` alone does not isolate.
+/// - `split` and `merged` are the clustered halves, and each row's own file
+///   has to name that row's slot and that row's pid: a successor that
+///   rehydrated two instances into each other's rows leaves every pid alive
+///   and every log growing.
+#[cfg(unix)]
+#[test]
+fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let counter = write_counting_script(&dir);
+    let slot = write_slot_script(&dir);
+    let chatty = write_channel_script(&dir);
+    let echoer = write_echoing_script(&dir);
+    let bye = write_farewell_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"counter\"\nscript = '{counter}'\n\n\
+             [[app]]\nname = \"echoer\"\nscript = '{echoer}'\nstdin = true\n\n\
+             [[app]]\nname = \"chatty\"\nscript = '{chatty}'\nchannel = true\nwait_ready = true\n\n\
+             [[app]]\nname = \"bye\"\nscript = '{bye}'\nshutdown_with_message = true\n\n\
+             [[app]]\nname = \"split\"\nscript = '{slot}'\ninstances = 2\n\n\
+             [[app]]\nname = \"merged\"\nscript = '{slot}'\ninstances = 2\nmerge_logs = true\n",
+            counter = counter.display(),
+            echoer = echoer.display(),
+            chatty = chatty.display(),
+            bye = bye.display(),
+            slot = slot.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("start")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    // `online` for all seven, which for `chatty` is already an assertion:
+    // `wait_ready` holds it at `starting` until the child writes up fd 3.
+    let before = poll_flock_data(dir.path(), FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| {
+            rows.len() == ROWS_IN_THE_MIXED_FLOCK
+                && rows
+                    .iter()
+                    .all(|row| row["status"] == "online" && !row["pid"].is_null())
+        })
+    });
+    let rows_before = rows_by_slot(&before);
+    assert_eq!(
+        rows_before.len(),
+        ROWS_IN_THE_MIXED_FLOCK,
+        "six apps, two of them clustered: {before}"
+    );
+
+    // Every feature is exercised BEFORE the reload too. A case where the
+    // whisper or the trigger never worked at all would otherwise read as a
+    // handover defect, and the point of this one is to separate those.
+    let out_file = |name: &str| rows_before[&(name.to_owned(), 0)].1.clone();
+    let counter_log = out_file("counter");
+    let echoer_log = out_file("echoer");
+    let bye_log = out_file("bye");
+    let seen_before = counting_lines(&counter_log, 3);
+    assert!(
+        seen_before.len() >= 3,
+        "the counter must be logging before the reload: {seen_before:?}"
+    );
+    whisper(dir.path(), "echoer", "before");
+    assert!(
+        await_log_line(&echoer_log, "heard before"),
+        "the whisper must reach the sheep before the reload, or this case proves nothing: {}",
+        std::fs::read_to_string(&echoer_log).unwrap_or_default()
+    );
+    let answered = trigger_ping(dir.path());
+    assert_eq!(
+        answered["kind"], "replied",
+        "the channel must work before the reload: {answered}"
+    );
+    let counts_before: HashMap<(String, u32), usize> = rows_before
+        .iter()
+        .filter(|((name, _), _)| name == "split" || name == "merged")
+        .map(|(key, (_, out_file))| (key.clone(), slot_lines(out_file).len()))
+        .collect();
 
     let reloaded = shep(dir.path())
         .arg("daemon")
@@ -7242,22 +8159,94 @@ fn a_flock_with_a_channel_sheep_takes_the_stop_arm() {
         String::from_utf8_lossy(&reloaded.stdout),
         String::from_utf8_lossy(&reloaded.stderr)
     );
+    // The exact sentence every feature variant of `handover::RefusedReason`
+    // ends with. Without this the case would pass on a stop-and-start, which
+    // restarts the flock and satisfies "everything still works".
     assert!(
-        text.contains("shepherd channel"),
-        "the refusal must name the feature that blocked the handover: {text}"
-    );
-    assert!(
-        text.contains("chatty"),
-        "and the sheep it blocked on: {text}"
+        !text.contains("falls back to a stop-and-start"),
+        "every kind in this flock is carried now, not refused: {text}"
     );
 
-    let after = poll_flock(dir.path(), |info| {
-        info["status"] == "online" && !info["pid"].is_null()
+    let after = poll_flock_data(dir.path(), FLOCK_DEADLINE, |data| {
+        data.as_array().is_some_and(|rows| {
+            rows.len() == ROWS_IN_THE_MIXED_FLOCK
+                && rows
+                    .iter()
+                    .all(|row| row["status"] == "online" && !row["pid"].is_null())
+        })
     });
-    assert_ne!(
-        after["pid"].as_u64(),
-        pid_before,
-        "the stop arm restarts the flock, so the pid must move: {after}"
+    let rows_after = rows_by_slot(&after);
+    assert_eq!(
+        rows_after, rows_before,
+        "every sheep keeps its pid and its own log file: {after}"
+    );
+
+    // The log plane, on a plain sheep.
+    let seen = counting_lines(&counter_log, seen_before.len() + 3);
+    assert!(
+        seen.len() > seen_before.len(),
+        "the counter stopped logging across the handover: {seen:?}"
+    );
+    assert_unbroken_sequence(&seen, "the counter's log across a handover");
+
+    // stdin, which nothing else in this file covers. A fresh line, so a
+    // stale `heard before` in the file cannot answer for it.
+    whisper(dir.path(), "echoer", "after");
+    assert!(
+        await_log_line(&echoer_log, "heard after"),
+        "the carried stdin pipe must still reach the same child: {}",
+        std::fs::read_to_string(&echoer_log).unwrap_or_default()
+    );
+
+    // The channel, both directions, against the child that has had fd 3
+    // since before the exec.
+    let still = trigger_ping(dir.path());
+    assert_eq!(
+        still["kind"], "replied",
+        "the successor must reach the same fd 3 the child has had all along: {still}"
+    );
+    assert_eq!(still["body"], "pong", "{still}");
+
+    // The clustered halves. Each row is asked for its own file, and every
+    // line written into it after the reload has to agree with the row.
+    for ((name, slot), (pid, out_file)) in &rows_after {
+        if name != "split" && name != "merged" {
+            continue;
+        }
+        let before = counts_before[&(name.clone(), *slot)];
+        let want = before + 2;
+        let lines = poll_slot_lines(out_file, want);
+        assert!(
+            lines.len() >= want,
+            "{name}:{slot} stopped logging across the handover: {} lines, wanted {want}",
+            lines.len()
+        );
+        for (line_slot, line_pid) in &lines[before..] {
+            assert_eq!(
+                rows_after[&(name.clone(), *line_slot)].0,
+                *line_pid,
+                "a {name} line's slot and pid disagree with the flock: {lines:?}"
+            );
+            if name == "split" {
+                assert_eq!(
+                    (*line_slot, *line_pid),
+                    (*slot, *pid),
+                    "{name}:{slot}'s own log holds another instance's output: {lines:?}"
+                );
+            }
+        }
+    }
+
+    // `shutdown_with_message`, last because it ends its sheep. The message
+    // goes down the carried socket, the child writes it to its own log and
+    // exits 0, so a `stopped` row with `told` in the file is the write
+    // direction working on the stop path four assertions after the exec.
+    let stopped = shep(dir.path()).arg("stop").arg("bye").output().unwrap();
+    assert_success(&stopped);
+    assert!(
+        await_log_line(&bye_log, "told {\"kind\":\"shutdown\"}"),
+        "the stop message must reach the child down the carried channel: {}",
+        std::fs::read_to_string(&bye_log).unwrap_or_default()
     );
 
     graceful_kill(dir.path());
