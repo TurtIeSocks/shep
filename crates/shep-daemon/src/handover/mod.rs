@@ -618,6 +618,30 @@ pub struct CarriedSheep {
     /// instead of to the reload machinery, which for an `autorestart` app
     /// respawns the old code into a slot the replacement owns.
     reload: Option<ReloadState>,
+    /// Whether a reload's readiness verification has already failed against
+    /// this instance.
+    ///
+    /// `Option` for the same reason the three fields above are, but NOT for
+    /// the same argument, and the difference is worth stating rather than
+    /// borrowing. Each of those was a gate refusal before it was a field, so
+    /// an absent key proves the fact was false. This was never a refusal: a
+    /// predecessor from before this field existed carried such an instance
+    /// happily and simply dropped the flag, so an absent key is that
+    /// predecessor staying silent rather than saying "no". `false` is still
+    /// the right reading of the silence — it is exactly what a successor
+    /// assumed before the field existed, so an older blob adopts the way it
+    /// always did — and it is the only reading available, since a hard parse
+    /// failure would leave a successor refusing to boot after its
+    /// predecessor had exec'd itself away. [`VERSION`] stays unmoved.
+    ///
+    /// It is what keeps a failed reload's leftovers REACHABLE. A reload
+    /// replaces `Online` instances, and an abandoned one is deliberately
+    /// left `Starting` so the daemon does not report a release that never
+    /// served as serving; `reload_eligible` reads this flag beside the
+    /// status, so the reload that rolls the release back can still reach the
+    /// instance. A successor that dropped it would answer that rollback with
+    /// `Ok` and replace nothing.
+    ready_failed: Option<bool>,
     /// The resolved config this instance runs under, environment included.
     ///
     /// This is the `AppConfig` beneath [`ProcessEntry::spec`]'s
@@ -651,12 +675,13 @@ pub struct CarriedSheep {
 impl CarriedSheep {
     /// Describe `entry` for the successor.
     ///
-    /// `epoch`, `fds`, `pending_delete` and `manual` are arguments rather
-    /// than reads off `entry` because none of them lives there: the respawn
-    /// epoch, the pending-delete marker and the manual-command marker are on
-    /// the supervisor's private slot type, and the descriptor numbers are
-    /// known only to whichever code holds the open descriptors. This is the
-    /// same split [`Candidate`] makes, for the same reason.
+    /// `epoch`, `fds`, `pending_delete`, `manual` and `ready_failed` are
+    /// arguments rather than reads off `entry` because none of them lives
+    /// there: the respawn epoch, the pending-delete marker, the
+    /// manual-command marker and the failed-readiness verdict are on the
+    /// supervisor's private slot type, and the descriptor numbers are known
+    /// only to whichever code holds the open descriptors. This is the same
+    /// split [`Candidate`] makes, for the same reason.
     #[must_use]
     pub fn from_entry(
         entry: &ProcessEntry,
@@ -664,6 +689,7 @@ impl CarriedSheep {
         fds: CarriedFds,
         pending_delete: bool,
         manual: Option<PendingManual>,
+        ready_failed: bool,
     ) -> Self {
         Self {
             id: entry.id,
@@ -678,9 +704,10 @@ impl CarriedSheep {
             fds,
             pending_delete: Some(pending_delete),
             manual,
-            // Read off the entry rather than passed in, unlike the two
-            // markers above: this one does live on `ProcessEntry`.
+            // Read off the entry rather than passed in, unlike the markers
+            // either side of it: this one does live on `ProcessEntry`.
             reload: Some(entry.reload),
+            ready_failed: Some(ready_failed),
             app: entry.spec.config().clone(),
         }
     }
@@ -718,6 +745,16 @@ impl CarriedSheep {
     #[must_use]
     pub const fn reload(&self) -> Option<ReloadState> {
         self.reload
+    }
+
+    /// Whether a reload's readiness verification has already failed against
+    /// this instance, or `None` for a blob written before this field
+    /// existed. That `None` reads as `false` — which is not the same claim
+    /// the three getters above make about their own, and the field's own doc
+    /// says why.
+    #[must_use]
+    pub const fn ready_failed(&self) -> Option<bool> {
+        self.ready_failed
     }
 
     /// The supervisor slot's respawn epoch at the moment of the handover.
@@ -1524,8 +1561,8 @@ mod tests {
 
         let blob = Handover::new(
             vec![
-                CarriedSheep::from_entry(&zero, 7, fds_at(11), false, None),
-                CarriedSheep::from_entry(&one, 8, fds_at(21), false, None),
+                CarriedSheep::from_entry(&zero, 7, fds_at(11), false, None, false),
+                CarriedSheep::from_entry(&one, 8, fds_at(21), false, None, false),
             ],
             DaemonFds {
                 listener: 3,
@@ -1624,6 +1661,7 @@ mod tests {
                 kind: ManualKind::Delete,
                 origin: CommandOrigin::Automatic,
             }),
+            false,
         );
         assert_eq!(
             marked.manual(),
@@ -1655,7 +1693,7 @@ mod tests {
     /// One carried sheep off `entry`, with the descriptor numbers a
     /// running sheep would have.
     fn carried(entry: &ProcessEntry) -> CarriedSheep {
-        CarriedSheep::from_entry(entry, 7, fds_at(11), false, None)
+        CarriedSheep::from_entry(entry, 7, fds_at(11), false, None, false)
     }
 
     fn handover_over(entry: &ProcessEntry) -> Handover {
@@ -1911,8 +1949,14 @@ mod tests {
             origin: CommandOrigin::Automatic,
         };
         let mut blob = sample_handover();
-        blob.sheep[0] =
-            CarriedSheep::from_entry(&entry_fixture(|_| {}), 7, fds_at(11), false, Some(marker));
+        blob.sheep[0] = CarriedSheep::from_entry(
+            &entry_fixture(|_| {}),
+            7,
+            fds_at(11),
+            false,
+            Some(marker),
+            false,
+        );
         let value = serde_json::to_value(&blob).unwrap();
 
         assert_eq!(
@@ -2016,6 +2060,60 @@ mod tests {
         );
     }
 
+    /// fails if a blob written before this daemon carried a failed
+    /// readiness verdict stops loading, or if a verdict that IS carried does
+    /// not survive the wire.
+    ///
+    /// Same stakes as the three cases above and a different argument, which
+    /// is why it is asserted rather than assumed. Each of those was a gate
+    /// refusal before it was a field, so an absent key proves the fact was
+    /// false; this was never a refusal, and a predecessor from before the
+    /// field existed carried such an instance while silently dropping the
+    /// flag. `None` is therefore that predecessor saying nothing rather than
+    /// saying "no" — and `false` is still the only reading available, since
+    /// it is what a successor of that blob assumed anyway and a hard parse
+    /// failure would leave this one refusing to boot after its predecessor
+    /// had exec'd itself away.
+    ///
+    /// The current-blob half is asserted first so the removal below removes
+    /// something: a blob whose `ready_failed` was `false` all along could
+    /// not tell an absent key from a present one.
+    #[test]
+    fn a_blob_written_before_ready_failed_was_carried_still_loads() {
+        let mut blob = sample_handover();
+        blob.sheep[0] =
+            CarriedSheep::from_entry(&entry_fixture(|_| {}), 7, fds_at(11), false, None, true);
+        let value = serde_json::to_value(&blob).unwrap();
+
+        assert_eq!(
+            Handover::load_value(value.clone())
+                .expect("a current blob loads")
+                .sheep[0]
+                .ready_failed(),
+            Some(true),
+            "a verdict on the wire must come back as one, or the rollback it keeps reachable \
+             cannot reach anything"
+        );
+
+        let mut older = value;
+        let sheep = older["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        assert!(
+            sheep.remove("ready_failed").is_some(),
+            "the field this case removes must be there to remove"
+        );
+
+        let loaded = Handover::load_value(older).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].ready_failed(), None);
+        assert_eq!(
+            loaded.sheep[0].id(),
+            blob.sheep[0].id(),
+            "the rest of the row is unchanged by the one field that was absent"
+        );
+    }
+
     #[test]
     fn the_exec_target_exists_and_is_a_file() {
         let p = exec_target().unwrap();
@@ -2102,7 +2200,7 @@ mod tests {
     ) -> Handover {
         Handover {
             version: VERSION,
-            sheep: vec![CarriedSheep::from_entry(entry, 7, fds, false, None)],
+            sheep: vec![CarriedSheep::from_entry(entry, 7, fds, false, None, false)],
             listener_fd,
             pidfile_fd,
             next_id: 9,

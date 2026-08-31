@@ -518,6 +518,7 @@ mod tests {
             pending_delete: Some(false),
             manual: None,
             reload: Some(crate::entry::ReloadState::None),
+            ready_failed: Some(false),
             app: crate::testing::app_with("web", |_| {}).into_config(),
         }
     }
@@ -1237,6 +1238,24 @@ mod tests {
         }]);
 
         dry_run(&blob).expect("a flock mid-reload is one a successor can adopt");
+    }
+
+    /// Fails if a blob carrying a failed readiness verdict cannot be
+    /// rehearsed.
+    ///
+    /// The rehearsal reparses the whole blob through the successor's own
+    /// [`Handover::load_value`] before it touches a descriptor, so a field
+    /// added to [`CarriedSheep`] rides the parse it already runs. That is
+    /// worth a case rather than an assumption: the rehearsal is what stands
+    /// between a bad blob and an `execve` with no way back, and a field it
+    /// could not parse would be found after the predecessor was gone.
+    #[tokio::test]
+    async fn a_blob_carrying_a_failed_readiness_verdict_passes_the_rehearsal() {
+        let predecessor = Predecessor::new();
+        let mut blob = predecessor.blob();
+        blob.sheep[0].ready_failed = Some(true);
+
+        dry_run(&blob).expect("an instance a reload gave up on is one a successor can adopt");
     }
 
     /// The whole reason the rehearsal runs against duplicates: the

@@ -3615,6 +3615,17 @@ impl<R: ProcessRunner> Actor<R> {
         // all, which said the same thing by refusing to carry one; see
         // `CarriedSheep::reload`.
         let reload = carried.reload().unwrap_or(ReloadState::None);
+        // Read here rather than at either `SheepSlot` literal below, because
+        // the readiness re-arm between them has to see it: a `ready_failed`
+        // instance is `Starting` by construction, so a gate that could not
+        // tell the two apart would arm a wait over the one shape that must
+        // not get one. See the re-arm itself for what that would cost.
+        //
+        // `false` for a blob written before this daemon carried the flag,
+        // which is what a successor of that blob's predecessor assumed
+        // anyway — the field is new, the assumption is not. See
+        // `CarriedSheep::ready_failed`.
+        let ready_failed = carried.ready_failed().unwrap_or(false);
         let mut entry = ProcessEntry {
             id,
             spec: app.clone(),
@@ -3681,7 +3692,14 @@ impl<R: ProcessRunner> Actor<R> {
                     epoch: carried.epoch(),
                     ready_tx: None,
                     actions: ActionWaits::default(),
-                    ready_failed: false,
+                    // Restored for the reason the pending delete above is:
+                    // it needs no task to act on it, and what consumes it is
+                    // whatever this slot's next spawn or exit does. A slot
+                    // with no process can still carry it — an abandoned
+                    // replacement that then exited is `WaitingRestart` with
+                    // the verdict still standing — and `respawn` clears it
+                    // at the spawn that answers it.
+                    ready_failed,
                 },
             );
             // A sheep the blob reports as `WaitingRestart` is owed a respawn,
@@ -3789,7 +3807,23 @@ impl<R: ProcessRunner> Actor<R> {
         // operator's deploy as the daemon's own doing, which is the lie the
         // flag exists to prevent.
         let manually = matches!(reload, ReloadState::Replacement);
-        let ready_tx = (status == ProcStatus::Starting).then(|| {
+        // `ready_failed` is the one `Starting` sheep that gets no wait, and
+        // skipping it is the faithful adoption rather than an exception to
+        // one. An abandoned reload's leftover has already had its verdict:
+        // the predecessor's wait ran, failed, and was not replaced — the
+        // instance is left `Starting` precisely because that is the one
+        // status literally true of a process that is up and not serving.
+        //
+        // Arming a fresh wait over it would invent a second chance the
+        // predecessor had ended, and `handle_ready_result` would spend it
+        // the wrong way in both directions. Its `TimedOut` arm goes `Online`
+        // ANYWAY, so a successor would promote an abandoned release to
+        // serving one `listen_timeout` after the exec — the exact false
+        // success `reload_ready_result` and `handle_reload_verified` refuse
+        // to write — and `went_online` would clear the carried flag on its
+        // way past, so the rollback this whole field exists for would find
+        // the instance `Online` for a reason that is not true.
+        let ready_tx = (status == ProcStatus::Starting && !ready_failed).then(|| {
             let source = ReadinessSource::of(app.config())
                 .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
             spawn_readiness_task(
@@ -3832,10 +3866,17 @@ impl<R: ProcessRunner> Actor<R> {
                 // Armed above for an instance the blob reports as
                 // `Starting`, and `None` for one it reports as `Online`,
                 // which has already resolved its readiness and has nothing
-                // left to wait for.
+                // left to wait for — or for one whose readiness already
+                // failed, which has nothing left to wait for either.
                 ready_tx,
                 actions: ActionWaits::default(),
-                ready_failed: false,
+                // Restored, and it is what keeps an abandoned reload's
+                // leftover reachable: `reload_eligible` reads it beside the
+                // status, so the rollback reload can replace an instance
+                // that never reached `Online`. A successor that dropped it
+                // would answer that rollback `Ok` and skip the only instance
+                // there was.
+                ready_failed,
             },
         );
         // A sheep the blob reports a `manual` marker for is one an operator
@@ -6296,6 +6337,7 @@ impl<R: ProcessRunner> Actor<R> {
                 manual: slot.manual,
                 pending_delete: slot.pending_delete,
                 epoch: slot.epoch,
+                ready_failed: slot.ready_failed,
                 log_ctl: slot.log_ctl.clone(),
                 channel_open: slot.open_channel().is_some(),
             })
@@ -8111,6 +8153,9 @@ struct HandoverDraft {
     /// The slot's respawn epoch, so a timer armed before the exec is still
     /// recognised as stale after it.
     epoch: u64,
+    /// Whether a reload's readiness verification has already failed against
+    /// this sheep. See [`SheepSlot::ready_failed`].
+    ready_failed: bool,
     /// This sheep's log pump, or `None` for a slot whose spawn never
     /// succeeded.
     log_ctl: Option<mpsc::Sender<LogCtl>>,
@@ -8207,6 +8252,7 @@ fn spawn_handover_task(
                 fds,
                 draft.pending_delete,
                 draft.manual,
+                draft.ready_failed,
             );
             let candidate = OwnedCandidate {
                 entry: draft.entry,
@@ -18146,7 +18192,7 @@ mod tests {
         );
     }
 
-    /// Fails if a snapshot loses the three actor counters or the two slot
+    /// Fails if a snapshot loses the three actor counters or the three slot
     /// facts nothing outside the actor can see.
     ///
     /// These are the reason this is a command rather than a getter, and each
@@ -18155,10 +18201,13 @@ mod tests {
     /// the successor never sees is an operator's `stop` that comes back as a
     /// running sheep.
     ///
-    /// Both slot facts used to reach the CANDIDATE, where they were
-    /// refusals. Neither is one any more, so both are asserted against the
-    /// blob instead — the marker whole rather than as a boolean, since the
-    /// kind and the origin decide different things on the far side.
+    /// Two of the three slot facts used to reach the CANDIDATE, where they
+    /// were refusals. Neither is one any more, so both are asserted against
+    /// the blob instead — the marker whole rather than as a boolean, since
+    /// the kind and the origin decide different things on the far side. The
+    /// third, `ready_failed`, was never a refusal and so was never asserted
+    /// anywhere: a snapshot that silently left it behind is the quiet half
+    /// of the same loss, and it is only visible here, on the write side.
     ///
     /// The sheep here has no live pump, which is also the registered-but-not
     /// -running case: it reports no descriptors, and that is not a refusal.
@@ -18172,6 +18221,7 @@ mod tests {
             kind: ManualKind::Stop,
             origin: CommandOrigin::Operator,
         });
+        actor.sheep.get_mut(&0).unwrap().ready_failed = true;
 
         let (reply, rx) = oneshot::channel();
         actor.handle_handover_snapshot(fds, reply);
@@ -18193,6 +18243,12 @@ mod tests {
             blob.sheep()[0].pending_delete(),
             Some(false),
             "nothing asked for this sheep to be deleted"
+        );
+        assert_eq!(
+            blob.sheep()[0].ready_failed(),
+            Some(true),
+            "an earlier reload's failed verdict must reach the successor, or the rollback that \
+             follows it has nothing left to replace"
         );
         assert!(
             blob.next_id() > 0,
@@ -18358,18 +18414,36 @@ mod tests {
         pid: Option<u32>,
         mutate: impl FnOnce(&mut ProcessEntry),
     ) -> CarriedSheep {
-        carried_marked(name, id, pid, false, None, mutate)
+        carried_marked(name, id, pid, false, None, false, mutate)
     }
 
-    /// [`carried`], with the two slot facts a blob carries beside the entry
-    /// set explicitly: a pending delete, and the manual command that owns
-    /// this sheep's next exit.
+    /// [`carried`], for an instance an earlier reload's readiness
+    /// verification failed against.
     ///
-    /// One function for both rather than one per fact, since a `Delete`
-    /// sets them together and a case about either usually has something to
-    /// say about the other. Separate from [`carried`] so the many cases that
-    /// are about neither do not grow two arguments they would always pass
-    /// the same values for.
+    /// Separate from [`carried_marked`] for the reason [`carried_in_swap`]
+    /// is: the many cases that are about none of this would otherwise grow
+    /// an argument they always pass the same value for.
+    #[cfg(unix)]
+    fn carried_ready_failed(
+        name: &str,
+        id: u32,
+        pid: Option<u32>,
+        mutate: impl FnOnce(&mut ProcessEntry),
+    ) -> CarriedSheep {
+        carried_marked(name, id, pid, false, None, true, mutate)
+    }
+
+    /// [`carried`], with the slot facts a blob carries beside the entry set
+    /// explicitly: a pending delete, the manual command that owns this
+    /// sheep's next exit, and an earlier reload's failed readiness verdict.
+    ///
+    /// One function for the first two rather than one per fact, since a
+    /// `Delete` sets them together and a case about either usually has
+    /// something to say about the other. Separate from [`carried`] so the
+    /// many cases that are about neither do not grow two arguments they
+    /// would always pass the same values for — which is also why the third
+    /// reaches this through [`carried_ready_failed`] rather than being
+    /// spelled out at every call.
     #[cfg(unix)]
     fn carried_marked(
         name: &str,
@@ -18377,6 +18451,7 @@ mod tests {
         pid: Option<u32>,
         pending_delete: bool,
         manual: Option<PendingManual>,
+        ready_failed: bool,
         mutate: impl FnOnce(&mut ProcessEntry),
     ) -> CarriedSheep {
         let mut app = AppConfig::minimal(name, "./srv");
@@ -18401,7 +18476,14 @@ mod tests {
             last_exit: None,
         };
         mutate(&mut entry);
-        CarriedSheep::from_entry(&entry, 0, CarriedFds::none(), pending_delete, manual)
+        CarriedSheep::from_entry(
+            &entry,
+            0,
+            CarriedFds::none(),
+            pending_delete,
+            manual,
+            ready_failed,
+        )
     }
 
     /// A carried sheep with no descriptors to rebuild, which is every case
@@ -18613,6 +18695,7 @@ mod tests {
                     Some(pid),
                     true,
                     None,
+                    false,
                     |_| {},
                 ))],
                 counters(9),
@@ -18764,6 +18847,7 @@ mod tests {
                         kind: ManualKind::Stop,
                         origin: CommandOrigin::Operator,
                     }),
+                    false,
                     respawnable(|app| app.autorestart = true),
                 ))],
                 counters(9),
@@ -18857,6 +18941,7 @@ mod tests {
                         kind: ManualKind::Stop,
                         origin: CommandOrigin::Operator,
                     }),
+                    false,
                     respawnable(|app| {
                         app.autorestart = false;
                         app.kill_timeout = "1000".parse().unwrap();
@@ -18916,6 +19001,7 @@ mod tests {
                         kind: ManualKind::Restart,
                         origin: CommandOrigin::Automatic,
                     }),
+                    false,
                     // Off, so the respawn below can only be the carried
                     // Restart: an `autorestart` app would come back from the
                     // crash loop whatever the marker said.
@@ -19129,7 +19215,7 @@ mod tests {
         manual: Option<PendingManual>,
         mutate: impl FnOnce(&mut ProcessEntry),
     ) -> CarriedSheep {
-        carried_marked(name, id, pid, false, manual, move |entry| {
+        carried_marked(name, id, pid, false, manual, false, move |entry| {
             mutate(entry);
             entry.reload = role;
             entry.status = status;
@@ -19642,6 +19728,121 @@ mod tests {
         .await;
 
         sup.shutdown().await;
+    }
+
+    /// Fails if a reload can no longer reach an instance an earlier reload's
+    /// readiness verification failed against, once that instance has crossed
+    /// a handover.
+    ///
+    /// The status alone rules it out. An abandoned reload leaves its
+    /// replacement `Starting` deliberately — up, and never having proved it
+    /// can serve — and a reload replaces `Online` instances, so
+    /// `SheepSlot::ready_failed` is the whole of what keeps the leftover
+    /// reachable. A successor that dropped the flag would answer the
+    /// rollback that follows a bad release with `Ok` and replace nothing,
+    /// which is the failure the flag exists to prevent, arriving through a
+    /// door that used to be shut by refusing the flock instead.
+    ///
+    /// Asserted through a real reload rather than by reading the slot back:
+    /// what an operator meets is the reload's own answer, and `handle_reload`
+    /// replies `Ok` with the row in it either way — before its selector pass
+    /// has decided that this instance is not eligible.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_carried_ready_failed_instance_is_still_replaceable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let pid = adoptable_child("sleep 30");
+        let sup = SupervisorBuilder::new(TokioRunner::new(), test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_ready_failed(
+                    "web",
+                    7,
+                    Some(pid),
+                    |entry| {
+                        swappable(entry);
+                        entry.status = ProcStatus::Starting;
+                    },
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        sup.reload(ProcessSelector::All)
+            .await
+            .expect("a registered app is one a reload can name");
+
+        let info = flock_until(
+            &sup,
+            |info| info.len() == 1 && info[0].id != 7,
+            "a carried `ready_failed` instance must still be replaceable by the reload that \
+             rolls its release back",
+        )
+        .await;
+
+        assert_eq!(
+            info[0].id, 9,
+            "the replacement takes the next carried id, not a reissued one"
+        );
+        assert_ne!(info[0].pid, Some(pid), "the replacement is a new process");
+
+        sup.shutdown().await;
+    }
+
+    /// Fails if a successor arms a readiness wait over an instance whose
+    /// readiness has already failed.
+    ///
+    /// The exact inverse of
+    /// [`an_adopted_sheep_that_was_still_starting_reaches_online`], and the
+    /// two together are why `install_adopted` reads the carried flag before
+    /// it decides: both sheep are `Starting`, and only the flag tells them
+    /// apart. An ordinary one is mid-wait and owed a fresh one; this one's
+    /// wait already ran, failed, and was deliberately not replaced.
+    ///
+    /// Arming one anyway would spend it the wrong way whichever answer came
+    /// back. `handle_ready_result`'s `TimedOut` arm goes `Online` ANYWAY, so
+    /// the successor would report an abandoned release as serving one
+    /// `listen_timeout` after the exec — the false success both abandonment
+    /// arms refuse to write — and `went_online` clears `ready_failed` on its
+    /// way past, so the rollback the sibling case above asserts would arrive
+    /// to find the instance `Online` for a reason that is not true.
+    ///
+    /// The clock is paused and then run well past the app's own
+    /// `listen_timeout`, so a wait that WAS armed has fired and been handled
+    /// by the time the status is read.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_carried_ready_failed_instance_gets_no_fresh_readiness_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _rx) = crate::bus::test_bus(64);
+        let sup = SupervisorBuilder::new(AdoptingRunner, test_paths(&dir), events)
+            .spawn_adopted(
+                vec![without_handles(carried_ready_failed(
+                    "web",
+                    7,
+                    Some(4242),
+                    |entry| {
+                        let mut app = AppConfig::minimal("web", "./srv");
+                        app.autorestart = false;
+                        app.wait_ready = true;
+                        entry.spec = normalize(app).unwrap();
+                        entry.status = ProcStatus::Starting;
+                    },
+                ))],
+                counters(9),
+                Vec::new(),
+            )
+            .expect("a carried flock installs");
+
+        tokio::time::sleep(Duration::from_secs(120)).await;
+
+        assert_eq!(
+            sup.list().await[0].status,
+            ProcStatus::Starting,
+            "an instance whose readiness already failed must not be handed a second verdict by \
+             the successor that adopted it"
+        );
     }
 
     /// The app a carried swap's two halves run: a real `sleep`, so a

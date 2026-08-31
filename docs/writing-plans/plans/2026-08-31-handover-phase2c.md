@@ -748,6 +748,99 @@ Ten, each applied alone against `cargo test -p shep-daemon --lib --all-features 
 
 ---
 
+### Review finding, closed after the tasks: `ready_failed` was not carried
+
+Found in review of the finished phase, not by a task. The blob carries
+`pending_delete`, `manual` and `reload`; `SheepSlot::ready_failed` is the
+fourth slot fact and it was still going out with the predecessor's image.
+
+**It is the same class as the four above, arriving by the one route none of
+them took.** Nothing about it is a timer. It is a VERDICT — the flag both
+abandonment arms set when a reload's readiness verification fails — and
+`reload_eligible` is `status == Online || ready_failed`, so it is the whole of
+what keeps an abandoned reload's leftover replaceable. That instance is left
+`Starting` on purpose, because `Online` over a process that is up and not
+serving is the false success the serial mode exists to remove. Drop the flag
+and the status is all that is left, and the status says the instance cannot be
+replaced. `handle_reload` still answers `Ok`, because it replies to the caller
+before its selector pass runs — so the rollback reload a deploy tool issues
+after a bad release reports success and replaces nothing. Exactly the
+looks-fine-is-not shape.
+
+#### What was built
+
+`CarriedSheep::ready_failed: Option<bool>`, threaded through `from_entry` and
+restored in `install_adopted`, `VERSION` unmoved and no `#[serde(default)]`,
+following the three siblings. One thing is NOT copied from them: what an
+absent key means. Each of those was a gate refusal before it was a field, so a
+missing key proves the fact was false. This was never a refusal — a
+predecessor carried such an instance happily and silently dropped the flag —
+so `None` is that predecessor saying nothing rather than saying "no". `false`
+is still the only reading available, and it is exactly what a successor
+assumed before the field existed, so an older blob adopts the way it always
+did. The field's own doc makes that argument rather than borrowing the
+sibling's.
+
+**The readiness re-arm is now gated on the flag, and that is the half the
+finding did not name.** `install_adopted` re-arms a wait for every `Starting`
+sheep, which is right for one still mid-start and wrong for one whose wait
+already ran and failed. `handle_ready_result`'s `TimedOut` arm goes `Online`
+ANYWAY, and `went_online` clears `ready_failed` on the way past, so an ungated
+re-arm writes the false success the abandonment arms refuse to write AND
+spends the carried flag one `listen_timeout` after the exec, before any
+rollback can use it. Both `Starting` sheep look identical; the carried flag is
+the only thing that tells them apart, which is why it is read before the
+re-arm decides rather than at either `SheepSlot` literal.
+
+#### Drill, measured
+
+An app with an exec `readiness_probe` gated on a sentinel file, `autorestart =
+false`, `listen_timeout = "20s"`, under an isolated `$SHEP_HOME`. Serial
+reload, since a probe without `reuse_port` takes it. Start with the sentinel
+present, remove it, reload: the drain finishes, the replacement never answers,
+and the reload is abandoned at 20s leaving `id 1` `starting` with
+`ready_failed` set. Then `shep daemon reload`, then the rollback.
+
+| after the handover | before | after |
+|---|---|---|
+| shepherd pid across the exec | unmoved | unmoved |
+| sentinel restored, `shep reload probed` | exit 0, `id 1` untouched | exit 0, `id 1` drained |
+| the flock 6s later | `id 1`, pid unchanged, `online` | `id 2`, new pid, `online` |
+
+The `online` in the before column is the second failure in one row: the
+rollback replaced nothing, and the release that never served is being reported
+as serving. A control run with no handover at all replaces the instance
+correctly, which is what pins the loss on the exec rather than on the
+abandonment.
+
+The re-arm gate has its own pair, same setup with the sentinel left absent, so
+the probe keeps failing:
+
+| 28s after the handover, probe still failing | before | after |
+|---|---|---|
+| `shep flock` | `online` | `starting` |
+
+#### Mutations
+
+| mutation | reddens |
+|---|---|
+| the restore in `install_adopted` dropped (both slot literals) | `a_carried_ready_failed_instance_is_still_replaceable` only |
+| the `&& !ready_failed` gate on the readiness re-arm removed | `a_carried_ready_failed_instance_gets_no_fresh_readiness_wait` only |
+| `HandoverDraft` reads `false` instead of the slot | `the_snapshot_carries_the_actors_counters_and_slot_state` only |
+| `#[serde(skip_serializing)]` on the field | `a_blob_written_before_ready_failed_was_carried_still_loads`, plus the two existing round-trip cases |
+| the field made non-optional | `a_blob_written_before_ready_failed_was_carried_still_loads` at its legacy half |
+
+The third is the one worth keeping. The write side was a hole: every other
+case builds its own `CarriedSheep`, so a daemon that never put the flag IN the
+blob passed all of them. It was found by mutating rather than by reading, and
+it is the half of a carry that is easiest to leave out.
+
+`a_blob_carrying_a_failed_readiness_verdict_passes_the_rehearsal` has no
+mutation of its own and is not claimed to: `dry_run` reparses whatever struct
+it is handed, so nothing short of a hand-written refusal reddens it. It is a
+regression guard on the reparse, the same shape and the same worth as
+`a_blob_carrying_a_swap_in_flight_passes_the_rehearsal`.
+
 ## Inherited from 2b, for a second look
 
 **The re-armed restart delay is a judgement call, and it shipped in v0.1.20.**
