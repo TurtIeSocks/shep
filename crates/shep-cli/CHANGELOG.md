@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-08-31
+
+### Added
+
+- Stop reporting a silent dog as online ([#91](https://github.com/shep-pm/shep/pull/91))
+
+
 ## [0.1.23] - 2026-08-31
 
 ### Added
