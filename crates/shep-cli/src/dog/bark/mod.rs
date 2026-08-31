@@ -242,9 +242,9 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
                         // `EventSource::resubscribe`, an await-on-connected
                         // that `ReconnectingClient` does not expose, and a
                         // ruling on what an ORPHANED dog does, which is a
-                        // question about every dog. See "The bark dog still
-                        // restarts once per reload" in `docs/specs/
-                        // deferred.md`.
+                        // question about every dog. `docs/specs/deferred.md`
+                        // carries it, under "The bark dog still restarts
+                        // once per reload".
                         None => break,
                         Some(Ok(event)) => {
                             let firings = rules.on_event(&event, now_ms());

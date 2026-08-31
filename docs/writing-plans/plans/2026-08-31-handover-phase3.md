@@ -575,12 +575,357 @@ Two things 2b recorded for whoever does this:
 - **Losing the `dog` field is not cosmetic.** `matching_ids` includes a dog only for an exact selector, so a carried dog without its marker leaves `shep dogs` and appears in `shep flock` beside the operator's own apps.
 - **Four tests use `RefusedReason::Dog` as their refusal fixture.** The two in `handover/mod.rs` are one line each (`e.reload = ReloadState::Replacement`). The two in `boot.rs` boot a real daemon, and a reload parked in `AwaitReady` is the one to build: a pending stop needs a script that ignores signals, which then blocks the test's own 5s teardown on `kill_timeout`.
 
-- [ ] **Step 1: Write the failing tests.**
-- [ ] **Step 2: Run them, watch them fail.**
-- [ ] **Step 3: Implement, and move the four fixtures.**
-- [ ] **Step 4: Prove each non-vacuous.**
-- [ ] **Step 5: Real reload** with both built-in dogs, proving `curl /metrics` still answers 200 afterwards and neither dog's restart count moved. That measurement is the whole phase.
-- [ ] **Step 6: `web/` and commit.** `getting-started.astro` says "A dog or anything mid-reload sends the reload down the older path instead"; the first half stops being true here.
+- [x] **Step 1: Write the failing tests.**
+- [x] **Step 2: Run them, watch them fail.**
+- [x] **Step 3: Implement, and move the four fixtures.**
+- [x] **Step 4: Prove each non-vacuous.**
+- [x] **Step 5: Real reload** with both built-in dogs, proving `curl /metrics` still answers 200 afterwards and neither dog's restart count moved. Half met and half ruled on: metrics holds its pid and `restarts 0` across six reloads while serving 200; bark still restarts once per reload, and the ruling is below.
+- [x] **Step 6: `web/` and commit.**
+
+#### Outcome
+
+**Four lines, as 2b measured, and four more that 2b could not have seen.**
+The carry itself was exactly what that section promised: strike
+`entry.dog.is_some()` in `refusal`, give `CarriedSheep` a `dog:
+Option<DogSource>`, read it off the entry in `from_entry` the way `reload`
+already is, restore it in `install_adopted`. `VERSION` unmoved, no
+`#[serde(default)]`, a legacy-blob test beside its seven siblings. What was
+not in the estimate: the four lines put a dog into the muster roll for the
+first time, and the fix for that is its own line with its own argument. See
+"Found in passing" below.
+
+**`PumpUnresponsive` is the only refusal left, and `Display` changed shape
+because of it.** The `(sheep, feature)` template existed for the variants
+that read "which this daemon cannot yet hand over"; `Dog` was the last of
+them, and a wedged pump has always had its own sentence because it is a
+fault rather than a gap a later phase closes. The template went with the
+variant. The tail — "reload falls back to a stop-and-start instead" — is
+unchanged and load-bearing: two `cli_e2e` cases probe for exactly that
+string to tell a carried flock from a stopped-and-started one, and a third
+does now.
+
+**The enum stays `#[non_exhaustive]` on a different argument than before.**
+It used to be justified by how much of the handover had shipped — every
+phase turned one variant into something the daemon carries, so a matcher had
+to tolerate variants going away. There is nothing left to remove. It stays
+because shep-daemon is a published library and a second way for a live
+sheep's descriptors to be unknowable would otherwise be a breaking change
+for an out-of-tree matcher (IR-20).
+
+**The whole `DogSource` rides the blob, not a boolean.** `shep dogs` prints
+a SOURCE column, so a successor holding only "this is a dog" would answer it
+with a guess. The adopted variant's path is the operator's own `shep adopt`
+argument, which the blob's `AppConfig` already carries as the program to
+run, so this adds nothing a reader of that file could not already see
+(IR-41).
+
+##### What the marker turns back on, measured rather than assumed
+
+Four readers, and this task strengthens three of them with no change to
+their code:
+
+| reader | what it does with the marker | measured |
+|---|---|---|
+| `matching_ids` | passes a dog over for every selector but an exact one | `shep flock`'s sheep table lists `web` and `freshsheep` only; both dogs are in their own section |
+| `dogs::spawn_dog_watch` | records an exhausted restart budget, but only for a marked entry | a CARRIED dog exhausted after a real reload wrote its line to `barks.jsonl` — drill B |
+| `rpc::dog_staleness` | builds its roster from it | both dogs are waited on now; task 3's measured gap on the handover arm is closed |
+| `dogs::spawn_enabled_dogs` | matches by name and inspects the reply's marker | the successor's "a sheep is already registered under this name" line is gone: **0 daemon log lines across six reloads**, against 1 in task 3's drill C |
+
+##### Found in passing, and it is not cosmetic: a carried dog would have entered the muster roll
+
+A successor rebuilds its registry from the blob — `record_config` per carried
+app — and the snapshot writer turns that registry into `flock.json` within
+seconds. **A dog has never been in the roll**: `spawn_enabled_dogs`
+registers dogs straight through the supervisor and nothing on that path ever
+touches `FlockRegistry`. Carrying one would have put it there for the first
+time, and permanently, because the roll outlives the daemon: a later cold
+boot would `restore_flock` `metrics` as an ordinary UNMARKED sheep before
+`spawn_enabled_dogs` ran, and `shep disable metrics` could not take it back
+out.
+
+`boot::apps_for_the_roll` is the filter. It is a named function rather than
+an inline `.filter()` because the registry takes bare `AppConfig`s, which
+carry no marker: this is the last place that still holds the blob's own
+rows, and that is the argument the function's doc makes.
+
+**Only the end-to-end tier reaches the call site**, which is the mutation
+worth recording — see below.
+
+##### The ruling on bark: deferred, with the design written down
+
+**Bark still restarts once per reload.** Measured here across three spaced
+reloads: pid moving every time, `restarts` 2 → 3 → 4, `online` after each,
+while metrics held pid 13096 at `restarts 0` throughout. Reproduces task 1
+exactly.
+
+**Three reloads inside 50ms produce ONE bark restart, not three**, and that
+is worth knowing before reading any restart count: bark exits when the
+connection it holds dies, so a reload it was not connected for costs it
+nothing. The count is per reload bark is actually up for.
+
+**The fix is not "re-arm the stream inside the client".** Task 1's argument
+still holds: `ReconnectingClient::subscribe` re-arming its own stream would
+silently swallow the gap between a connection dying and the successor
+accepting a fresh `Subscribe`, and an event stream that hides a gap is worse
+than one that ends.
+
+**The fix belongs in bark, where the gap already has an answer.**
+`run_loop`'s `Some(Err(dropped))` arm reconciles against `ListFlock` the
+moment the bus reports a lag, on the reasoning that a drop carries no
+information about what was lost and the only way to know is to ask the
+shepherd what things look like now. A handover gap is the same class of loss
+and deserves the same answer: re-subscribe, then reconcile. The state-based
+rules and the per-subject debounce are already built for a subject seen
+twice by two routes, so nothing new is invented.
+
+**Four things stop it being small, and the fourth is why it is its own task
+rather than a line here:**
+
+1. `EventSource` needs a `resubscribe`, which means a production adapter
+   holding the `ReconnectingClient` beside the stream and its topics.
+   `run_bark` moves that client into `ClientFlockSource` today.
+2. The adapter has to WAIT for the link before it can subscribe — a
+   `Subscribe` against a dead generation fails immediately with `Closed` —
+   and `ReconnectingClient` exposes `link()` as a reading, not a future.
+3. `LinkState::Refused` has to exit rather than retry, so G8's one restart
+   from disk still applies to a bark dog that cannot speak this protocol.
+4. **It needs a ruling on the ORPHANED dog, which is about every dog rather
+   than about bark.** Today bark exits when its shepherd goes away for any
+   reason; one that re-subscribed instead would linger, and would attach
+   itself to whatever daemon next binds that socket, beside that daemon's
+   own bark dog. The metrics dog already has that hazard through
+   `ReconnectingClient`'s supervisor, which retries forever, and nobody has
+   ruled on it. **Observed live during this task's mutation pass**: an
+   orphaned `shep dog metrics` from a killed test daemon was still resident
+   nine minutes later.
+
+Answering it for bark alone would leave the two dogs answering the same
+question differently for the third time. Recorded in
+`docs/specs/deferred.md` under "The bark dog still restarts once per
+reload", with `run_loop`'s `None` arm pointing at it so the next reader
+finds the ruling instead of rediscovering the question.
+
+**Why the phase is still complete without it.** The defect phase 3 was built
+for was a live process holding a dead socket: silent on both sides, 503 to
+every scrape, and indistinguishable from health on every column a listing
+has. Bark's is the opposite in every respect — it is a pid change and a
+counter an operator can read, it self-heals every time, and
+`install_adopted` gives each successor a fresh `RestartBudget` so reloads
+cannot exhaust one. What it costs is a false reading on one column and a
+lost debounce window, not an outage.
+
+##### The four fixtures moved, and there is nowhere left for them to move to
+
+All four needed A refusal rather than that one, and all four now use a
+wedged log pump. Their fixture has moved every time a phase carried the
+feature it was reaching for — a shepherd channel in 2b task 5, two instances
+in task 6, a dog here — and this is the last move available.
+
+| test | where | how it moved |
+|---|---|---|
+| `one_unsupported_sheep_refuses_the_whole_flock` | `handover/mod.rs` | a new `wedged(&entry)` helper beside `plain` |
+| `the_refusal_names_which_sheep_and_why` | `handover/mod.rs` | same, plus an assertion on the "falls back to" tail that the old version did not make |
+| `a_sighup_over_a_flock_it_cannot_carry_refuses_before_it_execs` | `boot.rs` | a `with_a_pump_that_never_reports` sheep started through the booted daemon |
+| `an_abandoned_handover_starts_every_pump_reading_again` | `boot.rs` | a third sheep, wedged, beside the two that answer |
+
+**2b's advice on the boot pair is stale and was not followed.** It said to
+build a reload parked in `AwaitReady`, because a pending stop needs a script
+that ignores signals and would then block the test's own 5s teardown on
+`kill_timeout`. Both of those were refusals in 2b and neither is one now:
+`refusal` reads `pump_unresponsive` and nothing else. A wedged pump is the
+only fixture available, and it needs no choreography at all.
+
+**Both boot cases moved to a paused clock, and that is not incidental.** The
+refusal is a missed `REPORT_DEADLINE`, which is two real seconds each.
+Measured: the daemon lib suite went **1.9s → 5.46s awake, and back to 2.35s
+paused**; the two cases run in 0.03s, stable over ten consecutive runs. The
+`SIGNAL_TEST_LOCK` guard is unrelated and stays — it is about concurrent
+`raise()` reaching this daemon's real listeners, not about the clock — and
+both comments now say which is which.
+
+**`an_abandoned_handover_starts_every_pump_reading_again` kept its own job
+rather than collapsing into its sibling.** With one wedged sheep it would
+have been `a_handover_abandoned_on_a_wedged_pump_resumes_the_pumps_that_
+parked` with a `boot()` in front. It has three sheep instead, two answering
+and one wedged, so it still proves the resume reaches EVERY pump reported to
+where the sibling has only one to reach — and it asserts `answered.len() ==
+2` so a future edit cannot quietly reduce it to the sibling's shape.
+
+##### Drill, measured
+
+**No bypass, for the first time in this phase.** Tasks 1, 2 and 3 each
+needed a temporary `if false && entry.dog.is_some()` to see anything. This
+is a plain release build of the committed tree, driving `shep daemon reload`
+against a real flock with both built-in dogs. Isolated `$SHEP_HOME` at
+`/tmp/p3d/home` (13 bytes) and `/tmp/p3e/home`.
+
+**A. Six reloads, both built-in dogs, one `sh` sheep.** Reloads 1-3 were
+back to back; 4-6 were spaced four seconds apart so bark was connected for
+each.
+
+| | before | after 6 |
+|---|---|---|
+| shepherd pid | 13052 | **13052** |
+| `web` pid / restarts | 13073 / 0 | **13073 / 0**, uptime 1m 49s unbroken |
+| `metrics` pid / restarts | 13096 / 0 | **13096 / 0**, uptime 1m 49s |
+| `bark` pid / restarts | 13871 / 1 | 14268 / **4** |
+| `curl /metrics` | HTTP 200 | **HTTP 200, six of six** |
+| reload wall clock | — | **0.043s, 0.049s, 0.050s** (spaced runs) |
+| daemon log lines | 0 | **0** |
+| `metrics-0-err.log` | 0 bytes | **0 bytes** |
+| lines about dogs in the reload | — | **0** |
+
+Reload wall clock is worth reading against task 3's, which measured 0.055s
+for a handover arm whose dog roster was EMPTY because the marker was lost.
+The roster is populated now, both dogs are waited on, and the verb is no
+slower: the reconnect lands before the first ask.
+
+**The decisive check is content, not status**, for the reason task 1 gave: a
+pid check cannot tell a live connection from a dead one. A sheep started
+after all six reloads appears in the exposition:
+
+```
+shep_sheep_status{sheep="freshsheep",id="4",fold="",status="online"} 1
+```
+
+**The two populations, after six reloads:**
+
+```
+$ shep dogs
+ID  NAME     STATUS  PID    RESTARTS  EXIT  CPU   MEM    UPTIME  SOURCE
+3   bark     online  14268  4         -     0.0%  11.0M  16s     built-in
+1   metrics  online  13096  0         -     0.5%  12.3M  1m 49s  built-in
+
+$ shep flock
+ID  NAME        STATUS  PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
+4   freshsheep  online  14378  0         -     0.2%  3.0M  2s      -     -
+0   web         online  13073  0         -     0.1%  3.1M  1m 49s  -     -
+
+Dogs
+...
+```
+
+Task 3's drill C had `shep dogs` **empty** and `metrics` listed beside the
+operator's own app. That is the marker loss, and it is closed.
+
+**The muster roll, read back through `shep save`:** `{'file':
+'/tmp/p3d/home/flock.json', 'apps': 2}`, holding `['freshsheep', 'web']`.
+No dog, after six real handovers.
+
+**B. `barks.jsonl`, which is task 2's finding and needs a dog that dies.**
+An adopted shim dog (`shep adopt`, exits 1 once a sentinel file appears),
+carried across a real reload — pid 14637 unmoved — then made to burn its
+whole budget:
+
+```
+1   shimdog  errored  -  16  1  -  -  0s  adopted
+
+$ shep barks
+WHEN                 RULE    SUBJECT  MESSAGE
+2026-08-31 13:56:26  daemon  shimdog  dog shimdog exhausted its restart budget: 16 restarts against a budget of 16
+```
+
+Task 2 measured a carried dog erupting through its whole budget and writing
+**nothing**. One line now, and it is the alert an operator reads after an
+outage.
+
+**C. A dog that never handshakes costs every reload the full wait, and says
+so.** The same shim, which does not speak the protocol at all:
+
+```
+wall=3.066s exit=0
+notice[reload]: the shepherd is now 0.1.22 (pid 14591)
+notice[reload]: the `shimdog` dog had not answered this shepherd after 3s, so this reload cannot say whether it came back
+```
+
+Reported rather than buried, because it is a real cost this task introduces
+and it will reach a real operator: **a third-party dog built against a
+`shep-client` older than task 2 sends an anonymous `Hello`, so nothing ever
+records a handshake for it and every reload pays `DOG_SETTLE_WAIT` and
+prints that line.** It is the phase decision's already-accepted cost
+("mute after a reload until rebuilt") arriving as a sentence instead of as
+silence, and the trade is three seconds against the stop arm restarting the
+entire flock. Exit stays 0 and the flock is carried either way.
+
+##### Mutations
+
+Eight, each applied to the committed tree, run, and restored from a saved
+copy rather than through git.
+
+| mutation | fails |
+|---|---|
+| the gate refuses a dog again | `a_dog_is_carried_rather_than_refused`, alone |
+| `from_entry` drops the marker | the two blob cases, the adopt case, the roll case — 4 |
+| `from_entry` invents one on every sheep | those, plus three carried-reload cases — 7 |
+| the blob field stops being optional on the wire | `a_blob_written_before_a_dog_was_carried_still_loads`, alone |
+| `install_adopted` drops the marker | `an_adopted_dog_keeps_its_marker_and_stays_out_of_a_wildcard`, alone |
+| `apps_for_the_roll` stops filtering | `a_carried_dog_does_not_reach_the_muster_roll`, alone |
+| **`boot` stops CALLING `apps_for_the_roll`** | **the end-to-end case, alone in the workspace** |
+| the reconnect supervisor never observes the death | 8 `reconnect` cases, the metrics dog case, and the end-to-end one |
+
+Three worth recording:
+
+- **The call-site mutation is the one only an end-to-end test catches, and it
+  was not covered until this drill went looking for it.** Restoring the old
+  `carried_apps.extend(...)` line leaves the helper, its unit case and all
+  **703** daemon lib tests green, because nothing but a booted daemon drives
+  `boot`'s use of it. The end-to-end case now reads the roll back through
+  `shep save` and fails at 3 apps against 2. Every task in this phase found
+  one of these; this is task 4's, and it is a `flock.json` that silently
+  acquires a dog forever.
+- **Inventing a marker has a blast radius of 7, and the three extra failures
+  are the right alarm.** `a_carried_ready_failed_instance_is_still_
+  replaceable`, `a_carried_reload_naming_no_registered_instance_is_dropped`
+  and `a_carried_swap_that_cannot_finish_is_still_abandoned_on_time` all
+  fail, because every carried sheep becomes a dog and wildcards stop
+  reaching any of them. A change that turned the whole flock into a kennel
+  would take `shep restart all` down with it, and three cases say so
+  without being about dogs at all.
+- **`a_dog_is_carried_rather_than_refused` is the only unit test guarding the
+  strike itself**, and its radius is 1. Nothing else in the lib suite goes
+  through `fitness` with a dog in it. The end-to-end case is the second
+  guard, and it catches the same mutation through the real verb: the reload
+  prints "falls back to a stop-and-start" and the assertion names it.
+
+##### Gate
+
+`cargo fmt --all --check` EXIT=0. `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` EXIT=0. `cargo test --workspace
+--all-features` EXIT=0, **2196 passed**, 0 failed across 32 binaries — task
+3's 2190 plus seven added and one removed. `RUSTDOCFLAGS="-D warnings" cargo
+doc --workspace --no-deps --all-features` EXIT=0. Windows cross-check with
+its own `CARGO_TARGET_DIR` EXIT=0 (the same `cfg(unix)` dead-code warnings
+`CLAUDE.md` documents; `apps_for_the_roll` is `#[cfg(unix)]` and adds none).
+
+Daemon lib: **703**, up from 698, and back to **2.35s** with the two boot
+cases on a paused clock.
+
+**`web/` needed the hand-written half only.** `cargo build --release` then
+`./web/scripts/generate-cli-reference.sh` leaves the generated reference
+byte-identical — 2510 lines, 40 verbs — because no verb, flag, exit code or
+config key moved. Three pages carried claims this task makes false:
+`getting-started.astro` said a dog sends the reload down the older path,
+which is now a wedged log pump and nothing else; and `docs/dogs.md` and
+`web/src/pages/docs/dogs.astro` documented the reconnect without ever saying
+what a reload does to a dog, which is the question a dog author reading that
+section actually has. Both now say it, including bark's exception, because a
+page that claimed every dog keeps its pid would be wrong about one of the
+two shipped dogs. `astro build` EXIT=0, `astro check` EXIT=0, 0 errors and 0
+warnings.
+
+##### Is the phase complete?
+
+**Yes, with one residual named above and recorded in `deferred.md`.** Every
+task's steps are ticked, `RefusedReason` has no feature variant left, and a
+real `shep daemon reload` carries a dog for the first time. The residual is
+bark's restart, which is G7's "no process restart at all" met for one of the
+two built-in dogs and not the other. It is written down rather than left
+implicit, in three places: this section, `docs/specs/deferred.md`, and the
+`None` arm of `run_loop` itself.
+
+What the phase does NOT close, deliberately and as the plan said at the
+outset: G11 and G12's row 5 — a dog answering `--version` so `adopt` can
+check the binary on disk.
 
 ---
 
