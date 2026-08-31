@@ -11,6 +11,12 @@
  * crates/shep-cli/src/cli.rs — this page cannot drift from it on its own,
  * only fall behind until someone re-runs the generator.
  *
+ * The version in the lede is the one thing here that does NOT come from
+ * that dump. It is read from Cargo.toml at build time through
+ * web/src/data/workspaceVersion.ts, because it was the only line a release
+ * changed and so the only line that went stale on its own — see that
+ * module's header for the four times it did.
+ *
  * Verbs are grouped by what an operator is trying to do, not by their
  * declaration order in the Commands enum — the grouping here is editorial,
  * the content inside each VerbSignature is generated.
@@ -21,6 +27,7 @@ import Callout from "../../components/docs/Callout.astro";
 import CodeBlock from "../../components/docs/CodeBlock.astro";
 import VerbSignature from "../../components/docs/VerbSignature.astro";
 import { cliReference } from "../../data/cliReference";
+import { workspaceVersion } from "../../data/workspaceVersion";
 
 const meta = {
   title: "CLI reference",
@@ -97,7 +104,7 @@ if (coveredCount !== cliReference.verbs.length) {
     <h1>CLI reference</h1>
     <ReferencePills slug="cli" />
     <p class="lede">
-      Every verb <code>shep {cliReference.version.replace(/^shep\s+/, "")}</code>
+      Every verb <code>shep {workspaceVersion}</code>
       understands, generated from the binary's own <code>--help</code>. Nothing
       below is hand-typed.
     </p>

@@ -61,8 +61,14 @@ VERBS=(
 )
 
 {
-  echo "@@VERSION@@"
-  shep --version
+  # No version line here, deliberately. `shep --version` used to lead this
+  # file, and it was the ONLY part of it that a release changed -- so every
+  # release left the committed copy wrong by exactly one line, with nothing
+  # failing and nobody noticing until someone re-ran the generator by hand.
+  # Four releases in a single day did it four times. The reference page now
+  # reads the workspace version straight out of Cargo.toml at Astro build
+  # time (web/src/data/workspaceVersion.ts), so what is committed here moves
+  # only when the CLI surface itself does -- which is the diff worth reading.
   echo "@@TOPLEVEL@@"
   shep --help
   for v in "${VERBS[@]}"; do
