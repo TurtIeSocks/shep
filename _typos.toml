@@ -54,6 +54,16 @@ contro = "contro"
 # error on the first-flockfile docs page.
 instnace = "instnace"
 
+# `retsarts` is the same shape as `contro` and `instnace` above: a deliberate
+# misspelling of `restarts` that a test depends on BY NAME. The bark dog's
+# rule parser must refuse an unknown key and say which one, so
+# `a_misspelled_trigger_field_is_refused_with_the_bad_key_named` asserts the
+# error string contains "retsarts". Correcting the spelling would make that
+# test assert nothing at all. Three sites, all in
+# crates/shep-cli/src/dog/bark/rules.rs: the test's doc comment, its TOML
+# fixture, and the assertion that reads the error back.
+retsarts = "retsarts"
+
 # Triggered by "marketing PNGs" (docs/systematic-refactor/.../assessment.md):
 # typos splits the plural acronym into "PN" + "Gs" and flags the first half
 # as a typo of "ON". A real word, not a real word, either way not a mistake
