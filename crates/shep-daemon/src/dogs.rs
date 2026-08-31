@@ -33,12 +33,15 @@
 //! that exposure to a second surface.
 
 use core::fmt;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use shep_core::barks::{self, Bark};
 use shep_core::config::{AppConfig, DaemonConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{BusEvent, DogSource, ProcessEventKind};
+use shep_core::selector::ProcessSelector;
 use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::bus::SharedEvent;
@@ -258,6 +261,223 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
     match config.dog.get(name) {
         None => Ok(String::new()),
         Some(table) => toml::to_string(table).map_err(|err| DogError::Config(err.to_string())),
+    }
+}
+
+/// What a refused handshake costs the dog that sent it.
+///
+/// Derived from how many times that dog has been refused since it last
+/// handshook successfully, rather than being a tuning choice — see
+/// [`DogRefusals::refused`], which is the only thing that produces one.
+///
+/// `#[non_exhaustive]`: `shep-daemon` is a published library, and a fourth
+/// verdict (a dog refused for something other than protocol skew, say)
+/// would otherwise be a breaking change for an out-of-tree matcher (IR-20).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The first refusal since this dog last handshook. Restart it once,
+    /// from disk: the running image is stale, and the binary on disk is
+    /// very often already the right one — that is the ordinary shape of an
+    /// upgrade, where the package replaced the file and the running process
+    /// is simply the old one.
+    Restart,
+    /// The second. The restart already happened and produced a dog that
+    /// speaks the same protocol the last one did, which PROVES the binary
+    /// on disk cannot satisfy this daemon either. Restarting again would be
+    /// a spin, not optimism. Report it stale and stop.
+    Stale,
+    /// Already stale, already reported. Say nothing further: a stale dog
+    /// that its own `autorestart` keeps respawning would otherwise write
+    /// one error line per respawn, and the operator has already been told
+    /// the one thing there is to tell.
+    AlreadyStale,
+}
+
+/// Which dogs this daemon has refused at the handshake, and how often since
+/// each last got in.
+///
+/// The handover design's G8, held as state: a refused dog is restarted
+/// ONCE and then reported stale, and the difference between those two is
+/// nothing more than whether this daemon has refused it before. Cheap to
+/// clone (one `Arc`), and shared by every connection through
+/// [`RpcContext`](crate::rpc::RpcContext).
+///
+/// **A count per dog, cleared by a successful handshake.** Clearing on the
+/// handshake rather than on the restart is what bounds the whole thing: a
+/// dog that keeps being refused never clears, so it never earns a second
+/// restart, while a dog that gets in is back to a clean slate and would be
+/// restarted once again by a LATER daemon that refuses it. One restart per
+/// episode, and an episode ends when the dog is talking again.
+///
+/// Nothing here survives a handover, and that is correct rather than a
+/// gap: a successor is a different daemon that has refused nobody yet, and
+/// a dog it can talk to is not stale by any definition it could apply.
+///
+/// `Debug` is derived and needs no redaction (IR-41): the map holds dog
+/// names and counts. A dog's name is the `[dog.<name>]` key an operator
+/// typed, which `dogs.rs` already places in the child's environment for the
+/// reason its module doc gives — the section's KEY is not one of its
+/// VALUES, and no value ever reaches this type.
+#[derive(Debug, Clone, Default)]
+pub struct DogRefusals {
+    /// Refusals per dog name since that dog last handshook. A name absent
+    /// from the map has not been refused since it last got in.
+    seen: Arc<Mutex<BTreeMap<String, u32>>>,
+}
+
+impl DogRefusals {
+    /// Builds an empty record — a daemon that has refused nobody.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one refused handshake from the dog named `name`, and says
+    /// what the daemon should do about it.
+    ///
+    /// The rule is G8's, and it falls out of the count rather than being
+    /// configured: the first refusal earns [`Refusal::Restart`], the second
+    /// [`Refusal::Stale`], and every one after that
+    /// [`Refusal::AlreadyStale`]. There is no fourth case and no dial.
+    pub fn refused(&self, name: &str) -> Refusal {
+        let mut seen = self.lock();
+        let count = seen.entry(name.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
+        match *count {
+            1 => Refusal::Restart,
+            2 => Refusal::Stale,
+            _ => Refusal::AlreadyStale,
+        }
+    }
+
+    /// Records that `name` handshook successfully, clearing whatever this
+    /// daemon held against it.
+    ///
+    /// A dog that is talking to this daemon is not stale by any definition
+    /// this daemon can apply, whatever happened before.
+    pub fn handshook(&self, name: &str) {
+        self.lock().remove(name);
+    }
+
+    /// Every dog this daemon has given up on, sorted.
+    ///
+    /// A dog is stale once it has been refused twice: the first refusal
+    /// bought it a restart from disk, and the second proved the disk binary
+    /// is no better. This is the daemon's own answer to "which dogs cannot
+    /// talk to me", and the reading G13's `daemon reload` reporting is
+    /// meant to take.
+    #[must_use]
+    pub fn stale(&self) -> Vec<String> {
+        self.lock()
+            .iter()
+            .filter(|(_, count)| **count >= 2)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// The map, treating a poisoned lock as ordinary data.
+    ///
+    /// Every critical section here is a lookup or an increment on a plain
+    /// `BTreeMap`, so a panic elsewhere cannot leave a torn value, and
+    /// taking down a daemon whose whole job is staying up would be the
+    /// worse failure — the same argument
+    /// [`FlockRegistry`](crate::snapshot) already makes for its own map.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, u32>> {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Records a dog's refused handshake and acts on it — the whole of the
+/// handover design's G8, from the one place that knows a refusal happened.
+///
+/// Three steps and one prohibition:
+///
+/// 1. **Record it.** Every refusal is logged, at a level that says what the
+///    daemon is doing about it. Before this existed the refusal was logged
+///    at no level at all, which is half of what G8 calls a defect: a dog
+///    could go mute and neither side would write a line.
+/// 2. **Restart it once, from disk.** A restart re-spawns the binary the
+///    dog's stored config names, which is the file on disk now and not the
+///    image the running process was started from. That is the entire
+///    automatic fix, and it is enough for the ordinary case: the package
+///    already replaced the binary and the running process is merely old.
+/// 3. **Then stop.** A second refusal proves the disk binary cannot satisfy
+///    this daemon either, so a third restart would be a spin rather than
+///    optimism. The dog is reported stale and left alone.
+///
+/// **Never loops**, and that is a property of the state rather than a
+/// budget: [`DogRefusals`] only clears a dog's count when that dog
+/// handshakes successfully, so a dog that cannot get in cannot earn a
+/// second restart however many times it is refused.
+///
+/// The restart runs on its own task rather than inline. A restart is a full
+/// kill ladder, which can take as long as the dog's `kill_timeout`, and the
+/// caller is a connection handler holding a socket this daemon has already
+/// refused — there is nothing left on that connection worth delaying for.
+///
+/// **What this does NOT do is stop a stale dog's own `autorestart`.** A dog
+/// whose process EXITS on a refused handshake — which is what a dog does
+/// when its very first connection is refused, rather than one it lost to a
+/// handover — is respawned by the supervisor exactly as any sheep would be,
+/// and goes on being refused until its restart budget runs out and
+/// [`spawn_dog_watch`] records the exhaustion. That loop is bounded, it is
+/// the supervisor's existing mechanism, and G8 is about not ADDING daemon
+/// restarts on top of it.
+pub fn record_refused_dog(
+    name: &str,
+    client_version: &str,
+    refusals: &DogRefusals,
+    supervisor: &SupervisorHandle,
+) -> Refusal {
+    let verdict = refusals.refused(name);
+    match verdict {
+        Refusal::Restart => {
+            tracing::warn!(
+                dog = %name,
+                dog_version = %client_version,
+                "refused a dog on protocol skew; restarting it once from the binary on disk"
+            );
+            let supervisor = supervisor.clone();
+            let name = name.to_string();
+            tokio::spawn(async move { restart_refused_dog(&supervisor, &name).await });
+        }
+        Refusal::Stale => tracing::error!(
+            dog = %name,
+            dog_version = %client_version,
+            "refused a dog on protocol skew again after restarting it: the binary on disk speaks the same protocol the running one did, so this dog is stale and will not be restarted again. Rebuild or reinstall it against this shep"
+        ),
+        Refusal::AlreadyStale => tracing::debug!(
+            dog = %name,
+            dog_version = %client_version,
+            "refused a dog already reported stale"
+        ),
+    }
+    verdict
+}
+
+/// Restarts the dog named `name`, logging either outcome.
+///
+/// [`SupervisorHandle::restart_automatic`] rather than the operator door:
+/// nobody typed this, so an operator's own `stop` or `delete` landing
+/// mid-ladder must take the dog off it rather than being silently converted
+/// into the restart it raced.
+///
+/// An exact-name selector, which is also the only kind that reaches a dog
+/// at all — the supervisor deliberately keeps dogs out of `all` and out of
+/// pattern matches, so an operator's `shep restart all` never touches one.
+async fn restart_refused_dog(supervisor: &SupervisorHandle, name: &str) {
+    match supervisor
+        .restart_automatic(ProcessSelector::Name(name.to_string()))
+        .await
+    {
+        Ok(_) => tracing::info!(dog = %name, "restarted a refused dog from the binary on disk"),
+        // Not an error the daemon can act on: the dog may have been
+        // disabled between the refusal and this restart, or the engine may
+        // be shutting down. Either way the dog is not coming back on this
+        // daemon's initiative, and saying so once is the whole of what is
+        // left to do.
+        Err(err) => tracing::warn!(dog = %name, %err, "a refused dog could not be restarted"),
     }
 }
 
@@ -614,5 +834,73 @@ mod tests {
         );
 
         watch.abort();
+    }
+
+    /// fails if a refused dog is restarted more than once. The one-restart
+    /// rule is the whole difference between an automatic fix and a crash
+    /// loop, and it is derived from the count rather than configured: a
+    /// second refusal PROVES the binary on disk cannot satisfy this daemon,
+    /// because the restart already ran it.
+    #[test]
+    fn a_refused_dog_earns_one_restart_and_is_then_stale_forever() {
+        let refusals = DogRefusals::new();
+        assert!(refusals.stale().is_empty());
+
+        assert_eq!(refusals.refused("metrics"), Refusal::Restart);
+        assert!(
+            refusals.stale().is_empty(),
+            "one refusal is a dog to restart, not a dog to give up on"
+        );
+
+        assert_eq!(refusals.refused("metrics"), Refusal::Stale);
+        assert_eq!(refusals.stale(), vec!["metrics".to_string()]);
+
+        // The refusals a stale dog's own autorestart goes on producing must
+        // not each buy another restart, and must not each be reported.
+        for _ in 0..5 {
+            assert_eq!(refusals.refused("metrics"), Refusal::AlreadyStale);
+        }
+        assert_eq!(refusals.stale(), vec!["metrics".to_string()]);
+    }
+
+    /// fails if a dog that got back in stays marked. The count is cleared
+    /// by a successful handshake and by nothing else, which is what makes
+    /// "one restart" mean one restart per episode rather than one per
+    /// daemon: a dog talking to this daemon is not stale by any definition
+    /// it could apply, and a LATER refusal is a new episode with its own
+    /// restart.
+    #[test]
+    fn a_dog_that_gets_in_is_owed_a_fresh_restart_if_it_is_ever_refused_again() {
+        let refusals = DogRefusals::new();
+        assert_eq!(refusals.refused("metrics"), Refusal::Restart);
+        refusals.handshook("metrics");
+        assert!(refusals.stale().is_empty());
+        assert_eq!(
+            refusals.refused("metrics"),
+            Refusal::Restart,
+            "the restart that fixed it must not be charged against the next episode"
+        );
+    }
+
+    /// fails if the record is per-daemon rather than per-dog. A stale
+    /// `bark` must not spend `metrics`'s one restart, and a healthy
+    /// `metrics` handshake must not clear `bark`'s stale mark.
+    #[test]
+    fn each_dog_carries_its_own_count() {
+        let refusals = DogRefusals::new();
+        assert_eq!(refusals.refused("bark"), Refusal::Restart);
+        assert_eq!(refusals.refused("bark"), Refusal::Stale);
+
+        assert_eq!(
+            refusals.refused("metrics"),
+            Refusal::Restart,
+            "bark's two refusals are bark's"
+        );
+        refusals.handshook("metrics");
+        assert_eq!(
+            refusals.stale(),
+            vec!["bark".to_string()],
+            "one dog getting in says nothing about another"
+        );
     }
 }

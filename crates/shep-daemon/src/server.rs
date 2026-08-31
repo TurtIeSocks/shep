@@ -488,9 +488,50 @@ async fn handshake(
             daemon_version: Some(ctx.daemon_version.clone()),
         });
         send(out, &refusal).await?;
+        // The refusal is on the writer's queue before anything else
+        // happens, so a peer that is about to be restarted still learns
+        // why. Then: which dog was that, and what does this daemon owe it?
+        //
+        // `None` is every client that is not a dog, and the CLI is nearly
+        // all of them. A `shep` verb has no way to name a dog here — the
+        // name travels only on `ReconnectingClient`, the type dogs use and
+        // no verb does — so the branch below cannot be reached by an
+        // operator with a stray `$SHEP_DOG_NAME` in their environment.
+        match &hello.dog_name {
+            Some(dog) => {
+                crate::dogs::record_refused_dog(
+                    dog,
+                    &hello.client_version,
+                    &ctx.dog_refusals,
+                    &ctx.supervisor,
+                );
+            }
+            // A refused client this daemon cannot restart and would not
+            // want to: an operator running an older `shep` against a newer
+            // daemon, who is already reading the skew in plain English from
+            // their own CLI. `debug!` rather than `warn!`, which this was
+            // until a real reload across a protocol bump measured it: the
+            // CLI polls the socket while it waits for a successor, so ONE
+            // `shep daemon reload` produced 442 of these in 9.8 seconds,
+            // and the daemon's default level is `warn`. The only fact this
+            // adds over `handle_conn`'s own "connection ended" line is the
+            // client's crate version, which is worth carrying and is not
+            // worth waking anybody for.
+            None => tracing::debug!(
+                client_protocol = hello.protocol,
+                client_version = %hello.client_version,
+                "refused a client on protocol skew"
+            ),
+        }
         return Err(ConnError::ProtocolMismatch {
             client: hello.protocol,
         });
+    }
+    // A dog that got in is not stale, whatever this daemon held against it
+    // before — including the restart it was just given, which is exactly
+    // the case that has to clear.
+    if let Some(dog) = &hello.dog_name {
+        ctx.dog_refusals.handshook(dog);
     }
     let ack: HelloReply = Ok(HelloAck {
         daemon_version: ctx.daemon_version.clone(),
@@ -523,14 +564,17 @@ mod tests {
     // HANDSHAKE_TIMEOUT_MS before the peer's bytes are delivered.
     use super::*;
     use crate::bus::SharedEvent;
+    use crate::fake::{FIRST_SCRIPTED_PID, ProcScript};
     use crate::testing::harness;
     use futures_util::{SinkExt, StreamExt};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use shep_core::protocol::{
-        BusEvent, Envelope, Hello, HelloReply, PROTOCOL_VERSION, ProcessEventKind, ProcessInfo,
-        Request, Response, RpcErrorCode, ServerFrame, codec, decode_frame, encode_frame,
+        BusEvent, DogSource, Envelope, Hello, HelloReply, PROTOCOL_VERSION, ProcessEventKind,
+        ProcessInfo, Request, Response, RpcErrorCode, ServerFrame, codec, decode_frame,
+        encode_frame,
     };
+    use shep_core::status::ProcStatus;
     use tokio_util::codec::Framed;
 
     const RECV_TIMEOUT: Duration = Duration::from_secs(5);
@@ -915,5 +959,217 @@ mod tests {
             dropped > 0,
             "a flood past CONN_QUEUE + BUS_CAPACITY must report a real lag"
         );
+    }
+
+    // --- G8: what a refused DOG's handshake costs it ------------------
+    //
+    // A refused handshake never reaches a request, so `Request::DogConfig`'s
+    // name — the one place a dog otherwise identifies itself — is
+    // unreachable on exactly the path where the daemon has to know which
+    // dog it just refused. `Hello.dog_name` is what closes that, and these
+    // four tests are what the daemon does with it.
+
+    /// Registers `name` as a built-in dog and returns the row it produced.
+    ///
+    /// Straight through [`crate::supervisor::SupervisorHandle::start_dog`]
+    /// rather than through `Request::EnableDog`, because the request path
+    /// would need a handshaken connection of its own and the point here is
+    /// what a REFUSED one does.
+    async fn start_dog(ctx: &RpcContext, name: &str) -> ProcessInfo {
+        let spec = crate::dogs::DogSpec {
+            name: name.to_string(),
+            source: DogSource::BuiltIn,
+        };
+        let app = crate::dogs::dog_app(&spec, &ctx.paths).expect("the dog fixture must assemble");
+        ctx.supervisor
+            .start_dog(app, DogSource::BuiltIn)
+            .await
+            .expect("the dog fixture must start")
+    }
+
+    /// One refused handshake, announcing `dog` (or nothing, for a client
+    /// that is not a dog), returning once the daemon has closed on it.
+    ///
+    /// The close is the forcing mechanism for everything synchronous
+    /// (IR-46): the daemon records the refusal and decides what it owes the
+    /// dog BEFORE it returns the error that closes the socket, so a caller
+    /// that has seen the close can read the verdict without racing it. The
+    /// restart itself runs on its own task and needs [`await_dog`].
+    async fn refuse_as(ctx: &RpcContext, dog: Option<&str>) {
+        let mut client = connected(ctx.clone()).await;
+        client
+            .send(&Hello {
+                client_version: "0.1.14".to_string(),
+                protocol: PROTOCOL_VERSION + 1,
+                dog_name: dog.map(str::to_owned),
+            })
+            .await;
+        let refusal: HelloReply = client.recv().await;
+        refusal.expect_err("a skewed protocol must be refused");
+        assert!(
+            client.closed().await,
+            "the daemon must close after refusing"
+        );
+    }
+
+    /// The flock row named `name`, or a panic naming what was there.
+    async fn dog_row(ctx: &RpcContext, name: &str) -> ProcessInfo {
+        ctx.supervisor
+            .list()
+            .await
+            .into_iter()
+            .find(|info| info.name == name)
+            .unwrap_or_else(|| panic!("no row named {name}"))
+    }
+
+    /// Waits until `name` is running as `pid`, or fails inside
+    /// [`RECV_TIMEOUT`], returning how long it took.
+    ///
+    /// The restart a refusal triggers runs on its own task, so there is no
+    /// handle to await; polling a real condition against a hard ceiling is
+    /// the forcing mechanism (IR-46). The elapsed time is returned because
+    /// the never-restart-twice test below sizes its negative window against
+    /// it rather than against a guess.
+    async fn await_dog(ctx: &RpcContext, name: &str, pid: u32) -> Duration {
+        let began = tokio::time::Instant::now();
+        let seen = tokio::time::timeout(RECV_TIMEOUT, async {
+            loop {
+                if dog_row(ctx, name).await.pid == Some(pid) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            seen.is_ok(),
+            "{name} never reached pid {pid} within {RECV_TIMEOUT:?}: {:?}",
+            ctx.supervisor.list().await
+        );
+        began.elapsed()
+    }
+
+    /// fails if a refused dog is left mute. This is G8's step 2, and the
+    /// daemon is the only party that can take it: the dog's own client has
+    /// stopped rather than spinning (that is `ReconnectingClient`'s half),
+    /// and a dog carried across a handover is a live process holding a dead
+    /// socket that nothing else will replace.
+    ///
+    /// The pid moving is the assertion, not the restart count: a restart
+    /// that re-registered the row without re-spawning would leave a dog
+    /// exactly as mute as it was.
+    #[tokio::test]
+    async fn a_refused_dog_is_restarted_once_from_the_binary_on_disk() {
+        let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        let started = start_dog(&h.ctx, "metrics").await;
+        assert_eq!(started.pid, Some(FIRST_SCRIPTED_PID));
+
+        refuse_as(&h.ctx, Some("metrics")).await;
+
+        await_dog(&h.ctx, "metrics", FIRST_SCRIPTED_PID + 1).await;
+        assert!(
+            h.ctx.dog_refusals.stale().is_empty(),
+            "one refusal buys a restart; it does not condemn the dog"
+        );
+    }
+
+    /// fails if the daemon restarts a dog it has already restarted — the
+    /// spin G8 exists to forbid. A second refusal proves the binary on disk
+    /// cannot satisfy this daemon either, because the restart already ran
+    /// it, so a third attempt is not optimism.
+    ///
+    /// Three independent things have to hold, and each catches a different
+    /// mutation. The dog must be REPORTED stale, which a daemon that
+    /// silently stopped restarting would fail. Its pid must not move inside
+    /// a window sized against the restart that really happened earlier in
+    /// this same test — a negative assertion is only as good as its window,
+    /// and a measured one scales with a loaded runner where a fixed number
+    /// would not. And the harness is scripted with exactly the two spawns
+    /// G8 permits, so a third would fail to spawn and take the dog out of
+    /// `Online` even if it somehow beat the window.
+    #[tokio::test]
+    async fn a_twice_refused_dog_is_reported_stale_and_never_restarted_again() {
+        let h = harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
+        start_dog(&h.ctx, "metrics").await;
+
+        refuse_as(&h.ctx, Some("metrics")).await;
+        let restart_took = await_dog(&h.ctx, "metrics", FIRST_SCRIPTED_PID + 1).await;
+
+        refuse_as(&h.ctx, Some("metrics")).await;
+        assert_eq!(
+            h.ctx.dog_refusals.stale(),
+            vec!["metrics".to_string()],
+            "the second refusal must be reported, not swallowed"
+        );
+
+        // Ten times the restart that DID happen, floored so a machine fast
+        // enough to make the measurement meaningless still watches for a
+        // real interval.
+        let window = (restart_took * 10).max(Duration::from_millis(200));
+        tokio::time::sleep(window).await;
+
+        let after = dog_row(&h.ctx, "metrics").await;
+        assert_eq!(
+            after.pid,
+            Some(FIRST_SCRIPTED_PID + 1),
+            "a second restart within {window:?} is the spin G8 forbids"
+        );
+        assert_eq!(
+            after.status,
+            ProcStatus::Online,
+            "a third spawn would exhaust the script and error the dog"
+        );
+    }
+
+    /// fails if a dog that got back in stays condemned. The restart G8 owes
+    /// a refused dog is worth nothing if the successful handshake it
+    /// produces does not clear the mark: the dog would be reported stale
+    /// forever while answering perfectly, and a LATER daemon that refused
+    /// it would skip straight past its one restart.
+    #[tokio::test]
+    async fn a_dog_that_handshakes_is_no_longer_stale() {
+        let h = harness(vec![]);
+        refuse_as(&h.ctx, Some("metrics")).await;
+        refuse_as(&h.ctx, Some("metrics")).await;
+        assert_eq!(h.ctx.dog_refusals.stale(), vec!["metrics".to_string()]);
+
+        let mut client = connected(h.ctx.clone()).await;
+        client
+            .send(&Hello {
+                client_version: "0.1.22".to_string(),
+                protocol: PROTOCOL_VERSION,
+                dog_name: Some("metrics".to_string()),
+            })
+            .await;
+        let ack: HelloReply = client.recv().await;
+        ack.expect("a matching protocol must be acked");
+
+        assert!(
+            h.ctx.dog_refusals.stale().is_empty(),
+            "a dog talking to this daemon is not stale by any definition it can apply"
+        );
+    }
+
+    /// fails if an operator running an older `shep` has a dog restarted
+    /// under them. The CLI cannot name a dog — the name travels only on
+    /// `ReconnectingClient`, which no verb uses — so a refusal carrying no
+    /// name must leave the flock exactly as it was, however many of them
+    /// arrive.
+    #[tokio::test]
+    async fn a_refused_client_that_is_not_a_dog_touches_nothing() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let started = start_dog(&h.ctx, "metrics").await;
+
+        for _ in 0..3 {
+            refuse_as(&h.ctx, None).await;
+        }
+
+        assert!(h.ctx.dog_refusals.stale().is_empty());
+        let after = dog_row(&h.ctx, "metrics").await;
+        assert_eq!(
+            after.pid, started.pid,
+            "a nameless refusal must not restart anything"
+        );
+        assert_eq!(after.status, ProcStatus::Online);
     }
 }

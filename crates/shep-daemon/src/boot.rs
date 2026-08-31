@@ -1319,6 +1319,10 @@ pub async fn boot<R: ProcessRunner>(
         daemon_config: paths.daemon_config.clone(),
         paths: paths.clone(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        // Empty, and deliberately not carried across a handover: a
+        // successor has refused nobody yet, and a dog it can talk to is not
+        // stale by any definition it could apply.
+        dog_refusals: crate::dogs::DogRefusals::new(),
         pid,
         shutdown,
         stats,

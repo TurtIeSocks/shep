@@ -75,6 +75,13 @@ pub struct RpcContext {
     pub(crate) paths: ShepPaths,
     /// This daemon's crate version, echoed in the handshake.
     pub(crate) daemon_version: String,
+    /// Which dogs this daemon has refused at the handshake, and how often.
+    ///
+    /// Written by the connection layer's handshake — the one place that
+    /// knows a refusal happened — and read by it to decide whether a
+    /// refused dog earns its one restart from disk or has already had it
+    /// (the handover design's G8; [`crate::dogs::DogRefusals`]).
+    pub(crate) dog_refusals: crate::dogs::DogRefusals,
     /// This daemon's OS pid, echoed in the handshake.
     pub(crate) pid: u32,
     /// Flips to `true` to start graceful daemon shutdown; see [`Self::shutdown`].
