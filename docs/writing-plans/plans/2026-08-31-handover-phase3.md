@@ -78,7 +78,9 @@ So G8's step 2 is not implementable as written. Three ways out:
 
 **DECIDED 2026-08-31 by the maintainer: option 1, carry the dog's name in
 `Hello`.** The reasoning below is what the decision was taken on and is kept
-for whoever implements task 2.
+for whoever implements task 2. **Built in task 2 as `Hello.dog_name`, with
+`PROTOCOL_VERSION` unmoved and that reading pinned by a test** — see that
+task's outcome section.
 
 **Recommendation: option 1.** It is the only one that makes the refusal itself informative rather than inferred, it costs one optional field, and it is the same additive-`Option` shape the handover blob has used five times without moving a version. Option 2 puts a platform gate above the transport, which CLAUDE.md calls a design decision rather than a shrug. Option 3 answers a different question than the one asked.
 
@@ -214,12 +216,100 @@ Two of those needed the tests strengthening before they died, and both are worth
 
 Per the section above, and per G8: record the refusal, restart that dog ONCE from disk, and if the restart is refused too, stop and report it stale. A second refusal proves the disk binary cannot satisfy this daemon, so retrying is a spin rather than optimism.
 
-- [ ] **Step 1: Write the failing tests**, including that a twice-refused dog is NOT restarted a third time.
-- [ ] **Step 2: Run them, watch them fail.**
-- [ ] **Step 3: Implement.** `server.rs` currently drops everything but `hello.protocol` and logs the refusal at no level; that is half the defect.
-- [ ] **Step 4: Prove each non-vacuous**, especially the never-loop case.
-- [ ] **Step 5: Real reload** with a deliberately stale dog, proving one restart and no loop.
-- [ ] **Step 6: Commit.**
+- [x] **Step 1: Write the failing tests**, including that a twice-refused dog is NOT restarted a third time.
+- [x] **Step 2: Run them, watch them fail.**
+- [x] **Step 3: Implement.** `server.rs` currently drops everything but `hello.protocol` and logs the refusal at no level; that is half the defect.
+- [x] **Step 4: Prove each non-vacuous**, especially the never-loop case.
+- [x] **Step 5: Real reload** with a deliberately stale dog, proving one restart and no loop.
+- [x] **Step 6: Commit.**
+
+#### Outcome
+
+**`Hello.dog_name`, an `Option<String>`, and `PROTOCOL_VERSION` did not move.** The decision above was taken on the reading that `Hello` carries no `#[serde(deny_unknown_fields)]`; that reading is now pinned by `a_hello_without_a_dog_name_still_parses`, which asserts both directions — a committed byte fixture from before the field, and a frame carrying a key an older daemon would not know. Nobody can add `deny_unknown_fields` later without seeing what it breaks. `#[serde(skip_serializing_if)]` follows `RpcError::daemon_version`, which was added under the same argument, so a non-dog client's `Hello` is byte-identical to the one protocol 2 shipped with and `hello_handshake_shape` needed no change.
+
+**The CLI cannot name a dog, by construction, and that is the same shape task 1 chose for the same reason.** A `Hello` naming a dog is what lets the daemon restart that dog, so a client able to claim a name it was not spawned as could have a dog restarted on its say-so. `Client`'s public constructors pass `None`; its dog-naming constructor is `pub(crate)` and its only caller is `ReconnectingClient::connect_as_dog`, the type dogs name and no `shep` verb does. Nothing in `shep-client` reads `$SHEP_DOG_NAME` — `DogRuntime::start` takes the name from its own caller's argv — so `SHEP_DOG_NAME=x shep stop web` cannot reach the branch.
+
+**The name rides every handshake, not just the first.** The refusal that matters is a successor's, and a dog that named itself at boot and then reconnected anonymously would leave that successor exactly as unable to act as it was before.
+
+**One restart falls out of the state, not a budget.** `DogRefusals` is a count per dog, cleared by a SUCCESSFUL handshake and by nothing else. A dog that cannot get in never clears, so it can never earn a second restart however many times it is refused; a dog that does get in is back to a clean slate, so a later daemon that refuses it gets its own one restart. One restart per episode, and an episode ends when the dog is talking again. The count does not survive a handover, deliberately: a successor has refused nobody, and a dog it can talk to is not stale by any definition it could apply.
+
+**In `dogs.rs`, not the supervisor**, for the reason `spawn_dog_watch` already gives: this answers *who should see this*, from outside, and the supervisor stays a machine that knows only how to supervise. The connection layer supplies the one fact only it has — a handshake was refused, by this name — and asks `dogs.rs` what that costs. The restart itself runs on its own task, because a restart is a full kill ladder and the caller is a connection handler holding a socket this daemon has already refused.
+
+**What it does NOT do is stop a stale dog's own `autorestart`, and that is worth stating because the drill makes it visible.** A dog whose process EXITS on a refused handshake — a FIRST connection refused, rather than one lost to a handover — is respawned by the supervisor as any sheep is, and goes on being refused until its restart budget (16) runs out. That loop is bounded and it is the supervisor's existing mechanism. G8 is about not adding daemon restarts on top of it. The third refusal onward is `AlreadyStale`: no restart, and no second error line.
+
+**A refusal carrying no dog name is `debug!`, and a real reload decided that.** It was `warn!` until it was measured. The daemon's default level IS `warn`, and `shep daemon reload` across a protocol bump leaves the CLI polling for a successor it cannot speak to: one reload wrote **442 of those lines in 9.8 seconds**. The operator is already reading the skew in plain English from their own CLI and `handle_conn` has always logged the closed connection at `debug!`, so the only fact the line adds is the client's crate version. A dog's refusal is the opposite case in every respect and keeps its level.
+
+##### Drill, measured
+
+Route 2 of the two the brief offered, plus a genuinely stale dog. Under an isolated `$SHEP_HOME` at `/tmp/p3b/home`, release builds, and three binaries: `shep-old` (this tree, protocol 2), `shep-new` (this tree with `PROTOCOL_VERSION` bumped to 3), and a predecessor built with `if false && entry.dog.is_some()` so the reload really hands a dog over. Both source edits reverted and proven reverted — `git diff` empty — before the gate. The dog is a shim that `exec`s `shep-old dog metrics`, adopted under the name `metrics`, so the running image and the disk binary are both protocol 2 while the daemon speaks 3.
+
+**A. A dog that stays alive when refused, which is what a carried dog is.** The shim holds the process open after the refusal rather than exiting, so every restart in this run is one the daemon chose.
+
+| | value |
+|---|---|
+| refusals the daemon logged | 3 lines, total, ever |
+| G8 restarts issued | **1** (pid 22658 → 22703, restarts 0 → 1) |
+| second refusal | 11 ms later, `ERROR ... stale and will not be restarted again` |
+| pid at T+74s | **22703, unmoved** |
+| restarts at T+74s | **1, frozen** |
+| further daemon log lines | **0** |
+
+**B. The ordinary case G8 exists for: stale running image, correct binary on disk.** The shim runs `shep-old` once and `shep-new` on every exec after it, which is exactly what a package manager leaves behind.
+
+| | value |
+|---|---|
+| G8 restarts issued | 1 |
+| error lines | **0** — no second refusal happened |
+| `curl 127.0.0.1:9615/metrics` | **HTTP 200** |
+| decisive check | a sheep started AFTER the restart appears in the exposition |
+
+That last row is the one that matters, for the reason task 1 gave: a pid check cannot tell a live connection from a dead one, and only content can.
+
+**C. Through a real `shep daemon reload`.** Predecessor at protocol 2 with the dog carry un-refused, the binary on disk replaced by an atomic rename as a package manager would, then `daemon reload`.
+
+| | value |
+|---|---|
+| daemon pid across the reload | 25677, unchanged — the exec happened |
+| successor's boot | `a sheep is already registered under this name` — the carry happened |
+| G8 restarts issued | **1** |
+| further refusals, from the dog's own autorestart | 15 |
+| further G8 action | **none** |
+| whole daemon log, default level | **3 lines** (445 before the `debug!` fix) |
+| operator's end state | `metrics errored`, restarts 16 (the budget), exit 6; `web` untouched |
+
+G8's restarts and `autorestart`'s are separable only in the log, which is why the log is the assertion: one `restarting it once` line against 15 later refusals.
+
+**Found in passing, and it is task 4's, not a defect here.** A carried dog loses its `dog` marker, which the plan already records for task 4 — but the consequence runs further than `shep dogs` and `shep flock`. `spawn_dog_watch` records an exhausted restart budget only when `info.dog.is_some()`, so the carried dog that erupted through its whole budget above wrote **nothing** to `barks.jsonl`. The bark an operator would read after the outage depends on the marker the carry drops.
+
+**Also found in passing.** `dog_version` in every G8 line reads `0.1.22` for both the protocol-2 and the protocol-3 build, because they differ only in `PROTOCOL_VERSION`. That is G9's point made concrete: `Hello.client_version` is the only thing that knows, and it does not know either.
+
+##### Mutations
+
+Ten, each applied, run against the full four-crate lib suite with `--no-fail-fast`, and reverted:
+
+| mutation | fails |
+|---|---|
+| `Hello` gains `deny_unknown_fields` | the no-dog-name fixture, alone |
+| `skip_serializing_if` dropped from `dog_name` | `hello_handshake_shape`, alone |
+| the reconnect supervisor dials without the name | `a_dogs_name_rides_every_handshake_including_the_refused_one` |
+| `Client::connect_as` drops the name before the frame | that test, plus the dog-runtime one |
+| `DogRuntime::start` calls `connect` instead of `connect_as_dog` | `a_dog_announces_its_own_name_at_the_handshake`, alone |
+| a stale dog is restarted too | `a_twice_refused_dog_is_reported_stale_and_never_restarted_again`, alone |
+| the second refusal never reads `Stale` | that test, plus the two ladder tests |
+| `handshook` becomes a no-op | the two clearing tests, and only those |
+| the refusal path ignores `hello.dog_name` | all three wiring tests |
+| `AlreadyStale` collapses into `Stale` | the ladder test, alone |
+
+Two are worth recording:
+
+- **`DogRuntime::start` calling `connect` was the one only an end-to-end run would have caught**, before a test was written at that seam. It is one line, it makes every real dog announce itself, and the whole of the rest of the suite is blind to it. `a_dog_announces_its_own_name_at_the_handshake` is what closes that, and it needed `fake_daemon`'s returned `Hello` rather than `serve_one_request`'s envelope.
+- **The never-loop test was checked against its own window.** Task 1 found its refusal test initially passed a spin, so this one asserts three independent things: the dog is REPORTED stale, its pid does not move inside a window sized at ten times the restart that really happened earlier in the same test, and the harness is scripted with exactly the two spawns G8 permits so a third would fail to spawn and take the dog out of `Online`. The window was then verified alone — with spare scripts added so the exhaustion tripwire could not fire, the spin mutation still failed it, at pid 1002 inside 200 ms. The two mechanisms agree rather than one propping up the other.
+
+##### Gate
+
+`cargo fmt --all --check` EXIT=0. `cargo clippy --workspace --all-targets --all-features -- -D warnings` EXIT=0. `cargo test --workspace --all-features` EXIT=0, **2180 passed**, 0 failed — task 1's 2167 plus the thirteen this task adds. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features` EXIT=0. Windows cross-check with its own `CARGO_TARGET_DIR` EXIT=0.
+
+**`web/` needed something this time, and the generator is not what found it.** `cargo build --release` then `./web/scripts/generate-cli-reference.sh` leaves the generated reference byte-identical — 2510 lines, 40 verbs — because no verb, flag or exit code moved. The hand-written pages are the ones that went stale: both `docs/dogs.md` and `web/src/pages/docs/dogs.astro` state the third-party dog wire contract, and both told an author to read `$SHEP_DOG_NAME`, put it in `Request::DogConfig`, and stopped there. A dog following either page exactly sends an anonymous `Hello` and cannot be restarted. Both now name `dog_name`, and both name `ReconnectingClient::connect_as_dog` — which was already missing from task 1, since the reconnect lives on that type and not on `Client`. `astro build` EXIT=0, `astro check` EXIT=0, 0 errors and 0 warnings.
 
 ### Task 3: a reconnected dog's version is fresh (G13)
 
