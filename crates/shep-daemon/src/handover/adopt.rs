@@ -1174,20 +1174,26 @@ mod tests {
     /// cannot be used to compare, because duplicating renumbers: a blob
     /// naming the same descriptor twice stops naming it twice here.
     fn adopt_a_copy(blob: &Handover) -> io::Result<()> {
-        fn dup_or_keep(fd: RawFd) -> RawFd {
-            fds::duplicate_raw(fd).unwrap_or(fd)
+        // Propagated, never `unwrap_or(fd)`. Falling back to the original
+        // hands `adopt` the fixture's own live descriptor, which it then
+        // closes -- the exact thing the doc above says the duplicates exist
+        // to prevent, reintroduced on the one path nobody watches. A case
+        // that hit it would fail somewhere else entirely, measuring a
+        // descriptor this helper had shut.
+        fn dup_or_fail(fd: RawFd) -> io::Result<RawFd> {
+            fds::duplicate_raw(fd)
         }
         let mut copy = blob.clone();
-        copy.listener_fd = dup_or_keep(copy.listener_fd);
-        copy.pidfile_fd = dup_or_keep(copy.pidfile_fd);
+        copy.listener_fd = dup_or_fail(copy.listener_fd)?;
+        copy.pidfile_fd = dup_or_fail(copy.pidfile_fd)?;
         for sheep in &mut copy.sheep {
             sheep.fds = CarriedFds {
-                out_pipe: sheep.fds.out_pipe.map(dup_or_keep),
-                err_pipe: sheep.fds.err_pipe.map(dup_or_keep),
-                out_log: sheep.fds.out_log.map(dup_or_keep),
-                err_log: sheep.fds.err_log.map(dup_or_keep),
-                stdin: sheep.fds.stdin.map(dup_or_keep),
-                channel: sheep.fds.channel.map(dup_or_keep),
+                out_pipe: sheep.fds.out_pipe.map(dup_or_fail).transpose()?,
+                err_pipe: sheep.fds.err_pipe.map(dup_or_fail).transpose()?,
+                out_log: sheep.fds.out_log.map(dup_or_fail).transpose()?,
+                err_log: sheep.fds.err_log.map(dup_or_fail).transpose()?,
+                stdin: sheep.fds.stdin.map(dup_or_fail).transpose()?,
+                channel: sheep.fds.channel.map(dup_or_fail).transpose()?,
             };
         }
         adopt(&copy).map(drop)

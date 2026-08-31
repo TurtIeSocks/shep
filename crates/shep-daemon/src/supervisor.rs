@@ -1963,8 +1963,15 @@ impl ReloadMode {
 
 /// The drainee/replacement pair a reload is working on right now.
 ///
-/// Serialized because a handover carries the job it belongs to, `snake_case`
-/// on the wire for the reason [`ManualKind`] gives.
+/// Serialized because a handover carries the job it belongs to.
+///
+/// Its `rename_all` is INERT, unlike the one on [`ReloadMode`] and
+/// [`ReloadPhase`] beside it, and that is worth a line rather than leaving a
+/// reader to work out which. Those two are enums, where the attribute
+/// renames VARIANTS and fixes their wire spelling. This is a struct, so it
+/// renames fields, and every field here is snake_case already. It stays for
+/// symmetry: the handover's types disagreeing about whether they declare
+/// their wire case costs more to read than an attribute that does nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct ReloadSwap {
