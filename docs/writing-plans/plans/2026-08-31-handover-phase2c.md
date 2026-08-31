@@ -299,6 +299,20 @@ child that inherits the test binary's stdout holds that pipe open, so under
 `cargo test | <anything>` a mutation run turned a failing assertion into a
 hang; the same helper now uses `Stdio::null()` and bounds its loop.
 
+**Tasks 3 and 4 are ONE unit too, corrected 2026-08-31 — the same mistake
+as 1 and 2, made twice.** `ReloadInFlight` refuses every sheep mid-swap, so
+nothing with a reload watchdog is ever carried, so a re-armed watchdog has
+nothing to fire against. Task 3 alone would be unobservable exactly the way
+task 1 alone was, and would need the same temporary bypass to show anything.
+
+They ship together. The ordering inside the task still stands and still
+matters: the watchdog re-arm is built first, because a carried swap with no
+watchdog is worse than a refused one.
+
+The error both times was splitting on structure rather than on observable
+behaviour. Two struct members, two refusal variants: neither is a seam a
+drill can stand on.
+
 ### Task 3: the reload deadline watchdog
 
 **Files:** `supervisor.rs` (`install_adopted`, `arm_reload_deadline`).
