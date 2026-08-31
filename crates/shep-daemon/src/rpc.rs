@@ -31,7 +31,6 @@ use shep_core::protocol::{
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
-use shep_core::status::ProcStatus;
 
 use crate::bus::{Bus, TopicFilter};
 use crate::dogs::DogSpec;
@@ -586,22 +585,21 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
 /// restart this daemon ASKED for is in `restarting` above whatever the
 /// supervisor's row says about it, and a carried dog that has not dialled
 /// back yet is `Online` — its process never died, only its socket did.
+///
+/// **A pure read, and it must stay one.** The set below is also what
+/// [`crate::dogs::spawn_silent_dog_watch`] eventually acts on, and it would
+/// be tempting to drive that ladder from here instead of from a clock. It
+/// would also be wrong: `shep daemon reload` POLLS this question every 50ms
+/// while it waits, so three asks would walk a merely slow dog from restart
+/// to stale inside a second. Giving up on a dog is a claim about elapsed
+/// time, never about how often somebody asked.
 async fn dog_staleness(ctx: &RpcContext) -> (Vec<String>, Vec<String>) {
     let stale = ctx.dog_refusals.stale();
     let mut pending = ctx.dog_refusals.restarting();
     // A stopped engine has no dogs left to wait on, so its rows are not
     // worth an error: the refusal record above is still the honest answer.
     if let Ok(infos) = ctx.supervisor.list_checked().await {
-        for info in infos {
-            let running = matches!(info.status, ProcStatus::Starting | ProcStatus::Online);
-            if info.dog.is_some()
-                && running
-                && !ctx.dog_refusals.has_handshook(&info.name)
-                && !stale.contains(&info.name)
-            {
-                pending.push(info.name);
-            }
-        }
+        pending.extend(crate::dogs::silent_dogs(&infos, &ctx.dog_refusals));
     }
     pending.sort();
     pending.dedup();
