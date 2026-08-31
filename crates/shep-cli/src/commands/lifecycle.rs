@@ -3394,7 +3394,22 @@ mod tests {
             )
             .unwrap();
 
-            let err = evaluate_js_flockfile(&path, Duration::from_secs(5)).unwrap_err();
+            // Twenty seconds, and both ends of that are load-bearing.
+            //
+            // The floor: five seconds was the budget until 2026-08-31 and it
+            // failed on CI four times, twice noted in the comment above and
+            // twice more on `slow (windows-latest)`. The slowest observed
+            // run took 11.41s. This is not a claim about shep, it is a claim
+            // about how long a shared runner takes to start a node process
+            // and notice a held pipe, so it wants headroom rather than
+            // precision.
+            //
+            // The ceiling: the pipe-holder above lives 30 seconds. A budget
+            // at or past that would let the child exit on its own, and the
+            // case would pass for the wrong reason.
+            const HELD_PIPE_BUDGET: Duration = Duration::from_secs(20);
+
+            let err = evaluate_js_flockfile(&path, HELD_PIPE_BUDGET).unwrap_err();
 
             assert_eq!(target_exit_code(&err), ExitCode::InvalidConfig);
             let message = err.to_string();
