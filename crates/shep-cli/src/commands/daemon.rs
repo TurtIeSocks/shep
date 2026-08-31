@@ -1065,35 +1065,66 @@ async fn report_dog_staleness(
 /// through it: the singular and the plural differ in four places, and a
 /// reader checking the wording should not have to run the ternaries in
 /// their head to see what either one says.
+///
+/// **Names the restart, not just the reinstall.** The production incident
+/// this whole phase traces to turned on exactly this gap: `cargo install`
+/// alone left the old code running, because a rename leaves the running
+/// inode mapped (G10) and the process that inode belongs to is never
+/// touched by installing a new one over it. The spec's own fix is two
+/// commands (`docs/brainstorming/specs/2026-08-29-daemon-handover-design.md`
+/// line 504); a sentence naming only the first leaves an operator one step
+/// short of it, exactly as this one did before this phase.
 fn stale_dog_report(stale: &[String], daemon_version: &str) -> String {
     match stale {
         [only] => format!(
             "the `{only}` dog cannot talk to this shepherd; restarting it from the binary on \
-             disk did not help, so rebuild or reinstall it against shep {daemon_version}"
+             disk did not help, so rebuild or reinstall it against shep {daemon_version}, then \
+             restart it"
         ),
         many => format!(
             "these dogs cannot talk to this shepherd: {}; restarting them from the binaries on \
-             disk did not help, so rebuild or reinstall them against shep {daemon_version}",
+             disk did not help, so rebuild or reinstall them against shep {daemon_version}, then \
+             restart them",
             quoted_names(many)
         ),
     }
 }
 
-/// The sentence for dogs that never finished settling inside the budget.
+/// The sentence for dogs that had not answered within the reload's settle
+/// wait.
 ///
 /// Said out loud rather than folded into silence, because silence here
 /// would mean the same thing as a clean reload and this is not one: the
 /// reading was taken before these dogs had answered, so it speaks for the
 /// rest of the flock and not for them.
+///
+/// **This population is not who it was expected to be.** G8's ladder
+/// (`shep_daemon::dogs::DogRefusals`) restarts a silent dog at
+/// [`shep_daemon::dogs::DOG_SILENCE_BUDGET`] and marks it stale five seconds
+/// after that, both later than this reload's own wait — so a dog stuck on a
+/// protocol it cannot speak lands HERE, not in [`stale_dog_report`], every
+/// time. Written for that population rather than for the fast, transient
+/// remnant a shorter ladder would have left behind.
+///
+/// **Names what the shepherd actually knows, not a verdict it does not
+/// have.** It cannot yet say whether this dog will come back — that
+/// question belongs to [`stale_dog_report`], later, if the restart does not
+/// help — but it does know a restart is coming and when, and it knows where
+/// the dog's own account of the silence lives. `shep bleats <dog>` is where
+/// the answer actually was in production, so this sentence points there
+/// instead of shrugging.
 fn unsettled_dog_report(pending: &[String], wait: std::time::Duration) -> String {
+    let budget = shep_daemon::dogs::DOG_SILENCE_BUDGET;
     match pending {
         [only] => format!(
-            "the `{only}` dog had not answered this shepherd after {wait:?}, so this reload \
-             cannot say whether it came back"
+            "the `{only}` dog has not answered this shepherd after {wait:?}; if it is still \
+             silent at {budget:?} it will be restarted from the binary on disk, and `shep \
+             bleats {only}` shows why"
         ),
         many => format!(
-            "these dogs had not answered this shepherd after {wait:?}, so this reload cannot say \
-             whether they came back: {}",
+            "these dogs have not answered this shepherd after {wait:?}: {}; if they are still \
+             silent at {budget:?} they will be restarted from the binaries on disk, and `shep \
+             bleats <dog>` shows why for each",
             quoted_names(many)
         ),
     }
@@ -1924,7 +1955,7 @@ otel = "/usr/local/bin/shep-otel"
 
         let text = String::from_utf8(err).unwrap();
         assert!(
-            text.contains("metrics") && text.contains("cannot say whether it came back"),
+            text.contains("metrics") && text.contains("shep bleats metrics"),
             "an unanswered dog is reported as unanswered, not as healthy: {text}"
         );
     }
@@ -1941,14 +1972,42 @@ otel = "/usr/local/bin/shep-otel"
         assert_eq!(
             one,
             "the `metrics` dog cannot talk to this shepherd; restarting it from the binary on \
-             disk did not help, so rebuild or reinstall it against shep 0.1.22"
+             disk did not help, so rebuild or reinstall it against shep 0.1.22, then restart it"
         );
 
         let two = stale_dog_report(&["bark".to_string(), "metrics".to_string()], "0.1.22");
         assert_eq!(
             two,
             "these dogs cannot talk to this shepherd: `bark`, `metrics`; restarting them from \
-             the binaries on disk did not help, so rebuild or reinstall them against shep 0.1.22"
+             the binaries on disk did not help, so rebuild or reinstall them against shep \
+             0.1.22, then restart them"
+        );
+    }
+
+    /// Pinned as an exact string in both shapes for the same reason as the
+    /// stale report above: a message naming the fix is the feature. Fails
+    /// if the sentence claims a verdict the shepherd does not have yet, or
+    /// if it stops pointing at `shep bleats` — that command is where the
+    /// answer actually was in the production incident this phase traces to.
+    #[test]
+    fn the_unsettled_report_says_what_to_check_and_never_claims_a_verdict() {
+        let one = unsettled_dog_report(&["metrics".to_string()], std::time::Duration::from_secs(3));
+        assert_eq!(
+            one,
+            "the `metrics` dog has not answered this shepherd after 3s; if it is still silent \
+             at 5s it will be restarted from the binary on disk, and `shep bleats metrics` \
+             shows why"
+        );
+
+        let two = unsettled_dog_report(
+            &["bark".to_string(), "metrics".to_string()],
+            std::time::Duration::from_secs(3),
+        );
+        assert_eq!(
+            two,
+            "these dogs have not answered this shepherd after 3s: `bark`, `metrics`; if they \
+             are still silent at 5s they will be restarted from the binaries on disk, and \
+             `shep bleats <dog>` shows why for each"
         );
     }
 
