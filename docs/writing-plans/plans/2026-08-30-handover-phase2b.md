@@ -341,7 +341,18 @@ Fixed by visiting the pumps CONCURRENTLY (`futures_util::future::join_all`, the 
 
 Measured: six wedged pumps, serial 12s, concurrent 2s (both virtual time, under a paused tokio clock). A normal single-sheep reload (three reloads of a chatty `awk` counter, no wedged pumps) was re-run by hand to confirm the drill is unaffected: every reload exit 0, shepherd pid and sheep pid both unmoved, 25,579,208 lines with zero gaps and zero duplicates after `shep stop`.
 
-#### Task 7: dogs (NOT DONE, and the sketch's premise is wrong)
+#### Task 7: dogs (DESCOPED TO PHASE 3 by the maintainer, 2026-08-30)
+
+Moved out of 2b rather than left open. The carry itself works and is not
+the problem; finishing it needs a `shep-client` reconnect, and a
+reconnecting client has to rule on G8's refusal and G13's
+`Client::daemon()` staleness, both of which Phase 3 owns. 2b ships with
+`RefusedReason::Dog` still in place, and the four tests using it as their
+refusal fixture stay where they are.
+
+The spec's G7 has been corrected in the same commit: it claimed dogs
+reconnect "which it already does today", which is false and was the reason
+this task looked cheap. Everything measured below is why.
 
 - [ ] **Step 1: Write the failing tests**
 - [ ] **Step 2: Run to verify they fail**

@@ -513,12 +513,35 @@ Dog processes are children of the daemon, so they survive the exec exactly
 as sheep do. What does not survive is their accepted connection, because
 carrying an accepted connection would mean carrying mid-stream codec state
 and pending requests across the image swap. So every dog sees its
-connection drop and reconnects, which it already does today.
+connection drop.
 
-The reconnect re-handshakes against the new daemon. A compatible dog is
-back in seconds with **no process restart at all**. An incompatible one is
-refused at exactly the moment the daemon can see it, which is the trigger
-G8 needs.
+**It does not reconnect. This section said "which it already does today"
+until 2b measured it on 2026-08-30, and that clause was the whole reason
+this looked cheap.** There is no reconnect in `DogRuntime::start`, in
+`metrics::run`, or in `bark::run_loop`. What a carried dog actually
+becomes is a live process holding a dead socket: over six real reloads the
+metrics dog kept its pid, reported zero restarts, stayed `online`, wrote
+nothing to stderr, and answered HTTP 503 to every scrape from the first
+reload onward. Nothing anywhere says so, which makes it worse than G6's
+mismatched dog -- that one at least writes a line per interval.
+
+The two built-in dogs do not even fail alike. Bark survives by accident,
+exiting 0 on EOF so autorestart catches it, which is neither what this
+section describes nor what G7 wants.
+
+So the reconnect is work Phase 3 has to build, not behaviour it can
+assume. The layer is `shep-client` rather than each dog: every dog links
+it, G9 already has a plain `cargo install <dog>` picking it up, and the
+dog contract does not change. A dog-side fix would reach only dogs that
+adopt it, and a daemon-side one cannot work at all -- `Hello` carries no
+dog identity, so a successor cannot map a connection back to its dog.
+
+Once it exists, the reconnect re-handshakes against the new daemon. A
+compatible dog is back in seconds with **no process restart at all**. An
+incompatible one is refused at exactly the moment the daemon can see it,
+which is the trigger G8 needs -- and a reconnecting client is precisely
+where G8's refusal and G13's `Client::daemon()` staleness have to be
+answered, which is why 2b could not finish this and stopped.
 
 Contrast the stop arm, which respawns every dog from disk whether it needed
 it or not.
