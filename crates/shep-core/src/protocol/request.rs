@@ -451,6 +451,27 @@ pub enum Request {
         /// The dog's name
         name: String,
     },
+    /// Ask which dogs this daemon has given up on, and which it is still
+    /// waiting to hear from (`shep daemon reload`, the handover design's
+    /// G13).
+    ///
+    /// Read-only, and about THIS daemon's own handshakes. A dog's recorded
+    /// crate version describes the process that was running when it
+    /// connected, so it says nothing about a dog that has since been
+    /// replaced; the only thing that knows whether a dog can talk to this
+    /// daemon is whether this daemon accepted its handshake. That is what
+    /// this answers, which is why the reading is worth taking AFTER a
+    /// reload rather than before one.
+    ///
+    /// Answers [`Response::DogStaleness`].
+    ///
+    /// # Why this variant does not move `PROTOCOL_VERSION`
+    ///
+    /// The same argument [`Self::HandoverFitness`] makes above, and the
+    /// same gate enforces it: its only caller is `shep daemon reload`, which
+    /// asks it of the successor it has just proven is running this binary's
+    /// own version. An older daemon is never sent it.
+    DogStaleness,
     /// Ask whether this daemon could hand its flock to a successor in place,
     /// rather than stopping it and starting it again (`shep daemon reload`).
     ///
@@ -1342,6 +1363,30 @@ pub enum Response {
     },
     /// Answer to `EnableDog` — the dog as it stands now
     DogStarted(ProcessInfo),
+    /// Answer to `DogStaleness` — this daemon's own handshake record, split
+    /// into the dogs it has given up on and the dogs it is still waiting on.
+    ///
+    /// Two lists rather than one because they are answers to two different
+    /// questions, and only one of them is reportable. `stale` is a
+    /// finding: those dogs were refused, restarted from the binary on disk,
+    /// and refused again. `pending` is a reason to ask again: those
+    /// dogs have not finished settling, so a reading taken now would be a
+    /// guess about them rather than a fact.
+    ///
+    /// Names only. What a stale dog's crate version is does not answer the
+    /// question a caller is asking — two builds differing only in the
+    /// protocol they speak report the same version — so carrying one here
+    /// would invite exactly the inference it cannot support.
+    DogStaleness {
+        /// Dogs this daemon has refused twice: once on the handshake that
+        /// bought them a restart from disk, and again after it. It will not
+        /// restart them a third time (the handover design's G8).
+        stale: Vec<String>,
+        /// Dogs this daemon is still waiting to hear a final answer from —
+        /// one whose restart is in flight, or one it supervises that has
+        /// not handshook yet. Neither stale nor known healthy.
+        pending: Vec<String>,
+    },
     /// Answer to `HandoverFitness`: `None` when the whole flock can be
     /// carried across a daemon handover, and otherwise the sentence saying
     /// which sheep cannot be and why.
@@ -2106,6 +2151,16 @@ mod tests {
                 deadline_ms: None,
                 body: Request::HandoverFitness,
             },
+            // The second request gated on the daemon's crate version, and
+            // pinned beside the first for that reason: the two are asked by
+            // the same verb, of the two daemons either side of the same
+            // handover, and a rename of either is a variant nothing on
+            // either side recognises.
+            Envelope {
+                id: 25,
+                deadline_ms: None,
+                body: Request::DogStaleness,
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v2", requests);
     }
@@ -2393,6 +2448,18 @@ mod tests {
                 id: 29,
                 result: Ok(Response::HandoverFitness {
                     refusal: Some("sheep 'web' has a shepherd channel".to_string()),
+                }),
+            },
+            // Both lists non-empty and DIFFERENT, because the two carry the
+            // same wire shape and a reply that filled one from the other
+            // would be invisible in a fixture that used the same names
+            // twice. Empty is the shape an ordinary reload sees, and it is
+            // already proven by every `Vec`-carrying row above.
+            Reply {
+                id: 30,
+                result: Ok(Response::DogStaleness {
+                    stale: vec!["metrics".to_string()],
+                    pending: vec!["bark".to_string()],
                 }),
             },
         ];

@@ -521,5 +521,21 @@ expression: replies
         }
       }
     }
+  },
+  {
+    "id": 30,
+    "result": {
+      "Ok": {
+        "kind": "dog_staleness",
+        "data": {
+          "stale": [
+            "metrics"
+          ],
+          "pending": [
+            "bark"
+          ]
+        }
+      }
+    }
   }
 ]
