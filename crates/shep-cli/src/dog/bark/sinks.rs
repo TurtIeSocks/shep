@@ -717,4 +717,125 @@ mod tests {
         };
         require_secure_scheme("ops", &sink).unwrap();
     }
+
+    // `Sink` is an internally tagged enum (`tag = "kind"`) with
+    // `deny_unknown_fields` and no `#[serde(flatten)]` anywhere near it —
+    // a different shape from `rules::Rule`'s, and one this fix's own audit
+    // confirmed parses correctly (`toml::from_str` was never broken here).
+    // These tests parse real TOML rather than building `Sink` in Rust, the
+    // same gap `rules::Rule`'s own tests closed, so a future change that
+    // reintroduces a flatten/deny_unknown_fields conflict here would be
+    // caught rather than shipped quietly a second time.
+
+    /// fails if the docs' own Discord sink — the exact inline-table shape
+    /// `docs/dogs.md` and `web/src/pages/docs/dogs.astro` publish under
+    /// `[dog.bark.sinks]` — cannot be parsed from TOML.
+    #[test]
+    fn the_docs_discord_sink_parses_from_toml() {
+        let sink: Sink = toml::from_str(
+            r#"kind = "discord"
+url = "https://discord.com/api/webhooks/..."
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sink,
+            Sink::Discord {
+                url: "https://discord.com/api/webhooks/...".to_owned(),
+            }
+        );
+    }
+
+    /// fails if a Slack sink cannot be parsed from TOML — not shown in the
+    /// published docs' worked example, but a real, documented `kind`
+    /// (`docs/dogs.md`'s reference table names all three).
+    #[test]
+    fn a_slack_sink_parses_from_toml() {
+        let sink: Sink = toml::from_str(
+            r#"kind = "slack"
+url = "https://hooks.slack.com/services/T0/B0/tok"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sink,
+            Sink::Slack {
+                url: "https://hooks.slack.com/services/T0/B0/tok".to_owned(),
+            }
+        );
+    }
+
+    /// fails if the docs' own JSON sink cannot be parsed from TOML, with
+    /// `body` correctly left `None` when the operator does not template
+    /// one — the same fragment `docs/dogs.md` publishes for `audit`.
+    #[test]
+    fn the_docs_json_sink_parses_from_toml() {
+        let sink: Sink = toml::from_str(
+            r#"kind = "json"
+url = "https://example.internal/hook"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sink,
+            Sink::Json {
+                url: "https://example.internal/hook".to_owned(),
+                body: None,
+            }
+        );
+    }
+
+    /// fails if a `Json` sink's own `body` template does not survive
+    /// parsing — `Json`'s one field the other two variants do not have.
+    #[test]
+    fn a_json_sink_s_body_template_parses_from_toml() {
+        let sink: Sink = toml::from_str(
+            r#"kind = "json"
+url = "https://example.internal/hook"
+body = "{\"text\": \"{message}\"}"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sink,
+            Sink::Json {
+                url: "https://example.internal/hook".to_owned(),
+                body: Some(r#"{"text": "{message}"}"#.to_owned()),
+            }
+        );
+    }
+
+    /// fails if a misspelled field is silently accepted rather than
+    /// refused with the bad key named — `deny_unknown_fields` doing the
+    /// job it is declared for, on an internally tagged enum this fix's own
+    /// audit left untouched because it was never broken.
+    #[test]
+    fn a_misspelled_sink_field_is_refused_with_the_bad_key_named() {
+        let err = toml::from_str::<Sink>(
+            r#"kind = "discord"
+urll = "https://discord.com/api/webhooks/..."
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("urll"),
+            "the error must name the misspelled key, not just fail: {err}"
+        );
+    }
+
+    /// fails if an unknown `kind` is accepted rather than refused with the
+    /// bad value named.
+    #[test]
+    fn an_unknown_sink_kind_is_refused_with_the_bad_value_named() {
+        let err = toml::from_str::<Sink>(
+            r#"kind = "discrod"
+url = "https://discord.com/api/webhooks/..."
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("discrod"),
+            "the error must name the bad value: {err}"
+        );
+    }
 }
