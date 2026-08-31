@@ -105,7 +105,7 @@ reviews:
     - path: "crates/**/*.rs"
       instructions: >-
         This workspace has a written Rust style, docs/idiomatic-rust.md, with
-        45 numbered rules IR-1 through IR-45. Cite the rule number when a
+        46 numbered rules IR-1 through IR-46. Cite the rule number when a
         finding matches one.
 
         Load-bearing rules, in rough order of how often they drift: no
@@ -120,6 +120,13 @@ reviews:
         The only unsafe in the workspace is shep-daemon's `sys.rs` and
         `sys_windows.rs`, and every block there needs its own `// SAFETY:`
         comment (IR-22, IR-23).
+
+        Weight a finding in test-only code lower than the same finding in
+        code an operator runs. The assertive profile is set because a missed
+        defect costs an operator their flock; a leaked descriptor in a test
+        binary that is about to exit costs nothing, so the trade that
+        justifies the volume does not apply there. Report it once, briefly,
+        and do not re-raise it on a later push.
 
         Do not suggest widening an input grammar past what the specification
         says. A parser here refusing something is usually the specified
@@ -167,15 +174,42 @@ reviews:
 
     - path: "**/*.md"
       instructions: >-
-        Prose here is hand-written and hand-wrapped in a deliberate voice. Do
-        not suggest rewording, tightening, or rewrapping. Flag only factual
+        Except where a more-specific Markdown rule sets terminology, prose
+        here is hand-written and hand-wrapped in a deliberate voice. Do not
+        suggest rewording, tightening, or rewrapping. Flag only factual
         drift: a claim about behaviour that the diff makes false, a command
         that no longer exists, a sample that will not parse.
 
-        Terminology is fixed by docs/terminology.md. A `sheep` is one managed
-        process and the word is singular only; the plural is `flock`, never
-        "sheeps" and never bare "sheep". `dogs` are plugin processes, `lambs`
-        are a sheep's children, and the daemon is only ever "the shepherd".
+        A residual the same diff already documents as a known limitation has
+        been considered. Raise it once if the reasoning looks wrong, and not
+        again on a later push.
+
+    - path: "docs/writing-plans/**/*.md"
+      instructions: >-
+        Working documents, not published prose. The terminology rule below
+        does not apply here: these name a feature after the verb an operator
+        types, so "daemon handover" tracks `shep daemon reload` and matches
+        the sibling plans deliberately. Flag factual drift only.
+
+    - path: "docs/brainstorming/**/*.md"
+      instructions: >-
+        Design documents under revision, held to the same standard as the
+        plans above: factual drift only, and the terminology rule does not
+        reach them.
+
+    - path: "web/**/*.md"
+      instructions: >-
+        Terminology is fixed by docs/terminology.md and this is published
+        prose, so it applies in full. A `sheep` is one managed process and
+        the word is singular only; the plural is `flock`, never "sheeps" and
+        never bare "sheep". `dogs` are plugin processes, `lambs` are a
+        sheep's children, and the daemon is only ever "the shepherd".
+
+    - path: "README.md"
+      instructions: >-
+        Published prose. Terminology is fixed by docs/terminology.md: the
+        plural of `sheep` is `flock`, and the daemon is only ever "the
+        shepherd".
 
     - path: ".github/workflows/**"
       instructions: >-
