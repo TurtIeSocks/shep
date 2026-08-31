@@ -91,6 +91,36 @@ pub fn close_raw_after_exec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Duplicate `fd` onto a fresh number, for a caller that needs to inspect a
+/// descriptor it must not take.
+///
+/// The duplicate refers to the same open file description, so every question
+/// an adoption asks answers identically through it: what kind of object it
+/// is, which direction it is open for, whether a socket is connected, which
+/// status flags it carries. What it does not share is ownership, and that is
+/// the whole point — closing the duplicate leaves the original open and
+/// still owned by whoever in this process owns it.
+///
+/// `F_DUPFD_CLOEXEC` rather than a bare `dup(2)`, and both halves of that
+/// are load-bearing here. The floor keeps a duplicate off stdio, so
+/// [`crate::sys::adoptable_fd`] cannot refuse it as reserved and report a
+/// problem the blob does not have. Close-on-exec means a duplicate that
+/// somehow outlived its inspection still cannot leak into a successor's
+/// image, which is precisely the failure [`close_raw_after_exec`] exists to
+/// undo for the named descriptors.
+///
+/// # Errors
+///
+/// Returns an error if `fcntl` fails, which is what a number naming no open
+/// descriptor looks like, and what a process at its descriptor limit looks
+/// like too.
+pub fn duplicate_raw(fd: RawFd) -> io::Result<RawFd> {
+    Ok(fcntl(
+        fd,
+        FcntlArg::F_DUPFD_CLOEXEC(crate::sys::RESERVED_FD_FLOOR),
+    )?)
+}
+
 /// Whether `fd` currently survives an `execve` (i.e. `FD_CLOEXEC` is
 /// clear).
 ///

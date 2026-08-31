@@ -335,12 +335,104 @@ D2. The predecessor already builds the blob and holds every descriptor. Before `
 
 A failure here is not an error the operator sees. It is the stop-and-start arm, which is the outcome they would have had anyway.
 
-- [ ] **Step 1: Write the failing test.** A blob naming a closed descriptor sends the reload down the stop arm instead of exec'ing.
-- [ ] **Step 2: Run it, watch it fail.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Prove it non-vacuous.**
-- [ ] **Step 5: Real reload** where a descriptor is closed under the daemon, confirming the flock survives by the stop arm rather than being left unsupervised.
-- [ ] **Step 6: Commit.**
+- [x] **Step 1: Write the failing test.** A blob naming a closed descriptor sends the reload down the stop arm instead of exec'ing.
+- [x] **Step 2: Run it, watch it fail.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Prove it non-vacuous.**
+- [x] **Step 5: Real reload** where a descriptor is closed under the daemon, confirming the flock survives by the stop arm rather than being left unsupervised.
+- [x] **Step 6: Commit.**
+
+#### The four claims above hold, checked 2026-08-31
+
+`nix::unistd::execve` at `handover/mod.rs:1120` is the only exec in the crate; every other `Command::new` is in a test. Nothing re-execs a predecessor: `hand_over` has exactly one production caller, `boot::hand_over_carrying`. `boot::rehydrate` at `:630` maps an adopt failure to `BootError::Adopt` and refuses to boot, and `adopt`'s own order leaves the pidfile descriptor open and unowned on a refusal, so the lock stays held. `BootError`'s `Display` arm at `:2141` says the flock is unsupervised and points at `shep muster`.
+
+#### Step 1's case is weaker than the plan thought, and the shipped tests are stronger
+
+**A closed descriptor was already refused before the exec.** `hand_over` clears `FD_CLOEXEC` on every number the blob names, and a closed one meets `EBADF` there. So a test built on "a closed descriptor" would have passed with no fix at all.
+
+Four cases were genuinely uncovered, and they are what the tests use:
+
+- a descriptor that is OPEN but not the kind its slot is adopted as. The sweep clears it happily, the exec happens, and the successor refuses.
+- a number below the stdio floor. Open, clears fine, refused after.
+- a blob naming one number twice. Clearing `FD_CLOEXEC` is idempotent by design, so a repeat crosses untouched and builds two owners on the far side.
+- a blob a successor could not read back off disk. For a handover this is the reachable case rather than the paranoid one, since a successor is by definition a different build: one that has moved `VERSION` refuses at `load_value`.
+
+#### What was built
+
+`handover::adopt::dry_run`, called from `boot::hand_over_carrying` between the fitness gate and `hand_over`. The two gates ask different questions: the first whether this flock is a shape a handover carries, the second whether the blob describing it is one a successor could adopt.
+
+**It runs the successor's own adoption rather than describing one.** A second implementation of "is this descriptor adoptable" is worse than none: if the successor's checks tighten and a hand-written copy does not, the rehearsal passes, the exec happens, and the boot still fails with the predecessor gone. So nothing re-states a check.
+
+| what could drift | what stops it |
+|---|---|
+| the per-kind checks | `dry_run` calls the same `adopt_listener`/`adopt_pipe`/`adopt_stdin`/`adopt_log`/`adopt_channel`/`adopt_fd` the successor calls, over an `F_DUPFD_CLOEXEC` duplicate so an adoption that takes ownership can run against a descriptor the predecessor must keep |
+| which number is which slot | one array, `CarriedFds::all_kinded`, pinned against `CarriedFds::all` (what the `FD_CLOEXEC` sweep walks) by a test; a seventh descriptor changes `all`'s return type and stops `all_kinded` compiling |
+| the repeated-number rule | `refuse_repeated_fds` itself, called rather than re-derived |
+| the floor-and-open probe | `sys::adopt_handover_fd`'s own, extracted as `sys::adoptable_fd` and shared. Checked against the BLOB's number, never the duplicate's: a duplicate is always open and always above the floor, so a rehearsal that only inspected duplicates would wave through exactly the two blobs the successor is certain to refuse |
+| the parse | `Handover::load_value`, the successor's own entry point, and the descriptors are rehearsed against the REPARSED blob |
+| a slot dispatched to the wrong adoption | `the_rehearsal_and_the_adoption_agree_on_every_slot` walks all six and compares verdicts |
+
+Two seams are named in the code rather than hidden. The successor reads bytes with `from_str` while this goes through `to_value`; and the four socket and pipe adoptions set `O_NONBLOCK`, which is a property of the open file description and so reaches the original through the duplicate — a write of the value already there, because tokio does not accept a blocking one.
+
+`VERSION` unmoved: nothing about the blob format changed.
+
+##### The measurement
+
+Fault injected identically in both builds (uncommitted, `SHEP_HANDOVER_FAULT`): one sheep's `out_pipe` replaced with an open `/dev/null`, which is open enough for the `FD_CLOEXEC` sweep and not a pipe. One quiet sheep, so the "unsupervised orphan" outcome is visible rather than being masked by `SIGPIPE` — a chatty sheep dies when the successor exits and closes the last reader, which is a different bad ending and hides this one.
+
+| | before (fix stashed) | after |
+|---|---|---|
+| `shep daemon reload` exit | 0 | 0 |
+| shepherd, before → after | 22988 → **29421** | 30605 → **66107** |
+| the sheep, before → after | 23052 → **29442** | 30680 → **66158** |
+| old sheep afterwards | **alive, `ppid` 1, orphaned** | gone |
+| `quiet.sh` processes afterwards | **2** | **1** |
+| what the shepherd supervises | 1 of the 2 | the 1 |
+| `run/handover.json` afterwards | **left behind** | gone |
+
+The blob left behind names `out_pipe: 16` — the injected number — for `quiet` at pid 23052, which is the orphan. It is on disk because the successor's `adopt` refused, and `adopt` unlinks only on success.
+
+The same fault by raw `SIGHUP`, so the two log lines can be read side by side:
+
+```
+BEFORE  error[failure]: the daemon failed to boot: this shepherd was handed a flock it could not
+        take over: sheep 'quiet' stdout pipe is not a readable pipe: not a pipe. The flock is still
+        running and nothing is supervising it. ...
+        -> sheep 84773 alive at ppid 1, no shep process anywhere, blob on disk
+
+AFTER   WARN shep_daemon::boot: SIGHUP: this flock could not be handed to a successor; stopping
+        gracefully instead ... refusal=a successor could not have adopted this flock, so none was
+        started: sheep 'quiet' stdout pipe is not a readable pipe: not a pipe. This is a shep bug
+        worth reporting: the descriptors are ones this shepherd opened itself, and the check that
+        refused them is the successor's own. ...
+        -> flock stopped by the ladder, no orphan, no blob
+```
+
+The refusal reaches the operator's log carrying the successor's own wording, so it names the sheep and the stream.
+
+**Residual, pre-existing and not touched here.** Both reloads took 10s, because `daemon::hand_over`'s `await_successor` waits out `admin::KILL_TEARDOWN_WAIT` for a successor that in the refusal case was deliberately never started. That is the CLI's behaviour for any post-signal handover failure, and shortening it would mean the CLI learning that the predecessor refused, which a signal cannot tell it.
+
+##### Mutations
+
+Ten, each applied alone against `cargo test -p shep-daemon --lib --all-features -- --skip ::slow::` and reverted afterwards. Baseline 656 passing.
+
+| # | what was broken | what failed |
+|---|---|---|
+| 1 | the `dry_run` call removed from `hand_over_carrying` | `a_sighup_over_a_blob_no_successor_could_adopt_refuses_before_it_execs` only |
+| 2 | `adoptable_fd` checks the duplicate's number, not the blob's | `a_reserved_or_closed_number_is_refused_before_the_exec`, plus the boot case at its `-1` assertion |
+| 3 | `refuse_repeated_fds` dropped from `dry_run` | `a_blob_naming_one_descriptor_twice_is_refused_before_the_exec` only |
+| 4 | the reparse skipped, rehearsing the blob as handed | `a_blob_a_successor_could_not_read_back_is_refused_before_the_exec` only |
+| 5 | `all_kinded` labels `out_pipe` as `Stdin` | seven, including `every_carried_number_is_kinded_in_the_same_order` |
+| 5b | `all_kinded` swaps the `out_pipe`/`err_pipe` fields, slots unchanged | `every_carried_number_is_kinded_in_the_same_order` at its `all()` equality |
+| 6 | the `Channel` slot dispatched to `adopt_log` | `the_rehearsal_and_the_adoption_agree_on_every_slot` only |
+| 7 | the sheep walk skipped | three, including the open-but-wrong-kind case |
+| 8 | one duplicate leaked per rehearsal | `a_rehearsal_leaks_no_descriptors` only |
+| 9 | the adoption handed the original instead of a duplicate | the test binary ABORTS: `IO Safety violation: owned file descriptor already closed`, attributed to `a_rehearsal_leaves_every_descriptor_it_checked_working` |
+| 10 | `rehearse` refuses everything | six, including `a_blob_a_successor_could_adopt_passes_the_rehearsal` |
+
+6 is the one worth keeping. It is exactly the drift this task was told not to ship — a rehearsal that grows lax while the adoption stays strict — and one test catches it, alone, with the other 655 green.
+
+9 is the second. Without the duplicate the rehearsal closes the predecessor's own descriptors, and Rust's IO-safety net turns that into an abort rather than a subtle failure.
 
 ---
 

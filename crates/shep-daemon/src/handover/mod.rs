@@ -819,6 +819,31 @@ pub struct CarriedFds {
     pub channel: Option<RawFd>,
 }
 
+/// Which of a sheep's six descriptors a number is.
+///
+/// Not a description of the object — that is what the adoption itself
+/// discovers — but of the SLOT, which is what decides which adoption runs.
+/// A stdout pipe and a stdin pipe are both pipes and are refused by opposite
+/// checks, so the slot is the part a caller has to carry with the number.
+///
+/// `Debug` is derived and carries nothing: six unit variants, no descriptor
+/// number, no path, no environment (IR-41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SheepFd {
+    /// The read end of the sheep's stdout pipe ([`CarriedFds::out_pipe`]).
+    OutPipe,
+    /// The read end of the sheep's stderr pipe ([`CarriedFds::err_pipe`]).
+    ErrPipe,
+    /// The appending handle on its stdout log ([`CarriedFds::out_log`]).
+    OutLog,
+    /// The appending handle on its stderr log ([`CarriedFds::err_log`]).
+    ErrLog,
+    /// The WRITE end of its stdin pipe ([`CarriedFds::stdin`]).
+    Stdin,
+    /// The daemon's end of its shepherd channel ([`CarriedFds::channel`]).
+    Channel,
+}
+
 impl CarriedFds {
     /// The six numbers, listener-order irrelevant but fixed: stdout's pipe,
     /// stderr's pipe, stdout's log, stderr's log, stdin's pipe, the
@@ -836,6 +861,34 @@ impl CarriedFds {
             self.err_log,
             self.stdin,
             self.channel,
+        ]
+    }
+
+    /// [`Self::all`], with each number labelled by which of the six it is,
+    /// and so by the adoption a successor will attempt on it.
+    ///
+    /// The pairing lives here rather than at either caller because there are
+    /// two callers and they must not disagree. [`adopt::adopt`] runs these
+    /// adoptions for real in the successor; [`adopt::dry_run`] runs the same
+    /// ones in the PREDECESSOR, against duplicates, so that a blob the
+    /// successor would refuse never reaches an `execve`. A number rehearsed
+    /// as the wrong kind is a rehearsal that passes and a boot that still
+    /// fails, which is worse than not rehearsing at all.
+    ///
+    /// Three things hold the two in step, and none of them is a promise to
+    /// remember. This array is the only pairing either side reads;
+    /// `every_carried_number_is_kinded_in_the_same_order` pins it against
+    /// [`Self::all`], which is what the `FD_CLOEXEC` sweep already walks; and
+    /// a seventh descriptor changes that function's return type, so this one
+    /// stops compiling until it grows a seventh entry too.
+    pub(crate) const fn all_kinded(&self) -> [(Option<RawFd>, SheepFd); 6] {
+        [
+            (self.out_pipe, SheepFd::OutPipe),
+            (self.err_pipe, SheepFd::ErrPipe),
+            (self.out_log, SheepFd::OutLog),
+            (self.err_log, SheepFd::ErrLog),
+            (self.stdin, SheepFd::Stdin),
+            (self.channel, SheepFd::Channel),
         ]
     }
 
@@ -1523,6 +1576,42 @@ mod tests {
 
     fn sample_handover() -> Handover {
         handover_over(&entry_fixture(|_| {}))
+    }
+
+    /// [`CarriedFds::all`] and [`CarriedFds::all_kinded`] must name the same
+    /// six numbers, in the same order, one slot each.
+    ///
+    /// `all` is what the `FD_CLOEXEC` sweep walks, and `all_kinded` is what
+    /// the pre-exec rehearsal walks. A slot paired with the wrong field
+    /// there would have the rehearsal check a stdout pipe against the stdin
+    /// check, which passes for the wrong reason on a fixture where both are
+    /// pipes and fails on a real flock. Nothing else would notice: both
+    /// arrays are six long and both are full of plausible numbers.
+    ///
+    /// Six DISTINCT numbers, so the equality below is about the pairing
+    /// rather than about the length, and a second pass over the slots, so a
+    /// copy-paste that repeated one cannot ride along behind numbers that
+    /// happen to line up.
+    #[test]
+    fn every_carried_number_is_kinded_in_the_same_order() {
+        let fds = CarriedFds {
+            out_pipe: Some(10),
+            err_pipe: Some(11),
+            out_log: Some(12),
+            err_log: Some(13),
+            stdin: Some(14),
+            channel: Some(15),
+        };
+
+        assert_eq!(
+            fds.all_kinded().map(|(fd, _)| fd),
+            fds.all(),
+            "the kinded walk and the `FD_CLOEXEC` walk must see the same numbers"
+        );
+
+        let slots: std::collections::HashSet<SheepFd> =
+            fds.all_kinded().iter().map(|(_, slot)| *slot).collect();
+        assert_eq!(slots.len(), 6, "each slot must appear exactly once");
     }
 
     fn sample_handover_with_secret_env() -> Handover {

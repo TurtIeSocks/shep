@@ -2024,10 +2024,17 @@ async fn hand_over_now(seam: &HandoverSeam) -> Result<core::convert::Infallible,
 /// [`hand_over_now`]'s body, split out so a single resume can cover every
 /// way it refuses.
 ///
+/// Two gates, in this order, and they ask different questions. The first
+/// asks whether this FLOCK is a shape a handover carries. The second asks
+/// whether the BLOB describing it is one a successor could actually adopt,
+/// by running the successor's own adoption here, against duplicates, while
+/// this image still exists to fall back to.
+///
 /// # Errors
 ///
-/// The flock cannot be carried, or the exec itself failed. Both leave this
-/// process still itself, with no blob on disk.
+/// The flock cannot be carried, a successor could not have adopted the blob,
+/// or the exec itself failed. All three leave this process still itself,
+/// with no blob on disk.
 #[cfg(unix)]
 fn hand_over_carrying(
     candidates: &[crate::handover::OwnedCandidate],
@@ -2041,6 +2048,25 @@ fn hand_over_carrying(
     if let crate::handover::Fitness::Refused(reason) = crate::handover::fitness(&borrowed) {
         return Err(reason.to_string());
     }
+    // The gate with no way back if it is skipped. After the `execve` there
+    // is no image to refuse to: `rehydrate` returns `BootError::Adopt`, this
+    // daemon's replacement exits without ever serving, and the flock runs on
+    // with nothing supervising it — which is what that variant's own message
+    // tells the operator, pointing them at `shep muster`.
+    //
+    // Here rather than inside `handover::hand_over`, which would be harder
+    // for a future caller to bypass. The rehearsal registers objects with
+    // the tokio reactor and so needs a runtime, and `hand_over`'s own exec
+    // self-test runs from a plain `#[test]` with a tempfile standing in for
+    // the listener. This is the production seam and its only caller.
+    crate::handover::adopt::dry_run(blob).map_err(|err| {
+        format!(
+            "a successor could not have adopted this flock, so none was started: {err}. This is \
+             a shep bug worth reporting: the descriptors are ones this shepherd opened itself, \
+             and the check that refused them is the successor's own. The flock is stopped and \
+             started instead, which is the reload an operator had before handovers existed"
+        )
+    })?;
     crate::handover::hand_over(blob, &seam.paths).map_err(|err| err.to_string())
 }
 
@@ -3491,6 +3517,80 @@ mod tests {
         // Bounded, like the sibling above. The lock this case now holds is
         // held across this await, so a teardown that hung would stop every
         // other signal test in the module rather than failing this one.
+        tokio::time::timeout(Duration::from_secs(5), daemon.run())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The second gate: a flock the fitness check passes, described by a
+    /// blob no successor could have adopted, refuses HERE rather than after
+    /// the `execve`.
+    ///
+    /// This is the failure with no way back. Past the exec there is no
+    /// predecessor to refuse to: `rehydrate` returns `BootError::Adopt`, the
+    /// successor exits without ever serving, and the flock keeps running
+    /// with nothing supervising it. So the rehearsal runs while this image
+    /// still exists, and a refusal takes the stop-and-start arm the operator
+    /// would have had before handovers existed.
+    ///
+    /// **Read the assertion, not just the `expect_err`.** These descriptors
+    /// were already refused before this gate existed, by the `FD_CLOEXEC`
+    /// sweep meeting `EBADF`, so a case that only checked for A refusal
+    /// would pass with the gate deleted. What is new is WHICH refusal: the
+    /// successor's own wording, reached before anything was written or
+    /// cleared. The wording is the whole test.
+    ///
+    /// **The descriptors stay deliberately invalid**, for the reason both
+    /// siblings above give. A blob that got past both gates would exec this
+    /// test binary into a re-run of the entire suite, so no case in this
+    /// module may offer one that could.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sighup_over_a_blob_no_successor_could_adopt_refuses_before_it_execs() {
+        // As every sibling: a successful `boot()` installs real signal
+        // listeners for this test's whole duration.
+        let _guard = SIGNAL_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        init_dirs(&paths).unwrap();
+        // No dog and no sheep, so the FIRST gate passes and this case is
+        // about the second one. An empty flock is carryable — see
+        // `handover::fitness`'s own doc.
+        let daemon = boot(
+            ScriptedRunner::new(Vec::new()),
+            paths.clone(),
+            BootOptions::default(),
+        )
+        .await
+        .unwrap();
+        let ctx = daemon.context();
+
+        let seam = HandoverSeam {
+            supervisor: ctx.supervisor.clone(),
+            fds: crate::handover::DaemonFds {
+                listener: -1,
+                pidfile: -2,
+            },
+            paths: paths.clone(),
+        };
+        let refusal = hand_over_now(&seam)
+            .await
+            .expect_err("a blob naming no real listener cannot be adopted");
+        assert!(
+            refusal.contains("a successor could not have adopted this flock"),
+            "the rehearsal must be what refuses, not the `FD_CLOEXEC` sweep further on: {refusal}"
+        );
+        assert!(
+            refusal.contains("-1"),
+            "the refusal must name the descriptor it refused: {refusal}"
+        );
+        assert!(
+            !crate::handover::Handover::path(&paths).exists(),
+            "a refusal before the exec must leave no blob on disk"
+        );
+
+        ctx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), daemon.run())
             .await
             .unwrap()
