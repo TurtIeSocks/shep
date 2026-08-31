@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-08-31
+
+### Fixed
+
+- Let [[dog.bark.rules]] actually parse from TOML
+
+
 ## [0.1.18] - 2026-08-30
 
 ### Added
