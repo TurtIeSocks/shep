@@ -45,19 +45,19 @@ fn default_debounce() -> UpDuration {
 
 /// One entry under `[dog.bark.rules]`.
 ///
-/// NOT `#[serde(deny_unknown_fields)]` on this struct, even though a
-/// misspelled key here must still be a startup error — see
+/// A misspelled key anywhere in a rule is a startup error naming the bad
+/// key, never a silently ignored setting. See
 /// [`BarkConfig`](super::BarkConfig)'s own doc for why that posture
-/// matters. `serde` does not support `deny_unknown_fields` together with
-/// `#[serde(flatten)]` on the same struct: the flattened field needs to
-/// collect whatever keys the outer struct's own named fields do not claim,
-/// and `deny_unknown_fields` rejects exactly those before the flattened
-/// field ever sees them — every key of a real rule, `on` included, is
-/// "unknown" from `Rule`'s own point of view. [`Trigger`] carries the
-/// attribute instead: everything this struct's own fields (`sinks`,
-/// `debounce`) do not consume flows into `Trigger`'s deserialize, so its
-/// `deny_unknown_fields` still catches a typo anywhere in a rule, just one
-/// level down from where the old attribute sat.
+/// matters.
+// The attribute enforcing that sits on `Trigger` rather than here, and it
+// cannot sit here: serde does not support `deny_unknown_fields` alongside
+// `#[serde(flatten)]` on one struct. The flattened field has to collect
+// whatever keys this struct's own named fields do not claim, and
+// `deny_unknown_fields` rejects exactly those before the flattened field
+// ever sees them, so every key of a real rule, `on` included, reads as
+// unknown from `Rule`'s point of view. Everything `sinks` and `debounce`
+// do not consume flows into `Trigger`'s deserialize instead, which catches
+// the typo one level down from where the attribute used to sit.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Rule {
     /// What fires it.
@@ -93,20 +93,17 @@ pub enum Trigger {
     /// missed — the app is down and staying down — and because it cannot
     /// disagree with the shepherd: it is keyed to the shepherd's own
     /// decision rather than to a threshold bark chose.
-    ///
-    /// An empty struct variant, `GaveUp {}`, rather than a bare unit
-    /// variant — deliberately, and load-bearing for `deny_unknown_fields`
-    /// above. An internally tagged unit variant deserializes through a
-    /// path that never visits the rest of the map, so a stray key next to
-    /// `on = "gave_up"` (a misspelled `debounce`, say) parsed silently
-    /// even with `deny_unknown_fields` set — confirmed empirically before
-    /// this fix, and covered by
-    /// `tests::a_misspelled_field_next_to_gave_up_is_still_refused` below.
-    /// A struct variant, even an empty one, goes through the same
-    /// field-checking visitor every other variant here already used, so
-    /// the typo is refused like any other. Wire-compatible: `on =
-    /// "gave_up"` alone still parses to this variant, unchanged — nothing
-    /// an operator types needs to change.
+    // An empty struct variant rather than a bare unit variant,
+    // deliberately, and load-bearing for the `deny_unknown_fields` above.
+    // An internally tagged UNIT variant deserializes through a path that
+    // never visits the rest of the map, so a stray key beside
+    // `on = "gave_up"` (a misspelled `debounce`, say) parsed silently even
+    // with the attribute set. Measured, not assumed, and covered by
+    // `tests::a_misspelled_field_next_to_gave_up_is_still_refused` below.
+    // A struct variant, even an empty one, goes through the same
+    // field-checking visitor every other variant here already used. The
+    // wire shape is identical either way: `on = "gave_up"` on its own
+    // still parses to this variant.
     GaveUp {},
     /// The early warning: `restarts` restarts within `within`. Opt-in,
     /// because it is the one that pages at 3am for a blip, and the
