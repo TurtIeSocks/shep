@@ -409,6 +409,51 @@ has never seen gets two `printf` calls right on the first try. Hand
 written JSON is where the quoting and the trailing comma go wrong, and
 nothing here nests.
 
+### What `shep restart <dog>` does with the answer
+
+`cargo install` replaces a file and never touches a process, so a dog
+upgraded on disk leaves a working system: the dog running now is the old
+binary, still connected, still doing its job. The two only meet at the next
+restart, which may be days away and for a reason that has nothing to do with
+the upgrade.
+
+`shep restart <name>` is that restart, so it asks the same question first:
+
+```
+notice[dog_binary_skew]: `log-rotate`'s binary at /usr/local/bin/shep-log-rotate
+was built for shep protocol 3, and this shep speaks 2; restarting it brings it
+back on that binary, unable to connect. Run a shep that speaks 3, or reinstall
+the dog against protocol 2, and restart it again
+```
+
+Then it restarts the dog. This is a warning and never a refusal: the
+operator asked for the restart, the binary on disk may be exactly what they
+just installed, and there are two ways out of the state rather than one, so
+the message names both and picks neither.
+
+| what the binary answers | what `restart` does |
+|---|---|
+| a `shep-protocol` this shep does not speak | warns, then restarts |
+| a protocol this shep speaks | restarts, silently |
+| a version and no protocol line | restarts, silently |
+| nothing, or a run that exits non-zero | restarts, silently |
+
+**Unknown is not stale.** Every dog written before this contract is in the
+last two rows, and a line on stderr for each of them is how an operator
+learns to skip the one that matters.
+
+Three things are never asked at all. A built-in dog has no binary of its
+own, so there is nothing to be stale. A selector that sweeps rather than
+names, `all` or a `/regex/`, does not reach a dog in the first place. And a
+dog named by id rather than by name is restarted without a check, because
+looking up its name would cost a round trip before the restart the operator
+asked for.
+
+The cost is the same second `adopt` spends, and it is paid only by a restart
+that named an adopted dog. A binary that hangs is killed when the second is
+up and the restart goes ahead unwarned, so the slowest a dog can make
+`shep restart` is one second, never indefinitely.
+
 ### Why the binary is the only thing that can answer
 
 A dog's crate version does not imply its protocol, and neither does

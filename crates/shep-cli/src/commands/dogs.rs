@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use shep_client::{Client, ConnectError, PROTOCOL_VERSION};
 use shep_core::barks;
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{DogSource, Request, Response};
+use shep_core::protocol::{DogSource, Request, Response, SelectorSpec};
 
 use crate::cli::{AdoptArgs, BarksArgs};
 use crate::commands::shep_toml::{ShepToml, ShepTomlError};
@@ -462,6 +462,52 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
         .map(|abs| shep_core::paths::strip_verbatim_prefix(&abs).into_owned())
         .map_err(|_| AdoptRefusal::Missing)?;
     let group_writable = writability(&canonical)?;
+    let answer = ask_version(&canonical, home, name)?;
+    // Only a STATED protocol can refuse, and only this one thing can.
+    // `answer.version` is deliberately not compared with anything: a
+    // third-party dog's crate version has no relationship to shep's own --
+    // `shep-log-rotate` 0.1.3 against shep 0.1.24 is the ordinary case, not
+    // a skew -- so comparing them would refuse, or warn about, every dog
+    // that exists. `docs/dogs.md`'s table is what this implements: the
+    // protocol decides whether the dog can connect at all and is hard, the
+    // version says which build it is and is reported.
+    if let Some(dog) = answer.as_ref().and_then(|answer| answer.protocol)
+        && dog != PROTOCOL_VERSION
+    {
+        return Err(AdoptRefusal::ProtocolMismatch {
+            dog,
+            shep: PROTOCOL_VERSION,
+        });
+    }
+    Ok(VettedBinary {
+        path: canonical,
+        group_writable,
+        answer,
+    })
+}
+
+/// Runs `path` with [`VERSION_FLAG`] and reads what it answers, within
+/// [`VERSION_BUDGET`].
+///
+/// `Ok(None)` is an UNKNOWN protocol and is never a fault: silence, output
+/// shep cannot read, a run that failed, and a run still going when the
+/// budget ran out all arrive here the same way. Answering is optional and stays
+/// optional, so every dog written before the contract existed reads as
+/// unknown rather than as broken.
+///
+/// Two callers ask the same binary the same question for different reasons.
+/// [`vet_binary`] asks a candidate nobody has adopted yet;
+/// [`warn_of_a_dog_a_restart_would_break`] asks a dog that has been adopted
+/// for months, because the answer lives in the binary and the binary
+/// changes on disk with nothing watching (G12 row 5). Neither writes the
+/// answer down.
+///
+/// # Errors
+/// [`AdoptRefusal::WillNotExec`], and only that: nothing here judges the
+/// answer it read, so [`AdoptRefusal::ProtocolMismatch`] stays
+/// [`vet_binary`]'s to raise. A caller that only wants an answer treats the
+/// error as one more way of not getting one.
+fn ask_version(path: &Path, home: &Path, name: &str) -> Result<Option<DogVersion>, AdoptRefusal> {
     // Spawned with ONE argument, `--version`, and torn down
     // unconditionally: `kill` is ignored (a process that already exited is
     // not a failure to vet), but `wait` always runs, on every path out of
@@ -479,9 +525,9 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
     // protocol is never a refusal. The vet asks; the supervisor does not.
     //
     // A candidate is somebody else's binary and is not assumed to be well
-    // behaved about any of it: [`version_answer`] bounds the wait, so a
-    // candidate that never exits costs [`VERSION_BUDGET`] rather than
-    // hanging the `adopt` that is trying to vet it.
+    // behaved about any of it: [`version_answer`] bounds the wait by
+    // `budget`, so one that never exits costs that and is then killed,
+    // rather than hanging the command that asked.
     //
     // `SHEP_HOME` is set to the home this invocation actually resolved, not
     // inherited: an inherited `SHEP_HOME` is usually unset, so the
@@ -528,7 +574,7 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
     // one could imitate shep's own output at the exact moment somebody is
     // deciding whether to trust it. The pipe is read by [`version_answer`]
     // and never rendered.
-    match Command::new(&canonical)
+    match Command::new(path)
         .arg(VERSION_FLAG)
         .env("SHEP_HOME", home)
         .env("SHEP_DOG_NAME", name)
@@ -553,28 +599,7 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
             let answer = version_answer(&mut child, reading);
             let _ = child.kill();
             let _ = child.wait();
-            // Only a STATED protocol can refuse, and only this one thing
-            // can. `answer.version` is deliberately not compared with
-            // anything: a third-party dog's crate version has no
-            // relationship to shep's own -- `shep-log-rotate` 0.1.3 against
-            // shep 0.1.24 is the ordinary case, not a skew -- so comparing
-            // them would refuse, or warn about, every dog that exists.
-            // `docs/dogs.md`'s table is what this implements: the protocol
-            // decides whether the dog can connect at all and is hard, the
-            // version says which build it is and is reported.
-            if let Some(dog) = answer.as_ref().and_then(|answer| answer.protocol)
-                && dog != PROTOCOL_VERSION
-            {
-                return Err(AdoptRefusal::ProtocolMismatch {
-                    dog,
-                    shep: PROTOCOL_VERSION,
-                });
-            }
-            Ok(VettedBinary {
-                path: canonical,
-                group_writable,
-                answer,
-            })
+            Ok(answer)
         }
     }
 }
@@ -607,8 +632,8 @@ const VERSION_FLAG: &str = "--version";
 /// by this one.
 const SHEP_PROTOCOL_KEY: &str = "shep-protocol";
 
-/// How long [`version_answer`] gives a candidate to answer, and separately
-/// how long it then waits for that answer to reach the reader thread.
+/// How long [`ask_version`] gives a binary to answer, and separately how
+/// long it then waits for that answer to reach the reader thread.
 ///
 /// One second, against the milliseconds a `println!` and an exit take. The
 /// generosity is for a cold, dynamically linked binary on a loaded machine,
@@ -617,6 +642,17 @@ const SHEP_PROTOCOL_KEY: &str = "shep-protocol";
 /// they are not symmetric -- too short records an unknown protocol for a
 /// slow dog, which costs the gate and not the adopt, while too long stalls
 /// every adopt of the dogs that exist today, none of which answer at all.
+///
+/// `restart` asks with the same number rather than a tighter one of its
+/// own, and the tighter one was tried first: a 250ms budget lost the answer
+/// outright on a loaded machine, where a probe measured 180-300ms against
+/// single-digit milliseconds idle. A budget that drops the warning whenever
+/// the box is busy is worse than one that occasionally costs a second,
+/// because a busy box is where an operator restarts things. The cost is
+/// bounded and it is paid only by a restart that NAMED an adopted dog: a
+/// binary that hangs is killed at the budget and the restart proceeds
+/// unwarned, so the slowest thing a dog can do to `shep restart` is delay
+/// it, never block it.
 const VERSION_BUDGET: Duration = Duration::from_secs(1);
 
 /// How often [`version_answer`] polls within [`VERSION_BUDGET`], following
@@ -690,6 +726,13 @@ fn read_in_background(mut stdout: std::process::ChildStdout) -> Receiver<String>
 }
 
 /// Waits, bounded by [`VERSION_BUDGET`], for `child` to answer.
+///
+/// Twice that is the worst case rather than once, because the wait for the
+/// exit and the wait for the text the reader thread collected are bounded
+/// separately. Only a child that has ALREADY exited successfully reaches
+/// the second one, so its text is written and its own end of the pipe is
+/// closed; that bound is there for a grandchild still holding the inherited
+/// pipe open, not for anything the dog itself is doing.
 ///
 /// `None` -- an unknown protocol, never a refusal -- for every way of not
 /// answering: no pipe to read, a run that did not exit inside the budget, a
@@ -905,6 +948,93 @@ fn report_dog_version(streams: &mut Streams<'_>, name: &str, answer: &DogVersion
         ),
     };
     streams.aside(DOG_VERSION_NOTICE, &message);
+}
+
+/// [`emit_notice`](crate::output::emit_notice) code for the warning
+/// `restart` prints before it restarts a dog whose binary on disk cannot
+/// speak to this shepherd -- caller-defined, like the two above, and like
+/// them not a failure: the restart still happens.
+const DOG_BINARY_SKEW_NOTICE: &str = "dog_binary_skew";
+
+/// Warns, before `restart` sends anything, about a dog whose binary ON DISK
+/// speaks a protocol this shepherd does not -- G12's row 5.
+///
+/// Row 5 is the one state in that matrix where nothing is wrong yet. The
+/// running dog is connected and working, the binary it would come back from
+/// is not, and the two only meet at the next restart, which may be days
+/// away and for an unrelated reason. This is the moment that restart
+/// happens, so this is where the operator can still be told.
+///
+/// **A warning, never a refusal.** They asked for the restart, the binary on
+/// disk may be exactly what they just installed, and refusing an explicit
+/// command on a prediction is a worse failure than letting them watch it
+/// happen with the warning in hand. G12 row 5's fix names two ways out and
+/// picks neither, so the message does the same.
+///
+/// **Silence is the answer for everything else.** A dog that does not answer
+/// [`VERSION_FLAG`] is unknown, not stale -- that is the state `adopt`
+/// records under G11's "recorded as unknown", and this is its reader. Every
+/// dog that existed when the contract was written is in that group, so a
+/// warning there would be a line on stderr for the ordinary case, which is
+/// how an operator learns to skip the one that matters.
+///
+/// # A built-in dog cannot reach this, by construction
+///
+/// The only way in is a path out of `[daemon] adopted_dogs`. A built-in dog
+/// has no entry there ([`dog_source`]), and could not use one: the shepherd
+/// runs `metrics` and `bark` as `<its own binary> dog <name>`, so a built-in
+/// dog's binary on disk IS the shepherd's, and there is no second thing to
+/// drift. There is no branch here skipping them, and none to forget to
+/// write.
+///
+/// # Why only a `Name` selector
+///
+/// The daemon includes a dog only for a selector that NAMED it
+/// (`ProcessSelector::is_exact`), so `restart all` and a `/regex/` sweep
+/// pass every dog by and there is nothing for this to warn about. That
+/// leaves `Id`, which is exact and could name a dog: it is not probed,
+/// because the CLI would have to ask the daemon what that id is called
+/// before it could look up a path, and a round trip is a lot to spend on
+/// the rarer way of typing the same thing. An operator who restarts a dog
+/// by id gets the restart and no warning.
+pub fn warn_of_a_dog_a_restart_would_break(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    selectors: &[SelectorSpec],
+) {
+    for selector in selectors {
+        let SelectorSpec::Name(name) = selector else {
+            continue;
+        };
+        // The one way in, and the reason a built-in dog is not a case here:
+        // this answers `None` for every name `[daemon] adopted_dogs` has
+        // never heard of, which is every built-in dog and every sheep.
+        let Ok(Some(binary)) = ShepToml::adopted_dog_path_readonly(&paths.daemon_config, name)
+        else {
+            continue;
+        };
+        // Asked, never remembered. A protocol recorded at adopt time would
+        // be a copy of a number that changes on disk with nothing watching,
+        // and row 5 IS the binary changing after the adopt -- so the stored
+        // copy would be wrong at precisely the moment it was needed.
+        let Ok(Some(answer)) = ask_version(&binary, &paths.home, name) else {
+            continue;
+        };
+        let Some(disk) = answer.protocol else {
+            continue;
+        };
+        if disk == PROTOCOL_VERSION {
+            continue;
+        }
+        let message = format!(
+            "`{name}`'s binary at {} was built for shep protocol {disk}, and this shep \
+             speaks {PROTOCOL_VERSION}; restarting it brings it back on that binary, \
+             unable to connect. Run a shep that speaks {disk}, or reinstall the dog \
+             against protocol {PROTOCOL_VERSION}, and restart it again",
+            binary.display()
+        );
+        streams.aside(DOG_BINARY_SKEW_NOTICE, &message);
+    }
 }
 
 /// `shep adopt <path> [--name <name>]`: vets a binary shep has never seen,

@@ -1271,7 +1271,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             }
         }
         Commands::Restart(ref args) => match connect_client(&mut streams, &paths, guard).await {
-            Ok(client) => lifecycle::restart(&client, &mut streams, args).await,
+            Ok(client) => lifecycle::restart(&client, &mut streams, &paths, args).await,
             Err(code) => code,
         },
         Commands::Reload(ref args) => match connect_client(&mut streams, &paths, guard).await {

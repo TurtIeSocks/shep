@@ -15,12 +15,14 @@ use std::time::Duration;
 
 use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
+use shep_core::paths::ShepPaths;
 use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec};
 use shep_core::selector::ProcessSelector;
 
 use crate::cli::Format;
 use crate::cli::{SelectorArgs, StartArgs, StockArgs};
 use crate::commands::bounded::{Bounded, run_bounded};
+use crate::commands::dogs;
 use crate::commands::selector::parse_selector;
 use crate::exit::ExitCode;
 use crate::output::{DeletedIds, FlockRows, Render, Streams, emit, emit_flock, write_outcome};
@@ -1450,11 +1452,25 @@ pub async fn stop(client: &Client, streams: &mut Streams<'_>, args: &SelectorArg
 }
 
 /// Restarts the sheep matching `args.selector`.
-pub async fn restart(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
+///
+/// `paths` is here for one thing: a restart that names a dog is warned about
+/// BEFORE the request goes out, when the operator can still act on it. See
+/// [`dogs::warn_of_a_dog_a_restart_would_break`] for what it warns about and
+/// why nothing is refused.
+pub async fn restart(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    args: &SelectorArgs,
+) -> ExitCode {
     let selectors = match parse_selectors(streams, &args.selectors) {
         Ok(selectors) => selectors,
         Err(code) => return code,
     };
+    // Before `request_each`, deliberately, and this is the whole ordering
+    // the spec asks for: a warning that arrives after the restart is a
+    // description of a state the operator is already in.
+    dogs::warn_of_a_dog_a_restart_would_break(streams, paths, &selectors);
     let (procs, failure) = request_each(
         client,
         streams,
@@ -1623,7 +1639,9 @@ mod tests {
     use super::*;
     use crate::cli::Format;
     use shep_client::DEFAULT_DEADLINE;
-    use shep_client::testing::{fake_client_capturing_envelopes, fake_client_replying_err};
+    use shep_client::testing::{
+        fake_client_answering, fake_client_capturing_envelopes, fake_client_replying_err,
+    };
     use shep_core::protocol::RpcErrorCode;
 
     /// Bare `shep start` with a Flockfile discovered by the caller must
@@ -2905,6 +2923,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = shep_client::testing::control_address(dir.path());
         let (client, mut envelopes) = fake_client_capturing_envelopes(&path).await;
+        // No `shep.toml` in this tempdir, so `restart`'s dog check finds
+        // nothing adopted and spawns nothing -- this test is about the wire.
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
 
         #[derive(Clone, Copy, Debug)]
         enum Verb {
@@ -2941,7 +2962,7 @@ mod tests {
                 };
                 let _ = match verb {
                     Verb::Stop => stop(&client, &mut streams, &args).await,
-                    Verb::Restart => restart(&client, &mut streams, &args).await,
+                    Verb::Restart => restart(&client, &mut streams, &paths, &args).await,
                     Verb::Reload => reload(&client, &mut streams, &args).await,
                     Verb::Delete => delete(&client, &mut streams, &args).await,
                 };
@@ -2961,6 +2982,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Everything G12 row 5 needs to exist: a `$SHEP_HOME`, a dog binary
+    /// answering `--version` with `protocol`, and a `shep.toml` that has
+    /// adopted it under `name`.
+    ///
+    /// Written through `ShepToml::adopt_dog`, the same writer `shep adopt`
+    /// uses, so a test dog is recorded exactly the way a real one is rather
+    /// than by a hand-built table that could drift from it.
+    fn adopted_dog(dir: &Path, name: &str, answer: &str) -> ShepPaths {
+        let paths = ShepPaths::resolve(&|_| None, dir);
+        let binary = dir.join(format!("shep-{name}"));
+        std::fs::write(&binary, format!("#!/bin/sh\n{answer}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        crate::commands::shep_toml::ShepToml::edit(&paths.daemon_config, |cfg| {
+            cfg.adopt_dog(name, &binary);
+        })
+        .unwrap();
+        paths
     }
 
     /// `"/[/"` is one of the only three inputs the selector grammar rejects.
@@ -3357,7 +3401,19 @@ mod tests {
 
     /// Wall-clock tests, skipped by every CI job but the serial `slow` one.
     ///
-    /// The case below needs a real node to START AND EXIT inside the budget,
+    /// Two kinds live here now. The `restart` cases below ask a dog's binary
+    /// on disk what protocol it speaks, which means a real fork, exec and
+    /// exit inside `commands::dogs`'s one-second budget; a probe that runs
+    /// out of budget answers "unknown", and unknown is deliberately silent,
+    /// so contention turns those tests' subject into thin air rather than
+    /// into a failure with a cause in it. Measured 2026-08-31 on this
+    /// machine: a `/bin/sh` probe takes single-digit milliseconds idle,
+    /// 180-300ms alongside the ordinary suite, and over a second at
+    /// `--test-threads=64`. The product behaviour under that load is right
+    /// -- a busy machine loses the warning and still performs the restart --
+    /// but a test cannot assert it.
+    ///
+    /// The node case needs a real node to START AND EXIT inside the budget,
     /// which is a claim about how fast the machine is rather than about shep.
     /// At 200ms it failed on four CI runners at once (arm, macos, musl and
     /// the coverage job) while passing every local run: node took longer than
@@ -3370,6 +3426,317 @@ mod tests {
     /// See `HELD_PIPE_BUDGET` below for both ends of the number.
     mod slow {
         use super::*;
+
+        /// A shepherd that restarts whatever it is asked to and lists an empty
+        /// flock afterwards -- enough for `restart` to run to the end and print
+        /// its receipt, so a test asserting that stderr is EMPTY is asserting
+        /// about the dog check and not about a reply the CLI could not read.
+        fn answering_a_restart(request: &Request) -> Response {
+            match request {
+                Request::Restart { .. } => Response::Restarted(Vec::new()),
+                _ => Response::Flock(Vec::new()),
+            }
+        }
+
+        /// The answer a dog gives when its binary was built against a protocol
+        /// this shep does not speak -- G12 row 5's binary on disk.
+        fn stale_answer() -> String {
+            format!(
+                "echo 'shep-log-rotate 0.1.3'\necho 'shep-protocol: {}'",
+                shep_client::PROTOCOL_VERSION + 1
+            )
+        }
+
+        /// fails if the warning about a dog whose disk binary cannot talk to
+        /// this shepherd arrives after the restart that acts on it. The whole
+        /// point of row 5 is that the operator can still do something at this
+        /// moment and cannot afterwards, so a warning printed after the request
+        /// is a description of a state they are already in.
+        ///
+        /// The ordering is read off stderr rather than off a clock. The
+        /// shepherd here refuses the restart, so its refusal lands on the same
+        /// stream as the warning, and the two offsets say which ran first --
+        /// the same path-shaped signal `dogs.rs`'s
+        /// `a_name_collision_is_refused_before_vet_binary_ever_runs` uses, for
+        /// the same reason: there is no timing here to race.
+        ///
+        /// Mutation check: moving the `warn_of_a_dog_a_restart_would_break`
+        /// call below `request_each` reddens this on the offsets, with both
+        /// messages still present.
+        #[tokio::test]
+        async fn a_dog_whose_disk_binary_cannot_connect_is_warned_about_before_the_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = adopted_dog(dir.path(), "log-rotate", &stale_answer());
+            let sock = shep_client::testing::control_address(dir.path());
+            let (client, _daemon) =
+                fake_client_replying_err(&sock, RpcErrorCode::NotFound, "no such sheep").await;
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                    style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
+                };
+                let args = SelectorArgs {
+                    selectors: vec!["log-rotate".into()],
+                };
+                let _ = restart(&client, &mut streams, &paths, &args).await;
+            }
+
+            let text = String::from_utf8(err).unwrap();
+            let warning = text
+                .find("dog_binary_skew")
+                .unwrap_or_else(|| panic!("the restart must warn first: {text}"));
+            let refusal = text
+                .find("no such sheep")
+                .unwrap_or_else(|| panic!("the restart must still be attempted: {text}"));
+            assert!(
+                warning < refusal,
+                "the warning must reach the operator before the restart does: {text}"
+            );
+        }
+
+        /// fails if the warning does not carry both numbers and both ways out
+        /// of row 5. G12 gives that row two fixes and picks neither -- the
+        /// operator knows which of the two they meant -- so the message names
+        /// both and tells them what the restart just did.
+        ///
+        /// Mutation check: dropping either clause from the message reddens
+        /// this.
+        #[tokio::test]
+        async fn the_restart_warning_names_both_numbers_and_both_ways_out() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = adopted_dog(dir.path(), "log-rotate", &stale_answer());
+            let sock = shep_client::testing::control_address(dir.path());
+            let (client, _envelopes) = fake_client_answering(&sock, answering_a_restart).await;
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                    style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
+                };
+                let args = SelectorArgs {
+                    selectors: vec!["log-rotate".into()],
+                };
+                let _ = restart(&client, &mut streams, &paths, &args).await;
+            }
+
+            let text = String::from_utf8(err).unwrap();
+            let disk = (shep_client::PROTOCOL_VERSION + 1).to_string();
+            let shep = shep_client::PROTOCOL_VERSION.to_string();
+            assert!(
+                text.contains(&disk) && text.contains(&shep),
+                "the warning names both numbers: {text}"
+            );
+            assert!(
+                text.contains("Run a shep that speaks") && text.contains("reinstall the dog"),
+                "the warning names both ways out, and picks neither: {text}"
+            );
+            assert!(
+                text.contains("log-rotate"),
+                "the warning names the dog it is about: {text}"
+            );
+        }
+
+        /// fails if an ordinary restart of a healthy dog says anything at all.
+        /// This is the case every restart of every working flock is in, so a
+        /// line here is a line an operator learns to skip, and the one warning
+        /// that matters goes with it.
+        ///
+        /// Mutation check: warning on any answer rather than on a protocol this
+        /// shep does not speak reddens this.
+        #[tokio::test]
+        async fn a_dog_whose_disk_binary_is_current_restarts_in_silence() {
+            let dir = tempfile::tempdir().unwrap();
+            let answer = format!(
+                "echo 'shep-log-rotate 0.1.3'\necho 'shep-protocol: {}'",
+                shep_client::PROTOCOL_VERSION
+            );
+            let paths = adopted_dog(dir.path(), "log-rotate", &answer);
+            let sock = shep_client::testing::control_address(dir.path());
+            let (client, mut envelopes) = fake_client_answering(&sock, answering_a_restart).await;
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                    style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
+                };
+                let args = SelectorArgs {
+                    selectors: vec!["log-rotate".into()],
+                };
+                let _ = restart(&client, &mut streams, &paths, &args).await;
+            }
+
+            assert_eq!(
+                String::from_utf8(err).unwrap(),
+                "",
+                "a healthy dog restarts with nothing said about it"
+            );
+            assert_eq!(
+                envelopes.recv().await.unwrap().body,
+                Request::Restart {
+                    selector: SelectorSpec::Name("log-rotate".into()),
+                },
+                "and it is still restarted"
+            );
+        }
+
+        /// fails if a dog that answers nothing is warned about. Every dog that
+        /// existed when the `--version` contract was written is in this state,
+        /// and `docs/dogs.md` promises that not answering is never held against
+        /// one. Unknown is not stale: it is the state `adopt` records, and the
+        /// silence here is what reads it.
+        ///
+        /// Mutation check: treating an unreadable answer as a mismatch -- for
+        /// instance warning whenever the disk protocol is not exactly
+        /// `PROTOCOL_VERSION`, `None` included -- reddens this.
+        #[tokio::test]
+        async fn a_dog_that_answers_nothing_restarts_in_silence() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = adopted_dog(
+                dir.path(),
+                "log-rotate",
+                "echo 'shep-log-rotate does not understand --version' >&2\nexit 2",
+            );
+            let sock = shep_client::testing::control_address(dir.path());
+            let (client, mut envelopes) = fake_client_answering(&sock, answering_a_restart).await;
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                    style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
+                };
+                let args = SelectorArgs {
+                    selectors: vec!["log-rotate".into()],
+                };
+                let _ = restart(&client, &mut streams, &paths, &args).await;
+            }
+
+            assert_eq!(
+                String::from_utf8(err).unwrap(),
+                "",
+                "a dog that does not answer is not a dog that is stale"
+            );
+            assert_eq!(
+                envelopes.recv().await.unwrap().body,
+                Request::Restart {
+                    selector: SelectorSpec::Name("log-rotate".into()),
+                },
+                "and it is still restarted"
+            );
+        }
+
+        /// fails if a dog that answers a version but names no protocol is
+        /// warned about. It is the second shape of unknown, and it reaches a
+        /// different line from the dog that answers nothing at all: there IS an
+        /// answer here, it just does not say. `docs/dogs.md` puts both in the
+        /// same place -- "its protocol is simply unknown" -- and a shep that
+        /// guessed a number for the missing line would be warning on its own
+        /// guess.
+        ///
+        /// Mutation check: reading a missing protocol as some sentinel number
+        /// (`answer.protocol.unwrap_or(0)`) reddens this, and leaves the dog
+        /// that answers nothing at all green -- that one never gets this far.
+        #[tokio::test]
+        async fn a_dog_that_names_no_protocol_restarts_in_silence() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = adopted_dog(dir.path(), "log-rotate", "echo 'shep-log-rotate 0.1.3'");
+            let sock = shep_client::testing::control_address(dir.path());
+            let (client, mut envelopes) = fake_client_answering(&sock, answering_a_restart).await;
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                    style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
+                };
+                let args = SelectorArgs {
+                    selectors: vec!["log-rotate".into()],
+                };
+                let _ = restart(&client, &mut streams, &paths, &args).await;
+            }
+
+            assert_eq!(
+                String::from_utf8(err).unwrap(),
+                "",
+                "an unstated protocol is unknown, and unknown is not stale"
+            );
+            assert_eq!(
+                envelopes.recv().await.unwrap().body,
+                Request::Restart {
+                    selector: SelectorSpec::Name("log-rotate".into()),
+                },
+                "and it is still restarted"
+            );
+        }
+
+        /// fails if a built-in dog is probed. It cannot be stale on disk: the
+        /// shepherd runs `metrics` and `bark` as `<its own binary> dog <name>`,
+        /// so a built-in dog's binary IS the shepherd's and there is no second
+        /// thing to drift. The config here has a stale adopted dog in it as
+        /// well, so the silence is about this name rather than about an empty
+        /// `adopted_dogs`.
+        ///
+        /// Mutation check: making the lookup fall back to any adopted path when
+        /// the name is not in `adopted_dogs` reddens this, and leaves every
+        /// other test in this group green.
+        #[tokio::test]
+        async fn a_built_in_dog_is_never_asked_what_its_binary_speaks() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = adopted_dog(dir.path(), "log-rotate", &stale_answer());
+            crate::commands::shep_toml::ShepToml::edit(&paths.daemon_config, |cfg| {
+                cfg.enable_dog("metrics");
+            })
+            .unwrap();
+            let sock = shep_client::testing::control_address(dir.path());
+            let (client, mut envelopes) = fake_client_answering(&sock, answering_a_restart).await;
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            {
+                let mut streams = Streams {
+                    out: &mut out,
+                    err: &mut err,
+                    style: crate::style::Presentation::BARE,
+                    fmt: Format::Table,
+                };
+                let args = SelectorArgs {
+                    selectors: vec!["metrics".into()],
+                };
+                let _ = restart(&client, &mut streams, &paths, &args).await;
+            }
+
+            assert_eq!(
+                String::from_utf8(err).unwrap(),
+                "",
+                "a built-in dog has no binary of its own to be stale"
+            );
+            assert_eq!(
+                envelopes.recv().await.unwrap().body,
+                Request::Restart {
+                    selector: SelectorSpec::Name("metrics".into()),
+                },
+                "and it is still restarted"
+            );
+        }
 
         /// fails if a module that leaves a process on node's stdout is
         /// reported as a module shep killed. node itself exits here:
