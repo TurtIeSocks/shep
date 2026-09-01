@@ -107,10 +107,16 @@ renaming a published URL later.
 
 1. **Tag scheme `shep-v{version}`.** release-plz sets no `git_tag_name`, so
    it uses `{{package}}-v{{version}}`. Confirmed on the repository: every
-   release tag has this shape. Every Homebrew `url`, Scoop `url`, WinGet
-   `InstallerUrl`, Chocolatey `$url64` and `curl -LO` line embeds it, so the
-   shape is the whole claim and no version is named here on purpose. `gh
-   release list` if you want the current one.
+   release tag has this shape, and no version is named here on purpose, since
+   the shape is the whole claim. `gh release list` if you want the current
+   one.
+
+   Everything that downloads from a GitHub release embeds this string: the
+   Scoop `url`, the WinGet `InstallerUrl`, Chocolatey's `$url64` and any
+   `curl -LO` line. **Homebrew does not**, and this file used to list it here
+   anyway while arguing the opposite further down. The formula's `url` is
+   `static.crates.io/crates/shep/shep-{version}.crate`, which carries the bare
+   version and no tag, for the reasons the Homebrew section gives.
 2. **Archive name `shep-{target}.tar.gz`**, `.zip` on Windows.
    `taiki-e/upload-rust-binary-action` defaults its archive name to
    `$bin-$target`, so a `bin:` list of three would emit three archives per
