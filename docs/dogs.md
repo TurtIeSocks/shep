@@ -322,6 +322,109 @@ comparison, not a hand-wave: you were already trusting whatever you point
 a Flockfile's `script` at, and a third-party dog is held to no higher bar
 than that.
 
+## Answering `--version`
+
+A dog answers `--version` on stdout and exits 0. Two numbers come back,
+and they answer different questions:
+
+| what | answers | on a mismatch |
+|---|---|---|
+| the version on line 1 | which build of the dog this is | reported |
+| `shep-protocol` | whether this dog can handshake with this shepherd at all | it cannot connect until one side moves |
+
+The format is line-oriented text:
+
+```
+shep-log-rotate 0.1.3
+shep-protocol: 2
+```
+
+- Line 1 is `<name> <version>`. Shep takes the last whitespace-separated
+  field as the version and ignores the name, so a crate whose name differs
+  from the dog's registered name is fine. This is the line clap already
+  prints for free.
+- Every later line is `<key>: <value>`, one pair to a line.
+  `shep-protocol` carries, in decimal, the `PROTOCOL_VERSION` the binary
+  was compiled against.
+- Unknown keys, blank lines, and the order of the key lines are all
+  ignored. Keys beginning `shep-` are reserved, so a third number can get
+  its own line later without breaking a parser that predates it. Put keys
+  of your own under a prefix of your own.
+
+Answering is optional and stays optional. Dogs predating the convention
+are still adoptable, and a dog that does not answer is never refused for
+it: its protocol is simply unknown.
+
+Emitting it needs four lines and no dependency a dog does not already
+have:
+
+```rust
+if std::env::args().nth(1).as_deref() == Some("--version") {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    println!("shep-protocol: {}", shep_client::shep_core::protocol::PROTOCOL_VERSION);
+    return;
+}
+```
+
+Lines rather than JSON, because a human runs `--version` far more often
+than shep does, and because a stranger writing a dog in a language shep
+has never seen gets two `printf` calls right on the first try. Hand
+written JSON is where the quoting and the trailing comma go wrong, and
+nothing here nests.
+
+### Why the binary is the only thing that can answer
+
+A dog's crate version does not imply its protocol, and neither does
+knowing that somebody installed it:
+
+| how the dog was built | which `shep-core` | so which protocol |
+|---|---|---|
+| `cargo install <dog>` | re-resolved, newest compatible | current |
+| `cargo install --locked`, and most CI | whatever the shipped lockfile pins | whatever was pinned on publish day |
+
+Measured 2026-08-31: `shep-log-rotate` 0.1.3 installed plain compiled
+`shep-core` 0.1.24, so the packaged lockfile was ignored, while the same
+crate built `--locked` produced a protocol 1 dog. Both published dogs
+were shipping a lockfile pinning a protocol 1 `shep-core` that day, and
+both repositories' CI had been red on it for two days. The crate version
+was identical either way. That is the whole argument for asking the
+binary: nothing outside it knows.
+
+### The built-in dogs are outside this
+
+`metrics` and `bark` are not separate binaries. The shepherd starts them
+as `<its own binary> dog <name>`, so a built-in dog **is** the shep
+binary that spawned it and cannot skew from it on disk. There is no
+question here for a contract to answer:
+
+```
+$ shep --version
+shep 0.1.24
+$ shep dog metrics --version
+shep-dog 0.1.24
+```
+
+Neither prints a `shep-protocol` line, and that is not a gap to close.
+The protocol a built-in dog speaks is the shepherd's own, because it is
+the shepherd's binary.
+
+### What this does not catch
+
+Two dogs can agree on the protocol and still be different code.
+`RpcError` gained a public `daemon_version` field inside the 0.1.x range;
+its fields are public and it has no constructor, so every literal built
+outside `shep-client` stopped compiling while `PROTOCOL_VERSION` stood
+still. Protocol equality is necessary and not sufficient.
+
+Closing that is deferred, and the reason is that `--version` cannot close
+it. A break of that kind is source level: it lands when the dog is
+compiled, in the dog's own repository, and a dog nobody rebuilt keeps
+running. Shep has no table of which `shep-client` versions build against
+which daemon, and a version comparison standing in for one would report
+dogs that are fine. What catches it is the dog's own CI building against
+a current `shep-core`, which is where both published dogs' breakage was
+already visible and unread.
+
 ## When a dog dies
 
 If an enabled dog exhausts its own restart budget and lands on `Errored`,

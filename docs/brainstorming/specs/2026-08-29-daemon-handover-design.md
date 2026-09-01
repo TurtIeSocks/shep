@@ -576,13 +576,35 @@ Forcing protocol 1 needed `cargo update -p shep-core --precise 0.1.14`.
 Two consequences, in opposite directions:
 
 - Good: a plain `cargo install <dog>` genuinely does fix the protocol,
-  because shep-core resolves forward on every rebuild.
+  because shep-core resolves forward on every rebuild. Measured 2026-08-31:
+  it also ignores the packaged lockfile, so this holds even for a crate
+  that published one pinning an old shep-core. `cargo install --locked`,
+  and most CI, honour that lockfile and produce whatever protocol was
+  pinned on publish day.
 - Bad: nothing an operator can read tells them which protocol an installed
-  dog speaks. Its manifest does not say, its lockfile is not shipped, and
-  the answer depends on the day it was last compiled.
+  dog speaks. Its manifest does not say, the shipped lockfile may or may
+  not have applied, and the answer depends on the day it was last compiled.
 
-So `Hello.client_version`, which the daemon already receives and discards,
-is not a convenience. It is the only thing that knows.
+**Corrected 2026-08-31: this named the wrong field.** It closed with "So
+`Hello.client_version`, which the daemon already receives and discards, is
+not a convenience. It is the only thing that knows." Wrong twice. `Hello`
+carries `client_version: String` and `protocol: u32` as separate fields,
+and `server.rs` refuses on `hello.protocol`, never on the version. So the
+crate version is not what decides compatibility, and it is not the only
+thing that knows: the field that knows sits beside it.
+
+The finding survives the correction and gets sharper for it. Both fields
+reach the daemon only AFTER the dog connects, so neither helps an operator
+holding a binary that has not started yet. That is the gap, and G11 is what
+closes it: the binary is the only thing that can be asked before it runs.
+
+Both numbers matter, for different questions, which is why `Hello` has
+carried both since before any of this:
+
+| number | answers | on a mismatch |
+|---|---|---|
+| protocol | can this dog connect at all | hard: refuse |
+| crate version | is this dog the same build as everything else | soft: report |
 
 ### G10. Why `cargo install` can replace a running dog at all
 
