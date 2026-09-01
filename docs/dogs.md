@@ -459,14 +459,16 @@ because the wait for the process to exit and the wait for its text are
 bounded separately: a grandchild holding the pipe open can cost the second
 budget after a clean exit.
 
-A named restart briefly runs your dog twice. To read the binary on disk,
-shep runs it with `--version`, and a dog that does not recognise that flag
+A named restart can briefly run your dog twice. To read the binary on disk,
+shep runs it with `--version`, and a dog that does not RECOGNISE that flag
 ignores it and starts doing its ordinary job instead, with `SHEP_HOME`
 pointing at the live shepherd. So a rotator can rotate once and a bark dog
 can open a second subscription, for up to the budget above, before the
 process is killed.
 
-Every dog written before this contract is in that group. The trade is
+Only dogs that ignore the flag are affected. A dog that recognises
+`--version` and exits, even without naming a protocol, does no work: its
+protocol is unknown and nothing overlaps. The trade is
 deliberate: the command is about to restart that dog anyway, so the only
 question is whether it briefly overlaps itself, and the alternative is not
 asking at all, which is what let a stale dog sit `online` unnoticed. Adding

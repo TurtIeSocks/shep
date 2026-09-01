@@ -1463,6 +1463,25 @@ pub async fn restart(
     paths: &ShepPaths,
     args: &SelectorArgs,
 ) -> ExitCode {
+    restart_within(client, streams, paths, args, dogs::VERSION_BUDGET).await
+}
+
+/// [`restart`], against a caller-chosen budget for the dog probe below.
+///
+/// Exists for the same reason `dogs::vet_binary_within` does. A test here
+/// asks whether the warning fires, in what order, and what it says. None of
+/// those are questions about how long a probe may take, but at the
+/// production budget they all became one: a busy machine makes the probe
+/// time out, a timed-out probe answers unknown, and unknown is deliberately
+/// silent, so the test fails saying no warning fired. That is a true
+/// statement about the runner and an empty one about shep.
+pub async fn restart_within(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    args: &SelectorArgs,
+    probe: Duration,
+) -> ExitCode {
     let selectors = match parse_selectors(streams, &args.selectors) {
         Ok(selectors) => selectors,
         Err(code) => return code,
@@ -1470,7 +1489,7 @@ pub async fn restart(
     // Before `request_each`, deliberately, and this is the whole ordering
     // the spec asks for: a warning that arrives after the restart is a
     // description of a state the operator is already in.
-    dogs::warn_of_a_dog_a_restart_would_break(streams, paths, &selectors);
+    dogs::warn_of_a_dog_a_restart_would_break(streams, paths, &selectors, probe);
     let (procs, failure) = request_each(
         client,
         streams,
@@ -3425,12 +3444,24 @@ mod tests {
     /// spends every run is the price of a red board that means something.
     /// See `HELD_PIPE_BUDGET` below for both ends of the number.
     mod slow {
+        /// A probe budget no contention can exhaust.
+        ///
+        /// These tests ask whether the warning fires, in what order, and
+        /// what it says. At the production budget they were also asking how
+        /// busy the machine was, because a probe that times out answers
+        /// unknown and unknown is silent by design, so a loaded runner made
+        /// them fail reporting no warning. Thirty seconds is not a claim
+        /// about how long a probe should take; it is far enough above this
+        /// suite's contention that timing stops being one of the variables.
+        const PROBE_BUDGET: Duration = Duration::from_secs(30);
+
         use super::*;
 
         /// A shepherd that restarts whatever it is asked to and lists an empty
         /// flock afterwards -- enough for `restart` to run to the end and print
         /// its receipt, so a test asserting that stderr is EMPTY is asserting
         /// about the dog check and not about a reply the CLI could not read.
+        #[cfg(unix)]
         fn answering_a_restart(request: &Request) -> Response {
             match request {
                 Request::Restart { .. } => Response::Restarted(Vec::new()),
@@ -3440,6 +3471,7 @@ mod tests {
 
         /// The answer a dog gives when its binary was built against a protocol
         /// this shep does not speak -- G12 row 5's binary on disk.
+        #[cfg(unix)]
         fn stale_answer() -> String {
             format!(
                 "echo 'shep-log-rotate 0.1.3'\necho 'shep-protocol: {}'",
@@ -3463,6 +3495,21 @@ mod tests {
         /// Mutation check: moving the `warn_of_a_dog_a_restart_would_break`
         /// call below `request_each` reddens this on the offsets, with both
         /// messages still present.
+        // Unix only, and not because the behaviour is. The warning path is
+        // platform-neutral: it reads a config, spawns a probe, compares two
+        // numbers. The FIXTURE is not. `adopted_dog` writes a `#!/bin/sh`
+        // script, which Windows cannot execute, so the probe fails there and
+        // answers unknown.
+        //
+        // That is worse than a failure for three of these. A probe that
+        // answers unknown is deliberately silent, so the three
+        // `restarts_in_silence` tests PASSED on Windows by way of the
+        // fixture never running, which is the definition of a vacuous test.
+        // Only the two that require a warning failed and made the problem
+        // visible. Gating all of them says what is true: this fixture is a
+        // shell script, so these tests are about unix until somebody writes
+        // a portable fake dog.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_dog_whose_disk_binary_cannot_connect_is_warned_about_before_the_restart() {
             let dir = tempfile::tempdir().unwrap();
@@ -3483,7 +3530,7 @@ mod tests {
                 let args = SelectorArgs {
                     selectors: vec!["log-rotate".into()],
                 };
-                let _ = restart(&client, &mut streams, &paths, &args).await;
+                let _ = restart_within(&client, &mut streams, &paths, &args, PROBE_BUDGET).await;
             }
 
             let text = String::from_utf8(err).unwrap();
@@ -3506,6 +3553,7 @@ mod tests {
         ///
         /// Mutation check: dropping either clause from the message reddens
         /// this.
+        #[cfg(unix)]
         #[tokio::test]
         async fn the_restart_warning_names_both_numbers_and_both_ways_out() {
             let dir = tempfile::tempdir().unwrap();
@@ -3525,7 +3573,7 @@ mod tests {
                 let args = SelectorArgs {
                     selectors: vec!["log-rotate".into()],
                 };
-                let _ = restart(&client, &mut streams, &paths, &args).await;
+                let _ = restart_within(&client, &mut streams, &paths, &args, PROBE_BUDGET).await;
             }
 
             let text = String::from_utf8(err).unwrap();
@@ -3552,6 +3600,7 @@ mod tests {
         ///
         /// Mutation check: warning on any answer rather than on a protocol this
         /// shep does not speak reddens this.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_dog_whose_disk_binary_is_current_restarts_in_silence() {
             let dir = tempfile::tempdir().unwrap();
@@ -3575,7 +3624,7 @@ mod tests {
                 let args = SelectorArgs {
                     selectors: vec!["log-rotate".into()],
                 };
-                let _ = restart(&client, &mut streams, &paths, &args).await;
+                let _ = restart_within(&client, &mut streams, &paths, &args, PROBE_BUDGET).await;
             }
 
             assert_eq!(
@@ -3605,6 +3654,7 @@ mod tests {
         /// Mutation check: treating an unreadable answer as a mismatch -- for
         /// instance warning whenever the disk protocol is not exactly
         /// `PROTOCOL_VERSION`, `None` included -- reddens this.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_dog_that_answers_nothing_restarts_in_silence() {
             let dir = tempfile::tempdir().unwrap();
@@ -3628,7 +3678,7 @@ mod tests {
                 let args = SelectorArgs {
                     selectors: vec!["log-rotate".into()],
                 };
-                let _ = restart(&client, &mut streams, &paths, &args).await;
+                let _ = restart_within(&client, &mut streams, &paths, &args, PROBE_BUDGET).await;
             }
 
             assert_eq!(
@@ -3660,6 +3710,7 @@ mod tests {
         /// Mutation check: reading a missing protocol as some sentinel number
         /// (`answer.protocol.unwrap_or(0)`) reddens this, and leaves the dog
         /// that answers nothing at all green -- that one never gets this far.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_dog_that_names_no_protocol_restarts_in_silence() {
             let dir = tempfile::tempdir().unwrap();
@@ -3679,7 +3730,7 @@ mod tests {
                 let args = SelectorArgs {
                     selectors: vec!["log-rotate".into()],
                 };
-                let _ = restart(&client, &mut streams, &paths, &args).await;
+                let _ = restart_within(&client, &mut streams, &paths, &args, PROBE_BUDGET).await;
             }
 
             assert_eq!(
@@ -3710,6 +3761,7 @@ mod tests {
         /// Mutation check: making the lookup fall back to any adopted path when
         /// the name is not in `adopted_dogs` reddens this, and leaves every
         /// other test in this group green.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_built_in_dog_is_never_asked_what_its_binary_speaks() {
             let dir = tempfile::tempdir().unwrap();
@@ -3733,7 +3785,7 @@ mod tests {
                 let args = SelectorArgs {
                     selectors: vec!["metrics".into()],
                 };
-                let _ = restart(&client, &mut streams, &paths, &args).await;
+                let _ = restart_within(&client, &mut streams, &paths, &args, PROBE_BUDGET).await;
             }
 
             assert_eq!(

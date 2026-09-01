@@ -591,8 +591,10 @@ the dog against protocol 2, and restart it again`}</CodeBlock>
         subscription, before the process is killed.
       </p>
       <p>
-        Every dog written before this contract is in that group. The trade is
-        deliberate: the command is about to restart that dog anyway, so the
+        Only dogs that ignore the flag are affected. A dog that recognises
+        <code>--version</code> and exits, even without naming a protocol,
+        does no work: its protocol is unknown and nothing overlaps. The
+        trade is deliberate: the command is about to restart that dog anyway, so the
         only question is whether it briefly overlaps itself, and the
         alternative is not asking at all. Adding <code>--version</code> to
         your dog removes the overlap, since a dog that answers exits
