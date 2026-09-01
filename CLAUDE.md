@@ -409,10 +409,18 @@ looked populated and every workflow ran green. A `CNAME` file under
 `web/public` does not fix that second one, since Pages ignores it for an
 Actions-based deploy. See `.github/workflows/pages.yml`'s header.
 
-**Phase 4 is OPEN, not merged**, in a pull request: a dog answers `--version`
-with the protocol it was compiled against, `shep adopt` refuses a mismatch,
-and `shep restart <dog>` warns before bringing a dog back on a binary that
-cannot connect. Do not describe it as shipped.
+**Phase 4 merged on 2026-09-01.** A dog answers `--version` with the
+protocol it was compiled against, `shep adopt` refuses a mismatch, and
+`shep restart <dog>` warns before bringing a dog back on a binary that
+cannot connect. The contract is published in `docs/dogs.md`; answering is
+optional, and a dog that does not answer is adopted with its protocol
+unknown rather than refused, which is every dog written before it.
+
+Two things it deliberately does not do, both argued at their call sites. A
+DAEMON-initiated restart gets no warning, since the check is CLI-side, so a
+crash or an autorestart respawn still walks into G12 row 5 unannounced. And
+`Child::kill` does not reach descendants, so a probe's grandchild can
+outlive it; closing that needs a process group rather than a patch.
 
 **Verb count: 40 generated, 41 listed, and the difference is `help`.**
 `./web/scripts/generate-cli-reference.sh` prints its own number every time it
