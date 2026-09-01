@@ -54,7 +54,9 @@ Notes worth having before you pick:
   shep's own launchd job, and running both would leave two pointed at one
   shepherd.
 - On Windows `shep.exe` needs the Visual C++ redistributable, which Windows
-  does not carry. `scoop install extras/vcredist2022` if it will not start.
+  does not carry. If it will not start, `scoop bucket add extras` and then
+  `scoop install extras/vcredist2022`. The bucket has to be added first, since
+  a fresh Scoop has only `main`.
 - Every channel installs all three binaries, `shep`, `shep-runtime` and
   `shep-dev`, but only `shep` is put on your PATH by the Windows packages.
 

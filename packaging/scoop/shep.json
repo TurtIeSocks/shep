@@ -58,7 +58,10 @@
     },
     "notes": [
         "shep.exe needs the Visual C++ redistributable, which is not part of Windows.",
-        "If it will not start, install it with: scoop install extras/vcredist2022",
+        "If it will not start, run these two. A fresh Scoop has only the main bucket,",
+        "so the first line is not optional:",
+        "  scoop bucket add extras",
+        "  scoop install extras/vcredist2022",
         "shep startup is not built on Windows: boot-time supervision there needs a",
         "Service Control Manager service. Run shep start in your own session, or wrap",
         "shep runtime in NSSM or WinSW.",

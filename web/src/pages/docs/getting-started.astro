@@ -55,8 +55,10 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       <code>shep startup</code> installs shep's own launchd job, and running
       both would leave two pointed at one shepherd. On Windows,
       <code>shep.exe</code> needs the Visual C++ redistributable, which
-      Windows does not carry, so run
-      <code>scoop install extras/vcredist2022</code> if it will not start.
+      Windows does not carry. If it will not start, run
+      <code>scoop bucket add extras</code> and then
+      <code>scoop install extras/vcredist2022</code>. A fresh Scoop has only
+      the <code>main</code> bucket, so that first line is not optional.
       Scoop puts only <code>shep</code> on your PATH; <code>shep-runtime</code>
       and <code>shep-dev</code> are installed beside it without shims, since
       they are container entrypoints.
