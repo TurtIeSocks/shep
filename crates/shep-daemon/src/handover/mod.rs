@@ -1145,46 +1145,23 @@ pub fn record_launch_path() {
     let _ = LAUNCH_PATH.set(launch_path_from_argv());
 }
 
-/// The binary to `execv` for a handover, and never the running image.
+/// Resolves the executable path to use for a daemon handover.
 ///
-/// # Why this does not use [`std::env::current_exe`]
-///
-/// Everywhere else in this workspace resolves its own binary that way, and
-/// here it is wrong. `current_exe` answers "which image am I running?",
-/// while a handover needs "which file holds the version an operator just
-/// installed?". Those are the same path only until somebody upgrades, which
-/// is the one moment this function exists for.
-///
-/// On Linux `current_exe` reads `/proc/self/exe`, a symlink to the *inode*
-/// this process was executed from rather than to a path. `cargo install`
-/// and every package manager replace a binary by renaming a new file over
-/// it, which leaves the old inode unlinked and still open, so the readlink
-/// comes back as `"<path> (deleted)"`. Exec'ing that string fails, and
-/// stripping the suffix is a guess about text the kernel does not promise:
-/// a path may legitimately end that way. So a handover using `current_exe`
-/// on Linux cannot upgrade, which is the whole feature.
-///
-/// On macOS the same sequence returns a clean path that holds the NEW
-/// image, so the naive version passes every local test. That is worse than
-/// failing, not better, and it is why this function is written the way it
-/// is. Do not simplify it back.
-///
-/// So: prefer the path this process was launched from, recorded by
-/// [`record_launch_path`] before anything could move the current directory,
-/// and fall back to `current_exe` only when that is unusable. Both arms go
-/// through [`check_target`], because a fallback that skips validation is
-/// the same bug with an extra step.
-///
-/// A bare `argv[0]` with no separator in it (a `PATH` lookup, so `shep
-/// daemon` typed by hand rather than the CLI's own spawn, which passes an
-/// absolute path) is not resolvable from `argv[0]` alone and is left to the
-/// `current_exe` arm.
+/// Prefers the executable path recorded at launch and falls back to the
+/// current executable path when the recorded path is unavailable or invalid.
+/// Each candidate must identify a readable regular file suitable for execution.
 ///
 /// # Errors
-/// - [`io::ErrorKind::NotFound`] if neither candidate is a file on disk
-///   that is safe to exec. The message names what each one was, and what
-///   was wrong with it. The caller falls back to the stop-and-start arm, which
-///   restarts the flock but does reach the new binary.
+///
+/// Returns an error when no candidate provides a valid executable path.
+///
+/// # Examples
+///
+/// ```
+/// let target = exec_target()?;
+/// assert!(target.is_file());
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub fn exec_target() -> io::Result<PathBuf> {
     let recorded = LAUNCH_PATH.get().cloned().flatten();
     let current = std::env::current_exe();
@@ -1194,25 +1171,27 @@ pub fn exec_target() -> io::Result<PathBuf> {
     )
 }
 
-/// The validated-candidate loop [`exec_target`] runs, pulled out so a test
-/// can hand it a synthetic `" (deleted)"` path directly rather than needing
-/// a real Linux inode-unlink to produce one — `current_exe` cannot be made
-/// to return that string on any other platform, or by any safe means at
-/// all.
+/// Selects the first valid executable path from the provided candidates.
 ///
-/// `pub(crate)` rather than private: [`crate::dogs::dog_app`] resolves a
-/// built-in dog's own program through [`exec_target`] for the same reason a
-/// handover does (see that module's `builtin_program` for the argument),
-/// and its tests use this seam the same way `exec_target`'s own tests do.
+/// Missing candidates are skipped. If no candidate is valid, an `io::ErrorKind::NotFound`
+/// error is returned; an optional `current_exe` error is included in the diagnostic.
 ///
-/// Returns the first candidate in `candidates` that [`check_target`]
-/// accepts, in order; a `None` entry is skipped (the "nothing recorded
-/// yet" case). `current_exe_error` is folded into the diagnostic only —
-/// a `current_exe()` failure is not itself a path to validate.
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// let result = resolve_target(
+///     [Some(PathBuf::from("/missing/program")), None],
+///     None,
+/// );
+///
+/// assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+/// ```
 ///
 /// # Errors
-/// [`io::ErrorKind::NotFound`] if every candidate is `None` or refused.
-/// The message names each candidate tried and what was wrong with it.
+///
+/// Returns `io::ErrorKind::NotFound` when every candidate is missing or rejected.
 pub(crate) fn resolve_target(
     candidates: [Option<PathBuf>; 2],
     current_exe_error: Option<&io::Error>,

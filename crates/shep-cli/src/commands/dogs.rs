@@ -364,6 +364,14 @@ pub enum AdoptRefusal {
 }
 
 impl std::fmt::Display for AdoptRefusal {
+    /// Formats the refusal as a user-facing error message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let refusal = AdoptRefusal::Missing;
+    /// assert_eq!(refusal.to_string(), "no file exists at that path");
+    /// ```
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Missing => write!(f, "no file exists at that path"),
@@ -390,87 +398,55 @@ impl std::fmt::Display for AdoptRefusal {
 
 impl core::error::Error for AdoptRefusal {}
 
-/// Vets `path` as a dog binary, before anything is written to `shep.toml`.
+/// Validates a dog binary using the standard version-probe budget.
 ///
-/// Returns the ABSOLUTE path, canonicalized. The daemon spawns from
-/// `shep.toml` after a reboot, from whatever working directory the init
-/// system gave it; a relative path recorded here would resolve against the
-/// operator's shell and then fail to exec months later, with nothing to
-/// connect the failure to the `adopt` that caused it.
-///
-/// The first three checks run in this order — existence, file-ness,
-/// permission bit — each refusing before the next one runs, so a refusal
-/// never claims the wrong cause (`NotExecutable` for a path that does not
-/// exist would send an operator to `chmod` a file that is not there). The
-/// fourth, [`AdoptRefusal::WorldWritable`], is [`writability`]'s, and runs
-/// before the exec probe below rather than after it: the probe RUNS the
-/// binary, and a binary any user can rewrite is not one to run in order to
-/// find out whether it runs. The fifth,
-/// [`AdoptRefusal::WillNotExec`], is answered by actually trying it —
-/// spawned, and killed once it is confirmed either to have run or to be
-/// still running. The question is whether this kernel can exec this file,
-/// and the only authority on that is this kernel; reading a header instead
-/// would mean writing a second, partial loader that disagrees with the real
-/// one — on a fat Mach-O, on a shebang naming an absent interpreter, on a
-/// binary needing a missing dynamic library.
-///
-/// The sixth, [`AdoptRefusal::ProtocolMismatch`], rides on that same
-/// process: it is spawned with [`VERSION_FLAG`], so the run that proves the
-/// kernel can exec the file is the same run that answers what protocol it
-/// speaks. A dog that answers a protocol this shep does not speak is
-/// refused here rather than adopted into an entry that connects to nothing.
-/// A dog that answers nothing is adopted with [`VettedBinary::answer`]
-/// `None`: answering is optional and stays optional, so every dog written
-/// before the contract existed is still adoptable.
-///
-/// `home` and `name` are the ones this invocation resolved, not the ambient
-/// ones — the probe is handed exactly the environment the adopted dog will
-/// run under, so it is vetted against the daemon the operator named and
-/// under the section key `adopt` is about to record.
+/// The candidate must resolve to an executable file that the current shep can
+/// run. Its canonical absolute path is returned, and its optional protocol
+/// information is recorded when the candidate responds to `--version`.
 ///
 /// # Errors
-/// The refusal, which the caller renders — including
-/// [`AdoptRefusal::ProtocolMismatch`] when the candidate names a protocol
-/// this shep cannot speak. Nothing here is a shep fault, so none of these
-/// is an [`ExitCode::Internal`].
-/// Proves this kernel can exec `path`, and asks it what protocol it speaks.
 ///
-/// The candidate is spawned twice over: once bare, to prove the exec works
-/// at all rather than discovering it at supervision time, and once with
-/// `--version` to read the contract in `docs/dogs.md`. A group-writable
-/// binary is reported rather than refused, since an operator naming a path
-/// has already made that call.
+/// Returns [`AdoptRefusal`] if the path is invalid, cannot be executed, or
+/// declares a protocol that this shep cannot speak.
 ///
-/// # Errors
-/// [`AdoptRefusal`] when the path does not resolve, is not a file this
-/// kernel will exec, or answers a protocol this shep cannot talk to. A
-/// candidate that does not answer `--version` is NOT an error: its protocol
-/// is recorded as unknown, which `docs/dogs.md` promises is never a refusal.
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// let result = vet_binary(Path::new("path/to/dog"), Path::new("/home/user"), "dog");
+/// let _ = result;
+/// ```
 pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, AdoptRefusal> {
     vet_binary_within(path, home, name, VERSION_BUDGET)
 }
 
-/// [`vet_binary`], against a caller-chosen budget for the `--version` probe.
+/// Validates an adopted dog binary and probes its reported version within a time budget.
 ///
-/// Production has exactly one budget and [`vet_binary`] passes it. This
-/// exists for tests, and for a specific failure rather than for symmetry:
-/// the probe spawns a real child and bounds the wait on a wall clock, so
-/// every test reaching it inherits that bound. Measured under a full
-/// workspace run, a `/bin/sh` candidate takes 180 to 300ms and over a
-/// second at high thread counts, against a [`VERSION_BUDGET`] of one. A
-/// test asking a question that has nothing to do with timing then fails
-/// because the machine was busy, which is a test reporting on the runner
-/// rather than on shep.
-///
-/// So a test that cares about the budget passes a small one and a test that
-/// does not passes a generous one, and neither is at the mercy of what else
-/// is running. The alternative considered and rejected was moving them all
-/// into `mod slow`, which would take roughly twenty tests out of the inner
-/// loop to fix a problem none of them are about.
+/// The returned path is canonicalized. The binary must be a regular executable file and
+/// must not violate the applicable writability checks. A stated protocol version that
+/// differs from the current shep protocol is rejected.
 ///
 /// # Errors
-/// The same [`AdoptRefusal`] set [`vet_binary`] raises, with the `--version`
-/// probe bounded by `budget` rather than by [`VERSION_BUDGET`].
+///
+/// Returns an [`AdoptRefusal`] when the path is invalid, permissions are unsafe, the
+/// version probe fails, or the binary reports an incompatible protocol.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// let path = std::env::current_exe().unwrap();
+/// let vetted = vet_binary_within(
+///     &path,
+///     &std::env::temp_dir(),
+///     "example",
+///     Duration::from_secs(1),
+/// );
+///
+/// assert!(vetted.is_ok());
+/// ```
 pub fn vet_binary_within(
     path: &Path,
     home: &Path,
@@ -529,35 +505,17 @@ pub fn vet_binary_within(
     })
 }
 
-/// Runs `path` with [`VERSION_FLAG`] and reads what it answers, within
-/// [`VERSION_BUDGET`].
+/// Builds the restricted environment used when probing a dog binary.
 ///
-/// `Ok(None)` is an UNKNOWN protocol and is never a fault: silence, output
-/// shep cannot read, a run that failed, and a run still going when the
-/// budget ran out all arrive here the same way. Answering is optional and stays
-/// optional, so every dog written before the contract existed reads as
-/// unknown rather than as broken.
+/// # Examples
 ///
-/// Two callers ask the same binary the same question for different reasons.
-/// [`vet_binary`] asks a candidate nobody has adopted yet;
-/// [`warn_of_a_dog_a_restart_would_break`] asks a dog that has been adopted
-/// for months, because the answer lives in the binary and the binary
-/// changes on disk with nothing watching (G12 row 5). Neither writes the
-/// answer down.
+/// ```
+/// let environment = probe_env();
+/// assert!(environment.iter().any(|(key, _)| key == "PATH"));
+/// ```
 ///
-/// # Errors
-/// [`AdoptRefusal::WillNotExec`], and only that: nothing here judges the
-/// answer it read, so [`AdoptRefusal::ProtocolMismatch`] stays
-/// The environment the probe runs a candidate with: what the daemon would
-/// give the dog, and nothing else.
-///
-/// Mirrors `shep_daemon::assemble::base_env` rather than importing it,
-/// because that function is private to a crate the CLI does not otherwise
-/// reach into for this. The lists are duplicated and that is a real cost:
-/// if the daemon's allowlist grows, this one has to follow, or a candidate
-/// is vetted under conditions its supervised run will not have.
-/// `a_probe_runs_with_the_daemons_environment_and_not_the_operators` is the
-/// test that fails when they disagree about the two variables that matter.
+/// The environment includes `PATH` and platform-specific variables available to
+/// supervised dogs, while excluding unrelated operator environment variables.
 fn probe_env() -> Vec<(String, String)> {
     #[cfg(unix)]
     const INHERITED: &[&str] = &["HOME", "USER", "LANG", "TZ"];
@@ -594,8 +552,23 @@ fn probe_env() -> Vec<(String, String)> {
     env
 }
 
-/// [`vet_binary`]'s to raise. A caller that only wants an answer treats the
-/// error as one more way of not getting one.
+/// Probes a candidate dog for its version and protocol information.
+///
+/// The candidate receives `--version` in the daemon-like environment. The probe
+/// is bounded by `budget`; failures, timeouts, silence, and unrecognized output
+/// produce `None`, while process-start failures produce an [`AdoptRefusal`].
+///
+/// # Examples
+///
+/// ```no_run
+/// let answer = ask_version(
+///     std::path::Path::new("/path/to/dog"),
+///     std::path::Path::new("/path/to/home"),
+///     "example",
+///     std::time::Duration::from_secs(1),
+/// )?;
+/// # Ok::<(), AdoptRefusal>(())
+/// ```
 fn ask_version(
     path: &Path,
     home: &Path,
@@ -795,16 +768,19 @@ pub struct DogVersion {
     pub protocol: Option<u32>,
 }
 
-/// Parses the format `docs/dogs.md` publishes: `<name> <version>` on line
-/// 1, then `<key>: <value>` lines.
+/// Parses a dog's version and optional `shep-protocol` declaration.
 ///
-/// `None` when there is no line 1 to read a version from. Everything past
-/// that is tolerated rather than refused -- unknown keys, blank lines, key
-/// order, and a `shep-protocol` that is not a number -- because a shep that
-/// refuses a dog over the shape of text the dog never promised to print is
-/// refusing on its own guess. The strictness is all in the other direction:
-/// only an exact [`SHEP_PROTOCOL_KEY`] carrying a decimal is believed, and
-/// only a believed protocol can refuse.
+/// Unknown keys, blank lines, and invalid protocol values are tolerated. Only a
+/// numeric value associated with the exact `shep-protocol` key is recorded.
+///
+/// # Examples
+///
+/// ```
+/// let answer = parse_version_answer("shep-dog 1.2.3\nshep-protocol: 7");
+/// assert_eq!(answer.unwrap().protocol, Some(7));
+/// ```
+///
+/// Returns `None` when the input does not contain a version line.
 fn parse_version_answer(text: &str) -> Option<DogVersion> {
     let mut lines = text.lines();
     let version = lines.next()?.split_whitespace().next_back()?.to_string();
@@ -819,17 +795,26 @@ fn parse_version_answer(text: &str) -> Option<DogVersion> {
     Some(DogVersion { version, protocol })
 }
 
-/// Drains `stdout` to end on a thread, handing the text back through the
-/// returned channel.
+/// Collects a child process's standard output without blocking the caller.
 ///
-/// A thread rather than a read on this one, because every read here has to
-/// be bounded and none of them can be. Reading before the candidate exits
-/// blocks until it writes; reading after it exits blocks for as long as
-/// anything the candidate spawned still holds the inherited pipe open,
-/// which a candidate shep is vetting precisely because it does not trust it
-/// could do forever. On the timeout path the thread is left to end on its
-/// own when the pipe closes: it holds nothing but a `String` and a sender,
-/// and `adopt` is a one-shot command.
+/// Invalid UTF-8 is treated as unreadable output and produces an empty string.
+///
+/// # Examples
+///
+/// ```
+/// use std::process::{Command, Stdio};
+///
+/// let mut child = Command::new("echo")
+///     .arg("hello")
+///     .stdout(Stdio::piped())
+///     .spawn()
+///     .unwrap();
+/// let output = read_in_background(child.stdout.take().unwrap())
+///     .recv()
+///     .unwrap();
+///
+/// assert_eq!(output.trim(), "hello");
+/// ```
 fn read_in_background(mut stdout: std::process::ChildStdout) -> Receiver<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -843,24 +828,21 @@ fn read_in_background(mut stdout: std::process::ChildStdout) -> Receiver<String>
     rx
 }
 
-/// Waits, bounded by [`VERSION_BUDGET`], for `child` to answer.
+/// Determines whether a child produced a valid version response within the given time budget.
 ///
-/// Twice that is the worst case rather than once, because the wait for the
-/// exit and the wait for the text the reader thread collected are bounded
-/// separately. Only a child that has ALREADY exited successfully reaches
-/// the second one, so its text is written and its own end of the pipe is
-/// closed; that bound is there for a grandchild still holding the inherited
-/// pipe open, not for anything the dog itself is doing.
+/// A response is accepted only when the child exits successfully and provides readable
+/// version output. Missing output, timeouts, execution failures, nonzero exits, and
+/// unparseable output produce `None`.
 ///
-/// `None` -- an unknown protocol, never a refusal -- for every way of not
-/// answering: no pipe to read, a run that did not exit inside the budget, a
-/// run that exited non-zero, or output with no line 1.
+/// # Examples
 ///
-/// The non-zero exit is not a technicality. `docs/dogs.md` says a dog
-/// answers on stdout AND exits 0, so lines printed by a run that then
-/// failed are not an answer -- and believing them would let a candidate
-/// refuse its own adopt with a protocol number from a code path that did
-/// not work.
+/// ```
+/// use std::process::Command;
+/// use std::time::Duration;
+///
+/// let mut child = Command::new("true").spawn().unwrap();
+/// assert!(version_answer(&mut child, None, Duration::from_secs(1)).is_none());
+/// ```
 fn version_answer(
     child: &mut Child,
     reading: Option<Receiver<String>>,
@@ -1024,13 +1006,14 @@ fn fail_adopt(streams: &mut Streams<'_>, path: &Path, refusal: &AdoptRefusal) ->
 /// [`ExitCode::code_str`]'s: `adopt` still succeeds here.
 const GROUP_WRITABLE_NOTICE: &str = "group_writable";
 
-/// Warns that `path` is group-writable, and lets the adopt proceed.
+/// Emits a notice when a candidate binary is writable by its group, allowing adoption to continue.
 ///
-/// Not an error and not a refusal — see [`writability`] for why this mode
-/// is warned about rather than refused. It goes out through
-/// [`emit_notice`] rather than [`emit_error`] for exactly the reason that
-/// function exists: a `--format json` consumer must be able to tell a
-/// diagnostic on a successful command from a failure.
+/// # Examples
+///
+/// ```no_run
+/// warn_group_writable(&mut streams, path);
+/// ```
+fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
 fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
     let message = format!(
         "{} is writable by its group; anyone in that group can replace the binary \
@@ -1044,19 +1027,17 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
 /// [`GROUP_WRITABLE_NOTICE`], and like it not a failure: `adopt` succeeded.
 const DOG_VERSION_NOTICE: &str = "dog_version";
 
-/// Tells the operator what the candidate answered.
+/// Reports a dog's version and whether it states a shep protocol.
 ///
-/// Only the version is reported, never compared -- see [`vet_binary`] for
-/// why comparing a third-party dog's crate version with shep's own would
-/// report every dog that exists. The protocol is not reported when it
-/// matches, because by then it has already decided the only thing it can
-/// decide; it is reported when it is missing, because that is the operator's
-/// one chance to hear that this dog's compatibility is unknown and will be
-/// found out at a handshake instead.
+/// # Examples
 ///
-/// A dog that answered nothing at all gets no notice. Every dog that
-/// existed when this contract was written is in that group, and a line on
-/// stderr for each of them would be noise about the ordinary case.
+/// ```ignore
+/// report_dog_version(&mut streams, "example", &DogVersion {
+///     version: "1.2.3".into(),
+///     protocol: Some(1),
+/// });
+/// ```
+fn report_dog_version(streams: &mut Streams<'_>, name: &str, answer: &DogVersion) {
 fn report_dog_version(streams: &mut Streams<'_>, name: &str, answer: &DogVersion) {
     let message = match answer.protocol {
         Some(protocol) => format!(
@@ -1078,57 +1059,23 @@ fn report_dog_version(streams: &mut Streams<'_>, name: &str, answer: &DogVersion
 /// them not a failure: the restart still happens.
 const DOG_BINARY_SKEW_NOTICE: &str = "dog_binary_skew";
 
-/// Warns, before `restart` sends anything, about a dog whose binary ON DISK
-/// speaks a protocol this shepherd does not -- G12's row 5.
+/// Warns when a named adopted dog's on-disk binary reports an incompatible protocol.
 ///
-/// Row 5 is the one state in that matrix where nothing is wrong yet. The
-/// running dog is connected and working, the binary it would come back from
-/// is not, and the two only meet at the next restart, which may be days
-/// away and for an unrelated reason. This is the moment that restart
-/// happens, so this is where the operator can still be told.
+/// Probes only named adopted dogs. Unknown or unavailable version information is
+/// silent, and a mismatch produces a warning without preventing the restart.
 ///
-/// **A warning, never a refusal.** They asked for the restart, the binary on
-/// disk may be exactly what they just installed, and refusing an explicit
-/// command on a prediction is a worse failure than letting them watch it
-/// happen with the warning in hand. G12 row 5's fix names two ways out and
-/// picks neither, so the message does the same.
+/// # Examples
 ///
-/// **Silence is the answer for everything else.** A dog that does not answer
-/// [`VERSION_FLAG`] is unknown, not stale -- that is the state `adopt`
-/// records under G11's "recorded as unknown", and this is its reader. Every
-/// dog that existed when the contract was written is in that group, so a
-/// warning there would be a line on stderr for the ordinary case, which is
-/// how an operator learns to skip the one that matters.
+/// ```no_run
+/// warn_of_a_dog_a_restart_would_break(&mut streams, &paths, &selectors, budget);
+/// ```
 ///
-/// # A built-in dog cannot reach this, by construction
+/// # Parameters
 ///
-/// The only way in is a path out of `[daemon] adopted_dogs`. A built-in dog
-/// has no entry there ([`dog_source`]), and could not use one: the shepherd
-/// runs `metrics` and `bark` as `<its own binary> dog <name>`, so a built-in
-/// dog's binary on disk IS the shepherd's, and there is no second thing to
-/// drift. There is no branch here skipping them, and none to forget to
-/// write.
-///
-/// # Why only a `Name` selector
-///
-/// The daemon includes a dog only for a selector that NAMED it
-/// (`ProcessSelector::is_exact`), so `restart all` and a `/regex/` sweep
-/// pass every dog by and there is nothing for this to warn about. That
-/// leaves `Id`, which is exact and could name a dog: it is not probed,
-/// because the CLI would have to ask the daemon what that id is called
-/// before it could look up a path, and a round trip is a lot to spend on
-/// the rarer way of typing the same thing. An operator who restarts a dog
-/// by id gets the restart and no warning.
-/// Takes the probe budget rather than reading [`VERSION_BUDGET`], for the
-/// same reason [`vet_binary_within`] exists. Both callers have a budget in
-/// hand, so there is no wrapper to add: `restart` passes the production
-/// one, and a test passes one that contention cannot exhaust.
-///
-/// A test here asks whether the warning fires, in what order, and what it
-/// says. At the production budget it was also asking how busy the machine
-/// was, because a probe that times out answers unknown, and unknown is
-/// deliberately silent, so the test failed reporting that no warning fired.
-/// True about the runner, empty about shep.
+/// * `streams` - Output streams used to display warnings.
+/// * `paths` - Shepherd paths, including the daemon configuration and home directory.
+/// * `selectors` - Dog selectors associated with the restart.
+/// * `budget` - Maximum duration allowed for each binary version probe.
 pub fn warn_of_a_dog_a_restart_would_break(
     streams: &mut Streams<'_>,
     paths: &ShepPaths,
@@ -1192,20 +1139,18 @@ pub fn warn_of_a_dog_a_restart_would_break(
     }
 }
 
-/// `shep adopt <path> [--name <name>]`: vets a binary shep has never seen,
-/// records it, and starts it if a shepherd is running.
+/// Adopts a binary as a dog and starts it when a shepherd is available.
 ///
-/// `args.path` is resolved before anything else ([`resolve_adopt_path`]),
-/// and `args.name` defaults to the resolved binary's file stem
-/// ([`default_dog_name`]) when omitted -- a defaulted name goes through the
-/// same [`collides_with_a_verb`] refusal an explicit `--name` would.
+/// The path is resolved and the dog name is checked for command collisions before
+/// the binary is vetted. Successful adoption records the canonical binary path;
+/// an unavailable shepherd does not prevent the configuration change.
 ///
-/// **The collision check runs before [`vet_binary`], not after.**
-/// `vet_binary` spawns the candidate to prove this kernel can exec it, so
-/// checking the name first means a refused name never gets that binary run
-/// at all -- a refusal that already ran the thing it refuses is not a
-/// refusal. `default_dog_name` needs only the resolved `candidate`, never
-/// the vetted/canonicalized path, so nothing forces the other order.
+/// # Examples
+///
+/// ```no_run
+/// let exit_code = adopt(&mut streams, &paths, &args).await;
+/// assert!(exit_code.success());
+/// ```
 pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArgs) -> ExitCode {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let path_var = std::env::var_os("PATH");

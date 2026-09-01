@@ -118,6 +118,16 @@ impl fmt::Display for DogError {
 }
 
 impl core::error::Error for DogError {
+    /// Provides the underlying error for error variants that wrap one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::error::Error;
+    ///
+    /// let error = DogError::Io(std::io::Error::other("read failed"));
+    /// assert!(error.source().is_some());
+    /// ```
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::NoBinary(err) | Self::Io(err) => Some(err),
@@ -126,93 +136,60 @@ impl core::error::Error for DogError {
     }
 }
 
-/// The program a built-in dog is spawned as: this binary's own resolved
-/// path.
+/// Resolves the executable path used to launch built-in dogs.
 ///
-/// # Why `handover::exec_target` and not `std::env::current_exe()`, on unix
+/// On Unix, prefers the daemon's recorded launch target so respawns remain
+/// executable after the running binary has been replaced.
 ///
-/// This used to call `current_exe` directly, and on Linux that is wrong for
-/// exactly the reason `handover::exec_target`'s own doc gives for
-/// a handover: `current_exe` reads `/proc/self/exe`, a symlink to the
-/// *inode* this process was executed from. A package manager replaces the
-/// shepherd's binary by renaming a new file over it, which leaves the old
-/// inode unlinked and still open, so `current_exe` comes back
-/// `"<path> (deleted)"`. No handover has to be in flight for that to bite —
-/// a built-in dog crashing, autorestarting, or `shep restart metrics` after
-/// such a rename hit it on the very next respawn, and the string cannot be
-/// exec'd.
+/// # Errors
 ///
-/// `exec_target`'s own doc frames its candidate order — the recorded
-/// launch path preferred over `current_exe` — as chosen for an exec that
-/// must reach the binary an operator just installed. A dog respawn does
-/// not share that requirement in the same words; it only needs a file it
-/// can exec, not specifically the newest one. The order still serves it
-/// here, for a narrower reason: after a rename, the recorded launch path
-/// is exactly the candidate that still resolves to a file, while
-/// `current_exe` is the one that comes back `" (deleted)"`. Reusing
-/// `exec_target` also keeps one place in this crate that decides "which
-/// file holds my own binary" instead of two, and the one already there
-/// validates every candidate before handing it to a spawn rather than
-/// trusting either blindly.
+/// Returns [`DogError::NoBinary`] if no executable path can be resolved.
 ///
-/// One consequence is worth stating rather than discovering later: if the
-/// shepherd's own binary has been replaced on disk but the running process
-/// has not yet reloaded or handed over, a dog respawned this way can run
-/// NEWER code than the shepherd currently has loaded in memory. That is a
-/// version-skew question for the `--version` contract this phase's later
-/// tasks add, not a spawn failure — this function's only job is to never
-/// hand a dog a path that cannot be exec'd at all.
+/// # Examples
 ///
-/// # Windows resolves it the plain way, and that is not a shortcut
-///
-/// `handover` is `#[cfg(unix)]` because `execve` and raw descriptor numbers
-/// have no Windows equivalent, so `exec_target` is not reachable there and
-/// this module does not compile for a Windows target if it asks for one.
-/// The guard would also have nothing to catch. `" (deleted)"` is what Linux
-/// puts in `/proc/self/exe` for an unlinked inode, and the rename that
-/// creates one cannot happen on Windows in the first place: the filesystem
-/// refuses to replace a running executable, which is why upgrading shep
-/// there means stopping it. So Windows keeps `current_exe`, which answers
-/// the same question correctly on a platform where the failure mode does
-/// not exist.
+/// ```
+/// let program = builtin_program().expect("the daemon executable should resolve");
+/// assert!(program.is_file());
+/// ```
 #[cfg(unix)]
 fn builtin_program() -> Result<PathBuf, DogError> {
     crate::handover::exec_target().map_err(DogError::NoBinary)
 }
 
-/// The program a built-in dog is spawned as, on a platform with no
-/// handover. See the unix version above for why the two differ.
-#[cfg(windows)]
+/// Resolves the path to the currently running daemon executable.
+///
+/// # Examples
+///
+/// ```
+/// let program = builtin_program().unwrap();
+/// assert!(program.is_absolute());
+/// ```
 fn builtin_program() -> Result<PathBuf, DogError> {
     std::env::current_exe().map_err(DogError::NoBinary)
 }
 
-/// The app config the daemon spawns `spec` from.
+/// Constructs the supervised application configuration for a dog.
 ///
-/// A built-in dog is `<this binary> dog <name>`; an adopted one is the
-/// operator's binary with no arguments. Either way the child's environment
-/// carries exactly two things it did not already need in order to exec:
-/// `SHEP_HOME`, which is how every client locates the socket, and
-/// `SHEP_DOG_NAME`, which is the name this dog was registered under and so
-/// the `name` its `Request::DogConfig` has to carry. No `[dog.<name>]`
-/// value is ever placed here — a dog asks for its section over the socket,
-/// because the environment is readable from the process table, inherited by
-/// every child, and captured into crash dumps. The section's KEY is not one
-/// of its values, and a dog that cannot learn it cannot ask for the section
-/// at all.
-///
-/// `autorestart` and the restart budget are left at their defaults: a dog
-/// is supervised exactly as a sheep is.
+/// Built-in dogs run this daemon with `dog <name>`. Adopted dogs run their
+/// configured binary without arguments. The resulting environment includes
+/// `SHEP_HOME` and `SHEP_DOG_NAME`; dog configuration is retrieved over the
+/// control socket rather than placed in the environment. Restart behavior and
+/// budgets use their default values.
 ///
 /// # Errors
-/// - [`DogError::NoBinary`] — a built-in dog has no program to run, either
-///   because [`std::env::current_exe`] itself failed or because the
-///   `builtin_program` helper above refused every candidate it found (see
-///   its doc for why that includes a Linux `current_exe` answer naming a
-///   deleted inode).
-/// - [`DogError::UnsupportedSource`] — the source is a kind this build does
-///   not know how to spawn.
-/// - [`DogError::Config`] — the assembled config failed `normalize`.
+///
+/// Returns [`DogError::NoBinary`] when a built-in dog executable cannot be
+/// resolved, [`DogError::UnsupportedSource`] for unsupported dog sources, or
+/// [`DogError::Config`] when the configuration cannot be normalized.
+///
+/// # Examples
+///
+/// ```
+/// # fn example(spec: &DogSpec, paths: &ShepPaths) -> Result<(), DogError> {
+/// let _app = dog_app(spec, paths)?;
+/// # Ok(())
+/// # }
+/// ```
 pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogError> {
     let (script, args) = match &spec.source {
         DogSource::BuiltIn => (

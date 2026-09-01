@@ -1423,7 +1423,15 @@ async fn start_one(
     failure.unwrap_or(ExitCode::Success)
 }
 
-/// Stops the sheep matching `args.selector`.
+/// Stops processes selected by the provided selectors.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) {
+/// let _status = stop(client, streams, args).await;
+/// # }
+/// ```
 pub async fn stop(client: &Client, streams: &mut Streams<'_>, args: &SelectorArgs) -> ExitCode {
     let selectors = match parse_selectors(streams, &args.selectors) {
         Ok(selectors) => selectors,
@@ -1466,15 +1474,29 @@ pub async fn restart(
     restart_within(client, streams, paths, args, dogs::VERSION_BUDGET).await
 }
 
-/// [`restart`], against a caller-chosen budget for the dog probe below.
+/// Restarts selected processes after checking whether adopted dog binaries are compatible.
 ///
-/// Exists for the same reason `dogs::vet_binary_within` does. A test here
-/// asks whether the warning fires, in what order, and what it says. None of
-/// those are questions about how long a probe may take, but at the
-/// production budget they all became one: a busy machine makes the probe
-/// time out, a timed-out probe answers unknown, and unknown is deliberately
-/// silent, so the test fails saying no warning fired. That is a true
-/// statement about the runner and an empty one about shep.
+/// The compatibility warning is emitted before restart requests are sent. Restart failures,
+/// including processes that remain errored, produce an appropriate exit code and suppress
+/// normal output.
+///
+/// # Arguments
+///
+/// * `probe` — Maximum duration allowed for checking adopted dog binaries.
+///
+/// # Examples
+///
+/// ```
+/// # async fn example(
+/// #     client: &Client,
+/// #     streams: &mut Streams<'_>,
+/// #     paths: &ShepPaths,
+/// #     args: &SelectorArgs,
+/// # ) {
+/// let probe = std::time::Duration::from_secs(20);
+/// let _ = restart_within(client, streams, paths, args, probe).await;
+/// # }
+/// ```
 pub async fn restart_within(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -3469,8 +3491,14 @@ mod tests {
             }
         }
 
-        /// The answer a dog gives when its binary was built against a protocol
-        /// this shep does not speak -- G12 row 5's binary on disk.
+        /// Produces a response identifying a protocol version newer than this client supports.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// let response = stale_answer();
+        /// assert!(response.contains("shep-protocol:"));
+        /// ```
         #[cfg(unix)]
         fn stale_answer() -> String {
             format!(

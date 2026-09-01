@@ -783,56 +783,24 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
     }
 }
 
-/// Parses, resolves `$SHEP_HOME` for the verbs that need it, and dispatches
-/// to the verb's own module.
+/// Dispatches a parsed CLI command using the resolved presentation settings.
 ///
-/// Every command receives an already-connected client; no verb module
-/// itself connects or autostarts. `Start` and `Muster` are the two
-/// exceptions at this layer: both dispatch through
-/// [`connect_or_spawn_client`], which autostarts a daemon if nothing
-/// answers — for `Start` because starting a sheep against a dead daemon
-/// means bringing one up first, and for `Muster` because that is the whole
-/// point of the verb: assembling the flock from the saved roll has to work
-/// against a freshly booted machine, where nothing is listening yet. Every
-/// other client-taking arm goes through [`connect_client`], which never
-/// spawns — `shep stop` against a dead daemon must not launch a supervisor
-/// in order to tell it to stop nothing.
+/// Commands that require a shepherd connect through the appropriate client
+/// path, while local and long-running commands are handled directly.
 ///
-/// `resolve_paths` runs only for the arms that actually touch the socket.
-/// `Completions` and `Daemon` never do — shell completion generation is
-/// exactly what runs in the minimal environments (package build scripts,
-/// container images, shell rc files) that have no `$HOME` at all, and the
-/// re-exec'd `daemon` subcommand resolves its own paths independently, in
-/// [`run_daemon_command`], rather than through this shared gate. Requiring
-/// a resolvable home for either was a bug, not a deliberate restriction.
+/// # Examples
 ///
-/// `Startup` and `Unstartup` are dispatched from the same early block, for
-/// a different reason: they resolve their own `$SHEP_HOME` from the TARGET
-/// user's passwd entry rather than from this process's environment, so the
-/// shared gate would both impose a requirement they do not have and hand
-/// them the wrong answer under `sudo`, which resets `$HOME` to root's.
+/// ```no_run
+/// let exit_code = run(cli, style).await;
+/// assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
+/// ```
 ///
-/// `Dog` DOES go through this shared gate, unlike `Completions`/`Daemon`: a
-/// dog resolves `$SHEP_HOME` exactly the way every ordinary verb does (the
-/// daemon sets it, alongside `SHEP_DOG_NAME`, as the two environment
-/// variables a dog's child inherits).
-/// It is still dispatched immediately after, ahead of the locked-streams
-/// block below, for the unrelated reason that block's own comment gives —
-/// it runs until signalled, so it may not hold a stdout/stderr guard for a
-/// process lifetime.
+/// `cli` contains the parsed command and global options. `style` specifies the
+/// presentation settings used for command output.
 ///
-/// `style` is [`run_argv`]'s resolved [`style::Presentation`], whose level
-/// is already forced to [`style::StyleLevel::Bare`] there if the hard rule
-/// applies — every `Streams` this function builds carries it unchanged.
-/// `Commands::Style`
-/// is the one exception: with no level to set, its report reads
-/// [`resolve_style`] again, unforced, because it answers a different
-/// question ("what is configured") than every other arm's `style` field
-/// does ("how do I render this table"). With a level, it writes
-/// `shep.toml` through [`ShepToml::set_style_level`] and then re-resolves
-/// the same way, so it can tell the operator whether the value it just
-/// wrote is what will actually run or whether `--style`/`$SHEP_STYLE`
-/// still outranks it.
+/// # Returns
+///
+/// The process exit code produced by the dispatched command.
 async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
     let fmt = cli.global.format;
     // Resolved once, here, rather than at each of the seventeen call sites
