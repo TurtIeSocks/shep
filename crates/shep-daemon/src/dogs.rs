@@ -129,10 +129,10 @@ impl core::error::Error for DogError {
 /// The program a built-in dog is spawned as: this binary's own resolved
 /// path.
 ///
-/// # Why [`crate::handover::exec_target`] and not `std::env::current_exe()`
+/// # Why `handover::exec_target` and not `std::env::current_exe()`, on unix
 ///
 /// This used to call `current_exe` directly, and on Linux that is wrong for
-/// exactly the reason [`crate::handover::exec_target`]'s own doc gives for
+/// exactly the reason `handover::exec_target`'s own doc gives for
 /// a handover: `current_exe` reads `/proc/self/exe`, a symlink to the
 /// *inode* this process was executed from. A package manager replaces the
 /// shepherd's binary by renaming a new file over it, which leaves the old
@@ -162,8 +162,29 @@ impl core::error::Error for DogError {
 /// version-skew question for the `--version` contract this phase's later
 /// tasks add, not a spawn failure — this function's only job is to never
 /// hand a dog a path that cannot be exec'd at all.
+///
+/// # Windows resolves it the plain way, and that is not a shortcut
+///
+/// `handover` is `#[cfg(unix)]` because `execve` and raw descriptor numbers
+/// have no Windows equivalent, so `exec_target` is not reachable there and
+/// this module does not compile for a Windows target if it asks for one.
+/// The guard would also have nothing to catch. `" (deleted)"` is what Linux
+/// puts in `/proc/self/exe` for an unlinked inode, and the rename that
+/// creates one cannot happen on Windows in the first place: the filesystem
+/// refuses to replace a running executable, which is why upgrading shep
+/// there means stopping it. So Windows keeps `current_exe`, which answers
+/// the same question correctly on a platform where the failure mode does
+/// not exist.
+#[cfg(unix)]
 fn builtin_program() -> Result<PathBuf, DogError> {
     crate::handover::exec_target().map_err(DogError::NoBinary)
+}
+
+/// The program a built-in dog is spawned as, on a platform with no
+/// handover. See the unix version above for why the two differ.
+#[cfg(windows)]
+fn builtin_program() -> Result<PathBuf, DogError> {
+    std::env::current_exe().map_err(DogError::NoBinary)
 }
 
 /// The app config the daemon spawns `spec` from.
@@ -924,6 +945,12 @@ mod tests {
     /// — and pins what a dog's own error reads once that refusal reaches
     /// `DogError`, since a message naming the fix is the feature this
     /// phase asks for.
+    ///
+    /// Unix only, because the guard it pins is: `handover` is `#[cfg(unix)]`,
+    /// and the `" (deleted)"` string it refuses is Linux's answer for an
+    /// unlinked `/proc/self/exe`. Windows resolves a built-in dog's program
+    /// with `current_exe` and has no such state to refuse.
+    #[cfg(unix)]
     #[test]
     fn a_deleted_inode_answer_from_current_exe_never_becomes_a_dogs_script() {
         let refusal = crate::handover::resolve_target(
