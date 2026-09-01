@@ -467,6 +467,10 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
 /// is running. The alternative considered and rejected was moving them all
 /// into `mod slow`, which would take roughly twenty tests out of the inner
 /// loop to fix a problem none of them are about.
+///
+/// # Errors
+/// The same [`AdoptRefusal`] set [`vet_binary`] raises, with the `--version`
+/// probe bounded by `budget` rather than by [`VERSION_BUDGET`].
 pub fn vet_binary_within(
     path: &Path,
     home: &Path,
@@ -642,6 +646,13 @@ fn ask_version(
     // place credentials live. Clearing and rebuilding models the run more
     // closely, not less. See `probe_env`.
     //
+    // The restart caller is the sharper case, and review is what made it
+    // visible. `vet_binary` WARNS about a group-writable binary and adopts
+    // it anyway, so a group member can replace an adopted dog. Every
+    // `shep restart <name>` after that runs their code, and a probe that
+    // ignores `--version` is a program of their choosing reading whatever
+    // the operator had exported.
+    //
     // An earlier revision of this comment said that filtered environment has
     // the dog's `[dog.<name>]` env merged over it, citing `AppConfig::env`'s
     // doc. That is true of a sheep and false of a dog: `dog_app` builds an
@@ -670,25 +681,8 @@ fn ask_version(
     // one could imitate shep's own output at the exact moment somebody is
     // deciding whether to trust it. The pipe is read by [`version_answer`]
     // and never rendered.
-    // `env_clear` and then an allowlist, NOT the operator's environment.
-    //
-    // An earlier revision inherited it, arguing that vetting has to model
-    // the run rather than an idealised one, and that clearing would refuse
-    // a binary needing `DYLD_LIBRARY_PATH` despite it working once adopted.
-    // The first half of that is right and the conclusion was backwards: the
-    // environment a dog actually runs with is the one the DAEMON builds,
-    // `assemble::base_env`, which is `PATH` plus a short allowlist. The
-    // operator's shell is a much richer thing, and it is the one place
-    // credentials live.
-    //
-    // That matters here more than at `adopt`, and review is what made it
-    // visible. `vet_binary` WARNS about a group-writable binary and adopts
-    // it anyway, so a group member can replace an adopted dog. Every
-    // `shep restart <name>` after that runs their code with whatever the
-    // operator had exported, and a probe that ignores `--version` is a
-    // program of their choosing reading it. Modelling the daemon's
-    // environment removes that and makes the vet a better model at the same
-    // time, which is why the original argument now points this way.
+    // `env_clear` and then the allowlist, never the operator's environment.
+    // Argued at the top of this function; `probe_env` builds the list.
     match Command::new(path)
         .arg(VERSION_FLAG)
         .env_clear()
