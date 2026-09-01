@@ -6,12 +6,14 @@
         "pushes the result on each release.",
         "",
         "NOT INSTALLABLE AS COMMITTED. The version below is 0.0.0 and the hash is a",
-        "sentinel, because release-artifacts.yml has never run against a real release",
-        "and the archive it names does not exist yet. The push job fails loudly if",
-        "either sentinel survives substitution.",
+        "sentinel, so this copy names an archive no release carries. The push job fails",
+        "loudly if either sentinel survives substitution.",
         "",
         "checkver and autoupdate are here so the bucket can bump itself if it ever runs",
-        "Scoop's excavator workflow. They are not what the release job uses.",
+        "Scoop's excavator workflow. They are not what the release job uses. The hash",
+        "url ends .sha256 on the archive's BASE name, not on its full filename: the",
+        "sidecar is shep-x86_64-pc-windows-msvc.sha256, and $url.sha256 would have",
+        "asked for a .zip.sha256 that does not exist.",
         "",
         "One architecture. shep publishes x86_64-pc-windows-msvc and nothing else on",
         "Windows: no 32-bit build, and no arm64 one yet.",
@@ -44,7 +46,7 @@
             }
         },
         "hash": {
-            "url": "$url.sha256"
+            "url": "https://github.com/shep-pm/shep/releases/download/shep-v$version/shep-x86_64-pc-windows-msvc.sha256"
         }
     },
     "notes": [
