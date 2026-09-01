@@ -471,6 +471,23 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
 /// # Errors
 /// The same [`AdoptRefusal`] set [`vet_binary`] raises, with the `--version`
 /// probe bounded by `budget` rather than by [`VERSION_BUDGET`].
+///
+/// # What `budget` actually bounds
+///
+/// One wait, not the call. [`version_answer`] bounds two things separately
+/// and gives each the full `budget`: the wait for the child to exit, and
+/// the wait for its output to arrive. So the call is bounded by roughly
+/// twice `budget`, plus up to 50ms on macOS for
+/// `macos_deferred_exec_failure`'s own poll.
+///
+/// Deliberate, and the alternative is worse. One absolute deadline shared
+/// between the two waits reads tidier and would make this doc a single
+/// number, but it means a child that exits at 0.9 of the budget leaves 0.1
+/// for its output to be read. A probe that runs out answers unknown, and
+/// unknown is deliberately silent, so tightening this would make shep go
+/// quiet about exactly the dogs it is meant to notice. The two waits bound
+/// different failures, a child that will not exit and a pipe a grandchild
+/// is holding, and neither should be able to consume the other's room.
 pub fn vet_binary_within(
     path: &Path,
     home: &Path,
