@@ -18,9 +18,10 @@ The face in the STATUS column is the fastest thing on the page to read:
 `(o.o)` online, `(o~o)` starting, `(>_<)` waiting to restart, `(-.-)` stopped,
 `(x.x)` errored.
 
-> Status: `0.1.24`, and pre-1.0 means anything can still change. macOS, Linux
-> and Windows. The Windows tier is the newest of the three, and the three
-> things it will not do are under [Windows](#windows) below.
+> Status: pre-1.0, so anything can still change. The version badge above is
+> the published one. macOS, Linux and Windows. The Windows tier is the newest
+> of the three, and the three things it will not do are under
+> [Windows](#windows) below.
 
 ## Install
 
