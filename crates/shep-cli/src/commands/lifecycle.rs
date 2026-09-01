@@ -3584,7 +3584,11 @@ mod tests {
                 "a healthy dog restarts with nothing said about it"
             );
             assert_eq!(
-                envelopes.recv().await.unwrap().body,
+                tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
+                    .await
+                    .expect("restart must reach the wire; it hung instead of sending a request")
+                    .unwrap()
+                    .body,
                 Request::Restart {
                     selector: SelectorSpec::Name("log-rotate".into()),
                 },
@@ -3633,7 +3637,11 @@ mod tests {
                 "a dog that does not answer is not a dog that is stale"
             );
             assert_eq!(
-                envelopes.recv().await.unwrap().body,
+                tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
+                    .await
+                    .expect("restart must reach the wire; it hung instead of sending a request")
+                    .unwrap()
+                    .body,
                 Request::Restart {
                     selector: SelectorSpec::Name("log-rotate".into()),
                 },
@@ -3680,7 +3688,11 @@ mod tests {
                 "an unstated protocol is unknown, and unknown is not stale"
             );
             assert_eq!(
-                envelopes.recv().await.unwrap().body,
+                tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
+                    .await
+                    .expect("restart must reach the wire; it hung instead of sending a request")
+                    .unwrap()
+                    .body,
                 Request::Restart {
                     selector: SelectorSpec::Name("log-rotate".into()),
                 },
@@ -3730,7 +3742,11 @@ mod tests {
                 "a built-in dog has no binary of its own to be stale"
             );
             assert_eq!(
-                envelopes.recv().await.unwrap().body,
+                tokio::time::timeout(Duration::from_secs(5), envelopes.recv())
+                    .await
+                    .expect("restart must reach the wire; it hung instead of sending a request")
+                    .unwrap()
+                    .body,
                 Request::Restart {
                     selector: SelectorSpec::Name("metrics".into()),
                 },

@@ -513,7 +513,9 @@ current shep-core, or run a shep that speaks 1`}</CodeBlock>
       the two would report every dog that exists.
     </p>
     <p>
-      A candidate gets one second to answer and is killed either way, so a
+      A candidate gets one second to exit and another to have its output
+      read, so two seconds is the worst case rather than one. It is killed
+      either way, so a
       dog that ignores <code>--version</code> and runs costs that second and
       is adopted with an unknown protocol. It can't hang the{" "}
       <code>adopt</code> that's vetting it.
@@ -575,9 +577,28 @@ the dog against protocol 2, and restart it again`}</CodeBlock>
       The cost is the same second <code>adopt</code> spends, and it's paid
       only by a restart that named an adopted dog. A binary that hangs is
       killed when the second is up and the restart goes ahead unwarned, so
-      the slowest a dog can make <code>shep restart</code> is one second,
+      the slowest a dog can make <code>shep restart</code> is two seconds,
       never indefinitely.
     </p>
+
+    <Callout variant="note">
+      <p>
+        A named restart briefly runs your dog twice. To read the binary on
+        disk, shep runs it with <code>--version</code>, and a dog that does
+        not recognise that flag ignores it and starts doing its ordinary job
+        instead, with <code>SHEP_HOME</code> pointing at the live shepherd.
+        So a rotator can rotate once, and a bark dog can open a second
+        subscription, before the process is killed.
+      </p>
+      <p>
+        Every dog written before this contract is in that group. The trade is
+        deliberate: the command is about to restart that dog anyway, so the
+        only question is whether it briefly overlaps itself, and the
+        alternative is not asking at all. Adding <code>--version</code> to
+        your dog removes the overlap, since a dog that answers exits
+        immediately.
+      </p>
+    </Callout>
 
     <h3>Why the binary is the only thing that can answer</h3>
     <p>

@@ -1017,6 +1017,28 @@ pub fn warn_of_a_dog_a_restart_would_break(
         // be a copy of a number that changes on disk with nothing watching,
         // and row 5 IS the binary changing after the adopt -- so the stored
         // copy would be wrong at precisely the moment it was needed.
+        //
+        // Reusing `ask_version` here costs something `adopt` does not pay,
+        // and the trade is different enough to argue separately rather than
+        // inherit. That function's own comment is explicit that a candidate
+        // ignoring `--version` runs its ordinary job instead, with
+        // `SHEP_HOME` pointing at the live daemon. For `adopt` that is a
+        // one-off against a binary nobody trusts yet. Here the dog is
+        // already adopted and already running, the probe repeats on every
+        // named restart, and the population that ignores `--version` is
+        // every dog written before this contract existed, which today is
+        // all of them. So `shep restart log-rotate` can rotate once before
+        // the restart, and a bark dog can open a second subscription, both
+        // for up to `VERSION_BUDGET`.
+        //
+        // Accepted rather than overlooked, on three grounds. The command
+        // is about to restart that dog anyway, so the dog runs either way
+        // and the question is only whether it briefly overlaps itself. The
+        // window is bounded and the process is killed. And the alternative
+        // is not asking, which is the state that let a stale dog sit
+        // `online` for two days. It is a real cost though, so it is named
+        // in `docs/dogs.md` where an operator can read it rather than only
+        // here.
         let Ok(Some(answer)) = ask_version(&binary, &paths.home, name) else {
             continue;
         };

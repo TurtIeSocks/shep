@@ -382,7 +382,9 @@ relationship to shep's own: `shep-log-rotate` 0.1.3 against shep 0.1.24 is
 the ordinary case, not a skew, and comparing the two would report every
 dog that exists.
 
-A candidate gets one second to answer and is killed either way, so a dog
+A candidate gets one second to exit and another to have its output read,
+so two seconds is the worst case rather than one. It is killed either way,
+so a dog
 that ignores `--version` and runs costs that second and is adopted with an
 unknown protocol. It cannot hang the `adopt` that is vetting it.
 
@@ -452,7 +454,25 @@ asked for.
 The cost is the same second `adopt` spends, and it is paid only by a restart
 that named an adopted dog. A binary that hangs is killed when the second is
 up and the restart goes ahead unwarned, so the slowest a dog can make
-`shep restart` is one second, never indefinitely.
+`shep restart` is two seconds, never indefinitely. Two rather than one
+because the wait for the process to exit and the wait for its text are
+bounded separately: a grandchild holding the pipe open can cost the second
+budget after a clean exit.
+
+A named restart briefly runs your dog twice. To read the binary on disk,
+shep runs it with `--version`, and a dog that does not recognise that flag
+ignores it and starts doing its ordinary job instead, with `SHEP_HOME`
+pointing at the live shepherd. So a rotator can rotate once and a bark dog
+can open a second subscription, for up to the budget above, before the
+process is killed.
+
+Every dog written before this contract is in that group. The trade is
+deliberate: the command is about to restart that dog anyway, so the only
+question is whether it briefly overlaps itself, and the alternative is not
+asking at all, which is what let a stale dog sit `online` unnoticed. Adding
+`--version` to your dog removes the overlap, since a dog that answers exits
+immediately.
+
 
 ### Why the binary is the only thing that can answer
 
