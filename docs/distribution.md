@@ -99,10 +99,10 @@ renaming a published URL later.
 
 1. **Tag scheme `shep-v{version}`.** release-plz sets no `git_tag_name`, so
    it uses `{{package}}-v{{version}}`. Confirmed on the repository: every
-   release tag has this shape, `shep-v0.1.25` being the newest as of
-   2026-09-01. Every Homebrew `url`, Scoop `url`, WinGet `InstallerUrl`,
-   Chocolatey `$url64` and `curl -LO` line embeds this string, so what
-   matters here is the shape rather than which version happens to be newest.
+   release tag has this shape. Every Homebrew `url`, Scoop `url`, WinGet
+   `InstallerUrl`, Chocolatey `$url64` and `curl -LO` line embeds it, so the
+   shape is the whole claim and no version is named here on purpose. `gh
+   release list` if you want the current one.
 2. **Archive name `shep-{target}.tar.gz`**, `.zip` on Windows.
    `taiki-e/upload-rust-binary-action` defaults its archive name to
    `$bin-$target`, so a `bin:` list of three would emit three archives per
