@@ -475,7 +475,7 @@ shep-protocol: 2`}</CodeBlock>
     <p>Emitting it needs no dependency a dog doesn't already have:</p>
     <CodeBlock label="main.rs">{`if std::env::args().nth(1).as_deref() == Some("--version") {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    println!("shep-protocol: {}", shep_client::shep_core::protocol::PROTOCOL_VERSION);
+    println!("shep-protocol: {}", shep_client::PROTOCOL_VERSION);
     return;
 }`}</CodeBlock>
     <Callout variant="note">

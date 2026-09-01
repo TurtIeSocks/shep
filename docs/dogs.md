@@ -361,7 +361,7 @@ have:
 ```rust
 if std::env::args().nth(1).as_deref() == Some("--version") {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    println!("shep-protocol: {}", shep_client::shep_core::protocol::PROTOCOL_VERSION);
+    println!("shep-protocol: {}", shep_client::PROTOCOL_VERSION);
     return;
 }
 ```
