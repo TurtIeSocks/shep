@@ -375,6 +375,7 @@ unknown field \`max_memory_restart\`, expected one of \`name\`, \`script\`, \`ar
     </p>
     <CodeBlock label="Flockfile.toml">{`[[app]]
 name = "z-worker"
+script = "./z-worker"
 instances = 4
 args = ["--metrics-port", "91{{instance}}"]
 

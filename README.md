@@ -18,7 +18,7 @@ The face in the STATUS column is the fastest thing on the page to read:
 `(o.o)` online, `(o~o)` starting, `(>_<)` waiting to restart, `(-.-)` stopped,
 `(x.x)` errored.
 
-> Status: `0.1.9`, and pre-1.0 means anything can still change. macOS, Linux
+> Status: `0.1.24`, and pre-1.0 means anything can still change. macOS, Linux
 > and Windows. The Windows tier is the newest of the three, and the three
 > things it will not do are under [Windows](#windows) below.
 
@@ -226,7 +226,7 @@ MSRV 1.88, edition 2024. `shep-core`, `shep-client` and `shep` are
 `#![forbid(unsafe_code)]`. `shep-daemon` denies it crate-wide and permits it in
 two files: `sys.rs`, for adopting a descriptor the daemon inherited, and
 `sys_windows.rs`, for the job object that holds a sheep and its lambs. That
-is seven blocks on unix and ten sites on Windows, each with its own
+is eight sites on unix and ten on Windows, each with its own
 `// SAFETY:` note, and the whole of the workspace's unsafe surface.
 
 ## License
