@@ -98,10 +98,11 @@ into every downstream manifest afterwards. Getting them wrong means
 renaming a published URL later.
 
 1. **Tag scheme `shep-v{version}`.** release-plz sets no `git_tag_name`, so
-   it uses `{{package}}-v{{version}}`. Confirmed on the repository: the
-   newest tag is `shep-v0.1.12`. Every Homebrew `url`, Scoop `url`, WinGet
-   `InstallerUrl`, Chocolatey `$url64` and `curl -LO` line embeds this
-   string.
+   it uses `{{package}}-v{{version}}`. Confirmed on the repository: every
+   release tag has this shape, `shep-v0.1.25` being the newest as of
+   2026-09-01. Every Homebrew `url`, Scoop `url`, WinGet `InstallerUrl`,
+   Chocolatey `$url64` and `curl -LO` line embeds this string, so what
+   matters here is the shape rather than which version happens to be newest.
 2. **Archive name `shep-{target}.tar.gz`**, `.zip` on Windows.
    `taiki-e/upload-rust-binary-action` defaults its archive name to
    `$bin-$target`, so a `bin:` list of three would emit three archives per
