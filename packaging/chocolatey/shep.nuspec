@@ -72,6 +72,15 @@ case, so they are installed without shims.
 stopping your processes on your behalf. Run `shep kill` first.
 ]]></description>
     <releaseNotes>https://github.com/shep-pm/shep/releases</releaseNotes>
+    <!-- shep.exe imports VCRUNTIME140.dll, which ships with the Visual C++
+         redistributable rather than with Windows. Rust's MSVC targets link the
+         CRT dynamically unless the build sets `+crt-static`, and this one does
+         not, so a machine without the redistributable fails to start the
+         binary at all. Verified by reading the import strings out of the
+         shep-x86_64-pc-windows-msvc.zip that shep-v0.1.25 published. -->
+    <dependencies>
+      <dependency id="vcredist140" />
+    </dependencies>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />

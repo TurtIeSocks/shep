@@ -22,7 +22,14 @@
         "rather than under a version-named directory.",
         "",
         "bin lists shep.exe only. shep-runtime and shep-dev are container entrypoint",
-        "aliases with no desktop use case, the same call the Chocolatey package makes."
+        "aliases with no desktop use case, the same call the Chocolatey package makes.",
+        "",
+        "The Visual C++ redistributable is a note rather than a `depends`. It is real:",
+        "shep.exe imports VCRUNTIME140.dll and Windows does not carry that. But the",
+        "Scoop package for it lives in the extras bucket, so declaring it would turn a",
+        "one-line install into a two-bucket one for the many machines that already",
+        "have it. The Chocolatey package declares it properly, since vcredist140 is in",
+        "the same repository the package itself comes from."
     ],
     "version": "0.0.0",
     "description": "Process manager that keeps a flock of long-running processes alive, with logs, watch and cron restarts, and webhook alerts",
@@ -50,6 +57,8 @@
         }
     },
     "notes": [
+        "shep.exe needs the Visual C++ redistributable, which is not part of Windows.",
+        "If it will not start, install it with: scoop install extras/vcredist2022",
         "shep startup is not built on Windows: boot-time supervision there needs a",
         "Service Control Manager service. Run shep start in your own session, or wrap",
         "shep runtime in NSSM or WinSW.",
