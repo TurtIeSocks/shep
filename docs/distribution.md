@@ -1,27 +1,37 @@
 # Distributing shep
 
-**`cargo install shep` is still the only way to install shep.** Every channel
-below is a thin wrapper around a download URL, so none of them can start until
-that URL exists. That one workflow is most of the work; the manifests on top
-of it are small.
+**`cargo install shep` is no longer the only way to install shep.** Homebrew
+and Scoop both work as of 2026-09-01, and every release since 0.1.24 carries
+seven prebuilt archives. What is left is the deb, WinGet and Chocolatey, and
+the four secrets that let the release workflow bump the two repositories it
+now pushes to.
 
-`.github/workflows/release-artifacts.yml` is that workflow, and as of
-2026-08-29 it has run against a real release and FAILED. Seven of its eight
-target legs built. `aarch64-unknown-linux-musl` did not: it runs natively on
-`ubuntu-24.04-arm`, and something asked rustup for
-`stable-x86_64-unknown-linux-gnu`, which an ARM runner refuses with
-"toolchain may not be able to run on this system". Because that leg failed,
-the Homebrew, Scoop, SHA256SUMS, Chocolatey, deb and WinGet jobs downstream of
-it were all skipped.
+Every channel here is a thin wrapper around a download URL, so none of them
+could start until that URL existed.
+`.github/workflows/release-artifacts.yml` is what produces it, and it works:
+shep-v0.1.24 and shep-v0.1.25 both carry all seven targets plus `SHA256SUMS`.
+This file used to describe that workflow as broken, because the first release
+it ran against lost `aarch64-unknown-linux-musl` to a rustup toolchain
+mismatch on the ARM runner and skipped every downstream job. That leg is fixed
+and has been green twice.
 
-So shep 0.1.13 is on crates.io carrying no binaries and no package-manager
-artifacts, and the sentence above stays true for a reason nobody intended.
-Fix that leg before reading the rest of this file as a plan.
+The publishing steps are still gated. Each one is switched on by a repository
+variable, and nothing reaches a package manager, a second repository or a
+third-party account until somebody sets it. The next section is the whole
+list.
 
-Everything downstream of it is written too, and every publishing step is
-switched off. Nothing here reaches a package manager, a second repository or
-a third-party account until somebody sets a repository variable. The next
-section is the whole list.
+**Three of the publishing jobs were broken in the same way and are now
+fixed.** The Homebrew job was fine, because it reads a hash from the crates.io
+API rather than from the release. The Scoop, Chocolatey and deb jobs each
+asked for `${archive}.sha256`, and the sidecar
+`taiki-e/upload-rust-binary-action` writes is named after its `archive:` input
+rather than after the archive filename. So they wanted
+`shep-x86_64-pc-windows-msvc.zip.sha256` where the release carries
+`shep-x86_64-pc-windows-msvc.sha256`. `gh release download` treats a pattern
+that matches nothing as an error, so all three would have failed on their
+first real run, which is exactly the run where somebody has just turned a
+channel on and gone to look at something else. `packaging/scoop/shep.json`'s
+`autoupdate` block had the same bug in `$url.sha256`.
 
 ## Turning a channel on
 
@@ -30,13 +40,20 @@ is the act of turning the channel on, and for the three that push somewhere
 else the variable is the destination, so nothing here hardcodes an owner or a
 repository name.
 
-| Channel | Variable | Secret | Also needs |
-|---|---|---|---|
-| `.deb` | `PUBLISH_DEB=true` | none | nothing |
-| Homebrew | `HOMEBREW_TAP_REPO=<owner>/homebrew-shep` | `HOMEBREW_TAP_TOKEN` | the tap repository |
-| Scoop | `SCOOP_BUCKET_REPO=<owner>/scoop-shep` | `SCOOP_BUCKET_TOKEN` | the bucket repository |
-| Chocolatey | `PUBLISH_CHOCOLATEY=true` | `CHOCO_API_KEY` | an icon |
-| WinGet | `WINGET_IDENTIFIER=<Publisher>.shep` | `WINGET_TOKEN` | a fork, one manual submission |
+| Channel | Variable | Secret | Also needs | State |
+|---|---|---|---|---|
+| `.deb` | `PUBLISH_DEB=true` | none | nothing | variable set 2026-09-01, first package lands on the next release |
+| Homebrew | `HOMEBREW_TAP_REPO=shep-pm/homebrew-shep` | `HOMEBREW_TAP_TOKEN` | the tap repository | tap created and seeded with 0.1.25, waiting on the secret |
+| Scoop | `SCOOP_BUCKET_REPO=shep-pm/scoop-shep` | `SCOOP_BUCKET_TOKEN` | the bucket repository | bucket created and seeded with 0.1.25, waiting on the secret |
+| Chocolatey | `PUBLISH_CHOCOLATEY=true` | `CHOCO_API_KEY` | an icon | icon done, waiting on an account and the key |
+| WinGet | `WINGET_IDENTIFIER=shep-pm.shep` | `WINGET_TOKEN` | a fork, one manual submission | fork made, first submission open at microsoft/winget-pkgs#427115 |
+
+**Set the variable last, not first.** A job-level `if:` reading `vars` is
+evaluated when the run starts, not when the job does, so setting a variable
+part way through a release does nothing to that release. More to the point,
+setting the variable before its secret exists does not leave the channel off:
+it turns the job on with an empty token, and the next release goes red on a
+`git clone` that cannot authenticate.
 
 The secrets are not all the same kind of thing. `HOMEBREW_TAP_TOKEN` and
 `SCOOP_BUCKET_TOKEN` are GitHub tokens with contents write on the repository
@@ -50,19 +67,26 @@ credential at all: it is an API key from a chocolatey.org account.
 nothing outside this repository. It is `dpkg -i` rather than `apt install`,
 for the reason the apt section below gives.
 
-Three of the five are waiting on decisions rather than on work:
+The naming question this section used to leave open is answered. Everything
+moved to the `shep-pm` organisation on 2026-08-31, so the tap is
+`shep-pm/homebrew-shep`, the bucket is `shep-pm/scoop-shep`, and the WinGet
+identifier is `shep-pm.shep`. That reads oddly next to `github.com/shep`,
+which is a dormant account created in 2008 with no public repositories and
+therefore not available.
 
-- Homebrew and Scoop both want a repository that does not exist. Naming it is
-  the open question, and `github.com/shep` is taken by a dormant account
-  created in 2008 with no public repositories, so an organisation called
-  `shep` is not available.
-- WinGet's `PackageIdentifier` embeds a publisher name, so it waits on the
-  same decision. Its first version also has to be submitted to
-  microsoft/winget-pkgs by hand: the release action checks that the package
-  already exists and refuses otherwise.
-- Chocolatey wants artwork. `iconUrl` is validator Guideline CPMR0033 rather
-  than a Requirement, so the package is approvable without one, and CPMR0076
-  forbids a raw GitHub URL once there is one.
+What is left is credentials, an account, and a queue:
+
+- Homebrew and Scoop each need a token with contents write on their
+  repository, held here as `HOMEBREW_TAP_TOKEN` and `SCOOP_BUCKET_TOKEN`. Both
+  repositories already carry a working 0.1.25 manifest, pushed by hand, so
+  neither channel is waiting on the secret to be installable. The secret is
+  what makes the NEXT release bump them without anyone typing anything.
+- WinGet needs `WINGET_TOKEN` scoped `public_repo` against
+  `shep-pm/winget-pkgs`, and the first submission to clear moderation before
+  the release action will do anything: it checks that the package already
+  exists and refuses otherwise.
+- Chocolatey needs an account on chocolatey.org and its API key. The artwork
+  it also wanted is done, at `web/public/icon.png`.
 
 ## The prerequisite: `release-artifacts.yml`
 
@@ -180,11 +204,20 @@ with `Formula/shep.rb`.
 The formula is written and lives at `packaging/homebrew/shep.rb`, which is
 its source of truth. `release-artifacts.yml`'s `homebrew` job rewrites the
 two version lines and pushes the result to the tap on each release, and
-`test.yml`'s `formula` job runs `brew style` over it. Three things are still
-needed, all of them outside this repository: create the tap repository, put
-the current formula in it as `Formula/shep.rb`, and give this repository a
-`HOMEBREW_TAP_TOKEN` secret holding a token with contents write on the tap.
-Then set `HOMEBREW_TAP_REPO` to its `<owner>/<name>`.
+`test.yml`'s `formula` job runs `brew style` over it. The tap now exists and
+carries the 0.1.25 formula, put there by hand on 2026-09-01. One thing is
+still needed and it is outside this repository: a `HOMEBREW_TAP_TOKEN` secret
+holding a token with contents write on the tap. Set `HOMEBREW_TAP_REPO` to
+`shep-pm/homebrew-shep` after that secret exists, not before.
+
+**The channel was tested end to end on a real Mac before any of that.**
+`brew install --build-from-source shep-pm/shep/shep` compiled and installed
+0.1.25, all three binaries answered `--version`, the completions landed in the
+three directories the formula names and carried none of the status line shep
+writes to stderr, and `brew test shep` and `brew audit --strict --online` both
+exited 0. Worth doing again after any formula change: a tap has no moderation
+queue to catch a mistake, and a bad formula reaches users on the next
+`brew update`.
 
 A separate repository is not strictly required. The `homebrew-` prefix is
 only hardcoded for the one-argument form of `brew tap`; the two-argument form
@@ -253,9 +286,21 @@ checked in, so the job has to be able to execute the binary it is packaging.
 Verified locally against cargo-deb rather than written from the README: a
 real package builds, and its nine assets land at `usr/bin/`,
 `usr/share/doc/shep/` and the three completion directories Debian expects.
-One correction fell out of that, worth recording because the README is wrong
-about it. `license-file` takes a plain string, not the documented
-`["path", lines]` pair, which fails to parse.
+This file used to say `license-file` takes a plain string and that the
+documented `["path", lines]` pair fails to parse. Not true of the cargo-deb
+in use now: `crates/shep-cli/Cargo.toml` carries
+`license-file = ["LICENSE-APACHE", "0"]` and it parses.
+
+**The whole deb job was replayed on real Linux on 2026-09-01**, in a
+`rust:1-slim-bookworm` container on arm64, running the job's own steps against
+the shep-v0.1.25 release: fetch the archive and its sidecar, `sha256sum
+--check`, unpack, generate the three completion files by running the binary,
+`cargo deb --no-build --no-strip`. The package builds, `dpkg -i` installs it,
+all three binaries answer `--version`, the completions land in
+`bash-completion/completions`, `zsh/vendor-completions` and
+`fish/vendor_completions.d`, `shep ping` exits 5 with no shepherd, and
+`dpkg -r` removes it cleanly. `Depends:` came out empty, which is the whole
+argument for musl in one line.
 
 Build against **musl**, not glibc. `depends = "$auto"` writes whatever
 glibc the runner linked against, `ubuntu-latest` is 24.04 (glibc 2.39), and
@@ -296,17 +341,29 @@ Scoop is close to free. `packaging/scoop/shep.json` is written, and the
 it is where a lot of the CLI audience on Windows actually looks. The manifest
 carries `checkver` and `autoupdate` as well, so a bucket running Scoop's
 excavator workflow could bump itself without this repository's help.
+`shep-pm/scoop-shep` exists and carries the 0.1.25 manifest, stamped by
+replaying the job's own `jq` against the real release. The url, the hash and
+the flat archive layout were all checked against a downloaded copy of the zip,
+which is as far as a Mac can take it: nothing here has run `scoop install`.
 
 WinGet ships with current Windows and its review is lighter than
 Chocolatey's for a well-formed submission. It is the one channel with nothing
 under `packaging/`, because its manifests are generated per version rather
 than maintained: the `winget` job runs the WinGet Releaser action against
-`WINGET_IDENTIFIER`. Two things have to happen first. The identifier embeds a
-publisher name, so it waits on the naming decision, and the first version has
-to be submitted to microsoft/winget-pkgs by hand, since the action refuses
-when the package is not already there. The action's default
-`installers-regex` matches by installer extension and would find nothing in a
-portable `.zip`, so the job sets its own.
+`WINGET_IDENTIFIER`. The action's default `installers-regex` matches by
+installer extension and would find nothing in a portable `.zip`, so the job
+sets its own.
+
+The first submission is open at microsoft/winget-pkgs#427115, adding
+`shep-pm.shep` 0.1.25 from `shep-pm/winget-pkgs`. Three manifests, written by
+hand because `winget validate` and `wingetcreate` are Windows-only, and
+checked against the published 1.12.0 JSON schemas instead. Both boxes on their
+checklist that mean "I ran this on Windows" are left unticked in the pull
+request body, which is the honest thing to do and also tells a moderator where
+to look first. Two things still need a person: the Microsoft CLA has to be
+signed by the account that opened it, and the release action stays inert until
+that pull request merges, since it checks that the package already exists and
+refuses otherwise.
 
 The Chocolatey package is written and lives in `packaging/chocolatey/`:
 `shep.nuspec`, the two scripts, `LICENSE.txt`, `VERIFICATION.txt` and the two
@@ -315,11 +372,18 @@ pushes it, and stays inert until the repository variable
 `PUBLISH_CHOCOLATEY` is set to `true` and a `CHOCO_API_KEY` secret exists.
 The parse check on its PowerShell runs in `test.yml`'s `packaging` job.
 
-Two things are still open on it. The first is artwork: `iconUrl` is missing,
-which is validator Guideline CPMR0033 rather than a Requirement, so the
-package is approvable without it, and CPMR0076 forbids linking a raw GitHub
-URL when one exists, so it has to go through a CDN like jsdelivr. The second
-is the moderation queue itself, which cannot be shortened from here.
+The artwork this section used to want exists now. `web/public/icon.svg` is
+`favicon.svg` padded to a square and put on the site's meadow green, because
+the mark's own viewBox is 104x78 and its body is cream, so unpadded and
+unbacked it is both the wrong shape and nearly invisible on a white package
+page. `web/public/icon.png` is that file at 256x256, and `iconUrl` points at
+`https://shep-pm.com/icon.png`: CPMR0076 forbids a raw GitHub URL, and the
+site is Pages behind a CDN, so it satisfies the rule without adding jsdelivr
+to the list of things that can break. Keeping the PNG under `web/public/` is
+what makes that URL true, since Astro copies that directory to the site root.
+
+What is left is an account on chocolatey.org, its API key, and the moderation
+queue, which cannot be shortened from here.
 
 What the package already settles:
 
@@ -329,8 +393,17 @@ What the package already settles:
   in the `.nupkg`, not inside the downloaded zip, because
   `Install-ChocolateyZipPackage` unpacks into the tools directory and
   shimgen scans it afterwards. The filename match is case sensitive.
-- `iconUrl` needs an image this repository does not have. `web/public/`
-  carries `favicon.ico` and `favicon.svg` and no PNG.
+- **Declare the Visual C++ redistributable.** `shep.exe` imports
+  `VCRUNTIME140.dll`, which comes with the redistributable rather than with
+  Windows: Rust's MSVC targets link the CRT dynamically unless the build sets
+  `+crt-static`, and this one does not. Read out of the import strings of the
+  zip shep-v0.1.25 published, so it is a fact about the shipped artifact
+  rather than a guess. The nuspec declares `vcredist140`, the WinGet manifest
+  declares `Microsoft.VCRedist.2015+.x64`, and Scoop gets a note instead
+  because its package for it lives in the `extras` bucket and depending on it
+  would turn a one-line install into a two-bucket one. Building the Windows
+  leg with `+crt-static` would delete the whole question, at the cost of a
+  bigger binary and a change to an artifact three channels already point at.
 - The uninstall script refuses while a shepherd is running rather than
   stopping the flock itself. `shep ping` is the probe, since it is the one
   verb that treats "no shepherd" as information rather than an error.
@@ -352,23 +425,26 @@ of this and is the text to reuse.
 ## Order
 
 0. Merge the Windows tier. Done, PR #16.
-1. `release-artifacts.yml`. Done.
-2. README and `web/` install docs. One pass, appended to as channels land.
-3. `.deb` on the release. Written. Set `PUBLISH_DEB`.
-4. Homebrew tap. Formula written, in `packaging/homebrew/`. Blocked on a
-   repository name.
-5. Scoop bucket. Manifest written, in `packaging/scoop/`. Blocked on the
-   same name.
-6. WinGet. Job written. Blocked on the same name, plus one manual
-   submission.
-7. Chocolatey. Package written, in `packaging/chocolatey/`. Blocked on
-   artwork, then on moderation.
+1. `release-artifacts.yml`. Done, and green against two real releases.
+2. README and `web/` install docs. Done for Homebrew, Scoop and the
+   prebuilt archives. Append the rest as they land.
+3. `.deb` on the release. `PUBLISH_DEB` is set, and the job was replayed on
+   real Linux. The first package rides the next release.
+4. Homebrew tap. Live at `shep-pm/homebrew-shep`, installed and tested on a
+   Mac. Waiting on `HOMEBREW_TAP_TOKEN`, then `HOMEBREW_TAP_REPO`.
+5. Scoop bucket. Live at `shep-pm/scoop-shep`. Waiting on
+   `SCOOP_BUCKET_TOKEN`, then `SCOOP_BUCKET_REPO`.
+6. WinGet. First submission open at microsoft/winget-pkgs#427115. Waiting on
+   the CLA and the moderators, then `WINGET_TOKEN` and `WINGET_IDENTIFIER`.
+7. Chocolatey. Package written, icon done. Waiting on a chocolatey.org
+   account and its API key, then on moderation.
 
-The engineering is done. What is left is four decisions and some clicking:
-a name for wherever the tap and the bucket live, artwork, a WinGet first
-submission, and the tokens. Chocolatey's moderation queue is the only part
-measured in days rather than minutes, which is the whole argument for its
-position.
+What is left is four credentials and one signature. Nothing in this
+repository blocks any of it, and nothing in it can produce any of it either:
+the four secrets have to be created by a person, and the Microsoft CLA has to
+be signed by the account that opened the pull request. Chocolatey's
+moderation queue is still the only part measured in days rather than minutes,
+which is the whole argument for its position at the bottom of this list.
 
 ## What each release costs afterwards
 
