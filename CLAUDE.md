@@ -44,7 +44,7 @@ briefs have now shipped a stale figure, this file carried "437 of 454"
 for long enough to be wrong by fifty, and it then carried "619 of 638" while
 the real number climbed by ninety-two. The 19 tests this skips live in a nested `mod slow`
 inside each file's `mod tests` — `extras.rs` has 9, `watch/source.rs` 7, and
-`watch/mod.rs` and `limits/sample.rs` one each — and wait on real macOS
+`watch/mod.rs`, `limits/sample.rs` and `handover/mod.rs` one each — and wait on real macOS
 FSEvents or real elapsed time; they are the reason the unfiltered lib run
 costs ~25s instead. A mutation in `supervisor.rs` does not need them — but a
 change to `watch/source.rs`'s watcher plumbing, or to timing-sensitive
