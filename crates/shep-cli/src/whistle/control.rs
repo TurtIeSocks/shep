@@ -154,7 +154,7 @@ impl Whistle {
     /// Reload a sheep: spawn the replacement, then drain the old one.
     #[tool(
         name = "reload_sheep",
-        description = "Reload a sheep with zero downtime: a replacement is spawned and made ready before the old process is drained. Refused while a reload of the same app is already in flight. The reply is an acceptance, not a finished swap.",
+        description = "Reload a sheep. Usually a replacement is spawned and made ready before the old process is drained, which is an overlap rather than zero downtime: mid-swap both are alive. An app with a readiness probe and no reuse_port is drained first instead, so it does have a gap. Refused while a reload of the same app is already in flight. The reply is an acceptance, not a finished swap.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
