@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-09-01
+
+### Fixed
+
+- Stop a built-in dog respawning from a deleted inode
+- Builtin_program has to compile where there is no handover
+
+
 ## [0.1.24] - 2026-08-31
 
 ### Added
