@@ -29,6 +29,35 @@ cargo install shep
 shep welcome
 ```
 
+Homebrew, on macOS and Linux:
+
+```bash
+brew install shep-pm/shep/shep
+```
+
+Scoop, on Windows:
+
+```powershell
+scoop bucket add shep https://github.com/shep-pm/scoop-shep
+scoop install shep
+```
+
+Or take a prebuilt archive off any
+[release](https://github.com/shep-pm/shep/releases). Seven targets, each with
+its own `.sha256` beside it and all of them in one `SHA256SUMS`.
+
+Notes worth having before you pick:
+
+- The Homebrew formula compiles the tree, so the first install is minutes
+  rather than seconds. Scoop takes the published binary.
+- The formula ships no `brew services` definition. `shep startup` installs
+  shep's own launchd job, and running both would leave two pointed at one
+  shepherd.
+- On Windows `shep.exe` needs the Visual C++ redistributable, which Windows
+  does not carry. `scoop install extras/vcredist2022` if it will not start.
+- Every channel installs all three binaries, `shep`, `shep-runtime` and
+  `shep-dev`, but only `shep` is put on your PATH by the Windows packages.
+
 ## Coming from pm2
 
 shep is a clean-room reimplementation of pm2's feature list, and `shep import`

@@ -39,6 +39,35 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       <div><span class="prompt">$</span> cargo install shep</div>
       <div><span class="prompt">$</span> shep --help</div>
     </div>
+    <p>Or from a package manager. Homebrew on macOS and Linux:</p>
+    <div class="terminal">
+      <div><span class="prompt">$</span> brew install shep-pm/shep/shep</div>
+    </div>
+    <p>Scoop on Windows:</p>
+    <div class="terminal">
+      <div><span class="prompt">&gt;</span> scoop bucket add shep https://github.com/shep-pm/scoop-shep</div>
+      <div><span class="prompt">&gt;</span> scoop install shep</div>
+    </div>
+    <p class="fine">
+      The formula compiles the whole tree, so the first
+      <code>brew install</code> is minutes rather than seconds. It ships no
+      <code>brew services</code> definition on purpose:
+      <code>shep startup</code> installs shep's own launchd job, and running
+      both would leave two pointed at one shepherd. On Windows,
+      <code>shep.exe</code> needs the Visual C++ redistributable, which
+      Windows does not carry, so run
+      <code>scoop install extras/vcredist2022</code> if it will not start.
+      Scoop puts only <code>shep</code> on your PATH; <code>shep-runtime</code>
+      and <code>shep-dev</code> are installed beside it without shims, since
+      they are container entrypoints.
+    </p>
+    <p>
+      Or take a prebuilt archive off any <a
+        href="https://github.com/shep-pm/shep/releases"
+        >release</a
+      >. Seven targets, each with its own <code>.sha256</code> beside it and
+      all of them together in one <code>SHA256SUMS</code>.
+    </p>
     <p>Prefer to build it yourself, or want to hack on it?</p>
     <div class="terminal">
       <div><span class="prompt">$</span> git clone https://github.com/shep-pm/shep.git</div>
@@ -75,6 +104,11 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       <div><span class="prompt">$</span> cargo install shep-log-rotate<span class="muted"> # and every other dog</span></div>
       <div><span class="prompt">$</span> shep daemon reload</div>
     </div>
+    <p class="fine">
+      <code>brew upgrade shep</code> and <code>scoop update shep</code> replace
+      the binary the same way, and leave a running shepherd alone the same way.
+      The reload is what moves it.
+    </p>
     <p>
       A flock that can be carried keeps running through the reload. The
       shepherd replaces its own image in place, so every sheep keeps the pid
