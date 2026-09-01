@@ -9,11 +9,11 @@ now pushes to.
 Every channel here is a thin wrapper around a download URL, so none of them
 could start until that URL existed.
 `.github/workflows/release-artifacts.yml` is what produces it, and it works:
-shep-v0.1.24 and shep-v0.1.25 both carry all seven targets plus `SHA256SUMS`.
-This file used to describe that workflow as broken, because the first release
-it ran against lost `aarch64-unknown-linux-musl` to a rustup toolchain
-mismatch on the ARM runner and skipped every downstream job. That leg is fixed
-and has been green twice.
+every release from shep-v0.1.24 on carries all seven targets plus
+`SHA256SUMS`. This file used to describe that workflow as broken, because the
+first release it ran against lost `aarch64-unknown-linux-musl` to a rustup
+toolchain mismatch on the ARM runner and skipped every downstream job. That leg
+is fixed and has been green on every release since.
 
 The publishing steps are still gated. Each one is switched on by a repository
 variable, and nothing reaches a package manager, a second repository or a
@@ -43,8 +43,8 @@ repository name.
 | Channel | Variable | Secret | Also needs | State |
 |---|---|---|---|---|
 | `.deb` | `PUBLISH_DEB=true` | none | nothing | variable set 2026-09-01, first package lands on the next release |
-| Homebrew | `HOMEBREW_TAP_REPO=shep-pm/homebrew-shep` | `HOMEBREW_TAP_TOKEN` | the tap repository | tap created and seeded with 0.1.25, waiting on the secret |
-| Scoop | `SCOOP_BUCKET_REPO=shep-pm/scoop-shep` | `SCOOP_BUCKET_TOKEN` | the bucket repository | bucket created and seeded with 0.1.25, waiting on the secret |
+| Homebrew | `HOMEBREW_TAP_REPO=shep-pm/homebrew-shep` | `HOMEBREW_TAP_TOKEN` | the tap repository | created and seeded by hand, waiting on the secret |
+| Scoop | `SCOOP_BUCKET_REPO=shep-pm/scoop-shep` | `SCOOP_BUCKET_TOKEN` | the bucket repository | created and seeded by hand, waiting on the secret |
 | Chocolatey | `PUBLISH_CHOCOLATEY=true` | `CHOCO_API_KEY` | an icon | icon done, waiting on an account and the key |
 | WinGet | `WINGET_IDENTIFIER=shep-pm.shep` | `WINGET_TOKEN` | a fork, one manual submission | fork made, first submission open at microsoft/winget-pkgs#427115 |
 
@@ -78,9 +78,17 @@ What is left is credentials, an account, and a queue:
 
 - Homebrew and Scoop each need a token with contents write on their
   repository, held here as `HOMEBREW_TAP_TOKEN` and `SCOOP_BUCKET_TOKEN`. Both
-  repositories already carry a working 0.1.25 manifest, pushed by hand, so
+  repositories already carry a current manifest, pushed by hand, so
   neither channel is waiting on the secret to be installable. The secret is
   what makes the NEXT release bump them without anyone typing anything.
+
+  **Until it exists, somebody bumps both by hand on every release**, and that
+  is not theoretical: the tap and the bucket were seeded, and a release landed
+  about forty minutes later that left both of them a version behind. Nothing
+  warns you when that happens. A tap serving a stale formula looks completely
+  healthy, and the person who notices is a user installing the wrong version.
+  The bump is a url and a sha256 read from the crates.io API for the tap, and
+  the same two read from the release's own `.sha256` sidecar for the bucket.
 - WinGet needs `WINGET_TOKEN` scoped `public_repo` against
   `shep-pm/winget-pkgs`, and the first submission to clear moderation before
   the release action will do anything: it checks that the package already
@@ -206,7 +214,7 @@ The formula is written and lives at `packaging/homebrew/shep.rb`, which is
 its source of truth. `release-artifacts.yml`'s `homebrew` job rewrites the
 two version lines and pushes the result to the tap on each release, and
 `test.yml`'s `formula` job runs `brew style` over it. The tap now exists and
-carries the 0.1.25 formula, put there by hand on 2026-09-01. One thing is
+carries a current formula, put there by hand. One thing is
 still needed and it is outside this repository: a `HOMEBREW_TAP_TOKEN` secret
 holding a token with contents write on the tap. Set `HOMEBREW_TAP_REPO` to
 `shep-pm/homebrew-shep` after that secret exists, not before.
@@ -342,7 +350,7 @@ Scoop is close to free. `packaging/scoop/shep.json` is written, and the
 it is where a lot of the CLI audience on Windows actually looks. The manifest
 carries `checkver` and `autoupdate` as well, so a bucket running Scoop's
 excavator workflow could bump itself without this repository's help.
-`shep-pm/scoop-shep` exists and carries the 0.1.25 manifest, stamped by
+`shep-pm/scoop-shep` exists and carries a current manifest, stamped by
 replaying the job's own `jq` against the real release. The url, the hash and
 the flat archive layout were all checked against a downloaded copy of the zip,
 which is as far as a Mac can take it: nothing here has run `scoop install`.
