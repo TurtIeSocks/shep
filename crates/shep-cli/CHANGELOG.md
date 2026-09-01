@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-09-01
+
+### Added
+
+- Ask a candidate dog what protocol it speaks, and refuse a mismatch
+- Warn before a restart brings a dog back on a binary that cannot connect
+
+### Fixed
+
+- Address review on the dog version probe
+- Probe with the daemon's environment, and let tests pick the budget
+
+
 ## [0.1.24] - 2026-08-31
 
 ### Added
