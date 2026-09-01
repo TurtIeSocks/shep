@@ -355,6 +355,43 @@ Answering is optional and stays optional. Dogs predating the convention
 are still adoptable, and a dog that does not answer is never refused for
 it: its protocol is simply unknown.
 
+### What `shep adopt` does with the answer
+
+`shep adopt` asks the candidate before it records anything. The vet was
+already spawning the binary to prove this kernel can exec it, so the
+question costs one argument on a process that was going to start anyway.
+
+| what the candidate answers | what `adopt` does |
+|---|---|
+| a `shep-protocol` this shep does not speak | refuses, before `shep.toml` is touched |
+| a protocol this shep speaks | adopts, and reports the version it gave |
+| a version and no protocol line | adopts, and says the protocol is unknown |
+| nothing, or a run that exits non-zero | adopts, protocol unknown, no notice |
+
+The refusal names both numbers and both ways out:
+
+```
+/usr/local/bin/shep-otel: this dog was built for shep protocol 1, and this
+shep speaks 2; reinstall the dog without --locked so it builds against the
+current shep-core, or run a shep that speaks 1
+```
+
+Only a stated protocol can refuse an adopt. The version is never compared
+with anything, because a third-party dog's crate version has no
+relationship to shep's own: `shep-log-rotate` 0.1.3 against shep 0.1.24 is
+the ordinary case, not a skew, and comparing the two would report every
+dog that exists.
+
+A candidate gets one second to answer and is killed either way, so a dog
+that ignores `--version` and runs costs that second and is adopted with an
+unknown protocol. It cannot hang the `adopt` that is vetting it.
+
+None of the answer is written down. `[daemon] adopted_dogs` records the
+path and nothing else, and a protocol stored at adopt time would be a copy
+of a number that can change on disk with nothing watching. That is G12's
+row 5, the one case where the stored copy would be wrong exactly when it
+mattered, so the binary is asked again rather than remembered.
+
 Emitting it needs four lines and no dependency a dog does not already
 have:
 

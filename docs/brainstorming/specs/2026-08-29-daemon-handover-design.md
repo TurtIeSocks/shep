@@ -633,6 +633,16 @@ That is a gap in the dog contract rather than a bug in one dog. So it
 becomes part of what a dog is: **a dog answers `--version` on stdout and
 exits 0.**
 
+**The format lives in `docs/dogs.md`'s "Answering `--version`" section,
+which is the contract third parties implement and shep parses.** That
+sentence above says less than the format needs, and the two would drift if
+this document tried to carry it too. The short of it: a version on line 1,
+`<key>: <value>` lines after it, `shep-protocol` carrying
+`PROTOCOL_VERSION` in decimal, `shep-` reserved so a third number gets its
+own line later, and everything else ignored. The section also records why
+the built-in dogs are outside the contract, and what a `--version` answer
+cannot catch.
+
 `shep adopt` vets it. Adopt already spawns the candidate to prove the
 kernel can exec it, so asking its version costs one more argument on a
 process it was already going to start. A dog that cannot satisfy the
