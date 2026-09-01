@@ -81,6 +81,22 @@ pub mod testing;
 
 pub use shep_core;
 
+/// The wire protocol this client speaks, re-exported from
+/// [`shep_core::protocol::PROTOCOL_VERSION`].
+///
+/// Here because `docs/dogs.md` asks every dog to print it, and the path
+/// through the crate re-export above reads as though a dog is reaching
+/// somewhere it should not: `shep_client::shep_core::protocol::PROTOCOL_VERSION`
+/// is four segments of plumbing for a number that is part of the dog
+/// contract. A dog depends on this crate and on nothing else, so the number
+/// it has to publish should be reachable from this crate's own root.
+///
+/// It is a re-export rather than a copy for the reason the protocol has bitten
+/// twice already: the value lives in shep-core, this crate's dependency on it
+/// floats within 0.1.x, and a second definition here could disagree with the
+/// one the handshake actually compares.
+pub use shep_core::protocol::PROTOCOL_VERSION;
+
 #[cfg(test)]
 mod tests {
     /// Not an assertion about behaviour — a line of output where a wrong

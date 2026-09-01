@@ -1188,9 +1188,37 @@ pub fn record_launch_path() {
 pub fn exec_target() -> io::Result<PathBuf> {
     let recorded = LAUNCH_PATH.get().cloned().flatten();
     let current = std::env::current_exe();
+    resolve_target(
+        [recorded, current.as_deref().ok().map(Path::to_path_buf)],
+        current.as_ref().err(),
+    )
+}
 
+/// The validated-candidate loop [`exec_target`] runs, pulled out so a test
+/// can hand it a synthetic `" (deleted)"` path directly rather than needing
+/// a real Linux inode-unlink to produce one — `current_exe` cannot be made
+/// to return that string on any other platform, or by any safe means at
+/// all.
+///
+/// `pub(crate)` rather than private: [`crate::dogs::dog_app`] resolves a
+/// built-in dog's own program through [`exec_target`] for the same reason a
+/// handover does (see that module's `builtin_program` for the argument),
+/// and its tests use this seam the same way `exec_target`'s own tests do.
+///
+/// Returns the first candidate in `candidates` that [`check_target`]
+/// accepts, in order; a `None` entry is skipped (the "nothing recorded
+/// yet" case). `current_exe_error` is folded into the diagnostic only —
+/// a `current_exe()` failure is not itself a path to validate.
+///
+/// # Errors
+/// [`io::ErrorKind::NotFound`] if every candidate is `None` or refused.
+/// The message names each candidate tried and what was wrong with it.
+pub(crate) fn resolve_target(
+    candidates: [Option<PathBuf>; 2],
+    current_exe_error: Option<&io::Error>,
+) -> io::Result<PathBuf> {
     let mut refusals = Vec::new();
-    for candidate in [recorded, current.as_deref().ok().map(Path::to_path_buf)] {
+    for candidate in candidates {
         let Some(candidate) = candidate else { continue };
         match check_target(&candidate) {
             Ok(()) => return Ok(candidate),
@@ -1198,7 +1226,7 @@ pub fn exec_target() -> io::Result<PathBuf> {
         }
     }
 
-    if let Err(e) = &current {
+    if let Some(e) = current_exe_error {
         refusals.push(format!("this process's own image ({e})"));
     }
     if refusals.is_empty() {
@@ -1206,7 +1234,7 @@ pub fn exec_target() -> io::Result<PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        format!("no binary to hand over to: {}", refusals.join("; ")),
+        format!("no binary to exec: {}", refusals.join("; ")),
     ))
 }
 
@@ -2511,6 +2539,21 @@ mod tests {
             !p.to_string_lossy().contains("(deleted)"),
             "exec target resolved to a deleted inode: {}",
             p.display()
+        );
+    }
+
+    #[test]
+    fn resolve_target_refuses_a_synthetic_deleted_inode_candidate() {
+        // The seam `dogs::builtin_program` depends on through
+        // `exec_target`. `current_exe` cannot be made to return a
+        // `" (deleted)"` string on this platform, so this hands
+        // `resolve_target` one directly — proving the refusal without
+        // needing a real Linux inode-unlink to produce the string.
+        let deleted = PathBuf::from("/opt/shep/shep (deleted)");
+        let err = resolve_target([None, Some(deleted)], None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no binary to exec: /opt/shep/shep (deleted) (names a deleted inode, not a file)"
         );
     }
 

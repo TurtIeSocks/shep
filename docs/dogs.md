@@ -322,6 +322,213 @@ comparison, not a hand-wave: you were already trusting whatever you point
 a Flockfile's `script` at, and a third-party dog is held to no higher bar
 than that.
 
+## Answering `--version`
+
+A dog answers `--version` on stdout and exits 0. Two numbers come back,
+and they answer different questions:
+
+| what | answers | on a mismatch |
+|---|---|---|
+| the version on line 1 | which build of the dog this is | reported |
+| `shep-protocol` | whether this dog can handshake with this shepherd at all | it cannot connect until one side moves |
+
+The format is line-oriented text:
+
+```
+shep-log-rotate 0.1.3
+shep-protocol: 2
+```
+
+- Line 1 is `<name> <version>`. Shep takes the last whitespace-separated
+  field as the version and ignores the name, so a crate whose name differs
+  from the dog's registered name is fine. This is the line clap already
+  prints for free.
+- Every later line is `<key>: <value>`, one pair to a line.
+  `shep-protocol` carries, in decimal, the `PROTOCOL_VERSION` the binary
+  was compiled against.
+- Unknown keys, blank lines, and the order of the key lines are all
+  ignored. Keys beginning `shep-` are reserved, so a third number can get
+  its own line later without breaking a parser that predates it. Put keys
+  of your own under a prefix of your own.
+
+Answering is optional and stays optional. Dogs predating the convention
+are still adoptable, and a dog that does not answer is never refused for
+it: its protocol is simply unknown.
+
+### What `shep adopt` does with the answer
+
+`shep adopt` asks the candidate before it records anything. The vet was
+already spawning the binary to prove this kernel can exec it, so the
+question costs one argument on a process that was going to start anyway.
+
+| what the candidate answers | what `adopt` does |
+|---|---|
+| a `shep-protocol` this shep does not speak | refuses, before `shep.toml` is touched |
+| a protocol this shep speaks | adopts, and reports the version it gave |
+| a version and no protocol line | adopts, and says the protocol is unknown |
+| nothing, or a run that exits non-zero | adopts, protocol unknown, no notice |
+
+The refusal names both numbers and both ways out:
+
+```
+/usr/local/bin/shep-otel: this dog was built for shep protocol 1, and this
+shep speaks 2; reinstall the dog without --locked so it builds against the
+current shep-core, or run a shep that speaks 1
+```
+
+Only a stated protocol can refuse an adopt. The version is never compared
+with anything, because a third-party dog's crate version has no
+relationship to shep's own: `shep-log-rotate` 0.1.3 against shep 0.1.24 is
+the ordinary case, not a skew, and comparing the two would report every
+dog that exists.
+
+A candidate gets one second to exit and another to have its output read,
+so two seconds is the worst case rather than one. It is killed either way,
+so a dog
+that ignores `--version` and runs costs that second and is adopted with an
+unknown protocol. It cannot hang the `adopt` that is vetting it.
+
+None of the answer is written down. `[daemon] adopted_dogs` records the
+path and nothing else, and a protocol stored at adopt time would be a copy
+of a number that can change on disk with nothing watching. That is G12's
+row 5, the one case where the stored copy would be wrong exactly when it
+mattered, so the binary is asked again rather than remembered.
+
+Emitting it needs four lines and no dependency a dog does not already
+have:
+
+```rust
+if std::env::args().nth(1).as_deref() == Some("--version") {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    println!("shep-protocol: {}", shep_client::PROTOCOL_VERSION);
+    return;
+}
+```
+
+Lines rather than JSON, because a human runs `--version` far more often
+than shep does, and because a stranger writing a dog in a language shep
+has never seen gets two `printf` calls right on the first try. Hand
+written JSON is where the quoting and the trailing comma go wrong, and
+nothing here nests.
+
+### What `shep restart <dog>` does with the answer
+
+`cargo install` replaces a file and never touches a process, so a dog
+upgraded on disk leaves a working system: the dog running now is the old
+binary, still connected, still doing its job. The two only meet at the next
+restart, which may be days away and for a reason that has nothing to do with
+the upgrade.
+
+`shep restart <name>` is that restart, so it asks the same question first:
+
+```
+notice[dog_binary_skew]: `log-rotate`'s binary at /usr/local/bin/shep-log-rotate
+was built for shep protocol 3, and this shep speaks 2; restarting it brings it
+back on that binary, unable to connect. Run a shep that speaks 3, or reinstall
+the dog against protocol 2, and restart it again
+```
+
+Then it restarts the dog. This is a warning and never a refusal: the
+operator asked for the restart, the binary on disk may be exactly what they
+just installed, and there are two ways out of the state rather than one, so
+the message names both and picks neither.
+
+| what the binary answers | what `restart` does |
+|---|---|
+| a `shep-protocol` this shep does not speak | warns, then restarts |
+| a protocol this shep speaks | restarts, silently |
+| a version and no protocol line | restarts, silently |
+| nothing, or a run that exits non-zero | restarts, silently |
+
+**Unknown is not stale.** Every dog written before this contract is in the
+last two rows, and a line on stderr for each of them is how an operator
+learns to skip the one that matters.
+
+Three things are never asked at all. A built-in dog has no binary of its
+own, so there is nothing to be stale. A selector that sweeps rather than
+names, `all` or a `/regex/`, does not reach a dog in the first place. And a
+dog named by id rather than by name is restarted without a check, because
+looking up its name would cost a round trip before the restart the operator
+asked for.
+
+The cost is the same second `adopt` spends, and it is paid only by a restart
+that named an adopted dog. A binary that hangs is killed when the second is
+up and the restart goes ahead unwarned, so the slowest a dog can make
+`shep restart` is two seconds, never indefinitely. Two rather than one
+because the wait for the process to exit and the wait for its text are
+bounded separately: a grandchild holding the pipe open can cost the second
+budget after a clean exit.
+
+A named restart can briefly run your dog twice. To read the binary on disk,
+shep runs it with `--version`, and a dog that does not RECOGNISE that flag
+ignores it and starts doing its ordinary job instead, with `SHEP_HOME`
+pointing at the live shepherd. So a rotator can rotate once and a bark dog
+can open a second subscription, for up to the budget above, before the
+process is killed.
+
+Only dogs that ignore the flag are affected. A dog that recognises
+`--version` and exits, even without naming a protocol, does no work: its
+protocol is unknown and nothing overlaps. The trade is
+deliberate: the command is about to restart that dog anyway, so the only
+question is whether it briefly overlaps itself, and the alternative is not
+asking at all, which is what let a stale dog sit `online` unnoticed. Adding
+`--version` to your dog removes the overlap, since a dog that answers exits
+immediately.
+
+
+### Why the binary is the only thing that can answer
+
+A dog's crate version does not imply its protocol, and neither does
+knowing that somebody installed it:
+
+| how the dog was built | which `shep-core` | so which protocol |
+|---|---|---|
+| `cargo install <dog>` | re-resolved, newest compatible | current |
+| `cargo install --locked`, and most CI | whatever the shipped lockfile pins | whatever was pinned on publish day |
+
+Measured 2026-08-31: `shep-log-rotate` 0.1.3 installed plain compiled
+`shep-core` 0.1.24, so the packaged lockfile was ignored, while the same
+crate built `--locked` produced a protocol 1 dog. Both published dogs
+were shipping a lockfile pinning a protocol 1 `shep-core` that day, and
+both repositories' CI had been red on it for two days. The crate version
+was identical either way. That is the whole argument for asking the
+binary: nothing outside it knows.
+
+### The built-in dogs are outside this
+
+`metrics` and `bark` are not separate binaries. The shepherd starts them
+as `<its own binary> dog <name>`, so a built-in dog **is** the shep
+binary that spawned it and cannot skew from it on disk. There is no
+question here for a contract to answer:
+
+```
+$ shep --version
+shep 0.1.24
+$ shep dog metrics --version
+shep-dog 0.1.24
+```
+
+Neither prints a `shep-protocol` line, and that is not a gap to close.
+The protocol a built-in dog speaks is the shepherd's own, because it is
+the shepherd's binary.
+
+### What this does not catch
+
+Two dogs can agree on the protocol and still be different code.
+`RpcError` gained a public `daemon_version` field inside the 0.1.x range;
+its fields are public and it has no constructor, so every literal built
+outside `shep-client` stopped compiling while `PROTOCOL_VERSION` stood
+still. Protocol equality is necessary and not sufficient.
+
+Closing that is deferred, and the reason is that `--version` cannot close
+it. A break of that kind is source level: it lands when the dog is
+compiled, in the dog's own repository, and a dog nobody rebuilt keeps
+running. Shep has no table of which `shep-client` versions build against
+which daemon, and a version comparison standing in for one would report
+dogs that are fine. What catches it is the dog's own CI building against
+a current `shep-core`, which is where both published dogs' breakage was
+already visible and unread.
+
 ## When a dog dies
 
 If an enabled dog exhausts its own restart budget and lands on `Errored`,

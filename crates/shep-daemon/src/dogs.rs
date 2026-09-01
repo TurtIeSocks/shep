@@ -83,8 +83,13 @@ pub struct DogSpec {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum DogError {
-    /// [`std::env::current_exe`] failed, so a built-in dog has no program to
-    /// run
+    /// A built-in dog has no program it can be spawned with. Two different
+    /// causes wrap the same [`std::io::Error`]: [`std::env::current_exe`]
+    /// itself failing, or — the more common case, and Linux-only — this
+    /// crate's own handover-target resolution refusing every candidate it
+    /// found, which includes a `current_exe` answer naming a deleted inode
+    /// after this binary was replaced on disk (`dog_app`'s doc has the
+    /// full argument).
     NoBinary(std::io::Error),
     /// The dog's binary comes from a source this build cannot spawn
     /// (carries the source as `Debug` renders it). [`DogSource`] is
@@ -102,7 +107,7 @@ pub enum DogError {
 impl fmt::Display for DogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoBinary(err) => write!(f, "this binary's own path is unreadable: {err}"),
+            Self::NoBinary(err) => write!(f, "this binary's own path is unresolvable: {err}"),
             Self::UnsupportedSource(source) => {
                 write!(f, "no way to spawn a dog from source {source}")
             }
@@ -119,6 +124,67 @@ impl core::error::Error for DogError {
             Self::UnsupportedSource(_) | Self::Config(_) => None,
         }
     }
+}
+
+/// The program a built-in dog is spawned as: this binary's own resolved
+/// path.
+///
+/// # Why `handover::exec_target` and not `std::env::current_exe()`, on unix
+///
+/// This used to call `current_exe` directly, and on Linux that is wrong for
+/// exactly the reason `handover::exec_target`'s own doc gives for
+/// a handover: `current_exe` reads `/proc/self/exe`, a symlink to the
+/// *inode* this process was executed from. A package manager replaces the
+/// shepherd's binary by renaming a new file over it, which leaves the old
+/// inode unlinked and still open, so `current_exe` comes back
+/// `"<path> (deleted)"`. No handover has to be in flight for that to bite —
+/// a built-in dog crashing, autorestarting, or `shep restart metrics` after
+/// such a rename hit it on the very next respawn, and the string cannot be
+/// exec'd.
+///
+/// `exec_target`'s own doc frames its candidate order — the recorded
+/// launch path preferred over `current_exe` — as chosen for an exec that
+/// must reach the binary an operator just installed. A dog respawn does
+/// not share that requirement in the same words; it only needs a file it
+/// can exec, not specifically the newest one. The order still serves it
+/// here, for a narrower reason: after a rename, the recorded launch path
+/// is exactly the candidate that still resolves to a file, while
+/// `current_exe` is the one that comes back `" (deleted)"`. Reusing
+/// `exec_target` also keeps one place in this crate that decides "which
+/// file holds my own binary" instead of two, and the one already there
+/// validates every candidate before handing it to a spawn rather than
+/// trusting either blindly.
+///
+/// One consequence is worth stating rather than discovering later: if the
+/// shepherd's own binary has been replaced on disk but the running process
+/// has not yet reloaded or handed over, a dog respawned this way can run
+/// NEWER code than the shepherd currently has loaded in memory. That is a
+/// version-skew question for the `--version` contract this phase's later
+/// tasks add, not a spawn failure — this function's only job is to never
+/// hand a dog a path that cannot be exec'd at all.
+///
+/// # Windows resolves it the plain way, and that is not a shortcut
+///
+/// `handover` is `#[cfg(unix)]` because `execve` and raw descriptor numbers
+/// have no Windows equivalent, so `exec_target` is not reachable there and
+/// this module does not compile for a Windows target if it asks for one.
+/// The guard would also have nothing to catch. `" (deleted)"` is what Linux
+/// puts in `/proc/self/exe` for an unlinked inode, and the rename that
+/// creates one cannot happen on Windows in the first place: the filesystem
+/// refuses to replace a running executable, which is why upgrading shep
+/// there means stopping it. So Windows keeps `current_exe`, which answers
+/// the same question correctly on a platform where the failure mode does
+/// not exist.
+#[cfg(unix)]
+fn builtin_program() -> Result<PathBuf, DogError> {
+    crate::handover::exec_target().map_err(DogError::NoBinary)
+}
+
+/// The program a built-in dog is spawned as, on a platform with no
+/// handover. See the unix version above for why the two differ.
+#[cfg(windows)]
+fn builtin_program() -> Result<PathBuf, DogError> {
+    std::env::current_exe().map_err(DogError::NoBinary)
 }
 
 /// The app config the daemon spawns `spec` from.
@@ -139,18 +205,18 @@ impl core::error::Error for DogError {
 /// is supervised exactly as a sheep is.
 ///
 /// # Errors
-/// - [`DogError::NoBinary`] — [`std::env::current_exe`] failed, so a
-///   built-in dog has no program to run.
+/// - [`DogError::NoBinary`] — a built-in dog has no program to run, either
+///   because [`std::env::current_exe`] itself failed or because the
+///   `builtin_program` helper above refused every candidate it found (see
+///   its doc for why that includes a Linux `current_exe` answer naming a
+///   deleted inode).
 /// - [`DogError::UnsupportedSource`] — the source is a kind this build does
 ///   not know how to spawn.
 /// - [`DogError::Config`] — the assembled config failed `normalize`.
 pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogError> {
     let (script, args) = match &spec.source {
         DogSource::BuiltIn => (
-            std::env::current_exe()
-                .map_err(DogError::NoBinary)?
-                .display()
-                .to_string(),
+            builtin_program()?.display().to_string(),
             vec!["dog".to_string(), spec.name.clone()],
         ),
         // No arguments: an adopted dog is a binary somebody else wrote, and
@@ -862,6 +928,43 @@ mod tests {
     use crate::testing::test_paths;
     use shep_core::protocol::ProcessInfo;
     use shep_core::status::ProcStatus;
+
+    /// fails if a `current_exe` answer carrying Linux's `" (deleted)"`
+    /// suffix ever becomes a built-in dog's script. Before this fix
+    /// `dog_app` called `std::env::current_exe()` unguarded and used
+    /// whatever it returned as the script directly; on Linux, a package
+    /// manager renaming a new file over the running shepherd's inode makes
+    /// that string literal, and exec'ing it fails.
+    ///
+    /// `current_exe` cannot be made to return that string on this platform
+    /// (or on any platform, safely), so this exercises the exact function
+    /// `builtin_program` now delegates to —
+    /// `crate::handover::resolve_target`, proven to refuse a deleted-inode
+    /// candidate by
+    /// `handover::tests::resolve_target_refuses_a_synthetic_deleted_inode_candidate`
+    /// — and pins what a dog's own error reads once that refusal reaches
+    /// `DogError`, since a message naming the fix is the feature this
+    /// phase asks for.
+    ///
+    /// Unix only, because the guard it pins is: `handover` is `#[cfg(unix)]`,
+    /// and the `" (deleted)"` string it refuses is Linux's answer for an
+    /// unlinked `/proc/self/exe`. Windows resolves a built-in dog's program
+    /// with `current_exe` and has no such state to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_inode_answer_from_current_exe_never_becomes_a_dogs_script() {
+        let refusal = crate::handover::resolve_target(
+            [None, Some(PathBuf::from("/opt/shep/shep (deleted)"))],
+            None,
+        )
+        .unwrap_err();
+        let err = DogError::NoBinary(refusal);
+        assert_eq!(
+            err.to_string(),
+            "this binary's own path is unresolvable: no binary to exec: \
+             /opt/shep/shep (deleted) (names a deleted inode, not a file)"
+        );
+    }
 
     /// fails if a `[dog.<name>]` value is folded into the child's
     /// environment. That is the design's whole reason for putting config on

@@ -435,6 +435,239 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       the same index without leaving a terminal.
     </p>
 
+    <h2>Answering <code>--version</code></h2>
+    <p>
+      A dog answers <code>--version</code> on stdout and exits 0. Two
+      numbers come back, and they answer different questions.
+    </p>
+    <div class="metrics-table">
+      <div class="row header">
+        <span>What</span>
+        <span>Answers</span>
+      </div>
+      <div class="row"><span>the version on line 1</span> <span>Which build of the dog this is. A difference is reported, never refused.</span></div>
+      <div class="row"><span><code>shep-protocol</code></span> <span>Whether this dog can handshake with this shepherd at all. A difference means it can't connect until one side moves.</span></div>
+    </div>
+    <CodeBlock>{`shep-log-rotate 0.1.3
+shep-protocol: 2`}</CodeBlock>
+    <p>
+      Line 1 is <code>&lt;name&gt; &lt;version&gt;</code>. Shep takes the
+      last whitespace-separated field as the version and ignores the name,
+      so a crate whose name differs from the dog's registered name is fine.
+      That's the line clap already prints for free. Every later line is{" "}
+      <code>&lt;key&gt;: &lt;value&gt;</code>, one pair to a line, and{" "}
+      <code>shep-protocol</code> carries in decimal the{" "}
+      <code>PROTOCOL_VERSION</code> the binary was compiled against.
+    </p>
+    <p>
+      Unknown keys, blank lines and the order of the key lines are all
+      ignored. Keys beginning <code>shep-</code> are reserved, so a third
+      number can get its own line later without breaking a parser that
+      predates it. Put keys of your own under a prefix of your own.
+    </p>
+    <p>
+      Lines rather than JSON, because a human runs <code>--version</code>{" "}
+      far more often than shep does, and because a stranger writing a dog in
+      a language shep has never seen gets two <code>printf</code> calls
+      right on the first try. Hand written JSON is where the quoting and the
+      trailing comma go wrong, and nothing here nests.
+    </p>
+    <p>Emitting it needs no dependency a dog doesn't already have:</p>
+    <CodeBlock label="main.rs">{`if std::env::args().nth(1).as_deref() == Some("--version") {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    println!("shep-protocol: {}", shep_client::PROTOCOL_VERSION);
+    return;
+}`}</CodeBlock>
+    <Callout variant="note">
+      Answering is optional and stays optional. Dogs predating the
+      convention are still adoptable, and a dog that doesn't answer is never
+      refused for it: its protocol is simply unknown.
+    </Callout>
+
+    <h3>What <code>shep adopt</code> does with the answer</h3>
+    <p>
+      <code>shep adopt</code> asks the candidate before it records anything.
+      The vet was already spawning the binary to prove this kernel can exec
+      it, so the question costs one argument on a process that was going to
+      start anyway.
+    </p>
+    <div class="metrics-table">
+      <div class="row header">
+        <span>What the candidate answers</span>
+        <span>What adopt does</span>
+      </div>
+      <div class="row"><span>a <code>shep-protocol</code> this shep doesn't speak</span> <span>Refuses, before <code>shep.toml</code> is touched.</span></div>
+      <div class="row"><span>a protocol this shep speaks</span> <span>Adopts, and reports the version it gave.</span></div>
+      <div class="row"><span>a version and no protocol line</span> <span>Adopts, and says the protocol is unknown.</span></div>
+      <div class="row"><span>nothing, or a run that exits non-zero</span> <span>Adopts, protocol unknown, no notice.</span></div>
+    </div>
+    <p>The refusal names both numbers and both ways out:</p>
+    <CodeBlock>{`/usr/local/bin/shep-otel: this dog was built for shep protocol 1, and this
+shep speaks 2; reinstall the dog without --locked so it builds against the
+current shep-core, or run a shep that speaks 1`}</CodeBlock>
+    <p>
+      Only a stated protocol can refuse an adopt. The version is never
+      compared with anything, because a third-party dog's crate version has
+      no relationship to shep's own: <code>shep-log-rotate</code> 0.1.3
+      against shep 0.1.24 is the ordinary case, not a skew, and comparing
+      the two would report every dog that exists.
+    </p>
+    <p>
+      A candidate gets one second to exit and another to have its output
+      read, so two seconds is the worst case rather than one. It is killed
+      either way, so a
+      dog that ignores <code>--version</code> and runs costs that second and
+      is adopted with an unknown protocol. It can't hang the{" "}
+      <code>adopt</code> that's vetting it.
+    </p>
+    <p>
+      None of the answer is written down. <code>[daemon] adopted_dogs</code>{" "}
+      records the path and nothing else, and a protocol stored at adopt time
+      would be a copy of a number that can change on disk with nothing
+      watching. Shep asks the binary again rather than remembering what it
+      said.
+    </p>
+
+    <h3>What <code>shep restart &lt;dog&gt;</code> does with the answer</h3>
+    <p>
+      <code>cargo install</code> replaces a file and never touches a
+      process, so a dog upgraded on disk leaves a working system: the dog
+      running now is the old binary, still connected, still doing its job.
+      The two only meet at the next restart, which may be days away and for
+      a reason that has nothing to do with the upgrade.
+    </p>
+    <p>
+      <code>shep restart &lt;name&gt;</code> is that restart, so it asks the
+      same question first:
+    </p>
+    <CodeBlock>{`notice[dog_binary_skew]: \`log-rotate\`'s binary at /usr/local/bin/shep-log-rotate
+was built for shep protocol 3, and this shep speaks 2; restarting it brings it
+back on that binary, unable to connect. Run a shep that speaks 3, or reinstall
+the dog against protocol 2, and restart it again`}</CodeBlock>
+    <p>
+      Then it restarts the dog. This is a warning and never a refusal: the
+      operator asked for the restart, the binary on disk may be exactly what
+      they just installed, and there are two ways out of the state rather
+      than one, so the message names both and picks neither.
+    </p>
+    <div class="metrics-table">
+      <div class="row header">
+        <span>What the binary answers</span>
+        <span>What restart does</span>
+      </div>
+      <div class="row"><span>a <code>shep-protocol</code> this shep doesn't speak</span> <span>Warns, then restarts.</span></div>
+      <div class="row"><span>a protocol this shep speaks</span> <span>Restarts, silently.</span></div>
+      <div class="row"><span>a version and no protocol line</span> <span>Restarts, silently.</span></div>
+      <div class="row"><span>nothing, or a run that exits non-zero</span> <span>Restarts, silently.</span></div>
+    </div>
+    <p>
+      Unknown is not stale. Every dog written before this contract is in the
+      last two rows, and a line on stderr for each of them is how an
+      operator learns to skip the one that matters.
+    </p>
+    <p>
+      Three things are never asked at all. A built-in dog has no binary of
+      its own, so there is nothing to be stale. A selector that sweeps
+      rather than names, <code>all</code> or a <code>/regex/</code>, doesn't
+      reach a dog in the first place. And a dog named by id rather than by
+      name is restarted without a check, because looking up its name would
+      cost a round trip before the restart the operator asked for.
+    </p>
+    <p>
+      The cost is the same second <code>adopt</code> spends, and it's paid
+      only by a restart that named an adopted dog. A binary that hangs is
+      killed when the second is up and the restart goes ahead unwarned, so
+      the slowest a dog can make <code>shep restart</code> is two seconds,
+      never indefinitely.
+    </p>
+
+    <Callout variant="note">
+      <p>
+        A named restart briefly runs your dog twice. To read the binary on
+        disk, shep runs it with <code>--version</code>, and a dog that does
+        not recognise that flag ignores it and starts doing its ordinary job
+        instead, with <code>SHEP_HOME</code> pointing at the live shepherd.
+        So a rotator can rotate once, and a bark dog can open a second
+        subscription, before the process is killed.
+      </p>
+      <p>
+        Only dogs that ignore the flag are affected. A dog that recognises
+        <code>--version</code> and exits, even without naming a protocol,
+        does no work: its protocol is unknown and nothing overlaps. The
+        trade is deliberate: the command is about to restart that dog anyway, so the
+        only question is whether it briefly overlaps itself, and the
+        alternative is not asking at all. Adding <code>--version</code> to
+        your dog removes the overlap, since a dog that answers exits
+        immediately.
+      </p>
+    </Callout>
+
+    <h3>Why the binary is the only thing that can answer</h3>
+    <p>
+      A dog's crate version doesn't imply its protocol, and neither does
+      knowing that somebody installed it. Which{" "}
+      <code>shep-core</code> a dog ends up carrying depends on how it was
+      built:
+    </p>
+    <div class="metrics-table">
+      <div class="row header">
+        <span>How it was built</span>
+        <span>Which protocol</span>
+      </div>
+      <div class="row"><span><code>cargo install &lt;dog&gt;</code></span> <span><code>shep-core</code> is re-resolved to the newest compatible release, so the protocol is current.</span></div>
+      <div class="row"><span><code>cargo install --locked</code>, and most CI</span> <span>The shipped lockfile is honoured, so the protocol is whatever was pinned on publish day.</span></div>
+    </div>
+    <p class="fine">
+      Measured 2026-08-31: <code>shep-log-rotate</code> 0.1.3 installed
+      plain compiled <code>shep-core</code> 0.1.24, ignoring the packaged
+      lockfile, while the same crate built <code>--locked</code> produced a
+      protocol 1 dog. Both published dogs were shipping a lockfile pinning a
+      protocol 1 <code>shep-core</code> that day, and both repositories' CI
+      had been red on it for two days. The crate version was identical
+      either way. That's the whole argument for asking the binary: nothing
+      outside it knows.
+    </p>
+
+    <h3>The built-in dogs are outside this</h3>
+    <p>
+      <code>metrics</code> and <code>bark</code> are not separate binaries.
+      The shepherd starts them as{" "}
+      <code>&lt;its own binary&gt; dog &lt;name&gt;</code>, so a built-in
+      dog <strong>is</strong> the shep binary that spawned it and cannot
+      skew from it on disk. There's no question here for a contract to
+      answer:
+    </p>
+    <CodeBlock>{`$ shep --version
+shep 0.1.24
+$ shep dog metrics --version
+shep-dog 0.1.24`}</CodeBlock>
+    <p>
+      Neither prints a <code>shep-protocol</code> line, and that isn't a gap
+      to close. The protocol a built-in dog speaks is the shepherd's own,
+      because it is the shepherd's binary.
+    </p>
+
+    <h3>What this doesn't catch</h3>
+    <p>
+      Two dogs can agree on the protocol and still be different code.{" "}
+      <code>RpcError</code> gained a public <code>daemon_version</code>{" "}
+      field inside the 0.1.x range; its fields are public and it has no
+      constructor, so every literal built outside <code>shep-client</code>{" "}
+      stopped compiling while <code>PROTOCOL_VERSION</code> stood still.
+      Protocol equality is necessary and not sufficient.
+    </p>
+    <p>
+      Closing that is deferred, and the reason is that{" "}
+      <code>--version</code> can't close it. A break of that kind is source
+      level: it lands when the dog is compiled, in the dog's own repository,
+      and a dog nobody rebuilt keeps running. Shep has no table of which{" "}
+      <code>shep-client</code> versions build against which daemon, and a
+      version comparison standing in for one would report dogs that are
+      fine. What catches it is the dog's own CI building against a current{" "}
+      <code>shep-core</code>, which is where both published dogs' breakage
+      was already visible and unread.
+    </p>
+
     <h2>When a dog dies</h2>
     <p>
       If an enabled dog exhausts its own restart budget and lands on{" "}

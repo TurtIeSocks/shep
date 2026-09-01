@@ -33,12 +33,14 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
-use shep_client::{Client, ConnectError};
+use shep_client::{Client, ConnectError, PROTOCOL_VERSION};
 use shep_core::barks;
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{DogSource, Request, Response};
+use shep_core::protocol::{DogSource, Request, Response, SelectorSpec};
 
 use crate::cli::{AdoptArgs, BarksArgs};
 use crate::commands::shep_toml::{ShepToml, ShepTomlError};
@@ -345,6 +347,20 @@ pub enum AdoptRefusal {
         /// What `exec` reported.
         reason: String,
     },
+    /// It answered `--version` (see [`DogVersion`]) with a `shep-protocol`
+    /// this shep does not speak. The two cannot handshake, so adopting it
+    /// would register a dog that connects to nothing — G11's
+    /// online-and-idle entry, refused here instead of discovered days
+    /// later.
+    ///
+    /// Only a stated protocol reaches this. A dog that names none is
+    /// [`DogVersion::protocol`]'s `None` and is adopted.
+    ProtocolMismatch {
+        /// What the candidate said it speaks.
+        dog: u32,
+        /// [`PROTOCOL_VERSION`], what this shep speaks.
+        shep: u32,
+    },
 }
 
 impl std::fmt::Display for AdoptRefusal {
@@ -362,6 +378,12 @@ impl std::fmt::Display for AdoptRefusal {
             Self::WillNotExec { reason } => {
                 write!(f, "this kernel refused to run that file: {reason}")
             }
+            Self::ProtocolMismatch { dog, shep } => write!(
+                f,
+                "this dog was built for shep protocol {dog}, and this shep speaks {shep}; \
+                 reinstall the dog without --locked so it builds against the current \
+                 shep-core, or run a shep that speaks {dog}"
+            ),
         }
     }
 }
@@ -385,14 +407,21 @@ impl core::error::Error for AdoptRefusal {}
 /// binary, and a binary any user can rewrite is not one to run in order to
 /// find out whether it runs. The fifth,
 /// [`AdoptRefusal::WillNotExec`], is answered by actually trying it —
-/// spawned with the same (empty) argument list the daemon uses for an
-/// adopted dog (`shep-daemon/src/dogs.rs`'s `dog_app`), and killed once it
-/// is confirmed either to have run or to be still running. The question is
-/// whether this kernel can exec this file, and the only authority on that
-/// is this kernel; reading a header instead would mean writing a second,
-/// partial loader that disagrees with the real one — on a fat Mach-O, on a
-/// shebang naming an absent interpreter, on a binary needing a missing
-/// dynamic library.
+/// spawned, and killed once it is confirmed either to have run or to be
+/// still running. The question is whether this kernel can exec this file,
+/// and the only authority on that is this kernel; reading a header instead
+/// would mean writing a second, partial loader that disagrees with the real
+/// one — on a fat Mach-O, on a shebang naming an absent interpreter, on a
+/// binary needing a missing dynamic library.
+///
+/// The sixth, [`AdoptRefusal::ProtocolMismatch`], rides on that same
+/// process: it is spawned with [`VERSION_FLAG`], so the run that proves the
+/// kernel can exec the file is the same run that answers what protocol it
+/// speaks. A dog that answers a protocol this shep does not speak is
+/// refused here rather than adopted into an entry that connects to nothing.
+/// A dog that answers nothing is adopted with [`VettedBinary::answer`]
+/// `None`: answering is optional and stays optional, so every dog written
+/// before the contract existed is still adoptable.
 ///
 /// `home` and `name` are the ones this invocation resolved, not the ambient
 /// ones — the probe is handed exactly the environment the adopted dog will
@@ -400,9 +429,71 @@ impl core::error::Error for AdoptRefusal {}
 /// under the section key `adopt` is about to record.
 ///
 /// # Errors
-/// The refusal, which the caller renders. Nothing here is a shep fault, so
-/// none of these is an [`ExitCode::Internal`].
+/// The refusal, which the caller renders — including
+/// [`AdoptRefusal::ProtocolMismatch`] when the candidate names a protocol
+/// this shep cannot speak. Nothing here is a shep fault, so none of these
+/// is an [`ExitCode::Internal`].
+/// Proves this kernel can exec `path`, and asks it what protocol it speaks.
+///
+/// The candidate is spawned twice over: once bare, to prove the exec works
+/// at all rather than discovering it at supervision time, and once with
+/// `--version` to read the contract in `docs/dogs.md`. A group-writable
+/// binary is reported rather than refused, since an operator naming a path
+/// has already made that call.
+///
+/// # Errors
+/// [`AdoptRefusal`] when the path does not resolve, is not a file this
+/// kernel will exec, or answers a protocol this shep cannot talk to. A
+/// candidate that does not answer `--version` is NOT an error: its protocol
+/// is recorded as unknown, which `docs/dogs.md` promises is never a refusal.
 pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, AdoptRefusal> {
+    vet_binary_within(path, home, name, VERSION_BUDGET)
+}
+
+/// [`vet_binary`], against a caller-chosen budget for the `--version` probe.
+///
+/// Production has exactly one budget and [`vet_binary`] passes it. This
+/// exists for tests, and for a specific failure rather than for symmetry:
+/// the probe spawns a real child and bounds the wait on a wall clock, so
+/// every test reaching it inherits that bound. Measured under a full
+/// workspace run, a `/bin/sh` candidate takes 180 to 300ms and over a
+/// second at high thread counts, against a [`VERSION_BUDGET`] of one. A
+/// test asking a question that has nothing to do with timing then fails
+/// because the machine was busy, which is a test reporting on the runner
+/// rather than on shep.
+///
+/// So a test that cares about the budget passes a small one and a test that
+/// does not passes a generous one, and neither is at the mercy of what else
+/// is running. The alternative considered and rejected was moving them all
+/// into `mod slow`, which would take roughly twenty tests out of the inner
+/// loop to fix a problem none of them are about.
+///
+/// # Errors
+/// The same [`AdoptRefusal`] set [`vet_binary`] raises, with the `--version`
+/// probe bounded by `budget` rather than by [`VERSION_BUDGET`].
+///
+/// # What `budget` actually bounds
+///
+/// One wait, not the call. [`version_answer`] bounds two things separately
+/// and gives each the full `budget`: the wait for the child to exit, and
+/// the wait for its output to arrive. So the call is bounded by roughly
+/// twice `budget`, plus up to 50ms on macOS for
+/// `macos_deferred_exec_failure`'s own poll.
+///
+/// Deliberate, and the alternative is worse. One absolute deadline shared
+/// between the two waits reads tidier and would make this doc a single
+/// number, but it means a child that exits at 0.9 of the budget leaves 0.1
+/// for its output to be read. A probe that runs out answers unknown, and
+/// unknown is deliberately silent, so tightening this would make shep go
+/// quiet about exactly the dogs it is meant to notice. The two waits bound
+/// different failures, a child that will not exit and a pipe a grandchild
+/// is holding, and neither should be able to consume the other's room.
+pub fn vet_binary_within(
+    path: &Path,
+    home: &Path,
+    name: &str,
+    budget: Duration,
+) -> Result<VettedBinary, AdoptRefusal> {
     let metadata = std::fs::metadata(path).map_err(|_| AdoptRefusal::Missing)?;
     if !metadata.is_file() {
         return Err(AdoptRefusal::NotAFile);
@@ -431,11 +522,123 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
         .map(|abs| shep_core::paths::strip_verbatim_prefix(&abs).into_owned())
         .map_err(|_| AdoptRefusal::Missing)?;
     let group_writable = writability(&canonical)?;
-    // Spawned with no arguments — an adopted dog is run exactly this way
-    // (`dog_app`'s own doc) — and torn down unconditionally: `kill` is
-    // ignored (a process that already exited is not a failure to vet), but
-    // `wait` always runs, on every path out of this match, so no zombie
-    // survives a refusal or a success.
+    let answer = ask_version(&canonical, home, name, budget)?;
+    // Only a STATED protocol can refuse, and only this one thing can.
+    // `answer.version` is deliberately not compared with anything: a
+    // third-party dog's crate version has no relationship to shep's own --
+    // `shep-log-rotate` 0.1.3 against shep 0.1.24 is the ordinary case, not
+    // a skew -- so comparing them would refuse, or warn about, every dog
+    // that exists. `docs/dogs.md`'s table is what this implements: the
+    // protocol decides whether the dog can connect at all and is hard, the
+    // version says which build it is and is reported.
+    if let Some(dog) = answer.as_ref().and_then(|answer| answer.protocol)
+        && dog != PROTOCOL_VERSION
+    {
+        return Err(AdoptRefusal::ProtocolMismatch {
+            dog,
+            shep: PROTOCOL_VERSION,
+        });
+    }
+    Ok(VettedBinary {
+        path: canonical,
+        group_writable,
+        answer,
+    })
+}
+
+/// Runs `path` with [`VERSION_FLAG`] and reads what it answers, within
+/// [`VERSION_BUDGET`].
+///
+/// `Ok(None)` is an UNKNOWN protocol and is never a fault: silence, output
+/// shep cannot read, a run that failed, and a run still going when the
+/// budget ran out all arrive here the same way. Answering is optional and stays
+/// optional, so every dog written before the contract existed reads as
+/// unknown rather than as broken.
+///
+/// Two callers ask the same binary the same question for different reasons.
+/// [`vet_binary`] asks a candidate nobody has adopted yet;
+/// [`warn_of_a_dog_a_restart_would_break`] asks a dog that has been adopted
+/// for months, because the answer lives in the binary and the binary
+/// changes on disk with nothing watching (G12 row 5). Neither writes the
+/// answer down.
+///
+/// # Errors
+/// [`AdoptRefusal::WillNotExec`], and only that: nothing here judges the
+/// answer it read, so [`AdoptRefusal::ProtocolMismatch`] stays
+/// The environment the probe runs a candidate with: what the daemon would
+/// give the dog, and nothing else.
+///
+/// Mirrors `shep_daemon::assemble::base_env` rather than importing it,
+/// because that function is private to a crate the CLI does not otherwise
+/// reach into for this. The lists are duplicated and that is a real cost:
+/// if the daemon's allowlist grows, this one has to follow, or a candidate
+/// is vetted under conditions its supervised run will not have.
+/// `a_probe_runs_with_the_daemons_environment_and_not_the_operators` is the
+/// test that fails when they disagree about the two variables that matter.
+fn probe_env() -> Vec<(String, String)> {
+    #[cfg(unix)]
+    const INHERITED: &[&str] = &["HOME", "USER", "LANG", "TZ"];
+    #[cfg(unix)]
+    const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+    #[cfg(windows)]
+    const INHERITED: &[&str] = &[
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "COMSPEC",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+    ];
+    #[cfg(windows)]
+    const DEFAULT_PATH: &str = r"C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem";
+
+    let path = std::env::var("PATH")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| DEFAULT_PATH.to_string());
+    let mut env = vec![("PATH".to_string(), path)];
+    env.extend(
+        INHERITED
+            .iter()
+            .filter_map(|key| std::env::var(key).ok().map(|v| ((*key).to_string(), v))),
+    );
+    env
+}
+
+/// [`vet_binary`]'s to raise. A caller that only wants an answer treats the
+/// error as one more way of not getting one.
+fn ask_version(
+    path: &Path,
+    home: &Path,
+    name: &str,
+    budget: Duration,
+) -> Result<Option<DogVersion>, AdoptRefusal> {
+    // Spawned with ONE argument, `--version`, and torn down
+    // unconditionally: `kill` is ignored (a process that already exited is
+    // not a failure to vet), but `wait` always runs, on every path out of
+    // this match, so no zombie survives a refusal or a success.
+    //
+    // That argument is the one place shep invents an argv for an adopted
+    // dog, and `dog_app`'s own doc argues the other way for the SUPERVISED
+    // run: "an argv shep invented for it is one more thing it has to agree
+    // with before it can start", so a dog is run with none. Both are
+    // right, because they are different runs. A supervised dog must work
+    // for a stranger who never read this repo, so shep asks it for nothing.
+    // This process is a throwaway that exists only to be observed and
+    // killed, so the cost of a candidate disagreeing about `--version` is
+    // an unknown protocol -- and `docs/dogs.md` promises that an unknown
+    // protocol is never a refusal. The vet asks; the supervisor does not.
+    //
+    // A candidate is somebody else's binary and is not assumed to be well
+    // behaved about any of it: [`version_answer`] bounds the wait by
+    // `budget`, so one that never exits costs that and is then killed,
+    // rather than hanging the command that asked.
     //
     // `SHEP_HOME` is set to the home this invocation actually resolved, not
     // inherited: an inherited `SHEP_HOME` is usually unset, so the
@@ -445,14 +648,27 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
     // to do would connect to the LIVE daemon and do it, during the command
     // whose entire purpose is deciding whether to trust the binary at all.
     //
-    // NOT `env_clear()`. A real
-    // adopted dog runs with a filtered environment the daemon builds
-    // (`assemble::base_env`: `PATH`, plus whichever of `HOME`/`USER`/`LANG`/
-    // `TZ` the daemon itself has), so clearing here would vet under stricter
-    // conditions than the dog will ever run under, and a binary needing
-    // `DYLD_LIBRARY_PATH` or its like would be refused despite working
-    // perfectly once adopted. Vetting has to model the real thing, not an
-    // idealised one.
+    // `env_clear()` and then the daemon's own allowlist, which is a
+    // REVERSAL of what this comment used to say and worth recording rather
+    // than quietly swapping. It argued that clearing would vet under
+    // stricter conditions than the dog ever runs under, so a binary needing
+    // `DYLD_LIBRARY_PATH` would be refused despite working once adopted,
+    // and that vetting has to model the real thing.
+    //
+    // The principle was right and the conclusion inverted. The real thing
+    // is not the operator's shell: an adopted dog runs with what the DAEMON
+    // builds (`assemble::base_env`: `PATH` plus a short allowlist), so
+    // inheriting the operator's environment vetted under LOOSER conditions
+    // than the dog will ever see, and handed a stranger's binary the one
+    // place credentials live. Clearing and rebuilding models the run more
+    // closely, not less. See `probe_env`.
+    //
+    // The restart caller is the sharper case, and review is what made it
+    // visible. `vet_binary` WARNS about a group-writable binary and adopts
+    // it anyway, so a group member can replace an adopted dog. Every
+    // `shep restart <name>` after that runs their code, and a probe that
+    // ignores `--version` is a program of their choosing reading whatever
+    // the operator had exported.
     //
     // An earlier revision of this comment said that filtered environment has
     // the dog's `[dog.<name>]` env merged over it, citing `AppConfig::env`'s
@@ -476,15 +692,22 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
     // killed on sight (immediately, on every kernel but macOS), so anything
     // it writes to prove what it received is a race with its own teardown.
     //
-    // Stdio goes to null. A candidate that writes on its way up would
+    // Stdin and stderr go to null, and stdout to a pipe shep reads rather
+    // than to the terminal. A candidate that writes on its way up would
     // otherwise scribble over the operator's terminal mid-vet, and a hostile
     // one could imitate shep's own output at the exact moment somebody is
-    // deciding whether to trust it.
-    match Command::new(&canonical)
+    // deciding whether to trust it. The pipe is read by [`version_answer`]
+    // and never rendered.
+    // `env_clear` and then the allowlist, never the operator's environment.
+    // Argued at the top of this function; `probe_env` builds the list.
+    match Command::new(path)
+        .arg(VERSION_FLAG)
+        .env_clear()
+        .envs(probe_env())
         .env("SHEP_HOME", home)
         .env("SHEP_DOG_NAME", name)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     {
@@ -492,16 +715,19 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
             reason: err.to_string(),
         }),
         Ok(mut child) => {
+            // Started before the exec probe below and before any wait: a
+            // candidate that writes more than a pipe buffer holds would
+            // otherwise block on its own `write` forever, and be
+            // indistinguishable from one that simply never exits.
+            let reading = child.stdout.take().map(read_in_background);
             if let Some(reason) = macos_deferred_exec_failure(&mut child) {
                 let _ = child.wait();
                 return Err(AdoptRefusal::WillNotExec { reason });
             }
+            let answer = version_answer(&mut child, reading, budget);
             let _ = child.kill();
             let _ = child.wait();
-            Ok(VettedBinary {
-                path: canonical,
-                group_writable,
-            })
+            Ok(answer)
         }
     }
 }
@@ -517,6 +743,157 @@ pub struct VettedBinary {
     /// directory, both, or (the ordinary case) neither. `adopt` reports one
     /// notice per entry; nothing here is a refusal.
     pub group_writable: Vec<PathBuf>,
+    /// What it answered when asked for its version, and `None` when it
+    /// answered nothing shep could read -- silence, a failed run, or output
+    /// with no first line. `adopt` reports it and does not record it; see
+    /// [`DogVersion`].
+    pub answer: Option<DogVersion>,
+}
+
+/// The flag [`vet_binary`] asks a candidate with, and the one
+/// `docs/dogs.md` publishes as the contract.
+const VERSION_FLAG: &str = "--version";
+
+/// The one key [`parse_version_answer`] reads. Every other `shep-` key is
+/// reserved for a number this shep has not heard of, and is ignored rather
+/// than refused, so a dog written against a later contract stays adoptable
+/// by this one.
+const SHEP_PROTOCOL_KEY: &str = "shep-protocol";
+
+/// How long [`ask_version`] gives a binary to answer, and separately how
+/// long it then waits for that answer to reach the reader thread.
+///
+/// One second, against the milliseconds a `println!` and an exit take. The
+/// generosity is for a cold, dynamically linked binary on a loaded machine,
+/// and the ceiling is what an operator will sit through: `adopt` is
+/// interactive and runs once. Both ways of being wrong are survivable and
+/// they are not symmetric -- too short records an unknown protocol for a
+/// slow dog, which costs the gate and not the adopt, while too long stalls
+/// every adopt of the dogs that exist today, none of which answer at all.
+///
+/// `restart` asks with the same number rather than a tighter one of its
+/// own, and the tighter one was tried first: a 250ms budget lost the answer
+/// outright on a loaded machine, where a probe measured 180-300ms against
+/// single-digit milliseconds idle. A budget that drops the warning whenever
+/// the box is busy is worse than one that occasionally costs a second,
+/// because a busy box is where an operator restarts things. The cost is
+/// bounded and it is paid only by a restart that NAMED an adopted dog: a
+/// binary that hangs is killed at the budget and the restart proceeds
+/// unwarned, so the slowest thing a dog can do to `shep restart` is delay
+/// it, never block it.
+pub(crate) const VERSION_BUDGET: Duration = Duration::from_secs(1);
+
+/// How often [`version_answer`] polls within [`VERSION_BUDGET`], following
+/// [`macos_deferred_exec_failure`]'s own polled-with-a-budget shape rather
+/// than inventing a second one.
+const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// What a candidate answered to `--version`, parsed by
+/// [`parse_version_answer`] from the format `docs/dogs.md` publishes.
+///
+/// The two fields answer different questions and only one of them can
+/// refuse an adopt: see [`AdoptRefusal::ProtocolMismatch`].
+#[derive(Debug, PartialEq, Eq)]
+/// What a dog answered `--version` with.
+///
+/// Two numbers rather than one, because they answer different questions:
+/// `protocol` decides whether the dog can handshake at all, and `version`
+/// only says which build it is. A dog may give the second and not the
+/// first, which is why `protocol` is optional and an absent one is unknown
+/// rather than incompatible.
+pub struct DogVersion {
+    /// The last whitespace-separated field of line 1 -- the version. The
+    /// name before it is ignored, so a crate whose name differs from the
+    /// dog's registered name answers correctly without knowing it.
+    pub version: String,
+    /// The `shep-protocol` line's value, and `None` when the answer carried
+    /// no such line or carried one that is not a decimal number. Answering
+    /// is optional, so `None` is an unknown protocol rather than a fault.
+    pub protocol: Option<u32>,
+}
+
+/// Parses the format `docs/dogs.md` publishes: `<name> <version>` on line
+/// 1, then `<key>: <value>` lines.
+///
+/// `None` when there is no line 1 to read a version from. Everything past
+/// that is tolerated rather than refused -- unknown keys, blank lines, key
+/// order, and a `shep-protocol` that is not a number -- because a shep that
+/// refuses a dog over the shape of text the dog never promised to print is
+/// refusing on its own guess. The strictness is all in the other direction:
+/// only an exact [`SHEP_PROTOCOL_KEY`] carrying a decimal is believed, and
+/// only a believed protocol can refuse.
+fn parse_version_answer(text: &str) -> Option<DogVersion> {
+    let mut lines = text.lines();
+    let version = lines.next()?.split_whitespace().next_back()?.to_string();
+    let mut protocol = None;
+    for line in lines {
+        if let Some((key, value)) = line.split_once(':')
+            && key.trim() == SHEP_PROTOCOL_KEY
+        {
+            protocol = value.trim().parse().ok();
+        }
+    }
+    Some(DogVersion { version, protocol })
+}
+
+/// Drains `stdout` to end on a thread, handing the text back through the
+/// returned channel.
+///
+/// A thread rather than a read on this one, because every read here has to
+/// be bounded and none of them can be. Reading before the candidate exits
+/// blocks until it writes; reading after it exits blocks for as long as
+/// anything the candidate spawned still holds the inherited pipe open,
+/// which a candidate shep is vetting precisely because it does not trust it
+/// could do forever. On the timeout path the thread is left to end on its
+/// own when the pipe closes: it holds nothing but a `String` and a sender,
+/// and `adopt` is a one-shot command.
+fn read_in_background(mut stdout: std::process::ChildStdout) -> Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut text = String::new();
+        // A candidate answering in bytes that are not UTF-8 is answering
+        // nothing shep can read, which is the same unknown as silence.
+        let _ = stdout.read_to_string(&mut text);
+        let _ = tx.send(text);
+    });
+    rx
+}
+
+/// Waits, bounded by [`VERSION_BUDGET`], for `child` to answer.
+///
+/// Twice that is the worst case rather than once, because the wait for the
+/// exit and the wait for the text the reader thread collected are bounded
+/// separately. Only a child that has ALREADY exited successfully reaches
+/// the second one, so its text is written and its own end of the pipe is
+/// closed; that bound is there for a grandchild still holding the inherited
+/// pipe open, not for anything the dog itself is doing.
+///
+/// `None` -- an unknown protocol, never a refusal -- for every way of not
+/// answering: no pipe to read, a run that did not exit inside the budget, a
+/// run that exited non-zero, or output with no line 1.
+///
+/// The non-zero exit is not a technicality. `docs/dogs.md` says a dog
+/// answers on stdout AND exits 0, so lines printed by a run that then
+/// failed are not an answer -- and believing them would let a candidate
+/// refuse its own adopt with a protocol number from a code path that did
+/// not work.
+fn version_answer(
+    child: &mut Child,
+    reading: Option<Receiver<String>>,
+    budget: Duration,
+) -> Option<DogVersion> {
+    let reading = reading?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) if started.elapsed() >= budget => return None,
+            Ok(None) => std::thread::sleep(VERSION_POLL_INTERVAL),
+        }
+    }
+    parse_version_answer(&reading.recv_timeout(budget).ok()?)
 }
 
 /// Who besides the owner can write `canonical` and the directory holding
@@ -680,6 +1057,158 @@ fn warn_group_writable(streams: &mut Streams<'_>, path: &Path) {
     streams.aside(GROUP_WRITABLE_NOTICE, &message);
 }
 
+/// [`emit_notice`] code for the version report -- caller-defined, like
+/// [`GROUP_WRITABLE_NOTICE`], and like it not a failure: `adopt` succeeded.
+const DOG_VERSION_NOTICE: &str = "dog_version";
+
+/// Tells the operator what the candidate answered.
+///
+/// Only the version is reported, never compared -- see [`vet_binary`] for
+/// why comparing a third-party dog's crate version with shep's own would
+/// report every dog that exists. The protocol is not reported when it
+/// matches, because by then it has already decided the only thing it can
+/// decide; it is reported when it is missing, because that is the operator's
+/// one chance to hear that this dog's compatibility is unknown and will be
+/// found out at a handshake instead.
+///
+/// A dog that answered nothing at all gets no notice. Every dog that
+/// existed when this contract was written is in that group, and a line on
+/// stderr for each of them would be noise about the ordinary case.
+fn report_dog_version(streams: &mut Streams<'_>, name: &str, answer: &DogVersion) {
+    let message = match answer.protocol {
+        Some(protocol) => format!(
+            "{name} reports version {}, shep protocol {protocol}",
+            answer.version
+        ),
+        None => format!(
+            "{name} reports version {} and names no shep protocol, so whether it can \
+             speak to this shep is unknown until it connects",
+            answer.version
+        ),
+    };
+    streams.aside(DOG_VERSION_NOTICE, &message);
+}
+
+/// [`emit_notice`](crate::output::emit_notice) code for the warning
+/// `restart` prints before it restarts a dog whose binary on disk cannot
+/// speak to this shepherd -- caller-defined, like the two above, and like
+/// them not a failure: the restart still happens.
+const DOG_BINARY_SKEW_NOTICE: &str = "dog_binary_skew";
+
+/// Warns, before `restart` sends anything, about a dog whose binary ON DISK
+/// speaks a protocol this shepherd does not -- G12's row 5.
+///
+/// Row 5 is the one state in that matrix where nothing is wrong yet. The
+/// running dog is connected and working, the binary it would come back from
+/// is not, and the two only meet at the next restart, which may be days
+/// away and for an unrelated reason. This is the moment that restart
+/// happens, so this is where the operator can still be told.
+///
+/// **A warning, never a refusal.** They asked for the restart, the binary on
+/// disk may be exactly what they just installed, and refusing an explicit
+/// command on a prediction is a worse failure than letting them watch it
+/// happen with the warning in hand. G12 row 5's fix names two ways out and
+/// picks neither, so the message does the same.
+///
+/// **Silence is the answer for everything else.** A dog that does not answer
+/// [`VERSION_FLAG`] is unknown, not stale -- that is the state `adopt`
+/// records under G11's "recorded as unknown", and this is its reader. Every
+/// dog that existed when the contract was written is in that group, so a
+/// warning there would be a line on stderr for the ordinary case, which is
+/// how an operator learns to skip the one that matters.
+///
+/// # A built-in dog cannot reach this, by construction
+///
+/// The only way in is a path out of `[daemon] adopted_dogs`. A built-in dog
+/// has no entry there ([`dog_source`]), and could not use one: the shepherd
+/// runs `metrics` and `bark` as `<its own binary> dog <name>`, so a built-in
+/// dog's binary on disk IS the shepherd's, and there is no second thing to
+/// drift. There is no branch here skipping them, and none to forget to
+/// write.
+///
+/// # Why only a `Name` selector
+///
+/// The daemon includes a dog only for a selector that NAMED it
+/// (`ProcessSelector::is_exact`), so `restart all` and a `/regex/` sweep
+/// pass every dog by and there is nothing for this to warn about. That
+/// leaves `Id`, which is exact and could name a dog: it is not probed,
+/// because the CLI would have to ask the daemon what that id is called
+/// before it could look up a path, and a round trip is a lot to spend on
+/// the rarer way of typing the same thing. An operator who restarts a dog
+/// by id gets the restart and no warning.
+/// Takes the probe budget rather than reading [`VERSION_BUDGET`], for the
+/// same reason [`vet_binary_within`] exists. Both callers have a budget in
+/// hand, so there is no wrapper to add: `restart` passes the production
+/// one, and a test passes one that contention cannot exhaust.
+///
+/// A test here asks whether the warning fires, in what order, and what it
+/// says. At the production budget it was also asking how busy the machine
+/// was, because a probe that times out answers unknown, and unknown is
+/// deliberately silent, so the test failed reporting that no warning fired.
+/// True about the runner, empty about shep.
+pub fn warn_of_a_dog_a_restart_would_break(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    selectors: &[SelectorSpec],
+    budget: Duration,
+) {
+    for selector in selectors {
+        let SelectorSpec::Name(name) = selector else {
+            continue;
+        };
+        // The one way in, and the reason a built-in dog is not a case here:
+        // this answers `None` for every name `[daemon] adopted_dogs` has
+        // never heard of, which is every built-in dog and every sheep.
+        let Ok(Some(binary)) = ShepToml::adopted_dog_path_readonly(&paths.daemon_config, name)
+        else {
+            continue;
+        };
+        // Asked, never remembered. A protocol recorded at adopt time would
+        // be a copy of a number that changes on disk with nothing watching,
+        // and row 5 IS the binary changing after the adopt -- so the stored
+        // copy would be wrong at precisely the moment it was needed.
+        //
+        // Reusing `ask_version` here costs something `adopt` does not pay,
+        // and the trade is different enough to argue separately rather than
+        // inherit. That function's own comment is explicit that a candidate
+        // ignoring `--version` runs its ordinary job instead, with
+        // `SHEP_HOME` pointing at the live daemon. For `adopt` that is a
+        // one-off against a binary nobody trusts yet. Here the dog is
+        // already adopted and already running, the probe repeats on every
+        // named restart, and the population that ignores `--version` is
+        // every dog written before this contract existed, which today is
+        // all of them. So `shep restart log-rotate` can rotate once before
+        // the restart, and a bark dog can open a second subscription, both
+        // for up to `VERSION_BUDGET`.
+        //
+        // Accepted rather than overlooked, on three grounds. The command
+        // is about to restart that dog anyway, so the dog runs either way
+        // and the question is only whether it briefly overlaps itself. The
+        // window is bounded and the process is killed. And the alternative
+        // is not asking, which is the state that let a stale dog sit
+        // `online` for two days. It is a real cost though, so it is named
+        // in `docs/dogs.md` where an operator can read it rather than only
+        // here.
+        let Ok(Some(answer)) = ask_version(&binary, &paths.home, name, budget) else {
+            continue;
+        };
+        let Some(disk) = answer.protocol else {
+            continue;
+        };
+        if disk == PROTOCOL_VERSION {
+            continue;
+        }
+        let message = format!(
+            "`{name}`'s binary at {} was built for shep protocol {disk}, and this shep \
+             speaks {PROTOCOL_VERSION}; restarting it brings it back on that binary, \
+             unable to connect. Run a shep that speaks {disk}, or reinstall the dog \
+             against protocol {PROTOCOL_VERSION}, and restart it again",
+            binary.display()
+        );
+        streams.aside(DOG_BINARY_SKEW_NOTICE, &message);
+    }
+}
+
 /// `shep adopt <path> [--name <name>]`: vets a binary shep has never seen,
 /// records it, and starts it if a shepherd is running.
 ///
@@ -718,6 +1247,9 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
     let path = vetted.path;
     for writable in &vetted.group_writable {
         warn_group_writable(streams, writable);
+    }
+    if let Some(answer) = &vetted.answer {
+        report_dog_version(streams, &name, answer);
     }
     if let Err(err) = ShepToml::edit(&paths.daemon_config, |cfg| {
         cfg.adopt_dog(&name, &path);
@@ -1373,18 +1905,18 @@ mod tests {
     fn a_binary_shep_has_never_seen_is_vetted_before_anything_is_written() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            vet_binary(&dir.path().join("nope"), dir.path(), "probe"),
+            vet_binary_within(&dir.path().join("nope"), dir.path(), "probe", TEST_BUDGET),
             Err(AdoptRefusal::Missing)
         );
         assert_eq!(
-            vet_binary(dir.path(), dir.path(), "probe"),
+            vet_binary_within(dir.path(), dir.path(), "probe", TEST_BUDGET),
             Err(AdoptRefusal::NotAFile)
         );
 
         let plain = dir.path().join("plain");
         std::fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
         assert_eq!(
-            vet_binary(&plain, dir.path(), "probe"),
+            vet_binary_within(&plain, dir.path(), "probe", TEST_BUDGET),
             Err(AdoptRefusal::NotExecutable)
         );
 
@@ -1392,7 +1924,7 @@ mod tests {
         // mode bit, so a `vet_binary` that refused for some other reason
         // fails here rather than passing for the wrong one.
         chmod(&plain, 0o755);
-        let vetted = vet_binary(&plain, dir.path(), "probe").unwrap();
+        let vetted = vet_binary_within(&plain, dir.path(), "probe", TEST_BUDGET).unwrap();
         assert_eq!(vetted.path, plain.canonicalize().unwrap());
         assert!(
             vetted.group_writable.is_empty(),
@@ -1404,7 +1936,7 @@ mod tests {
         std::fs::write(&bogus, b"\x7fELF\x00\x00\x00 not really").unwrap();
         chmod(&bogus, 0o755);
         assert!(matches!(
-            vet_binary(&bogus, dir.path(), "probe"),
+            vet_binary_within(&bogus, dir.path(), "probe", TEST_BUDGET),
             Err(AdoptRefusal::WillNotExec { .. })
         ));
     }
@@ -1425,7 +1957,7 @@ mod tests {
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
         chmod(&bin, 0o757);
         assert_eq!(
-            vet_binary(&bin, dir.path(), "probe"),
+            vet_binary_within(&bin, dir.path(), "probe", TEST_BUDGET),
             Err(AdoptRefusal::WorldWritable {
                 path: bin.canonicalize().unwrap(),
             }),
@@ -1436,7 +1968,7 @@ mod tests {
         chmod(&bin, 0o755);
         chmod(dir.path(), 0o777);
         assert_eq!(
-            vet_binary(&bin, dir.path(), "probe"),
+            vet_binary_within(&bin, dir.path(), "probe", TEST_BUDGET),
             Err(AdoptRefusal::WorldWritable {
                 path: bin.canonicalize().unwrap().parent().unwrap().to_path_buf(),
             }),
@@ -1444,6 +1976,355 @@ mod tests {
         );
         // Restored so the tempdir cleans up from a known state.
         chmod(dir.path(), 0o700);
+    }
+
+    /// Writes an executable `/bin/sh` script at `dir/name` whose body is
+    /// `body`, for the `--version` cases below: a dog's answer is text on
+    /// stdout and an exit status, and a shell script is the shortest thing
+    /// that can produce any pair of those on demand.
+    fn dog_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        chmod(&path, 0o755);
+        path
+    }
+
+    /// fails if a dog built against a protocol this shep cannot speak is
+    /// adopted anyway — G11's whole point: it would become an
+    /// online-and-idle entry whose failure surfaces days later, at a
+    /// handshake nobody is watching.
+    ///
+    /// Pins both numbers and both fixes in the message, per the spec's
+    /// "a message naming the fix is the feature".
+    ///
+    /// Mutation check: dropping the `protocol != PROTOCOL_VERSION` guard
+    /// reddens this — the vet returns `Ok` and the adopt succeeds.
+    #[tokio::test]
+    async fn a_dog_that_speaks_another_protocol_is_refused_at_adopt() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let stale = PROTOCOL_VERSION + 1;
+        let bin = dog_script(
+            dir.path(),
+            "shep-otel",
+            &format!("echo 'shep-otel 0.1.3'\necho 'shep-protocol: {stale}'"),
+        );
+
+        assert_eq!(
+            vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET),
+            Err(AdoptRefusal::ProtocolMismatch {
+                dog: stale,
+                shep: PROTOCOL_VERSION,
+            })
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::InvalidConfig);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains(&stale.to_string()) && text.contains(&PROTOCOL_VERSION.to_string()),
+            "the refusal names both numbers: {text}"
+        );
+        assert!(
+            text.contains("--locked") && text.contains("run a shep that speaks"),
+            "the refusal names both fixes, and picks neither: {text}"
+        );
+        assert!(
+            !paths.daemon_config.exists(),
+            "a refused adopt must not write shep.toml"
+        );
+    }
+
+    /// fails if a version difference is treated as a protocol difference.
+    /// The two numbers answer different questions (`docs/dogs.md`): a
+    /// third-party dog's crate version has no relationship to shep's own,
+    /// so it is reported and never compared, while the protocol is the
+    /// only one that can refuse.
+    ///
+    /// Mutation check: refusing on anything but the protocol reddens this.
+    #[tokio::test]
+    async fn a_dog_whose_version_is_nothing_like_sheps_is_still_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let bin = dog_script(
+            dir.path(),
+            "shep-otel",
+            &format!("echo 'shep-otel 9.9.9-rc1'\necho 'shep-protocol: {PROTOCOL_VERSION}'"),
+        );
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        assert_eq!(
+            vetted.answer,
+            Some(DogVersion {
+                version: "9.9.9-rc1".to_string(),
+                protocol: Some(PROTOCOL_VERSION),
+            })
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(
+            code,
+            ExitCode::Success,
+            "a version difference is not a refusal"
+        );
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("9.9.9-rc1"),
+            "the version it answered is reported: {text}"
+        );
+    }
+
+    /// fails if a dog that says nothing at all is refused. Every dog that
+    /// exists predates this contract, including both published ones, so
+    /// refusing silence would break the entire population —
+    /// `docs/dogs.md` promises in published prose that it never happens.
+    /// The protocol is unknown and prediction degrades to G8's
+    /// post-connection detection for that dog alone.
+    ///
+    /// Mutation check: making the parser answer `Some(PROTOCOL_VERSION)`
+    /// for empty output reddens the `answer` assertion here rather than
+    /// leaving it passing for the wrong reason.
+    #[tokio::test]
+    async fn a_dog_that_does_not_answer_is_adopted_with_an_unknown_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let bin = dog_script(dir.path(), "shep-otel", "exit 0");
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        assert_eq!(vetted.answer, None, "silence is an unknown, not an answer");
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(
+            code,
+            ExitCode::Success,
+            "a dog predating the contract is adoptable"
+        );
+        let cfg = std::fs::read_to_string(&paths.daemon_config).unwrap();
+        assert!(cfg.contains("otel"), "and it is recorded: {cfg}");
+    }
+
+    /// fails if the version line alone is treated as a protocol claim. A
+    /// clap-built dog prints `<name> <version>` for free without ever
+    /// having heard of `shep-protocol`, so this is the commonest partial
+    /// answer there is, and it is an unknown protocol rather than a
+    /// mismatched one.
+    #[tokio::test]
+    async fn a_dog_that_names_no_protocol_is_adopted_with_the_version_it_gave() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let bin = dog_script(dir.path(), "shep-otel", "echo 'shep-otel 0.1.3'");
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        assert_eq!(
+            vetted.answer,
+            Some(DogVersion {
+                version: "0.1.3".to_string(),
+                protocol: None,
+            })
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::Success);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("0.1.3") && text.contains("unknown"),
+            "the operator hears the version and that the protocol is unknown: {text}"
+        );
+    }
+
+    /// A budget for tests that are not about the budget.
+    ///
+    /// The probe spawns a real child, so every test reaching `vet_binary`
+    /// inherits a wall-clock bound. At the production one second, a test
+    /// asking whether a version string parses fails when the machine is
+    /// busy, which is the runner reporting on itself. Thirty seconds is not
+    /// a claim that a probe should ever take that long; it is far enough
+    /// above any contention this suite produces that timing stops being a
+    /// variable in tests that never meant to measure it.
+    ///
+    /// `a_candidate_that_never_exits_does_not_hang_the_vet` deliberately
+    /// does NOT use this: it is the one test that is about the bound, so it
+    /// passes the real budget.
+    const TEST_BUDGET: Duration = Duration::from_secs(30);
+
+    /// fails if the probe hands a candidate the operator's environment.
+    ///
+    /// The candidate is somebody else's binary, and `vet_binary` warns
+    /// about a group-writable one rather than refusing it, so a group
+    /// member can replace an adopted dog and have their code run on the
+    /// next `shep restart <name>`. If the probe inherited the operator's
+    /// shell, that code would be reading whatever they had exported.
+    ///
+    /// `CARGO_PKG_NAME` is the sentinel because cargo sets it for this very
+    /// process and it is not on the daemon's allowlist, so no environment
+    /// has to be mutated to run this: a leak would show up as the child
+    /// seeing a variable this test never gave it.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_runs_with_the_daemons_environment_and_not_the_operators() {
+        assert!(
+            std::env::var("CARGO_PKG_NAME").is_ok(),
+            "the sentinel has to be in this process for its absence downstream to mean anything"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // The sentinel has to be the LAST field of line 1, because that is
+        // the only part `parse_version_answer` keeps. An earlier version of
+        // this test put it first and asserted on `version`, so the string it
+        // checked could never have contained the sentinel: it passed with
+        // `env_clear` removed, which is the definition of proving nothing.
+        let bin = dog_script(
+            dir.path(),
+            "shep-otel",
+            "echo \"shep-otel ${CARGO_PKG_NAME:-clean}\"",
+        );
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        let version = vetted.answer.expect("the candidate answered").version;
+
+        assert_eq!(
+            version, "clean",
+            "the operator's environment reached a candidate: it saw CARGO_PKG_NAME"
+        );
+    }
+
+    /// fails if a candidate that never exits hangs `adopt`. The vet spawns
+    /// somebody else's binary and cannot assume it is well behaved, and a
+    /// hung `adopt` is worse than an unknown protocol: the operator has no
+    /// output, no refusal, and nothing to interrupt but the command.
+    ///
+    /// Mutation check: replacing the bounded wait with a blocking
+    /// `child.wait()` hangs this test rather than reddening it, which is
+    /// the point — the assertion on elapsed time is what turns that into a
+    /// failure a CI run can report.
+    #[test]
+    fn a_candidate_that_never_exits_does_not_hang_the_vet() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dog_script(dir.path(), "shep-otel", "sleep 30");
+
+        let started = std::time::Instant::now();
+        // The real budget, not `TEST_BUDGET`: this test IS the bound.
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", VERSION_BUDGET).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            vetted.answer, None,
+            "a candidate that never answered is unknown"
+        );
+        // Absolute rather than a multiple of `VERSION_BUDGET`: the bound
+        // has to stay wrong when the budget is what got mutated away. Ten
+        // seconds against a one-second budget and a candidate that sleeps
+        // thirty -- wide enough for a loaded CI runner, narrow enough that
+        // waiting on the candidate reddens this rather than passing slowly.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the vet is bounded by its own budget, not by the candidate: {elapsed:?}"
+        );
+    }
+
+    /// fails if an answer from a candidate that exited non-zero is
+    /// believed. `docs/dogs.md` says a dog answers on stdout **and exits
+    /// 0**; a non-zero exit means the run that printed those lines failed,
+    /// so what it printed is not an answer — least of all one that can
+    /// refuse an adopt.
+    ///
+    /// Mutation check: dropping the `status.success()` test reddens this —
+    /// the mismatched protocol on stdout becomes a refusal.
+    #[test]
+    fn an_answer_from_a_failed_run_is_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = PROTOCOL_VERSION + 1;
+        let bin = dog_script(
+            dir.path(),
+            "shep-otel",
+            &format!("echo 'shep-otel 0.1.3'\necho 'shep-protocol: {stale}'\nexit 3"),
+        );
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        assert_eq!(vetted.answer, None);
+    }
+
+    /// fails if unparseable output is a refusal. A binary that answers
+    /// `--version` with a usage message, a banner, or bytes is answering
+    /// nothing shep asked for, and shep has no standing to refuse a dog
+    /// over the shape of text it never promised to print.
+    #[test]
+    fn output_that_answers_nothing_shep_asked_is_not_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dog_script(
+            dir.path(),
+            "shep-otel",
+            "echo 'error: unrecognized option --version'",
+        );
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        assert_eq!(
+            vetted.answer,
+            Some(DogVersion {
+                version: "--version".to_string(),
+                protocol: None,
+            }),
+            "the last field of line 1 is taken as the version, whatever it is"
+        );
+    }
+
+    /// fails if the parser stops tolerating what `docs/dogs.md` says it
+    /// tolerates: a name on line 1 that is ignored, blank lines, key order,
+    /// unknown keys, and above all a reserved `shep-` key that does not
+    /// exist yet. That last one is the compatibility promise the published
+    /// contract makes on behalf of a parser nobody has written — a third
+    /// number gets its own line later, and a shep that predates it must
+    /// ignore the line rather than refuse the dog.
+    #[test]
+    fn a_future_shep_key_is_ignored_rather_than_breaking_the_parser() {
+        let answer = parse_version_answer(
+            "some-other-crate-name 0.4.0\n\nshep-channel: 7\nother: whatever\n\
+             shep-protocol: 2\nshep-lambs: 9\n",
+        );
+        assert_eq!(
+            answer,
+            Some(DogVersion {
+                version: "0.4.0".to_string(),
+                protocol: Some(2),
+            })
+        );
+
+        assert_eq!(parse_version_answer(""), None, "no output is no answer");
+        assert_eq!(
+            parse_version_answer("shep-otel 0.1.3\nshep-protocol: two\n"),
+            Some(DogVersion {
+                version: "0.1.3".to_string(),
+                protocol: None,
+            }),
+            "a protocol that is not a decimal is unknown, not a refusal"
+        );
     }
 
     /// fails if a group-writable deployment directory is refused rather
@@ -1462,7 +2343,7 @@ mod tests {
         chmod(&bin, 0o775);
         chmod(&deploy, 0o775);
 
-        let vetted = vet_binary(&bin, dir.path(), "otel").unwrap();
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
         assert_eq!(
             vetted.group_writable,
             vec![bin.canonicalize().unwrap(), deploy.canonicalize().unwrap()],
