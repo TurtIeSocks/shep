@@ -38,12 +38,13 @@ is one class of test.
 cargo test -p shep-daemon --lib --all-features -- --skip ::slow::
 ```
 
-**~1.9s, 619 of 638 lib tests as of 2026-08-30** — the exact counts drift
+**~2.3s, 711 of 730 lib tests as of 2026-08-31** — the exact counts drift
 every time a task adds one, so treat them as a shape, not a checksum. Three
-briefs have now shipped a stale figure, and this file carried "437 of 454"
-for long enough to be wrong by fifty. The 18 tests this skips live in a nested `mod slow`
+briefs have now shipped a stale figure, this file carried "437 of 454"
+for long enough to be wrong by fifty, and it then carried "619 of 638" while
+the real number climbed by ninety-two. The 19 tests this skips live in a nested `mod slow`
 inside each file's `mod tests` — `extras.rs` has 9, `watch/source.rs` 7, and
-`watch/mod.rs` and `limits/sample.rs` one each — and wait on real macOS
+`watch/mod.rs`, `limits/sample.rs` and `handover/mod.rs` one each — and wait on real macOS
 FSEvents or real elapsed time; they are the reason the unfiltered lib run
 costs ~25s instead. A mutation in `supervisor.rs` does not need them — but a
 change to `watch/source.rs`'s watcher plumbing, or to timing-sensitive
@@ -293,8 +294,12 @@ never costs clarity.
 
 - Every new public item needs docs and a deliberate Debug decision (redacted
   for anything carrying env/secrets, with an exact-string test — IR-41).
-- `#![forbid(unsafe_code)]` planned for core/client/cli; unsafe only in
-  `shep-daemon/src/sys.rs` with per-block `// SAFETY:` (IR-22/23).
+- `#![forbid(unsafe_code)]` is LIVE in core/client/cli, not planned. Unsafe
+  lives in exactly two files, both in shep-daemon and both carrying their own
+  `#![allow(unsafe_code)]` with per-block `// SAFETY:` (IR-22/23):
+  `sys.rs` (eight sites on unix) and `sys_windows.rs` (ten on Windows). This
+  line said "planned" and named only `sys.rs` for the whole of the Windows
+  port.
 - Open design decisions live at the bottom of map.md and in goals.md's open
   questions — check them before making architectural calls; if a decision is
   listed there, it is the maintainer's, not yours.
@@ -377,7 +382,45 @@ moments. Then 2026-08-19 added `ProcessInfo::last_exit` and an EXIT column
 `[interpreters]` mapping with `--interpreter`, `~/` expansion in every
 Flockfile path, a Flockfile app's `cwd` defaulting to its own directory, and
 `reuse_port` refused rather than silently ignored (which it no longer is; see
-the reload paragraph above). `shep init` is in flight.
+the reload paragraph above). `shep init` shipped: it is in the CLI's `VERBS` array, has its own
+module at `crates/shep-cli/src/commands/init.rs`, and is documented on the
+Flockfile page.
+
+**Phase 3b merged on 2026-08-31, and it is the one to read if a dog looks
+healthy and is not.** A dog that has never completed a handshake used to
+report `online` in `shep flock` and in `shep lookout`, with zero restarts,
+while retrying a handshake that could never succeed. `ProcessInfo` gained
+`handshook: Option<bool>` (additive, so neither `PROTOCOL_VERSION` nor
+`SCHEMA_VERSION` moved) and such a dog now reads `silent`. The daemon grew
+`DOG_SILENCE_BUDGET`, five seconds, so G8's one-restart ladder reaches a dog
+that cannot name itself: before that, the ladder was keyed on
+`Hello::dog_name`, which a client on an older protocol cannot send, so the
+dogs most likely to need the ladder were the ones structurally unable to
+reach it. `shep daemon reload`'s unsettled-dog report now points at `shep
+bleats <dog>`, and the version-skew refusal labels its remedy.
+
+**The repository moved to the `shep-pm` org on 2026-08-31**, along with both
+dogs and the four `shep-deploy` testbeds, and the docs site moved to
+`shep-pm.com`. Two things that cost real time and will again: a GitHub App
+installation does NOT follow a transfer, so CodeRabbit stopped reviewing
+until it was installed on the org; and the Pages custom domain DOES follow,
+carrying the old value, so the site was unreachable while every setting
+looked populated and every workflow ran green. A `CNAME` file under
+`web/public` does not fix that second one, since Pages ignores it for an
+Actions-based deploy. See `.github/workflows/pages.yml`'s header.
+
+**Phase 4 merged on 2026-09-01.** A dog answers `--version` with the
+protocol it was compiled against, `shep adopt` refuses a mismatch, and
+`shep restart <dog>` warns before bringing a dog back on a binary that
+cannot connect. The contract is published in `docs/dogs.md`; answering is
+optional, and a dog that does not answer is adopted with its protocol
+unknown rather than refused, which is every dog written before it.
+
+Two things it deliberately does not do, both argued at their call sites. A
+DAEMON-initiated restart gets no warning, since the check is CLI-side, so a
+crash or an autorestart respawn still walks into G12 row 5 unannounced. And
+`Child::kill` does not reach descendants, so a probe's grandchild can
+outlive it; closing that needs a process group rather than a patch.
 
 **Verb count: 40 generated, 41 listed, and the difference is `help`.**
 `./web/scripts/generate-cli-reference.sh` prints its own number every time it

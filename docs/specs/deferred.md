@@ -695,9 +695,11 @@ rather than a fix to apply on the way past.
 
 Everything this file used to carry that is now FIXED, STALE, resolved or
 rejected, plus the record of what shipped instead of being deferred, moved to
-[deferred-history.md](deferred-history.md) on 2026-08-29. That is 1182 lines
-against the 523 left here, and a reader had to get past all of it to reach
-the 9 entries under "Known debt" that are actually still open.
+[deferred-history.md](deferred-history.md) on 2026-08-29. That is 1191 lines
+against the 705 left here, and a reader had to get past all of it to reach
+the 12 entries under "Known debt" that are actually still open. All three
+numbers were stated once and then drifted, which is the failure this file
+warns about elsewhere; they are counted, not remembered.
 
 This file answers "what is not built". That one answers "what was not built,
 and what happened to it".

@@ -5,8 +5,10 @@ manager written in Rust: one binary runs a daemon called the shepherd, which
 keeps a flock of your long-running processes alive, captures what they print,
 and says plainly when something is wrong.
 
-It runs on macOS and Linux. On Windows every command prints `shep does not yet
-support Windows` and exits 1, which is a real answer but not a useful one.
+It runs on macOS, Linux and Windows. The Windows tier is the newest of the
+three and refuses three things deliberately: no graceful signal outside the
+shepherd channel, no `shep startup`, and no `user`/`group`. The repository
+README has the reasoning for each.
 
 Write a `Flockfile.toml`. Two fields is a complete one:
 
@@ -21,10 +23,10 @@ notices nothing is listening and re-execs itself in the background.
 
 ```console
 $ shep start Flockfile.toml
-$ shep ls
-ID  NAME    STATUS  PID   RESTARTS  CPU    MEM    UPTIME  FOLD
-1   web     online  1001  1         12.5%  48.1M  1m      backend
-2   worker  online  1002  2         12.5%  48.1M  2m      backend
+$ shep ls --style bare
+ID  NAME    STATUS  PID   RESTARTS  EXIT  CPU    MEM    UPTIME  FOLD     SMIT
+1   web     online  1001  1         -     12.5%  48.1M  1m      backend  -
+2   worker  online  1002  2         -     12.5%  48.1M  2m      backend  -
 ```
 
 `shep bleats` follows the logs, and `shep logs` is the same command for people
@@ -47,8 +49,8 @@ entry points, each of which owns the whole process (exit code, `argv`, signal
 handling) the way a CLI is expected to.
 
 The repository README has the full lexicon, what works today, and what is not
-built yet. shep is pre-release: no tagged release, and several v1.0 items are
-still missing.
+built yet. shep is pre-1.0, so anything can still change, and several v1.0
+items are still missing.
 
 ## License
 

@@ -25,7 +25,7 @@ export interface SpecRef {
 
 /** A docs.rs type this page is genuinely about — only where shep-core's own API is the subject. */
 export interface ApiRef {
-  /** Path under docs.rs/shep-core/latest/shep_core/, e.g. "config/struct.Flockfile.html". */
+  /** Path under docs.rs/shep-core/latest/shep_core/, e.g. "config/flockfile/struct.Flockfile.html". */
   path: string;
   /** Short label, e.g. "shep_core::config::Flockfile". */
   label: string;
