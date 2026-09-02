@@ -1,5 +1,6 @@
 ---
 source: crates/shep-core/src/protocol/events.rs
+assertion_line: 305
 expression: events
 ---
 [
@@ -27,7 +28,8 @@ expression: events
         },
         "smit": "▲ main@a1b2c3",
         "instance": null,
-        "handshook": null
+        "handshook": null,
+        "dog_stale": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -67,7 +69,8 @@ expression: events
         "last_exit": null,
         "smit": null,
         "instance": 2,
-        "handshook": null
+        "handshook": null,
+        "dog_stale": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -97,7 +100,8 @@ expression: events
         },
         "smit": null,
         "instance": null,
-        "handshook": null
+        "handshook": null,
+        "dog_stale": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -127,7 +131,8 @@ expression: events
         },
         "smit": null,
         "instance": null,
-        "handshook": null
+        "handshook": null,
+        "dog_stale": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -157,7 +162,8 @@ expression: events
         },
         "smit": null,
         "instance": null,
-        "handshook": null
+        "handshook": null,
+        "dog_stale": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -187,7 +193,8 @@ expression: events
         },
         "smit": null,
         "instance": null,
-        "handshook": null
+        "handshook": null,
+        "dog_stale": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -217,7 +224,8 @@ expression: events
         },
         "smit": null,
         "instance": null,
-        "handshook": null
+        "handshook": null,
+        "dog_stale": null
       },
       "manually": false,
       "at_ms": 1700000000000
@@ -247,7 +255,8 @@ expression: events
         },
         "smit": null,
         "instance": null,
-        "handshook": null
+        "handshook": null,
+        "dog_stale": null
       },
       "manually": false,
       "at_ms": 1700000000000

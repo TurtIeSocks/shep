@@ -1,5 +1,6 @@
 ---
 source: crates/shep-core/src/protocol/request.rs
+assertion_line: 2604
 expression: replies
 ---
 [
@@ -37,7 +38,8 @@ expression: replies
             },
             "smit": null,
             "instance": null,
-            "handshook": null
+            "handshook": null,
+            "dog_stale": null
           }
         ]
       }
@@ -111,7 +113,8 @@ expression: replies
             },
             "smit": null,
             "instance": null,
-            "handshook": null
+            "handshook": null,
+            "dog_stale": null
           }
         ]
       }
@@ -155,7 +158,8 @@ expression: replies
           },
           "smit": null,
           "instance": null,
-          "handshook": null
+          "handshook": null,
+          "dog_stale": null
         }
       }
     }
@@ -318,7 +322,8 @@ expression: replies
             },
             "smit": null,
             "instance": null,
-            "handshook": null
+            "handshook": null,
+            "dog_stale": null
           }
         ]
       }
@@ -388,7 +393,8 @@ expression: replies
             "last_exit": null,
             "smit": null,
             "instance": null,
-            "handshook": null
+            "handshook": null,
+            "dog_stale": null
           }
         ]
       }
@@ -420,7 +426,8 @@ expression: replies
             },
             "smit": null,
             "instance": null,
-            "handshook": null
+            "handshook": null,
+            "dog_stale": null
           }
         ]
       }
@@ -449,7 +456,8 @@ expression: replies
             "last_exit": null,
             "smit": "▲ main@a1b2c3",
             "instance": null,
-            "handshook": null
+            "handshook": null,
+            "dog_stale": null
           }
         ]
       }
@@ -502,7 +510,8 @@ expression: replies
             "last_exit": null,
             "smit": null,
             "instance": 2,
-            "handshook": null
+            "handshook": null,
+            "dog_stale": null
           }
         ]
       }
@@ -572,7 +581,41 @@ expression: replies
             "last_exit": null,
             "smit": null,
             "instance": null,
-            "handshook": false
+            "handshook": false,
+            "dog_stale": false
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 32,
+    "result": {
+      "Ok": {
+        "kind": "flock",
+        "data": [
+          {
+            "id": 10,
+            "name": "log-rotate",
+            "status": "online",
+            "pid": 208341,
+            "restarts": 0,
+            "uptime_ms": 0,
+            "fold": null,
+            "out_file": null,
+            "err_file": null,
+            "cpu_percent": null,
+            "memory_bytes": null,
+            "dog": {
+              "kind": "adopted",
+              "path": "/usr/local/bin/shep-log-rotate"
+            },
+            "lambs": null,
+            "last_exit": null,
+            "smit": null,
+            "instance": null,
+            "handshook": false,
+            "dog_stale": true
           }
         ]
       }

@@ -810,6 +810,33 @@ pub struct ProcessInfo {
     /// perfectly healthy, so the decision about which lifecycle states that
     /// silence is worth overriding belongs to the reader.
     pub handshook: Option<bool>,
+    /// Whether the reporting shepherd has GIVEN UP on this dog — restarted
+    /// it once for never answering, watched that not help, and stopped
+    /// restarting it; `None` for a sheep.
+    ///
+    /// The same `None` rule [`Self::handshook`] documents, for the same
+    /// reason: a sheep is never given up on because a sheep never had to
+    /// answer anything, so "no verdict to report" is the true answer both
+    /// for a sheep and for a peer daemon that predates this field, and a
+    /// reader that finds `None` renders exactly what it rendered before the
+    /// field existed. Do not "fix" this into three cases.
+    ///
+    /// **Why this is not derivable from [`Self::handshook`], which is the
+    /// whole reason it exists.** `Some(false)` there covers two dogs whose
+    /// rows are otherwise identical: one spawned three seconds ago that has
+    /// simply not dialled back yet, and one this shepherd has permanently
+    /// stopped restarting. The first needs nothing done about it and the
+    /// second is an incident. Before this field the give-up was a latch
+    /// inside the daemon that no listing could see, so every operator-facing
+    /// surface rendered both as the same word.
+    ///
+    /// A fact and not a verdict, again deliberately. It says the shepherd
+    /// stopped, never why — the why is what the shepherd wrote into that
+    /// dog's own log when it gave up, and it is the one place that can name
+    /// the evidence (`shep bleats <dog>`). A renderer that invented a cause
+    /// here would be re-committing the bug this field was added during: a
+    /// shepherd asserting a cause it never observed.
+    pub dog_stale: Option<bool>,
 }
 
 /// Orders one flock listing the way every operator-facing surface presents
@@ -882,6 +909,7 @@ impl ProcessInfo {
                 smit: None,
                 instance: None,
                 handshook: None,
+                dog_stale: None,
             },
         }
     }
@@ -991,6 +1019,13 @@ impl ProcessInfoBuilder {
     /// sheep, which has no handshake to report.
     pub fn handshook(mut self, handshook: Option<bool>) -> Self {
         self.info.handshook = handshook;
+        self
+    }
+
+    /// Sets whether the shepherd has given up restarting this dog; `None`
+    /// for a sheep, which is never given up on.
+    pub fn dog_stale(mut self, dog_stale: Option<bool>) -> Self {
+        self.info.dog_stale = dog_stale;
         self
     }
 
@@ -1601,6 +1636,7 @@ mod tests {
             smit: None,
             instance: None,
             handshook: None,
+            dog_stale: None,
         }
     }
 
@@ -1716,6 +1752,20 @@ mod tests {
                 .handshook,
             Some(false),
             "an empty `handshook` setter body is invisible to the comparison above"
+        );
+
+        // `dog_stale` is the fifth, and the pairing is the point: it and
+        // `handshook` are both `None` by default, so a setter that dropped
+        // this one would leave every dog row saying "silent" and never
+        // "given up on" -- the exact distinction the field was added to
+        // carry.
+        assert_eq!(
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .dog_stale(Some(true))
+                .build()
+                .dog_stale,
+            Some(true),
+            "an empty `dog_stale` setter body is invisible to the comparison above"
         );
     }
 
@@ -2517,6 +2567,13 @@ mod tests {
             // without this row the shape that actually changes an
             // operator's reading — a dog whose process is up and which has
             // never answered this shepherd — is never on the wire at all.
+            //
+            // `dog_stale: false` is not padding: this is the silence the
+            // shepherd is still waiting out, and the row below is the one it
+            // has given up on. The two differ in exactly one byte-level key
+            // and in what every operator-facing surface must say about them,
+            // so pinning one without the other would leave the distinction
+            // untested on the wire it travels over.
             Reply {
                 id: 31,
                 result: Ok(Response::Flock(vec![
@@ -2526,6 +2583,20 @@ mod tests {
                             path: "/usr/local/bin/shep-log-rotate".to_string(),
                         }))
                         .handshook(Some(false))
+                        .dog_stale(Some(false))
+                        .build(),
+                ])),
+            },
+            Reply {
+                id: 32,
+                result: Ok(Response::Flock(vec![
+                    ProcessInfo::builder(10, "log-rotate", ProcStatus::Online)
+                        .pid(Some(208_341))
+                        .dog(Some(DogSource::Adopted {
+                            path: "/usr/local/bin/shep-log-rotate".to_string(),
+                        }))
+                        .handshook(Some(false))
+                        .dog_stale(Some(true))
                         .build(),
                 ])),
             },
@@ -2563,6 +2634,23 @@ mod tests {
         let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
         assert_eq!(info.handshook, None);
         assert_eq!(info.dog, Some(DogSource::BuiltIn));
+    }
+
+    /// fails if `dog_stale` breaks an older peer, on the same terms as
+    /// `handshook` before it -- the same additive-optional rule, the same
+    /// unchanged `PROTOCOL_VERSION`.
+    ///
+    /// The fixture carries `handshook: false`, which is the case that
+    /// matters. A shepherd old enough to report a dog silent but too old to
+    /// say whether it gave up on that dog must keep rendering exactly the
+    /// word it rendered before -- `None` here is "this shepherd has no
+    /// verdict to report", never "it has not given up".
+    #[test]
+    fn a_process_info_without_a_dog_stale_key_still_deserializes() {
+        let fixture = r#"{"id":1,"name":"metrics","status":"online","pid":42,"restarts":0,"uptime_ms":10,"fold":null,"out_file":null,"err_file":null,"cpu_percent":null,"memory_bytes":null,"dog":{"kind":"built_in"},"lambs":null,"last_exit":null,"smit":null,"instance":0,"handshook":false}"#;
+        let info: ProcessInfo = serde_json::from_str(fixture).unwrap();
+        assert_eq!(info.dog_stale, None);
+        assert_eq!(info.handshook, Some(false));
     }
 
     /// fails if the daemon accepts a smit it should refuse. [`Smit`] must
