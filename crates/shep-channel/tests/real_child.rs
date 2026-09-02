@@ -2,10 +2,22 @@
 //! fd 3.
 //!
 //! unix only: wiring an inherited descriptor is the unix half of the
-//! contract. The Windows half is a named pipe the app opens by name, which
-//! needs a live shepherd to create, so it is covered by the shep daemon's
-//! own Windows tests rather than here. Everything above the descriptor is
-//! already covered on both platforms by the generic tests in `session.rs`.
+//! contract. The Windows half is a named pipe the app opens by name, and it
+//! is compiled by CI and executed by no test. This file is the only test in
+//! the crate that opens an endpoint at all, and it is `#![cfg(unix)]`;
+//! nothing outside the crate calls `shep_channel::serve` or `Channel::open`.
+//! So CI's Windows legs type-check `endpoint.rs`'s `Endpoint::Pipe` arm and
+//! run nothing through it.
+//!
+//! That is a gap, stated rather than papered over. The shepherd creates the
+//! pipe with a random name per spawn, so driving that arm needs a live
+//! daemon rather than a socketpair, which is why the coverage is not here.
+//! The daemon's own Windows tests do not supply it either: they predate this
+//! crate and drive `cmd.exe` children that never link it.
+//!
+//! Everything above the door is covered on both platforms by the generic
+//! tests in `session.rs`, and the crate doc's doctest runs `serve()`
+//! everywhere, taking the no-channel branch.
 //!
 //! # Why this does not spawn `examples/answers.rs`
 //!

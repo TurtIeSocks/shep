@@ -282,8 +282,9 @@ re-running that suite in isolation with the mutation still applied.
 
 ## Architecture
 
-Five workspace members, one distributed binary (`shep`): shep-core,
-shep-daemon, shep-client, shep-cli (published as `shep`), and
+Six published workspace members, one distributed binary (`shep`):
+shep-core, shep-daemon, shep-client, shep-cli (published as `shep`),
+shep-channel (the client an app links to speak the shepherd channel), and
 shep-cli-redirect, a placeholder holding the `shep-cli` name on crates.io.
 Each crate's Cargo.toml `description` states its role.
 
