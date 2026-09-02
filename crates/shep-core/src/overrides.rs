@@ -394,9 +394,92 @@ pub fn remove(path: &Path, name: &str) -> Result<bool, OverridesError> {
     Ok(was_present)
 }
 
+/// Applies several changes at once: `Some` stores, `None` removes.
+///
+/// One lock acquisition and one rewrite for the whole batch, where the
+/// per-name [`put`] and [`remove`] take one each. The daemon merges a whole
+/// Flockfile in one pass, and doing that through the single-name calls made
+/// an eleven-app file 11 full rewrites of this store on the thread
+/// supervising the flock. It also makes the record of one load atomic: either
+/// every app the load established is written, or none is.
+///
+/// Names this batch does not mention are left exactly as they are, which is
+/// what makes this safe against a concurrent writer touching a different app:
+/// the read and the write both happen under the one lock, so this is a
+/// read-modify-write of the whole file rather than a blind overwrite of it.
+///
+/// An empty batch takes no lock and writes nothing.
+///
+/// # Errors
+///
+/// The same set [`put`] returns: `FutureVersion`, `Decode`, `Io`. Nothing is
+/// written on any of them.
+pub fn update(
+    path: &Path,
+    changes: &BTreeMap<String, Option<AppOverrides>>,
+) -> Result<(), OverridesError> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let _lock = OverridesLock::acquire(path)?;
+    let mut file = read_file(path)?;
+    for (name, change) in changes {
+        match change {
+            Some(value) => {
+                file.apps.insert(name.clone(), value.clone());
+            }
+            None => {
+                file.apps.remove(name);
+            }
+        }
+    }
+    file.version = OVERRIDES_VERSION;
+    write_file(path, &file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fails if a batch does not store and remove in one pass, or if it
+    /// touches a name it was not given. The daemon writes a whole Flockfile
+    /// through this, so a batch that clobbered an app the file never
+    /// mentioned would delete an operator's overrides for it.
+    #[test]
+    fn update_stores_removes_and_leaves_the_rest_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("overrides.json");
+        let record = |value: u64| AppOverrides {
+            fields: [("max_restarts".to_string(), serde_json::json!(value))]
+                .into_iter()
+                .collect(),
+            ..AppOverrides::default()
+        };
+        put(&path, "web", &record(1)).unwrap();
+        put(&path, "worker", &record(2)).unwrap();
+        put(&path, "bystander", &record(3)).unwrap();
+
+        let changes = BTreeMap::from([
+            ("web".to_string(), Some(record(9))),
+            ("worker".to_string(), None),
+        ]);
+        update(&path, &changes).unwrap();
+
+        let all = all(&path).unwrap();
+        assert_eq!(all.get("web"), Some(&record(9)));
+        assert_eq!(all.get("worker"), None);
+        assert_eq!(all.get("bystander"), Some(&record(3)));
+    }
+
+    /// fails if an empty batch writes anything. A load whose every app
+    /// refused must not rewrite the store at all.
+    #[test]
+    fn an_empty_update_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("overrides.json");
+        update(&path, &BTreeMap::new()).unwrap();
+        assert!(!path.exists(), "an empty batch created a store");
+    }
 
     /// fails if a written override does not come back.
     #[test]
