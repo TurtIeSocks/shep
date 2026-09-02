@@ -2695,25 +2695,33 @@ pub(crate) struct Applied {
     /// Why some or all of this app's change did not land, in the daemon's own
     /// words, or `None` when the whole of it did.
     ///
-    /// Four refusals mean the app was not touched at all, and they are the
-    /// four raised before [`Actor::apply_one`] routes the instance count,
-    /// which is the only thing in a load that reshapes a flock: the flock has
-    /// no app of this name, the override store is unreadable, the merged
-    /// config does not normalize, or `handle_scale` itself refused the scale
-    /// (all of whose refusals precede anything it spawns or removes). All
-    /// four leave [`Self::applied`] and [`Self::pending`] empty.
+    /// Five refusals mean the app was not touched at all, and they are the
+    /// five raised before [`Actor::apply_one`] routes the instance count,
+    /// which is the only thing in a load that reshapes a flock:
     ///
-    /// **The two empty lists are not themselves that promise**, because two
+    /// 1. the flock has no app of this name,
+    /// 2. the override store could not be read,
+    /// 3. the merge could not be built at all (an override value of the wrong
+    ///    shape for its field is the way that happens),
+    /// 4. the merged config does not normalize,
+    /// 5. `handle_scale` itself refused the scale, and every refusal of its
+    ///    own precedes anything it spawns or removes.
+    ///
+    /// All five leave [`Self::applied`] and [`Self::pending`] empty.
+    ///
+    /// **The two empty lists are not themselves that promise**, because four
     /// later refusals produce the same shape without meaning it: a load whose
-    /// only change was a `NeedsRespawn` field that could not be parked, and a
-    /// plain load whose only declared change was the instance count it
-    /// declines to reshape. Read the message, which names what happened in
-    /// every case; the shape does not tell them apart.
+    /// only change was a `NeedsRespawn` field that could not be parked, a
+    /// load with no change of its own whose earlier parked config could not
+    /// be rebuilt, a plain load whose only declared change was the instance
+    /// count it declines to reshape, and the same skip while `shutting_down`.
+    /// Read the message, which names what happened in every case; the shape
+    /// does not tell them apart.
     ///
     /// Everything discoverable only after the count is routed is reported
     /// HERE while the two lists still carry what did land: a partial
-    /// scale-up's shortfall, a count a plain load declined to reshape, a
-    /// change that could not be parked, a store that could not be written.
+    /// scale-up's shortfall, a count that was not reshaped, a change that
+    /// could not be parked, a store that could not be written.
     pub(crate) refused: Option<String>,
     /// The merged, normalized app. `rpc.rs` hands this to
     /// `FlockRegistry::record`, the way the `Scale` arm hands it
@@ -2905,18 +2913,27 @@ fn merge_declared(
         }
     }
 
-    // Established is a high-water mark, never a snapshot of the current
-    // file: a key this file has stopped declaring is still a key somebody
-    // once established, and a later load must not be able to re-appear with
-    // a new value for it under a depth that promises to overwrite nothing.
+    // Both sets are a high-water mark, never a snapshot of the current file:
+    // a key this file has stopped declaring is still a key somebody once
+    // established, and a later load must not be able to re-appear with a new
+    // value for it under a depth that promises to overwrite nothing.
     //
-    // It records what this load actually TOOK from the file, not everything
-    // the file declared, and the two differ: a key held out of scope was not
-    // established by this load, and marking it so would establish a value
-    // that never landed. Every such key is added at its own arm above, next
-    // to the assignment that earns it. `instances` under a plain load is the
-    // standing example -- that depth never reshapes a flock, so the count
-    // stays whatever it was and the file has established nothing about it.
+    // The two are built DIFFERENTLY, and this is the statement that says so.
+    // `declared` is written key by key, up at the arm that actually takes the
+    // file's value, because a key held out of scope was not established by
+    // this load and marking it so would establish a value that never landed.
+    // `declared_env` is the blanket extend below: the env branch above has no
+    // equivalent per-key arm to hang an insert on, since it merges a whole
+    // table rather than assigning one value at a time.
+    //
+    // That asymmetry is a known gap rather than a considered split, and it
+    // has two shapes. Under `Settings` the env branch merges nothing at all
+    // and this line still establishes every env key the file declared. Under
+    // `None` an env key skipped because an override already holds it is
+    // established anyway, so clearing that override later leaves the key
+    // permanently out of scope. Both predate the key-by-key `declared` and
+    // belong with the slice that adds env editing; neither is reachable from
+    // anything that edits env today, because nothing does.
     next.declared_env
         .extend(incoming.declared_env.iter().cloned());
 
@@ -22486,7 +22503,10 @@ mod tests {
 
         assert_eq!(actor.sheep[&0].entry.spec.config().max_restarts, 99);
         assert!(
-            reply[0].refused.is_some(),
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("could not be rebuilt")),
             "a respawn is going to put max_restarts back to 10 and nobody was told: {reply:?}"
         );
         assert_eq!(
@@ -22526,12 +22546,16 @@ mod tests {
             declared_app(file, &["name", "script", "out_file"])
         };
 
+        let names_it = |why: &str| why.contains("out_file");
         let first = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
-        assert!(first[0].refused.is_some(), "{first:?}");
+        assert!(
+            first[0].refused.as_deref().is_some_and(names_it),
+            "{first:?}"
+        );
 
         let second = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
         assert!(
-            second[0].refused.is_some(),
+            second[0].refused.as_deref().is_some_and(names_it),
             "a retry of the same file must meet the same refusal, not silence: {second:?}"
         );
         assert!(
@@ -22541,6 +22565,148 @@ mod tests {
                 .declared
                 .contains("out_file"),
             "a key that went nowhere was established by nobody"
+        );
+    }
+
+    /// fails if a load never establishes the keys it took, which is the whole
+    /// of the additive default: `ResetDepth::None` skips a key somebody has
+    /// established, so a load that records nothing leaves every key
+    /// permanently re-writable and a Flockfile can change a running flock on
+    /// every load.
+    ///
+    /// Three loads, because two cannot tell the difference. The first
+    /// establishes the key, the second drops it from the file, and the third
+    /// re-adds it with a different value: only a record written by the FIRST
+    /// load can refuse the third. `a_file_load_appends_a_key_nobody_had_established`
+    /// asserts the spec and the report and never reads the store, and
+    /// `a_file_load_does_not_overwrite_an_established_key` reads a record its
+    /// own fixture wrote by hand, so the write side is invisible to both.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_a_load_took_is_established_against_the_next_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        let with_budget = |budget: u32| {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.max_restarts = budget;
+            declared_app(file, &["name", "script", "max_restarts"])
+        };
+
+        let first = apply_config(&mut actor, vec![with_budget(99)], ResetDepth::None).await;
+        assert_eq!(first[0].applied, vec!["max_restarts".to_string()]);
+        assert_eq!(actor.sheep[&0].entry.spec.config().max_restarts, 99);
+
+        // The key leaves the file. Nothing happens, and nothing may forget
+        // that it was established.
+        let dropped = apply_config(
+            &mut actor,
+            vec![declared_app(
+                AppConfig::minimal("web", "./srv"),
+                &["name", "script"],
+            )],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(dropped[0].applied.is_empty(), "{dropped:?}");
+
+        // And comes back with a different value. A plain load must not take
+        // it: the app has been running on 99 since the first load, and an
+        // operator may have set that 99 by hand for all this daemon knows.
+        let third = apply_config(&mut actor, vec![with_budget(5)], ResetDepth::None).await;
+
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().max_restarts,
+            99,
+            "a file overwrote a key an earlier load had established"
+        );
+        assert!(third[0].applied.is_empty(), "{third:?}");
+        assert!(
+            shep_core::overrides::get(&actor.paths.overrides, "web")
+                .unwrap()
+                .expect("a load records what it established")
+                .declared
+                .contains("max_restarts"),
+            "and the record is what makes that true"
+        );
+    }
+
+    /// fails if a load that refused keeps the override it spent on the way.
+    /// A key the file declares gives up its override during the merge, on the
+    /// grounds that the file speaks for it now; a load that then fails to
+    /// park has to hand it back, or an operator loses a value to a load that
+    /// changed nothing.
+    ///
+    /// `env` is the one field that can reach this under the default depth:
+    /// the top-level keys hold their override by being established, so they
+    /// are never in scope and never spend anything, while `env` merges one
+    /// key at a time and spends the whole override table for any key the file
+    /// declares.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_env_change_gives_the_operators_override_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        // Parked when the app ran ONE instance, with a shared explicit log
+        // path: legal for one, refused for the two running now, so this
+        // load's own change cannot be parked.
+        let earlier = app_with("web", |app| {
+            app.instances = 1;
+            app.out_file = Some("/tmp/web.log".to_string());
+        });
+        for id in [0, 1] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers two")
+                .entry
+                .pending = Some(earlier.clone());
+        }
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("env", serde_json::json!({ "OPERATOR": "1" }))],
+            ),
+        )
+        .unwrap();
+
+        // Two env keys: the one the operator already holds, which spends the
+        // override table, and one nobody has, which is what makes `env`
+        // drift at all.
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([
+            ("OPERATOR".to_string(), "2".to_string()),
+            ("MODE".to_string(), "blue".to_string()),
+        ]);
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("env")),
+            "the fixture must really refuse the env change: {reply:?}"
+        );
+
+        let record = shep_core::overrides::get(&actor.paths.overrides, "web")
+            .unwrap()
+            .expect("a load records what it established");
+        assert_eq!(
+            record
+                .fields
+                .get("env")
+                .and_then(|env| env.get("OPERATOR"))
+                .and_then(serde_json::Value::as_str),
+            Some("1"),
+            "a load that changed nothing spent the operator's override"
+        );
+        assert!(
+            record.declared_env.is_empty(),
+            "and it established env keys that never landed: {:?}",
+            record.declared_env
         );
     }
 }
