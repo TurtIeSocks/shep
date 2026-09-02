@@ -43,7 +43,7 @@ use crate::exit::ExitCode;
 /// `shep dog <name>` only ever reaches one of these two. Anything else in
 /// the config did not come from `enable`/`adopt`, however it got there, and
 /// [`run_dog`] refuses it before touching the socket.
-const BUILT_IN_DOGS: [&str; 2] = ["metrics", "bark"];
+pub(crate) const BUILT_IN_DOGS: [&str; 2] = ["metrics", "bark"];
 
 /// A dog's connection to the shepherd, and its own configuration.
 ///

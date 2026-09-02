@@ -134,30 +134,123 @@ async fn connect_or_absent(
     }
 }
 
+/// [`enable`]'s own failure, so its `try_edit` closure can refuse from
+/// inside the lock: either the config layer's error, or a name that
+/// answers to no dog at all.
+///
+/// [`ShepToml::try_edit`] is generic over the closure's error precisely so
+/// a verb whose refusal is its own thing does not have to dress it up as a
+/// [`ShepTomlError`] it is not.
+enum EnableRefusal {
+    /// The read-modify-write underneath the closure failed; rendered by
+    /// [`fail_config`], exactly as [`ShepToml::edit`]'s `Err` always was.
+    Config(ShepTomlError),
+    /// The name is neither one of [`crate::dog::BUILT_IN_DOGS`] nor a key
+    /// of `[daemon] adopted_dogs`. `adopted` carries what that map did
+    /// hold, read under the same lock, so the refusal can name the
+    /// alternatives without a second read that a concurrent `shep adopt`
+    /// could invalidate.
+    UnknownDog { adopted: Vec<String> },
+}
+
+impl From<ShepTomlError> for EnableRefusal {
+    fn from(err: ShepTomlError) -> Self {
+        Self::Config(err)
+    }
+}
+
 /// `shep enable <name>`: writes the config, and starts the dog if a
 /// shepherd is running.
+///
+/// A name that is neither built-in nor adopted is refused before anything
+/// is written. [`dog_source`] reads that distinction as an absence — a
+/// name outside `[daemon] adopted_dogs` is [`DogSource::BuiltIn`] by
+/// construction — so without this check a typo is written into
+/// `enabled_dogs` as a built-in, and the shepherd then spawns `shep dog
+/// <typo>` on a restart ladder that cannot ever succeed: `dog::run_dog`
+/// refuses the name once per attempt until the budget is spent, while
+/// `shep dogs` reports the dog's `SOURCE` as `built-in`, which it is not.
 pub async fn enable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
-    // The read and the edit are one `edit` call because they are one
-    // transaction: the source below is read from the same document this
-    // then writes back, under the lock that keeps a concurrent `shep
-    // adopt` from landing between the two.
-    let source = match ShepToml::edit(&paths.daemon_config, |cfg| {
+    // `try_edit` rather than `edit`, and the check inside the closure
+    // rather than before the call: the refusal must skip `save` entirely
+    // (a refused enable leaves `shep.toml` untouched, down to its inode),
+    // and the adopted-name lookup it turns on must happen under the lock
+    // that keeps a concurrent `shep adopt` from landing between the check
+    // and the write.
+    // `result_large_err` on the closure, for the same reason and on the same
+    // platform as the module-wide allow in `commands::shep_toml` -- see the
+    // banner there. `EnableRefusal::Config` carries that module's error, so
+    // this closure is measured against the same 128-byte threshold the
+    // `try_edit` call in `lib.rs`'s `shep style` arm already allows for.
+    #[cfg_attr(windows, allow(clippy::result_large_err))]
+    let source = match ShepToml::try_edit(&paths.daemon_config, |cfg| {
         // Read from the config rather than assumed: `shep adopt` records
         // the binary and `shep enable` is what starts it afterwards, so a
         // hardcoded `BuiltIn` here sends the shepherd off to spawn `shep
         // dog <name>` and the adopted binary never runs at all.
         let source = dog_source(cfg, name);
+        if matches!(source, DogSource::BuiltIn) && !crate::dog::BUILT_IN_DOGS.contains(&name) {
+            return Err(EnableRefusal::UnknownDog {
+                adopted: cfg.adopted_dog_names(),
+            });
+        }
         cfg.enable_dog(name);
-        source
+        Ok(source)
     }) {
         Ok(source) => source,
-        Err(err) => return fail_config(streams, &err),
+        Err(EnableRefusal::Config(err)) => return fail_config(streams, &err),
+        Err(EnableRefusal::UnknownDog { adopted }) => {
+            return fail_enable_unknown_dog(streams, name, &adopted);
+        }
     };
     let client = match connect_or_absent(paths, streams).await {
         Ok(client) => client,
         Err(code) => return code,
     };
     enable_after_config(streams, name, &source, client.as_ref()).await
+}
+
+/// Renders [`enable`]'s refusal of a name that names no dog.
+///
+/// `adopted` is every key of `[daemon] adopted_dogs`, read under the same
+/// lock the refusal was decided under; it is empty on a `$SHEP_HOME` where
+/// nothing has ever been adopted, which is the common case for this typo.
+///
+/// [`ExitCode::InvalidConfig`] rather than [`ExitCode::Usage`]: the name
+/// is not a malformed argument, it is one the daemon config cannot
+/// resolve — the same code [`fail_adopt_name_collision`] gives the
+/// mirror-image refusal on `shep adopt`.
+fn fail_enable_unknown_dog(streams: &mut Streams<'_>, name: &str, adopted: &[String]) -> ExitCode {
+    let valid: Vec<String> = crate::dog::BUILT_IN_DOGS
+        .iter()
+        .map(|built_in| format!("{built_in:?}"))
+        .chain(adopted.iter().map(|dog| format!("{dog:?}")))
+        .collect();
+    let message = format!(
+        "`{name}` is not a dog; valid names are {} -- if you meant a third-party dog, \
+         run `shep adopt {name}` first",
+        join_with_and(&valid)
+    );
+    streams.fail(ExitCode::InvalidConfig, &message)
+}
+
+/// Joins `items` as an English list: `a`, `a and b`, `a, b, and c`.
+///
+/// Hand-rolled rather than pulled in: the whole of it is where the two
+/// commas go, and shep has one caller ([`fail_enable_unknown_dog`]).
+///
+/// The empty slice answers with the empty string. No caller can reach it —
+/// [`crate::dog::BUILT_IN_DOGS`] is never empty, so the one list this
+/// builds always has at least two entries — but a `match` on a slice owes
+/// the arm either way, and an empty string is the answer that degrades
+/// most quietly if a second caller ever does.
+fn join_with_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 /// `enable`'s daemon half, split out from [`enable`] so a test can drive it
@@ -1785,6 +1878,143 @@ mod tests {
             text.contains("next shepherd"),
             "the operator needs to know the dog is not running yet: {text}"
         );
+    }
+
+    /// fails if `shep enable` accepts a name that answers to no dog.
+    ///
+    /// `dog_source` reads built-in-ness as an ABSENCE from `[daemon]
+    /// adopted_dogs`, so before this guard a typo was written into
+    /// `enabled_dogs` as a built-in and exited zero. The shepherd then
+    /// spawned `shep dog <typo>` on the restart ladder, `dog::run_dog`
+    /// refused the name once per attempt until the budget was spent, and
+    /// `shep dogs` reported its `SOURCE` as `built-in` throughout -- a name
+    /// that is not one.
+    #[tokio::test]
+    async fn enable_refuses_a_name_that_is_neither_built_in_nor_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = enable(&mut streams(&mut out, &mut err), &paths, "pydog").await;
+
+        assert_eq!(code, ExitCode::InvalidConfig);
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            text.contains("pydog"),
+            "the refusal must name the name: {text}"
+        );
+        assert!(
+            text.contains("shep adopt pydog"),
+            "the refusal must name the way out, the way `shep adopt`'s own \
+             name-collision refusal does: {text}"
+        );
+        assert!(
+            !paths.daemon_config.exists(),
+            "a refused enable must leave the config untouched -- `try_edit` \
+             skips `save`, so a `$SHEP_HOME` that had no `shep.toml` still \
+             has none"
+        );
+    }
+
+    /// fails if the refusal names only the built-ins. An operator with dogs
+    /// adopted is the one likeliest to have mistyped one of THEIR names, so
+    /// the adopted set is the half of the list they need.
+    ///
+    /// Read inside `enable`'s own `try_edit` closure, under the lock, rather
+    /// than by a second read afterwards: a concurrent `shep adopt` landing
+    /// between the two would make the message name a set that was never the
+    /// one the refusal was decided against.
+    #[tokio::test]
+    async fn enable_refusal_names_the_adopted_dogs_alongside_the_built_ins() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        ShepToml::edit(&paths.daemon_config, |cfg| {
+            cfg.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+        })
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = enable(&mut streams(&mut out, &mut err), &paths, "pydog").await;
+
+        assert_eq!(code, ExitCode::InvalidConfig);
+        let text = String::from_utf8(err).unwrap();
+        for expected in ["\"metrics\"", "\"bark\"", "\"otel\""] {
+            assert!(
+                text.contains(expected),
+                "the refusal must name {expected} among the valid names: {text}"
+            );
+        }
+    }
+
+    /// fails if the guard swallows the case it exists to allow through: a
+    /// name `shep adopt` recorded is a dog, and `enable` must still take it.
+    #[tokio::test]
+    async fn enable_still_accepts_a_name_adopt_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        ShepToml::edit(&paths.daemon_config, |cfg| {
+            cfg.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
+        })
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = enable(&mut streams(&mut out, &mut err), &paths, "otel").await;
+
+        assert_eq!(code, ExitCode::Success, "{}", String::from_utf8_lossy(&err));
+        let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
+        assert!(written.contains("otel"), "{written}");
+    }
+
+    /// fails if `disable` grows the guard `enable` just did.
+    ///
+    /// It must not: a `shep.toml` written before that guard existed -- or by
+    /// hand -- can already carry a name that answers to no dog, and `shep
+    /// disable <name>` is the only way to get it back out of `enabled_dogs`.
+    /// A symmetrical check here would strand exactly the operators the
+    /// guard is meant to rescue, with a restart-looping dog and no verb that
+    /// will remove it.
+    #[tokio::test]
+    async fn disable_still_removes_a_name_enable_would_now_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(paths.daemon_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &paths.daemon_config,
+            "[daemon]\nenabled_dogs = [\"pydog\", \"metrics\"]\n",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = disable(&mut streams(&mut out, &mut err), &paths, "pydog").await;
+
+        assert_eq!(code, ExitCode::Success, "{}", String::from_utf8_lossy(&err));
+        let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
+        assert!(
+            !written.contains("pydog"),
+            "disable is the escape hatch out of a config enable would now \
+             refuse to write: {written}"
+        );
+        assert!(
+            written.contains("metrics"),
+            "and it touches nothing else: {written}"
+        );
+    }
+
+    /// fails if the refusal's list grammar loses a comma or an `and`. The
+    /// two-name case is what every `$SHEP_HOME` with nothing adopted gets,
+    /// and the three-name case is the first one with an adopted dog in it.
+    #[test]
+    fn join_with_and_reads_as_an_english_list() {
+        let one = ["a".to_string()];
+        let two = ["a".to_string(), "b".to_string()];
+        let three = ["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(join_with_and(&[]), "");
+        assert_eq!(join_with_and(&one), "a");
+        assert_eq!(join_with_and(&two), "a and b");
+        assert_eq!(join_with_and(&three), "a, b, and c");
     }
 
     /// The name-collision guard `shep-daemon/src/rpc.rs`'s `EnableDog` arm
