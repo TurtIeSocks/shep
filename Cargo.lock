@@ -2095,6 +2095,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shep-channel"
+version = "0.2.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "shep-cli"
 version = "0.2.2"
 
@@ -2137,6 +2145,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "shep-channel",
  "syn 1.0.109",
  "tempfile",
  "tokio",

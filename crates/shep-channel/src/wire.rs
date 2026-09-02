@@ -6,23 +6,14 @@
 //! custom actions). Framing (newline-JSON over `BufReader::lines()`) is wired
 //! by shep-daemon's real runner; this module only pins the message shapes.
 //!
-//! # Why this lives in shep-core
+//! # Why these two enums are not `#[non_exhaustive]`
 //!
-//! It did not, until `BusEvent::Channel` (spec §6's `channel.*` topic) began
-//! carrying a [`ChildMessage`] verbatim to every subscriber. A bus event is a
-//! shep-core type, so the message it carries has to be one too — and a second
-//! copy of these shapes in shep-daemon would be two spellings of one wire that
-//! no test could compare across the crate boundary. shep-daemon re-exports
-//! both types from its own `channel` module, so nothing that already names
-//! them had to change.
-//!
-//! Both enums are deliberately NOT `#[non_exhaustive]`, unlike everything else
-//! under `protocol`. There is no handshake on fd 3 and no version to negotiate
-//! (`CHANNEL_VERSION` is a stamp, not a negotiation — see its own doc), so a
-//! new variant here is a change every app that speaks this wire has to be told
+//! There is no handshake on the shepherd channel and no version to
+//! negotiate. `CHANNEL_VERSION` is a stamp rather than a negotiation, so a
+//! new variant here is a change every app speaking this wire has to be told
 //! about out of band. Leaving them exhaustive means the compiler names every
-//! site that has to decide something, [`crate::protocol::BusEvent::topic`]
-//! included, which is exactly the review a change on this wire deserves.
+//! site that has to decide something, `BusEvent::topic` included, which is
+//! exactly the review a change on this wire deserves.
 //!
 //! This module pins the wire shapes; it is not the app-author-facing contract.
 //! An app that wants to speak this wire — including why it should reply to a

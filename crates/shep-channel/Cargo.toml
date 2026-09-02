@@ -1,0 +1,30 @@
+[package]
+name = "shep-channel"
+description = "Client for the shep shepherd channel: readiness, metrics and custom actions over the descriptor shep hands a supervised process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/shep-channel"
+keywords = ["shep", "process-manager", "ipc", "readiness", "metrics"]
+categories = ["api-bindings", "os"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# On by default. The client: descriptor discovery, the reader and writer
+# threads, and the handler layer. `shep-core` takes this crate with
+# `default-features = false` because it wants the wire types and nothing
+# else; an app wants the whole thing and says nothing.
+default = ["client"]
+client = ["dep:serde_json"]
+
+[dependencies]
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+
+[lints]
+workspace = true

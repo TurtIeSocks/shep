@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::channel::ChildMessage;
+use crate::protocol::ChildMessage;
 use crate::protocol::request::ProcessInfo;
 
 /// What happened to a sheep

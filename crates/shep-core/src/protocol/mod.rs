@@ -34,14 +34,12 @@
 //! moves; renaming one would erase the compatibility claim it exists to
 //! make.
 
-pub mod channel;
 pub mod events;
 pub mod frame;
 pub mod request;
 /// Frame encoding shared by daemon and client
 pub mod wire;
 
-pub use channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 pub use events::{BusEvent, ProcessEventKind};
 pub use frame::ServerFrame;
 pub use request::{
@@ -50,6 +48,7 @@ pub use request::{
     Response, RpcError, RpcErrorCode, SelectorSpec, SheepApplied, SheepDrift, SignalOutcome,
     SignalReply, Smit, SmitError, sort_flock,
 };
+pub use shep_channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 
 /// Wire protocol version.
