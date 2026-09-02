@@ -341,6 +341,23 @@ impl ShepToml {
             .map(PathBuf::from)
     }
 
+    /// Every name `[daemon] adopted_dogs` records, in TOML document order.
+    ///
+    /// Read by `commands::dogs::enable` to name the adopted dogs in its
+    /// refusal of a name that is neither adopted nor built in — a refusal
+    /// that lists the way out is worth the allocation, and this is the
+    /// only caller that wants the whole set rather than one lookup.
+    #[must_use]
+    pub fn adopted_dog_names(&self) -> Vec<String> {
+        self.doc
+            .get("daemon")
+            .and_then(Item::as_table)
+            .and_then(|daemon| daemon.get("adopted_dogs"))
+            .and_then(Item::as_table)
+            .map(|adopted| adopted.iter().map(|(name, _)| name.to_string()).collect())
+            .unwrap_or_default()
+    }
+
     /// [`Self::adopted_dog_path`] without [`Self::edit`]'s write side --
     /// for a caller that only wants the answer, such as `lib.rs`'s
     /// `dispatch_adopted_dog`, which runs on every unrecognized verb, most

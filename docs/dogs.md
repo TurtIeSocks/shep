@@ -56,8 +56,31 @@ starts a shepherd on your behalf to act on its own edit — that would be a
 bigger side effect than a config change should cause, and `shep muster` is
 the one verb in this CLI that autostarts anything.
 
+`enable` takes a built-in name or one `shep adopt` has already recorded,
+and refuses anything else before it writes:
+
+```
+$ shep enable pydog
+error[invalid_config]: `pydog` is not a dog; valid names are "metrics"
+and "bark" -- if you meant a third-party dog, run `shep adopt pydog` first
+```
+
+A refused `enable` writes nothing at all: a `$SHEP_HOME` that had no
+`shep.toml` still has none afterwards. The check reads `[daemon]
+adopted_dogs`, not the shepherd, so it holds with nothing listening.
+
+The guard is on the verb, not on the file. Write a name into `[daemon]
+enabled_dogs` by hand and the shepherd still reads it at boot, still
+treats anything outside `[daemon] adopted_dogs` as built-in, and spawns
+`shep dog <name>` for it once per restart until the budget is spent. What
+that looks like from `shep dogs` is a climbing restart count against a
+`SOURCE` of `built-in`, for a name that is not one; `shep bleats <name>`
+is where the refusal itself shows up.
+
 `shep disable <name>` is the mirror: it stops the dog if one is running,
-and removes it from the boot list either way.
+and removes it from the boot list either way. It carries no name check of
+its own, deliberately, so it is what takes a hand-written entry back out
+of `enabled_dogs`.
 
 Running two of these at once is safe. A provisioning script that
 backgrounds `shep adopt` and `shep enable` together has each of them take
