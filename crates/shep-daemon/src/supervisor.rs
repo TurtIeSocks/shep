@@ -4577,6 +4577,42 @@ impl<R: ProcessRunner> Actor<R> {
         }
     }
 
+    /// Moves a sheep's pending config onto its stored spec, if it has any.
+    ///
+    /// Called where a child is about to be replaced, which is the only moment
+    /// a [`ApplyGroup::NeedsRespawn`] field can take effect. Nothing here
+    /// re-reads a file: the pending config was put there by a file load that
+    /// already happened, so `shep reload`'s documented promise not to
+    /// re-parse a Flockfile is untouched.
+    ///
+    /// Returns the field names promoted, for a caller that wants to report
+    /// them.
+    fn promote_pending(&mut self, id: u32) -> Vec<String> {
+        let Some(slot) = self.sheep.get_mut(&id) else {
+            return Vec::new();
+        };
+        let Some(pending) = slot.entry.pending.take() else {
+            return Vec::new();
+        };
+        let promoted = slot.entry.spec.config().drifted_fields(pending.config());
+
+        // The one exception to [`ProcessEntry::credentials`] being resolved
+        // once. That rule exists so a restart never changes a running app's
+        // identity by accident; an operator who edited `user` or `group` is
+        // asking for exactly that change, and reusing the old identity would
+        // silently ignore them. Narrow on purpose: any other promoted field
+        // keeps the resolved value, so an ordinary config change costs no
+        // passwd lookup.
+        if promoted
+            .iter()
+            .any(|field| field == "user" || field == "group")
+        {
+            slot.entry.credentials = SpawnIdentity::Unresolved;
+        }
+        slot.entry.spec = pending;
+        promoted
+    }
+
     /// Respawns an already-registered id in place: reassembles from its
     /// stored spec + instance, bumps `restarts` and resets timing on
     /// success, or marks the entry `Errored` on failure. Used for both the
@@ -4591,13 +4627,22 @@ impl<R: ProcessRunner> Actor<R> {
     /// failure. Callers pass `origin == CommandOrigin::Operator`, never a
     /// literal, wherever a command is what got them here.
     fn respawn(&mut self, id: u32, manually: bool) -> ProcessInfo {
-        // Reused as-is once resolved (never re-resolved): a restart must
-        // never re-touch the passwd database, and must never silently change
-        // identity out from under an already-running app. An entry that has
-        // never been resolved -- restored from the muster roll, or left
-        // `Errored` by a refused start -- resolves HERE, because coming up
-        // as the shepherd instead would be a privilege downgrade nothing
-        // reports.
+        // Before the identity below is read, because a promoted `user` or
+        // `group` is what clears it. Here rather than in the `Restart` arms
+        // that call this, because every door a replacement child comes
+        // through is one: an operator's restart, the crash loop, a cron
+        // occurrence, a watched file, a memory breach. `pending` promises the
+        // parked config reaches the process at its NEXT spawn, and each of
+        // those is one.
+        self.promote_pending(id);
+        // Reused as-is once resolved: a restart must never re-touch the
+        // passwd database, and must never silently change identity out from
+        // under an already-running app. The one exception is the line above,
+        // which clears the resolution when the config it promoted is what
+        // changed `user` or `group`. An entry that has never been resolved
+        // -- restored from the muster roll, or left `Errored` by a refused
+        // start -- resolves HERE, because coming up as the shepherd instead
+        // would be a privilege downgrade nothing reports.
         let credentials = match self.credentials_for_spawn(id) {
             Ok(credentials) => credentials,
             Err(err) => return self.respawn_failed(id, manually, &err),
@@ -6264,8 +6309,18 @@ impl<R: ProcessRunner> Actor<R> {
     /// The mark is undone if the spawn fails, and nothing can observe it in
     /// between — the actor is synchronous here and emits no event. An
     /// identity that will not resolve returns before the mark is made at all,
-    /// which leaves the drainee where it stood by never moving it.
+    /// which leaves the drainee's status where it stood by never moving it.
+    /// Its config is a separate matter: the promotion below runs before the
+    /// resolution, so a drainee whose reload is abandoned that way is left
+    /// carrying the config it was going to be replaced on, waiting for the
+    /// next attempt.
     fn spawn_replacement(&mut self, old_id: u32, mode: ReloadMode) -> Result<u32, String> {
+        // Read off the drainee, whose entry is where a load parked it, and
+        // done before the identity below because a promoted `user` or `group`
+        // is what clears it. Both reload orderings reach here -- an overlap
+        // from `advance_reload`, a serial one from `reap_drainee` -- so this
+        // is the one place a reload can promote.
+        self.promote_pending(old_id);
         // `Credentials` is `Copy`; reused, never re-resolved. A drainee is
         // by definition running, so the seam finds a resolved identity and
         // touches nothing -- but a reload must not be the one path that
@@ -22707,6 +22762,211 @@ mod tests {
             record.declared_env.is_empty(),
             "and it established env keys that never landed: {:?}",
             record.declared_env
+        );
+    }
+
+    // --- Promotion: a parked config reaching the process that replaces the
+    // one it was parked behind ---
+    //
+    // Actor-tier for the same reason the load cases above are: what a
+    // promotion moves is `spec`, `pending` and `credentials`, and no reply
+    // spelling reports those three together.
+
+    /// fails if a reload does not pick up config a file load parked. Without
+    /// this the pending slot is written and never read, so an operator can
+    /// see a pending field forever and has no way to apply it.
+    #[tokio::test(start_paused = true)]
+    async fn reload_promotes_pending_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        let new_id = actor.reloads["web"]
+            .swap
+            .new_id
+            .expect("an overlapping reload spawns its replacement at once");
+        assert_eq!(
+            actor.sheep[&new_id]
+                .entry
+                .spec
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "the replacement must come up on the config the load parked"
+        );
+        assert!(
+            actor.sheep[&0].entry.pending.is_none(),
+            "a promoted config is owed no longer, so the slot must be empty"
+        );
+        assert_ne!(
+            actor.sheep[&new_id].entry.pid,
+            Some(APPLY_FIRST_PID),
+            "a promotion is only reachable through a process that actually replaced the old one"
+        );
+    }
+
+    /// fails if a restart does not promote. Both verbs replace the child, so
+    /// both are chances to apply what is owed.
+    #[tokio::test(start_paused = true)]
+    async fn restart_promotes_pending_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+
+        actor.apply_immediate(0, ManualKind::Restart, CommandOrigin::Operator);
+
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(
+            entry.spec.config().env.get("MODE").map(String::as_str),
+            Some("blue"),
+            "the restarted child must come up on the config the load parked"
+        );
+        assert!(
+            entry.pending.is_none(),
+            "a promoted config is owed no longer, so the slot must be empty"
+        );
+        assert_ne!(
+            entry.pid,
+            Some(APPLY_FIRST_PID),
+            "a promotion is only reachable through a process that actually replaced the old one"
+        );
+    }
+
+    /// fails if promoting a `user` change reuses the identity resolved at the
+    /// original start. `credentials` is resolved once precisely so a restart
+    /// does not change a running app's identity by accident; an operator
+    /// editing `user` is asking for it on purpose, and that is the one case
+    /// that must re-resolve.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn promoting_a_user_change_re_resolves_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.user = Some(own_user_name());
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "user"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        let wanted = Credentials {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: None,
+        };
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(wanted),
+            "the replacement must carry the identity the promoted `user` resolves to; `None` \
+             here is the fixture's stale resolution, which is the change being ignored"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.credentials,
+            SpawnIdentity::Resolved(Some(wanted)),
+            "and the fresh resolution is stored, so the restart after this one reuses it"
+        );
+    }
+
+    /// fails if promotion resets credentials for a field that has nothing to
+    /// do with identity. Re-resolving on every promotion would mean a passwd
+    /// lookup per config change and would defeat the once-only rule for no
+    /// reason.
+    #[tokio::test(start_paused = true)]
+    async fn promoting_an_unrelated_change_keeps_the_resolved_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.user = Some(NO_SUCH_USER.to_string())
+            })],
+        );
+        // Resolved back when that passwd entry still existed. A name that no
+        // longer resolves is what makes reuse observable at all: this value
+        // cannot be re-derived, so a spawn carrying it is a spawn that reused
+        // it, and a re-resolution could only fail.
+        let settled = Credentials {
+            uid: 4242,
+            gid: None,
+        };
+        actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registers one instance")
+            .entry
+            .credentials = SpawnIdentity::Resolved(Some(settled));
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.args = vec!["--port=8080".to_string()];
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "args"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        assert_eq!(
+            actor.runner.spawn_count(),
+            1,
+            "the replacement must have been spawned at all: an identity re-resolved here could \
+             only refuse, and a refusal would abandon the reload"
+        );
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(settled),
+            "an `args` change is not an identity change, so the replacement runs as whoever the \
+             instance was already running as"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.credentials,
+            SpawnIdentity::Resolved(Some(settled)),
+            "and the stored resolution is untouched, so no passwd lookup was spent"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().args,
+            vec!["--port=8080".to_string()],
+            "the promotion itself must still have happened"
         );
     }
 }
