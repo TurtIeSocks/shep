@@ -18,6 +18,8 @@
 #![deny(unsafe_code)]
 
 #[cfg(feature = "client")]
+mod dispatch;
+#[cfg(feature = "client")]
 mod endpoint;
 #[cfg(feature = "client")]
 mod outbox;
@@ -25,6 +27,8 @@ mod outbox;
 mod session;
 mod wire;
 
+#[cfg(feature = "client")]
+pub use dispatch::{ActionHandler, ShutdownHandler};
 #[cfg(feature = "client")]
 pub use endpoint::{Endpoint, FD_VAR, PIPE_VAR, VERSION_VAR};
 pub use wire::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
