@@ -597,9 +597,24 @@ async fn reload_with_wait(
     // `ShepToml::edit` from writing a file that will not PARSE, so the gap
     // this closes is a valid TOML, invalid VALUE file. `whistle` runs the
     // same check for the same reason (`whistle::mod::whistle`).
+    //
+    // FILE ONLY, deliberately, with `&|_| None` in place of an env layer:
+    // the daemon being reloaded is already running, so its own env and its
+    // own boot-time flags already loaded successfully once and have not
+    // changed since. Only the file changed, so the file is the only input
+    // worth checking here. Layering THIS process's env would be worse than
+    // skipping the check: the handover successor inherits the OLD daemon's
+    // argv and env through `execve`, not this CLI invocation's, so a value
+    // this process's shell happens to rescue (an exported `SHEP_LOG_LEVEL`
+    // the daemon never saw) would pass here and still exit the successor
+    // with the predecessor gone. A file-only check cannot pass where the
+    // successor fails, because a valid file plus an already-valid env and
+    // flags stays valid; it can refuse a file the successor would have
+    // survived on a boot-time flag, which is accepted on purpose, since a
+    // config value that only works because of a flag someone passed at
+    // boot is a trap worth naming.
     if let Err(err) = read_daemon_config_source(paths).and_then(|source| {
-        DaemonConfig::load(source.as_deref(), &|key| std::env::var(key).ok())
-            .map_err(DaemonRunError::from)
+        DaemonConfig::load(source.as_deref(), &|_| None).map_err(DaemonRunError::from)
     }) {
         return streams.fail(daemon_exit_code(&err), &err.to_string());
     }
@@ -1709,8 +1724,8 @@ otel = "/usr/local/bin/shep-otel"
     ///
     /// No daemon runs in this test, so without the pre-flight `reload`
     /// reaches `Client::connect`, fails, and returns `DaemonUnreachable`
-    /// instead of `InvalidConfig` -- see this task's own report for the
-    /// failure observed before the pre-flight was added.
+    /// instead of `InvalidConfig`: a connection attempt against a home no
+    /// daemon owns, rather than a refusal that never dials at all.
     #[tokio::test]
     async fn reload_refuses_a_shep_toml_that_will_not_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -1735,6 +1750,61 @@ otel = "/usr/local/bin/shep-otel"
         assert!(
             rendered.contains("verbose"),
             "the refusal must name the bad value: {rendered}"
+        );
+    }
+
+    /// Pins the ruling behind the file-only pre-flight: it must not layer
+    /// this process's environment over the file, because a handover
+    /// successor execs with the OLD daemon's argv and env, not this reload
+    /// invocation's. Layering here could refuse in one direction only if
+    /// that were the whole story -- but the divergence runs both ways, and
+    /// the dangerous direction is the one that lets a bad file through: a
+    /// value only valid because of an env var or flag this CLI process
+    /// happens to see, and the daemon being replaced never did, would load
+    /// clean here and still exit the successor after the predecessor is
+    /// gone. `reload`'s pre-flight cannot be handed a mock environment
+    /// directly (it hardcodes `&|_| None`, on purpose), so this proves the
+    /// premise against the same file with [`DaemonConfig::load`] and a real
+    /// env closure first, then proves `reload` itself still refuses it.
+    ///
+    /// `max_cron_sleep` is the field this needs: `log_level`/`log_json`
+    /// values fail at `toml::from_str` itself, before any layer runs, so no
+    /// env override could ever reach them. A duration below
+    /// `MIN_CRON_SLEEP` is syntactically valid and fails only at
+    /// `DaemonConfig`'s own validation pass, after env has already had a
+    /// chance to overwrite it -- see `load_layered`'s own comment on why
+    /// `SHEP_MAX_CRON_SLEEP` can rescue a broken file.
+    #[tokio::test]
+    async fn reload_refuses_a_shep_toml_an_env_var_would_have_rescued() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(paths.daemon_config.parent().unwrap()).unwrap();
+        let src = "[daemon]\nmax_cron_sleep = \"500ms\"\n";
+        std::fs::write(&paths.daemon_config, src).unwrap();
+
+        assert!(
+            DaemonConfig::load(Some(src), &|key| (key == "SHEP_MAX_CRON_SLEEP")
+                .then(|| "5s".to_string()))
+            .is_ok(),
+            "the premise of this test is that a real env layer rescues this file"
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            reload(&mut streams, &paths, VersionGuard::Exempt).await
+        };
+
+        assert_eq!(
+            code,
+            ExitCode::InvalidConfig,
+            "the file-only pre-flight must refuse a value only an env layer could rescue"
         );
     }
 
