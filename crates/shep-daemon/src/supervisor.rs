@@ -391,7 +391,7 @@ pub(crate) enum Command {
         pid: u32,
         /// The liveness epoch the reporting probe was armed under, or `None`
         /// for a memory breach, which has nothing equivalent that can go
-        /// stale; see `Actor::handle_extra_restart`'s third guard.
+        /// stale; see `Actor::handle_extra_restart`'s fifth guard.
         epoch: Option<u64>,
     },
     /// Replaces every matched sheep with a fresh instance, one instance of
