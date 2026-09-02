@@ -42,7 +42,7 @@ pub mod values;
 /// One-import surface for downstream crates
 pub mod prelude {
     #[doc(no_inline)]
-    pub use crate::config::{AppConfig, Flockfile};
+    pub use crate::config::{AppConfig, DeclaredApp, Flockfile};
     #[doc(no_inline)]
     pub use crate::paths::ShepPaths;
     #[doc(no_inline)]
