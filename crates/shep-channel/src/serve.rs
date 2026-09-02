@@ -419,6 +419,16 @@ mod tests {
 
         reader_loop(&mut reader, &outbox, &dispatch, &warn);
 
+        // Non-blocking probe for "closed" before the (otherwise
+        // could-park-forever) pop() below: push_blocking on a closed
+        // outbox returns Err(Closed) immediately rather than waiting, so a
+        // dropped `outbox.close()` in reader_loop fails right here in
+        // microseconds instead of hanging this test on an empty, open
+        // queue with no bound.
+        assert!(
+            outbox.push_blocking(ChildMessage::Ready).is_err(),
+            "reader_loop returned without closing the outbox"
+        );
         assert_eq!(
             outbox.pop(),
             None,
