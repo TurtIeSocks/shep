@@ -20,6 +20,8 @@
 #[cfg(feature = "client")]
 mod endpoint;
 #[cfg(feature = "client")]
+mod outbox;
+#[cfg(feature = "client")]
 mod session;
 mod wire;
 
