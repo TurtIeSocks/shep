@@ -18,6 +18,12 @@ pub const PIPE_VAR: &str = "SHEP_CHANNEL_PIPE";
 /// The wire version stamp, set on both platforms whenever a channel exists.
 pub const VERSION_VAR: &str = "SHEP_CHANNEL_VERSION";
 
+/// The lowest descriptor number the channel can arrive on.
+///
+/// The shepherd maps the child's end of the socketpair onto 3 and never
+/// anything lower, because 0, 1 and 2 are the app's own standard streams.
+const FIRST_INHERITABLE_FD: i32 = 3;
+
 /// Where this process's channel is, if it has one.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,21 +41,42 @@ pub enum Endpoint {
 /// # Errors
 ///
 /// [`ChannelError::Unusable`] when `SHEP_CHANNEL_FD` is set to something
-/// that is not a descriptor number. That is a broken environment rather
-/// than an absent channel, and saying so beats silently doing nothing.
+/// that is not a descriptor number, or to a number below 3. Either is a
+/// broken environment rather than an absent channel, and saying so beats
+/// silently doing nothing.
 pub fn discover() -> Result<Endpoint, ChannelError> {
     if let Some(raw) = std::env::var_os(FD_VAR) {
-        let text = raw.to_string_lossy().into_owned();
-        return text
-            .trim()
-            .parse::<i32>()
-            .map(Endpoint::Descriptor)
-            .map_err(|_| ChannelError::Unusable(format!("{FD_VAR}={text}")));
+        return descriptor_from(&raw.to_string_lossy());
     }
     if let Some(raw) = std::env::var_os(PIPE_VAR) {
         return Ok(Endpoint::Pipe(PathBuf::from(raw)));
     }
     Ok(Endpoint::Absent)
+}
+
+/// Reads one `SHEP_CHANNEL_FD` value and says whether it can be the channel.
+///
+/// Split out of [`discover`] so the refusals below can be tested without
+/// setting an environment variable: that is `unsafe` in edition 2024, which
+/// this crate denies outside its one descriptor site, and it would race
+/// every other test sharing the process.
+///
+/// The floor is what [`connect`]'s `from_raw_fd` leans on. A negative number
+/// is not an owned descriptor at all, and 1 is worse in practice than a
+/// number that is merely wrong: taking it would hand this crate ownership of
+/// the app's stdout, write JSON into it, and close it on drop.
+fn descriptor_from(text: &str) -> Result<Endpoint, ChannelError> {
+    let Ok(fd) = text.trim().parse::<i32>() else {
+        return Err(ChannelError::Unusable(format!("{FD_VAR}={text}")));
+    };
+    if fd < FIRST_INHERITABLE_FD {
+        return Err(ChannelError::Unusable(format!(
+            "{FD_VAR}={fd} must be {FIRST_INHERITABLE_FD} or above: the shepherd passes \
+             the channel as {FIRST_INHERITABLE_FD}, and 0, 1 and 2 are this process's own \
+             standard streams"
+        )));
+    }
+    Ok(Endpoint::Descriptor(fd))
 }
 
 /// The duplex this platform carries the channel on.
@@ -90,9 +117,13 @@ pub(crate) fn connect(endpoint: &Endpoint) -> Result<(Transport, Transport), Cha
             // `CHANNEL_TAKEN`, swapped just above, makes this arm reachable
             // at most once per process, and nothing else in this crate
             // touches that number, so this call takes sole ownership of it.
-            // A number that is not ours still produces an error on first
-            // use rather than undefined behaviour, because the standard
-            // library's socket calls check.
+            // `discover` is the only path that builds a `Descriptor` from
+            // the environment and it refuses anything below 3, so the two
+            // cases that are plainly not an owned descriptor -- a negative
+            // number, and this process's own standard streams -- never
+            // reach here. What is left is a number in range that the
+            // environment names wrongly; the standard library's socket
+            // calls report that as `EBADF` on first use.
             #[allow(unsafe_code)]
             unsafe {
                 Transport::from_raw_fd(*fd)
@@ -144,6 +175,47 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use super::*;
+
+    /// fails if a descriptor number the shepherd cannot have passed is
+    /// accepted. `from_raw_fd` wants a valid owned descriptor and -1 is
+    /// not one, so this is the case the SAFETY comment in `connect` used to
+    /// over-claim about.
+    #[test]
+    fn a_negative_descriptor_is_refused() {
+        match descriptor_from("-1") {
+            Err(ChannelError::Unusable(what)) => assert!(
+                what.contains(&format!("{FD_VAR}=-1")),
+                "the refusal names neither the variable nor the value: {what}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// fails if `SHEP_CHANNEL_FD=1` is accepted. Worse in practice than a
+    /// number that is merely wrong: taking 1 would give this crate
+    /// ownership of the app's stdout, write JSON into it, and close it on
+    /// drop.
+    #[test]
+    fn stdout_is_refused_as_a_descriptor() {
+        match descriptor_from("1") {
+            Err(ChannelError::Unusable(what)) => assert!(
+                what.contains(&format!("{FD_VAR}=1")),
+                "the refusal names neither the variable nor the value: {what}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// fails if the floor is set so high it rejects the descriptor the
+    /// shepherd actually passes, which would make the two refusals above
+    /// pass for the wrong reason.
+    #[test]
+    fn the_descriptor_the_shepherd_passes_is_accepted() {
+        assert!(matches!(
+            descriptor_from(" 3 "),
+            Ok(Endpoint::Descriptor(FIRST_INHERITABLE_FD))
+        ));
+    }
 
     /// The only test in this crate that calls `connect()`. `CHANNEL_TAKEN`
     /// is process-global and tests share one process, so a second test

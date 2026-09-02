@@ -6,6 +6,9 @@
 //! `wait_ready` gate, and a dropped reply costs an operator the whole
 //! `action_timeout`. So metrics are lossy and never block the caller, and
 //! everything else waits for room.
+//!
+//! One queue carries both, so the eviction rule has to hold the same line:
+//! a full queue gives up a metric, never a `Ready` or an `ActionReply`.
 
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -63,12 +66,20 @@ impl Outbox {
 
     /// Queues a message that may be dropped. Never blocks, never fails.
     ///
-    /// On a full queue the oldest waiting message is discarded and counted.
-    /// Oldest rather than newest: a metric's value is a sample, and the
-    /// newer sample is the one worth keeping.
+    /// On a full queue the oldest waiting metric is discarded and counted,
+    /// never a `Ready` or an `ActionReply`. Oldest rather than newest: a
+    /// metric's value is a sample, and the newer sample is the one worth
+    /// keeping. A full queue holding no metric at all has nothing this may
+    /// take, so the incoming message is what gets dropped.
     pub(crate) fn push_lossy(&self, message: ChildMessage) {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.closed {
+            // The sample is genuinely gone, so count it. `dropped()` is the
+            // one number an app reads to judge whether the shepherd is
+            // keeping up, and a counter frozen at whatever it held when the
+            // shepherd went away is a lie told exactly when an app is
+            // trying to find out why its samples stopped arriving.
+            inner.dropped = inner.dropped.saturating_add(1);
             return;
         }
         if self.capacity == 0 {
@@ -79,9 +90,25 @@ impl Outbox {
             return;
         }
         if inner.queue.len() >= self.capacity {
-            // `capacity >= 1` here, so `len >= capacity` means the queue is
-            // non-empty and this always evicts a real message.
-            inner.queue.pop_front();
+            // Scan for a metric rather than taking whatever is at the head.
+            // This queue is shared with `push_blocking`, and the whole point
+            // of the split policy is that a droppable message never
+            // displaces one that is not: a `Ready` evicted here hangs the
+            // operator's `wait_ready` gate with nothing anywhere saying why,
+            // and an `ActionReply` evicted here costs the operator the full
+            // `action_timeout`. The scan is O(n) only on a full queue, over
+            // a discriminant check.
+            let Some(oldest_metric) = inner
+                .queue
+                .iter()
+                .position(|queued| matches!(queued, ChildMessage::Metric { .. }))
+            else {
+                // Nothing in here may be given up, so the incoming metric is
+                // what goes.
+                inner.dropped = inner.dropped.saturating_add(1);
+                return;
+            };
+            inner.queue.remove(oldest_metric);
             inner.dropped = inner.dropped.saturating_add(1);
         }
         inner.queue.push_back(message);
@@ -135,6 +162,15 @@ impl Outbox {
         self.drained.notify_all();
     }
 
+    /// Whether the writer has stopped, which is the shepherd having gone
+    /// away. Nothing is ever queued again once this is true.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed
+    }
+
     /// How many messages `push_lossy` has discarded.
     pub(crate) fn dropped(&self) -> u64 {
         self.inner
@@ -174,6 +210,66 @@ mod tests {
         assert_eq!(outbox.dropped(), 1);
         assert_eq!(outbox.pop(), Some(metric(2.0)));
         assert_eq!(outbox.pop(), Some(metric(3.0)));
+    }
+
+    /// fails if a metric evicts a message that must not be lost. Nothing
+    /// mixed durable and lossy messages in a full queue before 2026-09-02,
+    /// which is the gap an unfiltered `pop_front()` lived in: it took
+    /// whatever sat at the head rather than the oldest metric, so a `Ready`
+    /// queued by `ready()` could be thrown away after that call had returned
+    /// `Ok(())`, hanging the operator's `wait_ready` gate with nothing
+    /// anywhere saying why -- and counting the loss as a dropped metric.
+    #[test]
+    fn a_full_outbox_evicts_a_metric_rather_than_a_readiness_signal() {
+        let outbox = Outbox::new(3);
+        outbox
+            .push_blocking(ChildMessage::Ready)
+            .expect("room for readiness");
+        outbox.push_lossy(metric(1.0));
+        outbox.push_lossy(metric(2.0));
+
+        outbox.push_lossy(metric(3.0));
+
+        assert_eq!(outbox.dropped(), 1);
+        assert_eq!(
+            outbox.pop(),
+            Some(ChildMessage::Ready),
+            "readiness was evicted by a metric"
+        );
+        assert_eq!(outbox.pop(), Some(metric(2.0)));
+        assert_eq!(outbox.pop(), Some(metric(3.0)));
+    }
+
+    /// fails if a full queue holding nothing droppable gives up something
+    /// durable anyway. With no metric to take, the incoming metric is what
+    /// goes: the queue never grows past its bound, and a `Ready` or an
+    /// `ActionReply` already waiting is never the thing that pays for it.
+    #[test]
+    fn a_full_outbox_with_no_metric_to_evict_drops_the_incoming_one() {
+        let reply = ChildMessage::ActionReply {
+            action: "gc".to_string(),
+            body: "ok".to_string(),
+            id: Some(1),
+        };
+        let outbox = Outbox::new(2);
+        outbox
+            .push_blocking(ChildMessage::Ready)
+            .expect("room for readiness");
+        outbox
+            .push_blocking(reply.clone())
+            .expect("room for the reply");
+
+        outbox.push_lossy(metric(1.0));
+
+        assert_eq!(outbox.dropped(), 1);
+        assert_eq!(outbox.pop(), Some(ChildMessage::Ready));
+        assert_eq!(outbox.pop(), Some(reply));
+        outbox.close();
+        assert_eq!(
+            outbox.pop(),
+            None,
+            "the incoming metric was queued past capacity"
+        );
     }
 
     /// fails if `push_blocking` returns while the queue is full. The forcing
@@ -242,15 +338,20 @@ mod tests {
         assert_eq!(outbox.pop(), None);
     }
 
-    /// fails if a lossy push on a closed outbox panics or queues. An app
-    /// emitting metrics past shutdown is ordinary, not an error.
+    /// fails if a lossy push on a closed outbox panics, queues, or goes
+    /// uncounted. An app emitting metrics past shutdown is ordinary, not an
+    /// error -- but the sample really is gone, and `dropped()` is the one
+    /// number an app has to notice that with. This asserted `dropped() == 0`
+    /// until 2026-09-02, which pinned a counter that froze at exactly the
+    /// moment it mattered: once the shepherd goes away every metric is
+    /// discarded and the number an app reads stops moving.
     #[test]
-    fn a_lossy_push_after_close_is_ignored() {
+    fn a_lossy_push_after_close_counts_the_drop_and_queues_nothing() {
         let outbox = Outbox::new(4);
         outbox.close();
         outbox.push_lossy(metric(1.0));
         assert_eq!(outbox.pop(), None);
-        assert_eq!(outbox.dropped(), 0);
+        assert_eq!(outbox.dropped(), 1);
     }
 
     /// fails if a zero-capacity outbox either under-counts the drop or

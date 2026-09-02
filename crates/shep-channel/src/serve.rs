@@ -57,13 +57,23 @@ impl Shepherd {
         }))
     }
 
-    /// Whether this process actually has a channel.
+    /// Whether this process's channel is live right now.
+    ///
+    /// False when the operator never opened one, and false again once the
+    /// shepherd goes away: the spec's shared contract calls this row
+    /// `live?`, and a handle that answered "a channel existed when we
+    /// started" would leave an app watching a frozen
+    /// [`Shepherd::dropped_metrics`] with no way to tell that every
+    /// [`Shepherd::metric`] since is being discarded.
     ///
     /// Branching on this is optional: every method already does nothing
-    /// without one.
+    /// without a channel.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.0.outbox.is_some()
+        self.0
+            .outbox
+            .as_ref()
+            .is_some_and(|outbox| !outbox.is_closed())
     }
 
     /// The `SHEP_CHANNEL_VERSION` stamp, when the shepherd set one.
@@ -341,6 +351,29 @@ mod tests {
         shepherd.ready().expect("an inert ready is not an error");
         assert_eq!(shepherd.dropped_metrics(), 0);
         assert_eq!(shepherd.version(), None);
+    }
+
+    /// fails if `is_active()` keeps saying yes after the shepherd has gone
+    /// away. The spec's shared contract calls this row `live?`, and it
+    /// answered `outbox.is_some()` until 2026-09-02 -- fixed at `serve()`
+    /// time, so it reported "a channel existed when we started" while every
+    /// `metric()` was being discarded and `dropped_metrics()` sat frozen.
+    #[test]
+    fn a_handle_stops_being_active_once_the_channel_closes() {
+        let outbox = Arc::new(Outbox::new(4));
+        let shepherd = Shepherd(Arc::new(Inner {
+            outbox: Some(Arc::clone(&outbox)),
+            dispatch: Arc::new(RwLock::new(Dispatch::default())),
+            version: None,
+        }));
+        assert!(shepherd.is_active(), "a fresh channel should read as live");
+
+        outbox.close();
+
+        assert!(
+            !shepherd.is_active(),
+            "a handle whose shepherd went away still reads as live"
+        );
     }
 
     /// fails if the no-channel advice stops naming all three fields that

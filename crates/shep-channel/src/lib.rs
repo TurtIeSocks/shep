@@ -35,8 +35,9 @@
 //!   longer than that is racing the shepherd's own patience, not just its
 //!   caller's.
 //! - `metric` can drop a sample under backpressure. `ready` and an action
-//!   reply cannot: both are queued with no ceiling, because losing either
-//!   silently is worse than a call that blocks.
+//!   reply cannot: on a full queue they wait for room instead, because
+//!   losing either silently is worse than a call that blocks. The queue is
+//!   bounded for all three; what differs is who gives way.
 //! - A shutdown message with no `on_shutdown` handler registered warns on
 //!   stderr and does nothing else. This crate never stops a process on its
 //!   own judgement; only a handler you registered does.
