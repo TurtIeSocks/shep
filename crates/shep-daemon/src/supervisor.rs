@@ -5431,9 +5431,31 @@ impl<R: ProcessRunner> Actor<R> {
         // this name regardless of status, so any slot left holding a stale
         // config keeps lying to everything that reads it, `shep describe`
         // included.
+        //
+        // The parked config travels the same way, onto the slots this call
+        // created and only those. `spawn_fresh` registers `pending: None`,
+        // and the config it spawned from was read off `slots[0]` -- which is
+        // the config the OLD instances are running, not the one a load has
+        // parked for them. Without this, `shep stock web 5` during a parking
+        // window brings up two instances on superseded config with nothing
+        // recording that a restart is owed, and the next load sees no drift
+        // against them and reports nothing to do. Copied verbatim, so every
+        // instance of the name is owed the same config; the count inside it
+        // is an earlier load's and is left alone for the same reason its
+        // `pending` is.
+        let owed = self.sheep.get(&slots[0].1).and_then(|slot| {
+            let parked = slot.entry.pending.clone()?;
+            Some((parked, slot.entry.pending_reidentifies))
+        });
         for id in survivors.iter().chain(orphaned_by_failed_spawn.iter()) {
             if let Some(slot) = self.sheep.get_mut(id) {
                 slot.entry.spec = stored.clone();
+                if slot.entry.pending.is_none()
+                    && let Some((parked, reidentifies)) = &owed
+                {
+                    slot.entry.pending = Some(parked.clone());
+                    slot.entry.pending_reidentifies = *reidentifies;
+                }
             }
         }
 
@@ -23340,5 +23362,59 @@ mod tests {
             0,
             "an overlap here would put a second instance on the drainee's address"
         );
+    }
+
+    /// fails if a scale-up creates instances that are owed nothing. The new
+    /// instances are spawned from the config the OLD ones are running, read
+    /// off instance 0, and `spawn_fresh` registers no pending slot -- so
+    /// `shep stock web 4` during a parking window would leave two instances
+    /// on superseded config with nothing anywhere saying a restart is due,
+    /// and the next load would see no drift against them and report nothing
+    /// to do.
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_up_carries_the_parked_config_onto_the_instances_it_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 2;
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "instances", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        // The standalone verb, not the count inside a load: `apply_one` parks
+        // onto every slot AFTER its own scale, so only this door can create an
+        // instance nothing has parked for.
+        let (reply, mut answer) = oneshot::channel();
+        actor.handle_scale("web", 4, reply);
+        answer
+            .try_recv()
+            .expect("handle_scale answers before it returns")
+            .expect("the fixture has scripts enough to scale to four");
+
+        for id in [2, 3] {
+            assert_eq!(
+                actor.sheep[&id]
+                    .entry
+                    .pending
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("instance {id} must be owed the parked config"))
+                    .config()
+                    .env
+                    .get("MODE")
+                    .map(String::as_str),
+                Some("blue"),
+                "an instance created during a parking window is owed the same config as its \
+                 siblings"
+            );
+            assert!(
+                actor.sheep[&id].entry.spec.config().env.is_empty(),
+                "and its own spec still describes what it was actually spawned from"
+            );
+        }
     }
 }
