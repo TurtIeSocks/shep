@@ -2904,14 +2904,37 @@ mod tests {
             .unwrap()
             .abort_handle();
 
+        // The prober closure is also the seam that pins ONE PROBER PER
+        // ENTRY. `assemble` bakes `SHEP_INSTANCE` and every `{{instance}}`
+        // template into the environment a prober runs with, so a shared
+        // prober would run every instance's liveness probe against a single
+        // instance's environment. Nothing observes which environment an
+        // `OsProber` ended up holding, but the number of calls and their
+        // order are observable right here.
+        let probed = std::sync::Mutex::new(Vec::new());
         registry.rearm_name(
             "web",
             &[&entry_a, &entry_b],
-            |_| idle_prober(),
+            |entry| {
+                probed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(entry.id);
+                idle_prober()
+            },
             &rig.extras,
             &handle,
         );
         tokio::task::yield_now().await;
+
+        assert_eq!(
+            probed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            [0, 1],
+            "each instance must get its own prober, in id order"
+        );
 
         let group = &registry.groups["web"];
         assert_eq!(

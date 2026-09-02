@@ -2718,11 +2718,14 @@ pub(crate) struct Applied {
     /// afresh, so the config it comes up on is the one a respawn would pick
     /// up anyway.
     ///
-    /// `None` for an app whose merge never produced one -- the three refusals
-    /// above that touch nothing. Recording an invented `ResolvedApp` for an
-    /// app the flock does not have would put a row in the muster roll that
-    /// has never run, which is the one thing `handle_scale`'s write-back
-    /// ordering exists to prevent.
+    /// `None` for an app whose merge never produced one: the three refusals
+    /// above that touch nothing, plus the one case where something WAS
+    /// touched and there is still no honest config to record -- a merge that
+    /// does not normalize at the instance count really running. Recording an
+    /// invented `ResolvedApp`, or one carrying a count that has never run,
+    /// would put exactly that row in the muster roll, which is the thing
+    /// `handle_scale`'s write-back ordering exists to prevent. The refusal
+    /// names which fields went nowhere.
     pub(crate) app: Option<ResolvedApp>,
 }
 
@@ -5602,18 +5605,18 @@ impl<R: ProcessRunner> Actor<R> {
                     .is_some_and(|slot| slot.entry.pending.is_some())
             });
         let parked = if parked_wanted {
-            match with_count(&merged, count) {
-                Some(parked) => Some(parked),
-                None => {
-                    refusals.push(format!(
-                        "the merged config does not hold at {count} instance(s)"
-                    ));
-                    None
-                }
-            }
+            with_count(&merged, count)
         } else {
             None
         };
+        // Nothing could be parked, so nothing may be REPORTED as parked
+        // either, and the previous parked config is left exactly as it is
+        // rather than cleared: it is an earlier load's change and still the
+        // one a respawn should pick up. Reachable through the instance count
+        // alone: a merge based on a parked config of one instance normalizes
+        // against one, and the same config against the two really running can
+        // refuse (a shared explicit `out_file`, say).
+        let parked_failed = parked_wanted && parked.is_none();
 
         // Re-read, and by `get_mut` rather than by index: a scale-up
         // registered ids this app did not have a moment ago, and a scale-down
@@ -5658,22 +5661,54 @@ impl<R: ProcessRunner> Actor<R> {
         let (autostart, later): (Vec<String>, Vec<String>) = next_spawn
             .into_iter()
             .partition(|field| field == "autostart");
+        // What could not be parked, for the refusal below to name. Under
+        // `park_all` that is every field, since nothing reached the running
+        // spec either; otherwise it is the `NeedsRespawn` ones alone, because
+        // a `NextSpawn` field is already ON the stored spec and needs no
+        // parking to reach the next spawn.
+        let unparked: Vec<String> = if !parked_failed {
+            Vec::new()
+        } else if park_all {
+            live.iter()
+                .cloned()
+                .chain(autostart.iter().cloned())
+                .chain(later.iter().cloned())
+                .chain(respawn.iter().cloned())
+                .collect()
+        } else {
+            respawn.clone()
+        };
+        if !unparked.is_empty() {
+            refusals.push(format!(
+                "{} could not be parked for a next spawn: the merged config does not hold at \
+                 {count} instance(s)",
+                unparked.join(", ")
+            ));
+        }
         let (mut applied, mut pending): (Vec<String>, Vec<String>) = if park_all {
             // Nothing reached the running instances at all, so nothing may be
             // reported as applied.
             (
                 Vec::new(),
-                live.iter()
-                    .cloned()
-                    .chain(autostart)
-                    .chain(later)
-                    .chain(respawn)
-                    .collect(),
+                if parked_failed {
+                    Vec::new()
+                } else {
+                    live.iter()
+                        .cloned()
+                        .chain(autostart)
+                        .chain(later)
+                        .chain(respawn)
+                        .collect()
+                },
             )
         } else {
             (
                 live.iter().cloned().chain(autostart).collect(),
-                later.into_iter().chain(respawn).collect(),
+                if parked_failed {
+                    later
+                } else {
+                    later.into_iter().chain(respawn).collect()
+                },
             )
         };
         if instances && count != running.instances {
@@ -5742,9 +5777,22 @@ impl<R: ProcessRunner> Actor<R> {
             })
             .map(|(id, slot)| (*id, &slot.entry))
             .collect();
-        if armable.is_empty() {
-            return;
-        }
+        // No early return on an empty list, and that is the point rather than
+        // an oversight. A name whose instances are ALL momentarily
+        // non-`Online` -- every one of them inside a crash-restart backoff
+        // during a deploy load, which is ordinary -- still has to reach
+        // `rearm_name`, because that is what aborts the group holding the OLD
+        // config. Returning here left a cron worker or a watch running on the
+        // config the load just replaced, reported to the operator as applied,
+        // and it does not heal: `Self::disarm_extras` deliberately leaves a
+        // sheep on its way to `WaitingRestart` armed, so it stays a group
+        // member, nothing ever tears the group down, and `arm` preserves the
+        // live handle when it respawns. The worst shape is `watch = false`: a
+        // load turning a watcher off during a backoff window would leave it
+        // watching forever. `rearm_name` takes an empty slice correctly --
+        // abort the group, rebuild nothing -- and the next `went_online`
+        // builds it from the new spec.
+        //
         // Sorted, so the order the group is rebuilt in does not depend on a
         // `HashMap`'s iteration order.
         armable.sort_unstable_by_key(|(id, _)| *id);
@@ -22193,5 +22241,155 @@ mod tests {
                 "changing {field} left the armed worker on the old value"
             );
         }
+    }
+
+    /// fails if a load leaves a group task running on the config it just
+    /// replaced. A name whose instances are all momentarily non-`Online` --
+    /// every one of them inside a crash-restart backoff, which a deploy load
+    /// walks into routinely -- has nothing to arm, and the tempting early
+    /// return there also skips the TEARDOWN. Nothing heals it afterwards:
+    /// `disarm_extras` deliberately leaves a `WaitingRestart` sheep armed, so
+    /// it stays a group member, the group is never torn down, and `arm`
+    /// preserves the live handle when it respawns. A load turning `watch` off
+    /// during that window would leave the watcher restarting the app forever
+    /// while reporting the field as applied.
+    ///
+    /// Arms FIRST, which is what makes it a test of the teardown.
+    /// `a_load_does_not_arm_a_stopped_instance` cannot catch this: its
+    /// fixture arms nothing, so its assertion holds either way.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_tears_down_a_group_whose_instances_are_all_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+            })],
+        );
+        actor.arm_extras(0);
+        assert_eq!(
+            actor.registry.group_members("web"),
+            Some(vec![0]),
+            "the fixture must really be armed, or this pins nothing"
+        );
+
+        // Mid-backoff: no pid, not online, still registered and still a group
+        // member.
+        let waiting = actor.sheep.get_mut(&0).expect("the fixture registers one");
+        waiting.entry.status = ProcStatus::WaitingRestart;
+        waiting.entry.pid = None;
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.cron_restart = Some("*/5 * * * *".to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "cron_restart"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(reply[0].applied, vec!["cron_restart".to_string()]);
+        assert_eq!(
+            actor.registry.group_members("web"),
+            None,
+            "a worker built from the replaced config survived a load that reported the \
+             field as applied"
+        );
+    }
+
+    /// fails if a load reports a change as parked that it could not park. The
+    /// merge is built on the app's INTENDED config, so it normalizes against
+    /// the count that config carries; the flock can be running a different
+    /// one, and the same config against that count can refuse. The previous
+    /// parked config is left alone (it is an earlier load's change and still
+    /// the one a respawn should pick up), which is exactly why the report
+    /// must not claim this load's fields are in it.
+    #[tokio::test(start_paused = true)]
+    async fn a_change_that_cannot_be_parked_is_not_reported_as_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        // An earlier load parked a one-instance config. Two are running.
+        let earlier = app_with("web", |app| {
+            app.instances = 1;
+            app.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        });
+        for id in [0, 1] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers two")
+                .entry
+                .pending = Some(earlier.clone());
+        }
+
+        // One explicit log path, no `{{instance}}` and no `merge_logs`: legal
+        // for the one instance the parked config declares, refused for the
+        // two really running.
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.out_file = Some("/tmp/web.log".to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "out_file"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert!(
+            !reply[0].pending.contains(&"out_file".to_string()),
+            "a field that went nowhere must not be reported as coming: {reply:?}"
+        );
+        assert!(
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("out_file")),
+            "and the operator must be told which field it was: {reply:?}"
+        );
+        assert_eq!(
+            actor.sheep[&0]
+                .entry
+                .pending
+                .as_ref()
+                .expect("the earlier load's parked config survives")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "the earlier load's parked config must not be cleared"
+        );
+        assert!(
+            reply[0].app.is_none(),
+            "there is no config that holds at the count really running, so nothing may be \
+             recorded: {reply:?}"
+        );
+    }
+
+    /// fails if a merge refusal is unreachable at the DEFAULT depth. The
+    /// sibling case above it reaches one through `instances`, which a plain
+    /// load holds out of the merge entirely, so without this nothing would
+    /// cover the depth every `shep start` actually uses. An app already
+    /// running two instances plus a file declaring one shared explicit
+    /// `out_file` is the reachable shape.
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_load_whose_merge_cannot_normalize_refuses_and_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.out_file = Some("/tmp/web.log".to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "out_file"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert!(reply[0].refused.is_some(), "{reply:?}");
+        assert!(reply[0].applied.is_empty() && reply[0].pending.is_empty());
+        assert!(reply[0].app.is_none());
+        assert!(actor.sheep[&0].entry.spec.config().out_file.is_none());
+        assert!(actor.sheep[&0].entry.pending.is_none());
+        assert_eq!(actor.ids_of_name("web").len(), 2);
     }
 }
