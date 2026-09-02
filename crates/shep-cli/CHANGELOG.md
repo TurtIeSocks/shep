@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-09-02
+
+### Fixed
+
+- Refuse `shep enable` of a name that is neither built-in nor adopted
+
+
 ## [0.1.26] - 2026-09-01
 
 
