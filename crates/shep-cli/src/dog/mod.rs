@@ -423,6 +423,7 @@ mod tests {
             socket,
             barks: home.join("barks.jsonl"),
             kv: home.join("kv.json"),
+            overrides: home.join("overrides.json"),
             home,
         }
     }

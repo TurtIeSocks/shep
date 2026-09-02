@@ -106,6 +106,8 @@ pub struct ShepPaths {
     pub barks: PathBuf,
     /// Key/value store: `kv.json`
     pub kv: PathBuf,
+    /// Operator override store: `overrides.json`
+    pub overrides: PathBuf,
 }
 
 /// FNV-1a, 64-bit, over `bytes`
@@ -177,6 +179,7 @@ impl ShepPaths {
             socket: run.join("shep.sock"),
             barks: home.join("barks.jsonl"),
             kv: home.join("kv.json"),
+            overrides: home.join("overrides.json"),
             run,
             home,
         };
@@ -275,6 +278,7 @@ mod tests {
         assert_eq!(p.run, Path::new("/home/ada/.shep/run"));
         assert_eq!(p.barks, Path::new("/home/ada/.shep/barks.jsonl"));
         assert_eq!(p.kv, Path::new("/home/ada/.shep/kv.json"));
+        assert_eq!(p.overrides, Path::new("/home/ada/.shep/overrides.json"));
     }
 
     /// The one field that is not the same kind of thing on both platforms —

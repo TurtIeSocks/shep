@@ -26,6 +26,7 @@ pub mod kv;
 // One definition of the log-line timestamp for the writer and every reader:
 // the daemon stamps, and three different file readers in shep-cli strip.
 pub mod logstamp;
+pub mod overrides;
 pub mod paths;
 pub mod protocol;
 pub mod selector;
