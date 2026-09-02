@@ -196,6 +196,9 @@ impl Render for FlockRows {
         // JSON only so a consumer that switches on `ProcessInfo` shape
         // alone still sees it, exactly as `dog` above does.
         "handshook",
+        // And its companion, for the same reason and never a value either:
+        // a shepherd gives up on dogs, and this table has none.
+        "dog_stale",
         // No column: the table now groups an app's instances under one
         // header row (`rows_for`) and labels each slot rather than adding a
         // column for it, but JSON stays flat -- one object per process,
@@ -413,6 +416,18 @@ fn reported(p: &ProcessInfo) -> Reported {
         return Reported::Live(p.status);
     }
     Reported::of(p.status, p.handshook)
+}
+
+/// The paragraph one row owes a reader beyond its STATUS cell, or `None`
+/// when the cell says everything there is to say.
+///
+/// A thin join of [`reported`] and
+/// [`crate::vocabulary::silence_note`], here rather than in `output/mod.rs`
+/// so that the `dog`-marker guard [`reported`] documents covers this surface
+/// too — a note is decided by the same function that decides the word it
+/// explains, and the two can never disagree about which rows are silent.
+pub(crate) fn silence_note(p: &ProcessInfo) -> Option<String> {
+    crate::vocabulary::silence_note(&p.name, reported(p), p.dog_stale)
 }
 
 /// The group's status: the shared word when every instance agrees, else a
@@ -1115,6 +1130,17 @@ impl Render for DogRows {
         // word -- `status` alone still reads `online` for a silent dog, and
         // truthfully so.
         "handshook",
+        // Also no column, and for a reason worth stating: it is the ONE
+        // fact about a silent dog the STATUS cell cannot carry, because
+        // both values render as the same word. A column for it would fit
+        // `true`/`false` where the sentence an operator needs runs to a
+        // paragraph, so the table points at `shep describe` (see
+        // `emit_flock`) and the paragraph lives there. It rides the JSON
+        // because a consumer scripting against dogs wants the latch as
+        // data, and it is not derivable from `handshook`: a dog spawned a
+        // moment ago and a dog this shepherd has stopped restarting are
+        // both `handshook: false`.
+        "dog_stale",
         // Always `Some(0)` here: a dog is one process, never stocked to N
         // instances, so the slot the daemon reports is never meaningful.
         // Rides in the JSON only for the same shape-consistency reason as
@@ -1641,6 +1667,9 @@ impl Render for FlushedRows {
         // And `handshook` for the same reason `dog` is: a flush matches
         // sheep, and a sheep has no handshake to report.
         "handshook",
+        // And `dog_stale` for the same reason again: a shepherd gives up
+        // on dogs, and a flush matches sheep.
+        "dog_stale",
         // Always `null` here: only `Describe` walks for lambs, and `flush`
         // is not `Describe`. Same shape-consistency reason as the rest of
         // this list.

@@ -101,6 +101,17 @@ pub struct SheepRow {
     /// however healthy `status` looks. `status` still reads `online` there,
     /// truthfully — it describes the process, not the relationship.
     pub handshook: Option<bool>,
+    /// Whether the shepherd has GIVEN UP on this dog — restarted it once
+    /// for never answering, watched that not help, and stopped restarting
+    /// it; absent for a sheep, which is never given up on.
+    ///
+    /// Not derivable from `handshook`, and that is why it is here. A dog
+    /// spawned a moment ago and a dog the shepherd will never touch again
+    /// are both `handshook: false` with a live process. `true` here says
+    /// nothing more will happen on its own; the reason lives in that dog's
+    /// own log (`shep bleats <name>`), which is the only place the shepherd
+    /// recorded what it actually saw.
+    pub dog_stale: Option<bool>,
 }
 
 /// Where a dog came from. Mirrors `DogSource`'s tagged wire shape exactly.
@@ -167,6 +178,7 @@ impl From<&ProcessInfo> for SheepRow {
             smit: info.smit.clone(),
             instance: info.instance,
             handshook: info.handshook,
+            dog_stale: info.dog_stale,
         }
     }
 }

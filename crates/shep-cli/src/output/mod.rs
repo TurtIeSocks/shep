@@ -433,6 +433,11 @@ pub(crate) fn terminal_width() -> usize {
 /// columns. A flock with no dogs prints exactly what it printed before this
 /// type existed — no caption, no second table.
 ///
+/// Under the dogs table, and only when a dog is silent, [`silence_pointer`]
+/// adds one line naming where that word is explained. A flock whose dogs are
+/// all talking prints nothing extra, which is the same rule the `Dogs`
+/// caption itself follows.
+///
 /// # Errors
 /// The underlying write failed.
 ///
@@ -456,9 +461,55 @@ pub fn emit_flock(
             if dogs.is_empty() {
                 return Ok(());
             }
+            // Read before `DogRows` takes the rows, which is the only
+            // reason it is not read after the table is written.
+            let pointer = silence_pointer(&dogs);
             write!(out, "\nDogs\n")?;
-            write!(out, "{}", table_of(&DogRows(dogs), style))
+            write!(out, "{}", table_of(&DogRows(dogs), style))?;
+            match pointer {
+                None => Ok(()),
+                Some(line) => writeln!(out, "\n{line}"),
+            }
         }
+    }
+}
+
+/// The one line under the dogs table that says where `silent` is explained,
+/// or nothing at all when no dog is silent.
+///
+/// **A pointer and not the explanation.** The explanation runs to a
+/// paragraph per dog (`vocabulary::silence_note`) and this table is the
+/// thing an operator leaves running in a loop — the same argument
+/// `ProcessInfo::lambs` makes for not walking the process tree on every
+/// listing. Three silent dogs would put three paragraphs under a
+/// three-row table on every refresh, which is how a warning stops being
+/// read.
+///
+/// **Outside the table, deliberately.** Nothing here touches a column, a
+/// width or a drop priority: the table is rendered and finished before this
+/// runs, so a long list of names wraps in the terminal rather than
+/// squeezing STATUS off the side of it.
+///
+/// Named rather than counted. "1 dog is silent" would make the operator go
+/// find which, and the names are what they type into the next command.
+fn silence_pointer(dogs: &[ProcessInfo]) -> Option<String> {
+    let silent: Vec<&str> = dogs
+        .iter()
+        .filter(|dog| rows::silence_note(dog).is_some())
+        .map(|dog| dog.name.as_str())
+        .collect();
+    match silent.as_slice() {
+        [] => None,
+        [only] => Some(format!(
+            "`{only}` is silent -- its process is up and it has never answered this shepherd. \
+             Run `shep describe {only}` for what that means and what to do about it."
+        )),
+        many => Some(format!(
+            "these dogs are silent -- their processes are up and they have never answered this \
+             shepherd: {}. Run `shep describe <name>` for what that means and what to do about \
+             it.",
+            many.join(", ")
+        )),
     }
 }
 
@@ -480,6 +531,16 @@ pub fn emit_flock(
 /// A sheep with no lambs, and a sheep whose reply did not walk for any,
 /// both print exactly what `describe` printed before this function
 /// existed: no caption, no second table.
+///
+/// # The silence note
+///
+/// A row whose STATUS reads `silent` also gets a paragraph, between the
+/// table and the lamb trees. This is the per-entity view, so it is where the
+/// long form belongs: `shep flock` points here (see [`silence_pointer`]) and
+/// this is what it points at. [`crate::vocabulary::silence_note`] owns every
+/// word of it, including the part that matters most — whether this shepherd
+/// is still waiting on the dog or has permanently given up on it, which is a
+/// latch no surface reported at all before it was put on the wire.
 ///
 /// # The caption
 ///
@@ -509,6 +570,14 @@ pub fn emit_described(
         Format::Table => {
             let flock = FlockRows(listing);
             write!(out, "{}", table_of(&flock, style))?;
+            // Before the lamb trees, because this explains a cell in the
+            // table directly above it and a lamb table would put a second
+            // table between the two.
+            for sheep in &flock.0 {
+                if let Some(note) = rows::silence_note(sheep) {
+                    writeln!(out, "\n{note}")?;
+                }
+            }
             for sheep in &flock.0 {
                 let Some(lambs) = &sheep.lambs else {
                     continue;
@@ -878,6 +947,205 @@ mod tests {
                 .ends_with("SOURCE"),
             "and this table's own column last"
         );
+    }
+
+    /// A silent dog: process up, and it has never answered this shepherd.
+    /// `given_up` is the latch -- `Some(true)` for a dog the shepherd has
+    /// stopped restarting, `Some(false)` for one it is still waiting on,
+    /// `None` for a shepherd too old to have an opinion.
+    fn silent_dog(name: &str, given_up: Option<bool>) -> ProcessInfo {
+        let mut info = dog_info(name, DogSource::BuiltIn);
+        info.status = ProcStatus::Online;
+        info.handshook = Some(false);
+        info.dog_stale = given_up;
+        info
+    }
+
+    /// fails if `silent` appears in a flock table with nothing to follow it
+    /// to.
+    ///
+    /// The word is right for the cell and wrong on its own: it names a
+    /// relationship rather than a state of the process, and an operator
+    /// cannot act on it from the table. This one line is the whole of the
+    /// fix at this surface -- the paragraph lives in `describe`, and this
+    /// says so by name.
+    #[test]
+    fn a_silent_dog_is_pointed_at_the_view_that_explains_it() {
+        let mut out = Vec::new();
+        emit_flock(
+            &mut out,
+            Format::Table,
+            "flock",
+            vec![sheep_info("web"), silent_dog("log-rotate", Some(true))],
+            Presentation::BARE,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains("silent"), "the cell still says it: {text}");
+        assert!(
+            text.contains("shep describe log-rotate"),
+            "and the pointer names the dog, so it can be typed: {text}"
+        );
+    }
+
+    /// fails if the pointer squeezes into the table rather than sitting
+    /// under it. The dogs table's columns are pinned by
+    /// `a_flock_listing_prints_the_dogs_in_their_own_table`; this pins the
+    /// other half of the same rule -- that adding a consequence for `silent`
+    /// added no column and moved no cell.
+    #[test]
+    fn the_silence_pointer_sits_below_the_table_and_changes_no_column() {
+        // The SAME dog either way, differing only in whether it has
+        // answered. A different dog would widen the NAME column on its own
+        // and the comparison below would be measuring the fixture rather
+        // than the pointer.
+        let silent = vec![sheep_info("web"), silent_dog("log-rotate", Some(true))];
+        let mut talking = silent.clone();
+        talking[1].handshook = Some(true);
+        talking[1].dog_stale = Some(false);
+
+        let render = |listing: Vec<ProcessInfo>| {
+            let mut out = Vec::new();
+            emit_flock(
+                &mut out,
+                Format::Table,
+                "flock",
+                listing,
+                Presentation::BARE,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let with_pointer = render(silent);
+        let header = with_pointer
+            .split_once("\nDogs\n")
+            .expect("a Dogs caption")
+            .1
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            header,
+            render(talking)
+                .split_once("\nDogs\n")
+                .expect("a Dogs caption")
+                .1
+                .lines()
+                .next()
+                .unwrap(),
+            "the pointer is prose under the table, never a column in it"
+        );
+        assert!(
+            with_pointer.trim_end().ends_with("what to do about it."),
+            "and it comes last, after the table it annotates: {with_pointer}"
+        );
+    }
+
+    /// fails if a flock whose dogs are all talking grows a line about
+    /// silence. The same rule the `Dogs` caption itself follows: a listing
+    /// with nothing to report prints exactly what it printed before this
+    /// existed.
+    #[test]
+    fn a_flock_with_no_silent_dog_says_nothing_about_silence() {
+        let mut out = Vec::new();
+        let mut talking = dog_info("bark", DogSource::BuiltIn);
+        talking.handshook = Some(true);
+        talking.dog_stale = Some(false);
+        emit_flock(
+            &mut out,
+            Format::Table,
+            "flock",
+            vec![sheep_info("web"), talking],
+            Presentation::BARE,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("silent"), "{text}");
+        assert!(!text.contains("shep describe"), "{text}");
+    }
+
+    /// fails if `describe` reports a dog the shepherd has given up on the
+    /// same way it reports one it is still waiting for.
+    ///
+    /// This is the whole point of the per-entity view. Both rows read
+    /// `silent` in every table shep prints; the difference between them is
+    /// whether anything further is going to happen, and until `dog_stale`
+    /// reached the wire no surface said. The give-up arm must also NOT name
+    /// a cause -- the shepherd wrote what it actually saw into the dog's own
+    /// log, and inventing a second account here is the exact bug this phase
+    /// was opened for.
+    #[test]
+    fn describe_says_whether_the_shepherd_has_given_up_on_a_silent_dog() {
+        let render = |info: ProcessInfo| {
+            let mut out = Vec::new();
+            emit_described(
+                &mut out,
+                Format::Table,
+                "describe",
+                vec![info],
+                Presentation::BARE,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let waiting = render(silent_dog("log-rotate", Some(false)));
+        assert!(
+            waiting.contains("restarts a dog once"),
+            "a dog still inside its budget is told what happens next: {waiting}"
+        );
+        assert!(
+            !waiting.contains("GIVEN UP"),
+            "and nothing has been given up on yet: {waiting}"
+        );
+
+        let given_up = render(silent_dog("log-rotate", Some(true)));
+        assert!(
+            given_up.contains("GIVEN UP"),
+            "the latch is the thing no other surface reports: {given_up}"
+        );
+        assert!(
+            given_up.contains("shep bleats log-rotate"),
+            "and it sends the reader to the log that holds the evidence: {given_up}"
+        );
+        assert!(
+            !given_up.contains("rebuild or reinstall it and run"),
+            "it must not restate the daemon's verdict, which it cannot know: {given_up}"
+        );
+
+        let unknown = render(silent_dog("log-rotate", None));
+        assert!(
+            unknown.contains("too old to say"),
+            "an older shepherd's silence about the latch is reported, not guessed: {unknown}"
+        );
+    }
+
+    /// fails if a sheep, or a dog that is talking, picks up a paragraph it
+    /// has no use for. `describe` is the verb an operator runs on one
+    /// healthy sheep constantly, and a note under every one of those would
+    /// be the surest way to stop the note being read.
+    #[test]
+    fn describe_says_nothing_extra_about_a_row_that_is_not_silent() {
+        let mut talking = dog_info("bark", DogSource::BuiltIn);
+        talking.handshook = Some(true);
+        talking.dog_stale = Some(false);
+
+        for info in [sheep_info("web"), talking] {
+            let mut out = Vec::new();
+            emit_described(
+                &mut out,
+                Format::Table,
+                "describe",
+                vec![info],
+                Presentation::BARE,
+            )
+            .unwrap();
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(!rendered.contains("never answered"), "{rendered}");
+        }
     }
 
     /// fails if the JSON surface is split to match the tables. The machine

@@ -170,6 +170,79 @@ impl Reported {
     }
 }
 
+/// The paragraph a `silent` row owes the reader, or `None` when the row is
+/// not silent.
+///
+/// # Why the word alone was not enough
+///
+/// [`Reported::Silent`] renders one word, and one word is right for a table
+/// cell. But `silent` is the only STATUS a table can show that an operator
+/// cannot act on from the word: `errored` says a process failed, `stopped`
+/// says it is not running, and both point at themselves. `silent` names a
+/// relationship, and worse, it names one the shepherd may already have GIVEN
+/// UP on — a latch that lived entirely inside the daemon and that no surface
+/// reported at all. A dog silent for three seconds and a dog this shepherd
+/// will never restart again printed the same five letters.
+///
+/// So the table keeps the word and this supplies the consequence, in the
+/// per-entity view where there is room for it.
+///
+/// # What it deliberately does NOT say
+///
+/// Why the dog is silent. This shepherd knows three different reasons and
+/// distinguishes them from peer credentials it can only read at the moment
+/// of the give-up — `shep-daemon`'s `dogs::stale_verdict` writes that
+/// finding into the dog's own log, and it is the only place the evidence
+/// exists. A listing has none of it. Every arm therefore ends by pointing at
+/// `shep bleats`, and none of them guesses: the bug this whole phase traces
+/// to was a shepherd asserting a cause it never observed, and a second
+/// surface inventing one would be the same defect wearing the fix's clothes.
+pub(crate) fn silence_note(
+    name: &str,
+    reported: Reported,
+    dog_stale: Option<bool>,
+) -> Option<String> {
+    if reported != Reported::Silent {
+        return None;
+    }
+    let budget = shep_daemon::dogs::DOG_SILENCE_BUDGET.as_secs();
+    Some(match dog_stale {
+        // The ordinary case, and usually a transient one: the dog was
+        // spawned recently and has not dialled back. Said in the future
+        // tense, because nothing has gone wrong yet and a sentence that
+        // sounded like a fault would train an operator to ignore the one
+        // below.
+        Some(false) => format!(
+            "silent  `{name}`'s process is up and it has never answered this shepherd. \
+             After {budget}s of that, shep restarts a dog once from the binary on disk; if \
+             the restarted dog stays silent shep gives up and says so here. \
+             `shep bleats {name}` shows what the dog itself says about connecting."
+        ),
+        // The latch. Loud about the give-up, because this is the state that
+        // ran for two days in production with every surface reporting it as
+        // an unremarkable `online`.
+        Some(true) => format!(
+            "silent  `{name}`'s process is up, it has never answered this shepherd, and this \
+             shepherd has GIVEN UP on it: the one restart it earned did not help, so it will \
+             not be restarted again and nothing more will happen on its own. shep wrote what \
+             it saw at that moment into this dog's own log -- run \
+             `shep bleats {name}` and read it, because that line says whether the dog cannot \
+             reach shep at all or reaches it without naming itself, and only one of those two \
+             is fixed by reinstalling."
+        ),
+        // A shepherd that predates the field. Says so rather than picking
+        // either arm above: guessing "still waiting" would hide a live
+        // incident, and guessing "given up" would invent one.
+        None => format!(
+            "silent  `{name}`'s process is up and it has never answered this shepherd. The \
+             shepherd answering this listing is too old to say whether it has given up on the \
+             dog or is still waiting for it -- run `shep bleats {name}` for the dog's own \
+             account, and `shep daemon reload` to bring the running shepherd up to the shep \
+             that is installed, which can answer."
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +320,88 @@ mod tests {
             Reported::Live(ProcStatus::Online).word(),
             ProcStatus::Online.to_string(),
             "a live row still spells its status exactly as the wire does"
+        );
+    }
+
+    /// fails if a row that is not silent picks up a paragraph explaining a
+    /// word it does not show. Every `ProcStatus` reads honestly on its own
+    /// (`Reported::of`'s own doc says why), so a note under one of those
+    /// would be an explanation of nothing.
+    #[test]
+    fn only_a_silent_row_gets_a_note() {
+        for status in [
+            ProcStatus::Online,
+            ProcStatus::Starting,
+            ProcStatus::WaitingRestart,
+            ProcStatus::Stopping,
+            ProcStatus::Stopped,
+            ProcStatus::Errored,
+        ] {
+            // Every latch value, because a live row must stay quiet
+            // regardless of what the shepherd reports about dogs.
+            for stale in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    silence_note("web", Reported::Live(status), stale),
+                    None,
+                    "status={status:?} dog_stale={stale:?}"
+                );
+            }
+        }
+        assert!(silence_note("log-rotate", Reported::Silent, Some(false)).is_some());
+    }
+
+    /// fails if the three latch states collapse into one sentence.
+    ///
+    /// They are three different situations with three different next steps,
+    /// and the production incident behind this phase was one message serving
+    /// three cases and asserting the harshest -- the same failure
+    /// `shep-daemon`'s `dogs::stale_verdict` was rewritten to stop making.
+    /// The three notes must differ, every one must name the dog, and every
+    /// one must end somewhere the reader can go.
+    #[test]
+    fn the_three_silences_read_differently_and_all_lead_somewhere() {
+        let notes: Vec<String> = [None, Some(false), Some(true)]
+            .into_iter()
+            .map(|stale| silence_note("log-rotate", Reported::Silent, stale).expect("a silent row"))
+            .collect();
+
+        for note in &notes {
+            assert!(note.contains("log-rotate"), "names the dog: {note}");
+            assert!(
+                note.contains("shep bleats log-rotate"),
+                "and sends the reader to the one file that holds the evidence: {note}"
+            );
+            assert!(
+                note.starts_with("silent"),
+                "labelled with the word it explains: {note}"
+            );
+        }
+
+        let mut distinct = notes.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            notes.len(),
+            "three states, three sentences: {notes:?}"
+        );
+    }
+
+    /// fails if the give-up stops being the loud part.
+    ///
+    /// `Some(true)` is the state that ran for two days in production while
+    /// every surface reported an unremarkable `online`. It has to say the
+    /// shepherd has stopped, that nothing further will happen, and -- the
+    /// part that cost the two days -- that reinstalling is not automatically
+    /// the answer.
+    #[test]
+    fn the_given_up_note_says_the_shepherd_has_stopped_trying() {
+        let note = silence_note("log-rotate", Reported::Silent, Some(true)).expect("a silent row");
+        assert!(note.contains("GIVEN UP"), "{note}");
+        assert!(note.contains("will not be restarted again"), "{note}");
+        assert!(
+            note.contains("only one of those two is fixed by reinstalling"),
+            "{note}"
         );
     }
 

@@ -189,18 +189,37 @@ Dogs
       grazing one.
     </p>
     <p>
-      The usual cause is a version skew: <code>cargo install</code> replaced
-      the binary on disk and the process still running is the old one. Read
-      <code>shep bleats &lt;dog&gt;</code> for the refusal, then
-      <code>shep restart &lt;dog&gt;</code>.
+      What to do about it does not fit in a cell, so the table points at
+      where it lives. One line under the dogs table names every silent dog,
+      and <code>shep describe &lt;dog&gt;</code> carries the long form.
+    </p>
+    <p>
+      What that adds is whether the shepherd has given up. A dog silent past
+      five seconds is restarted once from the binary on disk; if the
+      restarted dog stays silent, the shepherd stops and never restarts it
+      again. Nothing on the row changes when that happens — it still reads
+      <code>silent</code>, because the process is still up and still has not
+      answered — so <code>shep describe</code> is the only place that says
+      so.
+    </p>
+    <p>
+      Both of them send you to <code>shep bleats &lt;dog&gt;</code>, and that
+      is deliberate. The shepherd writes what it actually saw into the dog's
+      own log at the moment it gives up, and the fix follows from that. A
+      version skew is one cause: <code>cargo install</code> replaced the
+      binary on disk and the process still running is the old one, so a
+      reinstall and a <code>shep restart &lt;dog&gt;</code> fixes it. A dog
+      that reaches the shepherd on every connection and never names itself in
+      its handshake is another, and reinstalling the same build does nothing
+      at all for that one.
     </p>
     <p class="fine">
       Only <code>online</code> is replaced. <code>starting</code> already
       says the connection is not up yet, and a dog is silent for a moment
-      every time it starts. <code>--format json</code> carries the fact as
-      <code>handshook</code>, beside a <code>status</code> that still reads
-      <code>online</code> — true of the process, which is what that field
-      has always described.
+      every time it starts. <code>--format json</code> carries both facts as
+      <code>handshook</code> and <code>dog_stale</code>, beside a
+      <code>status</code> that still reads <code>online</code> — true of the
+      process, which is what that field has always described.
     </p>
 
     <h3 id="source-says-whose-code-is-running">SOURCE says whose code is running</h3>

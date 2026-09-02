@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `silent` leads somewhere. `shep flock` prints one line under the dogs table
+  naming every silent dog, and `shep describe <dog>` carries the long form:
+  whether the shepherd is still waiting on that dog or has given up on it,
+  and which command answers the rest. The give-up had no surface at all
+  before — an operator could watch a dog read `silent` forever with nothing
+  telling them shep had stopped trying. Neither addition touches a column:
+  the pointer is prose under the finished table. `--format json` carries
+  `dog_stale` on every dog row.
+
 ### Fixed
 
 - `shep bleats --no-follow` and `shep lookout`'s tail pane strip the daemon's
