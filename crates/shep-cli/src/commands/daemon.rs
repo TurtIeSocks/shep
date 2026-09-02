@@ -589,6 +589,21 @@ async fn reload_with_wait(
     guard: crate::VersionGuard,
     wait: std::time::Duration,
 ) -> ExitCode {
+    // Before the connection, and before either arm below. The handover arm
+    // execs a successor that re-reads this same file through
+    // `boot_supervisor`; a value that fails to load there exits the
+    // successor with the predecessor already gone, leaving the flock
+    // running with nothing supervising it. `toml_edit` already keeps
+    // `ShepToml::edit` from writing a file that will not PARSE, so the gap
+    // this closes is a valid TOML, invalid VALUE file. `whistle` runs the
+    // same check for the same reason (`whistle::mod::whistle`).
+    if let Err(err) = read_daemon_config_source(paths).and_then(|source| {
+        DaemonConfig::load(source.as_deref(), &|key| std::env::var(key).ok())
+            .map_err(DaemonRunError::from)
+    }) {
+        return streams.fail(daemon_exit_code(&err), &err.to_string());
+    }
+
     // Connected to ask who is there, and, on the handover arm, whether
     // this flock can be carried. Dropped before anything is signalled: this
     // connection is to the process about to be replaced.
@@ -1684,6 +1699,45 @@ otel = "/usr/local/bin/shep-otel"
         let text = String::from_utf8(err).unwrap();
         assert!(text.contains("no shepherd"), "{text}");
     }
+
+    /// Fails if `reload` signals anything on a `shep.toml` that will not
+    /// load. The successor execs into a fresh `boot_supervisor`, so a bad
+    /// value there exits the daemon AFTER the predecessor is gone, leaving a
+    /// running flock with no shepherd. The value below is valid TOML and an
+    /// invalid level, exactly the gap `toml_edit`'s own parse check cannot
+    /// close.
+    ///
+    /// No daemon runs in this test, so without the pre-flight `reload`
+    /// reaches `Client::connect`, fails, and returns `DaemonUnreachable`
+    /// instead of `InvalidConfig` -- see this task's own report for the
+    /// failure observed before the pre-flight was added.
+    #[tokio::test]
+    async fn reload_refuses_a_shep_toml_that_will_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        std::fs::create_dir_all(paths.daemon_config.parent().unwrap()).unwrap();
+        std::fs::write(&paths.daemon_config, "[daemon]\nlog_level = \"verbose\"\n").unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            reload(&mut streams, &paths, VersionGuard::Exempt).await
+        };
+
+        assert_eq!(code, ExitCode::InvalidConfig);
+        let rendered = String::from_utf8(err).unwrap();
+        assert!(
+            rendered.contains("verbose"),
+            "the refusal must name the bad value: {rendered}"
+        );
+    }
+
     /// A handshake that names a version at or past [`HANDOVER_SINCE`] is the
     /// only thing that selects the handover.
     #[cfg(unix)]

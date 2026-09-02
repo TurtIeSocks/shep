@@ -7466,6 +7466,71 @@ fn a_sheep_keeps_its_pid_and_its_log_across_a_daemon_reload() {
     graceful_kill(dir.path());
 }
 
+/// Fails if a bad `shep.toml` can orphan a running flock.
+///
+/// Writes a value that parses as TOML and not as config, runs `shep daemon
+/// reload`, then asserts the flock is still supervised: the refusal must
+/// happen before anything is signalled, on both the handover arm and the
+/// stop-and-start arm, so this case carries no `#[cfg(unix)]` -- the
+/// pre-flight in `reload_with_wait` runs before the arm is even chosen.
+#[test]
+fn a_bad_shep_toml_refuses_the_reload_and_leaves_the_flock_supervised() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
+
+    write_shep_toml(&dir, "[daemon]\nmax_cron_sleep = \"soon\"\n");
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_eq!(
+        reloaded.status.code(),
+        Some(4),
+        "InvalidConfig; stderr={}",
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+
+    let after = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("flock")
+        .output()
+        .unwrap();
+    assert_success(&after);
+    let envelope: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    let sheep = &envelope["data"][0];
+    assert_eq!(sheep["status"], "online", "still supervised: {sheep}");
+    assert_eq!(
+        sheep["pid"].as_u64(),
+        Some(pid_before),
+        "the refusal must happen before anything is signalled: {sheep}"
+    );
+
+    graceful_kill(dir.path());
+}
+
 /// A script that says which slot it is and which process it is, on every
 /// line.
 ///
