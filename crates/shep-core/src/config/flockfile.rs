@@ -261,8 +261,8 @@ impl Flockfile {
     /// Parses `text` and reports, per app, which keys the document wrote.
     ///
     /// Runs the exact same per-format parse and validation [`Flockfile::parse`]
-    /// does — so a document that `parse` accepts or refuses is accepted or
-    /// refused here for the same reason — then separately deserializes the
+    /// does, so a document that `parse` accepts or refuses is accepted or
+    /// refused here for the same reason, then separately deserializes the
     /// same source into a [`serde_json::Value`] and reads each app table's
     /// keys off it. `AppConfig`'s `#[serde(default)]` erases which keys a
     /// document actually named, which is exactly the information the value
@@ -980,8 +980,32 @@ env = { DB_HOST = "", NODE_ENV = "production" }
     /// intermediate was bypassed for a format.
     #[test]
     fn declared_survives_every_parse_format() {
-        let json = r#"{"app":[{"name":"web","script":"./srv","autorestart":true}]}"#;
-        let apps = Flockfile::parse_declared(json, FlockFormat::Json).unwrap();
-        assert!(apps[0].declared.contains("autorestart"));
+        let cases: [(FlockFormat, &str); 4] = [
+            (
+                FlockFormat::Toml,
+                "[[app]]\nname = \"web\"\nscript = \"./srv\"\nautorestart = true\n",
+            ),
+            (
+                FlockFormat::Yaml,
+                "app:\n  - name: web\n    script: ./srv\n    autorestart: true\n",
+            ),
+            (
+                FlockFormat::Json,
+                r#"{"app":[{"name":"web","script":"./srv","autorestart":true}]}"#,
+            ),
+            (
+                FlockFormat::Json5,
+                "{ app: [{ name: \"web\", script: \"./srv\", autorestart: true }] }",
+            ),
+        ];
+        for (format, text) in cases {
+            let apps = Flockfile::parse_declared(text, format)
+                .unwrap_or_else(|e| panic!("{format:?} failed to parse: {e}"));
+            assert!(
+                apps[0].declared.contains("autorestart"),
+                "{format:?}: declared {:?}",
+                apps[0].declared
+            );
+        }
     }
 }
