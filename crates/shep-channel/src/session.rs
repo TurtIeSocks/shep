@@ -16,6 +16,9 @@ pub(crate) fn read_message<R: BufRead>(
     if reader.read_line(&mut line).map_err(ChannelError::Io)? == 0 {
         return Ok(None);
     }
+    // Belt and braces, not load-bearing: serde_json already skips a
+    // trailing `\r`/`\n` as JSON whitespace before parsing. Kept explicit
+    // so a bare line does not quietly depend on that.
     let trimmed = line.trim_end_matches(['\n', '\r']);
     serde_json::from_str(trimmed)
         .map(Some)
@@ -60,8 +63,13 @@ mod tests {
         assert_eq!(read_message(&mut reader).unwrap(), None);
     }
 
-    /// fails if a `\r\n` line ending reaches serde. The Windows transport is
-    /// a byte-mode pipe and an app on the far side may well write one.
+    /// pins that a `\r\n`-terminated line still parses -- the Windows
+    /// transport is a byte-mode pipe and an app on the far side may well
+    /// write one. Doesn't guard `trim_end_matches` in `read_message` above:
+    /// serde_json already treats a trailing `\r`/`\n` as JSON whitespace,
+    /// so removing that call would not fail this test. What it would catch
+    /// is a parser swap, or framing that stops handing whole lines to the
+    /// decoder.
     #[test]
     fn a_carriage_return_before_the_newline_is_tolerated() {
         let mut reader = Cursor::new("{\"kind\":\"shutdown\"}\r\n".as_bytes());
