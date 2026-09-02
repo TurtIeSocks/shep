@@ -5,9 +5,18 @@
 //! that has no idea what it was asked are both silence, and only
 //! `action_timeout` running out tells them apart. An app author can forget
 //! that. This module cannot.
+//!
+//! Looking a handler up and running it are two different steps
+//! ([`Dispatch::resolve`] and [`run`]), on purpose: `resolve` is the only
+//! part that touches the registry, so the reader can drop its lock before
+//! `run` calls into app code. Without that split, a handler that registers
+//! a handler -- the obvious shape of a `reload` action swapping its own
+//! handlers -- would try to take the write lock `resolve` is still holding,
+//! on the same thread, and deadlock.
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 use crate::{ChildMessage, ShepherdMessage};
 
@@ -17,6 +26,16 @@ pub type ActionHandler = Box<dyn Fn(Option<&str>, &str) -> String + Send + Sync 
 
 /// What a shutdown handler is.
 pub type ShutdownHandler = Box<dyn Fn() + Send + Sync + 'static>;
+
+/// The registry's own storage for an action handler: an `Arc` rather than
+/// the `Box` callers register with, so [`Dispatch::resolve`] can clone a
+/// handle out to the caller and release the registry's lock before the
+/// handler runs. Not part of the public API -- `ActionHandler` stays a
+/// `Box`, and `register_action` converts on the way in.
+type ActionFn = dyn Fn(Option<&str>, &str) -> String + Send + Sync;
+
+/// The shutdown-handler equivalent of [`ActionFn`].
+type ShutdownFn = dyn Fn() + Send + Sync;
 
 /// What handling one message produced.
 #[derive(Debug)]
@@ -32,11 +51,40 @@ pub(crate) enum Outcome {
     ShutdownFailed(String),
 }
 
+/// What resolving one message against the registry found, before anything
+/// has run. Carries an owned handle to whatever handler applies (or the
+/// context to build a reply without one), so the registry's lock is free by
+/// the time [`run`] calls into it.
+pub(crate) enum Resolved {
+    /// A registered action's handler, ready to call.
+    Action {
+        /// The handler to run.
+        handler: Arc<ActionFn>,
+        /// The action's own name, echoed into the reply.
+        name: String,
+        /// The action's argument text, if the trigger carried any.
+        params: Option<String>,
+        /// This action's correlation id, echoed into the reply.
+        id: u64,
+    },
+    /// No handler is registered under this action name.
+    UnknownAction {
+        /// The action's own name, echoed into the reply.
+        name: String,
+        /// This action's correlation id, echoed into the reply.
+        id: u64,
+    },
+    /// A registered shutdown handler, ready to call.
+    Shutdown(Arc<ShutdownFn>),
+    /// A shutdown with no handler registered.
+    UnhandledShutdown,
+}
+
 /// The registered handlers.
 #[derive(Default)]
 pub(crate) struct Dispatch {
-    actions: HashMap<String, ActionHandler>,
-    shutdown: Option<ShutdownHandler>,
+    actions: HashMap<String, Arc<ActionFn>>,
+    shutdown: Option<Arc<ShutdownFn>>,
 }
 
 // Hand-written because a boxed closure is not `Debug` and the workspace
@@ -55,41 +103,76 @@ impl core::fmt::Debug for Dispatch {
 
 impl Dispatch {
     pub(crate) fn register_action(&mut self, name: String, handler: ActionHandler) {
-        self.actions.insert(name, handler);
+        self.actions.insert(name, Arc::from(handler));
     }
 
     pub(crate) fn register_shutdown(&mut self, handler: ShutdownHandler) {
-        self.shutdown = Some(handler);
+        self.shutdown = Some(Arc::from(handler));
     }
 
-    pub(crate) fn handle(&self, message: ShepherdMessage) -> Outcome {
+    /// Looks a message up against the registry and clones out whatever it
+    /// finds. The only step that touches `self` -- see the module doc for
+    /// why that split matters.
+    pub(crate) fn resolve(&self, message: ShepherdMessage) -> Resolved {
         match message {
             ShepherdMessage::Shutdown => match &self.shutdown {
-                Some(handler) => match catch_unwind(AssertUnwindSafe(handler)) {
-                    Ok(()) => Outcome::Handled,
-                    Err(payload) => Outcome::ShutdownFailed(panic_text(&*payload)),
-                },
-                None => Outcome::UnhandledShutdown,
+                Some(handler) => Resolved::Shutdown(Arc::clone(handler)),
+                None => Resolved::UnhandledShutdown,
             },
-            ShepherdMessage::Action { name, params, id } => {
-                let body = match self.actions.get(&name) {
-                    Some(handler) => {
-                        match catch_unwind(AssertUnwindSafe(|| handler(params.as_deref(), &name))) {
-                            Ok(body) => body,
-                            Err(payload) => {
-                                format!("action handler failed: {}", panic_text(&*payload))
-                            }
-                        }
-                    }
-                    None => format!("unknown action: {name}"),
-                };
-                Outcome::Reply(ChildMessage::ActionReply {
-                    action: name,
-                    body,
-                    id: Some(id),
-                })
-            }
+            ShepherdMessage::Action { name, params, id } => match self.actions.get(&name) {
+                Some(handler) => Resolved::Action {
+                    handler: Arc::clone(handler),
+                    name,
+                    params,
+                    id,
+                },
+                None => Resolved::UnknownAction { name, id },
+            },
         }
+    }
+
+    // Test-only now: `reader_loop` in `serve.rs` calls `resolve` and `run`
+    // separately so it can drop the registry's lock between them (Finding
+    // B). Kept as one call for the test suite below, which exercises
+    // `resolve`+`run` together the same way `reader_loop` does, just
+    // without a lock in between to drop.
+    #[cfg(test)]
+    pub(crate) fn handle(&self, message: ShepherdMessage) -> Outcome {
+        run(self.resolve(message))
+    }
+}
+
+/// Runs a resolved message and builds the reply, catching any panic from
+/// app code. Takes no lock: whatever produced `resolved` already released
+/// the registry before calling this.
+pub(crate) fn run(resolved: Resolved) -> Outcome {
+    match resolved {
+        Resolved::Action {
+            handler,
+            name,
+            params,
+            id,
+        } => {
+            let body = match catch_unwind(AssertUnwindSafe(|| handler(params.as_deref(), &name))) {
+                Ok(body) => body,
+                Err(payload) => format!("action handler failed: {}", panic_text(&*payload)),
+            };
+            Outcome::Reply(ChildMessage::ActionReply {
+                action: name,
+                body,
+                id: Some(id),
+            })
+        }
+        Resolved::UnknownAction { name, id } => Outcome::Reply(ChildMessage::ActionReply {
+            body: format!("unknown action: {name}"),
+            action: name,
+            id: Some(id),
+        }),
+        Resolved::Shutdown(handler) => match catch_unwind(AssertUnwindSafe(handler.as_ref())) {
+            Ok(()) => Outcome::Handled,
+            Err(payload) => Outcome::ShutdownFailed(panic_text(&*payload)),
+        },
+        Resolved::UnhandledShutdown => Outcome::UnhandledShutdown,
     }
 }
 
