@@ -1753,61 +1753,6 @@ otel = "/usr/local/bin/shep-otel"
         );
     }
 
-    /// Pins the ruling behind the file-only pre-flight: it must not layer
-    /// this process's environment over the file, because a handover
-    /// successor execs with the OLD daemon's argv and env, not this reload
-    /// invocation's. Layering here could refuse in one direction only if
-    /// that were the whole story -- but the divergence runs both ways, and
-    /// the dangerous direction is the one that lets a bad file through: a
-    /// value only valid because of an env var or flag this CLI process
-    /// happens to see, and the daemon being replaced never did, would load
-    /// clean here and still exit the successor after the predecessor is
-    /// gone. `reload`'s pre-flight cannot be handed a mock environment
-    /// directly (it hardcodes `&|_| None`, on purpose), so this proves the
-    /// premise against the same file with [`DaemonConfig::load`] and a real
-    /// env closure first, then proves `reload` itself still refuses it.
-    ///
-    /// `max_cron_sleep` is the field this needs: `log_level`/`log_json`
-    /// values fail at `toml::from_str` itself, before any layer runs, so no
-    /// env override could ever reach them. A duration below
-    /// `MIN_CRON_SLEEP` is syntactically valid and fails only at
-    /// `DaemonConfig`'s own validation pass, after env has already had a
-    /// chance to overwrite it -- see `load_layered`'s own comment on why
-    /// `SHEP_MAX_CRON_SLEEP` can rescue a broken file.
-    #[tokio::test]
-    async fn reload_refuses_a_shep_toml_an_env_var_would_have_rescued() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = ShepPaths::resolve(&|_| None, dir.path());
-        std::fs::create_dir_all(paths.daemon_config.parent().unwrap()).unwrap();
-        let src = "[daemon]\nmax_cron_sleep = \"500ms\"\n";
-        std::fs::write(&paths.daemon_config, src).unwrap();
-
-        assert!(
-            DaemonConfig::load(Some(src), &|key| (key == "SHEP_MAX_CRON_SLEEP")
-                .then(|| "5s".to_string()))
-            .is_ok(),
-            "the premise of this test is that a real env layer rescues this file"
-        );
-
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let code = {
-            let mut streams = Streams {
-                out: &mut out,
-                err: &mut err,
-                style: crate::style::Presentation::BARE,
-                fmt: Format::Table,
-            };
-            reload(&mut streams, &paths, VersionGuard::Exempt).await
-        };
-
-        assert_eq!(
-            code,
-            ExitCode::InvalidConfig,
-            "the file-only pre-flight must refuse a value only an env layer could rescue"
-        );
-    }
-
     /// A handshake that names a version at or past [`HANDOVER_SINCE`] is the
     /// only thing that selects the handover.
     #[cfg(unix)]

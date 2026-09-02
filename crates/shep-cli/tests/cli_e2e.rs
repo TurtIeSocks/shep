@@ -7531,6 +7531,88 @@ fn a_bad_shep_toml_refuses_the_reload_and_leaves_the_flock_supervised() {
     graceful_kill(dir.path());
 }
 
+/// Pins the ruling behind the file-only pre-flight: an env var set on the
+/// `shep daemon reload` invocation itself must not rescue a file that is
+/// invalid on its own, because a handover successor execs with the OLD
+/// daemon's argv and environment, not this CLI invocation's. The daemon
+/// here is started with no `SHEP_MAX_CRON_SLEEP` at all, so a pre-flight
+/// that layered THIS process's environment would see the reload command's
+/// own `SHEP_MAX_CRON_SLEEP`, load clean, and let a handover proceed into a
+/// successor that never had that variable and still fails.
+///
+/// `max_cron_sleep` is the field this needs: a value below `MIN_CRON_SLEEP`
+/// is syntactically valid TOML and fails only at `DaemonConfig`'s own
+/// validation pass, which is exactly the shape `SHEP_MAX_CRON_SLEEP` is
+/// documented to rescue under `file < env < flags` -- so this is a genuine
+/// rescue case, not a value nothing could ever save.
+///
+/// This is the test that actually exercises `Command::env` on a real child
+/// process: mutating the CURRENT process's environment is `unsafe` in
+/// edition 2024 and this crate forbids unsafe code outright, but setting
+/// environment on a child through `Command::env` is not, and is exactly
+/// what the pre-flight's own risk is about (a value only this invocation's
+/// environment, not the running daemon's, ever saw).
+#[test]
+fn a_bad_shep_toml_an_env_var_would_rescue_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
+
+    // Below MIN_CRON_SLEEP (1s): syntactically valid, refused only at
+    // DaemonConfig's own validation pass.
+    write_shep_toml(&dir, "[daemon]\nmax_cron_sleep = \"500ms\"\n");
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .env("SHEP_MAX_CRON_SLEEP", "5s")
+        .output()
+        .unwrap();
+    assert_eq!(
+        reloaded.status.code(),
+        Some(4),
+        "InvalidConfig, the env var on this invocation must not rescue a file the          daemon being replaced never saw it against; stderr={}",
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+
+    let after = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("flock")
+        .output()
+        .unwrap();
+    assert_success(&after);
+    let envelope: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    let sheep = &envelope["data"][0];
+    assert_eq!(sheep["status"], "online", "still supervised: {sheep}");
+    assert_eq!(
+        sheep["pid"].as_u64(),
+        Some(pid_before),
+        "the refusal must happen before anything is signalled: {sheep}"
+    );
+
+    graceful_kill(dir.path());
+}
+
 /// A script that says which slot it is and which process it is, on every
 /// line.
 ///
