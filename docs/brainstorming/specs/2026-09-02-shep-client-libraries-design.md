@@ -216,6 +216,17 @@ correctly stamped `action-reply`.
 | Node | `new net.Socket({ fd: 3 })` |
 | Python | `socket.socket(fileno=3)` |
 
+A second spike answered whether a dog is possible outside Rust at all,
+because the 0.2.0 scoping below depends on the answer. A dog written in
+Python, 90 lines of standard library, was adopted and run under a real
+shepherd on 2026-09-02. It answered `--version` with `shep-protocol: 2` and
+`shep adopt` read it, it received its `[dog.pydog]` section as opaque TOML
+over the socket, it subscribed to `process.*` and received events, and it
+held `online` with zero restarts. Nothing in shep had to change. Two
+refusals fired correctly on the way: `adopt` rejected the binary while it
+sat in a world-writable directory, and a socket path over `SUN_LEN` was a
+clean error rather than a hang.
+
 One result changes the Rust crate's header. There is no safe constructor
 from a raw descriptor, so `shep-channel` cannot carry
 `#![forbid(unsafe_code)]` like `shep-core`, `shep-client` and `shep`. It
@@ -240,6 +251,15 @@ Both obvious names are taken by unrelated projects, checked 2026-09-02. npm
 `pip install shep-pm[cli]` pulls the binary through an extra, so one command
 gets both halves without forcing the pure-Python library to carry platform
 tags.
+
+**Two distributions rather than one, and the binary size is why.** The
+published archives run 16 to 19 MB compressed, so roughly 40 to 60 MB
+unpacked. Under a single distribution, an app that wants to call `ch.ready()`
+drags a process manager that size into its dependency tree, its container
+layer and every CI cache that installs it. ruff and uv are the usual
+precedent for shipping a Rust binary through pip and they are the wrong one
+here, because both are binary-only with no library half. The right precedent
+is pydantic, which splits `pydantic` from `pydantic-core` for this reason.
 
 ## Repo layout
 
@@ -345,6 +365,14 @@ transports, and the `--version` contract Phase 4 added. `PROTOCOL_VERSION`
 is already at 2 and a mismatch is refused at the handshake, so that wire has
 broken once and will again.
 
+Feasibility is not the question; the spike above settled that. Size is. The
+transport is 20 lines in any language, so what a dog library is actually
+worth is the 76 request shapes, the bus events, and reconnecting across
+`shep daemon reload`. That last one is the sharp edge: `docs/dogs.md` says a
+dog that does not dial again after a reload is a live process holding a dead
+socket, online on every column and answering nothing. Rust gets it free from
+`ReconnectingClient::connect_as_dog` and no other language would.
+
 Publishing it later costs almost nothing, because the repos are laid out for
 it now. Publishing it at 0.1.0 would commit 76 immutable shapes per language
 through a generator that has never run in anger. The channel is the right
@@ -352,12 +380,16 @@ thing to exercise the pipeline on.
 
 **Async variants**, per D2. **Typed action names**, per D11.
 
-## Open questions for the maintainer
+## Questions the maintainer has settled
 
-1. Whether third-party dogs in languages other than Rust are wanted at all.
-   Every published dog client is a constraint on future `PROTOCOL_VERSION`
-   bumps, and that is a maintenance commitment rather than a technical one.
-2. Whether `shep-py` should publish one distribution with platform wheels
-   (the ruff and uv shape) instead of the two-distribution split above. The
-   split keeps the pure-Python library installable anywhere; one
-   distribution is a simpler install line.
+**Non-Rust dogs are wanted, at 0.2.0.** The worry was that each published dog
+client constrains future `PROTOCOL_VERSION` bumps. That constraint already
+exists: `shep adopt` is an advertised feature and `shep-log-rotate` is
+already published. What changes is volume, and the `--version` refusal path
+added in Phase 4 already handles skew by naming both numbers and both ways
+out. The spike argues for the library rather than against it. The wire is
+approachable enough that people will hand-roll it, and large enough that
+they should not have to.
+
+**`shep-py` ships two distributions**, per the size argument under Package
+names.
