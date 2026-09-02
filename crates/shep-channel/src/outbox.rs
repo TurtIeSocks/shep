@@ -13,6 +13,17 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use crate::{ChannelError, ChildMessage};
 
 /// How many messages may wait for the writer before the policy applies.
+///
+/// 1024 is a starting guess, not a measurement: no benchmark backs it yet.
+/// The reasoning behind picking it: `ChildMessage` itself is 64 bytes on the
+/// stack (`size_of`, checked directly, not estimated), so a full queue's
+/// fixed cost is tens of kilobytes plus whatever the queued names and
+/// bodies heap-allocate -- not a memory concern at this size for a process
+/// meant to run one app. What would justify moving it is throughput
+/// evidence in either direction: an app that regularly sees
+/// `dropped_metrics() > 0` under real load wants it raised, and profiling
+/// that finds this bound is where an app's peak memory actually goes wants
+/// it lowered.
 pub(crate) const DEFAULT_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
