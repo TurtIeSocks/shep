@@ -208,13 +208,22 @@ pub fn spawn_extras_reporter(
                         );
                         // No epoch to carry: a memory breach has nothing
                         // equivalent to a probe task that can be aborted
-                        // mid-`send`. `PollingEnforcer` is one shared
-                        // long-lived task that reads the CURRENT registered
-                        // pid and threshold fresh on every tick, so a re-arm
-                        // takes effect before the next sample rather than
-                        // racing a task already in flight (see
-                        // `PollingEnforcer::start`).
-                        supervisor.extra_restart(breach.id, breach.root_pid, None).await;
+                        // mid-`send`. What it carries instead is the size it
+                        // measured, which is its own staleness token -- the
+                        // breach was computed under `PollingEnforcer`'s lock
+                        // and is sent after that lock is released, so a
+                        // ceiling re-armed in between leaves this report
+                        // speaking for a limit nobody enforces any more. The
+                        // actor re-asks the question against the ceiling in
+                        // force when it arrives.
+                        supervisor
+                            .extra_restart(
+                                breach.id,
+                                breach.root_pid,
+                                None,
+                                Some(breach.observed),
+                            )
+                            .await;
                     }
                     None => breaches_open = false,
                 },
@@ -226,7 +235,7 @@ pub fn spawn_extras_reporter(
                             "liveness probe hit its failure_threshold; restarting"
                         );
                         supervisor
-                            .extra_restart(report.id, report.pid, Some(report.epoch))
+                            .extra_restart(report.id, report.pid, Some(report.epoch), None)
                             .await;
                     }
                     None => liveness_open = false,
@@ -1960,7 +1969,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_breach_naming_the_running_pid_restarts_that_sheep() {
         let (handle, mut rx, _fixture) = spawn_test_fixture();
-        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+        // The ceiling the synthetic breach below names. Carried on the app
+        // rather than left at `None` so the fixture describes a sheep that
+        // could really have produced that report: the actor now re-asks a
+        // breach against the ceiling in force, and an app configuring none
+        // has none in force.
+        handle
+            .start(vec![app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(500));
+            })])
+            .await
+            .unwrap();
         let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
         let (breach_tx, breach_rx) = mpsc::channel(4);
         let (_live_tx, live_rx) = mpsc::channel(4);
@@ -2034,7 +2053,7 @@ mod tests {
         let (handle, _rx, _fixture) = spawn_test_fixture();
         handle.start(vec![app_with("web", |_| {})]).await.unwrap();
 
-        handle.extra_restart(99, 4242, None).await;
+        handle.extra_restart(99, 4242, None, None).await;
 
         assert_eq!(
             handle.list().await.len(),
@@ -2070,7 +2089,7 @@ mod tests {
         );
         let pid = listing[0].pid.expect("a spawned sheep has a pid");
 
-        handle.extra_restart(0, pid, None).await;
+        handle.extra_restart(0, pid, None, None).await;
 
         assert_no_restart_within(&mut rx, "web", Duration::from_secs(30)).await;
         assert_eq!(handle.list().await[0].restarts, 0);
@@ -2122,7 +2141,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_breach_carrying_the_previous_pid_restarts_nothing() {
         let (handle, mut rx, _fixture) = spawn_test_fixture();
-        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+        // The ceiling both synthetic breaches below name; see the case above
+        // for why the fixture carries it.
+        handle
+            .start(vec![app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(500));
+            })])
+            .await
+            .unwrap();
         let stale_pid = handle.list().await[0].pid.expect("a live sheep has a pid");
         let (breach_tx, breach_rx) = mpsc::channel(4);
         let (_live_tx, live_rx) = mpsc::channel(4);

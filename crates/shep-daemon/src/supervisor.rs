@@ -58,6 +58,7 @@ use shep_core::protocol::{
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
 use shep_core::status::ProcStatus;
+use shep_core::values::MemSize;
 
 use crate::assemble::{assemble, instance_slots};
 use crate::brain::{Decision, decide_on_exit};
@@ -396,6 +397,18 @@ pub(crate) enum Command {
         /// for a memory breach, which has nothing equivalent that can go
         /// stale; see `Actor::handle_extra_restart`'s fifth guard.
         epoch: Option<u64>,
+        /// The tree size a memory breach was measured at, or `None` for a
+        /// liveness failure, which measures nothing.
+        ///
+        /// A memory breach's own staleness token, and the mirror of `epoch`
+        /// above: a breach is computed against the ceiling armed at that
+        /// moment and delivered later, so this is what lets
+        /// `Actor::handle_extra_restart`'s sixth guard re-ask the question
+        /// against the ceiling in force NOW. `Option` for `epoch`'s reason
+        /// too -- a liveness failure has no measurement to check, and
+        /// inventing one would make the guard answer for a report it knows
+        /// nothing about.
+        observed: Option<MemSize>,
     },
     /// Replaces every matched sheep with a fresh instance, one instance of
     /// each app at a time.
@@ -1109,10 +1122,21 @@ impl SupervisorHandle {
     /// like [`Self::restart_automatic`] it goes in as
     /// `CommandOrigin::Automatic` — displaceable by an operator's command,
     /// and reported on the bus with `manually: false`.
-    pub(crate) async fn extra_restart(&self, id: u32, pid: u32, epoch: Option<u64>) {
+    pub(crate) async fn extra_restart(
+        &self,
+        id: u32,
+        pid: u32,
+        epoch: Option<u64>,
+        observed: Option<MemSize>,
+    ) {
         let _ = self
             .tx
-            .send(Msg::Command(Command::ExtraRestart { id, pid, epoch }))
+            .send(Msg::Command(Command::ExtraRestart {
+                id,
+                pid,
+                epoch,
+                observed,
+            }))
             .await;
     }
 
@@ -3203,8 +3227,13 @@ impl<R: ProcessRunner> Actor<R> {
                 }
                 false
             }
-            Command::ExtraRestart { id, pid, epoch } => {
-                self.handle_extra_restart(id, pid, epoch);
+            Command::ExtraRestart {
+                id,
+                pid,
+                epoch,
+                observed,
+            } => {
+                self.handle_extra_restart(id, pid, epoch, observed);
                 false
             }
             // Rejected while `shutting_down` for CRITICAL-1's reason, the
@@ -7687,7 +7716,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// It goes in as [`CommandOrigin::Automatic`], which is what lets an
     /// operator's `stop` or `delete` take the sheep back off a restart already
     /// mid-ladder — see `claim_manual`.
-    fn handle_extra_restart(&mut self, id: u32, pid: u32, epoch: Option<u64>) {
+    fn handle_extra_restart(
+        &mut self,
+        id: u32,
+        pid: u32,
+        epoch: Option<u64>,
+        observed: Option<MemSize>,
+    ) {
         if self.shutting_down {
             tracing::debug!(id, pid, "extra restart dropped: engine is shutting down");
             return;
@@ -7734,6 +7769,32 @@ impl<R: ProcessRunner> Actor<R> {
                     epoch,
                     current,
                     "extra restart dropped: the reporting probe has been replaced"
+                );
+                return;
+            }
+        }
+        // A sixth guard, and the memory breach's half of the fifth. A breach
+        // is computed under `PollingEnforcer`'s lock and SENT after that lock
+        // is released, so a ceiling re-armed in between (which is what a
+        // config apply changing `max_memory` does, through
+        // `Actor::rearm_name`) leaves a report in flight that was measured
+        // against a ceiling nobody is enforcing any more. The pid and the
+        // status are both untouched by that, so neither guard above sees it,
+        // and a config apply must never kill a process. Re-asking the
+        // question rather than comparing the two ceilings is deliberate: a
+        // LOWERED ceiling makes an old measurement a genuine breach, and
+        // dropping it for having been computed early would miss one.
+        if let Some(observed) = observed {
+            let ceiling = self
+                .sheep
+                .get(&id)
+                .and_then(|slot| slot.entry.spec.config().max_memory);
+            if ceiling.is_none_or(|limit| observed <= limit) {
+                tracing::debug!(
+                    id,
+                    pid,
+                    observed = observed.bytes(),
+                    "extra restart dropped: the ceiling it breached is no longer in force"
                 );
                 return;
             }
@@ -11245,7 +11306,7 @@ mod tests {
         // Both sends land in the same mailbox in this order, so the actor sets
         // the restart's marker and starts its ladder before it ever sees the
         // stop -- no second task and no yielding needed.
-        handle.extra_restart(running.id, pid, None).await;
+        handle.extra_restart(running.id, pid, None, None).await;
         let stopped = handle.stop(ProcessSelector::All).await.unwrap();
 
         assert_eq!(stopped.len(), 1);
@@ -11290,7 +11351,7 @@ mod tests {
         let running = handle.list().await.remove(0);
         let pid = running.pid.expect("an online sheep has a pid");
 
-        handle.extra_restart(running.id, pid, None).await;
+        handle.extra_restart(running.id, pid, None, None).await;
         let deleted = handle
             .delete(ProcessSelector::Id(running.id))
             .await
@@ -11471,7 +11532,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut actor, mut ctl_rx) = actor_with_stopping_drainee(&dir, 4242, 0);
 
-        actor.handle_extra_restart(0, 4242, None);
+        actor.handle_extra_restart(0, 4242, None, None);
 
         let slot = actor.sheep.get(&0).expect("the sheep stays registered");
         assert_eq!(
@@ -11603,7 +11664,7 @@ mod tests {
 
         // A failure from the now-replaced probe, carrying the epoch it was
         // armed under, the CURRENT pid and status Online.
-        actor.handle_extra_restart(0, pid, Some(stale_epoch));
+        actor.handle_extra_restart(0, pid, Some(stale_epoch), None);
 
         let slot = actor.sheep.get(&0).expect("the sheep stays registered");
         assert!(
@@ -13899,7 +13960,7 @@ mod tests {
         )
         .await;
         let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
-        handle.extra_restart(0, pid, None).await;
+        handle.extra_restart(0, pid, None, None).await;
 
         let reloaded = handle
             .reload(ProcessSelector::Name("web".to_string()))
@@ -13964,7 +14025,7 @@ mod tests {
             .await
             .expect("the reload is accepted");
         expect_event(&mut rx, 1, ProcessEventKind::Start).await;
-        handle.extra_restart(0, pid, None).await;
+        handle.extra_restart(0, pid, None, None).await;
 
         // `Restart`, not `Delete`, and the difference is the whole assertion:
         // the bug kills the drainee and RESPAWNS it into a slot its
@@ -18640,7 +18701,7 @@ mod tests {
                             if let Some(first) = handle.list().await.first()
                                 && let Some(pid) = first.pid
                             {
-                                handle.extra_restart(first.id, pid, None).await;
+                                handle.extra_restart(first.id, pid, None, None).await;
                             }
                         }
                         Step::StaleReport => {
@@ -18650,7 +18711,7 @@ mod tests {
                                 // sheep would be just as stale here: the guard
                                 // compares against THIS id's entry.
                                 let stale = first.pid.unwrap_or(0).wrapping_add(1);
-                                handle.extra_restart(first.id, stale, None).await;
+                                handle.extra_restart(first.id, stale, None, None).await;
                             }
                         }
                         Step::List => {}
@@ -21540,5 +21601,51 @@ mod tests {
             MemSize::from_bytes(512 << 20),
             "the registry was re-armed with the old ceiling"
         );
+    }
+
+    /// fails if a breach measured under a ceiling the operator has since
+    /// RAISED still restarts the sheep. `PollingEnforcer` computes a breach
+    /// under its lock and sends it after releasing that lock, so a re-arm
+    /// landing in between leaves a report in flight that speaks for a limit
+    /// nobody enforces any more. The pid and the status are untouched by
+    /// that, so neither of the guards before this one sees it, and a config
+    /// apply must never kill a process.
+    ///
+    /// Reachable only since a load re-arms: nothing before it called
+    /// `arm` on an id that was already armed.
+    #[tokio::test(start_paused = true)]
+    async fn a_breach_measured_under_a_since_raised_ceiling_does_not_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(100 << 20));
+            })],
+        );
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_memory = Some(MemSize::from_bytes(512 << 20));
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_memory"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        // Over the ceiling that was armed when the sample was taken, well
+        // under the one the load just put in force.
+        actor.handle_extra_restart(
+            0,
+            APPLY_FIRST_PID,
+            None,
+            Some(MemSize::from_bytes(200 << 20)),
+        );
+
+        let slot = &actor.sheep[&0];
+        assert!(
+            slot.manual.is_none(),
+            "a breach against a ceiling the operator has raised must never claim the manual marker"
+        );
+        assert_eq!(slot.entry.pid, Some(APPLY_FIRST_PID));
     }
 }
