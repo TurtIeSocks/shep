@@ -226,6 +226,46 @@ pub fn check_peer(stream: &tokio::net::UnixStream, daemon_uid: u32) -> Result<u3
     }
 }
 
+/// The connecting peer's pid, when the OS will name one.
+///
+/// # Why this is not folded into [`check_peer`]
+///
+/// It reads the same [`UCred`](tokio::net::unix::UCred) that function
+/// already throws all but the uid away from, so folding the two would save
+/// one `getsockopt` per connection. It stays separate because `check_peer`
+/// is an AUTHORISATION decision — its answer either admits the peer or ends
+/// the connection — and this is a diagnostic that must never do either. A
+/// pid the OS declines to report is a `None` here and nothing more; making
+/// it a `check_peer` variant would put a refusal one careless `?` away from
+/// a question that has no security content at all. The saved syscall is
+/// paid back many times over by the handshake round trip that follows.
+///
+/// # What `None` means, and what it does not
+///
+/// Not "no process is there" — that peer exists and has already passed the
+/// uid check. It means the platform has no answer: tokio fills the pid on
+/// Linux, macOS, the BSDs, Solaris and several more, and returns `None`
+/// everywhere else. Callers must degrade honestly rather than treat it as a
+/// fact, which is what [`Contact::Unknown`](crate::dogs::Contact::Unknown)
+/// exists to make hard to get wrong.
+///
+/// # Platform
+///
+/// Unix only, alongside [`check_peer`]. There is no Windows counterpart and
+/// there is not meant to be one: `shep_core::transport`'s module doc argues
+/// that establishing an admitted peer's identity there would need
+/// `ImpersonateNamedPipeClient` and raw FFI, which `#![forbid(unsafe_code)]`
+/// does not permit.
+#[cfg(unix)]
+#[must_use]
+pub fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    // Every failure is the same answer: an OS that would not say. A pid
+    // wide enough to overflow `u32` is not a thing any of these platforms
+    // produces, and inventing one here rather than dropping it would be
+    // worse than admitting ignorance.
+    u32::try_from(stream.peer_cred().ok()?.pid()?).ok()
+}
+
 /// The daemon's effective uid.
 ///
 /// # Platform
@@ -383,6 +423,22 @@ async fn handle_conn(stream: ServerStream, ctx: RpcContext) -> Result<(), ConnEr
     // raw FFI to re-answer a question the OS already answered.
     #[cfg(unix)]
     check_peer(&stream, daemon_uid())?;
+    // Read once here, off the stream, and carried down to the handshake:
+    // this is the whole of what lets the silence ladder tell a dog that
+    // never reached the socket from one that reached it and would not say
+    // who it was. `None` on Windows, and on any unix whose OS declines to
+    // name a pid — see `peer_pid`, and `dogs::Contact::Unknown` for what a
+    // reader must do with that.
+    #[cfg(unix)]
+    let peer = peer_pid(&stream);
+    #[cfg(not(unix))]
+    let peer: Option<u32> = None;
+    // Recorded BEFORE a byte is read, deliberately: a peer that connects
+    // and then says nothing at all has still reached this daemon, and that
+    // is exactly the fact the ladder is missing today.
+    if let Some(pid) = peer {
+        ctx.peer_contacts.connected(pid);
+    }
     // Minted after the peer check, not before: a connection refused for its
     // uid never reaches a handler, so it has nothing to scope.
     let conn = ConnId::next();
@@ -391,7 +447,7 @@ async fn handle_conn(stream: ServerStream, ctx: RpcContext) -> Result<(), ConnEr
     let (out_tx, out_rx) = mpsc::channel::<Bytes>(CONN_QUEUE);
     let writer = tokio::spawn(write_loop(FramedWrite::new(write_half, codec()), out_rx));
 
-    let outcome = converse(&mut frames, &out_tx, conn, &ctx).await;
+    let outcome = converse(&mut frames, &out_tx, conn, peer, &ctx).await;
 
     // Drop the queue's sender and JOIN the writer before returning, on EVERY
     // path: a protocol-skew refusal is written by that task, so returning the
@@ -411,9 +467,10 @@ async fn converse(
     frames: &mut Frames,
     out: &mpsc::Sender<Bytes>,
     conn: ConnId,
+    peer: Option<u32>,
     ctx: &RpcContext,
 ) -> Result<(), ConnError> {
-    handshake(frames, out, ctx).await?;
+    handshake(frames, out, peer, ctx).await?;
     let mut forwarder: Option<JoinHandle<()>> = None;
     let outcome = read_loop(frames, out, conn, ctx, &mut forwarder).await;
     // EVERY path out of read_loop — Ok or any `?`-propagated Err — lands
@@ -465,6 +522,7 @@ async fn read_loop(
 async fn handshake(
     frames: &mut Frames,
     out: &mpsc::Sender<Bytes>,
+    peer: Option<u32>,
     ctx: &RpcContext,
 ) -> Result<(), ConnError> {
     let frame = tokio::time::timeout(Duration::from_millis(HANDSHAKE_TIMEOUT_MS), frames.next())
@@ -472,6 +530,16 @@ async fn handshake(
         .map_err(|_| ConnError::HandshakeTimeout)?
         .ok_or(ConnError::NoHandshake)??;
     let hello: Hello = decode_frame(&frame).map_err(ConnError::Decode)?;
+    // Ahead of the protocol check, and that ordering is the point: this
+    // records what the peer SENT, not what this daemon made of it. A dog
+    // refused on protocol skew still named itself, and a diagnosis that
+    // forgot so would put it back in the anonymous pile it does not belong
+    // in.
+    if hello.dog_name.is_some()
+        && let Some(pid) = peer
+    {
+        ctx.peer_contacts.named_a_dog(pid);
+    }
     if hello.protocol != PROTOCOL_VERSION {
         // Version skew is a typed error, not silence (spec §6).
         let refusal: HelloReply = Err(RpcError {

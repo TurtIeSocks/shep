@@ -159,11 +159,21 @@ pub(crate) const LOG_STAMP_BYTES: usize = 30;
 /// against.
 pub(crate) fn stamp_into(buf: &mut String) {
     use std::fmt::Write as _;
+    let start = buf.len();
     // Infallible: the only way `write!` to a `String` fails is a `Display`
     // impl that itself errors, and chrono's `DelayedFormat` only does that
     // for a format string it could not parse — which this one is a `const`
     // to keep from ever being.
     let _ = write!(buf, "{} ", chrono::Local::now().format(LOG_TIMESTAMP_FORMAT));
+    // The one place [`LOG_STAMP_BYTES`] is CHECKED rather than asserted in
+    // a comment. Everything that strips the prefix back off depends on it,
+    // so an edit to the format that changed the width would otherwise be
+    // found by a reader's mangled output rather than by a test run.
+    debug_assert_eq!(
+        buf.len() - start,
+        LOG_STAMP_BYTES,
+        "the stamp's width is fixed and readers strip it by count"
+    );
 }
 
 /// Bytes each stream's reader may hold ahead of the lines it has emitted.

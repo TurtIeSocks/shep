@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The stale verdict for a silent dog no longer asserts a cause the shepherd
+  never observed. It now records which process each connection arrived from
+  and whether that connection named a dog, and says one of three things: the
+  dog has never reached the socket (rebuild or reinstall it), it reaches the
+  socket and never names itself (a build against shep-client older than
+  0.1.23, which reinstalling the same build will not fix), or the platform
+  would not name the peer's process and so neither can be ruled out. Every
+  one ends in a command to run. Previously all three got *the binary on disk
+  cannot talk to this shep either*, which cost one operator two days of
+  reinstalling a dog that was connected and serving requests the whole time.
+
 ### Changed
 
 - Every line written to a sheep's or a dog's log file now starts with the

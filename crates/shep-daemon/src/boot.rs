@@ -1336,14 +1336,23 @@ pub async fn boot<R: ProcessRunner>(
     // carried across a handover: a successor has refused nobody yet, and a
     // dog it can talk to is not stale by any definition it could apply.
     let dog_refusals = crate::dogs::DogRefusals::new();
+    // Built beside the refusals and for the same reason: the watch on the
+    // next line reads it, and the connection layer writes it. Not carried
+    // across a handover either — a successor has been connected to by
+    // nobody, and a pid it has never seen is one it must not claim has
+    // never called.
+    let peer_contacts = crate::dogs::PeerContacts::new();
     // Spawned at every boot, INCLUDING a successor's after an `execve` --
     // that is why it is anchored here and not to a dog's own spawn (see
     // `spawn_silent_dog_watch`'s doc). It restarts a dog that has been
     // running without ever answering this shepherd, which costs a merely
     // slow dog one restart it did not need; the tradeoff is argued at
     // `record_silent_dog`.
-    let silent_dog_watch =
-        crate::dogs::spawn_silent_dog_watch(supervisor.clone(), dog_refusals.clone());
+    let silent_dog_watch = crate::dogs::spawn_silent_dog_watch(
+        supervisor.clone(),
+        dog_refusals.clone(),
+        peer_contacts.clone(),
+    );
 
     let writer = spawn_snapshot_writer(
         paths.snapshot.clone(),
@@ -1361,6 +1370,7 @@ pub async fn boot<R: ProcessRunner>(
         paths: paths.clone(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         dog_refusals,
+        peer_contacts,
         pid,
         shutdown,
         stats,

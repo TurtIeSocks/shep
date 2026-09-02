@@ -82,6 +82,15 @@ pub struct RpcContext {
     /// refused dog earns its one restart from disk or has already had it
     /// (the handover design's G8; [`crate::dogs::DogRefusals`]).
     pub(crate) dog_refusals: crate::dogs::DogRefusals,
+    /// What has connected to this daemon's socket, by peer pid.
+    ///
+    /// Written by the connection layer — the one place that can see a
+    /// peer's credentials — and read by [`crate::dogs::record_silent_dog`],
+    /// which is the only thing that asks. It is what lets a dog that never
+    /// reached the socket be told apart from one that reached it and did
+    /// not name itself: two silences with opposite fixes, which this daemon
+    /// used to report as one.
+    pub(crate) peer_contacts: crate::dogs::PeerContacts,
     /// This daemon's OS pid, echoed in the handshake.
     pub(crate) pid: u32,
     /// Flips to `true` to start graceful daemon shutdown; see [`Self::shutdown`].
