@@ -14,6 +14,10 @@ import VerbSignature from "../../components/docs/VerbSignature.astro";
 const barksDemo = `$ shep barks
 WHEN                 RULE    SUBJECT  MESSAGE                                                                     SINKS
 2026-08-29 21:06:35  daemon  flaky    dog flaky exhausted its restart budget: 15 restarts against a budget of 16  -`;
+
+const dogLogDemo = `2026-09-02T14:22:31.412+02:00 [shep] shep started this dog; its process is pid 5512
+2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as \`log-rotate\`, on protocol 1
+2026-09-02T14:22:31.492+02:00 rotating web-0-out.log (12.4 MiB)`;
 ---
 
 <DocsLayout
@@ -686,6 +690,66 @@ shep-dog 0.1.24`}</CodeBlock>
       fine. What catches it is the dog's own CI building against a current{" "}
       <code>shep-core</code>, which is where both published dogs' breakage
       was already visible and unread.
+    </p>
+
+    <h2>What shep writes into a dog's own log</h2>
+    <p>
+      A dog's log is the first place anyone looks when a dog misbehaves, and
+      it used to hold only what the dog itself said. Everything shep had to
+      say about it went to <code>shepd.err.log</code>, which is not the file
+      shep's own error messages tell you to open. Shep now writes its own
+      account into the dog's log too, marked <code>[shep]</code> so it can't
+      be mistaken for the dog's output.
+    </p>
+    <CodeBlock code={dogLogDemo} lang="text" />
+    <p>
+      Six things get written: the spawn and the resolved binary path, an
+      accepted handshake (once, the first time this shepherd hears from the
+      dog — not on every reconnect), a refused handshake with both
+      protocol numbers, the warning when a dog goes quiet, the verdict when
+      shep gives up on it, and the exit code or signal when its process
+      stops. <code>shep bleats &lt;name&gt; --follow</code> sees the same
+      lines live, marked the same way, interleaved with the dog's own output
+      in arrival order.
+    </p>
+
+    <h2>When a dog stops answering</h2>
+    <p>
+      A dog that is running but never handshakes gets one restart from disk
+      and then a verdict. That verdict says what the shepherd actually
+      watched happen, because the three cases it reports have opposite
+      fixes.
+    </p>
+    <ul>
+      <li>
+        <strong>Nothing has ever connected from the dog's process.</strong>{" "}
+        The dog isn't reaching the socket. Rebuild or reinstall it.
+      </li>
+      <li>
+        <strong>
+          Its process has connected, and never named a dog in its handshake.
+        </strong>{" "}
+        The dog is talking to shep and may be serving every request it's
+        asked; what it doesn't do is say who it is. Reinstalling the same
+        build won't change that — it's built against shep-client older
+        than 0.1.23, or it calls <code>Client::connect</code> where it should
+        call <code>ReconnectingClient::connect_as_dog</code>. Rebuild it
+        against a current shep-client.
+      </li>
+      <li>
+        <strong>Shep couldn't tell which process opened the connections.</strong>{" "}
+        Windows has no peer identity by design, and some unix platforms
+        decline to report a pid. Neither of the two above is ruled out, so
+        shep names both and tells you to read the dog's own log — where a
+        dog that can't reach the socket says so, and one that's merely
+        anonymous doesn't.
+      </li>
+    </ul>
+    <p class="fine">
+      Every one of them ends with a command to run. The one before them said{" "}
+      <em>the binary on disk cannot talk to this shep either</em> in all
+      three cases, which sent one operator through two days of reinstalling a
+      dog that was connected and serving requests the whole time.
     </p>
 
     <h2>When a dog dies</h2>
