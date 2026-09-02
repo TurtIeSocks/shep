@@ -93,6 +93,16 @@ stderr  /tmp/shepdocs/home/logs/shepd.err.log  emptied`;
       <code>merge_logs</code>: without one of those, every instance would be
       appending to the same path by accident rather than on purpose.
     </p>
+    <p>
+      Every line in those files starts with the time shep wrote it, in local
+      time with the offset spelled out:{" "}
+      <code>2026-09-02T14:22:31.412+02:00 the sheep said this</code>. The
+      stamp is always the same 30 characters wide, so anything that wants the
+      sheep's own bytes back cuts the first 30. It is a property of the file
+      and not of the stream — the bus carries the sheep's line untouched,
+      which is what <code>shep bleats --follow</code> and any dog subscribed
+      to <code>log.*</code> read.
+    </p>
     <p class="fine">
       Every handle is opened append-only, and a symlink sitting at the path
       is refused rather than written through. Append matters more than it
@@ -145,10 +155,11 @@ stderr  /tmp/shepdocs/home/logs/shepd.err.log  emptied`;
       follow has nothing left to hear. And within one file lines print in
       append order, but across a sheep's two files there is no merge:{" "}
       <code>out_file</code> prints in full, then <code>err_file</code>{" "}
-      starts. A log line carries no timestamp, so there is no key to
-      interleave them on, and seeing all of stdout before any of stderr must
-      not be read as everything on stdout having happened first. Following
-      has no such seam, because the bus delivers in arrival order.
+      starts. A log line carries the time shep wrote it, but nothing merges
+      the two files on it yet, so seeing all of stdout before any of stderr
+      must not be read as everything on stdout having happened first.
+      Following has no such seam, because the bus delivers in arrival
+      order.
     </Callout>
     <p class="fine">
       The tail is bounded twice: <code>--lines</code> lines, found within the

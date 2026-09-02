@@ -306,7 +306,8 @@ mod tests {
     ///
     /// `out then err`, not `out+err`. `+` reads as one merged stream, and
     /// this is two files rendered end to end with no interleaving at all —
-    /// a log line carries no timestamp, so there is no key to merge on. A
+    /// a log line carries the time it was written, but nothing here merges
+    /// on it. A
     /// sheep with forty stdout lines and one old stderr line shows the stale
     /// stderr line UNDER the fresh stdout ones, and the header is the only
     /// place on screen that can say why.

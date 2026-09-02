@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Every line written to a sheep's or a dog's log file now starts with the
+  time shep wrote it, RFC 3339 in local time with the offset spelled out
+  (`2026-09-02T14:22:31.412+02:00 `). The stamp is a fixed 30 bytes, so a
+  reader that wants the raw line strips a constant prefix. Lines on the bus
+  are unchanged: `shep bleats --follow` and every dog subscribed to `log.*`
+  still see the sheep's own bytes, which is why this needs no opt-out.
+
 ## [0.1.27] - 2026-09-02
 
 
