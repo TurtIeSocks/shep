@@ -90,10 +90,15 @@ pub enum SpawnIdentity {
     /// named a `user` or a `group`, `None` when it named neither and the
     /// child correctly runs as the shepherd.
     ///
-    /// Settled for the life of the entry. A restart reuses this value rather
-    /// than looking the name up a second time, so a running app's identity
-    /// can never change underneath it and no restart re-touches the passwd
-    /// database.
+    /// Settled for the life of the entry, with one exception. A restart
+    /// reuses this value rather than looking the name up a second time, so a
+    /// running app's identity does not change underneath it and no restart
+    /// re-touches the passwd database. The exception is a config load that
+    /// parks a `user` or `group` change: promoting that config puts the
+    /// entry back to [`Self::Unresolved`] first, so the spawn it precedes
+    /// resolves the new name. See `ProcessEntry::pending_reidentifies`
+    /// (crate-internal, hence code font), which is where that decision is
+    /// recorded.
     Resolved(Option<Credentials>),
 }
 

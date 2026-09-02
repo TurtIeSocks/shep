@@ -584,6 +584,7 @@ pub(crate) fn armed_entry(
         id,
         spec: app,
         pending: None,
+        pending_reidentifies: false,
         instance,
         status: ProcStatus::Online,
         pid: Some(pid),

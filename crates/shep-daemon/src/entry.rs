@@ -31,6 +31,28 @@ pub struct ProcessEntry {
     /// for an operator to read and includes fields already on `spec`. This is
     /// the config a respawn promotes.
     pub pending: Option<ResolvedApp>,
+    /// Whether the config in [`Self::pending`] changes who this sheep runs
+    /// as, so that promoting it must re-resolve [`Self::credentials`].
+    ///
+    /// Recorded by the load that PARKED the config, against the spec this
+    /// entry held at that moment, and not recomputed later. A promotion can
+    /// only diff `pending` against `spec`, and `spec` is not a fixed point:
+    /// a load writes one spec, derived from the app's first instance, onto
+    /// every instance of the name. Restart instance 0 alone -- a crash, a
+    /// memory breach and a liveness failure all do that with nobody asking
+    /// -- and the next load reads its promoted spec as the base for its
+    /// siblings, so the `user` change instance 1 has still not applied is no
+    /// longer visible as a difference to instance 1. Answering the question
+    /// while the answer is still there is what makes it survive that.
+    ///
+    /// STICKY, for the same reason: it stays set through every later load
+    /// until [`Self::pending`] is actually promoted, because a second load
+    /// that changes nothing about identity has not undone the first one's
+    /// change. Cleared in exactly one place, the promotion itself.
+    ///
+    /// `false` whenever [`Self::pending`] is `None`, which is every sheep
+    /// outside a parking window.
+    pub pending_reidentifies: bool,
     /// Instance number within the app (for clustered apps, 0..instances-1)
     pub instance: u32,
     /// Current lifecycle status
@@ -55,9 +77,10 @@ pub struct ProcessEntry {
     ///
     /// Resolved once — at the initial `Start` for an entry that got one, at
     /// the first spawn otherwise — and reused for every later respawn, so a
-    /// restart never re-touches the passwd database and never changes a
-    /// running app's identity underneath it (see
-    /// [`crate::privilege::resolve`]).
+    /// restart neither re-touches the passwd database nor changes a running
+    /// app's identity underneath it (see [`crate::privilege::resolve`]).
+    /// There is exactly one exception, two paragraphs down, and it is an
+    /// operator asking for the change rather than an accident.
     ///
     /// [`SpawnIdentity::Unresolved`] until that happens, and that is a
     /// different fact from an app that asked for no user at all: an entry
@@ -65,6 +88,14 @@ pub struct ProcessEntry {
     /// because its `user` could not be resolved, has never been looked up,
     /// and starting it as the shepherd would be a silent privilege
     /// downgrade rather than the configured behaviour.
+    ///
+    /// One exception, and only one: a config load that parks a `user` or
+    /// `group` change sets [`Self::pending_reidentifies`], and the promotion
+    /// of that config puts this back to [`SpawnIdentity::Unresolved`] so the
+    /// spawn it precedes resolves the new name. That is an operator asking
+    /// for the change on purpose, which is the case the once-only rule was
+    /// never protecting against; every other promoted field keeps the
+    /// resolved value and costs no passwd lookup.
     pub credentials: SpawnIdentity,
     /// Where this instance's stdout is appended, copied from the
     /// [`SpawnSpec`](crate::runner::SpawnSpec) that

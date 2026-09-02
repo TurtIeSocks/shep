@@ -1497,6 +1497,7 @@ mod tests {
             id: 1,
             spec,
             pending: None,
+            pending_reidentifies: false,
             instance: 0,
             status: ProcStatus::Online,
             pid: Some(100),
