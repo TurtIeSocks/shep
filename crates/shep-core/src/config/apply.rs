@@ -5,13 +5,20 @@
 //! can be swapped under a running process with no disruption; one baked into
 //! the child at exec cannot change until that process is replaced.
 //!
-//! The three entries most likely to look wrong carry their reasoning at their
-//! own arm below. All three were measured against the read sites rather than
+//! The four entries most likely to look wrong carry their reasoning at their
+//! own arm below. All four were measured against the read sites rather than
 //! inferred from the field's name.
 
 use serde::{Deserialize, Serialize};
 
 /// Where a field's new value takes effect.
+///
+/// `#[non_exhaustive]`: a field could someday be applied by nudging the
+/// running child through the existing `shep reopen` (SIGUSR2) signal path
+/// rather than by a fresh read, a next spawn, or a full respawn -- a
+/// reopen-triggered fifth group distinct from all four below. shep-core is
+/// published, so an out-of-tree match on this enum needs a wildcard arm to
+/// survive that addition without a major version bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApplyGroup {
@@ -116,6 +123,14 @@ pub fn is_classified(field: &str) -> bool {
 }
 
 /// How much of a Flockfile load overwrites what the operator has set since.
+///
+/// `#[non_exhaustive]`: a fourth depth is plausible, the mirror image of
+/// `Settings` -- reset only `env` back to the template while leaving every
+/// other operator-tuned setting alone. This type travels inside
+/// `Request::ApplyConfig` on the wire, so the attribute is protecting
+/// against an older daemon that cannot decode a variant it predates; without
+/// it, a non-exhaustive match there would silently compile against a peer
+/// that can never receive the new depth.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
