@@ -4111,11 +4111,45 @@ impl<R: ProcessRunner> Actor<R> {
         // anyway — the field is new, the assumption is not. See
         // `CarriedSheep::ready_failed`.
         let ready_failed = carried.ready_failed().unwrap_or(false);
+        // Restored, and as a PAIR: a parked config promoted without its
+        // reset flag comes up on the identity that flag exists to replace.
+        // See `CarriedSheep::pending_reidentifies`.
+        //
+        // A parked config that no longer normalizes is DROPPED rather than
+        // refusing the adoption, which is the opposite of what `app` above
+        // does, and the two differ because what they cost differs. `app` is
+        // the config a live child is already running: there is no version of
+        // this adoption without it. This is a change nobody has applied yet,
+        // so a successor whose `normalize` has tightened can lose it and
+        // still take over a healthy flock, where refusing would strand one.
+        // Logged at `warn` rather than dropped quietly, because this is the
+        // only account an operator gets of a change that will now never
+        // arrive.
+        let pending = carried
+            .pending()
+            .and_then(|parked| match normalize(parked.clone()) {
+                Ok(app) => Some(app),
+                Err(source) => {
+                    tracing::warn!(
+                        sheep = carried.name(),
+                        %source,
+                        "a config this sheep was owed did not survive the handover: this daemon \
+                         will not accept it, so the change is gone and the file must be loaded \
+                         again"
+                    );
+                    None
+                }
+            });
+        // `false` when the config was dropped just above as well as for a
+        // blob written before the flag existed: there is nothing left to
+        // promote, so there is nothing to re-resolve for.
+        let pending_reidentifies =
+            pending.is_some() && carried.pending_reidentifies().unwrap_or(false);
         let mut entry = ProcessEntry {
             id,
             spec: app.clone(),
-            pending: None,
-            pending_reidentifies: false,
+            pending,
+            pending_reidentifies,
             instance: carried.instance(),
             status,
             pid: carried.pid(),
@@ -23416,5 +23450,88 @@ mod tests {
                 "and its own spec still describes what it was actually spawned from"
             );
         }
+    }
+
+    /// fails if a parked config, or the reset decision that travels with it,
+    /// does not survive a daemon handover.
+    ///
+    /// Design spec: `ProcessEntry` gains `pending` and `CarriedSheep` gains
+    /// it too. The cost of losing it is silent config erasure through the
+    /// one door nobody watches: an operator loads a Flockfile, sees fields
+    /// reported pending, then runs `shep daemon reload` to pick up a new
+    /// binary. The `Live` fields ride across on the carried `AppConfig` and
+    /// survive; everything parked would vanish, and the next load would
+    /// compare against a spec that already matched and report nothing to do.
+    ///
+    /// The two fields are asserted through a promotion rather than by
+    /// reading them back, because reading them back is the handover module's
+    /// own case. What this adds is the property that case cannot reach: a
+    /// config that arrives without its flag promotes on the identity the
+    /// flag exists to replace, and only a spawn shows that.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_config_and_its_reset_decision_survive_a_handover() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[]);
+
+        // The predecessor's entry: registered, not running, owed a `user`
+        // change, and settled on an identity no lookup could produce -- so a
+        // spawn carrying 4242 is a spawn that reused it.
+        let settled = Credentials {
+            uid: 4242,
+            gid: None,
+        };
+        let entry = ProcessEntry {
+            id: 7,
+            spec: app_with("web", |_| {}),
+            pending: Some(app_with("web", |app| app.user = Some(own_user_name()))),
+            pending_reidentifies: true,
+            instance: 0,
+            status: ProcStatus::Stopped,
+            pid: None,
+            restarts: 0,
+            started_at: None,
+            budget: RestartBudget::default(),
+            reload: ReloadState::None,
+            credentials: SpawnIdentity::Resolved(Some(settled)),
+            out_file: PathBuf::new(),
+            err_file: PathBuf::new(),
+            dog: None,
+            last_exit: None,
+        };
+        let carried =
+            CarriedSheep::from_entry(&entry, 0, CarriedFds::none(), false, None, false, None);
+
+        // Through serde, which is the boundary a handover actually crosses:
+        // an accessor that read the entry it was built from would prove
+        // nothing about the blob.
+        let crossed: CarriedSheep = serde_json::from_value(serde_json::to_value(&carried).unwrap())
+            .expect("this daemon reads what it writes");
+
+        actor
+            .install_adopted(without_handles(crossed), &Arc::new(AdoptedReaper::new()))
+            .expect("a registered-and-stopped sheep installs with nothing to adopt");
+
+        assert!(
+            actor.sheep[&7].entry.pending.is_some(),
+            "the successor must still owe this sheep the change its predecessor parked"
+        );
+
+        actor.respawn(7, true);
+
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(Credentials {
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: None,
+            }),
+            "and promoting it must re-resolve: the settled 4242 here is the reset decision \
+             lost in the blob, which is the identity change silently dropped"
+        );
+        assert_eq!(
+            actor.sheep[&7].entry.spec.config().user,
+            Some(own_user_name()),
+            "and the promoted config is what the successor now records"
+        );
     }
 }
