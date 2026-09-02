@@ -43,6 +43,12 @@ speaks, so this is not a negotiation — it is there so a defensive app can
 notice a version it has never seen and say so, rather than failing to parse a
 line with nothing to connect that failure to a protocol change.
 
+**A Rust app does not have to speak this by hand.** The `shep-channel` crate
+implements everything on this page: discovering the descriptor, framing the
+JSON, and answering messages the app does not handle itself. Go, JavaScript
+and Python libraries over the same contract follow. Whatever language an app
+is written in, this document is still the contract it has to hold to.
+
 ## On Windows: a named pipe, not fd 3
 
 **Everything above this heading describes the unix tier.** Windows has no

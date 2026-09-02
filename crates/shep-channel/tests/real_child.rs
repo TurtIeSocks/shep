@@ -162,6 +162,7 @@ impl ChildGuard {
     ///
     /// If called more than once; this test calls it exactly once, on the
     /// success path after every assertion above has already passed.
+    #[track_caller]
     fn take(mut self) -> std::process::Child {
         self.0.take().expect("ChildGuard::take called twice")
     }

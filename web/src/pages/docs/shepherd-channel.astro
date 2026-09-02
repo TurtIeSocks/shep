@@ -65,6 +65,14 @@ channel = true`}</CodeBlock>
       defensive app can notice a wire it's never seen rather than failing to
       parse a line with nothing to connect that failure to.
     </p>
+    <p>
+      <strong>A Rust app does not have to speak this by hand.</strong> The{" "}
+      <code>shep-channel</code> crate implements everything on this page:
+      discovering the descriptor, framing the JSON, and answering messages
+      the app does not handle itself. Go, JavaScript and Python libraries
+      over the same contract follow. Whatever language an app is written
+      in, this page is still the contract it has to hold to.
+    </p>
 
     <h2>The wire format</h2>
     <p>

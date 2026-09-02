@@ -1,21 +1,32 @@
 # shep-channel
 
-Speak the shepherd channel for [shep](https://github.com/shep-pm/shep), a
-process manager written in Rust: signal readiness, emit a metric, answer a
-custom action, over the newline-JSON descriptor shep hands a supervised
-process on fd 3. `docs/shepherd-channel.md` in the shep repository is the
-contract this crate implements.
+Speak the shep shepherd channel from a supervised app: signal readiness,
+emit a metric, answer an action.
 
-This crate currently holds the wire's message shapes only —
-`ChildMessage`, `ShepherdMessage`, and `CHANNEL_VERSION` — re-exported by
-`shep-core` so a `BusEvent::Channel` and an app writing on fd 3 agree on one
-type. `shep-core` depends on this crate with `default-features = false` for
-exactly those types and nothing else.
+```rust
+let shepherd = shep_channel::serve();
 
-The `client` feature, on by default, is where discovering the descriptor,
-framing the JSON, and answering messages an app does not handle itself will
-live. An app that wants to speak this wire from Rust depends on this crate
-with default features; `shep-core` is the one consumer that turns them off.
+shepherd.on_action("gc", |params, _name| {
+    format!("collected, params={params:?}")
+});
+shepherd.on_shutdown(|| server.graceful_stop());
+shepherd.ready()?;
+shepherd.metric("rps", 4200.0);
+```
+
+Ask for a channel in the Flockfile with `channel = true`, or get one from
+`wait_ready` or `shutdown_with_message`.
+
+Without one, every call above does nothing and the app runs unchanged, so
+there is nothing to branch on. An action name you did not register still
+gets a reply, which is the part an app is most likely to get wrong: to the
+shepherd, silence from an app thinking hard and silence from an app that
+never understood the question look the same, and only `action_timeout`
+running out tells them apart.
+
+The wire itself is documented in `docs/shepherd-channel.md` in the shep
+repository. It is language agnostic, and there are Go, JavaScript and
+Python libraries over the same contract.
 
 shep is pre-release. Anything public here can change before 1.0.
 

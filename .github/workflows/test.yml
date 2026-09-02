@@ -386,6 +386,15 @@ jobs:
       # way and only a doctest run reads it.
       - run: cargo test -p shep-client --locked --no-default-features
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # shep-core takes shep-channel with `default-features = false` to get
+      # the wire types without the client (descriptor discovery, the reader
+      # and writer threads, the handler layer). Nothing else in the
+      # workspace asks for that combination directly -- the `--workspace
+      # --all-features` step below selects shep-channel itself and turns
+      # its "client" feature back on -- so this is the only place that
+      # names shep-core's specific requirement and checks it holds.
+      - run: cargo check -p shep-channel --locked --no-default-features
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: "cargo nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: 'cargo test --workspace --locked --all-features --doc'

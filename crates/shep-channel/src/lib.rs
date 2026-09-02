@@ -9,6 +9,37 @@
 //!
 //! Doing nothing is the normal case: an app whose operator never asked for a
 //! channel gets a handle whose every call is a no-op.
+//!
+//! ```
+//! let shepherd = shep_channel::serve();
+//!
+//! shepherd.on_action("gc", |params, _name| {
+//!     format!("collected, params={params:?}")
+//! });
+//! shepherd.on_shutdown(|| { /* stop gracefully */ });
+//!
+//! // This doctest runs as a plain test process, not under shep, so the
+//! // handle above has no channel: the two registrations above just sat
+//! // down in an empty registry nobody will read, and the calls below are
+//! // no-ops. That is the normal case, not a failure -- see `is_active`.
+//! assert!(!shepherd.is_active());
+//! shepherd.metric("rps", 4200.0);
+//! shepherd.ready().unwrap();
+//! ```
+//!
+//! Three things about that design are easy to miss:
+//!
+//! - The reader thread runs handlers itself, so a slow handler delays the
+//!   next message behind it. `action_timeout` (set per app in the
+//!   Flockfile) defaults to 3 seconds -- a handler that regularly takes
+//!   longer than that is racing the shepherd's own patience, not just its
+//!   caller's.
+//! - `metric` can drop a sample under backpressure. `ready` and an action
+//!   reply cannot: both are queued with no ceiling, because losing either
+//!   silently is worse than a call that blocks.
+//! - A shutdown message with no `on_shutdown` handler registered warns on
+//!   stderr and does nothing else. This crate never stops a process on its
+//!   own judgement; only a handler you registered does.
 
 #![doc(test(attr(deny(warnings))))]
 // Not `forbid`: taking the inherited descriptor needs one `unsafe` block,
