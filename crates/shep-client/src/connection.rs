@@ -75,6 +75,13 @@ pub enum ConnectError {
     /// sentence, verbatim — still not for parsing, and no longer the only
     /// thing a caller gets: `daemon_version` carries the running daemon's
     /// version as data.
+    ///
+    /// The [`Display`](fmt::Display) rendering of this variant is a public
+    /// surface in its own right, and a load-bearing one: a refused dog is
+    /// refused before it can issue a single request, so this string is the
+    /// entire account of the failure that reaches its log. It states the
+    /// skew and then what to do about it — see the impl for why it names
+    /// both directions of the remedy rather than picking one.
     ProtocolMismatch {
         /// This client's own protocol version.
         client: u32,
@@ -104,15 +111,45 @@ impl fmt::Display for ConnectError {
             Self::HandshakeTimeout { after } => {
                 write!(f, "the handshake did not complete within {after:?}")
             }
-            // `daemon_version` is deliberately not rendered here: the
-            // daemon's `message` already names its side of the skew, and a
-            // caller that wants the version as data has the field.
+            // The skew itself is stated once, by the daemon's own `message`,
+            // and this line adds the two things that sentence cannot carry:
+            // what to do, and which shep to do it against.
+            //
+            // `daemon_version` USED to be deliberately unrendered, on the
+            // grounds that `message` already names the daemon's side. That
+            // held while this was a bare statement of the skew: `message`
+            // names the daemon's PROTOCOL, and a protocol number is enough to
+            // describe the mismatch. It stops holding the moment the line
+            // says "rebuild against shep X", because a protocol number is not
+            // something anyone can install — the crate version is. So the
+            // field is rendered now, and only inside the remedy.
+            //
+            // The remedy names both directions because this type cannot tell
+            // them apart. `client` is a number and `message` is prose, so
+            // nothing here knows whether this build or the running shepherd
+            // is the older one, and a line that guessed would send half its
+            // readers to reinstall the wrong thing — the exact failure the
+            // silent-dog verdict in `shep-daemon`'s `dogs.rs` was rewritten
+            // to stop making. Naming both costs one clause and is true
+            // either way.
             Self::ProtocolMismatch {
-                client, message, ..
+                client,
+                daemon_version,
+                message,
             } => {
+                // A daemon too old to have sent its version still gets a
+                // usable sentence: "the running shep" is a thing the reader
+                // can identify, where a bare "shep" would leave them
+                // guessing which one this program failed to reach.
+                let shep = daemon_version
+                    .as_deref()
+                    .map_or_else(|| "the running shep".to_string(), |v| format!("shep {v}"));
                 write!(
                     f,
-                    "protocol mismatch (this client speaks {client}): {message}"
+                    "protocol mismatch (this client speaks {client}): {message}. \
+                     The older of the two has to be replaced: rebuild or reinstall this \
+                     program against {shep} and restart it, or upgrade shep itself and run \
+                     `shep daemon reload`"
                 )
             }
         }
@@ -386,6 +423,66 @@ mod tests {
         assert!(
             message.contains("protocol 2"),
             "the daemon's own message must still survive: {message}"
+        );
+    }
+
+    /// fails if the rendered refusal states the skew and stops.
+    ///
+    /// This string is what a dog writes into its own log, and it is the
+    /// whole of what an operator gets: the dog is refused before it can ask
+    /// for anything, so there is no later line to explain this one. A
+    /// sentence naming the two protocol numbers and nothing else leaves them
+    /// to invent the next step, which is how the production incident behind
+    /// this phase turned into two days of reinstalling.
+    #[test]
+    fn a_rendered_refusal_says_what_to_do_about_it() {
+        let rendered = ConnectError::ProtocolMismatch {
+            client: 1,
+            daemon_version: Some("0.1.27".into()),
+            message: "daemon speaks protocol 2, client sent 1".into(),
+        }
+        .to_string();
+
+        assert!(
+            rendered.contains("daemon speaks protocol 2, client sent 1"),
+            "the daemon's own sentence still leads: {rendered}"
+        );
+        assert!(
+            rendered.contains("shep 0.1.27"),
+            "the remedy has to name a version somebody can install: {rendered}"
+        );
+        assert!(
+            rendered.contains("rebuild or reinstall this program"),
+            "one direction of the remedy: {rendered}"
+        );
+        assert!(
+            rendered.contains("shep daemon reload"),
+            "the other direction, because this type cannot tell which build \
+             is the older one: {rendered}"
+        );
+        assert_eq!(rendered.lines().count(), 1, "one line: {rendered}");
+    }
+
+    /// fails if a daemon too old to name its version renders a remedy with a
+    /// hole in it -- `rebuild against shep` with nothing after `shep`, or a
+    /// literal `None`. That daemon is exactly the one most likely to produce
+    /// this error, so its wording is not an edge case.
+    #[test]
+    fn a_refusal_without_a_version_still_names_something_to_build_against() {
+        let rendered = ConnectError::ProtocolMismatch {
+            client: 2,
+            daemon_version: None,
+            message: "daemon speaks protocol 1, client sent 2".into(),
+        }
+        .to_string();
+
+        assert!(
+            rendered.contains("against the running shep and restart it"),
+            "the remedy must still point somewhere: {rendered}"
+        );
+        assert!(
+            !rendered.contains("None"),
+            "an absent version must never reach the reader: {rendered}"
         );
     }
 

@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `ConnectError::ProtocolMismatch`'s `Display` says what to do about the
+  skew instead of stating it twice and stopping. A refused dog is refused
+  before it can issue a single request, so that one line is the entire
+  account of the failure that reaches its log; it now names both remedies
+  (rebuild this program against the daemon's version, or upgrade shep and
+  reload) because the type cannot tell which of the two builds is the older
+  one, and a line that guessed would send half its readers to reinstall the
+  wrong thing. `daemon_version` is rendered now — it was deliberately left
+  out while this was a bare statement of the skew, and a protocol number is
+  not something anyone can install.
+
 ## [0.1.27] - 2026-09-02
 
 
