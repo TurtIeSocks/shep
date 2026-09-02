@@ -4,10 +4,9 @@ Status: designed 2026-09-02, not yet implemented. This is spec 1 of two. Spec 2
 covers a secret store and is deliberately not designed here; the one thing this
 spec owes it is a reserved token, named under Decisions.
 
-shep is 0.1.x and guarantees no API. This pass breaks the wire
-(`PROTOCOL_VERSION` 2 to 3) and adds two on-disk stores. It does not break the
-Flockfile grammar, and the reasons for that are argued below rather than
-assumed.
+shep is 0.1.x and guarantees no API. This pass adds request variants and two
+on-disk stores. It breaks neither the wire version nor the Flockfile grammar,
+and the reasons for both are argued below rather than assumed.
 
 ## The problem
 
@@ -91,12 +90,18 @@ design.
   spawn, not the next kill.
 - **`shutdown_with_message` is G3, not G1.** `assemble()` ORs it into whether
   fd 3 is opened for the child. That is the child's own fd table.
-- **The seven `extras` fields apply live only if something re-arms them.**
-  `max_memory`, `watch`, `ignore_watch`, `watch_delay`, `cron_restart`,
-  `cron_timezone` and `liveness_probe` are all read through a fresh
-  `entry.spec.config()` lookup, so the mechanism works. But `arm()` fires on a
-  went-online transition and nothing else. A config write alone re-arms
-  nothing, and those seven are G2 in practice unless the write triggers it.
+- **The seven `extras` fields apply live only if something re-arms them, and
+  re-arming is harder than one call.** `max_memory`, `watch`, `ignore_watch`,
+  `watch_delay`, `cron_restart`, `cron_timezone` and `liveness_probe` are all
+  read through a fresh `entry.spec.config()` lookup, so the mechanism works.
+  But `ExtrasRegistry::arm` is reached only from `went_online` and
+  `install_adopted`, so a config write re-arms nothing on its own. Worse,
+  calling `arm` again does not fix it: it rebuilds the per-id workers
+  (`max_memory`, `liveness_probe`) but leaves a LIVE name-group task alone,
+  `if group.cron.as_ref().is_none_or(JoinHandle::is_finished)` and the same
+  for watch. So the other five stay stale, and
+  `a_replacement_arming_before_the_drainee_disarms_keeps_the_groups_own_tasks`
+  pins that behaviour by task identity. See decision 5 for what this costs.
 
 Final split across 40 fields: G1 read at decision time, 19. G2 consumed at
 spawn, 4. G3 baked into the child, 14. G4 structural, 3.
@@ -190,9 +195,28 @@ Two consequences at the call sites:
   changing `user` is asking for that specific thing, so promotion sets
   `SpawnIdentity::Unresolved` for those two fields only. It needs its own
   argument in the code, not a silent reset.
-- **A G1 write must re-arm extras.** `disarm_instance` then `arm_instance`, or
-  the seven fields in the third correction above never take effect until the
-  next spawn.
+- **A G1 write must re-arm extras, through a new method rather than an
+  existing one.** `ExtrasRegistry` needs a force-replacing sibling to `arm`,
+  because `arm` deliberately preserves a live name-group task and `disarm`
+  only tears the group down when the id leaving was the last armed instance
+  of the name. On a multi-instance app that means re-arming the group at all
+  requires acting on the name, not on one id.
+
+  Three hazards come with it, and two are accepted rather than engineered
+  around. The watch rebuild leaves a real gap with no rescan, so a file saved
+  during it is missed; that is the same gap any watcher restart has, and it is
+  documented rather than closed. `stats.watch()` clears the CPU baseline for
+  the pid, so `shep flock` shows a blank CPU column for one
+  `MEMORY_POLL_INTERVAL`; cosmetic, also documented.
+
+  **The third is a correctness problem and must be fixed.** A liveness task
+  that is aborted mid-flight can still deliver its failure, and
+  `handle_extra_restart` guards only on pid and status
+  (`slot.entry.pid != Some(pid)`, `status != Online`). A config-only re-arm
+  changes neither, so a stale failure passes both guards and restarts the
+  sheep. That would make a config apply kill a process, which decision 4
+  forbids outright. The liveness arming needs an epoch the reporter carries
+  and the handler checks.
 
 A merged config that fails `normalize` refuses that app whole, with the error,
 and the rest of the flock still applies. `instances` moving while `out_file`
@@ -415,9 +439,15 @@ for `&self` on the grounds that applying under a running sheep is the outcome
 being ruled out, which was right for a request that reports. The applier is a
 sibling.
 
-`PROTOCOL_VERSION` 2 to 3. New variants an older daemon cannot deserialize, so
-it refuses a newer client at the handshake and the operator restarts the daemon
-after upgrading. Same shape and same remedy as `SelectorSpec::Instance`.
+`PROTOCOL_VERSION` stays 2, and this corrects an earlier draft of this spec
+that said it moves to 3. The rule at `protocol/mod.rs:43` keeps the version for
+new variants behind `#[non_exhaustive]`, and `shep-core`'s CHANGELOG applies it
+repeatedly, `ConfigDrift` itself among them: *"Additive: `PROTOCOL_VERSION`
+stays 1, a daemon that predates the request answers its existing 'does not
+implement that request' error."* The 1 to 2 bump was for `SelectorSpec`, a type
+nested inside requests an older daemon already knows how to decode, which is a
+different situation. An older daemon meeting `ApplyConfig` fails to decode the
+verb, which is the outcome every earlier additive variant shipped with.
 
 `SCHEMA_VERSION` stays 1. `ProcessInfo` gains `pending: Vec<String>` and
 `overridden: Vec<String>`, both additive, both names only, because `env`
@@ -458,11 +488,22 @@ Every await needs a forcing mechanism rather than a sleep (IR-46), and every
 test below gets proved non-vacuous by mutating what it protects and watching
 that specific test go red.
 
-The one that matters most is the extras re-arm. Set `watch = true` through an
-override on a running sheep and assert the watcher fires. Delete the
-`disarm_instance` and `arm_instance` pair and it must go red: without them the
-write lands on `entry.spec` and nothing reads it until the next spawn, which is
-the silent under-delivery this design exists to avoid.
+The one that matters most is the extras re-arm, and it needs two tests rather
+than one because the two halves fail differently.
+
+Set `max_memory` through an override on a running sheep and assert the new
+ceiling is enforced. That covers the per-id half, which a plain `arm` already
+rebuilds.
+
+Then set `watch = true` through an override on a running sheep and assert the
+watcher fires. That is the half a plain `arm` silently skips, so prove it
+non-vacuously by replacing the new force-replacing method with a call to `arm`
+and watching this test alone go red. If it stays green the test is not
+exercising the group path.
+
+A third: arm a liveness probe, force a re-arm, and assert no restart happens.
+Prove it by removing the epoch guard and watching a stale failure restart the
+sheep.
 
 - an established key is not overwritten by a later file load
 - a key absent from the established set is appended by a later file load
@@ -512,8 +553,10 @@ that catches a wrong prop; a build stays green on one.
 
 ## Migration
 
-- **`PROTOCOL_VERSION` 2 to 3.** An older daemon refuses a newer client at the
-  handshake. Restart the daemon after upgrading.
+- **`PROTOCOL_VERSION` stays 2.** An older daemon fails to decode the new
+  verbs rather than answering them, the same outcome every earlier additive
+  request variant shipped with. Restarting the daemon after upgrading is still
+  the fix for an operator who hits it.
 - **No Flockfile grammar change.** Every existing Flockfile parses unchanged.
 - **First load of an existing app establishes its current keys.** An operator
   upgrading has an app whose config came from a Flockfile, so the established
