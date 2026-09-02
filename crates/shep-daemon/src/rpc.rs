@@ -18,16 +18,17 @@
 use core::future::Future;
 use core::time::Duration;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::watch;
 
-use shep_core::config::normalize_all;
+use shep_core::config::{DeclaredApp, NormalizeError, ResolvedApp, normalize_all};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     Envelope, Lamb, ProcessInfo, Reply, Request, Response, RpcError, RpcErrorCode, SelectorSpec,
+    SheepApplied,
 };
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
@@ -36,7 +37,7 @@ use crate::bus::{Bus, TopicFilter};
 use crate::dogs::DogSpec;
 use crate::limits::stats::StatsState;
 use crate::snapshot::{FlockRegistry, SnapshotError, write_atomic};
-use crate::supervisor::{ConnId, SupervisorError, SupervisorHandle};
+use crate::supervisor::{Applied, ConnId, SupervisorError, SupervisorHandle};
 
 /// Deadline applied when a client sends none (spec §6: 5s default).
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
@@ -578,6 +579,34 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             id,
             result: Ok(Response::ShuttingDown),
         }),
+        // The acting half of `ConfigDrift` above, and the one arm in this
+        // function that changes a running flock's config without replacing
+        // anything running.
+        Request::ApplyConfig { apps, reset } => match duplicate_name(&apps) {
+            Some(name) => reply(Err(RpcError {
+                code: RpcErrorCode::InvalidConfig,
+                message: NormalizeError::DuplicateName(name).to_string(),
+                daemon_version: None,
+            })),
+            None => match ctx.supervisor.apply_config(apps, reset).await {
+                Ok(applied) => {
+                    // Recorded unconditionally, on the same reasoning the
+                    // `Scale` arm above gives: an apply that reached the
+                    // stored spec must reach the roll too, or a reboot
+                    // brings up config that was never running. An app whose
+                    // merge produced no honest config carries `None` and is
+                    // skipped rather than invented, which is the same call
+                    // `Applied::app`'s own doc argues at the other end.
+                    let recorded: Vec<ResolvedApp> =
+                        applied.iter().filter_map(|a| a.app.clone()).collect();
+                    ctx.registry.record(&recorded);
+                    reply(Ok(Response::Applied(
+                        applied.into_iter().map(SheepApplied::from).collect(),
+                    )))
+                }
+                Err(err) => reply(Err(rpc_error(&err))),
+            },
+        },
         // `Request` is #[non_exhaustive]: a verb from a newer client that this
         // daemon has never heard of is an error, not a panic.
         _ => reply(Err(RpcError {
@@ -585,6 +614,46 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             message: "this daemon does not implement that request".to_string(),
             daemon_version: None,
         })),
+    }
+}
+
+/// The first name two entries of an `ApplyConfig` share, if any.
+///
+/// Peer input is untrusted, exactly as `Start`'s `normalize_all` treats it,
+/// and this is the one malformed shape a merge cannot survive quietly.
+/// `handle_apply_config` reads the override store ONCE for the whole request
+/// and writes it once at the end, so a second entry of the same name merges
+/// against the store as the FIRST entry found it rather than against the
+/// record the first entry just made: the first entry's record is overwritten
+/// and nothing anywhere says so.
+///
+/// Refused whole rather than per app. A document naming one app twice is
+/// malformed rather than partly wrong, and there is no reading of it under
+/// which one of the two entries is the one the operator meant.
+///
+/// Linear in a `BTreeSet`, matching `normalize_all`: a request carries the
+/// apps one Flockfile declared, which is tens of entries.
+fn duplicate_name(apps: &[DeclaredApp]) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    apps.iter()
+        .find(|app| !seen.insert(app.config.name.as_str()))
+        .map(|app| app.config.name.clone())
+}
+
+/// The wire form of one app's load, with the merged config dropped.
+///
+/// `Applied` carries the whole merged [`ResolvedApp`] because `rpc.rs` hands
+/// it to the registry; [`SheepApplied`] does not, and that asymmetry is the
+/// point rather than an oversight. A client has no use for the config, and
+/// `env` is in it (IR-41), so the conversion is where the config stops.
+impl From<Applied> for SheepApplied {
+    fn from(applied: Applied) -> Self {
+        Self::new(
+            applied.name,
+            applied.applied,
+            applied.pending,
+            applied.refused,
+        )
     }
 }
 
@@ -1000,12 +1069,13 @@ mod tests {
     use crate::testing::{
         Harness, SCRIPTED_TREE_BYTES, harness, harness_identifying, harness_with_stats, identity,
     };
-    use shep_core::config::AppConfig;
+    use shep_core::config::{AppConfig, DeclaredApp, ResetDepth};
     use shep_core::protocol::{
         ActionOutcome, ActionReply, DogSource, Request, Response, RpcErrorCode, SelectorSpec,
     };
     use shep_core::status::ProcStatus;
     use shep_core::values::UpDuration;
+    use std::collections::BTreeSet;
     use tokio::time::Instant;
 
     /// Dispatches on a connection of its own, shadowing [`super::dispatch`]
@@ -1090,6 +1160,166 @@ mod tests {
             .await,
         );
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
+    }
+
+    /// One app as a Flockfile would declare it: the config, plus the keys
+    /// the document literally wrote. `declared` is what an apply keys on, so
+    /// a fixture that left it empty would declare nothing and apply nothing.
+    fn declared(name: &str, script: &str, keys: &[&str]) -> DeclaredApp {
+        DeclaredApp {
+            config: AppConfig::minimal(name, script),
+            declared: keys.iter().map(|k| (*k).to_string()).collect(),
+            declared_env: BTreeSet::new(),
+        }
+    }
+
+    /// fails if a request naming the same app twice is applied rather than
+    /// refused.
+    ///
+    /// `handle_apply_config` reads the override store ONCE for the whole
+    /// file and writes it once at the end, which is what keeps an eleven-app
+    /// Flockfile to one lock. A second entry of the same name is therefore
+    /// merged against the store as the FIRST entry found it, not against the
+    /// record the first entry just made, so the first entry's record is lost
+    /// with nothing anywhere saying so. `normalize_all` refuses a duplicate
+    /// on the `Start` path and is not on this one; this arm is where the
+    /// mirror belongs, because it is the trust boundary and it can refuse
+    /// before the flock is touched at all.
+    #[tokio::test(start_paused = true)]
+    async fn apply_config_refuses_a_request_naming_one_app_twice() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let _started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::ApplyConfig {
+                        apps: vec![
+                            declared("web", "./one", &["script"]),
+                            declared("web", "./two", &["script"]),
+                        ],
+                        reset: ResetDepth::None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let err = reply.result.unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("web"), "the name is named: {err:?}");
+
+        // Refused BEFORE anything was touched, which is the half an error
+        // code alone does not prove: the flock still runs what `Start`
+        // registered, not either of the two scripts the request carried.
+        let listed = reply_of(dispatch(envelope(3, Request::ListFlock), &h.ctx).await);
+        let Response::Flock(flock) = listed.result.unwrap() else {
+            panic!("expected flock")
+        };
+        let roll = h.ctx.registry.roll(&flock, 0);
+        assert_eq!(roll.apps[0].app.script, "./srv");
+    }
+
+    /// fails if an apply does not reach the muster roll.
+    ///
+    /// The `Scale` arm's reasoning, applied to this one: a change that
+    /// reached the stored spec and not the roll is undone by the next
+    /// reboot, and that is a bug nobody can see until the machine comes
+    /// back.
+    #[tokio::test(start_paused = true)]
+    async fn apply_config_records_what_it_applied_in_the_registry() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let _started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::ApplyConfig {
+                        apps: vec![DeclaredApp {
+                            config: {
+                                let mut app = AppConfig::minimal("web", "./srv");
+                                app.max_restarts = 99;
+                                app
+                            },
+                            declared: ["max_restarts"].iter().map(|k| (*k).to_string()).collect(),
+                            declared_env: BTreeSet::new(),
+                        }],
+                        reset: ResetDepth::None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Applied(report) = reply.result.unwrap() else {
+            panic!("expected applied")
+        };
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].name, "web");
+        assert_eq!(report[0].applied, vec!["max_restarts".to_string()]);
+        assert_eq!(report[0].refused, None);
+
+        let listed = reply_of(dispatch(envelope(3, Request::ListFlock), &h.ctx).await);
+        let Response::Flock(flock) = listed.result.unwrap() else {
+            panic!("expected flock")
+        };
+        let roll = h.ctx.registry.roll(&flock, 0);
+        assert_eq!(roll.apps[0].app.max_restarts, 99);
+    }
+
+    /// fails if an app the flock does not have costs the whole request its
+    /// reply. One app that cannot be applied must not cost the rest of the
+    /// file its load, so a miss is a per-app refusal inside an `Ok` and
+    /// never an `Err`.
+    #[tokio::test(start_paused = true)]
+    async fn apply_config_refuses_an_unregistered_app_inside_the_reply() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::ApplyConfig {
+                        apps: vec![declared("ghost", "./srv", &["script"])],
+                        reset: ResetDepth::None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Applied(report) = reply.result.unwrap() else {
+            panic!("expected applied")
+        };
+        assert_eq!(report.len(), 1);
+        let refused = report[0].refused.as_deref().unwrap_or_default();
+        assert!(
+            refused.contains("ghost"),
+            "the refusal names the app: {refused}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

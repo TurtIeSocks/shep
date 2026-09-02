@@ -4,7 +4,7 @@ use core::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, DeclaredApp, ResetDepth};
 use crate::status::ProcStatus;
 
 /// Client's opening frame
@@ -283,6 +283,39 @@ pub enum Request {
         /// it has not spelled out as a difference); failures return
         /// [`RpcErrorCode::InvalidConfig`].
         apps: Vec<AppConfig>,
+    },
+    /// Merge each declared app into the sheep of the same name, applying
+    /// what can be applied and parking the rest for that sheep's next spawn
+    ///
+    /// The acting half of [`Self::ConfigDrift`], which only reports. Nothing
+    /// is registered, nothing is pruned and nothing running is killed: an app
+    /// the flock does not have is refused by name rather than started, and a
+    /// field the running child was spawned from waits for a `shep reload`
+    /// instead of taking one.
+    ///
+    /// Additive by default, which is what `reset` exists to widen. A
+    /// Flockfile arrives from the app's own repository, so a load appends
+    /// what nobody has established and leaves everything an operator set
+    /// since alone.
+    ///
+    /// Answers [`Response::Applied`] with one [`SheepApplied`] per entry in
+    /// `apps`, in the order given, whether or not the app was found and
+    /// whether or not anything changed. One app that cannot be applied does
+    /// not cost the rest of the file its load; its refusal rides in
+    /// [`SheepApplied::refused`].
+    ApplyConfig {
+        /// The apps to merge in, each carrying the keys its document
+        /// literally wrote. The daemon MUST re-normalize the merge result
+        /// (peer input is untrusted) and refuses the whole request with
+        /// [`RpcErrorCode::InvalidConfig`] when two entries share a name:
+        /// the second would be merged against a store the first has not
+        /// written yet, so its record would be the one that survives.
+        apps: Vec<DeclaredApp>,
+        /// How much of what the operator has set since a template last
+        /// loaded this request may overwrite. Default
+        /// [`ResetDepth::None`](crate::config::ResetDepth::None), which
+        /// overwrites nothing.
+        reset: ResetDepth,
     },
     /// Stop matching sheep (stay registered)
     Stop {
@@ -1291,6 +1324,76 @@ impl SheepDrift {
     }
 }
 
+/// What one app's [`Request::ApplyConfig`] did: the answer a load owes the
+/// operator who ran it
+///
+/// One of these per app the request named, whether or not the app was found
+/// and whether or not anything about it changed. A load that quietly skipped
+/// an app would leave an operator reading a Flockfile that says one thing and
+/// a flock doing another, which is the failure this whole verb exists to fix.
+///
+/// Field NAMES only, never their values, exactly as [`SheepDrift`] carries
+/// them and for the same reason: this is built to be printed at an operator,
+/// and [`AppConfig::env`](crate::config::AppConfig::env) carries secrets, so
+/// an applied `env` reports `"env"` and nothing more (IR-41). `Debug` is
+/// derived on that basis: there is nothing here to redact. The merged config
+/// itself never reaches a client at all -- the daemon keeps it, because a
+/// config is not something a client needs and `env` is in it.
+// wire format: changing field names is a breaking change
+//
+// `#[non_exhaustive]`: shep-core is a published library, an out-of-tree
+// consumer can match or construct this exhaustively today, and a fourth
+// field (which of the pending fields a reload would promote, say) would
+// break them with no version bump to say so (IR-20). [`SheepApplied::new`]
+// is how the daemon builds one.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheepApplied {
+    /// The sheep's name, exactly as the request spelled it.
+    pub name: String,
+    /// Fields now in force, in field-name order. Empty when the load changed
+    /// nothing the daemon could act on immediately.
+    pub applied: Vec<String>,
+    /// Fields the app picks up at its next spawn, in field-name order. Empty
+    /// when nothing is waiting.
+    ///
+    /// `shep reload <name>` is what promotes them; a client rendering this
+    /// list says so, because a pending list with no remedy beside it is a
+    /// report nobody can act on.
+    pub pending: Vec<String>,
+    /// Why some or all of this app's change did not land, in the daemon's own
+    /// words, or `None` when the whole of it did.
+    ///
+    /// Not the same question as the two lists being empty. A refusal raised
+    /// before anything was touched leaves both empty, and so does a load with
+    /// nothing to do; a refusal raised after the flock was already reshaped
+    /// arrives beside lists that carry what did land. The message is what
+    /// tells them apart, which is why it is a sentence rather than a code.
+    pub refused: Option<String>,
+}
+
+impl SheepApplied {
+    /// Builds one app's report.
+    ///
+    /// No builder, matching [`SheepDrift::new`]: all four fields are required
+    /// and none can be defaulted to something honest, so there is no optional
+    /// surface for one to spare a caller.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        applied: Vec<String>,
+        pending: Vec<String>,
+        refused: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            applied,
+            pending,
+            refused,
+        }
+    }
+}
+
 /// One RPC response (pairs with [`Request`] variants)
 ///
 /// Ten variants carry a bare `Vec<ProcessInfo>` (`Flock`, `Described`,
@@ -1331,6 +1434,16 @@ pub enum Response {
     /// else. An empty vector means every app asked about either matches or
     /// is not registered at all.
     Drifted(Vec<SheepDrift>),
+    /// Answer to `ApplyConfig`: one entry per app the request named, in the
+    /// order it named them, including the apps that were refused and the
+    /// apps that had nothing to change.
+    ///
+    /// Complete where [`Self::Drifted`] is filtered, and the difference is
+    /// deliberate. A drift report answers "what is different", so a matching
+    /// app has nothing to say; a load answers "what did you do to each of
+    /// these", and an app missing from that answer is indistinguishable from
+    /// an app the daemon silently dropped.
+    Applied(Vec<SheepApplied>),
     /// Answer to `Stop`
     Stopped(Vec<ProcessInfo>),
     /// Answer to `Restart`
@@ -2261,6 +2374,33 @@ mod tests {
                 deadline_ms: None,
                 body: Request::DogStaleness,
             },
+            // The only request carrying a `DeclaredApp` rather than a bare
+            // `AppConfig`, and the two key sets beside the config are the
+            // whole reason it does: a merge keys on what a document CLAIMED,
+            // so a reader that dropped `declared` would apply every default
+            // the document never wrote. `declared_env` is pinned non-empty
+            // for the same reason and one more -- it holds env key NAMES,
+            // and a fixture is where an out-of-tree reader learns that no
+            // env VALUE travels under it (IR-41).
+            //
+            // `reset` is pinned at its non-default depth. The default
+            // serializes as `"none"`, which is the one value a reader could
+            // get right by accident.
+            Envelope {
+                id: 26,
+                deadline_ms: None,
+                body: Request::ApplyConfig {
+                    apps: vec![DeclaredApp {
+                        config: AppConfig::minimal("web", "./srv"),
+                        declared: ["name", "script"]
+                            .iter()
+                            .map(|k| (*k).to_string())
+                            .collect(),
+                        declared_env: ["DATABASE_URL"].iter().map(|k| (*k).to_string()).collect(),
+                    }],
+                    reset: ResetDepth::Settings,
+                },
+            },
         ];
         insta::assert_json_snapshot!("request_wire_v2", requests);
     }
@@ -2600,8 +2740,75 @@ mod tests {
                         .build(),
                 ])),
             },
+            // Three entries, because the three shapes a load produces are
+            // not interchangeable and a reader that saw only one would
+            // guess wrong about the others: an app that applied cleanly, an
+            // app whose change is waiting for a respawn, and an app that
+            // was refused outright. The refusal's `null` twin is pinned by
+            // the first two rows, so a reader learns the key is always
+            // present rather than sometimes absent.
+            //
+            // `env` is one of the pending names on purpose. Reporting it as
+            // a bare NAME is this reply's whole security property (IR-41),
+            // and a fixture is where an out-of-tree reader learns that no
+            // value ever travels with it.
+            Reply {
+                id: 32,
+                result: Ok(Response::Applied(vec![
+                    SheepApplied::new("web", vec!["max_memory".to_string()], Vec::new(), None),
+                    SheepApplied::new(
+                        "api",
+                        Vec::new(),
+                        vec!["args".to_string(), "env".to_string()],
+                        None,
+                    ),
+                    SheepApplied::new(
+                        "worker",
+                        Vec::new(),
+                        Vec::new(),
+                        Some("worker is not registered".to_string()),
+                    ),
+                ])),
+            },
         ];
         insta::assert_json_snapshot!("reply_wire_v2", replies);
+    }
+
+    /// fails if a `SheepApplied` ever carries a field's VALUE rather than
+    /// its name. This reply is printed at an operator and `env` values are
+    /// secrets, so the wire form has to be names alone (IR-41).
+    ///
+    /// Asserts on the serialized JSON rather than on the struct, because the
+    /// struct's `Vec<String>` cannot say which of the two a string is: a
+    /// build that put `DATABASE_URL=postgres://...` in the list would type-
+    /// check and pass any assertion made on the field's shape.
+    #[test]
+    fn a_sheep_applied_carries_names_and_never_values() {
+        let applied = SheepApplied::new(
+            "web",
+            vec!["cwd".to_string()],
+            vec!["env".to_string()],
+            None,
+        );
+        let json = serde_json::to_string(&applied).unwrap();
+        assert!(json.contains("\"env\""), "the NAME travels: {json}");
+        assert!(
+            !json.contains("DATABASE_URL"),
+            "and no value ever does: {json}"
+        );
+    }
+
+    /// fails if `SheepApplied`'s `Debug` grows a value. Derived today because
+    /// there is nothing here to redact, and that is a property of what the
+    /// daemon puts IN it rather than of the derive, so it is worth one exact
+    /// string (IR-41).
+    #[test]
+    fn a_sheep_applied_debug_prints_the_names_it_was_given() {
+        let applied = SheepApplied::new("web", vec!["cwd".to_string()], Vec::new(), None);
+        assert_eq!(
+            format!("{applied:?}"),
+            "SheepApplied { name: \"web\", applied: [\"cwd\"], pending: [], refused: None }"
+        );
     }
 
     /// fails if the new field breaks an older peer, on the same terms as

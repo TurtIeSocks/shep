@@ -973,13 +973,8 @@ impl SupervisorHandle {
     ///   per-app refusal rides inside the reply instead, in
     ///   [`Applied::refused`]: one app that cannot be applied must not cost
     ///   the rest of the file its load.
-    // The only door into `Command::ApplyConfig`, and the wire request that
-    // reaches it lands in a later task of this same slice; the actor arm and
-    // the merge underneath are exercised by this module's own tests today.
-    // `#[allow(dead_code)]` names that pre-wiring state in a plain comment
-    // rather than the rustdoc above, so deleting the attribute when the wire
-    // arrives takes this note with it.
-    #[allow(dead_code)]
+    // `rpc.rs`'s `Request::ApplyConfig` arm is the only door into
+    // `Command::ApplyConfig`.
     pub(crate) async fn apply_config(
         &self,
         apps: Vec<DeclaredApp>,
@@ -2657,13 +2652,9 @@ impl Scaled {
 /// whether or not anything about it changed: a load that quietly skipped an
 /// app would leave an operator reading a Flockfile that says one thing and a
 /// flock doing another.
-// Every field is read by this module's own tests and by the wire request a
-// later task of this slice lands, and by nothing in between, so a plain
-// `cargo build` reads the struct as dead. `#[allow(dead_code)]` names that
-// pre-wiring state in a plain comment rather than the rustdoc above, so
-// deleting the attribute when `rpc.rs` starts reading these takes this note
-// with it.
-#[allow(dead_code)]
+// Every field is read by `rpc.rs`'s `Request::ApplyConfig` arm: the first
+// four become the `SheepApplied` it replies with, and `app` is what it hands
+// the registry.
 #[derive(Debug)]
 pub(crate) struct Applied {
     /// The app's name, exactly as the file spells it.

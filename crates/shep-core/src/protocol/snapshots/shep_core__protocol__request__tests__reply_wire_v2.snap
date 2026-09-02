@@ -620,5 +620,38 @@ expression: replies
         ]
       }
     }
+  },
+  {
+    "id": 32,
+    "result": {
+      "Ok": {
+        "kind": "applied",
+        "data": [
+          {
+            "name": "web",
+            "applied": [
+              "max_memory"
+            ],
+            "pending": [],
+            "refused": null
+          },
+          {
+            "name": "api",
+            "applied": [],
+            "pending": [
+              "args",
+              "env"
+            ],
+            "refused": null
+          },
+          {
+            "name": "worker",
+            "applied": [],
+            "pending": [],
+            "refused": "worker is not registered"
+          }
+        ]
+      }
+    }
   }
 ]
