@@ -40,8 +40,14 @@ pub(crate) fn write_message<W: Write>(
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::time::Duration;
 
     use super::*;
+
+    /// Bounds the one real-socket read in this module's tests. A working
+    /// channel answers in microseconds; this is slack for a loaded runner,
+    /// not an expected duration.
+    const DEADLINE: Duration = Duration::from_secs(5);
 
     #[test]
     fn reads_two_messages_from_one_buffer() {
@@ -128,7 +134,11 @@ mod tests {
             writer: ours,
             version: Some("1".to_string()),
         };
-        let mut shepherd = BufReader::new(theirs.try_clone().expect("clone"));
+        let shepherd_reader = theirs.try_clone().expect("clone");
+        shepherd_reader
+            .set_read_timeout(Some(DEADLINE))
+            .expect("set the read deadline");
+        let mut shepherd = BufReader::new(shepherd_reader);
         let mut shepherd_writer = theirs;
 
         shepherd_writer
@@ -151,7 +161,9 @@ mod tests {
             })
             .expect("send");
         let mut back = String::new();
-        shepherd.read_line(&mut back).expect("read");
+        shepherd
+            .read_line(&mut back)
+            .expect("the channel never answered within the deadline");
         assert_eq!(
             back,
             "{\"kind\":\"action-reply\",\"action\":\"gc\",\"body\":\"ok\",\"id\":7}\n"
