@@ -46,7 +46,10 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-use shep_core::config::{AppConfig, ResolvedApp, normalize};
+use shep_core::config::{
+    AppConfig, ApplyGroup, DeclaredApp, ResetDepth, ResolvedApp, apply_group, normalize,
+};
+use shep_core::overrides::{self, AppOverrides};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
@@ -420,6 +423,17 @@ pub(crate) enum Command {
         count: u32,
         /// Answers with the app's surviving instances and its new config.
         reply: oneshot::Sender<Result<Scaled, SupervisorError>>,
+    },
+    /// Merges a Flockfile's apps into the running flock. See
+    /// [`Actor::handle_apply_config`].
+    ApplyConfig {
+        /// One entry per app the document declared, carrying the keys it
+        /// literally wrote as well as the values behind them.
+        apps: Vec<DeclaredApp>,
+        /// How much of the load overwrites what an operator has set since.
+        reset: ResetDepth,
+        /// Answers with one report per app given, in the order given.
+        reply: oneshot::Sender<Result<Vec<Applied>, SupervisorError>>,
     },
     /// Attaches a marker to one sheep by name, or clears it.
     ///
@@ -924,6 +938,43 @@ impl SupervisorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Command(Command::ConfigDrift { apps, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
+    /// Merges each app a Flockfile declared into the sheep of the same name.
+    ///
+    /// Additive by default, which is what [`Self::config_drift`] exists to
+    /// report on and this is the verb that acts on: a Flockfile arrives from
+    /// the app's own repository, so a load appends what nobody has
+    /// established and leaves everything else alone unless `reset` says
+    /// otherwise. Nothing is registered, nothing is pruned, and nothing that
+    /// is running is killed -- a field the running child holds parks in
+    /// [`ProcessEntry::pending`] for its next spawn instead. See
+    /// [`Actor::handle_apply_config`].
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`] - the actor is gone. Every
+    ///   per-app refusal rides inside the reply instead, in
+    ///   [`Applied::refused`]: one app that cannot be applied must not cost
+    ///   the rest of the file its load.
+    // The only door into `Command::ApplyConfig`, and the wire request that
+    // reaches it lands in a later task of this same slice; the actor arm and
+    // the merge underneath are exercised by this module's own tests today.
+    // `#[allow(dead_code)]` names that pre-wiring state in a plain comment
+    // rather than the rustdoc above, so deleting the attribute when the wire
+    // arrives takes this note with it.
+    #[allow(dead_code)]
+    pub(crate) async fn apply_config(
+        &self,
+        apps: Vec<DeclaredApp>,
+        reset: ResetDepth,
+    ) -> Result<Vec<Applied>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::ApplyConfig { apps, reset, reply }))
             .await
             .map_err(|_| SupervisorError::EngineStopped)?;
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
@@ -2576,6 +2627,288 @@ impl Scaled {
     }
 }
 
+/// What one app's [`Command::ApplyConfig`] did.
+///
+/// One of these per app the file named, whether or not the app was found and
+/// whether or not anything about it changed: a load that quietly skipped an
+/// app would leave an operator reading a Flockfile that says one thing and a
+/// flock doing another.
+// Every field is read by this module's own tests and by the wire request a
+// later task of this slice lands, and by nothing in between, so a plain
+// `cargo build` reads the struct as dead. `#[allow(dead_code)]` names that
+// pre-wiring state in a plain comment rather than the rustdoc above, so
+// deleting the attribute when `rpc.rs` starts reading these takes this note
+// with it.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct Applied {
+    /// The app's name, exactly as the file spells it.
+    pub(crate) name: String,
+    /// Fields now in force, in field-name order.
+    ///
+    /// [`ApplyGroup::Live`] only. A field is named here when the daemon will
+    /// read the new value at its next decision without anything having to be
+    /// restarted first.
+    pub(crate) applied: Vec<String>,
+    /// Fields the app picks up at its next spawn, in field-name order.
+    ///
+    /// Both [`ApplyGroup::NextSpawn`] and [`ApplyGroup::NeedsRespawn`] land
+    /// here, and the difference between them is invisible to an operator:
+    /// either way the running process keeps the old value until it is
+    /// replaced. What differs is where the new value is kept in the
+    /// meantime -- a `NextSpawn` field goes straight onto the stored spec,
+    /// while a `NeedsRespawn` one parks in [`ProcessEntry::pending`], because
+    /// the stored spec is the only account of what the running child was
+    /// spawned from.
+    pub(crate) pending: Vec<String>,
+    /// Why some or all of this app's change did not land, in the daemon's own
+    /// words, or `None` when the whole of it did.
+    ///
+    /// Set on four occasions: the flock has no app of this name, its override
+    /// store could not be read, the merged config does not normalize, or the
+    /// instance count could not be changed. The first three touch nothing at
+    /// all, which is what [`Self::applied`] and [`Self::pending`] being empty
+    /// says; the fourth can accompany a partial apply, so the two lists still
+    /// carry whatever did land.
+    pub(crate) refused: Option<String>,
+    /// The merged, normalized app. `rpc.rs` hands this to
+    /// `FlockRegistry::record`, the way the `Scale` arm hands it
+    /// `Scaled::app`, so a reboot comes up on the applied config.
+    ///
+    /// The FULL merge, `NeedsRespawn` fields included, rather than what the
+    /// running processes are on right now: a reboot spawns every one of them
+    /// afresh, so the config it comes up on is the one a respawn would pick
+    /// up anyway.
+    ///
+    /// `None` for an app whose merge never produced one -- the three refusals
+    /// above that touch nothing. Recording an invented `ResolvedApp` for an
+    /// app the flock does not have would put a row in the muster roll that
+    /// has never run, which is the one thing `handle_scale`'s write-back
+    /// ordering exists to prevent.
+    pub(crate) app: Option<ResolvedApp>,
+}
+
+/// The `AppConfig` fields a lifecycle extra reads when it is ARMED, rather
+/// than at each decision.
+///
+/// All eight are [`ApplyGroup::Live`] -- a write to the stored spec is enough
+/// for everything that reads the spec -- but the worker already armed against
+/// the old value keeps it for as long as that worker lives. Changing one of
+/// these is therefore the one Live change that needs
+/// [`ExtrasRegistry::rearm_name`] on top of the spec write. Kept as one list
+/// here rather than re-derived from [`apply_group`], which answers a
+/// different question: `fold` and `action_timeout` are Live too and need no
+/// re-arm at all.
+const EXTRAS_FIELDS: &[&str] = &[
+    "max_memory",
+    "watch",
+    "ignore_watch",
+    "watch_delay",
+    "watch_options",
+    "cron_restart",
+    "cron_timezone",
+    "liveness_probe",
+];
+
+/// Merges what a Flockfile declares into what a sheep is running, returning
+/// the merged config and the override record to write back.
+///
+/// Three rules, per field: a key the file declares takes the file's value and
+/// gives up its override; a key the file does not declare keeps its override;
+/// anything else falls back to the built-in default. `reset` decides which
+/// keys the three rules run for at all, and that is the whole of the
+/// difference between the depths:
+///
+/// - [`ResetDepth::None`] runs them only for a key the file declares that
+///   nobody has established yet, so a load can APPEND and can never
+///   overwrite. Every other key keeps exactly what it has, defaults
+///   included: "overwrite nothing" is the depth's own promise, and a key
+///   nobody ever declared has no template value to be put back to.
+/// - [`ResetDepth::Settings`] runs them for every key but `env`.
+/// - [`ResetDepth::All`] runs them for every key, `env` included, and ignores
+///   the overrides entirely.
+///
+/// `env` merges one level deeper than the rest, because it is a table rather
+/// than a value: under `None` an env key the file declares and nobody
+/// established is appended and the rest are left alone, under `All` the
+/// file's table replaces it whole, and under `Settings` it is not touched at
+/// all (see [`ResetDepth::Settings`] for why data and policy part company
+/// here).
+///
+/// # Errors
+///
+/// A description of the failure, for [`Applied::refused`], if either config
+/// fails to travel through serde -- which is how an override value of the
+/// wrong shape for its field reaches an operator instead of a panic.
+fn merge_declared(
+    stored: &AppConfig,
+    incoming: &DeclaredApp,
+    overrides: &AppOverrides,
+    reset: ResetDepth,
+) -> Result<(AppConfig, AppOverrides), String> {
+    // Through serde rather than field by field, for `AppConfig::drifted_fields`'
+    // own reason: 40 hand-written assignments is exactly the list that goes
+    // stale when a field is added to the struct.
+    let object = |config: &AppConfig| match serde_json::to_value(config) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err("an app config must serialize as an object".to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    let mut merged = object(stored)?;
+    let file = object(&incoming.config)?;
+    let defaults = object(&AppConfig::default())?;
+
+    let mut next = overrides.clone();
+    // What the file has established on an earlier load, plus what the
+    // operator has set since. Either one makes a key established: the point
+    // of the set is to tell "nobody has ever spoken for this" apart from
+    // "somebody has", and both halves are somebody.
+    let established: BTreeSet<&String> = overrides
+        .declared
+        .iter()
+        .chain(overrides.fields.keys())
+        .collect();
+
+    for key in defaults.keys() {
+        if key == "env" {
+            continue;
+        }
+        let in_scope = match reset {
+            ResetDepth::Settings | ResetDepth::All => true,
+            // `ResetDepth::None`, and any depth a newer client knows that
+            // this build does not: append-only is the rule that cannot
+            // overwrite something an operator set, so it is the one an
+            // unrecognised depth falls back to.
+            _ => incoming.declared.contains(key) && !established.contains(key),
+        };
+        if !in_scope {
+            continue;
+        }
+        let value = if incoming.declared.contains(key) {
+            // The file speaks for this key now, so the operator's override of
+            // it is spent rather than kept to be re-applied on the next load.
+            next.fields.remove(key);
+            file.get(key)
+        } else if matches!(reset, ResetDepth::All) {
+            defaults.get(key)
+        } else {
+            overrides.fields.get(key).or_else(|| defaults.get(key))
+        };
+        if let Some(value) = value {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+
+    match reset {
+        // `env` is operator-supplied data where the rest is operator-tuned
+        // policy: a `--reset` that took an app's database credentials away
+        // would be a different kind of event from one that put its restart
+        // budget back.
+        ResetDepth::Settings => {}
+        ResetDepth::All => {
+            next.fields.remove("env");
+            merged.insert(
+                "env".to_string(),
+                file.get("env")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+            );
+        }
+        _ => {
+            let overridden_env: BTreeSet<&String> = overrides
+                .fields
+                .get("env")
+                .and_then(serde_json::Value::as_object)
+                .map(|env| env.keys().collect())
+                .unwrap_or_default();
+            let mut env = stored.env.clone();
+            for key in &incoming.declared_env {
+                if overrides.declared_env.contains(key) || overridden_env.contains(key) {
+                    continue;
+                }
+                if let Some(value) = incoming.config.env.get(key) {
+                    env.insert(key.clone(), value.clone());
+                }
+            }
+            merged.insert(
+                "env".to_string(),
+                serde_json::to_value(env).map_err(|err| err.to_string())?,
+            );
+        }
+    }
+    // The file's env keys are its own from here, exactly as its top-level
+    // keys are: an override of one is spent.
+    if let Some(serde_json::Value::Object(env)) = next.fields.get_mut("env") {
+        for key in &incoming.declared_env {
+            env.remove(key);
+        }
+        if env.is_empty() {
+            next.fields.remove("env");
+        }
+    }
+
+    // Established is a high-water mark, never a snapshot of the current
+    // file: a key this file has stopped declaring is still a key somebody
+    // once established, and a later load must not be able to re-appear with
+    // a new value for it under a depth that promises to overwrite nothing.
+    next.declared.extend(incoming.declared.iter().cloned());
+    next.declared_env
+        .extend(incoming.declared_env.iter().cloned());
+
+    let merged: AppConfig =
+        serde_json::from_value(serde_json::Value::Object(merged)).map_err(|err| err.to_string())?;
+    Ok((merged, next))
+}
+
+/// The spec a load leaves on a running instance: what that instance was
+/// spawned from, plus every merged field that can reach it without a
+/// replacement, plus the instance count actually achieved.
+///
+/// `live` and `later` are the drifted field names as
+/// [`Actor::apply_one`] partitioned them, and only two of the four groups are
+/// copied across: [`ApplyGroup::Live`] because the daemon reads it fresh at
+/// each decision, and [`ApplyGroup::NextSpawn`] because it is read when a
+/// process spawns and the stored spec is what a spawn reads. A
+/// [`ApplyGroup::NeedsRespawn`] field is deliberately left behind -- it lives
+/// in [`ProcessEntry::pending`] until the instance is replaced.
+///
+/// # Errors
+///
+/// A description of the failure, for [`Applied::refused`], if the rebuilt
+/// config does not travel through serde or does not normalize. Neither is
+/// reachable from a merge that already normalized -- this config is a subset
+/// of that one, over a base that normalized when it was stored -- so an error
+/// here is a report rather than a path with behaviour of its own.
+fn reached_spec(
+    stored: &AppConfig,
+    merged: &AppConfig,
+    live: &[String],
+    later: &[String],
+    instances: u32,
+) -> Result<ResolvedApp, String> {
+    let object = |config: &AppConfig| match serde_json::to_value(config) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err("an app config must serialize as an object".to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    let mut next = object(stored)?;
+    let source = object(merged)?;
+    let reaching = live.iter().chain(
+        later
+            .iter()
+            .filter(|field| matches!(apply_group(field.as_str()), ApplyGroup::NextSpawn)),
+    );
+    for field in reaching {
+        if let Some(value) = source.get(field) {
+            next.insert(field.clone(), value.clone());
+        }
+    }
+    let mut config: AppConfig =
+        serde_json::from_value(serde_json::Value::Object(next)).map_err(|err| err.to_string())?;
+    config.instances = instances;
+    normalize(config).map_err(|err| err.to_string())
+}
+
 /// One command's aggregation state: which ids are still outstanding, the
 /// terminal snapshots collected so far, and where to reply once `remaining`
 /// is empty.
@@ -2744,6 +3077,16 @@ impl<R: ProcessRunner> Actor<R> {
             }
             Command::Scale { name, count, reply } => {
                 self.handle_scale(&name, count, reply);
+                false
+            }
+            // Answered during a shutdown, like ConfigDrift and for the mirror
+            // of CRITICAL-1's reason: it registers nothing and starts nothing
+            // that a shutdown aggregation could miss. The one thing it does
+            // that CAN spawn is the instance count, which it declines to
+            // route while `shutting_down` -- see `handle_apply_config`.
+            Command::ApplyConfig { apps, reset, reply } => {
+                let report = self.handle_apply_config(apps, reset);
+                let _ = reply.send(Ok(report));
                 false
             }
             // Neither is rejected while `shutting_down`: a smit registers
@@ -3288,6 +3631,7 @@ impl<R: ProcessRunner> Actor<R> {
         let entry = ProcessEntry {
             id,
             spec: app.clone(),
+            pending: None,
             instance: 0,
             status,
             pid: None,
@@ -3407,6 +3751,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let entry = ProcessEntry {
                     id,
                     spec: app.clone(),
+                    pending: None,
                     instance,
                     status,
                     pid: Some(pid),
@@ -3483,6 +3828,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let entry = ProcessEntry {
                     id,
                     spec: app.clone(),
+                    pending: None,
                     instance,
                     status: ProcStatus::Errored,
                     pid: None,
@@ -3668,6 +4014,7 @@ impl<R: ProcessRunner> Actor<R> {
         let mut entry = ProcessEntry {
             id,
             spec: app.clone(),
+            pending: None,
             instance: carried.instance(),
             status,
             pid: carried.pid(),
@@ -4914,6 +5261,282 @@ impl<R: ProcessRunner> Actor<R> {
         }));
     }
 
+    /// Every registered id of `name`, in instance order.
+    ///
+    /// Not [`Self::matching_ids`] over a name selector: this is a lookup of
+    /// one app's own slots for a command that already holds the exact name a
+    /// config declares, where a selector's matching rules (folds, wildcards,
+    /// a slot suffix) would be a second way to answer the same question.
+    fn ids_of_name(&self, name: &str) -> Vec<u32> {
+        let mut slots: Vec<(u32, u32)> = self
+            .sheep
+            .iter()
+            .filter(|(_, slot)| slot.entry.spec.config().name == name)
+            .map(|(id, slot)| (slot.entry.instance, *id))
+            .collect();
+        slots.sort_unstable();
+        slots.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Merges each declared app into the sheep of the same name, one app at a
+    /// time.
+    ///
+    /// # What a load may not do
+    ///
+    /// Three things, and all three are what makes this safe to point at a
+    /// running flock:
+    ///
+    /// - **It never registers.** An app the file names and the flock does not
+    ///   have is reported and skipped. `shep start` is the verb that adds
+    ///   sheep, and a load that also started things would make a config
+    ///   template a way to start processes on a host by opening a pull
+    ///   request against the app.
+    /// - **It never prunes.** An app the file does not mention is left
+    ///   running, untouched and unmentioned. The daemon has no record of
+    ///   which Flockfile an app came from, so `shep start ./a/Flockfile.toml`
+    ///   followed by `./b/Flockfile.toml` would otherwise have the second
+    ///   wipe the first's flock.
+    /// - **It never kills.** A field the running child holds -- its argv, its
+    ///   environment, its log paths -- parks in [`ProcessEntry::pending`] and
+    ///   reaches the process at its next spawn. `spec` keeps describing what
+    ///   the child was actually spawned from, which is the only account of
+    ///   that anywhere.
+    ///
+    /// # Per app, in order
+    ///
+    /// Find the slots, read the override store, merge, normalize, then split
+    /// the drifted fields by [`apply_group`] and route each group. A merge
+    /// that does not normalize refuses that app whole and touches nothing,
+    /// leaving the rest of the file to apply: one bad app in a file of eleven
+    /// costing the other ten their load is the failure `BatchPolicy::PerApp`
+    /// already exists to avoid on the start path.
+    ///
+    /// The instance count is the one field that reshapes the flock rather
+    /// than changing a value, and it is routed through [`Self::handle_scale`]
+    /// rather than reimplemented: slot allocation, the dog refusal, the
+    /// reload-in-flight refusal, the still-departing refusal and the
+    /// partial-scale write-back are all that function's, and a second
+    /// spelling of them here is a second thing to keep in step. It is skipped
+    /// entirely while `shutting_down`, because a scale-up spawns, and
+    /// CRITICAL-1 forbids a child the shutdown aggregation cannot know about.
+    fn handle_apply_config(&mut self, apps: Vec<DeclaredApp>, reset: ResetDepth) -> Vec<Applied> {
+        apps.iter()
+            .map(|incoming| self.apply_one(incoming, reset))
+            .collect()
+    }
+
+    /// One app's half of [`Self::handle_apply_config`].
+    fn apply_one(&mut self, incoming: &DeclaredApp, reset: ResetDepth) -> Applied {
+        let name = incoming.config.name.clone();
+        let refuse = |message: String| Applied {
+            name: name.clone(),
+            applied: Vec::new(),
+            pending: Vec::new(),
+            refused: Some(message),
+            app: None,
+        };
+
+        let ids = self.ids_of_name(&name);
+        let Some(first) = ids.first().copied() else {
+            return refuse(format!(
+                "{name} is not registered; `shep start` it before a config can be applied to it"
+            ));
+        };
+        let stored = self.sheep[&first].entry.spec.config().clone();
+
+        // Read before anything is written, so an unreadable store costs this
+        // app nothing rather than half of a merge. The read is a locked file
+        // read on the actor's own thread, which is the same trade the muster
+        // roll's write already makes: bounded, rare, and the alternative is
+        // an apply that cannot see what the operator has set.
+        let overrides = match overrides::get(&self.paths.overrides, &name) {
+            Ok(overrides) => overrides.unwrap_or_default(),
+            Err(err) => return refuse(format!("overrides could not be read: {err}")),
+        };
+        let (merged, next_overrides) = match merge_declared(&stored, incoming, &overrides, reset) {
+            Ok(merged) => merged,
+            Err(message) => return refuse(message),
+        };
+        let merged = match normalize(merged) {
+            Ok(merged) => merged,
+            Err(err) => return refuse(err.to_string()),
+        };
+
+        let mut live = Vec::new();
+        let mut later = Vec::new();
+        let mut respawn = false;
+        let mut instances = false;
+        for field in stored.drifted_fields(merged.config()) {
+            match apply_group(&field) {
+                ApplyGroup::Live => live.push(field),
+                ApplyGroup::NextSpawn => later.push(field),
+                ApplyGroup::NeedsRespawn => {
+                    respawn = true;
+                    later.push(field);
+                }
+                // `name` cannot drift (the app was found BY it) and
+                // `increment_var` is refused by `normalize`, so `instances`
+                // is the only structural field that reaches here.
+                ApplyGroup::Structural => instances |= field == "instances",
+                // A group a later shep-core adds. Treated as the table's own
+                // fallback treats an unknown field: the conservative answer
+                // is that the running process does not have the new value.
+                _ => {
+                    respawn = true;
+                    later.push(field);
+                }
+            }
+        }
+
+        let mut refusals = Vec::new();
+        let mut count = stored.instances;
+        if instances {
+            if self.shutting_down {
+                refusals.push(
+                    "instances: the daemon is shutting down and cannot start one".to_string(),
+                );
+            } else {
+                let (reply, mut answer) = oneshot::channel();
+                self.handle_scale(&name, merged.config().instances, reply);
+                match answer
+                    .try_recv()
+                    .expect("handle_scale answers before it returns")
+                {
+                    Ok(scaled) => {
+                        count = scaled.achieved();
+                        if let Some(shortfall) = scaled.shortfall {
+                            refusals.push(format!("instances: {shortfall}"));
+                        }
+                    }
+                    // Refused whole rather than applied around: a scale is
+                    // refused when the app's SHAPE is already being changed by
+                    // something else (a reload, an earlier scale's departures),
+                    // and writing this file's other fields onto slots mid-move
+                    // is the divergence `handle_scale`'s own guards exist to
+                    // stop. The operator retries once the flock settles.
+                    Err(err) => return refuse(err.to_string()),
+                }
+            }
+        }
+
+        // Built from the STORED config rather than from the merge, plus only
+        // the fields that may reach a running process: a `NeedsRespawn` field
+        // written here would erase the record of what the child was actually
+        // spawned from, which nothing else keeps.
+        let next_spec = match reached_spec(&stored, merged.config(), &live, &later, count) {
+            Ok(spec) => spec,
+            Err(message) => return refuse(message),
+        };
+        // The whole merge, for a next spawn to pick up. Recomputed even when
+        // this load changed no `NeedsRespawn` field of its own, whenever an
+        // earlier load left one parked: that parked config predates this
+        // load's Live changes, and promoting it later would put them back.
+        let parked = if respawn || ids.iter().any(|id| self.sheep[id].entry.pending.is_some()) {
+            let mut config = merged.config().clone();
+            config.instances = count;
+            match normalize(config) {
+                Ok(parked) => Some(parked),
+                Err(err) => return refuse(err.to_string()),
+            }
+        } else {
+            None
+        };
+
+        // Re-read: a scale-up registered ids this app did not have a moment
+        // ago, and a scale-down deregistered some it did.
+        for id in self.ids_of_name(&name) {
+            let Some(slot) = self.sheep.get_mut(&id) else {
+                continue;
+            };
+            slot.entry.spec = next_spec.clone();
+            if let Some(parked) = parked.clone() {
+                slot.entry.pending = Some(parked);
+            }
+        }
+
+        if live
+            .iter()
+            .any(|field| EXTRAS_FIELDS.contains(&field.as_str()))
+        {
+            self.rearm_name(&name);
+        }
+
+        // Written last, and only for an app that got this far: the record
+        // says what this load established, and a load that refused
+        // established nothing.
+        let recorded = if matches!(reset, ResetDepth::All) {
+            overrides::remove(&self.paths.overrides, &name).map(|_| ())
+        } else {
+            overrides::put(&self.paths.overrides, &name, &next_overrides)
+        };
+        if let Err(err) = recorded {
+            refusals.push(format!("overrides could not be written: {err}"));
+        }
+
+        let mut applied = live;
+        if instances && count != stored.instances {
+            applied.push("instances".to_string());
+        }
+        applied.sort_unstable();
+        later.sort_unstable();
+        let mut app = merged;
+        if count != app.config().instances {
+            let mut config = app.config().clone();
+            config.instances = count;
+            match normalize(config) {
+                Ok(achieved) => app = achieved,
+                Err(err) => return refuse(err.to_string()),
+            }
+        }
+        Applied {
+            name,
+            applied,
+            pending: later,
+            refused: (!refusals.is_empty()).then(|| refusals.join("; ")),
+            app: Some(app),
+        }
+    }
+
+    /// Rebuilds every lifecycle extra armed for `name`, so a changed
+    /// [`EXTRAS_FIELDS`] value reaches the worker enforcing it.
+    ///
+    /// [`ExtrasRegistry::rearm_name`] rather than [`Self::arm_extras`] per
+    /// id: `arm` deliberately PRESERVES a live cron or watch task, which is
+    /// right for a reload's overlap and wrong here -- those tasks read
+    /// `watch`, `cron_restart` and their neighbours when they are built, so a
+    /// task that survives keeps the old values for as long as it lives.
+    ///
+    /// One prober for the whole name, built from the first instance's
+    /// assembled spec: every instance of an app shares its config, and a
+    /// prober is a `cwd` and an environment, both of which that config
+    /// decides.
+    fn rearm_name(&mut self, name: &str) {
+        let Some(extras) = self.extras.as_ref() else {
+            return;
+        };
+        // Constructed inline, as `arm_extras` does, so the registry can be
+        // borrowed mutably while the flock is read.
+        let supervisor = SupervisorHandle {
+            tx: self.tx.clone(),
+        };
+        let entries: Vec<&ProcessEntry> = self
+            .sheep
+            .values()
+            .filter(|slot| slot.entry.spec.config().name == name)
+            .map(|slot| &slot.entry)
+            .collect();
+        let Some(first) = entries.first() else {
+            return;
+        };
+        let credentials = match first.credentials {
+            SpawnIdentity::Resolved(credentials) => credentials,
+            SpawnIdentity::Unresolved => None,
+        };
+        let spec = assemble(&first.spec, first.instance, &self.paths, credentials);
+        self.registry
+            .rearm_name(name, &entries, spec_prober(&spec), extras, &supervisor);
+    }
+
     /// Accepts a reload: answers the caller at once, then starts one swap per
     /// matched app.
     ///
@@ -5342,6 +5965,7 @@ impl<R: ProcessRunner> Actor<R> {
                 let entry = ProcessEntry {
                     id: new_id,
                     spec: app.clone(),
+                    pending: None,
                     instance,
                     status: ProcStatus::Starting,
                     pid: Some(pid),
@@ -8972,7 +9596,7 @@ mod tests {
     use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
     use shep_core::protocol::DogSource;
     use shep_core::status::ProcStatus;
-    use shep_core::values::UpDuration;
+    use shep_core::values::{MemSize, UpDuration};
 
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
@@ -8991,6 +9615,10 @@ mod tests {
     // put the daemon's own reporter behind them.
     use crate::cron::{DEFAULT_MAX_CRON_SLEEP, SystemClock};
     use crate::extras::{ExtrasReports, spawn_extras_reporter};
+    // Test-only: the apply cases arm real extras over a recording enforcer,
+    // which needs the trait in scope to coerce it behind the `Arc<dyn ..>`
+    // `Extras` holds.
+    use crate::limits::LimitEnforcer;
     // Test-only: `SilentPumpRunner` counts the requests its pumps receive so
     // a case can order itself against the actor. Imported here rather than
     // beside the module's other `tokio::sync` uses, which do not need it.
@@ -18745,6 +19373,7 @@ mod tests {
         let mut entry = ProcessEntry {
             id,
             spec: normalize(app).unwrap(),
+            pending: None,
             instance: 0,
             status: ProcStatus::Online,
             pid,
@@ -18795,6 +19424,7 @@ mod tests {
         let entry = ProcessEntry {
             id,
             spec: normalize(app).unwrap(),
+            pending: None,
             instance: 0,
             status: ProcStatus::WaitingRestart,
             pid: None,
@@ -20449,5 +21079,466 @@ mod tests {
         app.listen_timeout = UpDuration::from_millis(200);
         mutate(&mut app);
         entry.spec = normalize(app).unwrap();
+    }
+
+    // --- `ApplyConfig`: a Flockfile merged onto a running flock ---
+    //
+    // Actor-tier, all but one of them, for the reason the drainee cases
+    // above are: what a load left behind is `spec`, `pending` and a pid that
+    // must not have moved, and no reply spelling reports those three
+    // together. The one exception arms real extras, and says so.
+
+    /// The pid the first fixture instance carries. Distinctive enough that a
+    /// test asserting the running child was left alone cannot be reading a
+    /// default.
+    const APPLY_FIRST_PID: u32 = 7100;
+
+    /// An actor over one `Online` instance of each app, plus the recording
+    /// enforcer its extras are armed against.
+    ///
+    /// The extras are real rather than `None` so a case can assert that a
+    /// changed ceiling reached the registry; nothing is armed at
+    /// construction, because no instance here went through `went_online`.
+    fn actor_over(
+        dir: &tempfile::TempDir,
+        apps: &[ResolvedApp],
+    ) -> (Actor<ScriptedRunner>, Arc<RecordingEnforcer>) {
+        let paths = test_paths(dir);
+        let mut sheep = HashMap::new();
+        for (index, app) in apps.iter().enumerate() {
+            let id = u32::try_from(index).expect("a fixture flock is small");
+            sheep.insert(
+                id,
+                SheepSlot {
+                    entry: armed_entry(id, 0, APPLY_FIRST_PID + id, app.clone(), &paths),
+                    ctl: None,
+                    log_ctl: None,
+                    to_child: None,
+                    signals: None,
+                    to_stdin: None,
+                    manual: None,
+                    pending_delete: false,
+                    epoch: 0,
+                    ready_tx: None,
+                    actions: ActionWaits::default(),
+                    ready_failed: false,
+                    restart_due: None,
+                },
+            );
+        }
+        let enforcer = Arc::new(RecordingEnforcer::default());
+        let (breach_tx, _breaches) = mpsc::channel(1);
+        let (live_tx, _liveness) = mpsc::channel(1);
+        let extras = Extras {
+            clock: Arc::new(SystemClock),
+            enforcer: Arc::clone(&enforcer) as Arc<dyn LimitEnforcer>,
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports: ExtrasReports {
+                breaches: breach_tx,
+                liveness: live_tx,
+            },
+            stats: idle_stats(),
+        };
+        let (events, _events_rx) = crate::bus::test_bus(64);
+        let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
+        let actor = Actor {
+            runner: ScriptedRunner::new(vec![]),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id: u32::try_from(apps.len()).expect("a fixture flock is small"),
+            next_deadline: 0,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: Some(extras),
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+            smits: Smits::new(),
+        };
+        (actor, enforcer)
+    }
+
+    /// A [`DeclaredApp`] whose document wrote exactly `keys`, plus every key
+    /// of its own `env` table when `keys` names `env`.
+    fn declared_app(config: AppConfig, keys: &[&str]) -> DeclaredApp {
+        let declared: BTreeSet<String> = keys.iter().map(|key| (*key).to_string()).collect();
+        let declared_env = if declared.contains("env") {
+            config.env.keys().cloned().collect()
+        } else {
+            BTreeSet::new()
+        };
+        DeclaredApp {
+            config,
+            declared,
+            declared_env,
+        }
+    }
+
+    /// The override record an earlier load of `keys` would have left, with
+    /// `fields` set since by an operator.
+    fn established(
+        keys: &[&str],
+        fields: Vec<(&str, serde_json::Value)>,
+    ) -> shep_core::overrides::AppOverrides {
+        shep_core::overrides::AppOverrides {
+            fields: fields
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            declared: keys.iter().map(|key| (*key).to_string()).collect(),
+            declared_env: BTreeSet::new(),
+        }
+    }
+
+    /// Drives one `ApplyConfig` through the actor.
+    ///
+    /// `handle_command` answers synchronously, before it returns, which is
+    /// what makes the `await` here resolve rather than hope (IR-46).
+    async fn apply_config(
+        actor: &mut Actor<ScriptedRunner>,
+        apps: Vec<DeclaredApp>,
+        reset: ResetDepth,
+    ) -> Vec<Applied> {
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::ApplyConfig { apps, reset, reply });
+        answer
+            .await
+            .expect("the actor answers an apply before it returns")
+            .expect("the fixture flock is registered")
+    }
+
+    /// fails if a later file load overwrites a key the operator set. Additive
+    /// is the default precisely because a Flockfile arrives from the app's own
+    /// repository, so a merged pull request must not be able to change a
+    /// running flock's config.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_load_does_not_overwrite_an_established_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&dir, &[app_with("web", |app| app.max_restarts = 3)]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script", "max_restarts"],
+                vec![("max_restarts", serde_json::json!(3))],
+            ),
+        )
+        .unwrap();
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 99;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().max_restarts,
+            3,
+            "the file overwrote a key the operator had set"
+        );
+        assert!(
+            reply[0].applied.is_empty(),
+            "nothing applied, so nothing may be reported as applied: {reply:?}"
+        );
+    }
+
+    /// fails if a key absent from the established set is not appended. This is
+    /// what makes a template update reach an app at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_load_appends_a_key_nobody_had_established() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(&["name", "script"], Vec::new()),
+        )
+        .unwrap();
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_memory = Some(MemSize::from_bytes(512 << 20));
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_memory"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().max_memory,
+            Some(MemSize::from_bytes(512 << 20)),
+            "a key nobody had established must be appended"
+        );
+        assert_eq!(reply[0].applied, vec!["max_memory".to_string()]);
+    }
+
+    /// fails if a Live field does not take effect on the stored spec.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_field_lands_on_the_stored_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 42;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(actor.sheep[&0].entry.spec.config().max_restarts, 42);
+        assert_eq!(reply[0].applied, vec!["max_restarts".to_string()]);
+        assert!(reply[0].pending.is_empty(), "{reply:?}");
+    }
+
+    /// fails if a NeedsRespawn field touches the running child rather than
+    /// parking. A load must never kill a process.
+    #[tokio::test(start_paused = true)]
+    async fn a_needs_respawn_field_parks_as_pending_and_leaves_the_child_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(
+            entry.pid,
+            Some(APPLY_FIRST_PID),
+            "the running child must not have been replaced"
+        );
+        assert!(
+            entry.spec.config().env.is_empty(),
+            "the running child's own config must keep describing what it was spawned from"
+        );
+        assert_eq!(
+            entry
+                .pending
+                .as_ref()
+                .expect("a NeedsRespawn change parks as pending")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue")
+        );
+        assert_eq!(reply[0].pending, vec!["env".to_string()]);
+        assert!(reply[0].applied.is_empty(), "{reply:?}");
+        assert_eq!(
+            reply[0]
+                .app
+                .as_ref()
+                .expect("an applied app is recorded")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "a reboot spawns everything afresh, so what it comes up on is the \
+             full merge and not what the running child is on"
+        );
+    }
+
+    /// fails if a merged config that cannot normalize is half-applied. An app
+    /// whose merge is invalid refuses whole; the rest of the flock still
+    /// applies.
+    #[tokio::test(start_paused = true)]
+    async fn an_unnormalizable_merge_refuses_one_app_and_applies_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&dir, &[app_with("web", |_| {}), app_with("worker", |_| {})]);
+
+        // Two instances sharing one explicit log path, with no `{{instance}}`
+        // in it and no `merge_logs`: the one refusal a merge can produce out
+        // of two individually-legal keys.
+        let mut broken = AppConfig::minimal("web", "./srv");
+        broken.instances = 2;
+        broken.out_file = Some("/tmp/web.log".to_string());
+        let mut worker = AppConfig::minimal("worker", "./srv");
+        worker.max_restarts = 7;
+
+        let reply = apply_config(
+            &mut actor,
+            vec![
+                declared_app(broken, &["name", "script", "instances", "out_file"]),
+                declared_app(worker, &["name", "script", "max_restarts"]),
+            ],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert!(
+            reply[0].refused.is_some(),
+            "an unnormalizable merge must refuse: {reply:?}"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().instances,
+            1,
+            "a refused app's stored config must be untouched"
+        );
+        assert!(actor.sheep[&0].entry.spec.config().out_file.is_none());
+        assert_eq!(actor.sheep[&1].entry.spec.config().max_restarts, 7);
+        assert_eq!(reply[1].applied, vec!["max_restarts".to_string()]);
+    }
+
+    /// fails if an app the file no longer mentions is deleted. A load never
+    /// prunes: the daemon has no record of which Flockfile an app came from,
+    /// so `shep start ./a/Flockfile.toml` followed by `./b/Flockfile.toml`
+    /// would have the second wipe the first's flock.
+    #[tokio::test(start_paused = true)]
+    async fn an_app_absent_from_the_file_is_left_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&dir, &[app_with("web", |_| {}), app_with("worker", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 5;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let worker = &actor.sheep[&1].entry;
+        assert_eq!(worker.spec.config().name, "worker");
+        assert_eq!(worker.status, ProcStatus::Online);
+        assert_eq!(worker.pid, Some(APPLY_FIRST_PID + 1));
+        assert!(
+            reply.iter().all(|applied| applied.name != "worker"),
+            "a load must not claim to have touched an app the file never named: {reply:?}"
+        );
+    }
+
+    /// fails if the reset depths do not differ. `--reset` restores settings
+    /// and leaves env; `--reset-all` restores everything and drops
+    /// operator-added keys.
+    #[tokio::test(start_paused = true)]
+    async fn reset_depths_differ_on_env_and_on_extras() {
+        // The operator's three edits since the file established name, script
+        // and max_restarts: one over a key the file declares, one env key and
+        // one field the file has never mentioned.
+        let stored = |name: &str| {
+            app_with(name, |app| {
+                app.max_restarts = 3;
+                app.env = BTreeMap::from([("OPERATOR".to_string(), "1".to_string())]);
+                app.min_uptime = UpDuration::from_millis(9000);
+            })
+        };
+        let record = || {
+            established(
+                &["name", "script", "max_restarts"],
+                vec![
+                    ("max_restarts", serde_json::json!(3)),
+                    ("env", serde_json::json!({ "OPERATOR": "1" })),
+                    ("min_uptime", serde_json::json!("9000ms")),
+                ],
+            )
+        };
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.max_restarts = 10;
+            declared_app(file, &["name", "script", "max_restarts"])
+        };
+
+        let settings_dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&settings_dir, &[stored("web")]);
+        shep_core::overrides::put(&actor.paths.overrides, "web", &record()).unwrap();
+        apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+        let settings = actor.sheep[&0].entry.spec.config().clone();
+        let settings_pending = actor.sheep[&0].entry.pending.clone();
+        assert_eq!(
+            settings.max_restarts, 10,
+            "--reset puts a declared setting back to the file's"
+        );
+        assert_eq!(
+            settings.min_uptime,
+            UpDuration::from_millis(9000),
+            "--reset keeps a field the file never declared"
+        );
+        assert_eq!(
+            settings_pending
+                .as_ref()
+                .map_or(&settings.env, |app| &app.config().env)
+                .get("OPERATOR")
+                .map(String::as_str),
+            Some("1"),
+            "--reset keeps env"
+        );
+
+        let all_dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&all_dir, &[stored("web")]);
+        shep_core::overrides::put(&actor.paths.overrides, "web", &record()).unwrap();
+        apply_config(&mut actor, vec![file()], ResetDepth::All).await;
+        let all = actor.sheep[&0].entry.spec.config().clone();
+        let all_pending = actor.sheep[&0].entry.pending.clone();
+        assert_eq!(all.max_restarts, 10);
+        assert_eq!(
+            all.min_uptime,
+            AppConfig::default().min_uptime,
+            "--reset-all drops a field the operator added"
+        );
+        assert!(
+            all_pending
+                .as_ref()
+                .expect("dropping an env key needs a respawn")
+                .config()
+                .env
+                .is_empty(),
+            "--reset-all drops an env key the operator added"
+        );
+        assert!(
+            shep_core::overrides::get(&actor.paths.overrides, "web")
+                .unwrap()
+                .is_none(),
+            "--reset-all removes the override record"
+        );
+    }
+
+    /// fails if a changed memory ceiling never reaches the extras registry.
+    /// `max_memory`, `watch` and the cron pair are read when a worker is
+    /// ARMED, so a spec write alone leaves the old value enforced for as long
+    /// as that arming lives.
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_extras_field_rearms_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(100 << 20));
+            })],
+        );
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_memory = Some(MemSize::from_bytes(512 << 20));
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_memory"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            enforcer
+                .arms()
+                .last()
+                .expect("a changed ceiling re-arms the name")
+                .limit,
+            MemSize::from_bytes(512 << 20),
+            "the registry was re-armed with the old ceiling"
+        );
     }
 }

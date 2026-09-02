@@ -1496,6 +1496,7 @@ mod tests {
         ProcessEntry {
             id: 1,
             spec,
+            pending: None,
             instance: 0,
             status: ProcStatus::Online,
             pid: Some(100),

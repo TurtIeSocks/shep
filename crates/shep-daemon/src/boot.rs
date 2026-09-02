@@ -4151,6 +4151,7 @@ mod tests {
         let mut entry = crate::entry::ProcessEntry {
             id: 1,
             spec: normalize(AppConfig::minimal(name, "./srv")).unwrap(),
+            pending: None,
             instance: 0,
             status: shep_core::status::ProcStatus::Online,
             pid: Some(4242),

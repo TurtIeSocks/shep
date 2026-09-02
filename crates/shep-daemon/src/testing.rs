@@ -583,6 +583,7 @@ pub(crate) fn armed_entry(
     ProcessEntry {
         id,
         spec: app,
+        pending: None,
         instance,
         status: ProcStatus::Online,
         pid: Some(pid),

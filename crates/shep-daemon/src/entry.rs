@@ -19,6 +19,13 @@ pub struct ProcessEntry {
     pub id: u32,
     /// Resolved application spec
     pub spec: ResolvedApp,
+    /// The config a file load left for this sheep's next spawn.
+    ///
+    /// `None` for every sheep outside the window between a load that changed
+    /// a `NeedsRespawn` field and the restart that picks it up. `spec` keeps
+    /// describing what the running child was spawned from, which is the only
+    /// account of that anywhere; overwriting it would erase it.
+    pub pending: Option<ResolvedApp>,
     /// Instance number within the app (for clustered apps, 0..instances-1)
     pub instance: u32,
     /// Current lifecycle status
