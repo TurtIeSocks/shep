@@ -389,6 +389,10 @@ pub(crate) enum Command {
         id: u32,
         /// The pid the report was raised against, used as a generation token.
         pid: u32,
+        /// The liveness epoch the reporting probe was armed under, or `None`
+        /// for a memory breach, which has nothing equivalent that can go
+        /// stale; see `Actor::handle_extra_restart`'s third guard.
+        epoch: Option<u64>,
     },
     /// Replaces every matched sheep with a fresh instance, one instance of
     /// each app at a time.
@@ -1054,10 +1058,10 @@ impl SupervisorHandle {
     /// like [`Self::restart_automatic`] it goes in as
     /// `CommandOrigin::Automatic` — displaceable by an operator's command,
     /// and reported on the bus with `manually: false`.
-    pub(crate) async fn extra_restart(&self, id: u32, pid: u32) {
+    pub(crate) async fn extra_restart(&self, id: u32, pid: u32, epoch: Option<u64>) {
         let _ = self
             .tx
-            .send(Msg::Command(Command::ExtraRestart { id, pid }))
+            .send(Msg::Command(Command::ExtraRestart { id, pid, epoch }))
             .await;
     }
 
@@ -2856,8 +2860,8 @@ impl<R: ProcessRunner> Actor<R> {
                 }
                 false
             }
-            Command::ExtraRestart { id, pid } => {
-                self.handle_extra_restart(id, pid);
+            Command::ExtraRestart { id, pid, epoch } => {
+                self.handle_extra_restart(id, pid, epoch);
                 false
             }
             // Rejected while `shutting_down` for CRITICAL-1's reason, the
@@ -6999,10 +7003,11 @@ impl<R: ProcessRunner> Actor<R> {
     }
 
     /// A memory breach or a liveness failure asked for a restart. Guarded the
-    /// same way `RestartDue` is, on the **pid** rather than the epoch — the
-    /// epoch lives on the private [`SheepSlot`], while the pid is already on
-    /// both reports and is just as good a generation token (`None` while not
-    /// running, different after every respawn):
+    /// same way `RestartDue` is, on the **pid** rather than [`SheepSlot`]'s
+    /// own respawn epoch: the pid is already on both reports and is just as
+    /// good a generation token for a RESPAWN (`None` while not running,
+    /// different after every respawn). It says nothing about a probe
+    /// replaced without a respawn, which is guard 5 below:
     ///
     /// 1. NOT shutting down — a graceful shutdown forbids any new spawn.
     ///    Defence in depth, and deliberately untested rather than tested by a
@@ -7035,6 +7040,20 @@ impl<R: ProcessRunner> Actor<R> {
     ///    above is this guard's alone, so it is not redundant; a drainee is
     ///    covered twice over, and that is the right amount for the one case
     ///    where getting it wrong ends the instance being replaced.
+    /// 5. For a liveness report only (`epoch.is_some()`): the reporting
+    ///    probe's own epoch still matching `ExtrasRegistry::liveness_epoch`.
+    ///    `InstanceExtras::disarm` calls `liveness.abort()`, which does not
+    ///    await the aborted task, so a probe already inside
+    ///    `failures.send(..).await` when it is replaced can still deliver its
+    ///    failure after a fresh probe is already running against the SAME
+    ///    pid in the SAME `Online` status; a config-only re-arm changes
+    ///    neither, so guards 3 and 4 both pass it. Without this, changing any
+    ///    config field on a sheep with a `liveness_probe` could restart it,
+    ///    and a config apply must never kill a process. `None` (a memory
+    ///    breach) skips this guard entirely rather than being checked against
+    ///    it: `PollingEnforcer` is one shared long-lived task that reads the
+    ///    CURRENT registered pid and threshold fresh on every tick, so there
+    ///    is no equivalent in-flight task whose report can go stale this way.
     ///
     /// Delegates to `begin_manual` rather than `respawn`: that keeps the kill
     /// ladder, the marker rule, the `pending_delete` interaction and the budget
@@ -7044,7 +7063,7 @@ impl<R: ProcessRunner> Actor<R> {
     /// It goes in as [`CommandOrigin::Automatic`], which is what lets an
     /// operator's `stop` or `delete` take the sheep back off a restart already
     /// mid-ladder — see `claim_manual`.
-    fn handle_extra_restart(&mut self, id: u32, pid: u32) {
+    fn handle_extra_restart(&mut self, id: u32, pid: u32, epoch: Option<u64>) {
         if self.shutting_down {
             tracing::debug!(id, pid, "extra restart dropped: engine is shutting down");
             return;
@@ -7070,6 +7089,30 @@ impl<R: ProcessRunner> Actor<R> {
                 "extra restart dropped: the sheep is no longer online"
             );
             return;
+        }
+        // A fifth guard, and the two above cannot stand in for it. A probe
+        // replaced because its CONFIG changed leaves the pid and the status
+        // exactly as they were, so a failure already in flight from the
+        // aborted task passes both. `liveness.abort()` does not await, so
+        // that in-flight failure is a real case and not a theoretical one.
+        // Without this, changing any config field on a sheep with a liveness
+        // probe could restart it, and a config apply must never kill a
+        // process. `epoch` is `None` for a memory breach, which has no
+        // per-instance task that can go stale this way (see
+        // `spawn_extras_reporter`'s breach arm), so this guard never applies
+        // to it.
+        if let Some(epoch) = epoch {
+            let current = self.registry.liveness_epoch(id);
+            if current != epoch {
+                tracing::debug!(
+                    id,
+                    pid,
+                    epoch,
+                    current,
+                    "extra restart dropped: the reporting probe has been replaced"
+                );
+                return;
+            }
         }
         // A throwaway reply: `send_reply` already ignores a closed receiver,
         // and there is nobody to answer — the reporter is fire-and-forget by
@@ -8935,8 +8978,8 @@ mod tests {
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
     use crate::testing::{
-        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, harness, idle_stats,
-        probe_config, test_paths,
+        Harness, RecordingEnforcer, ScriptedProber, SharedRunner, app_with, armed_entry, harness,
+        idle_stats, probe_config, test_paths,
     };
     // Only `a_restart_that_starts_nothing_says_why_in_the_log` uses this,
     // and that test is unix-only: its second route drives an unresolvable
@@ -10574,7 +10617,7 @@ mod tests {
         // Both sends land in the same mailbox in this order, so the actor sets
         // the restart's marker and starts its ladder before it ever sees the
         // stop -- no second task and no yielding needed.
-        handle.extra_restart(running.id, pid).await;
+        handle.extra_restart(running.id, pid, None).await;
         let stopped = handle.stop(ProcessSelector::All).await.unwrap();
 
         assert_eq!(stopped.len(), 1);
@@ -10619,7 +10662,7 @@ mod tests {
         let running = handle.list().await.remove(0);
         let pid = running.pid.expect("an online sheep has a pid");
 
-        handle.extra_restart(running.id, pid).await;
+        handle.extra_restart(running.id, pid, None).await;
         let deleted = handle
             .delete(ProcessSelector::Id(running.id))
             .await
@@ -10800,7 +10843,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut actor, mut ctl_rx) = actor_with_stopping_drainee(&dir, 4242, 0);
 
-        actor.handle_extra_restart(0, 4242);
+        actor.handle_extra_restart(0, 4242, None);
 
         let slot = actor.sheep.get(&0).expect("the sheep stays registered");
         assert_eq!(
@@ -10815,6 +10858,142 @@ mod tests {
         assert!(
             ctl_rx.try_recv().is_err(),
             "a Stopping sheep must never receive a second Kill"
+        );
+    }
+
+    /// fails if a liveness failure from an ABORTED probe can still restart a
+    /// sheep. A config-only re-arm changes neither the pid nor the status, so
+    /// `handle_extra_restart`'s first two guards both pass and the sheep is
+    /// restarted by a probe that no longer exists. A config apply must never
+    /// kill a process.
+    ///
+    /// `slot.manual` is this test's observable, not the restart count or the
+    /// pid the brief's own sketch reaches for: this actor is driven directly
+    /// rather than through a running supervisor, so nothing here ever
+    /// actually kills or respawns the (nonexistent) child. `begin_manual`
+    /// claiming `slot.manual` is the synchronous, always-observable proof
+    /// that guard 5 let a restart through, matching
+    /// `a_stopping_sheep_rejects_an_extra_restart` right above, which asserts
+    /// the same field for the same reason.
+    #[tokio::test]
+    async fn a_stale_liveness_failure_from_a_replaced_probe_does_not_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.liveness_probe = Some(ProbeConfig {
+            failure_threshold: 1,
+            ..probe_config(ProbeKind::Tcp, "localhost:5432")
+        });
+        let app = normalize(app).unwrap();
+        let pid = 1111;
+        let entry = armed_entry(0, 0, pid, app, &paths);
+        // A live `ctl`, unlike `actor_with_one_online_sheep`'s fixture: guard
+        // 5 is meant to stop `begin_manual` from claiming a marker and
+        // queuing a `Kill` on a sheep that really is running, and
+        // `begin_manual_ids` reads `ctl.is_some()` to decide it is. Without
+        // one this case would take the "already stopped" synchronous path
+        // instead and prove nothing about the guard under test.
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(1);
+        let mut sheep = HashMap::new();
+        sheep.insert(
+            0,
+            SheepSlot {
+                entry,
+                ctl: Some(ctl_tx),
+                log_ctl: None,
+                to_child: None,
+                signals: None,
+                to_stdin: None,
+                manual: None,
+                pending_delete: false,
+                epoch: 0,
+                ready_tx: None,
+                actions: ActionWaits::default(),
+                ready_failed: false,
+                restart_due: None,
+            },
+        );
+        let (events, _events_rx) = crate::bus::test_bus(16);
+        let (tx, _mailbox) = mpsc::channel(16);
+        let mut actor = Actor {
+            runner: ScriptedRunner::new(vec![]),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id: 1,
+            next_deadline: 0,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+            smits: Smits::new(),
+        };
+        let entry = actor
+            .sheep
+            .get(&0)
+            .expect("the fixture registers id 0")
+            .entry
+            .clone();
+
+        let supervisor = SupervisorHandle {
+            tx: actor.tx.clone(),
+        };
+        let (breach_tx, _breaches) = mpsc::channel(1);
+        let (live_tx, _liveness) = mpsc::channel(1);
+        let extras = Extras {
+            clock: Arc::new(SystemClock),
+            enforcer: Arc::new(RecordingEnforcer::default()),
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports: ExtrasReports {
+                breaches: breach_tx,
+                liveness: live_tx,
+            },
+            stats: idle_stats(),
+        };
+        // Never fails on its own: this test drives the epoch mismatch
+        // directly rather than waiting on a real probe to raise one.
+        let prober: Arc<dyn Prober> = Arc::new(ScriptedProber::new(vec![]));
+
+        // Arm the entry's liveness probe; the epoch it gets is the STALE
+        // one this test will feed back in.
+        actor
+            .registry
+            .arm(&entry, Arc::clone(&prober), &extras, &supervisor);
+        let stale_epoch = actor.registry.liveness_epoch(0);
+
+        // The config changes: re-arm the SAME id. Neither the pid nor the
+        // status moves, but the epoch does.
+        actor.registry.arm(&entry, prober, &extras, &supervisor);
+        assert_ne!(
+            actor.registry.liveness_epoch(0),
+            stale_epoch,
+            "a re-arm must advance the epoch"
+        );
+
+        // A failure from the now-replaced probe, carrying the epoch it was
+        // armed under, the CURRENT pid and status Online.
+        actor.handle_extra_restart(0, pid, Some(stale_epoch));
+
+        let slot = actor.sheep.get(&0).expect("the sheep stays registered");
+        assert!(
+            slot.manual.is_none(),
+            "a stale liveness failure from a replaced probe must never claim the manual marker"
+        );
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "a stale liveness failure from a replaced probe must never queue a Kill"
+        );
+        assert_eq!(
+            slot.entry.restarts, 0,
+            "a dropped report must never bump the restart count"
+        );
+        assert_eq!(
+            slot.entry.pid,
+            Some(pid),
+            "a dropped report must never touch the running pid"
         );
     }
 
@@ -13092,7 +13271,7 @@ mod tests {
         )
         .await;
         let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
-        handle.extra_restart(0, pid).await;
+        handle.extra_restart(0, pid, None).await;
 
         let reloaded = handle
             .reload(ProcessSelector::Name("web".to_string()))
@@ -13157,7 +13336,7 @@ mod tests {
             .await
             .expect("the reload is accepted");
         expect_event(&mut rx, 1, ProcessEventKind::Start).await;
-        handle.extra_restart(0, pid).await;
+        handle.extra_restart(0, pid, None).await;
 
         // `Restart`, not `Delete`, and the difference is the whole assertion:
         // the bug kills the drainee and RESPAWNS it into a slot its
@@ -17833,7 +18012,7 @@ mod tests {
                             if let Some(first) = handle.list().await.first()
                                 && let Some(pid) = first.pid
                             {
-                                handle.extra_restart(first.id, pid).await;
+                                handle.extra_restart(first.id, pid, None).await;
                             }
                         }
                         Step::StaleReport => {
@@ -17843,7 +18022,7 @@ mod tests {
                                 // sheep would be just as stale here: the guard
                                 // compares against THIS id's entry.
                                 let stale = first.pid.unwrap_or(0).wrapping_add(1);
-                                handle.extra_restart(first.id, stale).await;
+                                handle.extra_restart(first.id, stale, None).await;
                             }
                         }
                         Step::List => {}

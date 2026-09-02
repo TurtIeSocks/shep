@@ -49,6 +49,27 @@ use crate::watch::{
     DEFAULT_WATCH_DELAY, MIN_WATCH_DELAY, WatchFilter, own_log_ignores, spawn_watch_group,
 };
 
+/// A [`LivenessFailure`] paired with the epoch its probe was armed under.
+///
+/// `InstanceExtras::disarm` calls `liveness.abort()`, which does not await
+/// the aborted task: a probe already inside `failures.send(..).await` when
+/// it is replaced (a config-only re-arm, which changes neither the pid nor
+/// the status the two older guards check) can still deliver its failure
+/// after a fresh probe is already running against the same process. This
+/// carries the epoch [`ExtrasRegistry::arm`] captured when THIS probe was
+/// spawned, so `Actor::handle_extra_restart` can tell that stale failure
+/// apart from a genuine one raised by the CURRENT probe, even though pid and
+/// status agree on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LivenessReport {
+    /// The sheep's id.
+    pub id: u32,
+    /// The pid this loop was armed against.
+    pub pid: u32,
+    /// The epoch the reporting probe was armed under.
+    pub epoch: u64,
+}
+
 /// Where the lifecycle extras send the two out-of-band failure reports.
 ///
 /// The matching receivers belong to the reporting task, never to the actor.
@@ -57,7 +78,7 @@ pub struct ExtrasReports {
     /// Memory-limit breaches, from the enforcer.
     pub breaches: mpsc::Sender<LimitBreach>,
     /// Sheep whose liveness probe hit `failure_threshold`.
-    pub liveness: mpsc::Sender<LivenessFailure>,
+    pub liveness: mpsc::Sender<LivenessReport>,
 }
 
 /// The four lifecycle extras, the seams they run on, and where their two
@@ -163,7 +184,7 @@ impl fmt::Debug for Extras {
 /// reporting task immediately.
 pub fn spawn_extras_reporter(
     mut breaches: mpsc::Receiver<LimitBreach>,
-    mut liveness: mpsc::Receiver<LivenessFailure>,
+    mut liveness: mpsc::Receiver<LivenessReport>,
     supervisor: SupervisorHandle,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -185,18 +206,28 @@ pub fn spawn_extras_reporter(
                             limit = %breach.limit,
                             "process tree exceeded its max_memory; restarting"
                         );
-                        supervisor.extra_restart(breach.id, breach.root_pid).await;
+                        // No epoch to carry: a memory breach has nothing
+                        // equivalent to a probe task that can be aborted
+                        // mid-`send`. `PollingEnforcer` is one shared
+                        // long-lived task that reads the CURRENT registered
+                        // pid and threshold fresh on every tick, so a re-arm
+                        // takes effect before the next sample rather than
+                        // racing a task already in flight (see
+                        // `PollingEnforcer::start`).
+                        supervisor.extra_restart(breach.id, breach.root_pid, None).await;
                     }
                     None => breaches_open = false,
                 },
                 maybe_failure = liveness.recv(), if liveness_open => match maybe_failure {
-                    Some(failure) => {
+                    Some(report) => {
                         tracing::warn!(
-                            id = failure.id,
-                            pid = failure.pid,
+                            id = report.id,
+                            pid = report.pid,
                             "liveness probe hit its failure_threshold; restarting"
                         );
-                        supervisor.extra_restart(failure.id, failure.pid).await;
+                        supervisor
+                            .extra_restart(report.id, report.pid, Some(report.epoch))
+                            .await;
                     }
                     None => liveness_open = false,
                 },
@@ -218,6 +249,31 @@ pub struct ExtrasRegistry {
     /// One instance's per-pid extras, keyed by sheep id. Present only while
     /// at least one of them is armed.
     instances: HashMap<u32, InstanceExtras>,
+    /// The epoch each id's liveness probe is CURRENTLY armed under, bumped
+    /// every time [`Self::arm`] (re)arms an id, whether or not that id
+    /// configures a `liveness_probe` at all, so an app that adds one later
+    /// never inherits a stale count from before it did.
+    ///
+    /// Deliberately not the supervisor's own private `SheepSlot::epoch`: that
+    /// one is bumped on a RESPAWN, when the pid changes, which is exactly
+    /// the case `Actor::handle_extra_restart`'s existing pid guard already
+    /// catches. This counter answers a narrower question a pid check
+    /// cannot: has THIS id's liveness probe been replaced without the
+    /// process underneath it changing at all, the case a config-only re-arm
+    /// produces. Overloading the respawn epoch for that would either bump it
+    /// on every config change too (a respawn-generation counter moving
+    /// without a respawn) or leave a config-only re-arm unable to move it at
+    /// all, so this is a second counter rather than a second use of the
+    /// first.
+    ///
+    /// Lives on the registry, not on `SheepSlot`, because that is the one
+    /// type that already knows when a liveness probe is actually replaced:
+    /// `SheepSlot` has no visibility into an arming `ExtrasRegistry::arm`
+    /// performs, and `rearm_name` (this registry's own config-only re-arm)
+    /// has no visibility into `SheepSlot` the other way. Keeping the counter
+    /// where the arming decision is made avoids two structs that would
+    /// otherwise need to agree on it.
+    liveness_epochs: HashMap<u32, u64>,
 }
 
 /// One name-group's per-name tasks, plus the armed instances keeping them
@@ -328,7 +384,16 @@ impl ExtrasRegistry {
         let id = entry.id;
 
         self.disarm_instance(id);
-        if let Some(instance) = arm_instance(entry, prober, extras) {
+        // Bumped unconditionally, ahead of `arm_instance` even for an entry
+        // configuring no `liveness_probe` at all; see
+        // `Self::liveness_epochs`'s doc for why this lives here rather than
+        // on `SheepSlot`. `arm_instance` only ever reads it for a probe it is
+        // about to spawn, so an id that never arms a probe pays nothing for
+        // an epoch nothing consults.
+        let liveness_epoch = self.liveness_epochs.entry(id).or_insert(0);
+        *liveness_epoch += 1;
+        let liveness_epoch = *liveness_epoch;
+        if let Some(instance) = arm_instance(entry, prober, extras, liveness_epoch) {
             self.instances.insert(id, instance);
         }
 
@@ -385,6 +450,14 @@ impl ExtrasRegistry {
     /// is needed and none is available.
     pub fn disarm(&mut self, id: u32, name: &str) {
         self.disarm_instance(id);
+        // Not inside `disarm_instance`: `Self::arm` calls that first and
+        // would otherwise reset the very counter it is about to bump,
+        // pinning every id's epoch at 1 forever and defeating the whole
+        // point of it. This is the FULL teardown (a sheep going terminal),
+        // so nothing left in `self.sheep` will ever compare against `id`
+        // again; removing it here is hygiene against an unbounded map on a
+        // daemon that runs for months, not a correctness requirement.
+        self.liveness_epochs.remove(&id);
 
         let Some(group) = self.groups.get_mut(name) else {
             return;
@@ -460,6 +533,15 @@ impl ExtrasRegistry {
             instance.disarm(id);
         }
     }
+
+    /// The epoch `id`'s liveness probe is CURRENTLY armed under, or `0` for
+    /// an id that has never been armed. `Actor::handle_extra_restart` drops a
+    /// [`LivenessReport`] whose own epoch does not match this, which is what
+    /// tells a failure raised by a since-replaced probe apart from one raised
+    /// by the probe running now.
+    pub(crate) fn liveness_epoch(&self, id: u32) -> u64 {
+        self.liveness_epochs.get(&id).copied().unwrap_or(0)
+    }
 }
 
 impl Drop for ExtrasRegistry {
@@ -499,6 +581,7 @@ fn arm_instance(
     entry: &ProcessEntry,
     prober: Arc<dyn Prober>,
     extras: &Extras,
+    liveness_epoch: u64,
 ) -> Option<InstanceExtras> {
     let config = entry.spec.config();
     let wants_anything = config.max_memory.is_some() || config.liveness_probe.is_some();
@@ -528,13 +611,37 @@ fn arm_instance(
     if let Some(probe) = config.liveness_probe.as_ref() {
         match ProbeTarget::parse(probe) {
             Ok(target) => {
+                // `spawn_liveness_task` only ever knows `LivenessFailure`;
+                // it lives in `probes`, which has no business knowing about
+                // an epoch this module invented. So the probe reports into a
+                // private one-shot channel instead of `extras.reports`
+                // directly, and this relay tags the single failure it may
+                // ever produce (the probe's own doc: it reports once, then
+                // ends) with the epoch THIS probe was spawned under, before
+                // forwarding it on to the shared reporter. Capturing the
+                // epoch here rather than reading it back off the registry at
+                // delivery time is the whole point: by delivery time a
+                // config-only re-arm may already have moved it on.
+                let (raw_tx, mut raw_rx) = mpsc::channel::<LivenessFailure>(1);
+                let reports_liveness = extras.reports.liveness.clone();
+                tokio::spawn(async move {
+                    if let Some(failure) = raw_rx.recv().await {
+                        let _ = reports_liveness
+                            .send(LivenessReport {
+                                id: failure.id,
+                                pid: failure.pid,
+                                epoch: liveness_epoch,
+                            })
+                            .await;
+                    }
+                });
                 instance.liveness = Some(spawn_liveness_task(
                     entry.id,
                     pid,
                     probe.clone(),
                     target,
                     prober,
-                    extras.reports.liveness.clone(),
+                    raw_tx,
                 ));
             }
             Err(err) => {
@@ -759,7 +866,7 @@ mod tests {
         extras: Extras,
         enforcer: Arc<RecordingEnforcer>,
         clock: Arc<TestClock>,
-        liveness: mpsc::Receiver<LivenessFailure>,
+        liveness: mpsc::Receiver<LivenessReport>,
         _breaches: mpsc::Receiver<LimitBreach>,
     }
 
@@ -924,9 +1031,9 @@ mod tests {
     }
 
     async fn expect_liveness(
-        rx: &mut mpsc::Receiver<LivenessFailure>,
+        rx: &mut mpsc::Receiver<LivenessReport>,
         window: Duration,
-    ) -> LivenessFailure {
+    ) -> LivenessReport {
         match tokio::time::timeout(window, rx.recv()).await {
             Ok(Some(failure)) => failure,
             Ok(None) => panic!("the liveness channel closed before a failure arrived"),
@@ -937,7 +1044,7 @@ mod tests {
     /// Waits up to `window` for a liveness failure, panicking if one arrives.
     /// A bounded `timeout` + `recv` for the same reason as
     /// [`assert_no_restart_within`].
-    async fn assert_no_liveness_within(rx: &mut mpsc::Receiver<LivenessFailure>, window: Duration) {
+    async fn assert_no_liveness_within(rx: &mut mpsc::Receiver<LivenessReport>, window: Duration) {
         match tokio::time::timeout(window, rx.recv()).await {
             Err(_) => {} // window elapsed with nothing arriving — expected
             Ok(Some(failure)) => panic!("unexpected liveness failure observed: {failure:?}"),
@@ -1634,7 +1741,11 @@ mod tests {
         let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
         assert_eq!(
             failure,
-            LivenessFailure { id: 8, pid: 5678 },
+            LivenessReport {
+                id: 8,
+                pid: 5678,
+                epoch: 1
+            },
             "only the registry that is still alive may report"
         );
         assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
@@ -1739,7 +1850,11 @@ mod tests {
         let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
         assert_eq!(
             failure,
-            LivenessFailure { id: 1, pid: 1001 },
+            LivenessReport {
+                id: 1,
+                pid: 1001,
+                epoch: 1
+            },
             "only the instance that is still armed may report"
         );
         assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
@@ -1778,7 +1893,14 @@ mod tests {
         );
 
         let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
-        assert_eq!(failure, LivenessFailure { id: 7, pid: 1234 });
+        assert_eq!(
+            failure,
+            LivenessReport {
+                id: 7,
+                pid: 1234,
+                epoch: 1
+            }
+        );
         // The scripted prober repeats its last outcome forever, so a loop
         // that kept probing after reporting would report again inside this
         // window.
@@ -1878,7 +2000,20 @@ mod tests {
         let (live_tx, live_rx) = mpsc::channel(4);
         let _reporter = spawn_extras_reporter(breach_rx, live_rx, handle.clone());
 
-        live_tx.send(LivenessFailure { id: 0, pid }).await.unwrap();
+        // `spawn_test_fixture` wires no `Extras` at all, so the actor's own
+        // registry never arms anything and its epoch for id 0 stays at the
+        // default `0` `ExtrasRegistry::liveness_epoch` reports for an id it
+        // has never seen. This report is injected straight past the
+        // (nonexistent) real probe, so it has to agree with that default
+        // rather than with the `1` a real arm would produce.
+        live_tx
+            .send(LivenessReport {
+                id: 0,
+                pid,
+                epoch: 0,
+            })
+            .await
+            .unwrap();
 
         let (info, manually) = expect_restart_event(&mut rx, "web", EVENT_WAIT).await;
         assert_eq!(info.id, 0);
@@ -1899,7 +2034,7 @@ mod tests {
         let (handle, _rx, _fixture) = spawn_test_fixture();
         handle.start(vec![app_with("web", |_| {})]).await.unwrap();
 
-        handle.extra_restart(99, 4242).await;
+        handle.extra_restart(99, 4242, None).await;
 
         assert_eq!(
             handle.list().await.len(),
@@ -1935,7 +2070,7 @@ mod tests {
         );
         let pid = listing[0].pid.expect("a spawned sheep has a pid");
 
-        handle.extra_restart(0, pid).await;
+        handle.extra_restart(0, pid, None).await;
 
         assert_no_restart_within(&mut rx, "web", Duration::from_secs(30)).await;
         assert_eq!(handle.list().await[0].restarts, 0);
@@ -2536,7 +2671,14 @@ mod tests {
             .expect("a live sheep has a pid");
 
         let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
-        assert_eq!(failure, LivenessFailure { id: 0, pid });
+        assert_eq!(
+            failure,
+            LivenessReport {
+                id: 0,
+                pid,
+                epoch: 1
+            }
+        );
     }
 
     /// fails if re-arming leaves the old group tasks running. `arm` deliberately
@@ -3281,9 +3423,10 @@ mod tests {
             let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
             assert_eq!(
                 failure,
-                LivenessFailure {
+                LivenessReport {
                     id: 1,
-                    pid: instance_one_pid
+                    pid: instance_one_pid,
+                    epoch: 1,
                 },
                 "only the instance whose own marker is missing may report"
             );
