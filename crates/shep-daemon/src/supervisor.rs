@@ -2695,19 +2695,25 @@ pub(crate) struct Applied {
     /// Why some or all of this app's change did not land, in the daemon's own
     /// words, or `None` when the whole of it did.
     ///
-    /// **Empty `applied` and `pending` alongside this is the promise that the
-    /// app was not touched at all**, and it is a promise: every refusal that
-    /// can answer it is raised before [`Actor::apply_one`] routes the
-    /// instance count, which is the only thing in a load that reshapes a
-    /// flock. Those are the flock having no app of this name, the override
-    /// store being unreadable, a merged config that does not normalize, and a
-    /// scale `handle_scale` itself refused (all of whose refusals precede
-    /// anything it spawns or removes).
+    /// Four refusals mean the app was not touched at all, and they are the
+    /// four raised before [`Actor::apply_one`] routes the instance count,
+    /// which is the only thing in a load that reshapes a flock: the flock has
+    /// no app of this name, the override store is unreadable, the merged
+    /// config does not normalize, or `handle_scale` itself refused the scale
+    /// (all of whose refusals precede anything it spawns or removes). All
+    /// four leave [`Self::applied`] and [`Self::pending`] empty.
     ///
-    /// Anything discoverable only after that point is reported HERE while the
-    /// two lists still carry what did land: a partial scale-up's shortfall, a
-    /// count a plain load declined to reshape, a store that could not be
-    /// written.
+    /// **The two empty lists are not themselves that promise**, because two
+    /// later refusals produce the same shape without meaning it: a load whose
+    /// only change was a `NeedsRespawn` field that could not be parked, and a
+    /// plain load whose only declared change was the instance count it
+    /// declines to reshape. Read the message, which names what happened in
+    /// every case; the shape does not tell them apart.
+    ///
+    /// Everything discoverable only after the count is routed is reported
+    /// HERE while the two lists still carry what did land: a partial
+    /// scale-up's shortfall, a count a plain load declined to reshape, a
+    /// change that could not be parked, a store that could not be written.
     pub(crate) refused: Option<String>,
     /// The merged, normalized app. `rpc.rs` hands this to
     /// `FlockRegistry::record`, the way the `Scale` arm hands it
@@ -2839,6 +2845,7 @@ fn merge_declared(
             // The file speaks for this key now, so the operator's override of
             // it is spent rather than kept to be re-applied on the next load.
             next.fields.remove(key);
+            next.declared.insert(key.clone());
             file.get(key)
         } else if matches!(reset, ResetDepth::All) {
             defaults.get(key)
@@ -2902,7 +2909,14 @@ fn merge_declared(
     // file: a key this file has stopped declaring is still a key somebody
     // once established, and a later load must not be able to re-appear with
     // a new value for it under a depth that promises to overwrite nothing.
-    next.declared.extend(incoming.declared.iter().cloned());
+    //
+    // It records what this load actually TOOK from the file, not everything
+    // the file declared, and the two differ: a key held out of scope was not
+    // established by this load, and marking it so would establish a value
+    // that never landed. Every such key is added at its own arm above, next
+    // to the assignment that earns it. `instances` under a plain load is the
+    // standing example -- that depth never reshapes a flock, so the count
+    // stays whatever it was and the file has established nothing about it.
     next.declared_env
         .extend(incoming.declared_env.iter().cloned());
 
@@ -5500,10 +5514,11 @@ impl<R: ProcessRunner> Actor<R> {
             .as_ref()
             .map_or_else(|| running.clone(), |parked| parked.config().clone());
 
-        let (merged, next_overrides) = match merge_declared(&intended, incoming, overrides, reset) {
-            Ok(merged) => merged,
-            Err(message) => return refuse(message),
-        };
+        let (merged, mut next_overrides) =
+            match merge_declared(&intended, incoming, overrides, reset) {
+                Ok(merged) => merged,
+                Err(message) => return refuse(message),
+            };
         let merged = match normalize(merged) {
             Ok(merged) => merged,
             Err(err) => return refuse(err.to_string()),
@@ -5643,15 +5658,6 @@ impl<R: ProcessRunner> Actor<R> {
             self.rearm_name(&name);
         }
 
-        // Handed to the caller rather than written here, so one file costs
-        // one lock. Recorded only for an app that got this far: the record
-        // says what this load established, and a load that refused
-        // established nothing.
-        changes.insert(
-            name.clone(),
-            (!matches!(reset, ResetDepth::All)).then_some(next_overrides),
-        );
-
         // `autostart` is the one `NextSpawn` field that reports as APPLIED.
         // It is read by `restorable()` at muster or boot rather than at a
         // spawn, so it is in force the moment it lands on the stored spec,
@@ -5678,13 +5684,59 @@ impl<R: ProcessRunner> Actor<R> {
         } else {
             respawn.clone()
         };
-        if !unparked.is_empty() {
+        // Unconditional on `parked_failed`, never on `unparked` being
+        // non-empty. The two come apart: `parked_wanted` is also set by an
+        // EARLIER load having left a config parked, so a load whose only
+        // drift is a Live field can fail to rebuild that parked config while
+        // having no field of its own to name. It reported success, and the
+        // stale parked config then reverts this load's Live change at the
+        // next respawn -- the exact thing the rebuild exists to prevent.
+        if parked_failed {
+            let what = if unparked.is_empty() {
+                "an earlier load's parked config could not be rebuilt, so a respawn will put \
+                 its values back"
+                    .to_string()
+            } else {
+                format!(
+                    "{} could not be parked for a next spawn",
+                    unparked.join(", ")
+                )
+            };
             refusals.push(format!(
-                "{} could not be parked for a next spawn: the merged config does not hold at \
-                 {count} instance(s)",
-                unparked.join(", ")
+                "{what}: the merged config does not hold at {count} instance(s)"
             ));
         }
+        // A field that went nowhere was established by nobody, so this app's
+        // record goes back to what it was for each of them. Without this the
+        // high-water mark absorbs the refused key, and an operator who reads
+        // the refusal and retries the identical file gets silence: the second
+        // load finds the key established, holds it out of scope, and reports
+        // nothing to do.
+        for field in &unparked {
+            match overrides.fields.get(field) {
+                Some(previous) => next_overrides
+                    .fields
+                    .insert(field.clone(), previous.clone()),
+                None => next_overrides.fields.remove(field),
+            };
+            if !overrides.declared.contains(field) {
+                next_overrides.declared.remove(field);
+            }
+            if field == "env" {
+                next_overrides
+                    .declared_env
+                    .clone_from(&overrides.declared_env);
+            }
+        }
+
+        // Handed to the caller rather than written here, so one file costs
+        // one lock. Recorded only for an app that got this far: the record
+        // says what this load established, and a load that refused
+        // established nothing.
+        changes.insert(
+            name.clone(),
+            (!matches!(reset, ResetDepth::All)).then_some(next_overrides),
+        );
         let (mut applied, mut pending): (Vec<String>, Vec<String>) = if park_all {
             // Nothing reached the running instances at all, so nothing may be
             // reported as applied.
@@ -22391,5 +22443,104 @@ mod tests {
         assert!(actor.sheep[&0].entry.spec.config().out_file.is_none());
         assert!(actor.sheep[&0].entry.pending.is_none());
         assert_eq!(actor.ids_of_name("web").len(), 2);
+    }
+
+    /// fails if a load that could not rebuild an earlier load's parked config
+    /// reports success. `parked_wanted` is set by an earlier parked config as
+    /// well as by this load's own `NeedsRespawn` drift, so a load whose only
+    /// drift is a LIVE field can fail the rebuild with no field of its own to
+    /// name -- and a refusal keyed on having a field to name says nothing at
+    /// all. The stale parked config then puts the old value back at the next
+    /// respawn, which is the exact thing the rebuild exists to prevent.
+    ///
+    /// Reachable whenever the instance count moved between two loads, which
+    /// `shep stock` and a `--reset` load both do.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_config_that_cannot_be_rebuilt_is_reported_even_with_no_field_to_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        // Parked when the app ran ONE instance: a shared explicit log path is
+        // legal for one and refused for the two running now.
+        let earlier = app_with("web", |app| {
+            app.instances = 1;
+            app.max_restarts = 10;
+            app.out_file = Some("/tmp/web.log".to_string());
+        });
+        for id in [0, 1] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers two")
+                .entry
+                .pending = Some(earlier.clone());
+        }
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 99;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(actor.sheep[&0].entry.spec.config().max_restarts, 99);
+        assert!(
+            reply[0].refused.is_some(),
+            "a respawn is going to put max_restarts back to 10 and nobody was told: {reply:?}"
+        );
+        assert_eq!(
+            actor.sheep[&0]
+                .entry
+                .pending
+                .as_ref()
+                .expect("the earlier parked config is still there")
+                .config()
+                .max_restarts,
+            10,
+            "and that is what makes the refusal true"
+        );
+    }
+
+    /// fails if a key whose apply refused is recorded as established. The
+    /// store's `declared` set is what `ResetDepth::None` skips over, so a
+    /// refused key entering it makes the refusal's own advice useless: the
+    /// operator retries the identical file and gets silence rather than the
+    /// same refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_key_is_not_established_so_the_same_file_still_tries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        let earlier = app_with("web", |app| app.instances = 1);
+        for id in [0, 1] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers two")
+                .entry
+                .pending = Some(earlier.clone());
+        }
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.out_file = Some("/tmp/web.log".to_string());
+            declared_app(file, &["name", "script", "out_file"])
+        };
+
+        let first = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert!(first[0].refused.is_some(), "{first:?}");
+
+        let second = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert!(
+            second[0].refused.is_some(),
+            "a retry of the same file must meet the same refusal, not silence: {second:?}"
+        );
+        assert!(
+            !shep_core::overrides::get(&actor.paths.overrides, "web")
+                .unwrap()
+                .expect("the load recorded what it established")
+                .declared
+                .contains("out_file"),
+            "a key that went nowhere was established by nobody"
+        );
     }
 }
