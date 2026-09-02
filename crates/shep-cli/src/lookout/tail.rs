@@ -78,12 +78,13 @@ pub struct TailLine {
 pub struct Tail {
     /// The newest lines, oldest first — `out`'s tail, then `err`'s.
     ///
-    /// **There is no merge, and that is stated rather than hidden.** A log
-    /// line does now carry the time the daemon wrote it, so a key exists —
-    /// but nothing here reads it, and until something does, guessing an order
-    /// from file order would be wrong exactly when a sheep writes to both at
-    /// once. `bleats`' module doc records the same limitation for the same
-    /// reason. The pane renders the LAST rows of this
+    /// **There is no merge, and that is stated rather than hidden.** The
+    /// files carry a per-line timestamp, so a key exists on disk — but this
+    /// reader strips it (a line has to mean the same thing here as on the
+    /// bus) and nothing merges on one. Until something does, guessing an
+    /// order from file order would be wrong exactly when a sheep writes to
+    /// both at once. `bleats`' module doc records the same limitation for the
+    /// same reason. The pane renders the LAST rows of this
     /// list, so a crash on stderr survives a chatty stdout — and its header
     /// says `out then err` rather than `out+err`, because `+` reads as one
     /// merged stream and this is two files end to end.

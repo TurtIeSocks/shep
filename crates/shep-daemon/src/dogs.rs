@@ -1326,7 +1326,22 @@ pub(crate) async fn narrate(events: &Bus, info: &ProcessInfo, message: &str) {
         // about the dog.
         if let Ok(mut file) = crate::tokio_runner::open_append(Path::new(path)).await {
             use tokio::io::AsyncWriteExt as _;
-            if let Err(error) = file.write_all(written.as_bytes()).await {
+            // The flush is not optional and not belt-and-braces.
+            // `tokio::fs::File` copies into its own buffer and hands the real
+            // `write(2)` to the blocking pool, so `write_all` returning means
+            // the bytes were ACCEPTED, not that they reached the file — and
+            // the type does not flush on drop, which is stated in tokio's own
+            // docs. Without this, the line is written on a best-effort basis
+            // and is lost outright often enough for a test reading the file
+            // straight afterwards to catch it. That would be the original
+            // defect all over again: shep with something to say and an empty
+            // log where it should have said it.
+            let written = async {
+                file.write_all(written.as_bytes()).await?;
+                file.flush().await
+            }
+            .await;
+            if let Err(error) = written {
                 tracing::warn!(
                     dog = %info.name,
                     %error,

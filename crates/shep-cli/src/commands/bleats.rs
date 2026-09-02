@@ -44,11 +44,13 @@
 //! **The ordering limitation is real and is stated, not hidden.** Within one
 //! file, lines print in file order (append order, chronological). Across a
 //! sheep's two files there is no merge: `out_file` prints in full, then
-//! `err_file` starts. A log line now carries the time the daemon wrote it,
-//! so a merge key exists — but nothing here merges on one yet, and until
-//! something does, guessing an order from file order would be wrong exactly
-//! when a sheep writes to both streams at once: seeing all of `out` before
-//! any of `err` must not be read as "everything on stdout happened first".
+//! `err_file` starts. The FILES now carry the time shep wrote each line, so
+//! a merge key exists on disk — but [`read_tail`] strips it before anything
+//! here sees a line (a line has to mean the same thing as it does on the
+//! bus), and nothing merges on one. Until something does, guessing an order
+//! from file order would be wrong exactly when a sheep writes to both
+//! streams at once: seeing all of `out` before any of `err` must not be read
+//! as "everything on stdout happened first".
 //! `--out`/`--err` sidestep the seam by reducing a sheep to the one file that
 //! matters. `--follow` has no such limitation: the bus delivers in arrival
 //! order, which is chronological across both streams.

@@ -98,10 +98,15 @@ stderr  /tmp/shepdocs/home/logs/shepd.err.log  emptied`;
       time with the offset spelled out:{" "}
       <code>2026-09-02T14:22:31.412+02:00 the sheep said this</code>. The
       stamp is always the same 30 characters wide, so anything that wants the
-      sheep's own bytes back cuts the first 30. It is a property of the file
-      and not of the stream — the bus carries the sheep's line untouched,
-      which is what <code>shep bleats --follow</code> and any dog subscribed
-      to <code>log.*</code> read.
+      sheep's own bytes back cuts the first 30.
+    </p>
+    <p class="fine">
+      It's a property of the file, not of the stream, and shep's own readers
+      treat it that way: <code>shep bleats</code> strips it whether it reads
+      the file or follows the bus, so a line means the same thing either way
+      and <code>--format json</code> reports the sheep's own bytes. The stamp
+      is there for <code>tail</code>, <code>less</code>, <code>grep</code>,
+      and a rotated archive nobody can date any other way.
     </p>
     <p class="fine">
       Every handle is opened append-only, and a symlink sitting at the path
@@ -155,11 +160,11 @@ stderr  /tmp/shepdocs/home/logs/shepd.err.log  emptied`;
       follow has nothing left to hear. And within one file lines print in
       append order, but across a sheep's two files there is no merge:{" "}
       <code>out_file</code> prints in full, then <code>err_file</code>{" "}
-      starts. A log line carries the time shep wrote it, but nothing merges
-      the two files on it yet, so seeing all of stdout before any of stderr
-      must not be read as everything on stdout having happened first.
-      Following has no such seam, because the bus delivers in arrival
-      order.
+      starts. The files carry a per-line timestamp, but{" "}
+      <code>bleats</code> strips it when it reads one and nothing merges the
+      two files on it, so seeing all of stdout before any of stderr must not
+      be read as everything on stdout having happened first. Following has no
+      such seam, because the bus delivers in arrival order.
     </Callout>
     <p class="fine">
       The tail is bounded twice: <code>--lines</code> lines, found within the
