@@ -34,6 +34,9 @@ pub(crate) struct Outbox {
 }
 
 impl Outbox {
+    /// `capacity` bounds how many messages `push_lossy` will hold before it
+    /// starts discarding. Zero is legal: nothing is ever retained, so every
+    /// lossy push is immediately counted as a drop.
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -57,7 +60,16 @@ impl Outbox {
         if inner.closed {
             return;
         }
+        if self.capacity == 0 {
+            // Nothing is ever retained at zero capacity, so the message
+            // being pushed is exactly what gets dropped. Count it and stop,
+            // rather than evicting nothing and queueing past capacity.
+            inner.dropped = inner.dropped.saturating_add(1);
+            return;
+        }
         if inner.queue.len() >= self.capacity {
+            // `capacity >= 1` here, so `len >= capacity` means the queue is
+            // non-empty and this always evicts a real message.
             inner.queue.pop_front();
             inner.dropped = inner.dropped.saturating_add(1);
         }
@@ -228,5 +240,20 @@ mod tests {
         outbox.push_lossy(metric(1.0));
         assert_eq!(outbox.pop(), None);
         assert_eq!(outbox.dropped(), 0);
+    }
+
+    /// fails if a zero-capacity outbox either under-counts the drop or
+    /// queues past its own capacity. `dropped()` is what an app reads to
+    /// judge whether the shepherd is keeping up, so it must count exactly
+    /// what it discards -- and closing before `pop()` is what keeps this
+    /// test from blocking on an empty, open outbox.
+    #[test]
+    fn a_zero_capacity_outbox_counts_the_drop_and_retains_nothing() {
+        let outbox = Outbox::new(0);
+        outbox.push_lossy(metric(1.0));
+        assert_eq!(outbox.dropped(), 1);
+
+        outbox.close();
+        assert_eq!(outbox.pop(), None);
     }
 }
