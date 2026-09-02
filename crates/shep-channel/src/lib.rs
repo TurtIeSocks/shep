@@ -48,6 +48,11 @@ pub enum ChannelError {
     Unusable(String),
     /// The writer has stopped and the message was not queued.
     Closed,
+    /// This process already took its shepherd channel. A second
+    /// [`Channel::open`] call returns this instead of taking the inherited
+    /// descriptor a second time, which would produce two values that both
+    /// believe they own it.
+    AlreadyTaken,
 }
 
 #[cfg(feature = "client")]
@@ -58,6 +63,9 @@ impl core::fmt::Display for ChannelError {
             Self::Malformed(message) => write!(f, "malformed shepherd-channel frame: {message}"),
             Self::Unusable(what) => write!(f, "unusable shepherd channel: {what}"),
             Self::Closed => f.write_str("the shepherd channel is closed"),
+            Self::AlreadyTaken => f.write_str(
+                "the shepherd channel has already been taken by this process and can only be taken once",
+            ),
         }
     }
 }
@@ -74,7 +82,7 @@ impl core::error::Error for ChannelError {
 
 /// The channel with no threads: you own the loop.
 ///
-/// [`serve`] is the other road and the documented default, because it
+/// `serve` is the other road and the documented default, because it
 /// answers the messages you did not register a handler for. Reach for this
 /// when your app already has an event loop and wants the channel inside it.
 #[cfg(feature = "client")]
@@ -89,11 +97,18 @@ pub struct Channel {
 impl Channel {
     /// Opens this process's channel, or `Ok(None)` when it has none.
     ///
+    /// At most one channel exists per process. A second call does not take
+    /// the inherited descriptor again -- which would produce two values
+    /// that both believe they own it -- it returns
+    /// [`ChannelError::AlreadyTaken`] instead.
+    ///
     /// # Errors
     ///
     /// - [`ChannelError::Unusable`] when the environment names a channel
     ///   that cannot be opened here.
     /// - [`ChannelError::Io`] when the transport cannot be opened.
+    /// - [`ChannelError::AlreadyTaken`] when this process already took its
+    ///   channel.
     pub fn open() -> Result<Option<Self>, ChannelError> {
         let found = endpoint::discover()?;
         if found == endpoint::Endpoint::Absent {
