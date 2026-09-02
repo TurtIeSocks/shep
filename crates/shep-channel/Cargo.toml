@@ -23,7 +23,15 @@ default = ["client"]
 client = ["dep:serde_json"]
 
 [dependencies]
-serde.workspace = true
+# `features = ["std"]` is load-bearing, not tidiness. The workspace pins serde
+# with `default-features = false`, and both enums here are internally tagged
+# (`#[serde(tag = "kind")]`), whose derive expands to serde's Content
+# machinery -- `TaggedContentVisitor` and friends -- which lives behind
+# serde/std. Without this the crate compiles only when something else in the
+# graph happens to enable serde/std, which `--no-default-features` is exactly
+# the check for. A member may raise a workspace dependency's features; it may
+# not lower them.
+serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, optional = true }
 
 [lints]
