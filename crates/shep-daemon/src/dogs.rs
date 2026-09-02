@@ -47,7 +47,7 @@ use shep_core::status::ProcStatus;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
-use crate::bus::SharedEvent;
+use crate::bus::{Bus, SharedEvent};
 use crate::supervisor::SupervisorHandle;
 
 /// One dog the daemon knows about: its name, and where its binary comes from.
@@ -281,6 +281,7 @@ pub async fn spawn_enabled_dogs(
     specs: &[DogSpec],
     paths: &ShepPaths,
     supervisor: &SupervisorHandle,
+    events: &Bus,
 ) {
     for spec in specs {
         let app = match dog_app(spec, paths) {
@@ -290,12 +291,31 @@ pub async fn spawn_enabled_dogs(
                 continue;
             }
         };
+        // Read before `start_dog` takes the app. This is the one place that
+        // knows which file a dog's spawn actually resolved to — a built-in
+        // dog's is this shep's own binary, an adopted one's is whatever the
+        // operator's `[dog.<name>]` named — and an operator reading the
+        // dog's log during an upgrade is usually asking exactly that.
+        let script = app.config().script.clone();
         match supervisor.start_dog(app, spec.source.clone()).await {
             Ok(info) if info.dog.is_none() => tracing::warn!(
                 dog = %spec.name,
                 "a sheep is already registered under this name; the dog did not start"
             ),
-            Ok(_) => {}
+            Ok(info) => {
+                // `start_dog` is idempotent by name, so this reply may be a
+                // dog that was already running rather than one just spawned
+                // — which is why the wording is about the binary this
+                // shepherd resolved and not about a spawn having happened.
+                // `spawn_dog_watch` narrates the spawns, off the bus, where
+                // that distinction is not a guess.
+                narrate(
+                    events,
+                    &info,
+                    &format!("shep has this dog enabled, running the binary at {script}"),
+                )
+                .await;
+            }
             Err(err) => tracing::warn!(dog = %spec.name, %err, "a dog did not start"),
         }
     }
@@ -450,10 +470,16 @@ impl DogRefusals {
     ///
     /// A dog that is talking to this daemon is not stale by any definition
     /// this daemon can apply, whatever happened before.
-    pub fn handshook(&self, name: &str) {
+    ///
+    /// Answers whether this CHANGED anything — whether the dog was not
+    /// already marked as having got in. A dog reconnects, and often; the
+    /// caller writes a line into that dog's own log the first time this
+    /// shepherd hears from it, and a boolean is what keeps that from
+    /// becoming one line per reconnect for the life of the daemon.
+    pub fn handshook(&self, name: &str) -> bool {
         let mut seen = self.lock();
         seen.refusals.remove(name);
-        seen.handshook.insert(name.to_string());
+        seen.handshook.insert(name.to_string())
     }
 
     /// Whether `name` has handshook with this daemon and not been refused
@@ -897,7 +923,7 @@ pub(crate) fn silent_dogs(infos: &[ProcessInfo], refusals: &DogRefusals) -> Vec<
 /// [`DogRefusals`]'s is: the map holds dog names and instants, and a dog's
 /// name is a `[dog.<name>]` KEY rather than one of its values.
 #[derive(Debug, Default)]
-struct SilentDogs {
+pub(crate) struct SilentDogs {
     /// One instant per dog currently silent. A name absent from the map is a
     /// dog that was talking, stopped, or deleted at the last look.
     first_seen: BTreeMap<String, Instant>,
@@ -935,10 +961,11 @@ impl SilentDogs {
 ///
 /// Returns what it acted on, which is what its tests assert against; the
 /// loop that calls it discards the answer.
-async fn check_silent_dogs(
+pub(crate) async fn check_silent_dogs(
     supervisor: &SupervisorHandle,
     refusals: &DogRefusals,
     contacts: &PeerContacts,
+    events: &Bus,
     seen: &mut SilentDogs,
     now: Instant,
 ) -> Vec<(String, Refusal)> {
@@ -956,7 +983,7 @@ async fn check_silent_dogs(
         // whatever holds the name by the time the message is written.
         let info = infos.iter().find(|info| info.name == name);
         let evidence = Silence::of(info.and_then(|info| info.pid), contacts);
-        let verdict = record_silent_dog(&name, evidence, refusals, supervisor).await;
+        let verdict = record_silent_dog(&name, info, evidence, refusals, events, supervisor).await;
         acted.push((name, verdict));
     }
     acted
@@ -1046,19 +1073,33 @@ impl Silence {
 /// its own log without end.
 async fn record_silent_dog(
     name: &str,
+    info: Option<&ProcessInfo>,
     evidence: Silence,
     refusals: &DogRefusals,
+    events: &Bus,
     supervisor: &SupervisorHandle,
 ) -> Refusal {
     let verdict = refusals.refused(name);
     match verdict {
         Refusal::Restart => {
+            let seen = first_rung_evidence(evidence);
             tracing::warn!(
                 dog = %name,
                 silent_for_secs = DOG_SILENCE_BUDGET.as_secs(),
-                evidence = %first_rung_evidence(evidence),
+                evidence = %seen,
                 "a dog has been running without ever answering this shepherd; restarting it once from the binary on disk"
             );
+            if let Some(info) = info {
+                narrate(
+                    events,
+                    info,
+                    &format!(
+                        "this dog has been running for {}s without ever answering this shepherd: {seen}. Restarting it once from the binary on disk",
+                        DOG_SILENCE_BUDGET.as_secs()
+                    ),
+                )
+                .await;
+            }
             // Awaited rather than spawned, which is the one difference from
             // `record_refused_dog`: that caller is a connection handler
             // holding a socket, and this one is a background loop with
@@ -1067,11 +1108,16 @@ async fn record_silent_dog(
             // judged mid-restart.
             restart_refused_dog(supervisor, name).await;
         }
-        Refusal::Stale => tracing::error!(
-            dog = %name,
-            "{}",
-            stale_verdict(name, evidence)
-        ),
+        Refusal::Stale => {
+            let verdict = stale_verdict(name, evidence);
+            tracing::error!(dog = %name, "{verdict}");
+            // Into the dog's OWN log as well, because that is the file the
+            // verdict tells the operator to read. Before this it could not
+            // hold a word of the reason it was being read for.
+            if let Some(info) = info {
+                narrate(events, info, &verdict).await;
+            }
+        }
         // Unreachable through this path, because `silent_dogs` filters a
         // stale dog out before it can be seen quiet again. Kept as a real
         // arm anyway: it is the honest thing to do with a rung the ladder
@@ -1188,6 +1234,7 @@ pub fn spawn_silent_dog_watch(
     supervisor: SupervisorHandle,
     refusals: DogRefusals,
     contacts: PeerContacts,
+    events: Bus,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(DOG_SILENCE_POLL);
@@ -1198,9 +1245,159 @@ pub fn spawn_silent_dog_watch(
         let mut seen = SilentDogs::default();
         loop {
             let now = ticks.tick().await;
-            check_silent_dogs(&supervisor, &refusals, &contacts, &mut seen, now).await;
+            check_silent_dogs(&supervisor, &refusals, &contacts, &events, &mut seen, now).await;
         }
     })
+}
+
+/// The marker every line shep writes into a dog's own log begins with, once
+/// the timestamp is past.
+///
+/// A dog's log is the dog's voice, and an operator reading it is entitled to
+/// assume every line came from the process they started. Shep now writes
+/// into that file too, so the file has to say which lines are whose.
+///
+/// Short and bracketed because it sits at the head of a line already
+/// carrying a 30-character timestamp, and an operator scanning a long file
+/// has to be able to pick these out without reading them. A dog that emits
+/// `[shep]` at the start of a line of its own is impersonating the shepherd
+/// in its own log, which is its problem rather than something this can
+/// defend against.
+const SHEP_VOICE: &str = "[shep]";
+
+/// Writes one line of shep's own narration into `info`'s log, and publishes
+/// it to whoever is following that log live.
+///
+/// # Why this exists
+///
+/// Every message about the incident this subsystem was rebuilt for went to
+/// `shepd.err.log`. The dog's own log — the file shep's own error message
+/// told the operator to read — could not contain a word of it. So `shep
+/// bleats log-rotate` showed a dog repeating itself into an empty room, and
+/// nothing about why shep had given up on it.
+///
+/// # Why it writes the file directly rather than through the pump
+///
+/// The pump owns a buffered handle and forwards what it writes to the bus,
+/// so routing narration through it would put both halves in one place. It
+/// is not used, for one reason that decides it: the pump ends when its
+/// sheep's streams reach EOF, so the last thing there is to say about a dog
+/// — how it exited — arrives after the only thing that could write it is
+/// gone. A narration that silently vanished for exactly the events worth
+/// narrating would be worse than none.
+///
+/// Writing directly is safe because of the property [`open_append`]
+/// documents at length: `O_APPEND` makes every write seek to end atomically,
+/// which is what already lets several instances share one log file. The
+/// whole line is assembled and written in one call for that reason. It also
+/// inherits `O_NOFOLLOW` and the ancestry check from that same function, so
+/// narration cannot be redirected through a planted symlink any more than a
+/// sheep's own output can.
+///
+/// The cost is ordering, and it is named rather than hidden: a narration
+/// line can land ahead of dog output that was appended earlier and is still
+/// in the pump's buffer, which is bounded by `IDLE_FLUSH` at 50 ms. The
+/// timestamps say which came first even when the file order does not.
+///
+/// # The live half
+///
+/// [`Bus::publish_log`] is the same call a sheep's own line takes to reach
+/// `shep bleats --follow`, so a follower sees the narration interleaved
+/// with the dog's output in arrival order, marked exactly as the file marks
+/// it. It carries the marker but not the timestamp: the stamp is a property
+/// of the file (see `LOG_TIMESTAMP_FORMAT`), and a follower is watching the
+/// line arrive.
+///
+/// A dog with no `err_file` — a peer daemon predating the field, in a
+/// listing this daemon did not resolve — still gets the live half. Nothing
+/// is logged about the missing path: it is not a failure, it is a listing
+/// that did not carry one.
+pub(crate) async fn narrate(events: &Bus, info: &ProcessInfo, message: &str) {
+    let line = format!("{SHEP_VOICE} {message}");
+    if let Some(path) = &info.err_file {
+        let mut written = String::with_capacity(line.len() + 32);
+        crate::tokio_runner::stamp_into(&mut written);
+        written.push_str(&line);
+        written.push('\n');
+        // A failed open is already logged by `open_append`, with the path
+        // and the OS error; there is nothing this could add. A failed write
+        // is not, so it is reported here — and neither is propagated,
+        // because a log shep cannot write to must not change what shep does
+        // about the dog.
+        if let Ok(mut file) = crate::tokio_runner::open_append(Path::new(path)).await {
+            use tokio::io::AsyncWriteExt as _;
+            if let Err(error) = file.write_all(written.as_bytes()).await {
+                tracing::warn!(
+                    dog = %info.name,
+                    %error,
+                    "shep's own narration did not reach this dog's log"
+                );
+            }
+        }
+    }
+    events.publish_log(BusEvent::LogErr { id: info.id, line });
+}
+
+/// [`narrate`], for a caller that knows a dog's NAME and not its listing.
+///
+/// Spawned rather than awaited, and that is the reason this is a second
+/// function rather than a parameter. Both callers are connection handlers
+/// mid-handshake: one is about to send an ack the dog is waiting on, and
+/// the other has a refusal already queued behind it. Neither may be held up
+/// by a listing round trip and a file open, and neither has anything to do
+/// with the answer.
+///
+/// A name that does not resolve to a dog is silently nothing. By the time
+/// this runs the dog may have been stopped, deleted, or replaced by a sheep
+/// of the same name; narrating into whatever holds the name now would be a
+/// worse answer than saying nothing.
+pub(crate) fn narrate_by_name(
+    supervisor: &SupervisorHandle,
+    events: &Bus,
+    name: &str,
+    message: String,
+) {
+    let supervisor = supervisor.clone();
+    let events = events.clone();
+    let name = name.to_string();
+    tokio::spawn(async move {
+        let Ok(infos) = supervisor.list_checked().await else {
+            return;
+        };
+        if let Some(info) = infos
+            .iter()
+            .find(|info| info.name == name && info.dog.is_some())
+        {
+            narrate(&events, info, &message).await;
+        }
+    });
+}
+
+/// How a dog's process stopped existing, in the plainest words there are.
+///
+/// A signal number rather than a name, which is the rule
+/// [`ExitInfo::signal`](shep_core::protocol::ExitInfo::signal) states for
+/// itself: the number is what the OS reported, and shep-core deliberately
+/// carries no table to turn it into `SIGKILL`. The daemon is an OS-aware
+/// layer and could, but a dog's log is read next to `journalctl`, and one
+/// spelling in both places is worth more than a nicer one in this.
+fn exit_words(info: &ProcessInfo) -> String {
+    match info.last_exit {
+        Some(exit) => match (exit.code, exit.signal) {
+            (Some(code), _) => format!("this dog's process exited with code {code}"),
+            (None, Some(signal)) => {
+                format!("this dog's process was killed by signal {signal}")
+            }
+            (None, None) => {
+                "this dog's process stopped, and the OS reported neither an exit code nor a signal"
+                    .to_string()
+            }
+        },
+        // Reachable rather than defensive: `last_exit` is `None` when the
+        // peer that built this listing predates the field, and a successor
+        // reading a carried entry can see one.
+        None => "this dog's process stopped, and this shepherd has no record of how".to_string(),
+    }
 }
 
 /// Watches the bus and records, locally, every enabled dog that exhausts
@@ -1210,6 +1407,14 @@ pub fn spawn_silent_dog_watch(
 /// sinks and no webhook code, by design. What it can guarantee is a local
 /// trail, so an operator reading `shep barks` after an outage finds the
 /// moment alerting stopped rather than a gap they have to infer.
+///
+/// It also writes a dog's own spawn and exit into that dog's log, in shep's
+/// voice (see [`narrate`]). Read from the bus rather than from the two
+/// places that cause them, and for the same reason the bark record above is:
+/// a `Start` on the bus is a spawn that really happened, while a call site
+/// answering `Ok` covers `start_dog`'s idempotent no-op as well, and the
+/// pump that could have carried an exit is already ending when the exit
+/// fires.
 ///
 /// A bus WATCHER rather than a branch inside the supervisor, and the
 /// distinction is the phase's own tripwire: this answers *who should see
@@ -1223,27 +1428,50 @@ pub fn spawn_silent_dog_watch(
 /// than dependent on sender count.
 pub fn spawn_dog_watch(
     mut events: broadcast::Receiver<SharedEvent>,
+    publish: Bus,
     barks: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match events.recv().await {
-                // Only a DOG's Errored is this watcher's business. A sheep's
+                // Only a DOG's Errored earns a bark record. A sheep's
                 // Errored is bark's job — bark writes those records over its
                 // own client connection — and duplicating that write here
                 // would leave one event with two authors in one file. Exit
-                // is excluded too: it fires on every restart a dog survives,
-                // and a `barks.jsonl` full of those is one an operator stops
-                // reading.
+                // is excluded from the BARKS file too: it fires on every
+                // restart a dog survives, and a `barks.jsonl` full of those
+                // is one an operator stops reading. It is not excluded from
+                // the dog's own log, which is where an operator goes looking
+                // for exactly that.
                 Ok(event) => {
-                    if let BusEvent::Process {
-                        event: ProcessEventKind::Errored,
-                        info,
-                        ..
+                    let BusEvent::Process {
+                        event: kind, info, ..
                     } = &*event
-                        && info.dog.is_some()
-                    {
-                        record_dog_errored(&barks, &info.name, info.restarts);
+                    else {
+                        continue;
+                    };
+                    if info.dog.is_none() {
+                        continue;
+                    }
+                    match kind {
+                        ProcessEventKind::Errored => {
+                            record_dog_errored(&barks, &info.name, info.restarts);
+                        }
+                        ProcessEventKind::Start => {
+                            let pid = info
+                                .pid
+                                .map_or_else(|| "unknown".to_string(), |pid| pid.to_string());
+                            narrate(
+                                &publish,
+                                info,
+                                &format!("shep started this dog; its process is pid {pid}"),
+                            )
+                            .await;
+                        }
+                        ProcessEventKind::Exit => {
+                            narrate(&publish, info, &exit_words(info)).await;
+                        }
+                        _ => {}
                     }
                 }
                 // The bus DROPS events for a lagging subscriber rather than
@@ -1543,7 +1771,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
         let (events, rx) = crate::bus::test_bus(16);
-        let watch = spawn_dog_watch(rx, barks_path.clone());
+        let watch = spawn_dog_watch(rx, events.clone(), barks_path.clone());
 
         events.send(errored_event("web", None)).unwrap();
         events
@@ -1570,7 +1798,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
         let (events, rx) = crate::bus::test_bus(16);
-        let watch = spawn_dog_watch(rx, barks_path.clone());
+        let watch = spawn_dog_watch(rx, events.clone(), barks_path.clone());
 
         events
             .send(process_event(
@@ -1769,11 +1997,12 @@ mod tests {
         start_test_dog(&h.ctx, "metrics").await;
         let refusals = &h.ctx.dog_refusals;
         let contacts = &h.ctx.peer_contacts;
+        let events = &h.ctx.events;
         let mut seen = SilentDogs::default();
         let t0 = Instant::now();
 
         assert!(
-            check_silent_dogs(&h.ctx.supervisor, refusals, contacts, &mut seen, t0)
+            check_silent_dogs(&h.ctx.supervisor, refusals, contacts, events, &mut seen, t0)
                 .await
                 .is_empty(),
             "a dog seen quiet for the first time has not yet been quiet for any length of time"
@@ -1784,6 +2013,7 @@ mod tests {
                 &h.ctx.supervisor,
                 refusals,
                 contacts,
+                events,
                 &mut seen,
                 t0 + DOG_SILENCE_BUDGET
             )
@@ -1802,6 +2032,7 @@ mod tests {
                 &h.ctx.supervisor,
                 refusals,
                 contacts,
+                events,
                 &mut seen,
                 t0 + 2 * DOG_SILENCE_BUDGET
             )
@@ -1816,6 +2047,7 @@ mod tests {
                 &h.ctx.supervisor,
                 refusals,
                 contacts,
+                events,
                 &mut seen,
                 t0 + 3 * DOG_SILENCE_BUDGET
             )
@@ -1837,6 +2069,7 @@ mod tests {
         start_test_dog(&h.ctx, "metrics").await;
         let refusals = &h.ctx.dog_refusals;
         let contacts = &h.ctx.peer_contacts;
+        let events = &h.ctx.events;
         refusals.handshook("metrics");
         let mut seen = SilentDogs::default();
         let t0 = Instant::now();
@@ -1847,6 +2080,7 @@ mod tests {
                     &h.ctx.supervisor,
                     refusals,
                     contacts,
+                    events,
                     &mut seen,
                     t0 + elapsed * DOG_SILENCE_BUDGET
                 )
@@ -1871,6 +2105,7 @@ mod tests {
         start_test_dog(&h.ctx, "metrics").await;
         let refusals = &h.ctx.dog_refusals;
         let contacts = &h.ctx.peer_contacts;
+        let events = &h.ctx.events;
         refusals.refused("metrics");
         refusals.refused("metrics");
         assert_eq!(refusals.stale(), vec!["metrics".to_string()]);
@@ -1883,6 +2118,7 @@ mod tests {
                     &h.ctx.supervisor,
                     refusals,
                     contacts,
+                    events,
                     &mut seen,
                     t0 + elapsed * DOG_SILENCE_BUDGET
                 )
@@ -1909,6 +2145,7 @@ mod tests {
         start_test_dog(&h.ctx, "metrics").await;
         let refusals = &h.ctx.dog_refusals;
         let contacts = &h.ctx.peer_contacts;
+        let events = &h.ctx.events;
         let mut seen = SilentDogs::default();
         let t0 = Instant::now();
 
@@ -1918,6 +2155,7 @@ mod tests {
                     &h.ctx.supervisor,
                     refusals,
                     contacts,
+                    events,
                     &mut seen,
                     t0 + (DOG_SILENCE_BUDGET / 20) * look
                 )
@@ -1933,6 +2171,7 @@ mod tests {
                 &h.ctx.supervisor,
                 refusals,
                 contacts,
+                events,
                 &mut seen,
                 t0 + DOG_SILENCE_BUDGET
             )
@@ -1966,6 +2205,7 @@ mod tests {
             h.ctx.supervisor.clone(),
             refusals.clone(),
             h.ctx.peer_contacts.clone(),
+            h.ctx.events.clone(),
         );
 
         // The watcher's own interval fires an immediate first tick, which
@@ -2193,5 +2433,82 @@ mod tests {
             Silence::Unattributed,
             "no pid is no attribution, which is a different answer from no contact"
         );
+    }
+
+    /// Fails if shep's own account of a dog stays in `shepd.err.log`, where
+    /// the dog's operator was never told to look.
+    ///
+    /// Every message in the incident behind this module went to the daemon's
+    /// log. The dog's own log — the file shep's error message told the
+    /// operator to read — could not hold a word of it, so `shep bleats
+    /// log-rotate` showed a dog repeating itself into an empty room and
+    /// nothing about why shep had given up on it.
+    ///
+    /// Both halves are asserted, because they have different failure modes:
+    /// the file is what survives to be read afterwards, and the bus is what
+    /// a `shep bleats --follow` sees live.
+    #[tokio::test]
+    async fn shep_s_own_account_of_a_dog_reaches_that_dog_s_log() {
+        let h = crate::testing::harness(vec![ProcScript::never_exits()]);
+        start_test_dog(&h.ctx, "log-rotate").await;
+        let info = h
+            .ctx
+            .supervisor
+            .list()
+            .await
+            .into_iter()
+            .find(|info| info.name == "log-rotate")
+            .expect("the dog fixture must be listed");
+        let err_log = info
+            .err_file
+            .clone()
+            .expect("a dog's log paths are resolved");
+
+        // A real `log.*` forwarder, the same one a `shep bleats --follow`
+        // gets: `Bus::publish_log` skips the whole publish while nothing has
+        // registered an interest in log topics, so a plain `subscribe()`
+        // would assert that the gate is shut rather than that the narration
+        // travels. Registered before the narration, because a broadcast
+        // receiver starts at the channel's current tail.
+        let (out_tx, mut following) = tokio::sync::mpsc::channel(16);
+        let forwarder = crate::bus::spawn_forwarder(
+            &h.ctx.events,
+            crate::bus::TopicFilter::new(&["log.*".to_string()]).unwrap(),
+            out_tx,
+        );
+
+        narrate(&h.ctx.events, &info, "shep did a thing worth saying").await;
+
+        let written = std::fs::read_to_string(&err_log).expect("the narration must reach the log");
+        let line = written
+            .strip_suffix('\n')
+            .expect("one whole line, newline included");
+        assert!(
+            line.ends_with("[shep] shep did a thing worth saying"),
+            "the line must be marked as shep's voice, not the dog's: {line:?}"
+        );
+        let (stamp, rest) = line.split_at(crate::tokio_runner::LOG_STAMP_BYTES);
+        assert_eq!(
+            rest, "[shep] shep did a thing worth saying",
+            "the stamp is the same fixed-width prefix every other line carries: {line:?}"
+        );
+        chrono::DateTime::parse_from_rfc3339(stamp.trim_end())
+            .unwrap_or_else(|err| panic!("{stamp:?} must parse as RFC 3339: {err}"));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), following.recv())
+            .await
+            .expect("a follower must be told inside the budget")
+            .expect("the forwarder must deliver rather than end");
+        match shep_core::protocol::decode_frame::<BusEvent>(&frame).unwrap() {
+            BusEvent::LogErr { id, line } => {
+                assert_eq!(id, info.id, "the line belongs to the dog it is about");
+                assert_eq!(
+                    line, "[shep] shep did a thing worth saying",
+                    "a follower sees the marker and not the file's stamp"
+                );
+            }
+            other => panic!("narration must reach a follower as a log line, got {other:?}"),
+        }
+        forwarder.abort();
     }
 }

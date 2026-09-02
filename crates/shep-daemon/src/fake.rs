@@ -407,6 +407,9 @@ pub const FIRST_SCRIPTED_PID: u32 = 1000;
 /// Deterministic fake [`ProcessRunner`] driven by a pre-scripted [`ProcScript`] per spawn.
 pub struct ScriptedRunner {
     scripts: Mutex<VecDeque<ProcScript>>,
+    /// The pid every spawn reports, when [`ScriptedRunner::spawning_at`] set
+    /// one; otherwise pids come from the spawn index.
+    pid: Mutex<Option<u32>>,
     /// Sheep names whose [`ProcessRunner::spawn`] fails, by name because
     /// that is what a caller has.
     ///
@@ -470,7 +473,23 @@ impl ScriptedRunner {
             fail_spawn: Mutex::new(Vec::new()),
             #[cfg(unix)]
             deaf_pump: Mutex::new(Vec::new()),
+            pid: Mutex::new(None),
         }
+    }
+
+    /// Makes every spawn report `pid` instead of [`FIRST_SCRIPTED_PID`] and
+    /// the numbers above it.
+    ///
+    /// For the one fixture shape the default cannot express: a scripted
+    /// process that ALSO opens a real socket to the daemon. Peer credentials
+    /// on a socket pair name the process that actually opened it, so a test
+    /// asserting on what the daemon concluded from a peer's pid needs the
+    /// scripted proc and the connecting process to be the same one — which
+    /// they are, when the caller passes `std::process::id()`.
+    #[must_use]
+    pub fn spawning_at(self, pid: u32) -> Self {
+        *self.pid.lock().unwrap() = Some(pid);
+        self
     }
 
     /// Makes these sheep's pumps accept a [`LogCtl::ReportFds`] and never
@@ -1067,7 +1086,11 @@ impl ProcessRunner for ScriptedRunner {
             to_stdin: to_stdin_tx,
         };
         // Arbitrary but deterministic — real pids come from the OS in the real runner.
-        let pid = FIRST_SCRIPTED_PID + u32::try_from(index).unwrap_or(u32::MAX);
+        let pid = self
+            .pid
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| FIRST_SCRIPTED_PID + u32::try_from(index).unwrap_or(u32::MAX));
         Ok((FakeProc { pid, state }, proc_io))
     }
 }

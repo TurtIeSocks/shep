@@ -496,26 +496,50 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                     message: err.to_string(),
                     daemon_version: None,
                 })),
-                Ok(app) => match ctx.supervisor.start_dog(app, spec.source).await {
-                    // `start_dog` is idempotent by NAME, so what comes back
-                    // is whatever already holds that name. An unmarked
-                    // entry means a sheep holds it: no dog was started, and
-                    // none can be while the name is taken. Answering with
-                    // the sheep would report a success that never happened,
-                    // so it is refused instead — and there is nothing to
-                    // undo, because the supervisor returns the squatter
-                    // without spawning anything.
-                    Ok(info) if info.dog.is_none() => reply(Err(RpcError {
-                        code: RpcErrorCode::InvalidConfig,
-                        message: format!(
-                            "a sheep is already registered as `{}`; rename it or give the dog another name",
-                            spec.name
-                        ),
-                        daemon_version: None,
-                    })),
-                    Ok(info) => reply(Ok(Response::DogStarted(info))),
-                    Err(err) => reply(Err(rpc_error(&err))),
-                },
+                Ok(app) => {
+                    // Read before `start_dog` takes the app. This arm and
+                    // `dogs::spawn_enabled_dogs` are the two places that know
+                    // which file a dog's spawn resolved to, and an operator
+                    // reading the dog's log during an upgrade is usually
+                    // asking exactly that.
+                    let script = app.config().script.clone();
+                    match ctx.supervisor.start_dog(app, spec.source).await {
+                        // `start_dog` is idempotent by NAME, so what comes back
+                        // is whatever already holds that name. An unmarked
+                        // entry means a sheep holds it: no dog was started, and
+                        // none can be while the name is taken. Answering with
+                        // the sheep would report a success that never happened,
+                        // so it is refused instead — and there is nothing to
+                        // undo, because the supervisor returns the squatter
+                        // without spawning anything.
+                        Ok(info) if info.dog.is_none() => reply(Err(RpcError {
+                            code: RpcErrorCode::InvalidConfig,
+                            message: format!(
+                                "a sheep is already registered as `{}`; rename it or give the dog another name",
+                                spec.name
+                            ),
+                            daemon_version: None,
+                        })),
+                        Ok(info) => {
+                            // Wording is about the binary this shepherd
+                            // resolved, not about a spawn having happened:
+                            // `start_dog` is idempotent by name, so this may be
+                            // a dog that was already running. `spawn_dog_watch`
+                            // narrates the spawns themselves, off the bus, where
+                            // that distinction is not a guess.
+                            crate::dogs::narrate(
+                                &ctx.events,
+                                &info,
+                                &format!(
+                                    "shep has this dog enabled, running the binary at {script}"
+                                ),
+                            )
+                            .await;
+                            reply(Ok(Response::DogStarted(info)))
+                        }
+                        Err(err) => reply(Err(rpc_error(&err))),
+                    }
+                }
             }
         }
         // Through `delete` with an exact `Name` selector, which is the whole

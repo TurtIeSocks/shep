@@ -1212,7 +1212,7 @@ pub async fn boot<R: ProcessRunner>(
     // writer, not a branch inside the engine (see `spawn_dog_watch`'s own
     // doc), and giving it a receiver early means it can never miss an
     // `Errored` a dog reaches during boot's own restore step.
-    let dog_watch = spawn_dog_watch(events.subscribe(), paths.barks.clone());
+    let dog_watch = spawn_dog_watch(events.subscribe(), events.clone(), paths.barks.clone());
     let (breach_tx, breach_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
     let (live_tx, live_rx) = mpsc::channel(EXTRAS_REPORT_CAPACITY);
     let extras = Extras::real(
@@ -1329,7 +1329,7 @@ pub async fn boot<R: ProcessRunner>(
     // load-bearing. Never fails the boot: a dog that cannot be spawned is a
     // monitoring gap, not an outage, and `spawn_enabled_dogs` warns and
     // carries on rather than propagating anything here.
-    crate::dogs::spawn_enabled_dogs(&options.dogs, &paths, &supervisor).await;
+    crate::dogs::spawn_enabled_dogs(&options.dogs, &paths, &supervisor, &events).await;
 
     // Built here rather than inside the `RpcContext` below because the watch
     // on the next line shares it. Still empty, and still deliberately not
@@ -1352,6 +1352,7 @@ pub async fn boot<R: ProcessRunner>(
         supervisor.clone(),
         dog_refusals.clone(),
         peer_contacts.clone(),
+        events.clone(),
     );
 
     let writer = spawn_snapshot_writer(

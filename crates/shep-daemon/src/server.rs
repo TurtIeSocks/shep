@@ -573,6 +573,19 @@ async fn handshake(
                     &ctx.dog_refusals,
                     &ctx.supervisor,
                 );
+                // Into the dog's own log as well as the daemon's. Both
+                // protocol numbers, because "protocol mismatch" without
+                // them tells an operator nothing they can act on, and the
+                // dog's log is where they will look first.
+                crate::dogs::narrate_by_name(
+                    &ctx.supervisor,
+                    &ctx.events,
+                    dog,
+                    format!(
+                        "shep REFUSED this dog's handshake: this shepherd speaks protocol {PROTOCOL_VERSION} and the dog sent {}. Its own build is shep-client {}. Rebuild or reinstall it against this shep and run `shep restart {dog}`",
+                        hello.protocol, hello.client_version
+                    ),
+                );
             }
             // A refused client this daemon cannot restart and would not
             // want to: an operator running an older `shep` against a newer
@@ -599,7 +612,21 @@ async fn handshake(
     // before — including the restart it was just given, which is exactly
     // the case that has to clear.
     if let Some(dog) = &hello.dog_name {
-        ctx.dog_refusals.handshook(dog);
+        // Only the TRANSITION is narrated. A dog reconnects — after a
+        // handover, after a daemon restart, after any dropped connection —
+        // and a line per connection would bury the dog's own output in its
+        // own log. `handshook` answers whether this shepherd had already
+        // heard from it.
+        if ctx.dog_refusals.handshook(dog) {
+            crate::dogs::narrate_by_name(
+                &ctx.supervisor,
+                &ctx.events,
+                dog,
+                format!(
+                    "shep accepted this dog's handshake; it is registered with this shepherd as `{dog}`, on protocol {PROTOCOL_VERSION}"
+                ),
+            );
+        }
     }
     let ack: HelloReply = Ok(HelloAck {
         daemon_version: ctx.daemon_version.clone(),
@@ -1239,5 +1266,159 @@ mod tests {
             "a nameless refusal must not restart anything"
         );
         assert_eq!(after.status, ProcStatus::Online);
+    }
+
+    // --- The incident: a dog that reaches shep and never names itself ---
+
+    /// fails if a dog that is CONNECTED to this shepherd is reported as a
+    /// binary that cannot talk to it.
+    ///
+    /// # The incident, in full
+    ///
+    /// An operator ran a log-rotation dog under shep. shep rendered it
+    /// `silent`, restarted it once, then said: *the binary on disk cannot
+    /// talk to this shep either, so this dog is stale — rebuild or reinstall
+    /// it*. Every clause after "has still not answered it" was false. The
+    /// dog was connected the whole time and correctly serving `DogConfig`
+    /// and `ListFlock`; it was never refused anything. Its only defect was
+    /// `Client::connect`, which sends `Hello.dog_name: None`, so the
+    /// handshake's `handshook` call never fired. The operator spent two days
+    /// reinstalling, because the message told them to, and reinstalling
+    /// could never have fixed it.
+    ///
+    /// # Why this is not a `DogRefusals` test
+    ///
+    /// Because the isolated logic was already RIGHT. `has_handshook` was
+    /// correctly false, the ladder correctly fired, and the verdict was
+    /// correctly `Stale`. What was wrong was the sentence drawn from it. So
+    /// the case has to run the real pieces end to end — a real socket whose
+    /// peer credentials this daemon really reads, a real `Hello` with no
+    /// `dog_name`, a real request served over that same connection, and the
+    /// real ladder — and then read what the operator would have read.
+    ///
+    /// # Why the harness pins a pid
+    ///
+    /// Peer credentials on a real socket name the process that opened it,
+    /// which here is the test itself. `harness_at_pid` makes the scripted
+    /// dog run at that same pid, so the daemon's two facts — "this dog runs
+    /// at pid P" and "this is what pid P has sent me" — are about one
+    /// process, exactly as they are in production.
+    #[tokio::test]
+    async fn a_dog_that_connects_without_naming_itself_is_not_called_a_stale_binary() {
+        // Three: the first spawn, the restart the ladder's first rung asks
+        // for, and one spare so a spawn is never refused for want of script.
+        let h = crate::testing::harness_at_pid(
+            vec![
+                ProcScript::never_exits(),
+                ProcScript::never_exits(),
+                ProcScript::never_exits(),
+            ],
+            std::process::id(),
+        );
+        let dog = start_dog(&h.ctx, "log-rotate").await;
+        assert_eq!(
+            dog.pid,
+            Some(std::process::id()),
+            "the fixture only means anything if the dog and this test are one process"
+        );
+        let err_log = dog
+            .err_file
+            .clone()
+            .expect("a dog's listing resolves its log paths");
+
+        // Exactly what the dog in the incident sent: the current protocol,
+        // a real client version, and no `dog_name` at all.
+        let mut client = connected(h.ctx.clone()).await;
+        client
+            .send(&Hello {
+                protocol: PROTOCOL_VERSION,
+                client_version: "0.1.22".to_string(),
+                dog_name: None,
+            })
+            .await;
+        let ack: HelloReply = client.recv().await;
+        ack.expect("an anonymous handshake on the current protocol is ACCEPTED, not refused");
+
+        // And it works. This is the half the old message denied outright,
+        // so the test states it rather than assuming it.
+        client
+            .send(&Envelope {
+                id: 1,
+                deadline_ms: None,
+                body: Request::ListFlock,
+            })
+            .await;
+        match client.recv::<ServerFrame>().await {
+            ServerFrame::Reply(reply) => match reply.result {
+                Ok(Response::Flock(flock)) => assert!(
+                    flock.iter().any(|info| info.name == "log-rotate"),
+                    "the connection this daemon is about to call stale is serving requests"
+                ),
+                other => panic!("ListFlock must answer with the flock, got {other:?}"),
+            },
+            other => panic!("an accepted connection must serve ListFlock, got {other:?}"),
+        }
+
+        assert_eq!(
+            h.ctx.peer_contacts.from_pid(Some(std::process::id())),
+            crate::dogs::Contact::Anonymous,
+            "the handshake path must record what actually arrived"
+        );
+        assert!(
+            !h.ctx.dog_refusals.has_handshook("log-rotate"),
+            "no `dog_name` means no handshake was recorded, which is the whole trap"
+        );
+
+        // The real ladder, walked over two whole budgets. Instants rather
+        // than a paused clock: the connection above is a real socket, and a
+        // paused runtime auto-advances whenever it idles.
+        let mut seen = crate::dogs::SilentDogs::default();
+        let t0 = tokio::time::Instant::now();
+        let ladder = async |seen: &mut crate::dogs::SilentDogs, at| {
+            crate::dogs::check_silent_dogs(
+                &h.ctx.supervisor,
+                &h.ctx.dog_refusals,
+                &h.ctx.peer_contacts,
+                &h.ctx.events,
+                seen,
+                at,
+            )
+            .await
+        };
+        assert!(ladder(&mut seen, t0).await.is_empty());
+        assert_eq!(
+            ladder(&mut seen, t0 + crate::dogs::DOG_SILENCE_BUDGET).await,
+            vec![("log-rotate".to_string(), crate::dogs::Refusal::Restart)]
+        );
+        assert_eq!(
+            ladder(&mut seen, t0 + 2 * crate::dogs::DOG_SILENCE_BUDGET).await,
+            vec![("log-rotate".to_string(), crate::dogs::Refusal::Stale)],
+            "the ladder's verdict is unchanged; what changes is what it SAYS"
+        );
+
+        // What the operator reads. The dog's own log, which is the file the
+        // verdict tells them to open and which could not hold a word of this
+        // before.
+        let written = std::fs::read_to_string(&err_log).expect("the narration must reach the log");
+        assert!(
+            written.contains("[shep]"),
+            "shep's voice in a dog's log has to be marked as shep's: {written}"
+        );
+        assert!(
+            written.contains("HAS connected to this shepherd"),
+            "the verdict must say what this shepherd watched arrive: {written}"
+        );
+        assert!(
+            written.contains("reinstalling the same build will NOT"),
+            "the two days were spent on advice this line has to refuse: {written}"
+        );
+        assert!(
+            !written.contains("cannot talk to this shep either"),
+            "the sentence that cost two days must not appear on this path: {written}"
+        );
+        assert!(
+            !written.contains("cannot reach this shep"),
+            "this dog reached shep; nothing here may claim otherwise: {written}"
+        );
     }
 }

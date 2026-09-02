@@ -552,6 +552,56 @@ dogs that are fine. What catches it is the dog's own CI building against
 a current `shep-core`, which is where both published dogs' breakage was
 already visible and unread.
 
+## What shep writes into a dog's own log
+
+A dog's log is the first place anyone looks when a dog misbehaves, and
+until recently it held only what the dog itself said. Everything shep had
+to say about it — the spawn, the handshake, the verdict — went to
+`shepd.err.log`, which is not the file shep's own error messages tell you
+to open.
+
+Shep now writes its own account into the dog's log as well, marked
+`[shep]` so it cannot be mistaken for the dog's output:
+
+```
+2026-09-02T14:22:31.412+02:00 [shep] shep started this dog; its process is pid 5512
+2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as `log-rotate`, on protocol 1
+2026-09-02T14:22:31.492+02:00 rotating web-0-out.log (12.4 MiB)
+```
+
+Six things get written: the spawn and the resolved binary path, an
+accepted handshake (once, the first time this shepherd hears from the
+dog — not on every reconnect), a refused handshake with both protocol
+numbers, the warning when a dog has gone quiet, the verdict when shep
+gives up on it, and the exit code or signal when its process stops.
+
+`shep bleats <name> --follow` sees the same lines live, marked the same
+way, interleaved with the dog's own output in arrival order.
+
+## When a dog stops answering
+
+A dog that is running but never handshakes gets one restart from disk and
+then a verdict. That verdict now says what the shepherd actually watched
+happen, because the three cases it could not previously tell apart have
+opposite fixes:
+
+- **Nothing has ever connected from the dog's process.** The dog is not
+  reaching the socket. Rebuild or reinstall it.
+- **Its process has connected, and never named a dog in its handshake.**
+  The dog is talking to shep and may be serving every request it is
+  asked; what it does not do is say who it is. Reinstalling the same
+  build will not change that — it is built against shep-client older than
+  0.1.23, or it calls `Client::connect` where it should call
+  `ReconnectingClient::connect_as_dog`. Rebuild it against a current
+  shep-client.
+- **Shep could not tell which process opened the connections.** Windows
+  has no peer identity by design, and some unix platforms decline to
+  report a pid. Neither of the two above is ruled out, so shep names both
+  and tells you to read the dog's own log, where a dog that cannot reach
+  the socket says so and one that is merely anonymous does not.
+
+Every one of them ends with a command to run.
+
 ## When a dog dies
 
 If an enabled dog exhausts its own restart budget and lands on `Errored`,

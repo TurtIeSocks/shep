@@ -388,9 +388,23 @@ pub(crate) fn harness_with_stats(scripts: Vec<ProcScript>) -> Harness {
 /// and distinctive so a test asserting on it cannot be reading a default.
 pub(crate) const SCRIPTED_TREE_BYTES: u64 = 4096;
 
+/// [`harness`], with every spawn reporting `pid` rather than a number
+/// derived from spawn order.
+///
+/// For a test whose scripted proc has to be the same process as a real
+/// socket's peer — see [`ScriptedRunner::spawning_at`].
+pub(crate) fn harness_at_pid(scripts: Vec<ProcScript>, pid: u32) -> Harness {
+    harness_sampling_with(ScriptedRunner::new(scripts).spawning_at(pid), vec![vec![]])
+}
+
 /// [`harness`] over a scripted process table — the body both spellings share.
 fn harness_sampling(scripts: Vec<ProcScript>, readings: Vec<Vec<ProcessRss>>) -> Harness {
-    harness_with_extras(scripts, |reports| {
+    harness_sampling_with(ScriptedRunner::new(scripts), readings)
+}
+
+/// [`harness_sampling`], over a runner the caller built.
+fn harness_sampling_with(runner: ScriptedRunner, readings: Vec<Vec<ProcessRss>>) -> Harness {
+    harness_with_runner(runner, |reports| {
         let sampler: Arc<dyn MemorySampler> = Arc::new(ScriptedSampler::new(readings));
         let stats = Arc::new(StatsState::new(Arc::clone(&sampler)));
         Extras {
@@ -485,6 +499,18 @@ pub(crate) fn harness_with_extras(
     scripts: Vec<ProcScript>,
     build_extras: impl FnOnce(ExtrasReports) -> Extras,
 ) -> Harness {
+    harness_with_runner(ScriptedRunner::new(scripts), build_extras)
+}
+
+/// [`harness`], over a [`ScriptedRunner`] the caller built.
+///
+/// The one thing a `Vec<ProcScript>` cannot say is anything about the runner
+/// itself — which pid its spawns report, which sheep it refuses. A test that
+/// needs one of those builds the runner and hands it over.
+pub(crate) fn harness_with_runner(
+    runner: ScriptedRunner,
+    build_extras: impl FnOnce(ExtrasReports) -> Extras,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let paths = test_paths(&dir);
     let (events, events_rx) = crate::bus::test_bus(256);
@@ -498,10 +524,9 @@ pub(crate) fn harness_with_extras(
     // layer and the extras must share ONE state, or a listing would read a
     // watch set nothing ever wrote to.
     let stats = Arc::clone(&extras.stats);
-    let supervisor =
-        SupervisorBuilder::new(ScriptedRunner::new(scripts), paths.clone(), events.clone())
-            .extras(extras)
-            .spawn();
+    let supervisor = SupervisorBuilder::new(runner, paths.clone(), events.clone())
+        .extras(extras)
+        .spawn();
     let (shutdown, shutdown_rx) = watch::channel(false);
     Harness {
         ctx: RpcContext {

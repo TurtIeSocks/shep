@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Shep writes its own account of a dog into that dog's log file, marked
+  `[shep]` so it cannot be read as the dog's own output: the spawn and the
+  resolved binary path, an accepted handshake (once per episode, not per
+  reconnect), a refused one with both protocol numbers, the silence warning,
+  the stale verdict, and the exit code or signal. Every one of those used to
+  go only to `shepd.err.log` — which is not the file shep's own error message
+  tells the operator to read. `shep bleats --follow` sees the same lines live.
+
 ### Fixed
 
 - The stale verdict for a silent dog no longer asserts a cause the shepherd

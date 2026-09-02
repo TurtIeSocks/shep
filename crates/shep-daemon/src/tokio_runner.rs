@@ -164,7 +164,11 @@ pub(crate) fn stamp_into(buf: &mut String) {
     // impl that itself errors, and chrono's `DelayedFormat` only does that
     // for a format string it could not parse — which this one is a `const`
     // to keep from ever being.
-    let _ = write!(buf, "{} ", chrono::Local::now().format(LOG_TIMESTAMP_FORMAT));
+    let _ = write!(
+        buf,
+        "{} ",
+        chrono::Local::now().format(LOG_TIMESTAMP_FORMAT)
+    );
     // The one place [`LOG_STAMP_BYTES`] is CHECKED rather than asserted in
     // a comment. Everything that strips the prefix back off depends on it,
     // so an edit to the format that changed the width would otherwise be
@@ -2841,14 +2845,8 @@ mod tests {
 
         let _ = pump.report_fds().await;
 
-        assert_eq!(
-            log_text(&pump.out_path),
-            "before-the-blob\n"
-        );
-        assert_eq!(
-            log_text(&pump.err_path),
-            "and-on-stderr\n"
-        );
+        assert_eq!(log_text(&pump.out_path), "before-the-blob\n");
+        assert_eq!(log_text(&pump.err_path), "and-on-stderr\n");
     }
 
     /// How long a case watches a parked pump before believing it.
