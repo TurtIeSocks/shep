@@ -424,13 +424,14 @@ impl ExtrasRegistry {
     /// `stats.watch()` clears the pid's CPU baseline, so `shep flock` shows a
     /// blank CPU cell for one poll interval. Both are documented rather than
     /// closed; see the design spec.
-    ///
-    /// `extras` is `pub(crate)`, so an unconsumed method here reads as dead
-    /// code to a plain `cargo build`/`clippy`, unlike a genuinely public
-    /// crate's API surface. Its own tests are the only caller for now;
-    /// wiring it into the supervisor's config-apply path is a later task in
-    /// the same slice. `#[allow(dead_code)]` says so explicitly rather than
-    /// leaving it silently red between the two.
+    // `extras` is `pub(crate)`, so an unconsumed method here reads as dead
+    // code to a plain `cargo build`/`clippy`, unlike a genuinely public
+    // crate's API surface. Its own tests are the only caller for now, ahead
+    // of a later task in the same slice wiring it into the supervisor's
+    // config-apply path. `#[allow(dead_code)]` names that pre-wiring state
+    // explicitly, in a plain comment rather than the rustdoc above, so
+    // deleting the attribute when that task lands takes this note with it
+    // instead of leaving a doc comment claiming nobody calls this.
     #[allow(dead_code)]
     pub fn rearm_name(
         &mut self,
@@ -2676,6 +2677,80 @@ mod tests {
             worker_watch_before.id(),
             worker_watch_after.id(),
             "rearming \"web\" must not touch \"worker\"'s group"
+        );
+    }
+
+    /// fails if `rearm_name`'s delegation to `arm` per entry stops sharing
+    /// one group across a name's own instances. Today that sharing is only
+    /// TRANSITIVELY protected, by `arm`'s own idempotency test, because
+    /// `rearm_name` never builds a task itself; a future refactor that stops
+    /// delegating and builds per entry instead would orphan a multi-instance
+    /// app's membership with nothing in this diff to catch it. Task 8 calls
+    /// `rearm_name` with every entry of a name, so this is the path any app
+    /// running more than one instance actually exercises.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_name_rebuilds_a_multi_instance_group_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.instances = 2;
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        let entry_a = armed_entry(0, 0, 1000, app.clone(), &paths);
+        let entry_b = armed_entry(1, 1, 1001, app.clone(), &paths);
+        registry.arm(&entry_a, idle_prober(), &rig.extras, &handle);
+        registry.arm(&entry_b, idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let before_cron = registry.groups["web"].cron.as_ref().unwrap().abort_handle();
+        let before_watch = registry.groups["web"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+
+        registry.rearm_name(
+            "web",
+            &[&entry_a, &entry_b],
+            idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        tokio::task::yield_now().await;
+
+        let group = &registry.groups["web"];
+        assert_eq!(
+            group.members,
+            HashSet::from([0, 1]),
+            "both instances must still be members after a rearm, not just the last one arm'd"
+        );
+        assert!(
+            group.cron.is_some(),
+            "the group must hold exactly one cron task, not zero"
+        );
+        assert!(
+            group.watch.is_some(),
+            "the group must hold exactly one watch task, not zero"
+        );
+        let after_cron = group.cron.as_ref().unwrap().abort_handle();
+        let after_watch = group.watch.as_ref().unwrap().abort_handle();
+        assert_ne!(
+            before_cron.id(),
+            after_cron.id(),
+            "the cron worker must be rebuilt by the rearm, not left over"
+        );
+        assert_ne!(
+            before_watch.id(),
+            after_watch.id(),
+            "the watch task must be rebuilt by the rearm, not left over"
         );
     }
 
