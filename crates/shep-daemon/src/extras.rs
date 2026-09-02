@@ -401,6 +401,57 @@ impl ExtrasRegistry {
         }
     }
 
+    /// Rebuilds everything armed for `name`, replacing live tasks rather than
+    /// keeping them.
+    ///
+    /// [`Self::arm`] deliberately preserves a running cron or watch task, so
+    /// that a reload's replacement instance arming before the drainee disarms
+    /// does not tear down a watcher the drainee still needs. That is right for
+    /// the transition it was written for and wrong for a config change: the
+    /// group-scoped fields (`watch`, `ignore_watch`, `watch_delay`,
+    /// `watch_options`) and the cron ones (`cron_restart`, `cron_timezone`)
+    /// are read when the task is built, so a task that survives keeps the old
+    /// values for as long as it lives.
+    ///
+    /// Takes every entry of the name rather than one id, because the group is
+    /// per-name: disarming a single instance of a multi-instance app leaves
+    /// the group standing, by design.
+    ///
+    /// # What this loses
+    ///
+    /// The OS watch is torn down and rebuilt with a real gap and no rescan, so
+    /// a file saved during it is missed. Same gap any watcher restart has.
+    /// `stats.watch()` clears the pid's CPU baseline, so `shep flock` shows a
+    /// blank CPU cell for one poll interval. Both are documented rather than
+    /// closed; see the design spec.
+    ///
+    /// `extras` is `pub(crate)`, so an unconsumed method here reads as dead
+    /// code to a plain `cargo build`/`clippy`, unlike a genuinely public
+    /// crate's API surface. Its own tests are the only caller for now;
+    /// wiring it into the supervisor's config-apply path is a later task in
+    /// the same slice. `#[allow(dead_code)]` says so explicitly rather than
+    /// leaving it silently red between the two.
+    #[allow(dead_code)]
+    pub fn rearm_name(
+        &mut self,
+        name: &str,
+        entries: &[&ProcessEntry],
+        prober: Arc<dyn Prober>,
+        extras: &Extras,
+        supervisor: &SupervisorHandle,
+    ) {
+        // Abort the group's own tasks before rebuilding, which is the whole
+        // difference from `arm`. Removing the entry rather than mutating it
+        // means the rebuild below takes `arm`'s own "no task yet" path, so
+        // there is one construction site rather than two.
+        if let Some(group) = self.groups.remove(name) {
+            group.abort();
+        }
+        for entry in entries {
+            self.arm(entry, Arc::clone(&prober), extras, supervisor);
+        }
+    }
+
     /// Undoes one instance's per-pid arming: the memory limit and the
     /// liveness loop. A no-op for an id that had neither.
     fn disarm_instance(&mut self, id: u32) {
@@ -2485,6 +2536,147 @@ mod tests {
 
         let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
         assert_eq!(failure, LivenessFailure { id: 0, pid });
+    }
+
+    /// fails if re-arming leaves the old group tasks running. `arm` deliberately
+    /// keeps a live cron or watch task, which is right for a reload's overlap and
+    /// wrong for a config change: those tasks read `watch`, `ignore_watch`,
+    /// `watch_delay`, `watch_options`, `cron_restart` and `cron_timezone` when
+    /// they are BUILT, so a task that survives keeps the old values forever.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_name_replaces_a_live_group_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        let entry = armed_entry(0, 0, 1000, app.clone(), &paths);
+        registry.arm(&entry, idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let before_cron = registry.groups["web"].cron.as_ref().unwrap().abort_handle();
+        let before_watch = registry.groups["web"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+
+        registry.rearm_name("web", &[&entry], idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let after_cron = registry.groups["web"].cron.as_ref().unwrap().abort_handle();
+        let after_watch = registry.groups["web"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        assert_ne!(
+            before_cron.id(),
+            after_cron.id(),
+            "the cron worker survived a rearm"
+        );
+        assert_ne!(
+            before_watch.id(),
+            after_watch.id(),
+            "the watch task survived a rearm"
+        );
+    }
+
+    /// fails if rearm_name tears a group down without rebuilding it. An app left
+    /// with no watcher at all is worse than one left with a stale watcher.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_name_leaves_the_group_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        let entry = armed_entry(0, 0, 1000, app.clone(), &paths);
+        registry.arm(&entry, idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        registry.rearm_name("web", &[&entry], idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let group = &registry.groups["web"];
+        assert!(
+            group.cron.as_ref().is_some_and(|cron| !cron.is_finished()),
+            "the group must still have a live cron worker after a rearm"
+        );
+        assert!(
+            group
+                .watch
+                .as_ref()
+                .is_some_and(|watch| !watch.is_finished()),
+            "the group must still have a live watch task after a rearm"
+        );
+    }
+
+    /// fails if rearm_name reaches into another app's group. The registry is
+    /// keyed by name and a rebuild stays inside one name.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_name_leaves_another_apps_group_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let web_root = tempfile::tempdir().unwrap();
+        let worker_root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let web = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(web_root.path().display().to_string());
+        });
+        let worker = app_with("worker", |app| {
+            app.watch = true;
+            app.cwd = Some(worker_root.path().display().to_string());
+        });
+        handle
+            .start(vec![web.clone(), worker.clone()])
+            .await
+            .unwrap();
+
+        let web_entry = armed_entry(0, 0, 1000, web.clone(), &paths);
+        let worker_entry = armed_entry(1, 0, 1001, worker.clone(), &paths);
+        registry.arm(&web_entry, idle_prober(), &rig.extras, &handle);
+        registry.arm(&worker_entry, idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let worker_watch_before = registry.groups["worker"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+
+        registry.rearm_name("web", &[&web_entry], idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let worker_watch_after = registry.groups["worker"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        assert_eq!(
+            worker_watch_before.id(),
+            worker_watch_after.id(),
+            "rearming \"web\" must not touch \"worker\"'s group"
+        );
     }
 
     /// Tests that wait on real filesystem events or real elapsed time.
