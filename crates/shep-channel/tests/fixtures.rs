@@ -25,10 +25,14 @@ fn check(name: &str, encoded: String) {
         return;
     }
     let committed = fs::read_to_string(&path).unwrap_or_else(|error| {
-        panic!("{}: {error}. Run with SHEP_CHANNEL_BLESS=1 to create it.", path.display())
+        panic!(
+            "{}: {error}. Run with SHEP_CHANNEL_BLESS=1 to create it.",
+            path.display()
+        )
     });
     assert_eq!(
-        committed, encoded,
+        committed,
+        encoded,
         "{} is stale. Three other libraries are written against these bytes.",
         path.display()
     );
@@ -38,13 +42,29 @@ fn check(name: &str, encoded: String) {
 fn child_messages_match_their_fixtures() {
     let cases: Vec<(&str, ChildMessage)> = vec![
         ("child-ready", ChildMessage::Ready),
-        ("child-metric", ChildMessage::Metric { name: "rps".into(), value: 42.0 }),
-        ("child-action-reply", ChildMessage::ActionReply {
-            action: "gc".into(), body: "ok".into(), id: None,
-        }),
-        ("child-action-reply-id", ChildMessage::ActionReply {
-            action: "gc".into(), body: "ok".into(), id: Some(7),
-        }),
+        (
+            "child-metric",
+            ChildMessage::Metric {
+                name: "rps".into(),
+                value: 42.0,
+            },
+        ),
+        (
+            "child-action-reply",
+            ChildMessage::ActionReply {
+                action: "gc".into(),
+                body: "ok".into(),
+                id: None,
+            },
+        ),
+        (
+            "child-action-reply-id",
+            ChildMessage::ActionReply {
+                action: "gc".into(),
+                body: "ok".into(),
+                id: Some(7),
+            },
+        ),
     ];
     for (name, value) in cases {
         let encoded = serde_json::to_string(&value).expect("encode");
@@ -58,12 +78,22 @@ fn child_messages_match_their_fixtures() {
 fn shepherd_messages_match_their_fixtures() {
     let cases: Vec<(&str, ShepherdMessage)> = vec![
         ("shepherd-shutdown", ShepherdMessage::Shutdown),
-        ("shepherd-action", ShepherdMessage::Action {
-            name: "gc".into(), params: None, id: 7,
-        }),
-        ("shepherd-action-params", ShepherdMessage::Action {
-            name: "set-log-level".into(), params: Some("debug".into()), id: 8,
-        }),
+        (
+            "shepherd-action",
+            ShepherdMessage::Action {
+                name: "gc".into(),
+                params: None,
+                id: 7,
+            },
+        ),
+        (
+            "shepherd-action-params",
+            ShepherdMessage::Action {
+                name: "set-log-level".into(),
+                params: Some("debug".into()),
+                id: 8,
+            },
+        ),
     ];
     for (name, value) in cases {
         let encoded = serde_json::to_string(&value).expect("encode");
@@ -83,6 +113,10 @@ fn an_action_reply_without_an_id_still_decodes() {
             .expect("decode");
     assert_eq!(
         decoded,
-        ChildMessage::ActionReply { action: "gc".into(), body: "ok".into(), id: None }
+        ChildMessage::ActionReply {
+            action: "gc".into(),
+            body: "ok".into(),
+            id: None
+        }
     );
 }
