@@ -25,8 +25,8 @@ never understood the question look the same, and only `action_timeout`
 running out tells them apart.
 
 The wire itself is documented in `docs/shepherd-channel.md` in the shep
-repository. It is language agnostic, and there are Go, JavaScript and
-Python libraries over the same contract.
+repository. It is language agnostic, and Go, JavaScript and Python
+libraries over the same contract are planned.
 
 shep is pre-release. Anything public here can change before 1.0.
 

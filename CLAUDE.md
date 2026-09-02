@@ -375,11 +375,15 @@ never costs clarity.
 - Every new public item needs docs and a deliberate Debug decision (redacted
   for anything carrying env/secrets, with an exact-string test — IR-41).
 - `#![forbid(unsafe_code)]` is LIVE in core/client/cli, not planned. Unsafe
-  lives in exactly two files, both in shep-daemon and both carrying their own
-  `#![allow(unsafe_code)]` with per-block `// SAFETY:` (IR-22/23):
-  `sys.rs` (eight sites on unix) and `sys_windows.rs` (ten on Windows). This
-  line said "planned" and named only `sys.rs` for the whole of the Windows
-  port.
+  lives in three files across two crates, each carrying its own
+  `#![allow(unsafe_code)]` or `#[allow(unsafe_code)]` with per-block
+  `// SAFETY:` (IR-22/23): shep-daemon's `sys.rs` (eight sites on unix) and
+  `sys_windows.rs` (ten on Windows), and shep-channel's `endpoint.rs` (one
+  site, taking the descriptor the shepherd names in `SHEP_CHANNEL_FD`, sound
+  because a process-global guard makes it reachable at most once per
+  process). This line said "planned" and named only `sys.rs` for the whole
+  of the Windows port, then said "exactly two files" after shep-channel
+  added a third.
 - Open design decisions live at the bottom of map.md and in goals.md's open
   questions — check them before making architectural calls; if a decision is
   listed there, it is the maintainer's, not yours.
