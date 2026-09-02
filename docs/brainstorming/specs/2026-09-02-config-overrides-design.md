@@ -115,7 +115,7 @@ app, and shep never writes it. What the operator tunes afterwards lives in
 shep. The systemd analogy is exact: a vendor unit plus drop-ins, with
 `systemctl cat` to see which is which.
 
-Taking the analogy means taking its reading tools too, which is decision 8.
+Taking the analogy means taking its reading tools too, which is decision 9.
 
 ### 2. The Flockfile is read when you name a file, never when you name a sheep
 
@@ -205,7 +205,37 @@ Under decision 1 there is nothing to contain. `shep stock web 5` sets an
 override on `instances`, the same way any other field is set, and its
 write-back is the model rather than the anomaly.
 
-### 7. Two new stores, both daemon-owned
+### 7. `shep add` registers without starting
+
+`shep add Flockfile.toml`, `shep add ./server`. Same targets `shep start`
+takes, same load path, and the only difference is that nothing spawns.
+
+It is here rather than in a later spec because the template model needs it. A
+Flockfile shipping `env = { DB_HOST = "", DB_PASSWORD = "" }` is the pattern
+decision 10 endorses, and without `add` the first thing an operator does is
+`shep start Flockfile.toml`, which spawns a process with an empty database URL.
+It crashes, `autorestart` spends the restart budget, and the operator has to
+stop a flapping app before they can configure it. With `add` the sequence is
+register, fill in, start.
+
+The daemon side exists. `register_at_rest` registers `ProcStatus::Stopped`,
+spawns nothing, and is idempotent by name; its only production caller today is
+the muster restore of a sheep saved while stopped.
+`register_without_spawning`'s doc anticipates this exactly: *"Adding a third
+means deciding there, not here."* So the work is a request variant, an rpc arm
+and a verb, not new supervisor machinery.
+
+`--reset` and `--reset-all` apply, since the load path is shared. On an app
+that is already running it appends config and leaves it running: refusing would
+break re-running it after a template edit, and stopping it would break decision
+4. An added app has `instances_running = 0`, so `restorable()` will not bring
+it up after a reboot while it stays a registered member, which is already the
+behaviour and needs no work.
+
+Verb counts both move and stay different for the reason `CLAUDE.md` records:
+40 generated to 41, 41 listed to 42, with `help` still the difference.
+
+### 8. Two new stores, both daemon-owned
 
 `$SHEP_HOME/overrides.json` holds override deltas plus each app's established
 key set. `$SHEP_HOME/shared-env.json` holds shared env values. Both `0600`,
@@ -220,10 +250,10 @@ Beside `flock.json` rather than inside it, because the lifecycles differ.
 authored intent, and losing it loses the deployment.
 
 Shared env is its own store rather than a `shep.toml` section for two reasons:
-lookout stays out of that file's free-form maps (decision 10), and spec 2 needs
+lookout stays out of that file's free-form maps (decision 11), and spec 2 needs
 somewhere it can encrypt.
 
-### 8. Provenance and export
+### 9. Provenance and export
 
 `shep describe` labels each field with where its value came from: the
 Flockfile, an override, or the default. Without it, the question "why does prod
@@ -234,7 +264,7 @@ of decision 1 and the reason systemd ships `systemctl cat`.
 the template and none of the overrides. `commands/import/render.rs` already
 renders a Flockfile through `toml::to_string`, so this is mostly wiring.
 
-### 9. Shared env is referenced per key, through the existing template seam
+### 10. Shared env is referenced per key, through the existing template seam
 
 ```
 {{shared:DB_HOST}}   this spec
@@ -259,7 +289,7 @@ pattern, the `.env.example` convention. The keys are established at first load,
 the operator fills them in lookout, and additive-append means no later load
 touches them. `""` needs no special meaning.
 
-### 10. lookout edits settings and overrides, both behind `--allow-control`
+### 11. lookout edits settings and overrides, both behind `--allow-control`
 
 `shep.toml`: scalars and per-dog enable/disable toggles routed through the same
 code `shep enable` and `shep disable` use. Excluded: `adopted_dogs`, because
@@ -291,7 +321,7 @@ name removed keeps running and is never told to stop, and a changed
 `adopted_dogs` path does not re-spawn. lookout reports this rather than
 implying a reload settles it.
 
-### 11. Env is write-only from lookout
+### 12. Env is write-only from lookout
 
 lookout can set an env value and can see, per key, whether it is set and what
 kind of value it holds. A `{{shared:DB_HOST}}` reference displays in full,
@@ -302,7 +332,7 @@ So no request returns env values, `ProcessInfo` keeps having no env field, and
 whistle needs no new rule because there is nothing new for it to call. The cost
 is that an operator who forgets what they typed has to overwrite it.
 
-### 12. Panes are generated from the schema, not hand-written
+### 13. Panes are generated from the schema, not hand-written
 
 lookout renders from `flockfile_schema_json()`: section headers from
 `init.group`, per-field help text from `init.blurb`. Both already exist for
@@ -324,7 +354,7 @@ Because the TUI never names a field, a later cleanup of `AppConfig`'s
 pm2-shaped grammar does not mean rewriting it. There is no ordering dependency
 between the two.
 
-### 13. `shep daemon reload` validates before it acts
+### 14. `shep daemon reload` validates before it acts
 
 `reload_with_wait` asks the daemon whether its flock can be carried. It never
 asks whether `shep.toml` parses. The successor `execve`s, loads config, and on
@@ -342,9 +372,9 @@ pre-flight covers a hand-typed reload, lookout's apply, and an init system's
 SIGHUP.
 
 This is a live bug that predates the feature. It is fixed here because decision
-10 adds a button that triggers it.
+11 adds a button that triggers it.
 
-### 14. `SpawnSpec` gets a redacted Debug
+### 15. `SpawnSpec` gets a redacted Debug
 
 `runner.rs:1017` derives plain `Debug` with an unredacted
 `pub env: BTreeMap<String, String>`, and the type sits on the exec boundary at
@@ -377,7 +407,7 @@ and each has to normalize against the others.
 
 `Request::Overrides` answers with values for every field except `env`, which
 comes back as per-key metadata only (set or unset, literal or reference, and
-the reference text when it is one). Decision 11 is enforced by the response
+the reference text when it is one). Decision 12 is enforced by the response
 type rather than by a rule someone has to remember.
 
 `Request::ConfigDrift` is unchanged and stays read-only. Its doc already argues
@@ -414,7 +444,7 @@ marker up without separate work.
   stating precisely, which is why it gets its own threat model.
 - **The `{{secret:...}}` resolver.** Token reserved here, resolver in spec 2.
 - **Cleaning up `AppConfig`'s pm2-shaped grammar.** A breaking release of its
-  own. Decision 12 removes the ordering dependency.
+  own. Decision 13 removes the ordering dependency.
 - **The handover blob left on disk after a failed adopt.** Deliberate today, as
   operator-readable evidence, and argued as no worse than `flock.json`. If spec
   2 tightens `flock.json`, this becomes the most exposed copy and the argument
