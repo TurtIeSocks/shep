@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go only to `shepd.err.log` — which is not the file shep's own error message
   tells the operator to read. `shep bleats --follow` sees the same lines live.
 
+### Changed
+
+- `ListFlock` and `Describe` now report `ProcessInfo::dog_stale` beside
+  `handshook`, so a listing can tell a dog this shepherd is still waiting on
+  from one it has permanently stopped restarting. Both were
+  `handshook: false` with a live process before, and the give-up was visible
+  nowhere outside this daemon's own memory.
+
 ### Fixed
 
 - The stale verdict for a silent dog no longer asserts a cause the shepherd
