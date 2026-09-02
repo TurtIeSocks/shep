@@ -70,7 +70,7 @@ pub use channel::Channel;
 #[cfg(feature = "client")]
 pub use dispatch::{ActionHandler, ShutdownHandler};
 #[cfg(feature = "client")]
-pub use endpoint::{Endpoint, FD_VAR, PIPE_VAR, VERSION_VAR};
+pub use endpoint::{Endpoint, FD_VAR, PIPE_VAR, VERSION_VAR, discover};
 #[cfg(feature = "client")]
 pub use error::ChannelError;
 #[cfg(feature = "client")]

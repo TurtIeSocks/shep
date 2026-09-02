@@ -51,6 +51,19 @@ pub use request::{
 pub use shep_channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 
+/// The shepherd channel's wire types. Moved to the `shep-channel` crate;
+/// this path is kept so consumers of 0.1.x do not break.
+///
+/// `docs/specs/deferred.md` told app authors to reach for it by this path
+/// and this crate's own CHANGELOG advertised it by name, so removing it
+/// would break anyone who listened. It is also what `cargo-semver-checks`
+/// sees on a release pull request: a removed public module is a major bump,
+/// and `version_group = "shep"` would carry all five crates with it.
+#[deprecated(since = "0.1.26", note = "use `shep_core::protocol` directly")]
+pub mod channel {
+    pub use shep_channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
+}
+
 /// Wire protocol version.
 ///
 /// Evolution rule: ADDITIVE optional fields (new serde-defaulted `Option<T>`
