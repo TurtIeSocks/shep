@@ -37,5 +37,11 @@ serde_json = { workspace = true, optional = true }
 [dev-dependencies]
 serde_json.workspace = true
 
+# Maps a socketpair onto fd 3 in `tests/real_child.rs`, the same crate
+# `tokio_runner.rs` uses for the real thing. Unix-only: that test is
+# unix-only, and `command-fds` does unconditional unix fd work.
+[target.'cfg(unix)'.dev-dependencies]
+command-fds.workspace = true
+
 [lints]
 workspace = true

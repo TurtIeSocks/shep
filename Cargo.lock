@@ -2098,6 +2098,7 @@ dependencies = [
 name = "shep-channel"
 version = "0.2.2"
 dependencies = [
+ "command-fds",
  "serde",
  "serde_json",
 ]
