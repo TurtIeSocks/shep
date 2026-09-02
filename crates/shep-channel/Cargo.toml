@@ -34,5 +34,8 @@ client = ["dep:serde_json"]
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, optional = true }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true
