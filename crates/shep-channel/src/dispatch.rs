@@ -27,6 +27,9 @@ pub(crate) enum Outcome {
     Handled,
     /// A shutdown, and no handler was registered.
     UnhandledShutdown,
+    /// A shutdown, and the registered handler panicked. Carries the panic
+    /// text, the same way a panicking action handler's reply does.
+    ShutdownFailed(String),
 }
 
 /// The registered handlers.
@@ -62,10 +65,10 @@ impl Dispatch {
     pub(crate) fn handle(&self, message: ShepherdMessage) -> Outcome {
         match message {
             ShepherdMessage::Shutdown => match &self.shutdown {
-                Some(handler) => {
-                    handler();
-                    Outcome::Handled
-                }
+                Some(handler) => match catch_unwind(AssertUnwindSafe(handler)) {
+                    Ok(()) => Outcome::Handled,
+                    Err(payload) => Outcome::ShutdownFailed(panic_text(&*payload)),
+                },
                 None => Outcome::UnhandledShutdown,
             },
             ShepherdMessage::Action { name, params, id } => {
@@ -198,6 +201,27 @@ mod tests {
             dispatch.handle(ShepherdMessage::Shutdown),
             Outcome::UnhandledShutdown
         ));
+    }
+
+    /// fails if a panicking shutdown handler takes the reader thread down
+    /// with it. Mirrors `a_panicking_handler_replies_with_the_panic_message`
+    /// for the one handler `handle` used to call unguarded: an unwind out of
+    /// here would skip the reader's own `close()` and hang the writer in
+    /// `pop()` forever.
+    #[test]
+    fn a_panicking_shutdown_handler_is_reported_rather_than_taking_the_reader_down() {
+        let mut dispatch = Dispatch::default();
+        dispatch.register_shutdown(Box::new(|| panic!("no such state")));
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = dispatch.handle(ShepherdMessage::Shutdown);
+        std::panic::set_hook(previous);
+
+        match outcome {
+            Outcome::ShutdownFailed(message) => assert_eq!(message, "no such state"),
+            other => panic!("expected ShutdownFailed, got {other:?}"),
+        }
     }
 
     /// fails if `Debug` starts printing handler internals or stops naming

@@ -210,6 +210,15 @@ fn warn(message: &str) {
 #[derive(Clone, Debug)]
 pub struct Shepherd(Arc<Inner>);
 
+// Pins the "safe to share... from any thread" claim above at compile time,
+// so a later field addition that quietly breaks it fails the build instead
+// of the next reader's assumption.
+#[cfg(feature = "client")]
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Shepherd>();
+};
+
 #[cfg(feature = "client")]
 #[derive(Debug)]
 struct Inner {
@@ -253,6 +262,10 @@ impl Shepherd {
 
     /// Registers a handler for one action name, replacing any handler
     /// already registered under it.
+    ///
+    /// The handler is called with the action's params (`None` when the
+    /// operator triggered it with none) and then the action's own name,
+    /// and returns the reply body sent back to the operator.
     ///
     /// Registering after [`serve`] has started is fine and takes effect on
     /// the next message.
@@ -303,10 +316,15 @@ impl Shepherd {
     /// A sample may be dropped if the shepherd stops reading; see
     /// [`Shepherd::dropped_metrics`]. That trade is deliberate, so that no
     /// call on an app's hot path can park on a full socket.
-    pub fn metric(&self, name: impl AsRef<str>, value: f64) {
+    ///
+    /// Takes `impl Into<String>` rather than `on_action`'s `impl AsRef<str>`:
+    /// this runs per sample on a documented hot path, and an owned `String`
+    /// the caller already has moves in for free instead of being copied
+    /// again.
+    pub fn metric(&self, name: impl Into<String>, value: f64) {
         if let Some(outbox) = &self.0.outbox {
             outbox.push_lossy(ChildMessage::Metric {
-                name: name.as_ref().to_string(),
+                name: name.into(),
                 value,
             });
         }
@@ -369,7 +387,7 @@ fn start() -> Shepherd {
     let dispatch = Arc::new(RwLock::new(Dispatch::default()));
 
     let writing = Arc::clone(&outbox);
-    std::thread::Builder::new()
+    let writer_spawn = std::thread::Builder::new()
         .name("shep-channel-writer".to_string())
         .spawn(move || {
             while let Some(message) = writing.pop() {
@@ -378,12 +396,26 @@ fn start() -> Shepherd {
                 }
             }
             writing.close();
-        })
-        .ok();
+        });
+    if let Err(error) = writer_spawn {
+        // Nothing will ever drain the outbox without this thread, so a
+        // handle that reported `is_active()` true here would be worse than
+        // no handle: `ready()` would queue into a channel nothing reads and
+        // return `Ok(())`, and the operator's `wait_ready` gate would time
+        // out with nothing anywhere saying why. Close the outbox first so
+        // `ready()`/`metric()` see the failure honestly, then hand back an
+        // inert handle -- still carrying the version stamp, since the
+        // channel itself did open.
+        warn(&format!(
+            "failed to spawn the shep-channel writer thread: {error}; continuing without a channel"
+        ));
+        outbox.close();
+        return Shepherd::inert(version);
+    }
 
     let reading = Arc::clone(&outbox);
     let handlers = Arc::clone(&dispatch);
-    std::thread::Builder::new()
+    let reader_spawn = std::thread::Builder::new()
         .name("shep-channel-reader".to_string())
         .spawn(move || {
             let mut reader = reader;
@@ -403,6 +435,9 @@ fn start() -> Shepherd {
                             }
                             Outcome::Handled => {}
                             Outcome::UnhandledShutdown => warn(UNHANDLED_SHUTDOWN_ADVICE),
+                            Outcome::ShutdownFailed(message) => {
+                                warn(&format!("shutdown handler panicked: {message}"));
+                            }
                         }
                     }
                     Err(ChannelError::Malformed(message)) => {
@@ -415,8 +450,18 @@ fn start() -> Shepherd {
                 }
             }
             reading.close();
-        })
-        .ok();
+        });
+    if let Err(error) = reader_spawn {
+        // The writer is still useful without this thread: `ready()` and
+        // `metric()` still reach the shepherd. Only actions go unanswered,
+        // since nothing is left to read `ShepherdMessage::Action` off the
+        // wire and dispatch it -- warn and hand back a handle that still
+        // does the two things it can, rather than tearing the writer down
+        // over a failure that does not touch it.
+        warn(&format!(
+            "failed to spawn the shep-channel reader thread: {error}; readiness and metrics still work, but no action sent to this process will ever be answered"
+        ));
+    }
 
     Shepherd(Arc::new(Inner {
         outbox: Some(outbox),
@@ -445,10 +490,14 @@ mod tests {
     }
 
     /// fails if the no-channel advice stops naming all three fields that
-    /// would open one. An author reading this line is deciding which to set.
+    /// would open one. An author reading this line is deciding which to
+    /// set. Asserts the exact `channel = true` clause, not the bare
+    /// substring "channel" -- that substring also occurs in the advice's
+    /// leading "no channel on this process" and would pass even with the
+    /// whole `channel = true` clause deleted.
     #[test]
     fn the_no_channel_advice_names_every_field_that_opens_one() {
-        for field in ["channel", "wait_ready", "shutdown_with_message"] {
+        for field in ["channel = true", "wait_ready", "shutdown_with_message"] {
             assert!(
                 NO_CHANNEL_ADVICE.contains(field),
                 "advice does not mention {field}"
