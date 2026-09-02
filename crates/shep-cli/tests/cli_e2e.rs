@@ -2455,7 +2455,7 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
          archive now: stdout={stdout}"
     );
     assert_eq!(
-        std::fs::read_to_string(&archive).unwrap(),
+        unstamped_file(&archive),
         format!("{ROTATE_BEFORE}\n"),
         "the renamed file must stop growing the moment the handle is swapped"
     );
@@ -2626,7 +2626,7 @@ fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
     std::fs::copy(&out_file, &archive).unwrap();
     std::fs::File::create(&out_file).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&archive).unwrap(),
+        unstamped_file(&archive),
         format!("{ROTATE_BEFORE}\n"),
         "sanity: the copy really took the line the truncate is about to drop"
     );
@@ -2656,7 +2656,12 @@ fn an_external_copytruncate_leaves_the_next_line_at_offset_zero() {
     // and the loop that read it back has already waited for it to be on disk.
     assert_eq!(
         std::fs::metadata(&out_file).unwrap().len(),
-        (ROTATE_AFTER.len() + 1) as u64,
+        // Stamp, line, newline. Counted in rather than stripped, because
+        // what is asserted here is a BYTE OFFSET: the point is that the
+        // file holds exactly one line's worth of bytes and no hole in
+        // front of it, and a length ignoring part of the line would not
+        // say that.
+        (shep_core::logstamp::LOG_STAMP_BYTES + ROTATE_AFTER.len() + 1) as u64,
         "the sheep's next line must land at offset 0 of the emptied file: a \
          handle that kept its offset across an external truncation would \
          leave a hole the size of what was emptied in front of it, and \
@@ -2766,7 +2771,12 @@ fn flush_empties_a_log_the_sheep_goes_on_appending_to() {
     // the loop that read it back has already waited for it to be on disk.
     assert_eq!(
         std::fs::metadata(&out_file).unwrap().len(),
-        (ROTATE_AFTER.len() + 1) as u64,
+        // Stamp, line, newline. Counted in rather than stripped, because
+        // what is asserted here is a BYTE OFFSET: the point is that the
+        // file holds exactly one line's worth of bytes and no hole in
+        // front of it, and a length ignoring part of the line would not
+        // say that.
+        (shep_core::logstamp::LOG_STAMP_BYTES + ROTATE_AFTER.len() + 1) as u64,
         "the sheep's next line must land at offset 0 of the emptied file: a \
          handle that kept its offset across the truncate would leave a hole \
          the size of what was emptied in front of it, and `bleats` would \
@@ -7304,11 +7314,31 @@ fn write_counting_script(dir: &TempDir) -> PathBuf {
 /// Returns rather than panicking on expiry, so the failure that reaches CI is
 /// the caller's own assertion naming what it wanted.
 #[cfg(unix)]
+/// A log file's contents with the daemon's per-line timestamp taken back
+/// off, which is what these cases mean when they say what a sheep wrote.
+///
+/// Through `shep_core::logstamp::strip`, the same call `shep bleats` makes
+/// when it reads one of these files — so an assertion here is about what an
+/// operator is shown and not about a prefix this test invented.
+fn unstamped_file(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut out = String::new();
+    for line in text.lines() {
+        out.push_str(shep_core::logstamp::strip(line));
+        out.push('\n');
+    }
+    out
+}
+
 fn counting_lines(path: &Path, want: usize) -> Vec<String> {
     let start = Instant::now();
     loop {
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let lines: Vec<String> = text
+            .lines()
+            .map(shep_core::logstamp::strip)
+            .map(str::to_owned)
+            .collect();
         if lines.len() >= want || start.elapsed() >= HANDOVER_DEADLINE {
             return lines;
         }
@@ -7465,6 +7495,7 @@ fn slot_lines(path: &Path) -> Vec<(u32, u32)> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
+        .map(shep_core::logstamp::strip)
         .map(|line| {
             let (slot, pid) = line
                 .split_once(' ')
@@ -7903,7 +7934,10 @@ fn await_log_line(path: &Path, want: &str) -> bool {
     let start = Instant::now();
     loop {
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        if text.lines().any(|line| line == want) {
+        if text
+            .lines()
+            .any(|line| shep_core::logstamp::strip(line) == want)
+        {
             return true;
         }
         if start.elapsed() >= HANDOVER_DEADLINE {

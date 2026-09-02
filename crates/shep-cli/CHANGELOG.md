@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `shep bleats --no-follow` and `shep lookout`'s tail pane strip the daemon's
+  new per-line timestamp before rendering, so a line means the same thing
+  there as it does on the bus. Without this, `--follow` and `--no-follow`
+  would report a sheep as having said two different things, and
+  `--format json`'s `line` would have carried a prefix the sheep never wrote.
+
 ## [0.1.27] - 2026-09-02
 
 ### Fixed

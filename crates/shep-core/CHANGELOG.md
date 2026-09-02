@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `logstamp`: the timestamp the daemon writes ahead of every line in a log
+  file, its fixed 30-byte width, and `strip`, which takes it back off. One
+  definition for the writer and every reader — the daemon stamps, and three
+  separate file readers in `shep-cli` strip — so the two cannot drift.
+
 ## [0.1.27] - 2026-09-02
 
 

@@ -1316,7 +1316,7 @@ pub(crate) async fn narrate(events: &Bus, info: &ProcessInfo, message: &str) {
     let line = format!("{SHEP_VOICE} {message}");
     if let Some(path) = &info.err_file {
         let mut written = String::with_capacity(line.len() + 32);
-        crate::tokio_runner::stamp_into(&mut written);
+        shep_core::logstamp::stamp_into(&mut written);
         written.push_str(&line);
         written.push('\n');
         // A failed open is already logged by `open_append`, with the path
@@ -2487,7 +2487,7 @@ mod tests {
             line.ends_with("[shep] shep did a thing worth saying"),
             "the line must be marked as shep's voice, not the dog's: {line:?}"
         );
-        let (stamp, rest) = line.split_at(crate::tokio_runner::LOG_STAMP_BYTES);
+        let (stamp, rest) = line.split_at(shep_core::logstamp::LOG_STAMP_BYTES);
         assert_eq!(
             rest, "[shep] shep did a thing worth saying",
             "the stamp is the same fixed-width prefix every other line carries: {line:?}"

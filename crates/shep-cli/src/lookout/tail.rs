@@ -262,7 +262,14 @@ fn read_window(seen: &mut BTreeMap<PathBuf, u64>, path: &Path) -> std::io::Resul
     };
 
     let text = String::from_utf8_lossy(bytes);
-    let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
+    // Stripped here for the same reason `commands::bleats::read_tail` strips
+    // it: this pane and the live feed show one sheep's output side by side,
+    // and a line that grew a 30-character prefix on only one of those two
+    // paths would read as two different sheep.
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|line| shep_core::logstamp::strip(line).to_string())
+        .collect();
     if lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }

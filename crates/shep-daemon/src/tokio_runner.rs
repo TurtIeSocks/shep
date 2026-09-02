@@ -91,94 +91,21 @@ const LOG_BUFFER: usize = 8 * 1024;
 /// buffer until its next one, which for some sheep is never.
 const IDLE_FLUSH: Duration = Duration::from_millis(50);
 
-/// The `strftime` spelling of the stamp every line written to a log file
-/// carries, in the daemon's own local time: `2026-09-02T14:22:31.412+02:00`.
+/// The per-line timestamp, re-exported from where the readers find it.
 ///
-/// # Why lines are stamped at all
+/// The format, its fixed width, and the function that takes it back off all
+/// live in [`shep_core::logstamp`], because they are a contract between this
+/// writer and three different file readers in `shep-cli` — see that module's
+/// own doc for why one definition and not four, and for what the stamp is
+/// worth.
 ///
-/// A log file that carries no time is a file an operator cannot date. The
-/// incident this exists for was a 341 KB log of byte-identical lines whose
-/// newest entry was two days old, read by an operator who had no way to see
-/// that and spent two days acting on it as if it were live. `mtime` answers
-/// only for the whole file and only until something touches it, and shep's
-/// own rotation touches it.
-///
-/// # Why local time, and why an offset
-///
-/// Local because the reader is a person looking at their own clock, which
-/// is the same call `shep list`'s table already makes for the timestamps it
-/// prints. The offset is what keeps that from being a lie: a bare local
-/// time is unreadable across a DST boundary and unusable to anyone
-/// correlating this file with a UTC one, and printing it costs six
-/// characters.
-///
-/// # Why RFC 3339 rather than something shorter
-///
-/// It sorts lexicographically within one offset, every log tool already
-/// parses it, and the `T` makes the date/time boundary unambiguous without a
-/// second separator. Milliseconds because a dog's handshake round trip is
-/// measured in them, so a second-resolution stamp would put a spawn, its
-/// handshake and its refusal all at the same instant.
-///
-/// # Why there is no opt-out
-///
-/// Named here because it is a real decision and not an oversight. Three
-/// reasons, in order of weight: an unstamped feed already exists for anyone
-/// who post-processes lines — [`Bus::publish_log`](crate::bus::Bus::publish_log)
-/// carries the sheep's line verbatim, which is what `shep bleats --follow`
-/// and every dog subscribing to `log.*` read, so the stamp is a property of
-/// the FILE and not of shep's log stream; a knob that turns this off
-/// re-creates the incident above for whoever sets it, and makes "do you
-/// have timestamps on?" the first question of every future log report; and
-/// the prefix is fixed-width ([`LOG_STAMP_BYTES`]), so a reader that wants
-/// the raw line strips a constant number of leading bytes.
-const LOG_TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f%:z";
-
-/// How many bytes [`stamp_into`] writes, stamp and separating space
-/// together.
-///
-/// Fixed rather than approximate, and that is a property of
-/// [`LOG_TIMESTAMP_FORMAT`] rather than a hope: `%:z` renders `+HH:MM` for
-/// every offset chrono can produce (it truncates the sub-minute offsets a
-/// handful of pre-1900 zones carry), and every other field in that format is
-/// zero-padded to a fixed width. 10 date + 1 `T` + 8 time + 4 `.mmm` + 6
-/// offset + 1 space.
-///
-/// Load-bearing twice: it is the byte count a reader strips to recover a
-/// sheep's own line, and it is what lets `LOG_BUFFER`'s spill test still
-/// predict how many writes a run of lines costs.
-pub(crate) const LOG_STAMP_BYTES: usize = 30;
-
-/// Appends the current local time in [`LOG_TIMESTAMP_FORMAT`], plus the
-/// single space that separates it from the line, to `buf`.
-///
-/// Takes a buffer rather than returning a `String` because the caller on the
-/// hot path is [`LogFile::append`], which runs once per logged line and can
-/// reuse one allocation for the life of the file — a sheep emitting 1.6M
-/// lines a second is a workload this pump has actually been measured
-/// against.
-pub(crate) fn stamp_into(buf: &mut String) {
-    use std::fmt::Write as _;
-    let start = buf.len();
-    // Infallible: the only way `write!` to a `String` fails is a `Display`
-    // impl that itself errors, and chrono's `DelayedFormat` only does that
-    // for a format string it could not parse — which this one is a `const`
-    // to keep from ever being.
-    let _ = write!(
-        buf,
-        "{} ",
-        chrono::Local::now().format(LOG_TIMESTAMP_FORMAT)
-    );
-    // The one place [`LOG_STAMP_BYTES`] is CHECKED rather than asserted in
-    // a comment. Everything that strips the prefix back off depends on it,
-    // so an edit to the format that changed the width would otherwise be
-    // found by a reader's mangled output rather than by a test run.
-    debug_assert_eq!(
-        buf.len() - start,
-        LOG_STAMP_BYTES,
-        "the stamp's width is fixed and readers strip it by count"
-    );
-}
+/// The one thing that stays here is the decision about the LINE: what
+/// [`LogFile::append`] writes to the file is stamped, and what the pump
+/// forwards to `Bus::publish_log` is the sheep's own bytes, unstamped. That
+/// split is why this needs no opt-out — an unstamped feed already exists for
+/// anything post-processing lines, and `bleats`' file readers strip the
+/// prefix so the two paths report a sheep as having said the same thing.
+use shep_core::logstamp::stamp_into;
 
 /// Bytes each stream's reader may hold ahead of the lines it has emitted.
 ///
@@ -2577,6 +2504,8 @@ mod tests {
         }
     }
 
+    use shep_core::logstamp::LOG_STAMP_BYTES;
+
     /// One log file's contents with [`LogFile::append`]'s per-line stamp
     /// taken back off, so a test can assert on the bytes the SHEEP produced.
     ///
@@ -2590,30 +2519,21 @@ mod tests {
         unstamped(&fs::read_to_string(path).unwrap())
     }
 
-    /// Drops a leading [`LOG_TIMESTAMP_FORMAT`] stamp from every line of
-    /// `text` that carries one, leaving the rest of the line untouched.
+    /// Drops the per-line stamp from every line of `text` that carries one,
+    /// leaving the rest of the line untouched.
     ///
-    /// The stamp is RECOGNISED rather than assumed, by parsing the first
-    /// [`LOG_STAMP_BYTES`] as RFC 3339: some of these tests write a line
-    /// into a log file directly, ahead of any pump, and blindly cutting a
-    /// fixed prefix would silently eat the first 30 characters of it. It
-    /// also means a stamp that stopped being well formed shows up as a
-    /// failed assertion on the line, rather than as a prefix quietly
-    /// removed.
+    /// Through [`shep_core::logstamp::strip`], which is the same call
+    /// `bleats` makes when it reads one of these files — so what these tests
+    /// compare against is what an operator is shown. It recognises a stamp
+    /// rather than assuming one, which matters here because some of these
+    /// tests write a line into a log file directly, ahead of any pump.
     fn unstamped(text: &str) -> String {
         let mut out = String::new();
         for line in text.lines() {
-            out.push_str(strip_stamp(line).unwrap_or(line));
+            out.push_str(shep_core::logstamp::strip(line));
             out.push('\n');
         }
         out
-    }
-
-    /// `line` without its stamp, or `None` when it does not start with one.
-    fn strip_stamp(line: &str) -> Option<&str> {
-        let (stamp, rest) = line.split_at_checked(LOG_STAMP_BYTES)?;
-        chrono::DateTime::parse_from_rfc3339(stamp.strip_suffix(' ')?).ok()?;
-        Some(rest)
     }
 
     /// Waits for `path` to hold exactly `expected`, ignoring the per-line
