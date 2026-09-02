@@ -2676,6 +2676,13 @@ pub(crate) struct Applied {
     pub(crate) applied: Vec<String>,
     /// Fields the app picks up at its next spawn, in field-name order.
     ///
+    /// **Not the same set as [`ProcessEntry::pending`], which shares its
+    /// name.** That one is a whole parked `ResolvedApp` and holds only what a
+    /// respawn has to pick up; this one is a list of field NAMES for an
+    /// operator to read, and it also carries the `NextSpawn` fields, which
+    /// are already on the stored spec and need no promotion. Task 9 promotes
+    /// the entry's, never this.
+    ///
     /// Both [`ApplyGroup::NextSpawn`] and [`ApplyGroup::NeedsRespawn`] land
     /// here, and the difference between them is invisible to an operator:
     /// either way the running process keeps the old value until it is
@@ -2688,12 +2695,19 @@ pub(crate) struct Applied {
     /// Why some or all of this app's change did not land, in the daemon's own
     /// words, or `None` when the whole of it did.
     ///
-    /// Set on four occasions: the flock has no app of this name, its override
-    /// store could not be read, the merged config does not normalize, or the
-    /// instance count could not be changed. The first three touch nothing at
-    /// all, which is what [`Self::applied`] and [`Self::pending`] being empty
-    /// says; the fourth can accompany a partial apply, so the two lists still
-    /// carry whatever did land.
+    /// **Empty `applied` and `pending` alongside this is the promise that the
+    /// app was not touched at all**, and it is a promise: every refusal that
+    /// can answer it is raised before [`Actor::apply_one`] routes the
+    /// instance count, which is the only thing in a load that reshapes a
+    /// flock. Those are the flock having no app of this name, the override
+    /// store being unreadable, a merged config that does not normalize, and a
+    /// scale `handle_scale` itself refused (all of whose refusals precede
+    /// anything it spawns or removes).
+    ///
+    /// Anything discoverable only after that point is reported HERE while the
+    /// two lists still carry what did land: a partial scale-up's shortfall, a
+    /// count a plain load declined to reshape, a store that could not be
+    /// written.
     pub(crate) refused: Option<String>,
     /// The merged, normalized app. `rpc.rs` hands this to
     /// `FlockRegistry::record`, the way the `Scale` arm hands it
@@ -2748,6 +2762,9 @@ const EXTRAS_FIELDS: &[&str] = &[
 ///   overwrite. Every other key keeps exactly what it has, defaults
 ///   included: "overwrite nothing" is the depth's own promise, and a key
 ///   nobody ever declared has no template value to be put back to.
+///   `instances` is excluded from this depth however unestablished it is:
+///   see the `in_scope` arm below for why appending a count is not the same
+///   kind of act as appending a value.
 /// - [`ResetDepth::Settings`] runs them for every key but `env`.
 /// - [`ResetDepth::All`] runs them for every key, `env` included, and ignores
 ///   the overrides entirely.
@@ -2802,8 +2819,15 @@ fn merge_declared(
             // `ResetDepth::None`, and any depth a newer client knows that
             // this build does not: append-only is the rule that cannot
             // overwrite something an operator set, so it is the one an
-            // unrecognised depth falls back to.
-            _ => incoming.declared.contains(key) && !established.contains(key),
+            // unrecognised depth falls back to. `instances` is held out of
+            // it entirely, because appending that field is not a value
+            // change but a reshaping of the flock -- a scale-down through a
+            // plain load would DELETE instances, and `shep stock` is an
+            // operator setting the count that the store cannot yet tell
+            // apart from a count nobody has touched.
+            _ => {
+                key != "instances" && incoming.declared.contains(key) && !established.contains(key)
+            }
         };
         if !in_scope {
             continue;
@@ -2888,26 +2912,29 @@ fn merge_declared(
 /// spawned from, plus every merged field that can reach it without a
 /// replacement, plus the instance count actually achieved.
 ///
-/// `live` and `later` are the drifted field names as
-/// [`Actor::apply_one`] partitioned them, and only two of the four groups are
-/// copied across: [`ApplyGroup::Live`] because the daemon reads it fresh at
-/// each decision, and [`ApplyGroup::NextSpawn`] because it is read when a
-/// process spawns and the stored spec is what a spawn reads. A
-/// [`ApplyGroup::NeedsRespawn`] field is deliberately left behind -- it lives
-/// in [`ProcessEntry::pending`] until the instance is replaced.
+/// `reaching` is the drifted [`ApplyGroup::Live`] and
+/// [`ApplyGroup::NextSpawn`] field names, as [`Actor::apply_one`] partitioned
+/// them: the first because the daemon reads it fresh at each decision, the
+/// second because it is read when a process spawns and the stored spec is
+/// what a spawn reads. A [`ApplyGroup::NeedsRespawn`] field is deliberately
+/// left behind -- it lives in [`ProcessEntry::pending`] until the instance is
+/// replaced.
 ///
 /// # Errors
 ///
-/// A description of the failure, for [`Applied::refused`], if the rebuilt
-/// config does not travel through serde or does not normalize. Neither is
-/// reachable from a merge that already normalized -- this config is a subset
-/// of that one, over a base that normalized when it was stored -- so an error
-/// here is a report rather than a path with behaviour of its own.
+/// A description of the failure if the rebuilt config does not travel through
+/// serde or does not normalize.
+///
+/// **Normalizing can genuinely fail here, on a config whose full merge is
+/// perfectly valid**, because `normalize` checks fields against each other
+/// and this is a SUBSET: a file declaring both `watch` and `cwd` brings the
+/// `watch` forward and leaves the `cwd` behind, and a watch with no directory
+/// to watch is refused. The caller treats that as "this app needs a restart"
+/// and parks everything, never as an invalid file.
 fn reached_spec(
     stored: &AppConfig,
     merged: &AppConfig,
-    live: &[String],
-    later: &[String],
+    reaching: &[String],
     instances: u32,
 ) -> Result<ResolvedApp, String> {
     let object = |config: &AppConfig| match serde_json::to_value(config) {
@@ -2917,11 +2944,6 @@ fn reached_spec(
     };
     let mut next = object(stored)?;
     let source = object(merged)?;
-    let reaching = live.iter().chain(
-        later
-            .iter()
-            .filter(|field| matches!(apply_group(field.as_str()), ApplyGroup::NextSpawn)),
-    );
     for field in reaching {
         if let Some(value) = source.get(field) {
             next.insert(field.clone(), value.clone());
@@ -2931,6 +2953,18 @@ fn reached_spec(
         serde_json::from_value(serde_json::Value::Object(next)).map_err(|err| err.to_string())?;
     config.instances = instances;
     normalize(config).map_err(|err| err.to_string())
+}
+
+/// `app` with its instance count set to `instances`, or `None` if the result
+/// does not normalize.
+///
+/// Re-normalized rather than mutated in place for `handle_scale`'s reason: a
+/// [`ResolvedApp`] is a proof token that its config passed `normalize`, and
+/// the one place in the tree holding one that had not would be here.
+fn with_count(app: &ResolvedApp, instances: u32) -> Option<ResolvedApp> {
+    let mut config = app.config().clone();
+    config.instances = instances;
+    normalize(config).ok()
 }
 
 /// One command's aggregation state: which ids are still outstanding, the
@@ -5333,29 +5367,106 @@ impl<R: ProcessRunner> Actor<R> {
     ///
     /// # Per app, in order
     ///
-    /// Find the slots, read the override store, merge, normalize, then split
-    /// the drifted fields by [`apply_group`] and route each group. A merge
-    /// that does not normalize refuses that app whole and touches nothing,
-    /// leaving the rest of the file to apply: one bad app in a file of eleven
-    /// costing the other ten their load is the failure `BatchPolicy::PerApp`
-    /// already exists to avoid on the start path.
+    /// Find the slots, merge, normalize, then split the drifted fields by
+    /// [`apply_group`] and route each group. A merge that does not normalize
+    /// refuses that app whole and touches nothing, leaving the rest of the
+    /// file to apply: one bad app in a file of eleven costing the other ten
+    /// their load is the failure `BatchPolicy::PerApp` already exists to
+    /// avoid on the start path.
+    ///
+    /// The override store is read once for the whole file and written once at
+    /// the end, around that loop rather than inside it.
     ///
     /// The instance count is the one field that reshapes the flock rather
     /// than changing a value, and it is routed through [`Self::handle_scale`]
     /// rather than reimplemented: slot allocation, the dog refusal, the
     /// reload-in-flight refusal, the still-departing refusal and the
     /// partial-scale write-back are all that function's, and a second
-    /// spelling of them here is a second thing to keep in step. It is skipped
-    /// entirely while `shutting_down`, because a scale-up spawns, and
-    /// CRITICAL-1 forbids a child the shutdown aggregation cannot know about.
+    /// spelling of them here is a second thing to keep in step. Two depths
+    /// never reach it at all: [`ResetDepth::None`], which never reshapes a
+    /// flock, and any depth while `shutting_down`, because a scale-up spawns
+    /// and CRITICAL-1 forbids a child the shutdown aggregation cannot know
+    /// about.
     fn handle_apply_config(&mut self, apps: Vec<DeclaredApp>, reset: ResetDepth) -> Vec<Applied> {
-        apps.iter()
-            .map(|incoming| self.apply_one(incoming, reset))
-            .collect()
+        // One locked read for the whole file and one locked write at the end,
+        // never a pair per app. The store is rewritten whole on every write,
+        // so a per-app pair made an eleven-app Flockfile 22 lock acquisitions
+        // and 11 full rewrites on the thread that supervises the flock. It
+        // also makes the record of a load atomic per file rather than per app.
+        let store = match overrides::all(&self.paths.overrides) {
+            Ok(store) => store,
+            Err(err) => {
+                // Nothing is applied at all, and this is the one refusal that
+                // covers the whole file: the merge cannot tell what an
+                // operator has set without this store, and applying a
+                // template over an unreadable one is exactly how those edits
+                // get silently overwritten.
+                let message = format!("overrides could not be read: {err}");
+                return apps
+                    .iter()
+                    .map(|incoming| Applied {
+                        name: incoming.config.name.clone(),
+                        applied: Vec::new(),
+                        pending: Vec::new(),
+                        refused: Some(message.clone()),
+                        app: None,
+                    })
+                    .collect();
+            }
+        };
+
+        let mut changes = BTreeMap::new();
+        let mut report = Vec::with_capacity(apps.len());
+        for incoming in &apps {
+            let overrides = store
+                .get(&incoming.config.name)
+                .cloned()
+                .unwrap_or_default();
+            report.push(self.apply_one(incoming, reset, &overrides, &mut changes));
+        }
+
+        if let Err(err) = overrides::update(&self.paths.overrides, &changes) {
+            // Reported next to what landed rather than as a refusal: the
+            // flock has already been changed by the time this runs, and an
+            // `Applied` claiming nothing happened would be the one thing this
+            // function must never say untruthfully.
+            let note = format!("overrides could not be written: {err}");
+            for applied in &mut report {
+                if !changes.contains_key(&applied.name) {
+                    continue;
+                }
+                applied.refused = Some(match applied.refused.take() {
+                    Some(existing) => format!("{existing}; {note}"),
+                    None => note.clone(),
+                });
+            }
+        }
+        report
     }
 
     /// One app's half of [`Self::handle_apply_config`].
-    fn apply_one(&mut self, incoming: &DeclaredApp, reset: ResetDepth) -> Applied {
+    ///
+    /// `overrides` is this app's record as the one store read found it, and
+    /// `changes` is where its replacement goes: the write is the caller's, so
+    /// that a file of eleven apps costs one lock rather than eleven.
+    ///
+    /// # Where a refusal may be raised
+    ///
+    /// Every refusal that answers "this app was not touched" is raised BEFORE
+    /// the instance count is routed, and that ordering is the whole of this
+    /// function's care about a partial apply. A refusal after the scale would
+    /// report an untouched app while the flock had already been reshaped --
+    /// the divergence `handle_scale`'s spawn-before-write-back ordering exists
+    /// to prevent, arriving through a door it does not cover. Anything that
+    /// can only be discovered after the scale is reported alongside what did
+    /// land instead, never as a refusal.
+    fn apply_one(
+        &mut self,
+        incoming: &DeclaredApp,
+        reset: ResetDepth,
+        overrides: &AppOverrides,
+        changes: &mut BTreeMap<String, Option<AppOverrides>>,
+    ) -> Applied {
         let name = incoming.config.name.clone();
         let refuse = |message: String| Applied {
             name: name.clone(),
@@ -5366,23 +5477,27 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         let ids = self.ids_of_name(&name);
-        let Some(first) = ids.first().copied() else {
+        let Some(slot) = ids.first().and_then(|id| self.sheep.get(id)) else {
             return refuse(format!(
                 "{name} is not registered; `shep start` it before a config can be applied to it"
             ));
         };
-        let stored = self.sheep[&first].entry.spec.config().clone();
+        // Two configs, and the difference between them is this function's
+        // whole subject. `running` is what the child was spawned from;
+        // `intended` is what the app is meant to be, which is an earlier
+        // load's parked config when there is one. The merge builds on
+        // `intended`, because a second load of the same file would otherwise
+        // find its own key established, skip it, and merge the RUNNING value
+        // over the parked one -- erasing the first load's change. Two
+        // identical `shep start Flockfile.toml` calls is what a deploy does.
+        let running = slot.entry.spec.config().clone();
+        let intended = slot
+            .entry
+            .pending
+            .as_ref()
+            .map_or_else(|| running.clone(), |parked| parked.config().clone());
 
-        // Read before anything is written, so an unreadable store costs this
-        // app nothing rather than half of a merge. The read is a locked file
-        // read on the actor's own thread, which is the same trade the muster
-        // roll's write already makes: bounded, rare, and the alternative is
-        // an apply that cannot see what the operator has set.
-        let overrides = match overrides::get(&self.paths.overrides, &name) {
-            Ok(overrides) => overrides.unwrap_or_default(),
-            Err(err) => return refuse(format!("overrides could not be read: {err}")),
-        };
-        let (merged, next_overrides) = match merge_declared(&stored, incoming, &overrides, reset) {
+        let (merged, next_overrides) = match merge_declared(&intended, incoming, overrides, reset) {
             Ok(merged) => merged,
             Err(message) => return refuse(message),
         };
@@ -5392,17 +5507,14 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         let mut live = Vec::new();
-        let mut later = Vec::new();
-        let mut respawn = false;
+        let mut next_spawn = Vec::new();
+        let mut respawn = Vec::new();
         let mut instances = false;
-        for field in stored.drifted_fields(merged.config()) {
+        for field in intended.drifted_fields(merged.config()) {
             match apply_group(&field) {
                 ApplyGroup::Live => live.push(field),
-                ApplyGroup::NextSpawn => later.push(field),
-                ApplyGroup::NeedsRespawn => {
-                    respawn = true;
-                    later.push(field);
-                }
+                ApplyGroup::NextSpawn => next_spawn.push(field),
+                ApplyGroup::NeedsRespawn => respawn.push(field),
                 // `name` cannot drift (the app was found BY it) and
                 // `increment_var` is refused by `normalize`, so `instances`
                 // is the only structural field that reaches here.
@@ -5410,19 +5522,32 @@ impl<R: ProcessRunner> Actor<R> {
                 // A group a later shep-core adds. Treated as the table's own
                 // fallback treats an unknown field: the conservative answer
                 // is that the running process does not have the new value.
-                _ => {
-                    respawn = true;
-                    later.push(field);
-                }
+                _ => respawn.push(field),
             }
         }
 
         let mut refusals = Vec::new();
-        let mut count = stored.instances;
+        let mut count = running.instances;
+        // A plain load never reshapes a flock, so `merge_declared` keeps
+        // `instances` out of the merge under that depth entirely and this
+        // only has a note to make. `shep stock` is an operator setting the
+        // count, and the additive default exists so that a template cannot
+        // change what an operator set; the store cannot yet tell a stocked
+        // count from an untouched one, so no plain load may act on the field.
+        if !matches!(reset, ResetDepth::Settings | ResetDepth::All)
+            && incoming.declared.contains("instances")
+            && incoming.config.instances != running.instances
+        {
+            refusals.push(format!(
+                "instances: a plain load never reshapes a flock; `shep start --reset` to take \
+                 the file's count of {}",
+                incoming.config.instances
+            ));
+        }
         if instances {
             if self.shutting_down {
                 refusals.push(
-                    "instances: the daemon is shutting down and cannot start one".to_string(),
+                    "instances: the daemon is shutting down and cannot reshape a flock".to_string(),
                 );
             } else {
                 let (reply, mut answer) = oneshot::channel();
@@ -5437,92 +5562,137 @@ impl<R: ProcessRunner> Actor<R> {
                             refusals.push(format!("instances: {shortfall}"));
                         }
                     }
-                    // Refused whole rather than applied around: a scale is
-                    // refused when the app's SHAPE is already being changed by
-                    // something else (a reload, an earlier scale's departures),
-                    // and writing this file's other fields onto slots mid-move
-                    // is the divergence `handle_scale`'s own guards exist to
-                    // stop. The operator retries once the flock settles.
+                    // Refused whole, and honestly: every `Err` `handle_scale`
+                    // answers with is raised before it spawns or removes
+                    // anything, so the flock really is as it was. It is
+                    // refused rather than applied around because a scale is
+                    // refused exactly when the app's SHAPE is already being
+                    // changed by something else (a reload, an earlier scale's
+                    // departures), and writing this file's other fields onto
+                    // slots mid-move is what `handle_scale`'s own guards
+                    // exist to stop. The operator retries once it settles.
                     Err(err) => return refuse(err.to_string()),
                 }
             }
         }
 
-        // Built from the STORED config rather than from the merge, plus only
-        // the fields that may reach a running process: a `NeedsRespawn` field
-        // written here would erase the record of what the child was actually
-        // spawned from, which nothing else keeps.
-        let next_spec = match reached_spec(&stored, merged.config(), &live, &later, count) {
-            Ok(spec) => spec,
-            Err(message) => return refuse(message),
-        };
+        // Built from the RUNNING config, plus only the fields that can reach a
+        // running process: a `NeedsRespawn` field written here would erase the
+        // record of what the child was actually spawned from, which nothing
+        // else keeps.
+        let reaching: Vec<String> = live.iter().chain(next_spawn.iter()).cloned().collect();
+        // A subset of a config that normalized can still fail, because
+        // normalize checks fields against each other: `watch` needs a `cwd`
+        // to watch, and a file declaring both leaves the `cwd` behind (it is
+        // `NeedsRespawn`) while bringing the `watch` forward. That is a
+        // change this app needs a restart for, not an invalid file, so
+        // everything parks instead of anything refusing.
+        let next_spec = reached_spec(&running, merged.config(), &reaching, count).ok();
+        let park_all = next_spec.is_none();
+
         // The whole merge, for a next spawn to pick up. Recomputed even when
         // this load changed no `NeedsRespawn` field of its own, whenever an
         // earlier load left one parked: that parked config predates this
         // load's Live changes, and promoting it later would put them back.
-        let parked = if respawn || ids.iter().any(|id| self.sheep[id].entry.pending.is_some()) {
-            let mut config = merged.config().clone();
-            config.instances = count;
-            match normalize(config) {
-                Ok(parked) => Some(parked),
-                Err(err) => return refuse(err.to_string()),
+        let parked_wanted = park_all
+            || !respawn.is_empty()
+            || ids.iter().any(|id| {
+                self.sheep
+                    .get(id)
+                    .is_some_and(|slot| slot.entry.pending.is_some())
+            });
+        let parked = if parked_wanted {
+            match with_count(&merged, count) {
+                Some(parked) => Some(parked),
+                None => {
+                    refusals.push(format!(
+                        "the merged config does not hold at {count} instance(s)"
+                    ));
+                    None
+                }
             }
         } else {
             None
         };
 
-        // Re-read: a scale-up registered ids this app did not have a moment
-        // ago, and a scale-down deregistered some it did.
+        // Re-read, and by `get_mut` rather than by index: a scale-up
+        // registered ids this app did not have a moment ago, and a scale-down
+        // deregistered some it did -- synchronously, for an instance with no
+        // live task, so the pre-scale list can name a slot that is already
+        // gone.
         for id in self.ids_of_name(&name) {
             let Some(slot) = self.sheep.get_mut(&id) else {
                 continue;
             };
-            slot.entry.spec = next_spec.clone();
+            if let Some(next_spec) = next_spec.clone() {
+                slot.entry.spec = next_spec;
+            }
             if let Some(parked) = parked.clone() {
                 slot.entry.pending = Some(parked);
             }
         }
 
-        if live
-            .iter()
-            .any(|field| EXTRAS_FIELDS.contains(&field.as_str()))
+        if !park_all
+            && live
+                .iter()
+                .any(|field| EXTRAS_FIELDS.contains(&field.as_str()))
         {
             self.rearm_name(&name);
         }
 
-        // Written last, and only for an app that got this far: the record
+        // Handed to the caller rather than written here, so one file costs
+        // one lock. Recorded only for an app that got this far: the record
         // says what this load established, and a load that refused
         // established nothing.
-        let recorded = if matches!(reset, ResetDepth::All) {
-            overrides::remove(&self.paths.overrides, &name).map(|_| ())
-        } else {
-            overrides::put(&self.paths.overrides, &name, &next_overrides)
-        };
-        if let Err(err) = recorded {
-            refusals.push(format!("overrides could not be written: {err}"));
-        }
+        changes.insert(
+            name.clone(),
+            (!matches!(reset, ResetDepth::All)).then_some(next_overrides),
+        );
 
-        let mut applied = live;
-        if instances && count != stored.instances {
+        // `autostart` is the one `NextSpawn` field that reports as APPLIED.
+        // It is read by `restorable()` at muster or boot rather than at a
+        // spawn, so it is in force the moment it lands on the stored spec,
+        // and telling an operator to restart for it would be telling them to
+        // do nothing useful. Its three group-mates (`kill_signal`,
+        // `listen_timeout`, `readiness_probe`) really are read at a spawn.
+        let (autostart, later): (Vec<String>, Vec<String>) = next_spawn
+            .into_iter()
+            .partition(|field| field == "autostart");
+        let (mut applied, mut pending): (Vec<String>, Vec<String>) = if park_all {
+            // Nothing reached the running instances at all, so nothing may be
+            // reported as applied.
+            (
+                Vec::new(),
+                live.iter()
+                    .cloned()
+                    .chain(autostart)
+                    .chain(later)
+                    .chain(respawn)
+                    .collect(),
+            )
+        } else {
+            (
+                live.iter().cloned().chain(autostart).collect(),
+                later.into_iter().chain(respawn).collect(),
+            )
+        };
+        if instances && count != running.instances {
             applied.push("instances".to_string());
         }
         applied.sort_unstable();
-        later.sort_unstable();
-        let mut app = merged;
-        if count != app.config().instances {
-            let mut config = app.config().clone();
-            config.instances = count;
-            match normalize(config) {
-                Ok(achieved) => app = achieved,
-                Err(err) => return refuse(err.to_string()),
-            }
-        }
+        pending.sort_unstable();
+
+        let app = if count == merged.config().instances {
+            Some(merged)
+        } else {
+            with_count(&merged, count)
+        };
         Applied {
             name,
             applied,
-            pending: later,
+            pending,
             refused: (!refusals.is_empty()).then(|| refusals.join("; ")),
-            app: Some(app),
+            app,
         }
     }
 
@@ -5535,10 +5705,24 @@ impl<R: ProcessRunner> Actor<R> {
     /// `watch`, `cron_restart` and their neighbours when they are built, so a
     /// task that survives keeps the old values for as long as it lives.
     ///
-    /// One prober for the whole name, built from the first instance's
-    /// assembled spec: every instance of an app shares its config, and a
-    /// prober is a `cwd` and an environment, both of which that config
-    /// decides.
+    /// # Only what is online
+    ///
+    /// Gated on `Online` with a live pid, exactly as every other arming site
+    /// in this crate is (they all hang off the `went_online` transition).
+    /// [`ExtrasRegistry::arm`] decides group membership from the
+    /// CONFIGURATION rather than from whether anything is running, so arming
+    /// a stopped instance puts it in a group whose cron occurrence and whose
+    /// watch both restart every member -- a config apply would then start a
+    /// process the operator had stopped, with no operator action and no
+    /// report. `ExtrasRegistry::disarm`'s own doc names that mechanism as
+    /// what keeps a stopped sheep down.
+    ///
+    /// # One prober per instance
+    ///
+    /// [`assemble`] bakes `SHEP_INSTANCE` and every `{{instance}}` template
+    /// into the environment a prober runs with, so a shared prober would run
+    /// every instance's liveness probe against one instance's environment.
+    /// The normal arming path gives each instance its own, and so does this.
     fn rearm_name(&mut self, name: &str) {
         let Some(extras) = self.extras.as_ref() else {
             return;
@@ -5548,22 +5732,42 @@ impl<R: ProcessRunner> Actor<R> {
         let supervisor = SupervisorHandle {
             tx: self.tx.clone(),
         };
-        let entries: Vec<&ProcessEntry> = self
+        let mut armable: Vec<(u32, &ProcessEntry)> = self
             .sheep
-            .values()
-            .filter(|slot| slot.entry.spec.config().name == name)
-            .map(|slot| &slot.entry)
+            .iter()
+            .filter(|(_, slot)| {
+                slot.entry.spec.config().name == name
+                    && slot.entry.status == ProcStatus::Online
+                    && slot.entry.pid.is_some()
+            })
+            .map(|(id, slot)| (*id, &slot.entry))
             .collect();
-        let Some(first) = entries.first() else {
+        if armable.is_empty() {
             return;
-        };
-        let credentials = match first.credentials {
-            SpawnIdentity::Resolved(credentials) => credentials,
-            SpawnIdentity::Unresolved => None,
-        };
-        let spec = assemble(&first.spec, first.instance, &self.paths, credentials);
-        self.registry
-            .rearm_name(name, &entries, spec_prober(&spec), extras, &supervisor);
+        }
+        // Sorted, so the order the group is rebuilt in does not depend on a
+        // `HashMap`'s iteration order.
+        armable.sort_unstable_by_key(|(id, _)| *id);
+        let entries: Vec<&ProcessEntry> = armable.into_iter().map(|(_, entry)| entry).collect();
+        let paths = &self.paths;
+        self.registry.rearm_name(
+            name,
+            &entries,
+            |entry| {
+                // `Credentials` is `Copy`, which is why this needs no clone.
+                // This spec is assembled for the prober alone and is never
+                // spawned, so the unresolved arm costs nothing: an entry
+                // reached here is already running, and resolved its identity
+                // before it could start.
+                let credentials = match entry.credentials {
+                    SpawnIdentity::Resolved(credentials) => credentials,
+                    SpawnIdentity::Unresolved => None,
+                };
+                spec_prober(&assemble(&entry.spec, entry.instance, paths, credentials))
+            },
+            extras,
+            &supervisor,
+        );
     }
 
     /// Accepts a reload: answers the caller at once, then starts one swap per
@@ -21157,35 +21361,47 @@ mod tests {
     /// An actor over one `Online` instance of each app, plus the recording
     /// enforcer its extras are armed against.
     ///
+    /// One slot per instance the app's config declares, so a case can reach
+    /// the multi-instance paths; ids are handed out in order, which makes the
+    /// first app's instances 0.., then the next app's.
+    ///
     /// The extras are real rather than `None` so a case can assert that a
     /// changed ceiling reached the registry; nothing is armed at
     /// construction, because no instance here went through `went_online`.
+    ///
+    /// Every slot is `Online` with a pid and no `ctl`. A case wanting a
+    /// stopped instance writes that onto the entry itself, which is also what
+    /// makes its removal synchronous (no live task owns its exit).
     fn actor_over(
         dir: &tempfile::TempDir,
         apps: &[ResolvedApp],
     ) -> (Actor<ScriptedRunner>, Arc<RecordingEnforcer>) {
         let paths = test_paths(dir);
         let mut sheep = HashMap::new();
-        for (index, app) in apps.iter().enumerate() {
-            let id = u32::try_from(index).expect("a fixture flock is small");
-            sheep.insert(
-                id,
-                SheepSlot {
-                    entry: armed_entry(id, 0, APPLY_FIRST_PID + id, app.clone(), &paths),
-                    ctl: None,
-                    log_ctl: None,
-                    to_child: None,
-                    signals: None,
-                    to_stdin: None,
-                    manual: None,
-                    pending_delete: false,
-                    epoch: 0,
-                    ready_tx: None,
-                    actions: ActionWaits::default(),
-                    ready_failed: false,
-                    restart_due: None,
-                },
-            );
+        let mut next_id = 0;
+        for app in apps {
+            for instance in 0..app.config().instances {
+                let id = next_id;
+                next_id += 1;
+                sheep.insert(
+                    id,
+                    SheepSlot {
+                        entry: armed_entry(id, instance, APPLY_FIRST_PID + id, app.clone(), &paths),
+                        ctl: None,
+                        log_ctl: None,
+                        to_child: None,
+                        signals: None,
+                        to_stdin: None,
+                        manual: None,
+                        pending_delete: false,
+                        epoch: 0,
+                        ready_tx: None,
+                        actions: ActionWaits::default(),
+                        ready_failed: false,
+                        restart_due: None,
+                    },
+                );
+            }
         }
         let enforcer = Arc::new(RecordingEnforcer::default());
         let (breach_tx, _breaches) = mpsc::channel(1);
@@ -21203,12 +21419,15 @@ mod tests {
         let (events, _events_rx) = crate::bus::test_bus(64);
         let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
         let actor = Actor {
-            runner: ScriptedRunner::new(vec![]),
+            // Enough scripts for a scale-up to actually come up: a case that
+            // spawns nothing pays nothing for them, and one that scales would
+            // otherwise be asserting on a shortfall rather than on the apply.
+            runner: ScriptedRunner::new(vec![ProcScript::never_exits(); 4]),
             paths,
             events,
             tx,
             sheep,
-            next_id: u32::try_from(apps.len()).expect("a fixture flock is small"),
+            next_id,
             next_deadline: 0,
             next_action_stamp: 0,
             pending: Vec::new(),
@@ -21431,13 +21650,16 @@ mod tests {
         let mut worker = AppConfig::minimal("worker", "./srv");
         worker.max_restarts = 7;
 
+        // `Settings`, not `None`: a plain load holds `instances` out of the
+        // merge entirely (it never reshapes a flock), so the two keys could
+        // not meet under it and the merge would be perfectly valid.
         let reply = apply_config(
             &mut actor,
             vec![
                 declared_app(broken, &["name", "script", "instances", "out_file"]),
                 declared_app(worker, &["name", "script", "max_restarts"]),
             ],
-            ResetDepth::None,
+            ResetDepth::Settings,
         )
         .await;
 
@@ -21647,5 +21869,329 @@ mod tests {
             "a breach against a ceiling the operator has raised must never claim the manual marker"
         );
         assert_eq!(slot.entry.pid, Some(APPLY_FIRST_PID));
+    }
+
+    /// fails if a second load of the same file erases what the first one
+    /// parked. The merge builds on the app's INTENDED config, which is the
+    /// parked one when there is one, not on what the running child was
+    /// spawned from: on the second load the key is established, a plain load
+    /// skips it, and a merge based on the running config would carry the OLD
+    /// value forward over the parked one. Two `shep start Flockfile.toml`
+    /// calls is what a deploy does.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_load_of_the_same_file_keeps_the_first_loads_parked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+            declared_app(file, &["name", "script", "env"])
+        };
+
+        let first = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert_eq!(first[0].pending, vec!["env".to_string()]);
+
+        let second = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+
+        assert_eq!(
+            actor.sheep[&0]
+                .entry
+                .pending
+                .as_ref()
+                .expect("the parked config survives a second load")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "the second load erased what the first parked"
+        );
+        assert_eq!(
+            second[0]
+                .app
+                .as_ref()
+                .expect("an applied app is recorded")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "the recorded app lost it too, so a reboot would come up without it"
+        );
+        assert!(
+            second[0].pending.is_empty(),
+            "the second load changes nothing that was not already coming: {second:?}"
+        );
+    }
+
+    /// fails if a scale-down that removes a non-running instance panics the
+    /// actor, which closes its mailbox and takes the engine down with it. An
+    /// instance with no live task is deregistered SYNCHRONOUSLY inside
+    /// `handle_scale`, so the id list read before the scale can name a slot
+    /// that is already gone by the time the spec write walks it.
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_down_removing_a_non_running_instance_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        // The ordinary case: one instance exited and never came back. No
+        // `ctl`, so its delete resolves on the spot rather than through a
+        // kill ladder.
+        let stopped = actor.sheep.get_mut(&1).expect("the fixture registers two");
+        stopped.entry.status = ProcStatus::Stopped;
+        stopped.entry.pid = None;
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 1;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "instances"])],
+            ResetDepth::Settings,
+        )
+        .await;
+
+        assert_eq!(actor.ids_of_name("web"), vec![0]);
+        assert_eq!(reply[0].applied, vec!["instances".to_string()]);
+        assert_eq!(actor.sheep[&0].entry.spec.config().instances, 1);
+    }
+
+    /// fails if a load that has already reshaped the flock then reports the
+    /// app as untouched. `Applied::refused` with two empty lists is a promise
+    /// that nothing happened, and a scale had happened: the reply said
+    /// nothing landed, `app` was `None` so the muster roll would keep the old
+    /// count, and a second instance was registered and running.
+    ///
+    /// The shape that used to produce it is the same one IMPORTANT 1 names: a
+    /// file declaring `watch` and `cwd` together merges cleanly and cannot be
+    /// reached by a running instance, because `cwd` needs a respawn and
+    /// `watch` does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_that_scales_and_cannot_reach_the_running_spec_reports_what_landed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 2;
+        file.watch = true;
+        file.cwd = Some(root.path().display().to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(
+                file,
+                &["name", "script", "instances", "watch", "cwd"],
+            )],
+            ResetDepth::Settings,
+        )
+        .await;
+
+        assert_eq!(
+            actor.ids_of_name("web").len(),
+            2,
+            "the scale really did happen"
+        );
+        assert!(
+            reply[0].refused.is_none(),
+            "a merge that normalizes is not an invalid file: {reply:?}"
+        );
+        assert!(
+            reply[0].app.is_some(),
+            "the muster roll must not be left on the pre-load config: {reply:?}"
+        );
+        assert_eq!(reply[0].applied, vec!["instances".to_string()]);
+        assert!(
+            reply[0].pending.contains(&"watch".to_string())
+                && reply[0].pending.contains(&"cwd".to_string()),
+            "a change no running instance can take must park, not vanish: {reply:?}"
+        );
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "and it must be parked on the entry, not only reported"
+        );
+    }
+
+    /// fails if a load arms a stopped instance into its name group. Group
+    /// membership is decided by the CONFIG rather than by what is running,
+    /// and both group triggers restart every member, so arming one is arming
+    /// a cron occurrence or a file save to start a process the operator
+    /// stopped. Nothing would tear it down again either: the stopped member
+    /// is already terminal, so no transition calls `disarm` for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_does_not_arm_a_stopped_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+            })],
+        );
+        let stopped = actor.sheep.get_mut(&0).expect("the fixture registers one");
+        stopped.entry.status = ProcStatus::Stopped;
+        stopped.entry.pid = None;
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.cron_restart = Some("*/5 * * * *".to_string());
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "cron_restart"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            actor.registry.group_members("web"),
+            None,
+            "a load armed a schedule that will start a sheep the operator stopped"
+        );
+    }
+
+    /// fails if a plain load reshapes a flock, in either direction: it must
+    /// skip the count and say why, and a `--reset` must take it.
+    /// `shep stock` is an operator setting the count, the additive default
+    /// exists so a template cannot change what an operator set, and the
+    /// override store cannot yet tell a stocked count from an untouched one.
+    /// A plain load acting on the field would DELETE instances.
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_load_never_scales_and_a_reset_does() {
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.instances = 1;
+            declared_app(file, &["name", "script", "instances"])
+        };
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&plain_dir, &[app_with("web", |app| app.instances = 2)]);
+        let reply = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert_eq!(
+            actor.ids_of_name("web").len(),
+            2,
+            "a plain load deleted an instance"
+        );
+        assert!(!reply[0].applied.contains(&"instances".to_string()));
+        assert!(
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("instances")),
+            "an operator whose count did not move must be told why: {reply:?}"
+        );
+        assert_eq!(
+            reply[0]
+                .app
+                .as_ref()
+                .expect("an applied app is recorded")
+                .config()
+                .instances,
+            2,
+            "the recorded count must be the one really running"
+        );
+
+        let reset_dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&reset_dir, &[app_with("web", |app| app.instances = 2)]);
+        let reply = apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+        assert_eq!(actor.ids_of_name("web"), vec![0], "--reset must take it");
+        assert_eq!(reply[0].applied, vec!["instances".to_string()]);
+    }
+
+    /// fails if any one of the eight [`EXTRAS_FIELDS`] stops triggering a
+    /// re-arm. All eight are read when a worker is ARMED, so a spec write
+    /// alone leaves the old value enforced for the life of that worker, and
+    /// deleting any single entry from that list must turn this red rather
+    /// than only the `max_memory` case.
+    ///
+    /// The observable is the memory ceiling, which every one of these apps
+    /// carries unchanged: a re-arm arms every instance, so an arming recorded
+    /// at all is proof the name was re-armed.
+    #[tokio::test(start_paused = true)]
+    async fn every_extras_field_triggers_a_rearm() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().display().to_string();
+        let ceiling = MemSize::from_bytes(100 << 20);
+        // The "before" values every case edits away from.
+        let base = |cwd: &str| {
+            let cwd = cwd.to_string();
+            move |app: &mut AppConfig| {
+                app.max_memory = Some(ceiling);
+                app.cwd = Some(cwd.clone());
+                app.watch = true;
+                app.ignore_watch = vec!["target/**".to_string()];
+                app.watch_delay = Some(UpDuration::from_millis(1000));
+                app.watch_options = vec!["src/**".to_string()];
+                app.cron_restart = Some("0 * * * *".to_string());
+                app.cron_timezone = Some("UTC".to_string());
+                // An interval no paused-clock case advances to, so the probe
+                // never runs and this stays a test about arming.
+                app.liveness_probe = Some(ProbeConfig {
+                    failure_threshold: 3,
+                    interval: UpDuration::from_millis(600_000),
+                    timeout: UpDuration::from_millis(1000),
+                    ..probe_config(ProbeKind::Tcp, "127.0.0.1:1")
+                });
+            }
+        };
+        // One edit per entry in `EXTRAS_FIELDS`, named by the field it
+        // moves, so a field removed from that list has a case with its own
+        // name that goes red.
+        type Edit = (&'static str, fn(&mut AppConfig));
+        let edits: Vec<Edit> = vec![
+            ("max_memory", |app| {
+                app.max_memory = Some(MemSize::from_bytes(512 << 20));
+            }),
+            ("watch", |app| app.watch = false),
+            ("ignore_watch", |app| {
+                app.ignore_watch = vec!["dist/**".to_string()];
+            }),
+            ("watch_delay", |app| {
+                app.watch_delay = Some(UpDuration::from_millis(2500));
+            }),
+            ("watch_options", |app| {
+                app.watch_options = vec!["lib/**".to_string()];
+            }),
+            ("cron_restart", |app| {
+                app.cron_restart = Some("*/5 * * * *".to_string());
+            }),
+            ("cron_timezone", |app| {
+                app.cron_timezone = Some("Europe/Berlin".to_string());
+            }),
+            ("liveness_probe", |app| app.liveness_probe = None),
+        ];
+
+        for (field, edit) in edits {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut actor, enforcer) = actor_over(&dir, &[app_with("web", base(&cwd))]);
+            let mut file = AppConfig::minimal("web", "./srv");
+            base(&cwd)(&mut file);
+            edit(&mut file);
+            let reply = apply_config(
+                &mut actor,
+                vec![declared_app(
+                    file,
+                    &[
+                        "name",
+                        "script",
+                        "cwd",
+                        "max_memory",
+                        "watch",
+                        "ignore_watch",
+                        "watch_delay",
+                        "watch_options",
+                        "cron_restart",
+                        "cron_timezone",
+                        "liveness_probe",
+                    ],
+                )],
+                ResetDepth::Settings,
+            )
+            .await;
+            assert!(
+                reply[0].applied.contains(&field.to_string()),
+                "{field} did not apply at all: {reply:?}"
+            );
+            assert!(
+                !enforcer.arms().is_empty(),
+                "changing {field} left the armed worker on the old value"
+            );
+        }
     }
 }

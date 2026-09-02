@@ -25,6 +25,11 @@ pub struct ProcessEntry {
     /// a `NeedsRespawn` field and the restart that picks it up. `spec` keeps
     /// describing what the running child was spawned from, which is the only
     /// account of that anywhere; overwriting it would erase it.
+    ///
+    /// A whole config, and not the same thing as the `pending` list on a
+    /// load's per-app report, which shares its name: that one is field NAMES
+    /// for an operator to read and includes fields already on `spec`. This is
+    /// the config a respawn promotes.
     pub pending: Option<ResolvedApp>,
     /// Instance number within the app (for clustered apps, 0..instances-1)
     pub instance: u32,

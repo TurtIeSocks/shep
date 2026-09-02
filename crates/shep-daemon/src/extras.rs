@@ -506,20 +506,16 @@ impl ExtrasRegistry {
     /// `stats.watch()` clears the pid's CPU baseline, so `shep flock` shows a
     /// blank CPU cell for one poll interval. Both are documented rather than
     /// closed; see the design spec.
-    // `extras` is `pub(crate)`, so an unconsumed method here reads as dead
-    // code to a plain `cargo build`/`clippy`, unlike a genuinely public
-    // crate's API surface. Its own tests are the only caller for now, ahead
-    // of a later task in the same slice wiring it into the supervisor's
-    // config-apply path. `#[allow(dead_code)]` names that pre-wiring state
-    // explicitly, in a plain comment rather than the rustdoc above, so
-    // deleting the attribute when that task lands takes this note with it
-    // instead of leaving a doc comment claiming nobody calls this.
-    #[allow(dead_code)]
+    /// `prober` is called once per entry rather than shared, because
+    /// `assemble` bakes `SHEP_INSTANCE` and every `{{instance}}` template
+    /// into the environment a prober runs with: one prober for a
+    /// multi-instance app would run every instance's liveness probe against a
+    /// single instance's environment.
     pub fn rearm_name(
         &mut self,
         name: &str,
         entries: &[&ProcessEntry],
-        prober: Arc<dyn Prober>,
+        prober: impl Fn(&ProcessEntry) -> Arc<dyn Prober>,
         extras: &Extras,
         supervisor: &SupervisorHandle,
     ) {
@@ -531,7 +527,7 @@ impl ExtrasRegistry {
             group.abort();
         }
         for entry in entries {
-            self.arm(entry, Arc::clone(&prober), extras, supervisor);
+            self.arm(entry, prober(entry), extras, supervisor);
         }
     }
 
@@ -550,6 +546,23 @@ impl ExtrasRegistry {
     /// by the probe running now.
     pub(crate) fn liveness_epoch(&self, id: u32) -> u64 {
         self.liveness_epochs.get(&id).copied().unwrap_or(0)
+    }
+
+    /// The ids in `name`'s armed group, or `None` when nothing of that name is
+    /// armed at all.
+    ///
+    /// Test-facing, and it exists because `groups` is private to this module
+    /// while the decision about WHICH entries get armed lives in
+    /// `supervisor.rs`. A stopped instance in a group is armed to be
+    /// restarted by that group's cron occurrence or file save, so
+    /// "who is in the group" is the exact question a case there has to ask.
+    #[cfg(test)]
+    pub(crate) fn group_members(&self, name: &str) -> Option<Vec<u32>> {
+        self.groups.get(name).map(|group| {
+            let mut members: Vec<u32> = group.members.iter().copied().collect();
+            members.sort_unstable();
+            members
+        })
     }
 }
 
@@ -2738,7 +2751,7 @@ mod tests {
             .unwrap()
             .abort_handle();
 
-        registry.rearm_name("web", &[&entry], idle_prober(), &rig.extras, &handle);
+        registry.rearm_name("web", &[&entry], |_| idle_prober(), &rig.extras, &handle);
         tokio::task::yield_now().await;
 
         let after_cron = registry.groups["web"].cron.as_ref().unwrap().abort_handle();
@@ -2780,7 +2793,7 @@ mod tests {
         registry.arm(&entry, idle_prober(), &rig.extras, &handle);
         tokio::task::yield_now().await;
 
-        registry.rearm_name("web", &[&entry], idle_prober(), &rig.extras, &handle);
+        registry.rearm_name("web", &[&entry], |_| idle_prober(), &rig.extras, &handle);
         tokio::task::yield_now().await;
 
         let group = &registry.groups["web"];
@@ -2833,7 +2846,13 @@ mod tests {
             .unwrap()
             .abort_handle();
 
-        registry.rearm_name("web", &[&web_entry], idle_prober(), &rig.extras, &handle);
+        registry.rearm_name(
+            "web",
+            &[&web_entry],
+            |_| idle_prober(),
+            &rig.extras,
+            &handle,
+        );
         tokio::task::yield_now().await;
 
         let worker_watch_after = registry.groups["worker"]
@@ -2888,7 +2907,7 @@ mod tests {
         registry.rearm_name(
             "web",
             &[&entry_a, &entry_b],
-            idle_prober(),
+            |_| idle_prober(),
             &rig.extras,
             &handle,
         );
