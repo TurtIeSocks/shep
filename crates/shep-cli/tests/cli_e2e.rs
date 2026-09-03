@@ -7308,18 +7308,15 @@ fn write_counting_script(dir: &TempDir) -> PathBuf {
     )
 }
 
-/// Reads `path` until it holds at least `want` lines, or
-/// [`HANDOVER_DEADLINE`] expires, and returns what it held on the last read.
-///
-/// Returns rather than panicking on expiry, so the failure that reaches CI is
-/// the caller's own assertion naming what it wanted.
-#[cfg(unix)]
 /// A log file's contents with the daemon's per-line timestamp taken back
 /// off, which is what these cases mean when they say what a sheep wrote.
 ///
 /// Through `shep_core::logstamp::strip`, the same call `shep bleats` makes
-/// when it reads one of these files — so an assertion here is about what an
+/// when it reads one of these files, so an assertion here is about what an
 /// operator is shown and not about a prefix this test invented.
+///
+/// Not gated: reading a file and stripping a fixed-width prefix is portable,
+/// and both callers are cases that run on every platform.
 fn unstamped_file(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap();
     let mut out = String::new();
@@ -7330,6 +7327,12 @@ fn unstamped_file(path: &Path) -> String {
     out
 }
 
+/// Reads `path` until it holds at least `want` lines, or
+/// [`HANDOVER_DEADLINE`] expires, and returns what it held on the last read.
+///
+/// Returns rather than panicking on expiry, so the failure that reaches CI is
+/// the caller's own assertion naming what it wanted.
+#[cfg(unix)]
 fn counting_lines(path: &Path, want: usize) -> Vec<String> {
     let start = Instant::now();
     loop {
