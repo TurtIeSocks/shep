@@ -449,11 +449,16 @@ impl ShepToml {
         Ok(Self::open(path)?.adopted_dog_path(name))
     }
 
-    /// Forgets `name` entirely: out of `enabled_dogs`, out of
-    /// `adopted_dogs`, and `[dog.<name>]` removed. The difference between
-    /// `rehome` and `disable`, and the reason they are two verbs.
+    /// Forgets `name` in this file: out of `enabled_dogs`, out of
+    /// `adopted_dogs`, and `[dog.<name>]` removed if an un-migrated
+    /// `shep.toml` still carries one. The difference between `rehome` and
+    /// `disable`, and the reason they are two verbs.
     ///
-    /// Called by `commands::dogs::rehome`.
+    /// **This is half of a rehome.** A dog's configuration lives in
+    /// `dogs.toml` now, and striking it there is
+    /// `commands::dog_migration::forget_dog_section`, called by
+    /// `commands::dogs::rehome` immediately after this: one file per
+    /// writer, since this type owns `shep.toml` and only that.
     pub fn rehome_dog(&mut self, name: &str) {
         self.disable_dog(name);
         if let Some(adopted_dogs) = self
