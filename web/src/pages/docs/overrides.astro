@@ -157,7 +157,7 @@ const store = `$ cat $SHEP_HOME/overrides.json
 
     <h2>Three things a load with no flag will not do</h2>
     <div class="rows">
-      <div class="row"><span>never registers</span><span>An app the file names and the flock does not have is reported and skipped. <code>shep start</code> adds sheep; a load that also started things would make a config file a way to run processes on a host by opening a pull request.</span></div>
+      <div class="row"><span>never registers</span><span>The merge adds no app. An app the file names and the flock does not have is skipped by the merge, and the <code>shep start</code> carrying it registers and starts that app as it always has, because starting things is what you typed. What the merge cannot do is reach a host through config alone: the load half of a merged pull request can only touch sheep that are already there.</span></div>
       <div class="row"><span>never prunes</span><span>An app the file does not mention is left alone. shep has no record of which Flockfile a sheep came from, so loading <code>./a/Flockfile.toml</code> and then <code>./b/Flockfile.toml</code> would otherwise have the second wipe the first's flock.</span></div>
       <div class="row"><span>never kills</span><span>A plain load stops no process. A setting the running child is holding waits for that child to be replaced, and says so.</span></div>
     </div>

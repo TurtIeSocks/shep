@@ -1238,7 +1238,11 @@ that request. The sentence describes something no terminal can produce.
 **What shipped.** `Request::ApplyConfig`, answered by `Response::Applied`, sent
 by `shep start <Flockfile>` and by a Flockfile discovered in the working
 directory. It merges each declared app into the sheep of the same name:
-nothing is registered, nothing is pruned, and nothing running is killed. A
+the MERGE registers nothing, prunes nothing and kills nothing running. That
+is a statement about the apply phase and not about the verb around it: the
+`shep start` carrying the load still registers and starts an app the flock
+does not have, on its own fresh path, which is the whole of what `shep start`
+has always done. A
 field the daemon reads fresh takes effect immediately, and a field the running
 child holds parks for the sheep's next spawn, where `shep reload` and `shep
 restart` promote it. A `CFG` column in `shep flock` and a pending section in
