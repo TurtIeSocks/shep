@@ -961,6 +961,43 @@ async fn resume_all(
     failure.unwrap_or(ExitCode::Success)
 }
 
+/// Reports the sheep `shep add` found already registered, and changes
+/// nothing.
+///
+/// `add`'s answer to what [`resume_all`] answers for `start`, and a much
+/// shorter one: `start` has to decide what to bring up, and `add` has
+/// nothing left to do at all. Registration is the whole of what the verb
+/// promises, and the flock already has these.
+///
+/// Always [`ExitCode::Success`]. Re-running a template against a flock that
+/// already holds its apps is the ordinary case, not an error, and a deploy
+/// script that ran `shep add Flockfile.toml` twice must not fail the second
+/// time.
+///
+/// ONE notice however large the set is, matching [`resume_all`]: `shep add
+/// all` against a thirteen-app flock would otherwise print thirteen lines
+/// saying the same thing.
+///
+/// No remedy is suggested, and that is deliberate rather than an omission.
+/// `shep start <name>` is the right next command for a row that is stopped
+/// and the wrong one for a row that is up, and this arm holds both -- so
+/// naming one would be advice that is wrong half the time, in the one place
+/// an operator has no reason to doubt it.
+fn already_registered(streams: &mut Streams<'_>, matched: &[ProcessInfo]) -> ExitCode {
+    let refs: Vec<&ProcessInfo> = matched.iter().collect();
+    let names = unique_names(&refs);
+    let message = match names.as_slice() {
+        [] => return ExitCode::Success,
+        [one] => format!("{one} is already registered; nothing to add."),
+        several => format!(
+            "{} are already registered; nothing to add.",
+            several.join(", ")
+        ),
+    };
+    streams.aside("add", &message);
+    ExitCode::Success
+}
+
 /// Every distinct name in `infos`, in the order they first appear.
 ///
 /// Feeds the already-running notice and nothing else -- never the respawn
@@ -1139,6 +1176,7 @@ async fn apply_declared(
     streams: &mut Streams<'_>,
     declared: &[DeclaredApp],
     reset: ResetDepth,
+    mode: Load,
 ) -> ExitCode {
     let apps: Vec<DeclaredApp> = declared
         .iter()
@@ -1198,7 +1236,7 @@ async fn apply_declared(
             // operator guessing about the rest of the file.
             failure = failure.or(Some(streams.fail(REFUSED_EXIT, &message)));
         } else {
-            streams.aside("start", &message);
+            streams.aside(mode.verb(), &message);
         }
     }
     failure.unwrap_or(ExitCode::Success)
@@ -1346,12 +1384,74 @@ fn reset_depth(args: &StartArgs) -> ResetDepth {
     }
 }
 
+/// Which of the two verbs that read a Flockfile is running.
+///
+/// They share everything: the same targets, the same four-tier resolution,
+/// the same merge into an app the flock already has, the same refusals. The
+/// whole difference is whether anything is spawned at the end, and it is one
+/// code path rather than two because a document that registered differently
+/// depending on which verb read it is a document nobody could reason about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Load {
+    /// `shep start`: register what the flock does not have, and bring up what
+    /// it does.
+    Start,
+    /// `shep add`: register what the flock does not have, and stop there.
+    Add,
+}
+
+impl Load {
+    /// The verb's own name, for a notice's code and for the `--format json`
+    /// envelope's `command`.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Add => "add",
+        }
+    }
+}
+
+/// Registers what `args` resolves to and brings all of it up.
 pub async fn start(
     client: &Client,
     streams: &mut Streams<'_>,
     args: &StartArgs,
     discovered: Option<&Path>,
     interpreters: &BTreeMap<String, String>,
+) -> ExitCode {
+    load(client, streams, args, discovered, interpreters, Load::Start).await
+}
+
+/// Registers what `args` resolves to and starts none of it.
+///
+/// The app lands registered and stopped, which is what makes a Flockfile
+/// usable as a template. One shipping `env = { DB_HOST = "", DB_PASSWORD =
+/// "" }` cannot be started before it is configured -- the process comes up
+/// against an empty database URL, crashes, spends its restart budget, and has
+/// to be stopped before anybody can fix it. With this the order is register,
+/// fill in, start.
+///
+/// An app the flock already has is merged into and left exactly as it is,
+/// running or not. Re-running this after editing a template is the ordinary
+/// thing to do, so it must not be able to stop a service.
+pub async fn add(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    args: &StartArgs,
+    discovered: Option<&Path>,
+    interpreters: &BTreeMap<String, String>,
+) -> ExitCode {
+    load(client, streams, args, discovered, interpreters, Load::Add).await
+}
+
+/// The body [`start`] and [`add`] share -- see [`Load`] for what they do not.
+async fn load(
+    client: &Client,
+    streams: &mut Streams<'_>,
+    args: &StartArgs,
+    discovered: Option<&Path>,
+    interpreters: &BTreeMap<String, String>,
+    mode: Load,
 ) -> ExitCode {
     // `--name` renames the sheep a target becomes, and a name is unique to
     // one sheep, so it cannot mean anything across several targets.
@@ -1361,7 +1461,7 @@ pub async fn start(
     }
     if args.targets.is_empty() {
         let mut started = Vec::new();
-        let code = start_one(
+        let code = load_one(
             client,
             streams,
             args,
@@ -1369,6 +1469,7 @@ pub async fn start(
             discovered,
             interpreters,
             &mut started,
+            mode,
         )
         .await;
         // Printed whenever the verb did its work, not only when it touched a row.
@@ -1378,7 +1479,7 @@ pub async fn start(
         // FAILED still leaves stdout empty, which is the discipline `cli_e2e`'s
         // `assert_json_error` pins crate-wide.
         if code == ExitCode::Success {
-            let wrote = render_outcome(client, streams, "start", FlockRows(started)).await;
+            let wrote = render_outcome(client, streams, mode.verb(), FlockRows(started)).await;
             if wrote != ExitCode::Success {
                 return wrote;
             }
@@ -1391,7 +1492,7 @@ pub async fn start(
     let mut failure: Option<ExitCode> = None;
     let mut started = Vec::new();
     for target in &args.targets {
-        let code = start_one(
+        let code = load_one(
             client,
             streams,
             args,
@@ -1399,6 +1500,7 @@ pub async fn start(
             discovered,
             interpreters,
             &mut started,
+            mode,
         )
         .await;
         if code != ExitCode::Success {
@@ -1423,7 +1525,7 @@ pub async fn start(
     // that is a data envelope beside an error envelope, which is two answers
     // to one question and what `cli_e2e`'s `assert_json_error` refuses.
     if failure.is_none() {
-        let wrote = render_outcome(client, streams, "start", FlockRows(started)).await;
+        let wrote = render_outcome(client, streams, mode.verb(), FlockRows(started)).await;
         if wrote != ExitCode::Success {
             return wrote;
         }
@@ -1431,20 +1533,20 @@ pub async fn start(
     failure.unwrap_or(ExitCode::Success)
 }
 
-/// One target's worth of [`start`].
+/// One target's worth of [`load`].
 ///
 /// Eight parameters, the same growth `lookout::frames::sheep`'s own
 /// `#[allow(clippy::too_many_arguments)]` already accepted for itself:
-/// `client`, `streams` and `fmt` are the RPC/rendering plumbing every verb
-/// in this file threads through; `args`, `target` and `discovered` are the
-/// three ways one invocation names what to start; `interpreters` is task
-/// 47's `shep.toml` mapping, read once by the caller rather than
-/// re-reading the file per target; and `started` is the caller's own
-/// accumulator. None of the eight groups naturally into a struct without
-/// inventing one used nowhere else, the same call that function's own doc
-/// makes.
+/// `client` and `streams` are the RPC/rendering plumbing every verb in this
+/// file threads through; `args`, `target` and `discovered` are the three ways
+/// one invocation names what to load; `interpreters` is task 47's
+/// `shep.toml` mapping, read once by the caller rather than re-reading the
+/// file per target; `started` is the caller's own accumulator; and `mode` is
+/// which of the two verbs is running. None of the eight groups naturally
+/// into a struct without inventing one used nowhere else, the same call that
+/// function's own doc makes.
 #[allow(clippy::too_many_arguments)]
-async fn start_one(
+async fn load_one(
     client: &Client,
     streams: &mut Streams<'_>,
     args: &StartArgs,
@@ -1452,6 +1554,7 @@ async fn start_one(
     discovered: Option<&Path>,
     interpreters: &BTreeMap<String, String>,
     started: &mut Vec<shep_core::protocol::ProcessInfo>,
+    mode: Load,
 ) -> ExitCode {
     // `args.target` is optional so bare `shep start` can mean "this
     // directory's Flockfile". The caller does the discovery, because the
@@ -1533,7 +1636,16 @@ async fn start_one(
                     );
                     return streams.fail(ExitCode::Usage, &message);
                 }
-                return resume_all(client, streams, Some(token), &matched, started).await;
+                return match mode {
+                    Load::Start => {
+                        resume_all(client, streams, Some(token), &matched, started).await
+                    }
+                    // Nothing to do and nothing to report as an error: the
+                    // sheep is registered, which is all `add` was asked for.
+                    // Saying so anyway, because a verb that printed a table
+                    // and no word would look like it had done something.
+                    Load::Add => already_registered(streams, &matched),
+                };
             }
             // Held for the failure path below rather than reported here: the
             // token may still name a Flockfile or a path, and only if it names
@@ -1654,9 +1766,17 @@ async fn start_one(
     // `start` was asked to do, they are what an operator running this in a
     // deploy needs to happen, and the refusal is reported the moment it
     // arrives either way. What it changes is what the verb EXITS with.
+    //
+    // The merge runs under `add` too, and only the resume below it does not.
+    // That is the whole of `shep add Flockfile.toml` against an app the flock
+    // already has: the file's new keys are appended, a field the running
+    // child holds parks for its next spawn, and nothing is replaced. Refusing
+    // instead would break re-running the file after a template edit, and
+    // stopping the app would be a config load that killed a process, which
+    // this design forbids outright.
     let declared: Vec<DeclaredApp> = resumed.iter().map(|(app, _)| app.clone()).collect();
-    let applied = apply_declared(client, streams, &declared, reset_depth(args)).await;
-    if !resumed.is_empty() {
+    let applied = apply_declared(client, streams, &declared, reset_depth(args), mode).await;
+    if !resumed.is_empty() && mode == Load::Start {
         // `None`, not the operator's token: this arm reached the flock through
         // a Flockfile or a path, so there is no selector to quote back in the
         // "already running" notice. `shep restart ./rotom.sh` is not a
@@ -1677,32 +1797,46 @@ async fn start_one(
 
     let (procs, failure) = request_each(
         client,
-        streams, // One request either way: `Start` carries the apps, so the "selector"
-        // here is a placeholder the body closure ignores. Reusing the looping
-        // helper keeps the collect-then-render shape in one place.
+        streams, // One request either way: `Start` and `Add` both carry the apps, so
+        // the "selector" here is a placeholder the body closure ignores.
+        // Reusing the looping helper keeps the collect-then-render shape in
+        // one place.
         &[SelectorSpec::All],
+        // `START_DEADLINE` for both, and it is not spare budget on the `Add`
+        // side. Nothing is spawned there, but the actor is single-threaded:
+        // an `Add` that arrives while the daemon is part way through a batch
+        // of cold spawns waits behind them, and the client's ordinary 5s
+        // would abandon a registration that was about to happen.
         Some(START_DEADLINE),
-        |_| Request::Start { apps: apps.clone() },
+        |_| match mode {
+            Load::Start => Request::Start { apps: apps.clone() },
+            Load::Add => Request::Add { apps: apps.clone() },
+        },
         |response| match response {
-            Response::Started(procs) => Some(procs),
+            Response::Started(procs) | Response::Added(procs) => Some(procs),
             _ => None,
         },
     )
     .await;
     // The load that establishes what a FRESH app's file declared, and the
     // whole of the spec's migration clause: "first load of an existing app
-    // establishes its current keys". `Request::Start` registers an app and
-    // writes nothing to the override store, so without this the app has an
-    // empty established set and the SECOND load of the same file treats every
-    // key as unestablished and overwrites the lot -- the one thing the
-    // additive default exists to prevent, arriving on the load after the one
-    // everybody tests.
+    // establishes its current keys". `Request::Start` and `Request::Add` both
+    // register an app and write nothing to the override store, so without
+    // this the app has an empty established set and the SECOND load of the
+    // same file treats every key as unestablished and overwrites the lot --
+    // the one thing the additive default exists to prevent, arriving on the
+    // load after the one everybody tests.
     //
     // `ResetDepth::None` whatever flag the operator passed, because there is
     // nothing to reset: the app was registered from this very file a moment
     // ago, so every declared key already holds the file's value and the merge
     // is a no-op that reports nothing. `--reset-all` would be worse than a
     // no-op, since it drops the record this call exists to write.
+    //
+    // `Request::Add` needs it for exactly the reason `Request::Start` does,
+    // and needs it more: `add` exists so an operator can fill in the empty
+    // `env` keys a template shipped, and a key that was never established is
+    // one the next load of that same template overwrites.
     //
     // Only the apps the daemon really registered. An app whose spawn failed
     // is not in `procs`, and sending its name here would earn an `is not
@@ -1713,7 +1847,7 @@ async fn start_one(
         .into_iter()
         .filter(|app| registered.contains(app.config.name.as_str()))
         .collect();
-    let recorded = apply_declared(client, streams, &established, ResetDepth::None).await;
+    let recorded = apply_declared(client, streams, &established, ResetDepth::None, mode).await;
     started.extend(procs);
     first_failure(
         applied,
@@ -4285,6 +4419,223 @@ mod tests {
         assert!(
             String::from_utf8(err).unwrap().contains("shep delete web"),
             "the daemon's own sentence has to reach the operator"
+        );
+    }
+
+    /// A daemon that registers what it is asked to register: an `Add`
+    /// answers one `Stopped` row per app, and a `Start` one `Online` row.
+    ///
+    /// A `Start` is ANSWERED rather than refused on purpose. A build that
+    /// sent one from `shep add` should fail on the assertion that names the
+    /// request it sent, not on a transport error that says only that
+    /// something went wrong.
+    fn a_daemon_that_registers(
+        flock: Vec<ProcessInfo>,
+    ) -> impl Fn(&Request) -> Response + Send + 'static {
+        use shep_core::status::ProcStatus;
+        let rows = |apps: &[AppConfig], status: ProcStatus| -> Vec<ProcessInfo> {
+            apps.iter()
+                .enumerate()
+                .map(|(i, app)| {
+                    ProcessInfo::builder(u32::try_from(i).unwrap(), &app.name, status).build()
+                })
+                .collect()
+        };
+        move |request| match request {
+            Request::ListFlock => Response::Flock(flock.clone()),
+            Request::ApplyConfig { apps, .. } => Response::Applied(
+                apps.iter()
+                    .map(|app| {
+                        SheepApplied::new(app.config.name.clone(), Vec::new(), Vec::new(), None)
+                    })
+                    .collect(),
+            ),
+            Request::Add { apps } => Response::Added(rows(apps, ProcStatus::Stopped)),
+            Request::Start { apps } => Response::Started(rows(apps, ProcStatus::Online)),
+            Request::Restart { .. } => Response::Restarted(Vec::new()),
+            _ => Response::Pong,
+        }
+    }
+
+    /// Every request body an invocation put on the wire, in order.
+    ///
+    /// One drain rather than a helper per request kind, unlike `applies` and
+    /// `respawns` above: a channel can only be emptied once, and every
+    /// assertion below is about what was sent AND what was not, which two
+    /// separate drains could not both see.
+    fn sent(
+        envelopes: &mut tokio::sync::mpsc::UnboundedReceiver<shep_core::protocol::Envelope>,
+    ) -> Vec<Request> {
+        let mut bodies = Vec::new();
+        while let Ok(envelope) = envelopes.try_recv() {
+            bodies.push(envelope.body);
+        }
+        bodies
+    }
+
+    /// Runs `shep add` against `target` and hands back its code and streams.
+    async fn add_against(client: &Client, target: &str) -> (ExitCode, String, String) {
+        let args = start_args(target);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            add(client, &mut streams, &args, None, &BTreeMap::new()).await
+        };
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    /// fails if `shep add` spawns the app it just registered.
+    ///
+    /// The whole of the verb, and the assertion that no `Start` was sent is
+    /// the half that matters: `add` and `start` are one code path, so the
+    /// failure this guards is not a missing feature but a mode that leaked.
+    #[tokio::test]
+    async fn add_registers_a_fresh_app_and_sends_no_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"demo\"\nscript = \"/bin/sleep\"\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_that_registers(Vec::new())).await;
+
+        let (code, _out, _err) = add_against(&client, flockfile.to_str().unwrap()).await;
+
+        assert_eq!(code, ExitCode::Success);
+        let sent = sent(&mut envelopes);
+        let registered: Vec<&str> = sent
+            .iter()
+            .filter_map(|request| match request {
+                Request::Add { apps } => Some(apps[0].name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(registered, vec!["demo"], "one registration, for the app");
+        assert!(
+            !sent.iter().any(|r| matches!(r, Request::Start { .. })),
+            "nothing was started"
+        );
+    }
+
+    /// fails if `shep add` leaves a fresh app with no established key set.
+    ///
+    /// The load that follows the registration is not bookkeeping: `add`
+    /// exists so an operator can fill in the empty `env` keys a template
+    /// shipped, and a key nothing established is one the NEXT load of that
+    /// same template overwrites. Without this the pattern the verb was built
+    /// for breaks on the second load rather than the first.
+    #[tokio::test]
+    async fn add_establishes_the_keys_the_template_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"demo\"\nscript = \"/bin/sleep\"\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_that_registers(Vec::new())).await;
+
+        let (code, _out, _err) = add_against(&client, flockfile.to_str().unwrap()).await;
+
+        assert_eq!(code, ExitCode::Success);
+        let sent = sent(&mut envelopes);
+        let add_at = sent
+            .iter()
+            .position(|r| matches!(r, Request::Add { .. }))
+            .expect("the app was registered");
+        let apply_at = sent
+            .iter()
+            .position(|r| matches!(r, Request::ApplyConfig { .. }))
+            .expect("its declared keys were established");
+        assert!(
+            add_at < apply_at,
+            "the app is registered before its keys are established"
+        );
+    }
+
+    /// fails if `shep add` restarts an app the flock already has.
+    ///
+    /// Re-running a template after editing it is the ordinary thing to do,
+    /// so the file's new keys have to be merged in -- and the running child
+    /// has to survive it. A config load that killed a process is the one
+    /// outcome this design forbids outright.
+    #[tokio::test]
+    async fn add_merges_into_a_running_app_without_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"zam\"\nscript = \"/bin/sleep\"\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_that_registers(a_clustered_flock(&[0]))).await;
+
+        let (code, _out, _err) = add_against(&client, flockfile.to_str().unwrap()).await;
+
+        assert_eq!(code, ExitCode::Success);
+        let sent = sent(&mut envelopes);
+        assert!(
+            sent.iter()
+                .any(|r| matches!(r, Request::ApplyConfig { .. })),
+            "the template was merged in"
+        );
+        assert!(
+            !sent.iter().any(|r| matches!(r, Request::Restart { .. })),
+            "and nothing was replaced"
+        );
+        assert!(
+            !sent.iter().any(|r| matches!(r, Request::Add { .. })),
+            "the flock already has it, so there was nothing to register"
+        );
+    }
+
+    /// fails if `shep add <name>` reads a file or registers anything.
+    ///
+    /// A name target reads no Flockfile -- the security boundary the apply
+    /// design rests on, and `add` sits behind the same one. What is left for
+    /// the verb to do is nothing at all, so the one thing it owes the
+    /// operator is saying so.
+    #[tokio::test]
+    async fn add_by_name_registers_nothing_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_that_registers(a_clustered_flock(&[0]))).await;
+
+        let (code, _out, said) = add_against(&client, "zam").await;
+
+        assert_eq!(code, ExitCode::Success);
+        let sent = sent(&mut envelopes);
+        assert!(
+            !sent.iter().any(|r| matches!(r, Request::Add { .. })),
+            "the flock already has it"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, Request::ApplyConfig { .. })),
+            "a name target reads no file, so there is nothing to apply"
+        );
+        assert!(
+            said.contains("already registered"),
+            "the operator is told why nothing happened: {said}"
         );
     }
 

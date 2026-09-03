@@ -263,6 +263,31 @@ pub enum Request {
         /// untrusted); failures return [`RpcErrorCode::InvalidConfig`]
         apps: Vec<AppConfig>,
     },
+    /// Register apps as flock members without starting any of them
+    ///
+    /// Everything [`Self::Start`] does to the flock's membership and none of
+    /// what it does to processes: each app lands `Stopped`, holds no pid, and
+    /// nothing is spawned. `shep add` is the verb.
+    ///
+    /// It exists because a Flockfile is a template. One shipping
+    /// `env = { DB_PASSWORD = "" }` would otherwise have to be STARTED before
+    /// it could be configured, and a process spawned against an empty
+    /// database URL crashes, spends its restart budget, and has to be stopped
+    /// before the operator can get anywhere near it.
+    ///
+    /// Idempotent by name, like the muster restore that shares its supervisor
+    /// path: an app the flock already has is answered as it stands, running
+    /// or not, and nothing about it changes. Config is a separate request:
+    /// [`Self::ApplyConfig`] is what merges a template into an app the flock
+    /// already has, and `shep add` sends both.
+    ///
+    /// Answers [`Response::Added`].
+    Add {
+        /// App configs, carried exactly as [`Self::Start`] carries them. The
+        /// daemon MUST re-normalize (peer input is untrusted); failures
+        /// return [`RpcErrorCode::InvalidConfig`]
+        apps: Vec<AppConfig>,
+    },
     /// Ask which of `apps` name a sheep the flock already has under a
     /// different config
     ///
@@ -1490,6 +1515,14 @@ pub enum Response {
     Described(Vec<ProcessInfo>),
     /// Answer to `Start`
     Started(Vec<ProcessInfo>),
+    /// Answer to `Add`: one row per app the request named, registered and
+    /// spawning nothing.
+    ///
+    /// A row here can still be `Online`. `Add` is idempotent by name, so an
+    /// app the flock already had is answered as it stands rather than
+    /// replaced. The reply describes the membership the request leaves
+    /// behind, not work it did.
+    Added(Vec<ProcessInfo>),
     /// Answer to `ConfigDrift`: one entry per app that is registered under a
     /// config different from the one asked about, and no entry for anything
     /// else. An empty vector means every app asked about either matches or
@@ -2150,6 +2183,28 @@ mod tests {
     /// `NotWritten` stops carrying its reason. That reason is the only thing that
     /// distinguishes "the app is not reading its stdin" from "the pipe broke", and
     /// the operator's next move differs between them.
+    /// fails if an `Add` decodes as anything but an `Add`.
+    ///
+    /// `Add` and `Start` carry byte-identical payloads and differ by their
+    /// `kind` alone, so the tag is the entire distinction between registering
+    /// an app and spawning it. The snapshot above pins what this ENCODES to;
+    /// this pins what a daemon reading those bytes gets back, which is the
+    /// half that decides whether a process starts.
+    #[test]
+    fn an_add_request_and_its_reply_round_trip() {
+        let request = Request::Add {
+            apps: vec![AppConfig::minimal("web", "./srv")],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+        assert!(json.contains(r#""kind":"add""#), "{json}");
+
+        let reply = Response::Added(vec![]);
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), reply);
+        assert!(json.contains(r#""kind":"added""#), "{json}");
+    }
+
     #[test]
     fn a_send_line_request_and_its_reply_round_trip() {
         let request = Request::SendLine {
@@ -2488,6 +2543,20 @@ mod tests {
                         declared_env: ["DATABASE_URL"].iter().map(|k| (*k).to_string()).collect(),
                     }],
                     reset: ResetDepth::Settings,
+                },
+            },
+            // The same app as the `start` row above, deliberately: the two
+            // requests carry identical payloads and differ by their `kind`
+            // alone, so an `add` that serialized under `start`'s tag -- the
+            // shape a copy-pasted variant takes -- shows up here as two
+            // identical objects rather than as a diff a reader has to
+            // compare field by field. The same trick the `reopen`/`flush`
+            // pair above plays.
+            Envelope {
+                id: 27,
+                deadline_ms: None,
+                body: Request::Add {
+                    apps: vec![AppConfig::minimal("web", "./srv")],
                 },
             },
         ];
@@ -2858,6 +2927,17 @@ mod tests {
                         Some("worker is not registered".to_string()),
                     ),
                 ])),
+            },
+            // `Added`'s tag. It is a `Vec<ProcessInfo>` like three of the
+            // rows above, so the tag is the only thing about it a fixture can
+            // prove, and empty is the shape that proves it -- the same
+            // reasoning the block of empty rows further up states for its
+            // own. Down here rather than beside `Started`, where it belongs
+            // by meaning, because every id in this vector is hand-written and
+            // an insertion in the middle renumbers twenty rows for nothing.
+            Reply {
+                id: 33,
+                result: Ok(Response::Added(vec![])),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v2", replies);

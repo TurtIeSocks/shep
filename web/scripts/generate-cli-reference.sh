@@ -49,12 +49,16 @@ fi
 # This list is hand-kept, and for a long time nothing checked it: `style`
 # and `welcome` shipped and were simply absent from the published
 # reference, because regenerating the file refreshes what is listed here
-# and can say nothing about what is not. `verbs_the_reference_generator_
-# misses` in `cli.rs` now compares it against the binary's own visible
-# subcommands, so a new verb fails a test rather than going quietly
-# undocumented. `help` is clap's own and is the one deliberate omission.
+# and can say nothing about what is not.
+# `every_visible_verb_reaches_the_docs_site_generator` in `cli.rs` now
+# compares it against the binary's own visible subcommands, so a new verb
+# fails a test rather than going quietly undocumented. (That name is the
+# real one. Both this comment and web/src/data/cliReference.ts called it
+# `verbs_the_reference_generator_misses`, which has never existed.)
+#
+# `help` is clap's own and is the one deliberate omission.
 VERBS=(
-  start serve stop restart reload delete stock flock dogs enable disable
+  start add serve stop restart reload delete stock flock dogs enable disable
   adopt rehome describe trigger signal whisper fold bleats lookout whistle
   reopen flush barks set get unset ping kill save muster runtime dev
   import startup unstartup completions init style welcome

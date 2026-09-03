@@ -294,6 +294,29 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 }
             }
         },
+        // The membership half of `Start` with none of the spawning, and the
+        // same untrusted-peer rule: re-normalize before anything is
+        // registered.
+        //
+        // Recorded in the registry exactly as `Start` is. An added app is a
+        // flock member that happens to be stopped, so a `shep save` after a
+        // `shep add` has to write it -- without this the roll would forget an
+        // app that was registered and never started, which is the whole
+        // sequence this request exists to make possible.
+        Request::Add { apps } => match normalize_all(apps) {
+            Err(err) => reply(Err(RpcError {
+                code: RpcErrorCode::InvalidConfig,
+                message: err.to_string(),
+                daemon_version: None,
+            })),
+            Ok(resolved) => {
+                ctx.registry.record(&resolved);
+                match ctx.supervisor.register_at_rest(resolved).await {
+                    Ok(infos) => reply(Ok(Response::Added(infos))),
+                    Err(err) => reply(Err(rpc_error(&err))),
+                }
+            }
+        },
         // Re-normalized for the reason `Start` is, plus one of its own: an
         // unnormalized config would report every default it did not spell
         // out as a difference from the normalized copy the flock stores, so
@@ -1160,6 +1183,131 @@ mod tests {
             .await,
         );
         assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
+    }
+
+    /// fails if `Add` spawns anything.
+    ///
+    /// The harness is scripted with NO processes, which is the forcing
+    /// mechanism rather than a convenience: `ScriptedRunner::spawn` refuses
+    /// with `script exhausted` once the list is empty, so a build that routed
+    /// this at `do_start` cannot reach a row that is `Stopped` with no pid.
+    /// It would land `Errored`, and the two assertions below say which.
+    #[tokio::test(start_paused = true)]
+    async fn add_registers_a_stopped_member_and_spawns_nothing() {
+        let h = harness(vec![]);
+        let added = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Add {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Added(infos) = added.result.unwrap() else {
+            panic!("expected added")
+        };
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].status, ProcStatus::Stopped);
+        assert_eq!(infos[0].pid, None, "nothing was spawned");
+
+        // The roll can only be built if `Add` recorded the config, and an app
+        // registered and never started is precisely the one a roll would
+        // otherwise forget.
+        let roll = h.ctx.registry.roll(&infos, 0);
+        assert_eq!(roll.apps.len(), 1);
+        assert_eq!(roll.apps[0].app.script, "./srv");
+        assert_eq!(roll.apps[0].instances_running, 0);
+
+        let listed = reply_of(dispatch(envelope(2, Request::ListFlock), &h.ctx).await);
+        let Response::Flock(flock) = listed.result.unwrap() else {
+            panic!("expected flock")
+        };
+        assert_eq!(
+            flock.len(),
+            1,
+            "it is a member of the flock, just a still one"
+        );
+    }
+
+    /// fails if `Add` trusts what a peer sent it. Same rule as `Start`: the
+    /// socket is the boundary, and an empty name is the shape `normalize`
+    /// refuses.
+    #[tokio::test(start_paused = true)]
+    async fn add_re_normalizes_untrusted_peer_config() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Add {
+                        apps: vec![AppConfig::minimal("", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(reply.result.unwrap_err().code, RpcErrorCode::InvalidConfig);
+    }
+
+    /// fails if a second `Add` of a name the flock already has registers a
+    /// second row, or disturbs the first.
+    ///
+    /// The sheep here is ONLINE, which is the case that matters: re-running
+    /// `shep add Flockfile.toml` after editing the file is the ordinary thing
+    /// to do, and it must not stop a service. One script, so a second spawn
+    /// would fail rather than pass quietly.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_add_leaves_a_running_sheep_exactly_as_it_was() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Started(before) = started.result.unwrap() else {
+            panic!("expected started")
+        };
+
+        let added = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::Add {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Response::Added(after) = added.result.unwrap() else {
+            panic!("expected added")
+        };
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].id, before[0].id,
+            "the same sheep, not a second one"
+        );
+        assert_eq!(after[0].status, ProcStatus::Online, "still running");
+        assert_eq!(after[0].pid, before[0].pid, "the same process");
+
+        let listed = reply_of(dispatch(envelope(3, Request::ListFlock), &h.ctx).await);
+        let Response::Flock(flock) = listed.result.unwrap() else {
+            panic!("expected flock")
+        };
+        assert_eq!(flock.len(), 1, "one row, not two");
     }
 
     /// One app as a Flockfile would declare it: the config, plus the keys

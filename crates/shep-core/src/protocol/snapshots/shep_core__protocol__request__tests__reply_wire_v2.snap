@@ -1,6 +1,5 @@
 ---
 source: crates/shep-core/src/protocol/request.rs
-assertion_line: 2604
 expression: replies
 ---
 [
@@ -651,6 +650,15 @@ expression: replies
             "refused": "worker is not registered"
           }
         ]
+      }
+    }
+  },
+  {
+    "id": 33,
+    "result": {
+      "Ok": {
+        "kind": "added",
+        "data": []
       }
     }
   }

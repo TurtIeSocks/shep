@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Request::Add` and `Response::Added`: register apps as flock members
+  without starting any of them. Everything `Start` does to membership and
+  none of what it does to processes, so a Flockfile shipping empty `env`
+  keys can be registered and configured before anything spawns against
+  them. `PROTOCOL_VERSION` stays at 2, following the six additive
+  precedents below it: no existing variant moved, was renamed, or was
+  retyped. An older shepherd cannot decode the variant, and what an
+  operator meets depends on whether the crate version moved with it.
+  Across a release, `shep-cli`'s skew guard refuses first: it compares the
+  shepherd's reported version against the client's own and refuses every
+  verb but `kill`, `ping` and `daemon reload`, so `shep add` exits
+  `version_skew` naming `shep daemon reload` before the request is sent.
+  Within one version, a client built from this commit against a shepherd
+  built from an earlier one, the versions match, the guard passes, and the
+  shepherd ends the connection on an envelope it cannot decode. Restart the
+  shepherd either way.
+
 ## [0.1.30] - 2026-09-03
 
 ### Added

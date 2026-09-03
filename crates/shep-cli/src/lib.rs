@@ -57,7 +57,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{AdoptArgs, Commands, DaemonArgs, Format};
+use cli::{AdoptArgs, Commands, DaemonArgs, Format, StartArgs};
 use cli::{Cli, GlobalArgs};
 use commands::admin;
 use commands::bleats;
@@ -67,6 +67,7 @@ use commands::dogs;
 use commands::import;
 use commands::kv;
 use commands::lifecycle;
+use commands::lifecycle::Load;
 use commands::logs;
 use commands::muster;
 use commands::query;
@@ -1233,37 +1234,10 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 ExitCode::Success
             }
         },
-        // Bare `shep start` means the Flockfile in this directory, the way
-        // `shep runtime` and `shep dev` already read one -- and when there is
-        // none, it means "bring a shepherd up", which is the only way to get
-        // one without also starting a process.
         Commands::Start(ref args) => {
-            let discovered = if args.targets.is_empty() {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|cwd| shep_core::config::flockfile::discover(&cwd))
-            } else {
-                None
-            };
-            if args.targets.is_empty() && discovered.is_none() {
-                return start_bare_shepherd(&mut streams, &paths, guard).await;
-            }
-            let shep_toml_text = std::fs::read_to_string(&paths.daemon_config).ok();
-            let interpreters = interpreters_from_config(shep_toml_text.as_deref());
-            match connect_or_spawn_client(&mut streams, &paths, guard).await {
-                Ok(client) => {
-                    lifecycle::start(
-                        &client,
-                        &mut streams,
-                        args,
-                        discovered.as_deref(),
-                        &interpreters,
-                    )
-                    .await
-                }
-                Err(code) => code,
-            }
+            load_command(&mut streams, &paths, guard, args, Load::Start).await
         }
+        Commands::Add(ref args) => load_command(&mut streams, &paths, guard, args, Load::Add).await,
         Commands::Stop(ref args) | Commands::Thatlldo(ref args) => {
             match connect_client(&mut streams, &paths, guard).await {
                 Ok(client) => lifecycle::stop(&client, &mut streams, args).await,
@@ -1495,6 +1469,60 @@ pub(crate) async fn connect_or_spawn_client(
         Err(err) => {
             let code = ExitCode::from(&err);
             Err(streams.fail(code, &err.to_string()))
+        }
+    }
+}
+
+/// `shep start` and `shep add`, which differ in one thing and share
+/// everything before it.
+///
+/// Bare, either verb means the Flockfile in this directory, the way `shep
+/// runtime` and `shep dev` already read one. What the two disagree about is
+/// what an EMPTY directory means, and the arm below is the whole of it.
+///
+/// Reading `shep.toml`'s interpreter mapping, discovering the file, and
+/// bringing a shepherd up to talk to are identical for both, which is why
+/// this is one function rather than two arms that would drift.
+async fn load_command(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    guard: VersionGuard,
+    args: &StartArgs,
+    mode: Load,
+) -> ExitCode {
+    let discovered = if args.targets.is_empty() {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| shep_core::config::flockfile::discover(&cwd))
+    } else {
+        None
+    };
+    if args.targets.is_empty() && discovered.is_none() {
+        // Bare `shep start` in an empty directory means "bring a shepherd
+        // up", the only way to get one without also starting a process.
+        // `shep add` cannot mean that: a shepherd holding nothing is what it
+        // would produce either way, so the operator has named something that
+        // is not there and the honest answer is to say so.
+        return match mode {
+            Load::Start => start_bare_shepherd(streams, paths, guard).await,
+            Load::Add => streams.fail(
+                ExitCode::Usage,
+                "no target and no Flockfile in this directory",
+            ),
+        };
+    }
+    let shep_toml_text = std::fs::read_to_string(&paths.daemon_config).ok();
+    let interpreters = interpreters_from_config(shep_toml_text.as_deref());
+    let client = match connect_or_spawn_client(streams, paths, guard).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match mode {
+        Load::Start => {
+            lifecycle::start(&client, streams, args, discovered.as_deref(), &interpreters).await
+        }
+        Load::Add => {
+            lifecycle::add(&client, streams, args, discovered.as_deref(), &interpreters).await
         }
     }
 }
@@ -3141,6 +3169,21 @@ mod tests {
         assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
     }
 
+    /// An empty [`StartArgs`], for asking which guard `add` gets. Its
+    /// fields do not reach the guard, which reads the verb alone.
+    fn add_args() -> StartArgs {
+        StartArgs {
+            targets: Vec::new(),
+            name: None,
+            fold: None,
+            cwd: None,
+            interpreter: None,
+            flockfile: false,
+            reset: false,
+            reset_all: false,
+        }
+    }
+
     /// A [`DaemonArgs`] carrying `cmd` and nothing else, for asking which
     /// guard the `daemon` verb's two shapes get.
     fn daemon_args(cmd: Option<cli::DaemonCmd>) -> DaemonArgs {
@@ -3190,6 +3233,17 @@ mod tests {
         assert_eq!(
             VersionGuard::for_command(&Commands::Kill),
             VersionGuard::Exempt
+        );
+        // `add` carries a request an older shepherd cannot decode
+        // (`Request::Add`, added without moving `PROTOCOL_VERSION`), so the
+        // skew refusal is the whole of what stands between an operator who
+        // upgraded and a client that dies on the reply. It reaches
+        // `Enforce` through the `_` arm rather than by being named, which
+        // is the right default and an easy one to lose: pinned here so a
+        // future exemption for `add` has to be argued rather than typed.
+        assert_eq!(
+            VersionGuard::for_command(&Commands::Add(add_args())),
+            VersionGuard::Enforce
         );
     }
 

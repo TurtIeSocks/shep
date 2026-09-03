@@ -39,8 +39,21 @@ export interface CliReferenceData {
 // Kept here (rather than re-derived from the generated file) so a missing
 // or misspelled `@@VERB:...@@` marker is a loud parse error, not a silently
 // short verb list.
+//
+// It was silently short by three anyway, from whenever `init`, `style` and
+// `welcome` shipped until 2026-09-03. Nothing caught it: this list is what
+// the page renders FROM, so a verb absent here is a verb the reference
+// simply does not have, and `cli.astro`'s own count check compares the
+// groups against this list rather than against the generated file, so the
+// two agreed with each other while both disagreed with the binary. The
+// generator's `VERBS` array has a Rust test holding it to the real command
+// tree (`every_visible_verb_reaches_the_docs_site_generator` in
+// crates/shep-cli/src/cli.rs); this list has nothing, and
+// the only thing standing between it and the same drift is the build error
+// you get when the groups and this list disagree.
 const VERB_NAMES = [
   "start",
+  "add",
   "serve",
   "stop",
   "restart",
@@ -77,6 +90,9 @@ const VERB_NAMES = [
   "startup",
   "unstartup",
   "completions",
+  "init",
+  "style",
+  "welcome",
 ] as const;
 
 function fail(message: string): never {

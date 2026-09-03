@@ -3,8 +3,8 @@
  * Overrides (crates/shep-core/src/overrides.rs, crates/shep-core/src/config/apply.rs
  * for ApplyGroup and ResetDepth, crates/shep-daemon/src/supervisor.rs for
  * merge_declared and handle_apply_config, `shep start --help`). Every
- * transcript below was run for real against target/release/shep on
- * 2026-09-02, one sheep in a throwaway $SHEP_HOME, and re-run there twice the
+ * transcript below was run for real against target/release/shep, one sheep in
+ * a throwaway $SHEP_HOME. All but one on 2026-09-02, re-run there twice the
  * same day: once when a fresh start began establishing the keys its file
  * declared, and again when a review found the reset-scales sample still
  * carrying a `cwd` clause the fixed binary does not print. The `cwd` the
@@ -12,6 +12,12 @@
  * it so the promotion can spawn. A `cwd` equal to where the app already runs
  * parks nothing, and on macOS a /tmp path and its /private/tmp resolution
  * differ enough to park one for a reason no reader could reproduce.
+ *
+ * `addFirst` is the exception: run on 2026-09-03, when `shep add` shipped,
+ * in a throwaway $SHEP_HOME of its own. Its RESTARTS column reads 1 on the
+ * third command and that is the real output, not a paste error. `shep start
+ * <name>` resumes a stopped sheep through `Request::Restart`, which counts
+ * a restart, and has since long before this verb.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
@@ -73,6 +79,18 @@ notice[start]: web: env waiting on the next spawn (\`shep reload web\` promotes 
 notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
 1   web   online  96368  0         -     !1   -    1.2M  3s      -     -`;
+
+const addFirst = `$ shep add Flockfile.toml
+ID  NAME  STATUS   PID  RESTARTS  EXIT  CFG  CPU  MEM  UPTIME  FOLD  SMIT
+0   web   stopped  -    0         -     -    -    -    0s      -     -
+
+$ shep flock
+ID  NAME  STATUS   PID  RESTARTS  EXIT  CFG  CPU  MEM  UPTIME  FOLD  SMIT
+0   web   stopped  -    0         -     -    -    -    0s      -     -
+
+$ shep start web
+ID  NAME  STATUS  PID   RESTARTS  EXIT  CFG  CPU  MEM    UPTIME  FOLD  SMIT
+0   web   online  4745  1         -     -    -    32.0K  0s      -     -`;
 
 const resetScales = `$ shep flock
 ID  NAME   STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
@@ -318,6 +336,44 @@ const store = `$ cat $SHEP_HOME/overrides.json
       supposed to: the key was established, so the template no longer speaks
       for it. <code>--reset-all</code> is the only thing that hands
       <code>env</code> back to the file.
+    </p>
+
+    <h2>Registering before starting</h2>
+    <p>
+      <code>shep add</code> takes the targets <code>shep start</code> takes
+      and runs the same load. The one difference is that nothing spawns: the
+      app lands registered and stopped, with the keys its file declared
+      already established, and <code>shep start &lt;name&gt;</code> is what
+      brings it up.
+    </p>
+    <CodeBlock>{addFirst}</CodeBlock>
+    <p>
+      The empty values above are why it exists. Starting that file spawns a
+      process against an empty database URL: it crashes,
+      <code>autorestart</code> spends the restart budget on it, and the app
+      has to be stopped before anyone can configure it. Registering first
+      puts the steps in the order they belong.
+    </p>
+    <p class="fine">
+      The <code>1</code> under RESTARTS is not something <code>add</code>
+      did. <code>shep start &lt;name&gt;</code> brings a stopped sheep up
+      through the same request <code>shep restart</code> uses, and has
+      counted it that way since before this verb existed.
+    </p>
+    <Callout variant="careful">
+      The middle step is the one shep has no verb for yet. Filling in an
+      established key today means editing the Flockfile and loading it with
+      <code>--reset-all</code>, which hands <code>env</code> back to the file
+      and drops the override record with it. Read
+      <a href="#the-reset-flags-reshape-the-flock">the reset warning</a>
+      first if the app has been scaled.
+    </Callout>
+    <p>
+      Running <code>shep add</code> again changes nothing and prints nothing,
+      the way a second load of an unchanged file does. Naming a sheep instead
+      of a file says so out loud, because a name reads no Flockfile at all
+      and leaves nothing to register:
+      <code>notice[add]: web is already registered; nothing to add.</code>
     </p>
 
     <h2>A template may add, never overwrite</h2>

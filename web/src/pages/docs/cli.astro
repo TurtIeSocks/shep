@@ -40,7 +40,16 @@ const byName = new Map(cliReference.verbs.map((v) => [v.name, v]));
 const groups = [
   {
     title: "Managing a sheep",
-    verbs: ["start", "serve", "stop", "restart", "reload", "delete", "stock"],
+    verbs: [
+      "start",
+      "add",
+      "serve",
+      "stop",
+      "restart",
+      "reload",
+      "delete",
+      "stock",
+    ],
   },
   {
     title: "Inspecting the flock",
@@ -79,8 +88,12 @@ const groups = [
     verbs: ["import", "startup", "unstartup"],
   },
   {
-    title: "Shell completions",
-    verbs: ["completions"],
+    title: "Getting oriented",
+    verbs: ["welcome", "init"],
+  },
+  {
+    title: "Your shell and terminal",
+    verbs: ["completions", "style"],
   },
 ];
 

@@ -343,5 +343,56 @@ expression: requests
       ],
       "reset": "settings"
     }
+  },
+  {
+    "id": 27,
+    "deadline_ms": null,
+    "body": {
+      "kind": "add",
+      "apps": [
+        {
+          "name": "web",
+          "script": "./srv",
+          "args": [],
+          "cwd": null,
+          "interpreter": null,
+          "env": {},
+          "instances": 1,
+          "autorestart": true,
+          "autostart": true,
+          "stop_exit_codes": [],
+          "min_uptime": "1s",
+          "max_restarts": 16,
+          "restart_delay": null,
+          "exp_backoff_restart_delay": "100",
+          "kill_signal": null,
+          "kill_timeout": "1600",
+          "shutdown_with_message": false,
+          "listen_timeout": "3s",
+          "graceful_timeout": "8s",
+          "action_timeout": "3s",
+          "max_memory": null,
+          "watch": false,
+          "ignore_watch": [],
+          "watch_delay": null,
+          "cron_restart": null,
+          "fold": null,
+          "user": null,
+          "group": null,
+          "out_file": null,
+          "err_file": null,
+          "merge_logs": false,
+          "channel": false,
+          "stdin": false,
+          "wait_ready": false,
+          "reuse_port": false,
+          "readiness_probe": null,
+          "liveness_probe": null,
+          "watch_options": [],
+          "cron_timezone": null,
+          "increment_var": null
+        }
+      ]
+    }
   }
 ]

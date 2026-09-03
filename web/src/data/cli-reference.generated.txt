@@ -10,7 +10,7 @@ Getting started
   shep save               remember this flock across reboots
   shep startup            bring it back after a reboot
 
-Run things       start serve stop restart reload delete stock
+Run things       start add serve stop restart reload delete stock
 See what's up    flock describe bleats lookout fold barks
 Survive reboots  save muster startup unstartup
 Talk to a sheep  trigger signal whisper
@@ -85,14 +85,145 @@ Arguments:
           The wildcard selectors work here too, and mean what they mean everywhere else: `all`,
           `/regex/`, and glob patterns such as `web-*`. They reach only sheep the flock already has,
           since there is nothing to register. A sheep already running is reported and left alone;
-          `restart` is the verb that replaces one.
+          `restart` is the verb that replaces one, and `add` never starts anything in the first
+          place.
           
-          Omit the targets to start the Flockfile in the current directory, or, when there is none,
-          to bring a shepherd up with nothing running yet.
+          Omit the targets to read the Flockfile in the current directory. With no Flockfile there,
+          `shep start` brings a shepherd up with nothing running yet, and `shep add` has nothing it
+          could register.
           
-          Several are started in turn, not atomically: if the second fails the first is already up,
-          and the exit code is the first failure. `--name` is refused with more than one, since a
-          name is unique to one sheep.
+          Several are handled in turn, not atomically: if the second fails the first has already
+          landed, and the exit code is the first failure. `--name` is refused with more than one,
+          since a name is unique to one sheep.
+
+Options:
+      --format <FORMAT>
+          Output format
+
+          Possible values:
+          - table: Human-readable columns (the default)
+          - json:  A versioned JSON envelope, one object per invocation
+          
+          [default: table]
+
+      --name <NAME>
+          Name for this sheep (script form only)
+
+      --fold <FOLD>
+          Fold to place this sheep in
+
+  -q, --quiet
+          Suppress non-essential output
+          
+          Currently narrows `bleats`' own notices (a dropped-events count, a daemon-shutdown notice,
+          ...): diagnostics distinct from a sheep's own line or a real error, both of which still
+          print regardless.
+
+      --cwd <CWD>
+          Working directory to run in (default: where you ran `shep start`)
+
+      --style <STYLE>
+          How much this invocation dresses up its output: `full`, `plain`, or `bare`
+          
+          Wins over `$SHEP_STYLE` and `shep.toml`'s `[style] level`. Omit to let those decide; `shep
+          style` reports which one answered.
+
+          Possible values:
+          - full:  Sheep, boxes and colour
+          - plain: Boxes and colour, no sheep
+          - bare:  Exactly what shep printed before any of this, and exactly what a pipe gets
+
+      --home <HOME>
+          Talk to a different shepherd
+          
+          Mostly plumbing: `shep dev` sessions, a system-wide flock, tests. You almost certainly
+          want the default, ~/.shep.
+          
+          [env: SHEP_HOME=]
+
+      --interpreter <INTERPRETER>
+          Interpreter to run the script with, overriding both shep.toml's extension mapping and a
+          Flockfile app's own interpreter field.
+          
+          The precedence, lowest to highest: shep.toml's interpreters table (matched against the
+          script's extension), then a Flockfile's own interpreter for that app, then this flag. shep
+          never guesses an interpreter on its own; every one of those three is something an operator
+          wrote down. Pass "none" to run the script directly, overriding a mapping or a Flockfile
+          that would otherwise pick one.
+
+      --flockfile
+          Read TARGET as a Flockfile rather than as a script path.
+          
+          Required for a `.js` Flockfile and the only way to reach one: shep reads a `.js` config by
+          running it through node, which is arbitrary code execution, so it never happens because a
+          file merely has that extension. Without this flag `shep start server.js` starts
+          `server.js` as a script, which is what it has always meant.
+
+      --reset
+          Put process settings back to what the Flockfile says, keeping env.
+          
+          Every setting goes back, whether the file declares it or not: a key the file is silent
+          about goes to the value a fresh `shep start` off that same file would give it. Without
+          this flag a load is additive: it appends keys nobody has set and overwrites nothing. `env`
+          is operator-supplied data and survives even this reset; everything else is operator-tuned
+          policy, and resetting policy is recoverable. Refused when the target supplies no template
+          to reset to: a sheep name reads no file, and a bare script path is a command line rather
+          than a file.
+
+      --reset-all
+          Put everything back to what the Flockfile says, including env, and drop the override
+          record.
+          
+          The wider of the two resets: `--reset` keeps `env` because it is operator-supplied data,
+          not policy, and losing it takes the app's database away. This flag drops it too. Refused
+          on the same targets `--reset` is: a sheep name reads no file, and a bare script path is a
+          command line rather than a file.
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+@@VERB:add@@
+Register a sheep without starting it.
+
+The same targets `shep start` takes and the same load path. The one difference is that nothing
+spawns: the app lands registered and stopped, and `shep start <name>` is what brings it up.
+
+It is here for the Flockfile a project commits with its secrets left blank: `env = { DB_HOST = "",
+DB_PASSWORD = "" }`, the `.env.example` convention. Starting that file spawns a process against an
+empty database URL, which crashes, spends its restart budget, and has to be stopped before anyone
+can configure it. This registers it instead, so the order becomes register, fill in, start.
+
+An app the flock already has is merged into and left exactly as it is, running or not.
+
+Usage: shep add [OPTIONS] [TARGETS]...
+
+Arguments:
+  [TARGETS]...
+          Selectors, script paths, Flockfiles, or `-` to read Flockfile JSON from stdin
+          
+          A target is resolved in four tiers and the first one that matches wins: a sheep the flock
+          already has, by id or by name; then a fold, written either as `fold:<name>` or as the bare
+          fold name; then a Flockfile, by its extension; then a path on disk, started as a script.
+          
+          So `shep start backed` starts the fold `backed` even when a file called `backed` is
+          sitting in the current directory. Write `./backed` to mean the file: a sheep name may
+          never contain a path separator, so a target carrying one is always a path.
+          
+          The wildcard selectors work here too, and mean what they mean everywhere else: `all`,
+          `/regex/`, and glob patterns such as `web-*`. They reach only sheep the flock already has,
+          since there is nothing to register. A sheep already running is reported and left alone;
+          `restart` is the verb that replaces one, and `add` never starts anything in the first
+          place.
+          
+          Omit the targets to read the Flockfile in the current directory. With no Flockfile there,
+          `shep start` brings a shepherd up with nothing running yet, and `shep add` has nothing it
+          could register.
+          
+          Several are handled in turn, not atomically: if the second fails the first has already
+          landed, and the exit code is the first failure. `--name` is refused with more than one,
+          since a name is unique to one sheep.
 
 Options:
       --format <FORMAT>
