@@ -1273,7 +1273,10 @@ fn stale_verdict(name: &str, evidence: Silence) -> String {
             "{seen}, and nothing has ever connected to this shepherd's socket from its process (pid {pid}): \
              the binary on disk cannot reach this shep either, so this dog is stale and will not be \
              restarted again. Read its own log with `shep bleats {name}` for what it says about \
-             connecting, then rebuild or reinstall it and run `shep restart {name}`"
+             connecting, then rebuild or reinstall it and run `shep restart {name}`. A dog \
+             installed with cargo wants `cargo install <crate> --force`: its own version does \
+             not change when the shep it was built against does, so a plain `cargo install` \
+             reports the package already installed, builds nothing, and exits 0"
         ),
         Silence::Anonymous { pid } => format!(
             "{seen}, but its process (pid {pid}) HAS connected to this shepherd — every time without \
@@ -1281,8 +1284,10 @@ fn stale_verdict(name: &str, evidence: Silence) -> String {
              is reaching shep and may be serving every request it is asked; reinstalling the same \
              build will NOT change that. It is built against shep-client older than 0.1.23, or it \
              connects with `Client::connect` instead of `ReconnectingClient::connect_as_dog`. Rebuild \
-             it against shep-client 0.1.23 or newer, then run `shep restart {name}`. It will not be \
-             restarted again in the meantime, and it goes on running"
+             it against shep-client 0.1.23 or newer, then run `shep restart {name}`. With cargo \
+             that means `cargo install <crate> --force`: the dog's own version does not change \
+             when its shep-client does, so a plain `cargo install` builds nothing and exits 0. \
+             It will not be restarted again in the meantime, and it goes on running"
         ),
         Silence::Unattributed => format!(
             "{seen}, and this shepherd could not tell which process opened its connections, so it \
@@ -2645,6 +2650,16 @@ mod tests {
         );
 
         let unattributed = stale_verdict("metrics", Silence::Unattributed);
+        // Naming the flag is the point: `cargo install <dog>` on a dog whose
+        // version has not moved prints "already installed", builds nothing,
+        // and exits 0, so an operator following the advice sees success and
+        // gets the same stale binary back.
+        for verdict in [&unreachable, &anonymous] {
+            assert!(
+                verdict.contains("--force"),
+                "reinstall advice that omits --force is advice that silently does nothing: {verdict}"
+            );
+        }
         assert!(
             unattributed.contains("could not tell which process"),
             "not knowing has to be said rather than papered over: {unattributed}"
