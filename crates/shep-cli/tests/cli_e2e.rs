@@ -7655,6 +7655,84 @@ fn a_bad_shep_toml_refuses_the_reload_and_leaves_the_flock_supervised() {
     graceful_kill(dir.path());
 }
 
+/// Fails if a dog section shep cannot move can orphan a running flock.
+///
+/// The dog-config migration runs at the top of every boot, so on the
+/// handover arm it runs in a successor whose predecessor is already gone: a
+/// refusal there used to exit the successor with the flock still running
+/// and nothing supervising it. Measured before the fix, with exactly this
+/// setup: the reload failed, the sheep survived reparented to init, `shep
+/// flock` reported it stopped, and a recovering `shep muster` started a
+/// second copy alongside the orphan.
+///
+/// `metrics` configured in both `shep.toml` and `dogs.toml` is the refusal
+/// with the fewest moving parts (`DogMigrationError::WouldOverwrite`), and
+/// it is one an operator reaches by hand-writing `dogs.toml` before
+/// upgrading. No `#[cfg(unix)]`, for the same reason the bad-`shep.toml`
+/// case above carries none: the pre-flight runs before the arm is chosen.
+#[test]
+fn a_refused_dog_migration_refuses_the_reload_and_leaves_the_flock_supervised() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
+
+    write_shep_toml(&dir, "[dog.metrics]\nbind = \"127.0.0.1:19616\"\n");
+    std::fs::write(
+        dir.path().join("dogs.toml"),
+        "[metrics]\nbind = \"127.0.0.1:19617\"\n",
+    )
+    .unwrap();
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_eq!(
+        reloaded.status.code(),
+        Some(4),
+        "InvalidConfig; stderr={}",
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+
+    let after = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("flock")
+        .output()
+        .unwrap();
+    assert_success(&after);
+    let envelope: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    let sheep = &envelope["data"][0];
+    assert_eq!(sheep["status"], "online", "still supervised: {sheep}");
+    assert_eq!(
+        sheep["pid"].as_u64(),
+        Some(pid_before),
+        "the refusal must happen before anything is signalled: {sheep}"
+    );
+
+    graceful_kill(dir.path());
+}
+
 /// Pins the ruling behind the file-only pre-flight: an env var set on the
 /// `shep daemon reload` invocation itself must not rescue a file that is
 /// invalid on its own, because a handover successor execs with the OLD

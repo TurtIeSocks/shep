@@ -662,6 +662,52 @@ async fn reload_with_wait(
         return streams.fail(daemon_exit_code(&err), &err.to_string());
     }
 
+    // The same argument as the config check above, aimed at the other file
+    // the successor reads. The migration runs at the top of every boot
+    // (`boot_supervisor`), so on the handover arm it runs in a successor
+    // whose predecessor is already gone: a refusal there exits the
+    // successor and leaves the flock running with nothing supervising it.
+    // Reproduced before this line existed, with a dog named in both files:
+    // `shep daemon reload` failed, the sheep survived reparented to init,
+    // `shep flock` reported it stopped, and a recovering `shep muster`
+    // started a second copy alongside the orphan. `shep daemon reload` is
+    // the documented upgrade command, so for most operators the migration's
+    // first run happens inside a handover.
+    //
+    // RUN, not dry-run, and that is what makes this a pre-flight rather
+    // than a second opinion. The migration is idempotent -- a boot after
+    // the first finds nothing under `[dog]` and returns before it opens
+    // either file -- so doing the work here leaves the successor's own call
+    // with nothing to do, and there is no window in which a file changes
+    // between a check and the act it was checking. It takes both files'
+    // locks itself, in this crate's one order (`shep.toml` outer,
+    // `dogs.toml` inner), and this process holds neither, so the ordering
+    // is unchanged.
+    //
+    // This is the CLI process, and nothing below has signalled the
+    // predecessor yet, so a refusal here ends the verb with the running
+    // shepherd untouched -- which is the whole point.
+    match dog_migration::migrate_dog_sections(paths) {
+        Ok(moved) if moved.is_empty() => {}
+        Ok(moved) => {
+            // In front of the person who typed the verb, not in the
+            // daemon's log. Before this ran here the successor printed it
+            // to the shepherd's own stderr, where an operator who did not
+            // know the move was coming had no reason to look.
+            streams.aside(
+                "reload",
+                &format!(
+                    "moved dog config out of shep.toml and into dogs.toml: {}",
+                    moved.join(", ")
+                ),
+            );
+        }
+        Err(err) => {
+            let err = DaemonRunError::DogMigration(err);
+            return streams.fail(daemon_exit_code(&err), &err.to_string());
+        }
+    }
+
     // Connected to ask who is there, and, on the handover arm, whether
     // this flock can be carried. Dropped before anything is signalled: this
     // connection is to the process about to be replaced.
