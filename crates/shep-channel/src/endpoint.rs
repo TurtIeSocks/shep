@@ -25,6 +25,25 @@ pub const VERSION_VAR: &str = "SHEP_CHANNEL_VERSION";
 const FIRST_INHERITABLE_FD: i32 = 3;
 
 /// Where this process's channel is, if it has one.
+///
+/// # Debug
+///
+/// Derived, and prints the Windows pipe path in full including the random
+/// suffix the shepherd puts on it. That is a decision rather than an
+/// oversight, so it has a test.
+///
+/// The suffix is not a secret. `tokio_runner.rs`, where the shepherd builds
+/// the name, argues that 128 bits closes prediction and not observation: the
+/// pipe namespace lists to any unprivileged local user, measured at 190
+/// pipes from a non-elevated session, so anyone positioned to read this
+/// value out of a log can enumerate the live name directly. It is also in
+/// `SHEP_CHANNEL_PIPE` in this process's own environment, and the instance
+/// it names is consumed once the app connects.
+///
+/// The rest of the crate leaks nothing here to match, which is worth knowing
+/// before adding a redaction: on Windows `std::fs::File`'s own `Debug` is
+/// `File { handle: 0xb4 }` and carries no path, so [`crate::Channel`] and
+/// the reader half print handles rather than names.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
@@ -364,6 +383,35 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use super::*;
+
+    /// fails if [`Endpoint`]'s `Debug` starts redacting, or stops printing
+    /// the path at all. Both are reasonable things for someone to do to a
+    /// type carrying an environment value, which is exactly why the
+    /// decision not to is pinned here rather than left to a derive nobody
+    /// revisits. The reasoning is on the type; change it there first if
+    /// this test is ever meant to fail.
+    ///
+    /// Platform-independent despite naming a Windows path: `Path`'s `Debug`
+    /// escapes a backslash the same way on every target, so the expected
+    /// string below is the same one a unix run produces.
+    #[test]
+    fn the_pipe_endpoint_prints_its_path_in_full() {
+        let endpoint = Endpoint::Pipe(PathBuf::from(
+            r"\\.\pipe\shep-channel-1234-0-0123456789abcdef0123456789abcdef",
+        ));
+        assert_eq!(
+            format!("{endpoint:?}"),
+            r#"Pipe("\\\\.\\pipe\\shep-channel-1234-0-0123456789abcdef0123456789abcdef")"#
+        );
+    }
+
+    /// fails if the other two variants start carrying something they did
+    /// not, which is the cheap half of the same guard.
+    #[test]
+    fn the_other_endpoints_print_only_what_they_hold() {
+        assert_eq!(format!("{:?}", Endpoint::Descriptor(3)), "Descriptor(3)");
+        assert_eq!(format!("{:?}", Endpoint::Absent), "Absent");
+    }
 
     /// fails if a descriptor number the shepherd cannot have passed is
     /// accepted. `from_raw_fd` wants a valid owned descriptor and -1 is
