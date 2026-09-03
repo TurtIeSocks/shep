@@ -49,7 +49,6 @@ impl DogsConfig {
 }
 
 /// Why `dogs.toml` could not be read
-#[derive(Debug)]
 // One variant today. `#[non_exhaustive]` so a second reading failure (a
 // permissions error, once this type learns to open the file itself) is
 // additive rather than breaking.
@@ -57,6 +56,30 @@ impl DogsConfig {
 pub enum DogsConfigError {
     /// The file is not valid TOML
     Toml(toml::de::Error),
+}
+
+/// Manual, not derived (IR-41): `toml::de::Error`'s own `Debug` forwards to
+/// `toml_edit::TomlError`, which keeps the ENTIRE source document in a `raw`
+/// field so `Display` can quote a line of context. A derived `Debug` here
+/// prints all of it, and this is the one type in the workspace whose source
+/// document is `dogs.toml` -- the file `docs/dogs.md` tells an operator to
+/// paste a Discord or Slack webhook URL into. Measured against `toml`
+/// 0.8.23: a derived `Debug` emitted the whole file, webhook and all, five
+/// lines below the redacted `Debug` [`DogsConfig`] carries for the same
+/// secret.
+///
+/// The redaction is the parser's short `message()`, never the line it
+/// quotes -- the same posture, for the same reason, that
+/// `ShepTomlError::Parse` takes in shep-cli. `Display` below still shows the
+/// full line-and-column rendering: that is the deliberate surface, meant for
+/// the operator who broke their own file to read. `Debug` is not that
+/// surface, it is what a log captures.
+impl fmt::Debug for DogsConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Toml(err) => f.debug_tuple("Toml").field(&err.message()).finish(),
+        }
+    }
 }
 
 impl fmt::Display for DogsConfigError {
@@ -109,6 +132,34 @@ mod tests {
     // path. `Debug` is the one thing between such a token and any future
     // `tracing::debug!("{config:?}")`, so the exact string is pinned rather
     // than the shape.
+    // IR-41 again, and this is the leak the redaction above defeated by
+    // being five lines away from it: `DogsConfig`'s own `Debug` says
+    // `<1 tables>`, and the error returned when the same file will not
+    // parse used to print every byte of it. The exact string is pinned,
+    // not the shape, because a shape assertion passes on a `Debug` that
+    // appended the raw source after the message.
+    #[test]
+    fn debug_redacts_the_source_a_parse_error_carries() {
+        let source =
+            "[bark.sinks]\noncall = { url = \"https://discord.com/api/webhooks/SECRET\" }\n[oops\n";
+        let err = DogsConfig::load(Some(source)).expect_err("unterminated table header");
+        assert_eq!(
+            format!("{err:?}"),
+            "Toml(\"invalid table header\\nexpected `.`, `]`\")"
+        );
+        // The operator's own surface is untouched: `Display` still quotes
+        // the line that failed, which is the one line of the file this type
+        // is meant to show.
+        assert!(
+            err.to_string().contains("line 3, column 6"),
+            "Display keeps its line-and-column context: {err}"
+        );
+        assert!(
+            !err.to_string().contains("SECRET"),
+            "and it quotes only the line that failed: {err}"
+        );
+    }
+
     #[test]
     fn debug_redacts_every_dog_section() {
         let source =

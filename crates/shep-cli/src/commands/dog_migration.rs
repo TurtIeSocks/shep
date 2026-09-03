@@ -266,9 +266,14 @@ fn write_dogs_config(path: &Path, rendered: &str) -> std::io::Result<()> {
 ///
 /// Derived `Debug`, deliberately (IR-41): every variant carries a dog name,
 /// an I/O error, or a serializer's complaint, and never a section's
-/// contents, so there is nothing here to redact. The one wrapped type that
-/// could carry the file, [`ShepTomlError`], redacts its own `Debug` for
-/// exactly that reason.
+/// contents, so there is nothing here to redact. That is a claim about the
+/// two wrapped types that COULD carry a file, and both of them redact their
+/// own `Debug` for exactly that reason: [`ShepTomlError`] for `shep.toml`,
+/// and [`DogsConfigError`] for `dogs.toml`. The second one did not, for a
+/// while, and this comment asserted it anyway -- a derive over
+/// `toml::de::Error` prints the parser's `raw` field, which is the whole
+/// source document. A derive here is only ever as safe as what it forwards
+/// to, so a new variant wrapping a parse error needs the same check.
 #[derive(Debug)]
 // `#[non_exhaustive]`: the migration is the one writer of `dogs.toml` and
 // will grow refusals as operators meet shapes nobody predicted, so a
