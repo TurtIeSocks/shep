@@ -3218,6 +3218,79 @@ mod tests {
         sent
     }
 
+    /// fails if the second deserialize `resolve_target` now runs can refuse
+    /// a document the first one accepted, in any of the four formats.
+    ///
+    /// `resolve_target` used to run `Flockfile::parse` and stop. It now goes
+    /// through `Flockfile::parse_declared`, which runs the same validating
+    /// parse and then deserializes the SAME source a second time into a
+    /// `serde_json::Value` to recover which keys the document literally
+    /// wrote. The signature did not change, so `shep runtime` and `shep dev`
+    /// gained that second pass without their call sites moving, and nothing
+    /// pinned that the two passes agree.
+    ///
+    /// They cannot disagree for JSON and JSON5, whose backends deserialize
+    /// into `Value` by construction, and should not for TOML and YAML --
+    /// but "should not" is an argument, and this is the test. One case per
+    /// format, each carrying a nested table (the probe) and a list, which
+    /// are the two shapes a generic value pass is most likely to handle
+    /// differently from a typed one.
+    #[test]
+    fn every_format_survives_the_second_deserialize_resolve_target_now_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = [
+            (
+                "Flockfile.toml",
+                "[[app]]\nname = \"web\"\nscript = \"./srv\"\nargs = [\"-p\", \"80\"]\n\
+                 [app.env]\nMODE = \"live\"\n",
+            ),
+            (
+                "Flockfile.yaml",
+                "app:\n  - name: web\n    script: ./srv\n    args: ['-p', '80']\n\
+                 \n    env:\n      MODE: live\n",
+            ),
+            (
+                "Flockfile.json",
+                "{\"app\":[{\"name\":\"web\",\"script\":\"./srv\",\
+                 \"args\":[\"-p\",\"80\"],\"env\":{\"MODE\":\"live\"}}]}",
+            ),
+            (
+                "Flockfile.json5",
+                "{app:[{name:'web',script:'./srv',args:['-p','80'],env:{MODE:'live'}}]}",
+            ),
+        ];
+        for (filename, source) in sources {
+            let path = dir.path().join(filename);
+            std::fs::write(&path, source).unwrap();
+            let target = path.to_str().unwrap();
+
+            // The validating pass alone, which is all `resolve_target` ran
+            // before this change: the baseline the second pass must not
+            // narrow.
+            let format = FlockFormat::from_path(&path).expect("a recognised extension");
+            let first = Flockfile::parse(source, format).expect("the validating pass accepts it");
+
+            let apps = resolve_target(target, None, b"", false)
+                .unwrap_or_else(|err| panic!("{filename} was refused after the first pass: {err}"));
+            assert_eq!(
+                apps.len(),
+                first.apps.len(),
+                "{filename}: both passes see the same apps"
+            );
+            assert_eq!(apps[0].name, "web", "{filename}");
+            assert_eq!(
+                apps[0].args,
+                vec!["-p".to_string(), "80".to_string()],
+                "{filename}"
+            );
+            assert_eq!(
+                apps[0].env.get("MODE").map(String::as_str),
+                Some("live"),
+                "{filename}: a nested table survives both passes"
+            );
+        }
+    }
+
     /// fails if bare `shep start` in a directory holding a Flockfile does
     /// not apply that file to an app the flock already runs.
     ///
