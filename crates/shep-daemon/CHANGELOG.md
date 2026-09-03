@@ -10,6 +10,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-09-03
+
+### Added
+
+- Rearm_name, a force-replacing sibling to arm for config changes
+- The override store, locked and owner-only like the KV store
+- Apply a Flockfile onto a running flock additively, without killing anything
+- Reload and restart promote pending config, re-resolving identity only when it changed
+- Request::ApplyConfig on the wire, answered by Response::Applied
+- A CFG column and a describe section, so pending config is visible
+- A Flockfile is a template, and a load applies it without killing anything ([#104](https://github.com/shep-pm/shep/pull/104))
+
+### Fixed
+
+- Redact SpawnSpec's Debug, the one env-carrying type without it
+- Pin rearm_name's multi-instance path, move dead_code note out of rustdoc
+- An epoch, so a replaced liveness probe cannot restart the sheep it left
+- Correct guard ordinal in ExtraRestart epoch doc
+- Drop a memory breach measured against a ceiling a load has since changed
+- Four ways a Flockfile load could touch what it must not
+- A load must tear a group down even when it can arm nothing
+- Report a parked rebuild that failed with no field to name, and stop establishing refused keys
+- Decide a promotion's identity reset when the config is parked, and let a reload read what it is owed without taking it
+- A scale-up carries the parked config onto the instances it creates
+- Carry a parked config and its reset decision across a handover
+- Keep the overridden cache correct across reload, scale-up and restore
+- A reset resolves an undeclared key to the file, not to the default
+- A Flockfile that names a dog is refused, not merged onto it
+- A load during a reload reads the replacement, not the drainee
+- A reset no longer establishes env keys it never merged
+- A scale brings the count forward in the config it has parked
+- The two parking keys travel as a pair in both directions
+
+
 ## [0.1.29] - 2026-09-03
 
 ### Fixed
