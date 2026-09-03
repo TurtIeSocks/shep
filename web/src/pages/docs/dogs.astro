@@ -333,8 +333,12 @@ sinks = ["oncall"]`}</CodeBlock>
     <VerbSignature verb="rehome" usage="shep rehome <name>">
       <p>
         <code>disable</code>'s counterpart for a third-party dog: stops it
-        if running and forgets the registration entirely, rather than
-        leaving it disabled-but-known.
+        if running and forgets it entirely, rather than leaving it
+        disabled-but-known. That is both files, the registration in{" "}
+        <code>shep.toml</code> and the dog's own <code>[&lt;name&gt;]</code>
+        section in <code>dogs.toml</code>, webhook URLs and all.{" "}
+        <code>disable</code> keeps that section on purpose;{" "}
+        <code>rehome</code> is the verb that does not.
       </p>
     </VerbSignature>
     <CodeBlock>{`$ shep adopt ./bin/my-watchdog --name watchdog

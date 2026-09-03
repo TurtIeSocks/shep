@@ -265,8 +265,11 @@ started as `shep dog <name>` and read their own name from that argv, but
 neither is a dog anybody writes: they ship inside the binary.
 
 `rehome <name>` is `disable`'s counterpart for a third-party dog: it stops
-it if running and forgets the registration in `shep.toml` entirely, rather
-than leaving it disabled-but-known the way plain `disable` would.
+it if running and forgets the dog entirely, rather than leaving it
+disabled-but-known the way plain `disable` would. Both files: the
+registration in `shep.toml`, and the dog's own `[<name>]` section in
+`dogs.toml`, webhook URLs and all. `disable` keeps that section on
+purpose; `rehome` is the verb that does not.
 
 The wire a third-party dog speaks is the same client protocol
 [§6](specs/shep-v1.md#6-wire-protocol-v1--protocol-version-1) pins for
