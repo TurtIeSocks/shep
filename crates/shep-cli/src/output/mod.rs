@@ -1426,11 +1426,7 @@ mod tests {
         .unwrap();
         let rendered = String::from_utf8(out).unwrap();
 
-        assert_eq!(
-            rendered.matches("Pending for web").count(),
-            1,
-            "{rendered}"
-        );
+        assert_eq!(rendered.matches("Pending for web").count(), 1, "{rendered}");
         assert_eq!(
             rendered.matches("Overridden for web").count(),
             1,
