@@ -169,11 +169,26 @@ pub(crate) fn connect(endpoint: &Endpoint) -> Result<(Transport, Transport), Cha
             ));
         }
     };
-    // `CHANNEL_TAKEN` is not released if this fails: once `transport` above
-    // has taken the descriptor, the channel is taken for the life of the
-    // process no matter what `try_clone` does next. There is no way to
-    // hand a raw descriptor back once `from_raw_fd` owns it.
-    let writer = transport.try_clone().map_err(ChannelError::Io)?;
+    // Whether a failure here releases the claim depends on what was taken,
+    // and the two platforms differ.
+    //
+    // On unix the descriptor is owned for the life of the process the
+    // moment `from_raw_fd` returns, and there is no way to hand a raw
+    // descriptor back, so the channel really is taken however this ends.
+    //
+    // On Windows nothing irrevocable has happened. `transport` is a handle
+    // that closes cleanly when it drops, and the pipe can be opened again,
+    // so a claim kept here would refuse a later attempt that might well
+    // have worked, and would refuse it as `AlreadyTaken` by a process
+    // holding nothing.
+    let writer = match transport.try_clone() {
+        Ok(writer) => writer,
+        Err(error) => {
+            #[cfg(windows)]
+            CHANNEL_TAKEN.store(false, Ordering::SeqCst);
+            return Err(ChannelError::Io(error));
+        }
+    };
     Ok((transport, writer))
 }
 
