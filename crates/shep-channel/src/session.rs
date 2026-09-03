@@ -40,6 +40,7 @@ pub(crate) fn write_message<W: Write>(
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    #[cfg(unix)]
     use std::time::Duration;
 
     use super::*;
@@ -47,6 +48,12 @@ mod tests {
     /// Bounds the one real-socket read in this module's tests. A working
     /// channel answers in microseconds; this is slack for a loaded runner,
     /// not an expected duration.
+    ///
+    /// Unix-gated with the one test that uses it. Windows has no socketpair
+    /// to point that test at, and an ungated constant is dead code there --
+    /// which `clippy --all-targets -- -D warnings` fails on, on a platform
+    /// CI only ever runs `cargo test` against.
+    #[cfg(unix)]
     const DEADLINE: Duration = Duration::from_secs(5);
 
     #[test]
