@@ -729,15 +729,20 @@ pub struct CarriedSheep {
     /// hold.
     pending: Option<AppConfig>,
     /// Whether promoting [`Self::pending`] must re-resolve
-    /// [`Self::credentials`], or `None` for a blob written before this field
-    /// existed.
+    /// [`Self::credentials`].
+    ///
+    /// `None` means two different things and both read as `false`, which is
+    /// why one `Option` covers them. A blob written before this field
+    /// existed has no key at all, and a sheep with nothing parked writes no
+    /// key either, because the pairing below makes the two absent together.
+    /// Neither has a promotion coming, so neither has an identity to
+    /// re-resolve, and a reader that treats the absence as `false` is right
+    /// about both without having to tell them apart.
     ///
     /// `Option` for the reason [`Self::ready_failed`] gives rather than the
     /// one [`Self::pending_delete`] gives, and it is the same distinction: a
     /// predecessor from before the field existed was not refusing anything,
-    /// it simply had nothing to say. `false` is the right reading of that
-    /// silence, because such a predecessor also had no [`Self::pending`] to
-    /// go with it. [`VERSION`] stays unmoved.
+    /// it simply had nothing to say. [`VERSION`] stays unmoved.
     ///
     /// **Carried with [`Self::pending`] and never without it.** The decision
     /// is made by the load that parks the config, against the spec that
