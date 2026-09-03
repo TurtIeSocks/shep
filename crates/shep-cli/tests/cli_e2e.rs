@@ -6926,15 +6926,17 @@ fn a_load_that_refused_one_app_exits_non_zero_and_still_reports_the_other() {
     // `steady` carries the field that lands, `stocky` the one that cannot.
     // `max_restarts` is read when a sheep exits, so it is in force the
     // moment it reaches the stored spec and reports as APPLIED.
-    let body = |extra: &str| {
+    // One closure for both writes, so the only difference between the run
+    // that registers and the run that loads is the two lines under test.
+    let body = |steady: &str, stocky: &str| {
         format!(
-            "[[app]]\nname = \"steady\"\nscript = '{}'\n{extra}\n\
-             [[app]]\nname = \"stocky\"\nscript = '{}'\n",
+            "[[app]]\nname = \"steady\"\nscript = '{}'\n{steady}\
+             [[app]]\nname = \"stocky\"\nscript = '{}'\n{stocky}",
             script.display(),
             script.display(),
         )
     };
-    let flockfile = write_flockfile(&dir, &body(""));
+    let flockfile = write_flockfile(&dir, &body("", ""));
     let mut guard = DaemonGuard::default();
 
     let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
@@ -6943,15 +6945,7 @@ fn a_load_that_refused_one_app_exits_non_zero_and_still_reports_the_other() {
     poll_flock(home, |info| info["status"] == "online");
 
     // One field each: one the daemon applies, one it refuses.
-    write_flockfile(
-        &dir,
-        &format!(
-            "[[app]]\nname = \"steady\"\nscript = '{}'\nmax_restarts = 9\n\
-             [[app]]\nname = \"stocky\"\nscript = '{}'\ninstances = 2\n",
-            script.display(),
-            script.display(),
-        ),
-    );
+    write_flockfile(&dir, &body("max_restarts = 9\n", "instances = 2\n"));
     let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
 
     let stderr = String::from_utf8_lossy(&again.stderr);
