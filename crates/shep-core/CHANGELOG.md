@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Request::Add` and `Response::Added`: register apps as flock members
+  without starting any of them. Everything `Start` does to membership and
+  none of what it does to processes, so a Flockfile shipping empty `env`
+  keys can be registered and configured before anything spawns against
+  them. `PROTOCOL_VERSION` stays at 2, following the six additive
+  precedents below it: no existing variant moved, was renamed, or was
+  retyped. The consequence is the same one `Request::ApplyConfig` carried:
+  a CLI from this commit passes an older daemon's handshake, sends `add`,
+  and that daemon ends the connection on an envelope it cannot decode, so
+  the operator sees a dead client rather than a named version refusal.
+  `shep daemon reload` after upgrading is the fix.
+
 ## [0.1.30] - 2026-09-03
 
 ### Added

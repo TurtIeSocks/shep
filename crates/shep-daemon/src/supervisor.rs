@@ -3150,8 +3150,11 @@ impl<R: ProcessRunner> Actor<R> {
             }
             // Not rejected while `shutting_down`, unlike Start: this
             // spawns nothing, so it can leave no child outside the shutdown
-            // aggregation. It is still pointless during a shutdown, and
-            // nothing calls it there.
+            // aggregation. `Request::Add` can now reach it at any moment a
+            // connection is still being served, a shutdown included, and that
+            // is safe for the same reason rather than for a new one: the
+            // worst it can do is register a member of a flock that is on its
+            // way out.
             Command::RegisterAtRest { apps, reply } => {
                 let registered = apps.iter().map(|app| self.register_at_rest(app)).collect();
                 let _ = reply.send(Ok(registered));
