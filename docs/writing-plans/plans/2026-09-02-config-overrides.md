@@ -580,16 +580,26 @@ pub enum ResetDepth {
     /// because a Flockfile arrives from the app's own repository.
     #[default]
     None,
-    /// Put non-`env` settings back to the template, keeping `env` and keeping
-    /// fields added since. `env` is operator-supplied data while the rest is
-    /// operator-tuned policy: resetting policy is recoverable, resetting data
-    /// takes the app's database away.
+    /// Put non-`env` settings back to the template, keeping `env`. `env` is
+    /// operator-supplied data while the rest is operator-tuned policy:
+    /// resetting policy is recoverable, resetting data takes the app's
+    /// database away.
     Settings,
-    /// Put everything back to the template, `env` included, and drop fields
-    /// added since.
+    /// Put everything back to the template, `env` included.
     All,
 }
 ```
+
+**What shipped is wider than the design spec's wording, and the difference is
+the maintainer's to settle.** Spec section 3 says `--reset` keeps
+operator-added keys; `merge_declared` puts EVERY non-`env` key in scope at
+this depth, undeclared ones included, and spends the override on each. An
+undeclared key therefore goes back to the value a fresh start of this same
+file would have registered, which for a key nothing supplies is the compiled
+default, and no non-`env` override survives a `--reset`. Only `env` survives
+it, and `All` removes that too. This text describes the code, because the code
+is what ships; whether the code should narrow to the spec is an open question,
+not something a doc edit decides.
 
 Register the module in `crates/shep-core/src/config/mod.rs` and re-export `ApplyGroup`, `apply_group` and `ResetDepth`.
 
@@ -644,7 +654,7 @@ if group.cron.as_ref().is_none_or(JoinHandle::is_finished) {
 
 and the same for watch. `a_replacement_arming_before_the_drainee_disarms_keeps_the_groups_own_tasks` pins that by task identity, so it is deliberate. `disarm` is no escape: it aborts the group only when the id leaving was the last armed member.
 
-So five Live fields (`watch`, `ignore_watch`, `watch_delay`, `watch_options`, `cron_restart`, `cron_timezone`) need a method that replaces the group tasks unconditionally, acting on the name rather than one id.
+So six Live fields (`watch`, `ignore_watch`, `watch_delay`, `watch_options`, `cron_restart`, `cron_timezone`) need a method that replaces the group tasks unconditionally, acting on the name rather than one id.
 
 - [ ] **Step 1: Read `arm` and `disarm` in full**
 
@@ -725,7 +735,7 @@ Expected: FAIL, the method does not exist.
     /// that a reload's replacement instance arming before the drainee disarms
     /// does not tear down a watcher the drainee still needs. That is right for
     /// the transition it was written for and wrong for a config change: the
-    /// five group-scoped fields (`watch`, `ignore_watch`, `watch_delay`,
+    /// four group-scoped fields (`watch`, `ignore_watch`, `watch_delay`,
     /// `watch_options`) and the two cron ones are read when the task is built,
     /// so a task that survives keeps the old values forever.
     ///
@@ -1149,15 +1159,17 @@ async fn an_app_absent_from_the_file_is_left_running() {
     // no Applied entry claims to have touched it.
 }
 
-/// fails if the reset depths do not differ. --reset restores settings and
-/// leaves env; --reset-all restores everything and drops operator-added keys.
+/// fails if the reset depths do not differ. --reset restores every non-env
+/// setting, declared or not, and leaves env; --reset-all restores env too and
+/// drops the override record.
 #[tokio::test]
 async fn reset_depths_differ_on_env_and_on_extras() {
     // Establish name, script, max_restarts from a file.
     // Override max_restarts, add an env key nobody declared, add a
     // never-declared field.
     // ResetDepth::Settings: max_restarts back to the file's, the env key
-    // survives, the added field survives.
+    // survives, the never-declared field goes back to what a fresh start off
+    // this file would give it and its override is spent.
     // ResetDepth::All: env key gone, added field gone.
 }
 ```
@@ -1471,12 +1483,12 @@ Expected: FAIL, the flags do not exist.
 On `StartArgs`, with `conflicts_with`:
 
 ```rust
-    /// Put process settings back to what the Flockfile says, keeping env and
-    /// any fields added since.
+    /// Put process settings back to what the Flockfile says, keeping env.
+    /// Every setting goes back, declared or not.
     #[arg(long, conflicts_with = "reset_all")]
     pub reset: bool,
     /// Put everything back to what the Flockfile says, including env, and
-    /// drop fields added since.
+    /// drop the override record.
     #[arg(long = "reset-all")]
     pub reset_all: bool,
 ```
