@@ -1206,9 +1206,13 @@ impl Render for DogRows {
         // Rides in the JSON only for the same shape-consistency reason as
         // the rest of this list.
         "instance",
-        // No CFG column here: task 12's field is a sheep concept -- a dog
-        // is built-in or adopted, never loaded from a Flockfile a config
-        // load can park or override. Both fields ride the JSON for the same
+        // No CFG column here: a dog is built-in or adopted, and
+        // `Actor::apply_one` refuses an entry that is one, so a config load
+        // can neither park nor override a dog and both fields stay empty.
+        // That refusal is what makes the sentence true. Before it, a
+        // Flockfile naming `metrics` really did replace the built-in dog's
+        // binary on the next restart, and this table was the surface the
+        // drift would have shown on. Both fields ride the JSON for the same
         // shape-consistency reason as the rest of this list.
         "pending",
         "overridden",

@@ -5756,6 +5756,20 @@ impl<R: ProcessRunner> Actor<R> {
                 "{name} is not registered; `shep start` it before a config can be applied to it"
             ));
         };
+        // Mirroring `handle_scale`'s guard, and for a sharper reason. A dog
+        // runs at the daemon's own trust level and its binary is what `shep
+        // adopt` vetted; a Flockfile that happened to name `metrics` merged
+        // its own `script` onto the built-in dog and the next restart ran it,
+        // while `shep dogs` still said `built-in`. Nothing else could stop
+        // it: a dog is never in the override store, so every key a file
+        // declares for one is unestablished forever and the additive rule
+        // that protects a sheep can never engage.
+        if slot.entry.dog.is_some() {
+            return refuse(format!(
+                "{name} is a dog, and a dog's config comes from `shep adopt` rather than \
+                 from a Flockfile"
+            ));
+        }
         // Two configs, and the difference between them is this function's
         // whole subject. `running` is what the child was spawned from;
         // `intended` is what the app is meant to be, which is an earlier
@@ -22168,6 +22182,53 @@ mod tests {
         assert!(
             reply.iter().all(|applied| applied.name != "worker"),
             "a load must not claim to have touched an app the file never named: {reply:?}"
+        );
+    }
+
+    /// fails if a Flockfile can reach a dog. A dog runs at the daemon's own
+    /// trust level, so a file that names one and carries a `script` was a way
+    /// to replace an adopted binary without adopting anything, and `shep
+    /// dogs` went on reporting the dog it used to be.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_naming_a_dog_is_refused_rather_than_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("metrics", |_| {})]);
+        actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registered one slot")
+            .entry
+            .dog = Some(DogSource::BuiltIn);
+
+        let mut file = AppConfig::minimal("metrics", "/opt/evil");
+        file.max_restarts = 42;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            reply[0].refused.as_deref(),
+            Some(
+                "metrics is a dog, and a dog's config comes from `shep adopt` rather than \
+                 from a Flockfile"
+            ),
+            "{reply:?}"
+        );
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(entry.spec.config().script, "./srv");
+        assert_eq!(
+            entry.spec.config().max_restarts,
+            AppConfig::default().max_restarts
+        );
+        assert!(entry.pending.is_none(), "a refused app parks nothing");
+        assert!(
+            shep_core::overrides::get(&actor.paths.overrides, "metrics")
+                .unwrap()
+                .is_none(),
+            "a refused app establishes nothing"
         );
     }
 
