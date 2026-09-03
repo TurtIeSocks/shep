@@ -54,7 +54,7 @@ fi
 # subcommands, so a new verb fails a test rather than going quietly
 # undocumented. `help` is clap's own and is the one deliberate omission.
 VERBS=(
-  start serve stop restart reload delete stock flock dogs enable disable
+  start add serve stop restart reload delete stock flock dogs enable disable
   adopt rehome describe trigger signal whisper fold bleats lookout whistle
   reopen flush barks set get unset ping kill save muster runtime dev
   import startup unstartup completions init style welcome

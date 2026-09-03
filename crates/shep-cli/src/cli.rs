@@ -28,7 +28,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Run things",
         &[
-            "start", "serve", "stop", "restart", "reload", "delete", "stock",
+            "start", "add", "serve", "stop", "restart", "reload", "delete", "stock",
         ],
     ),
     (
@@ -71,7 +71,7 @@ Getting started
   shep save               remember this flock across reboots
   shep startup            bring it back after a reboot
 
-Run things       start serve stop restart reload delete stock
+Run things       start add serve stop restart reload delete stock
 See what's up    flock describe bleats lookout fold barks
 Survive reboots  save muster startup unstartup
 Talk to a sheep  trigger signal whisper
@@ -205,6 +205,22 @@ pub enum Init {
 pub enum Commands {
     /// Start a sheep from a script, a Flockfile, or stdin.
     Start(StartArgs),
+    /// Register a sheep without starting it.
+    ///
+    /// The same targets `shep start` takes and the same load path. The one
+    /// difference is that nothing spawns: the app lands registered and
+    /// stopped, and `shep start <name>` is what brings it up.
+    ///
+    /// It is here for the Flockfile a project commits with its secrets left
+    /// blank — `env = { DB_HOST = "", DB_PASSWORD = "" }`, the
+    /// `.env.example` convention. Starting that file spawns a process
+    /// against an empty database URL, which crashes, spends its restart
+    /// budget, and has to be stopped before anyone can configure it. This
+    /// registers it instead, so the order becomes register, fill in, start.
+    ///
+    /// An app the flock already has is merged into and left exactly as it
+    /// is, running or not.
+    Add(StartArgs),
     /// Serve a directory over plain HTTP, as a managed sheep.
     ///
     /// Registers a sheep whose command line is this invocation, canonicalized
@@ -589,7 +605,13 @@ pub enum Commands {
     Schema,
 }
 
-/// Arguments to `shep start`.
+/// Arguments to `shep start` and `shep add`.
+///
+/// One struct for both, the precedent [`SelectorArgs`] already sets for
+/// `stop`/`restart`/`reload`/`delete`: the two verbs take the same targets,
+/// resolve them the same way, and differ only in whether anything is spawned
+/// at the end. A second struct would be the same eight fields with the same
+/// meanings, and a flag added to one of them and not the other.
 #[derive(Debug, clap::Args)]
 pub struct StartArgs {
     /// Selectors, script paths, Flockfiles, or `-` to read Flockfile JSON
@@ -610,14 +632,17 @@ pub struct StartArgs {
     /// everywhere else: `all`, `/regex/`, and glob patterns such as
     /// `web-*`. They reach only sheep the flock already has, since there is
     /// nothing to register. A sheep already running is reported and left
-    /// alone; `restart` is the verb that replaces one.
+    /// alone; `restart` is the verb that replaces one, and `add` never
+    /// starts anything in the first place.
     ///
-    /// Omit the targets to start the Flockfile in the current directory, or,
-    /// when there is none, to bring a shepherd up with nothing running yet.
+    /// Omit the targets to read the Flockfile in the current directory. With
+    /// no Flockfile there, `shep start` brings a shepherd up with nothing
+    /// running yet, and `shep add` has nothing it could register.
     ///
-    /// Several are started in turn, not atomically: if the second fails the
-    /// first is already up, and the exit code is the first failure. `--name`
-    /// is refused with more than one, since a name is unique to one sheep.
+    /// Several are handled in turn, not atomically: if the second fails the
+    /// first has already landed, and the exit code is the first failure.
+    /// `--name` is refused with more than one, since a name is unique to one
+    /// sheep.
     #[arg(num_args = 0..)]
     pub targets: Vec<String>,
     /// Name for this sheep (script form only)

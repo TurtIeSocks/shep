@@ -9062,3 +9062,140 @@ fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {
 
     graceful_kill(home);
 }
+
+/// `shep add` registers a sheep, starts nothing, and a later `shep start`
+/// brings that same sheep up.
+///
+/// The whole sequence the verb exists for. A Flockfile is a template, and one
+/// shipping `env = { DB_HOST = "", DB_PASSWORD = "" }` is the endorsed
+/// pattern -- the `.env.example` convention. Without `add`, the first thing an
+/// operator does with such a file is `shep start Flockfile.toml`, which spawns
+/// a process against an empty database URL: it crashes, `autorestart` spends
+/// the restart budget, and the app has to be stopped before it can be
+/// configured. With `add` the order is register, fill in, start.
+///
+/// The listing is read ONCE and not polled, deliberately. `Request::Add` is
+/// answered after the actor has registered, exactly as `Request::Start` is
+/// answered after the actor has spawned, so a build that routed `add` through
+/// the start path reports `online` on this very first read. Polling for
+/// `stopped` would spin out the deadline and reach the same assertion a lot
+/// later; a single read fails immediately and names the same cause.
+///
+/// What a broken implementation this catches: `add` wired to
+/// `Request::Start` (the row is `online`, and on unix the script's pid file
+/// exists); `add` registering nothing at all (the row is missing, and the
+/// `start` below cannot find it); the app registered under a status a later
+/// `start` cannot resume from (the final poll never reaches `online`).
+#[test]
+fn add_registers_a_stopped_sheep_that_a_later_start_brings_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"pending\"\nscript = '{}'\n",
+            script.display(),
+        ),
+    );
+    let mut guard = DaemonGuard::default();
+
+    let added = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("add")
+        .arg(&flockfile)
+        .output()
+        .unwrap();
+    guard.adopt_home(home);
+    assert_success(&added);
+
+    let envelope: serde_json::Value = serde_json::from_slice(&added.stdout)
+        .unwrap_or_else(|e| panic!("add stdout was not JSON: {e}"));
+    assert_eq!(
+        envelope["command"], "add",
+        "the envelope names the verb the operator typed: {envelope}"
+    );
+    assert_eq!(
+        envelope["data"][0]["status"], "stopped",
+        "registered, not started: {envelope}"
+    );
+    assert!(
+        envelope["data"][0]["pid"].is_null(),
+        "a sheep that was never spawned has no pid: {envelope}"
+    );
+
+    // The strongest form of "nothing spawned" available here: the script
+    // itself appends its pid to this file on every run, so an empty one is
+    // the child's own evidence that it never executed. Unix only, because
+    // `record_pid_line` writes nothing on Windows and says why.
+    #[cfg(unix)]
+    assert!(
+        !dir.path().join(FIXTURE_PIDS).exists(),
+        "the script never ran, so it never recorded a pid"
+    );
+
+    // Registered rather than merely reported: a row `shep flock` cannot see
+    // is not a flock member, and `shep start pending` below would have
+    // nothing to name.
+    let listed = shep(home)
+        .arg("--format")
+        .arg("json")
+        .arg("flock")
+        .output()
+        .unwrap();
+    assert_success(&listed);
+    let flock: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(flock["data"][0]["name"], "pending", "it is in the flock");
+    assert_eq!(flock["data"][0]["status"], "stopped", "and still at rest");
+
+    // By NAME, which is the half of the sequence that proves the
+    // registration was the real thing: a name reads no file, so this can only
+    // reach a sheep the flock already holds.
+    let started = shep(home).arg("start").arg("pending").output().unwrap();
+    assert_success(&started);
+    let running = poll_flock(home, |info| info["status"] == "online");
+    assert_eq!(
+        running["status"], "online",
+        "the registered sheep came up: {running}"
+    );
+
+    graceful_kill(home);
+}
+
+/// `shep add` with no target and no Flockfile in the current directory is a
+/// usage error, where bare `shep start` brings a shepherd up.
+///
+/// The one thing the two verbs disagree about. `start`'s empty-directory case
+/// means "give me a shepherd with nothing running yet", which is the only way
+/// to get one without also starting a process. `add` cannot mean that: a
+/// shepherd holding nothing is what it would produce either way, so the
+/// operator has named something that is not there.
+///
+/// The temporary directory is the working directory as well as the home, so
+/// there is genuinely no Flockfile to discover.
+///
+/// What a broken implementation this catches: `add` falling through to
+/// `start_bare_shepherd` (exit 0, and a daemon left running behind it).
+#[test]
+fn add_with_nothing_to_add_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    let output = shep(home).arg("add").current_dir(home).output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "clap's own code for bad arguments: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no target and no Flockfile"),
+        "the refusal says what was missing: {stderr}"
+    );
+    assert!(
+        !home.join("run").join("shep.sock").exists(),
+        "and no shepherd was started to answer a request nobody made"
+    );
+}
