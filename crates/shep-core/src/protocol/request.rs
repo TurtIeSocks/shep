@@ -277,7 +277,7 @@ pub enum Request {
     ///
     /// Idempotent by name, like the muster restore that shares its supervisor
     /// path: an app the flock already has is answered as it stands, running
-    /// or not, and nothing about it changes. Config is a separate request —
+    /// or not, and nothing about it changes. Config is a separate request:
     /// [`Self::ApplyConfig`] is what merges a template into an app the flock
     /// already has, and `shep add` sends both.
     ///
@@ -1520,7 +1520,7 @@ pub enum Response {
     ///
     /// A row here can still be `Online`. `Add` is idempotent by name, so an
     /// app the flock already had is answered as it stands rather than
-    /// replaced — the reply describes the membership the request leaves
+    /// replaced. The reply describes the membership the request leaves
     /// behind, not work it did.
     Added(Vec<ProcessInfo>),
     /// Answer to `ConfigDrift`: one entry per app that is registered under a

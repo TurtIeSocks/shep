@@ -194,6 +194,15 @@ script = "./server"`}</CodeBlock>
       whole story, including which settings change under a running process
       and which wait for the next spawn.
     </p>
+    <p>
+      A template that ships its secrets blank, <code>env = &#123; DB_HOST =
+      "", DB_PASSWORD = "" &#125;</code>, has one more problem:
+      <code>shep start</code> would spawn the app against those blanks and
+      leave it crash-looping. <code>shep add Flockfile.toml</code> takes the
+      same targets and the same load and spawns nothing, so the app lands
+      registered and stopped, and <code>shep start web</code> brings it up
+      once it has real values.
+    </p>
     <p class="fine">
       Naming a sheep reads no Flockfile at all. <code>shep start web</code>
       starts the sheep called <code>web</code> from the config the shepherd

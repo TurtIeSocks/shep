@@ -52,6 +52,7 @@ export interface CliReferenceData {
 // you get when the groups and this list disagree.
 const VERB_NAMES = [
   "start",
+  "add",
   "serve",
   "stop",
   "restart",

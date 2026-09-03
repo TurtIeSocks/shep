@@ -462,6 +462,25 @@ not guessed from field names: `kill_signal` is NextSpawn rather than Live,
 and `shutdown_with_message` needs a respawn. `web/src/pages/docs/overrides.astro`
 is the operator-facing account.
 
+**`shep add` is decision 7 of that same spec, and it is the verb that makes
+the template model usable.** It takes the targets `shep start` takes, runs the
+same load, and spawns nothing: the app lands registered and `Stopped`, its
+declared keys established, and `shep start <name>` brings it up. Without it
+the first thing an operator does with a template shipping `env = { DB_HOST =
+"", DB_PASSWORD = "" }` is start it, which spawns against an empty database
+URL, crash-loops through the restart budget, and has to be stopped before it
+can be configured. `start` and `add` are ONE code path (`lifecycle::load`,
+carrying a `Load`), because a document that registered differently depending
+on which verb read it is one nobody could reason about. Four places consult
+it: which request a fresh app goes out as, whether an app the flock already
+has is resumed after the merge, what a name target that resolves to a
+registered sheep does, and the notice code. `Request::Add` /
+`Response::Added` are additive, so `PROTOCOL_VERSION` stays at 2 and the
+paragraph below applies to `shep add` word for word. **The fill-in half of
+"register, fill in, start" does not exist yet**: an established `env` key
+today moves only through the file plus `--reset-all`, and editing one in
+place is a later slice (spec decisions 10 and 11).
+
 **Restart the shepherd after upgrading to it.** `PROTOCOL_VERSION` did NOT
 move (the variant is additive, and six precedents in shep-core's changelog
 agree), but the consequence is sharper than those precedents had: a CLI from
@@ -471,10 +490,10 @@ decode, so `shep start <Flockfile>` fails on a dead client rather than on a
 named version refusal. `shep daemon reload` is the whole fix, and
 `getting-started.astro` says so where an operator reads.
 
-**Verb count: 40 generated, 41 listed, and the difference is `help`.**
+**Verb count: 41 generated, 42 listed, and the difference is `help`.**
 `./web/scripts/generate-cli-reference.sh` prints its own number every time it
-runs, and its `VERBS` array holds 40 because it does not generate a page for
-`help`. `shep --help`'s grouped listing shows 41 because it does. Both are
+runs, and its `VERBS` array holds 41 because it does not generate a page for
+`help`. `shep --help`'s grouped listing shows 42 because it does. Both are
 right about different questions, so neither is a bug to fix; check which one is
 being asked before changing either. README.md deliberately quotes the grouping
 without a count, so there is no third number to keep in step.

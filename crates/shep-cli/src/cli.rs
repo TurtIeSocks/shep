@@ -212,7 +212,7 @@ pub enum Commands {
     /// stopped, and `shep start <name>` is what brings it up.
     ///
     /// It is here for the Flockfile a project commits with its secrets left
-    /// blank — `env = { DB_HOST = "", DB_PASSWORD = "" }`, the
+    /// blank: `env = { DB_HOST = "", DB_PASSWORD = "" }`, the
     /// `.env.example` convention. Starting that file spawns a process
     /// against an empty database URL, which crashes, spends its restart
     /// budget, and has to be stopped before anyone can configure it. This
