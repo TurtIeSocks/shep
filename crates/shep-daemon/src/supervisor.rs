@@ -5538,22 +5538,42 @@ impl<R: ProcessRunner> Actor<R> {
         // parked for them. Without this, `shep stock web 5` during a parking
         // window brings up two instances on superseded config with nothing
         // recording that a restart is owed, and the next load sees no drift
-        // against them and reports nothing to do. Copied verbatim, so every
-        // instance of the name is owed the same config; the count inside it
-        // is an earlier load's and is left alone for the same reason its
-        // `pending` is.
+        // against them and reports nothing to do.
+        //
+        // One field of it is not an earlier load's to keep: the COUNT. Copied
+        // verbatim, every slot carried `pending.instances = 1` against a spec
+        // of 5, so `drifted_fields` reported `instances` pending on every row
+        // forever, `shep describe` told the operator a reload would promote
+        // it, and the reload that promoted rewrote the count back down --
+        // over a number `registry.record` had already put in the muster roll.
+        // `with_count` keeps every slot agreeing AND correct. It re-normalizes,
+        // so it can refuse (a shared explicit `out_file` at the new count);
+        // the verbatim copy is the fallback, since an instance that owes a
+        // restart must go on owing it.
         let owed = self.sheep.get(&slots[0].1).and_then(|slot| {
             let parked = slot.entry.pending.clone()?;
+            let parked = with_count(&parked, achieved).unwrap_or(parked);
             Some((parked, slot.entry.pending_reidentifies))
         });
         for id in survivors.iter().chain(orphaned_by_failed_spawn.iter()) {
             if let Some(slot) = self.sheep.get_mut(id) {
                 slot.entry.spec = stored.clone();
-                if slot.entry.pending.is_none()
-                    && let Some((parked, reidentifies)) = &owed
-                {
-                    slot.entry.pending = Some(parked.clone());
-                    slot.entry.pending_reidentifies = *reidentifies;
+                match &mut slot.entry.pending {
+                    // A slot that was already owed a config keeps it, with
+                    // the count brought forward for the same reason the copy
+                    // above carries one: a parked count of 2 against a spec
+                    // of 4 is drift that never clears.
+                    Some(parked) => {
+                        if let Some(recounted) = with_count(parked, achieved) {
+                            *parked = recounted;
+                        }
+                    }
+                    None => {
+                        if let Some((parked, reidentifies)) = &owed {
+                            slot.entry.pending = Some(parked.clone());
+                            slot.entry.pending_reidentifies = *reidentifies;
+                        }
+                    }
                 }
             }
         }
@@ -24017,6 +24037,57 @@ mod tests {
             assert!(
                 actor.sheep[&id].entry.spec.config().env.is_empty(),
                 "and its own spec still describes what it was actually spawned from"
+            );
+        }
+    }
+
+    /// fails if a scale leaves a stale count inside the config it carries
+    /// onto the slots it created. The parked config was copied verbatim, so
+    /// after `shep stock web 4` during a parking window every slot held
+    /// `pending.instances = 2` against a spec of 4: `drifted_fields` reported
+    /// `instances` pending on every row forever, `shep describe` told the
+    /// operator a reload would promote it, and the reload that promoted
+    /// rewrote the count back down over a number the muster roll already had.
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_updates_the_count_inside_the_config_it_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 2;
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "instances", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let (reply, mut answer) = oneshot::channel();
+        actor.handle_scale("web", 4, reply);
+        answer
+            .try_recv()
+            .expect("handle_scale answers before it returns")
+            .expect("the fixture has scripts enough to scale to four");
+
+        for id in 0..4 {
+            let entry = &actor.sheep[&id].entry;
+            assert_eq!(
+                entry
+                    .pending
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("instance {id} must be owed the parked config"))
+                    .config()
+                    .instances,
+                4,
+                "the count a scale achieved, not the one an earlier load parked"
+            );
+            assert!(
+                !to_info(entry, &actor.smits)
+                    .pending
+                    .unwrap_or_default()
+                    .contains(&"instances".to_string()),
+                "a reload owes this instance nothing about the count"
             );
         }
     }
