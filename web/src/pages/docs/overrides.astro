@@ -4,8 +4,14 @@
  * for ApplyGroup and ResetDepth, crates/shep-daemon/src/supervisor.rs for
  * merge_declared and handle_apply_config, `shep start --help`). Every
  * transcript below was run for real against target/release/shep on
- * 2026-09-02, one sheep in a throwaway $SHEP_HOME, and re-run there the same
- * day once a fresh start started establishing the keys its file declared.
+ * 2026-09-02, one sheep in a throwaway $SHEP_HOME, and re-run there twice the
+ * same day: once when a fresh start began establishing the keys its file
+ * declared, and again when a review found the reset-scales sample still
+ * carrying a `cwd` clause the fixed binary does not print. The `cwd` the
+ * second load adds points at a DIFFERENT directory, with the script beside
+ * it so the promotion can spawn. A `cwd` equal to where the app already runs
+ * parks nothing, and on macOS a /tmp path and its /private/tmp resolution
+ * differ enough to park one for a reason no reader could reproduce.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
@@ -22,62 +28,69 @@ DB_PASSWORD = ""`;
 
 const firstLoad = `$ shep start Flockfile.toml
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM    UPTIME  FOLD  SMIT
-0   web   online  29182  0         -     -    -    32.0K  0s      -     -`;
+0   web   online  96289  0         -     -    -    32.0K  0s      -     -`;
 
 const secondLoad = `$ shep start Flockfile.toml
 notice[start]: web: applied max_memory; cwd waiting on the next spawn (\`shep reload web\` promotes them)
 notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
-0   web   online  29182  0         -     !1   -    1.2M  4s      -     -`;
+0   web   online  96289  0         -     !1   -    1.2M  4s      -     -`;
 
 const describePending = `$ shep describe web
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
-0   web   online  29182  0         -     !1   -    1.2M  4s      -     -
+0   web   online  96289  0         -     !1   -    1.2M  4s      -     -
 
 Pending for web (id 0), parked by a load; \`shep reload web\` promotes it:
   cwd`;
 
 const promote = `$ shep reload web
 ID  NAME   STATUS    PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
-0   web:0  stopping  29182  0         -     !1   -    1.2M  4s      -     -
-1   web:0  starting  29261  0         -     -    -    -     0s      -     -
+0   web:0  stopping  96289  0         -     !1   -    1.2M  4s      -     -
+1   web:0  starting  96368  0         -     -    -    -     0s      -     -
 
 $ shep flock
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
-1   web   online  29261  0         -     -    -    1.2M  3s      -     -`;
+1   web   online  96368  0         -     -    -    1.2M  3s      -     -`;
 
 const established = `$ shep start Flockfile.toml
 notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
-1   web   online  29261  0         -     -    -    1.2M  3s      -     -
+1   web   online  96368  0         -     -    -    1.2M  3s      -     -
 
 $ shep start Flockfile.toml --reset
 notice[start]: web: applied max_memory
 notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
-1   web   online  29261  0         -     -    -    1.2M  3s      -     -`;
+1   web   online  96368  0         -     -    -    1.2M  3s      -     -`;
 
 const envHeld = `$ shep start Flockfile.toml
 notice[start]: web is already online; \`shep restart web\` replaces it.
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+1   web   online  96368  0         -     -    -    1.2M  3s      -     -
 
 $ shep start Flockfile.toml --reset-all
 notice[start]: web: env waiting on the next spawn (\`shep reload web\` promotes them)
-notice[start]: web is already online; \`shep restart web\` replaces it.`;
+notice[start]: web is already online; \`shep restart web\` replaces it.
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+1   web   online  96368  0         -     !1   -    1.2M  3s      -     -`;
 
 const resetScales = `$ shep flock
 ID  NAME   STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
-0   web:0  online  29451  0         -     -    -    1.2M  2s      -     -
-1   web:1  online  29473  0         -     -    -    1.2M  2s      -     -
-2   web:2  online  29474  0         -     -    -    1.2M  2s      -     -
-3   web:3  online  29475  0         -     -    -    1.2M  2s      -     -
+0   web:0  online  96556  0         -     -    -    1.2M  2s      -     -
+1   web:1  online  96578  0         -     -    -    1.2M  2s      -     -
+2   web:2  online  96579  0         -     -    -    1.2M  2s      -     -
+3   web:3  online  96580  0         -     -    -    1.2M  2s      -     -
 
 $ shep start Flockfile.toml --reset
-notice[start]: web: applied instances; cwd waiting on the next spawn (\`shep reload web\` promotes them)
+notice[start]: web: applied instances
 notice[start]: web are already running; \`shep restart web\` replaces them.
+ID  NAME   STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0  online  96556  0         -     -    -    1.2M  2s      -     -
+3   web:3  online  96580  0         -     -    -    0B    2s      -     -
 
 $ shep flock
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
-0   web   online  29451  0         -     !1   -    1.2M  5s      -     -`;
+0   web   online  96556  0         -     -    -    1.2M  5s      -     -`;
 
 const store = `$ cat $SHEP_HOME/overrides.json
 {
@@ -176,8 +189,8 @@ const store = `$ cat $SHEP_HOME/overrides.json
       Nothing to report on a first load: the app was not in the flock, so
       <code>shep start</code> registered and started it, and every key in the
       file became one somebody has now spoken for. Add a
-      <code>max_memory</code> and a <code>cwd</code>, and load the same file
-      again:
+      <code>max_memory</code> and a <code>cwd</code> pointing somewhere else,
+      and load the same file again:
     </p>
     <CodeBlock>{secondLoad}</CodeBlock>
     <p>
@@ -276,6 +289,12 @@ const store = `$ cat $SHEP_HOME/overrides.json
       left. Nothing there is a bug and nothing was silent: the report names
       <code>instances</code> among what it applied. It is still the sharpest
       edge on this page, because the file that caused it never said the word.
+    </p>
+    <p class="fine">
+      The table <code>start</code> prints is a snapshot taken while the
+      departures are still leaving, which is why it can still show a row on
+      its way out with <code>0B</code> against it. The
+      <code>shep flock</code> underneath is the settled count.
     </p>
 
     <h2>Empty values are the point</h2>
