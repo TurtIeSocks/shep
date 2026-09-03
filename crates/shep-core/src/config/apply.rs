@@ -139,13 +139,15 @@ pub enum ResetDepth {
     /// because a Flockfile arrives from the app's own repository.
     #[default]
     None,
-    /// Put non-`env` settings back to the template, keeping `env` and keeping
-    /// fields added since. `env` is operator-supplied data while the rest is
-    /// operator-tuned policy: resetting policy is recoverable, resetting data
-    /// takes the app's database away.
+    /// Put non-`env` settings back to the template, `env` kept. Every
+    /// setting goes back, declared or not: a key the template is silent
+    /// about goes to the value a fresh start off that template would give
+    /// it. `env` is operator-supplied data while the rest is operator-tuned
+    /// policy: resetting policy is recoverable, resetting data takes the
+    /// app's database away.
     Settings,
-    /// Put everything back to the template, `env` included, and drop fields
-    /// added since.
+    /// Put everything back to the template, `env` included, and drop the
+    /// override record.
     All,
 }
 

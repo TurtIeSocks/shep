@@ -649,18 +649,19 @@ pub struct StartArgs {
     /// `server.js` as a script, which is what it has always meant.
     #[arg(long)]
     pub flockfile: bool,
-    /// Put process settings back to what the Flockfile says, keeping env and
-    /// any fields added since.
+    /// Put process settings back to what the Flockfile says, keeping env.
     ///
-    /// Without this flag a load is additive: it appends keys nobody has set
-    /// and overwrites nothing. `env` is operator-supplied data and survives
-    /// even this reset; everything else is operator-tuned policy, and
-    /// resetting policy is recoverable. Refused when the target is a sheep
+    /// Every setting goes back, whether the file declares it or not: a key
+    /// the file is silent about goes to the value a fresh `shep start` off
+    /// that same file would give it. Without this flag a load is additive:
+    /// it appends keys nobody has set and overwrites nothing. `env` is
+    /// operator-supplied data and survives even this reset; everything else
+    /// is operator-tuned policy, and resetting policy is recoverable. Refused when the target is a sheep
     /// name rather than a Flockfile, since a name reads no file to reset to.
     #[arg(long, conflicts_with = "reset_all")]
     pub reset: bool,
     /// Put everything back to what the Flockfile says, including env, and
-    /// drop fields added since.
+    /// drop the override record.
     ///
     /// The wider of the two resets: `--reset` keeps `env` because it is
     /// operator-supplied data, not policy, and losing it takes the app's

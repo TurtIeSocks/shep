@@ -2759,13 +2759,11 @@ const EXTRAS_FIELDS: &[&str] = &[
 /// Merges what a Flockfile declares into what a sheep is running, returning
 /// the merged config and the override record to write back.
 ///
-/// Three rules, per field: a key the file declares takes the file's value and
-/// gives up its override; a key the file does not declare keeps its override;
-/// anything else falls back to the built-in default. `reset` decides which
-/// keys the three rules run for at all, and that is the whole of the
-/// difference between the depths:
+/// One rule, per field: a key in scope takes the file's value and gives up
+/// its override. `reset` decides which keys are in scope at all, and that is
+/// the whole of the difference between the depths:
 ///
-/// - [`ResetDepth::None`] runs them only for a key the file declares that
+/// - [`ResetDepth::None`] puts in scope only a key the file declares that
 ///   nobody has established yet, so a load can APPEND and can never
 ///   overwrite. Every other key keeps exactly what it has, defaults
 ///   included: "overwrite nothing" is the depth's own promise, and a key
@@ -2773,9 +2771,9 @@ const EXTRAS_FIELDS: &[&str] = &[
 ///   `instances` is excluded from this depth however unestablished it is:
 ///   see the `in_scope` arm below for why appending a count is not the same
 ///   kind of act as appending a value.
-/// - [`ResetDepth::Settings`] runs them for every key but `env`.
-/// - [`ResetDepth::All`] runs them for every key, `env` included, and ignores
-///   the overrides entirely.
+/// - [`ResetDepth::Settings`] puts every key but `env` in scope.
+/// - [`ResetDepth::All`] puts every key in scope, `env` included, and drops
+///   the whole override record afterwards.
 ///
 /// `env` merges one level deeper than the rest, because it is a table rather
 /// than a value: under `None` an env key the file declares and nobody
@@ -2840,18 +2838,30 @@ fn merge_declared(
         if !in_scope {
             continue;
         }
-        let value = if incoming.declared.contains(key) {
-            // The file speaks for this key now, so the operator's override of
-            // it is spent rather than kept to be re-applied on the next load.
-            next.fields.remove(key);
+        // The file's value, whether or not the file declared the key, and
+        // that is the whole of what a reset means: become the template as it
+        // was loaded. `incoming.config` is the app the CLI resolved, so an
+        // undeclared key reads back the value a fresh `shep start` of this
+        // same file would have registered -- the `cwd` defaulted to the
+        // Flockfile's own directory, the fold from `--fold`, the interpreter
+        // from `[interpreters]`. Resolving it to the COMPILED default instead
+        // is what made `shep start Flockfile.toml --reset` against an
+        // unmodified file park `cwd` as `None` and leave the app unable to
+        // come back up.
+        //
+        // The override is spent either way. A key just put back to the
+        // template is not a key an operator is still holding a value for, and
+        // leaving one in `fields` would keep `ProcessEntry::overridden`
+        // reporting a field that no longer differs from the file.
+        next.fields.remove(key);
+        // `declared` grows only where the file really spoke. It is the set a
+        // later plain load reads to decide what is already established, so
+        // marking an undeclared key would establish a value the file never
+        // asked for and lock a later append out of it.
+        if incoming.declared.contains(key) {
             next.declared.insert(key.clone());
-            file.get(key)
-        } else if matches!(reset, ResetDepth::All) {
-            defaults.get(key)
-        } else {
-            overrides.fields.get(key).or_else(|| defaults.get(key))
-        };
-        if let Some(value) = value {
+        }
+        if let Some(value) = file.get(key) {
             merged.insert(key.clone(), value.clone());
         }
     }
@@ -22161,11 +22171,56 @@ mod tests {
         );
     }
 
-    /// fails if the reset depths do not differ. `--reset` restores settings
-    /// and leaves env; `--reset-all` restores everything and drops
-    /// operator-added keys.
+    /// fails if a reset resolves an undeclared key to the compiled default
+    /// rather than to the file as loaded. The CLI defaults `cwd` to the
+    /// Flockfile's own directory without the document declaring it, so a
+    /// reset that reached for the default parked `cwd: None` on an app whose
+    /// file had not changed at all, and the next restart could not find the
+    /// script. `fold` and `interpreter` arrive the same way.
     #[tokio::test(start_paused = true)]
-    async fn reset_depths_differ_on_env_and_on_extras() {
+    async fn a_reset_against_an_unchanged_file_keeps_a_defaulted_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.cwd = Some("/srv/web".to_string());
+                app.fold = Some("edge".to_string());
+            })],
+        );
+
+        // What `shep start Flockfile.toml --reset` sends for an unmodified
+        // two-line file: the resolved config carries the defaulted `cwd` and
+        // the `--fold`, and the document declared neither.
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.cwd = Some("/srv/web".to_string());
+        file.fold = Some("edge".to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script"])],
+            ResetDepth::Settings,
+        )
+        .await;
+
+        // `cwd` is a `NeedsRespawn` field, so the damage lands in `pending`
+        // rather than on the running spec: the child kept the directory it
+        // was spawned in and the next restart was the one that could not
+        // find the script.
+        assert!(
+            actor.sheep[&0].entry.pending.is_none(),
+            "an unchanged file has nothing to park: {reply:?}"
+        );
+        assert!(reply[0].pending.is_empty(), "{reply:?}");
+        let config = actor.sheep[&0].entry.spec.config().clone();
+        assert_eq!(config.cwd.as_deref(), Some("/srv/web"));
+        assert_eq!(config.fold.as_deref(), Some("edge"));
+    }
+
+    /// fails if a reset does not put every non-env setting back to the file,
+    /// or if the two depths do not part company over env. `--reset` restores
+    /// settings, declared or not, and leaves env; `--reset-all` takes env
+    /// with it and drops the record.
+    #[tokio::test(start_paused = true)]
+    async fn reset_restores_every_setting_and_only_reset_all_takes_env() {
         // The operator's three edits since the file established name, script
         // and max_restarts: one over a key the file declares, one env key and
         // one field the file has never mentioned.
@@ -22204,8 +22259,9 @@ mod tests {
         );
         assert_eq!(
             settings.min_uptime,
-            UpDuration::from_millis(9000),
-            "--reset keeps a field the file never declared"
+            AppConfig::default().min_uptime,
+            "--reset puts a field the file never declared back to the file's \
+             own value, which for an undeclared key is the compiled default"
         );
         assert_eq!(
             settings_pending

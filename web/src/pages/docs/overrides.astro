@@ -221,14 +221,14 @@ const store = `$ cat $SHEP_HOME/overrides.json
     <CodeBlock>{established}</CodeBlock>
     <p>
       <code>--reset</code> is what puts the file back in charge. It resets
-      settings, keeps <code>env</code>, and keeps any field established
-      since. <code>--reset-all</code> is the wider one: it resets
+      every setting, declared or not, and keeps <code>env</code>.
+      <code>--reset-all</code> is the wider one: it resets
       <code>env</code> too and drops the record entirely, so the next plain
       load starts from a clean sheet.
     </p>
     <div class="rows">
       <div class="row"><span>no flag</span><span>Append what nobody has established. Overwrite nothing. <code>instances</code> is held out of even this: a plain load never reshapes a flock.</span></div>
-      <div class="row"><span><code>--reset</code></span><span>Every setting but <code>env</code> goes back to what the file says, the instance count included, which is the one that can delete a process. <code>env</code> and anything added since are kept.</span></div>
+      <div class="row"><span><code>--reset</code></span><span>Every setting but <code>env</code> goes back to what the file says, the instance count included, which is the one that can delete a process. A setting the file never mentions goes back too, to whatever a fresh start off that file would give it. <code>env</code> is kept.</span></div>
       <div class="row"><span><code>--reset-all</code></span><span>Everything goes back to the file, <code>env</code> and the instance count included, and the sheep's override record is dropped.</span></div>
     </div>
     <p>
@@ -257,8 +257,8 @@ const store = `$ cat $SHEP_HOME/overrides.json
     </p>
     <Callout variant="careful">
       A Flockfile that never mentions <code>instances</code> still says
-      something about it under a reset flag: it says 1, because that is the
-      compiled default the reset falls back to. So an app you scaled to four
+      something about it under a reset flag: it says 1, because that is what
+      a fresh start off that file would run. So an app you scaled to four
       with <code>shep stock</code> goes to one on a <code>--reset</code>
       against a file that has no opinion about instances at all. Write the
       count you want into the template before you reset against it.
