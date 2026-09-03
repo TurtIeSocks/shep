@@ -335,9 +335,9 @@ pub enum Commands {
     /// Turn off a registered dog: removes it from `[daemon] enabled_dogs`,
     /// and stops it now if a shepherd is running.
     ///
-    /// Leaves `[dog.<name>]` in place — the dog's own configuration
-    /// survives a disable/enable cycle. `shep rehome` is the verb that
-    /// forgets a dog entirely.
+    /// Leaves `[<name>]` in `dogs.toml` in place: the dog's own
+    /// configuration survives a disable/enable cycle. `shep rehome` is the
+    /// verb that forgets a dog entirely.
     Disable(DogArgs),
     /// Vet a binary shep has never seen and register it as a dog: writes
     /// `[daemon] adopted_dogs` and `[daemon] enabled_dogs` in `shep.toml`,
@@ -356,7 +356,7 @@ pub enum Commands {
     Adopt(AdoptArgs),
     /// Forget an adopted dog entirely: stops it if a shepherd is running,
     /// and removes it from `[daemon] enabled_dogs`, `[daemon]
-    /// adopted_dogs`, and its own `[dog.<name>]` table.
+    /// adopted_dogs`, and its own `[<name>]` table in `dogs.toml`.
     ///
     /// `shep disable` stops a dog without forgetting its configuration;
     /// `rehome` is the verb that forgets it.
@@ -963,7 +963,7 @@ pub struct DogsArgs {
 /// would never touch the extra field.
 #[derive(Debug, clap::Args)]
 pub struct DogArgs {
-    /// The dog's name — the `[dog.<name>]` config key
+    /// The dog's name, the `[<name>]` config key in `dogs.toml`
     pub name: String,
 }
 
@@ -987,7 +987,7 @@ pub struct DogArgs {
 /// `the_hidden_pm2_spelling_reaches_adopt_with_the_arguments_the_right_way_round`.
 #[derive(Debug, clap::Args)]
 pub struct EnableArgs {
-    /// The dog's name — the `[dog.<name>]` config key
+    /// The dog's name, the `[<name>]` config key in `dogs.toml`
     pub name: String,
     /// Hidden pm2-spelling alias for `shep adopt`: routes to `adopt` with
     /// this flag's value as the binary path
@@ -1011,8 +1011,8 @@ pub struct AdoptArgs {
     /// Resolved before vetting: as given, with a leading `~/` expanded, or
     /// looked up on `$PATH` if it names no directory — first hit wins.
     pub path: PathBuf,
-    /// The dog's name — the `[dog.<name>]` config key. Defaults to the
-    /// binary's file stem with a leading `shep-` stripped.
+    /// The dog's name, the `[<name>]` config key in `dogs.toml`. Defaults
+    /// to the binary's file stem with a leading `shep-` stripped.
     #[arg(long)]
     pub name: Option<String>,
 }
