@@ -245,7 +245,10 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// booted daemon in hand rather than a call that blocks until shutdown: it
 /// spawns `run()` as a task and then talks to the same supervisor over its
 /// own socket, like any other client. Nothing about the boot differs
-/// between the two callers, and the split is what keeps that true.
+/// between the two callers, and the split is what keeps that true -- which
+/// is why the dog-config migration is at the top of THIS function and not
+/// in [`run_daemon`]. It sat there for a release, and `shep runtime` spent
+/// it starting dogs against a `dogs.toml` nothing had written.
 ///
 /// `delete_flock_on_shutdown` becomes [`BootOptions::delete_flock_on_shutdown`]
 /// verbatim — see that field's own doc. `run_daemon` below always passes
@@ -260,11 +263,58 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// - [`DaemonRunError::Boot`] — the config file itself could not be read
 ///   (any IO error other than "does not exist"), or the supervisor failed
 ///   to boot.
+/// - [`DaemonRunError::DogMigration`] — `[dog.<name>]` sections could not
+///   be moved out of `shep.toml` and into `dogs.toml`.
 pub async fn boot_supervisor(
     paths: ShepPaths,
     args: &DaemonArgs,
     delete_flock_on_shutdown: bool,
 ) -> Result<RunningDaemon, DaemonRunError> {
+    // Here rather than in `run_daemon`, because `run_daemon` is not the only
+    // caller that boots a supervisor and serves dogs. `commands::foreground`
+    // reaches this function directly for `shep runtime` and `shep dev`, and
+    // `boot_options` below builds their dogs out of `enabled_dogs` exactly as
+    // it does for the daemon -- so a `shep runtime` used to start a dog and
+    // then hand it a `dogs.toml` that would never exist. Measured: with
+    // `[dog.metrics] bind = "127.0.0.1:19616"` in shep.toml, nothing listened
+    // on 19616 and the compiled default 9615 served instead, with no warning
+    // and no file written. Permanent, since a container that only ever runs
+    // `shep runtime` never migrates. For bark it means every sink disappears
+    // and alerting stops silently.
+    //
+    // Before the config load and before the supervisor: `dog_section` reads
+    // the new file from the first request onward and a dog can connect as
+    // soon as the socket is up. A boot after the first finds nothing under
+    // `[dog]` and returns before it opens either file.
+    //
+    // This runs in more than one place on purpose. `reload_with_wait` runs
+    // the same call in the CLI process before it signals anything, so a
+    // handover successor is not the process that discovers a refusal (see
+    // that pre-flight's own comment). Both are safe because the migration is
+    // idempotent and takes both files' locks itself, in this crate's one
+    // order: shep.toml outer, dogs.toml inner. Two of them at once serialise
+    // rather than race, and the loser finds nothing left to move.
+    let moved =
+        dog_migration::migrate_dog_sections(&paths).map_err(DaemonRunError::DogMigration)?;
+    if !moved.is_empty() {
+        // Named individually: an operator who did not know this was coming
+        // needs to be able to find where their config went.
+        //
+        // `eprintln!` rather than `tracing::info!`, and only because of
+        // where this sits: `install_log_subscriber` runs a few lines below,
+        // so at this point in the boot there is no subscriber and a
+        // `tracing` record would be dropped on the floor. Stderr is the same
+        // destination that subscriber writes to (see `launch::launch_daemon`,
+        // which is what redirects it into the shepherd's own log), so the
+        // line lands where the rest of the boot's diagnostics do, one
+        // migration only, without a format the operator has to go looking
+        // for. `shep runtime` and `shep dev` are already streaming their
+        // flock's bleats to this same stderr, so it reaches them too.
+        eprintln!(
+            "shep: moved dog config out of shep.toml and into dogs.toml: {}",
+            moved.join(", ")
+        );
+    }
     let env = |key: &str| std::env::var(key).ok();
     let file_source = read_daemon_config_source(&paths)?;
     let overrides = daemon_overrides(args);
@@ -292,7 +342,8 @@ pub async fn boot_supervisor(
 ///
 /// [`boot_supervisor`] does everything up to and including the boot; this
 /// adds only `.run()` on top of it. See that function's own doc for the
-/// config-loading and log-subscriber detail this used to carry directly.
+/// config-loading, dog-migration and log-subscriber detail this used to
+/// carry directly.
 ///
 /// # Errors
 /// - [`DaemonRunError::Config`] — `shep.toml` failed to parse, or a
@@ -305,29 +356,6 @@ pub async fn boot_supervisor(
 /// - [`DaemonRunError::DogMigration`]: `[dog.<name>]` sections could not be
 ///   moved out of `shep.toml` and into `dogs.toml`.
 pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
-    // Before the supervisor, because `dog_section` reads the new file from
-    // the first request onward and a dog can connect as soon as the socket
-    // is up. A boot after the first finds nothing and returns immediately.
-    let moved =
-        dog_migration::migrate_dog_sections(&paths).map_err(DaemonRunError::DogMigration)?;
-    if !moved.is_empty() {
-        // Named individually: an operator who did not know this was coming
-        // needs to be able to find where their config went.
-        //
-        // `eprintln!` rather than `tracing::info!`, and only because of
-        // where this sits: `install_log_subscriber` runs inside
-        // `boot_supervisor`, so at this point in the boot there is no
-        // subscriber and a `tracing` record would be dropped on the floor.
-        // Stderr is the same destination that subscriber writes to (see
-        // `launch::launch_daemon`, which is what redirects it into the
-        // shepherd's own log), so the line lands where the rest of the
-        // boot's diagnostics do, one migration only, without a format the
-        // operator has to go looking for.
-        eprintln!(
-            "shep: moved dog config out of shep.toml and into dogs.toml: {}",
-            moved.join(", ")
-        );
-    }
     // A production daemon always keeps its final roll — `shep muster` after
     // a reboot is the entire reason it exists.
     boot_supervisor(paths, args, false)
