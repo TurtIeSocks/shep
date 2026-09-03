@@ -1321,6 +1321,21 @@ fn apply_interpreters(
 ///
 /// `clap`'s `conflicts_with` already refuses the two together, so at most one
 /// of `args.reset`/`args.reset_all` is ever set here.
+/// The reset flag the operator typed, `None` when they typed neither.
+///
+/// Named so the two arms that REFUSE a reset can quote back the flag the
+/// operator actually wrote. `clap`'s `conflicts_with` refuses the two
+/// together, so `--reset-all` winning here is a tie that cannot happen.
+fn reset_flag(args: &StartArgs) -> Option<&'static str> {
+    if args.reset_all {
+        Some("--reset-all")
+    } else if args.reset {
+        Some("--reset")
+    } else {
+        None
+    }
+}
+
 fn reset_depth(args: &StartArgs) -> ResetDepth {
     if args.reset_all {
         ResetDepth::All
@@ -1512,12 +1527,7 @@ async fn start_one(
                 // A reset flag here would be meaningless rather than a
                 // no-op: this arm reads no file, so there is no template to
                 // reset to. Refusing rather than silently doing nothing.
-                if args.reset || args.reset_all {
-                    let flag = if args.reset_all {
-                        "--reset-all"
-                    } else {
-                        "--reset"
-                    };
+                if let Some(flag) = reset_flag(args) {
                     let message = format!(
                         "{flag} needs a Flockfile to reset to; {token} names a sheep, not a file"
                     );
@@ -1568,6 +1578,25 @@ async fn start_one(
             }
             Err(err) => return fail_target(streams, &err),
         };
+
+    // The same refusal the name arm above makes, for the other target that
+    // supplies no template. `resolve_target_declared` hands a bare script
+    // path an EMPTY declared set, so a reset flag on one reached
+    // `apply_declared`, which sends nothing for an app that declared
+    // nothing, and `shep start --reset ./thing` exited 0 having reset
+    // exactly nothing. A meaningless flag is refused rather than obeyed
+    // into a no-op.
+    //
+    // The test is the declared set, not the shape of the token, because
+    // that is the thing the reset acts on: every Flockfile app carries at
+    // least its own `script` key, so a real document never lands here.
+    if let Some(flag) = reset_flag(args)
+        && apps.iter().all(|app| app.declared.is_empty())
+    {
+        let message =
+            format!("{flag} needs a Flockfile to reset to; {target} is a script, not a Flockfile");
+        return streams.fail(ExitCode::Usage, &message);
+    }
 
     if let Some(fold) = &args.fold {
         for app in &mut apps {
@@ -3136,6 +3165,36 @@ mod tests {
         assert!(
             said.contains("--reset") && said.contains("zam"),
             "the refusal names the flag and the token it was refused for: {said}"
+        );
+    }
+
+    /// fails if a reset flag is accepted when the target is a bare script
+    /// path. The command line is not a template, so there is no file to
+    /// reset to and the flag would otherwise exit 0 having reset nothing.
+    #[tokio::test]
+    async fn a_reset_flag_on_a_bare_script_target_is_refused() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("zam");
+        std::fs::write(&script, "#!/bin/sh\nsleep 1\n").unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
+
+        let mut args = start_args(script.to_str().unwrap());
+        args.reset = true;
+        let (code, printed, said) = start_against_with_args(&client, &args).await;
+
+        assert_eq!(code, ExitCode::Usage);
+        assert!(printed.is_empty(), "a refusal prints no data envelope");
+        assert!(
+            said.contains("--reset") && said.contains("zam"),
+            "the refusal names the flag and the token it was refused for: {said}"
+        );
+        assert!(
+            applies(&mut envelopes).is_empty(),
+            "a refused reset sends no load"
         );
     }
 
