@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-09-03
+
+### Added
+
+- A request that registers an app without starting it
+
+### Fixed
+
+- The skew guard already gates add, and say so accurately
+
+
 ### Added
 
 - `Request::Add` and `Response::Added`: register apps as flock members

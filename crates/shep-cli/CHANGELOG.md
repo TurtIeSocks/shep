@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-09-03
+
+### Added
+
+- Shep add, which registers a sheep and starts nothing
+
+### Fixed
+
+- The skew guard already gates add, and say so accurately
+
+
 ## [0.1.30] - 2026-09-03
 
 ### Added

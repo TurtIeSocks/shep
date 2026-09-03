@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-09-03
+
+### Added
+
+- A request that registers an app without starting it
+
+
 ## [0.1.30] - 2026-09-03
 
 ### Added
