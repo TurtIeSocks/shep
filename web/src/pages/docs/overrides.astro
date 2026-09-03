@@ -241,10 +241,13 @@ const store = `$ cat $SHEP_HOME/overrides.json
     <CodeBlock>{established}</CodeBlock>
     <p>
       <code>--reset</code> is what puts the file back in charge. It resets
-      every setting, declared or not, and keeps <code>env</code>.
-      <code>--reset-all</code> is the wider one: it resets
-      <code>env</code> too and drops the record entirely, so the next plain
-      load starts from a clean sheet.
+      every setting, declared or not, and keeps <code>env</code>. Only
+      <code>env</code> survives it: a setting an operator had set is put back
+      like any other, and its entry in the override record is spent on the way
+      through, so what the record still holds after a <code>--reset</code> is
+      <code>env</code> and nothing else. <code>--reset-all</code> is the wider
+      one: it resets <code>env</code> too and drops the record entirely, so
+      the next plain load starts from a clean sheet.
     </p>
     <div class="rows">
       <div class="row"><span>no flag</span><span>Append what nobody has established. Overwrite nothing. <code>instances</code> is held out of even this: a plain load never reshapes a flock.</span></div>
@@ -260,10 +263,12 @@ const store = `$ cat $SHEP_HOME/overrides.json
       recoverable; resetting data is not.
     </p>
     <p class="fine">
-      Both flags are refused outright when the target is a sheep rather than
-      a file: <code>--reset needs a Flockfile to reset to; web names a sheep,
-      not a file</code>, exit 2. There is no template to reset to, and doing
-      nothing quietly would be worse.
+      Both flags are refused outright when the target supplies no template.
+      Naming a sheep is one: <code>--reset needs a Flockfile to reset to; web
+      names a sheep, not a file</code>, exit 2. A bare script path is the
+      other, for the same reason and with the same exit code, since the
+      command line is not a template either. There is nothing to reset to in
+      either case, and doing nothing quietly would be worse.
     </p>
 
     <h2 id="the-reset-flags-reshape-the-flock">The reset flags reshape the flock, and that can kill</h2>

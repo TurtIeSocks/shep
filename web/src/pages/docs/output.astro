@@ -105,17 +105,24 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       reads <code>-</code>. <code>!2</code> means two fields are parked for
       this sheep's next spawn, left there by a Flockfile load that would have
       had to kill the process to apply them, and
-      <code>shep reload &lt;name&gt;</code> promotes them. <code>*2</code>
-      means two fields an operator has set that the sheep's current Flockfile
-      does not declare.
+      <code>shep reload &lt;name&gt;</code> promotes them.
     </p>
     <p>
       A count and not the names, because the names are what
       <code>shep describe</code> lists underneath its table and a
-      three-character cell has room for one number. Pending takes the cell
-      when a sheep has both: a parked field is one command away from taking
-      effect, while an override has been true since the last load. See
+      three-character cell has room for one number. See
       <a href="/docs/overrides">Overrides</a>.
+    </p>
+    <p class="fine">
+      The cell has a second marker, <code>*2</code>, for fields an operator
+      has set that the sheep's current Flockfile does not declare. No
+      release can print it yet. No verb writes an operator-set value into the
+      override store today, so on any flock shep itself built the count is
+      zero and the cell reads <code>-</code> or <code>!N</code>. It is documented here because
+      it arrives with the verb that writes one, and because pending will take
+      the cell ahead of it when a sheep has both: a parked field is one
+      command away from taking effect, while an override has been true since
+      the last load.
     </p>
 
     <h2 id="grouped-instances">Multi-instance apps group</h2>

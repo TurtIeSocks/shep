@@ -197,8 +197,9 @@ script = "./server"`}</CodeBlock>
     <p class="fine">
       Naming a sheep reads no Flockfile at all. <code>shep start web</code>
       starts the sheep called <code>web</code> from the config the shepherd
-      already holds. Only a path you name, or a Flockfile discovered in the
-      directory you ran the command from, is a load.
+      already holds. Three things are a load, and nothing else is: a path you
+      name, a Flockfile discovered in the directory you ran the command from,
+      and <code>-</code>, which reads Flockfile JSON on stdin.
     </p>
 
     <h2>Or start from a generated one</h2>
