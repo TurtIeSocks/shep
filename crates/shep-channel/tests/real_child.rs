@@ -268,16 +268,21 @@ fn open_channel_and_spawn_child() -> (ShepherdSide, std::process::Child) {
             child_fd: 3,
         }])
         .expect("map the socketpair to fd 3");
-    let child = command
-        .spawn()
-        .expect("spawn the re-exec'd test binary as the channel child");
+    // Guarded from the moment it exists, not from the caller. Everything
+    // between here and the return is fallible, and a panic in it would
+    // otherwise leave the child parked with nothing owning it.
+    let child = ChildGuard(Some(
+        command
+            .spawn()
+            .expect("spawn the re-exec'd test binary as the channel child"),
+    ));
 
     let writer = ours.try_clone().expect("clone");
     let side = ShepherdSide {
         reader: std::io::BufReader::new(ours),
         writer,
     };
-    (side, child)
+    (side, child.take())
 }
 
 /// The shepherd's end of a named pipe, read and written a line at a time.
@@ -371,9 +376,15 @@ fn open_channel_and_spawn_child() -> (ShepherdSide, std::process::Child) {
     command
         .env_remove("SHEP_CHANNEL_FD")
         .env("SHEP_CHANNEL_PIPE", &name);
-    let child = command
-        .spawn()
-        .expect("spawn the re-exec'd test binary as the channel child");
+    // Guarded from the moment it exists. The wait below is the failure this
+    // test is built to detect, and it is exactly the path on which the
+    // child would otherwise be left parked with nothing owning it: both
+    // `expect`s panic before the caller ever wraps it.
+    let child = ChildGuard(Some(
+        command
+            .spawn()
+            .expect("spawn the re-exec'd test binary as the channel child"),
+    ));
 
     runtime
         .block_on(async { tokio::time::timeout(DEADLINE, server.connect()).await })
@@ -384,5 +395,5 @@ fn open_channel_and_spawn_child() -> (ShepherdSide, std::process::Child) {
         pipe: tokio::io::BufReader::new(server),
         runtime,
     };
-    (side, child)
+    (side, child.take())
 }

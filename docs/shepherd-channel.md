@@ -97,11 +97,17 @@ hypothetical — it is what `shep-channel` itself did on Windows until
 
 Two ways out. Pick one before you write the reader:
 
-- **Never park.** `PeekNamedPipe` reports what is already buffered and
-  returns either way; issue a `ReadFile` only for bytes it has just told you
-  are there. This holds the file object for the length of a copy rather than
-  the length of a wait, so the writer gets in between polls. It is what
-  `shep-channel` does, polling every 20 ms.
+- **Never park waiting for data.** `PeekNamedPipe` does not block for bytes
+  to arrive; issue a `ReadFile` only for bytes it has just told you are
+  there. This holds the file object for the length of a copy rather than the
+  length of a wait, so the writer gets in between polls. It is what
+  `shep-channel` does, polling every 20 ms. Note what it does not buy you:
+  the handle is still synchronous, so a peek queues behind any operation
+  already running on it, and Microsoft documents `PeekNamedPipe` as able to
+  block in a multithreaded application for that reason. A writer parked on a
+  full pipe buffer delays the next peek until the shepherd drains. That is a
+  stall, not the deadlock above, because the shepherd reads and writes on
+  independent tasks.
 - **Open the pipe with `FILE_FLAG_OVERLAPPED`** and drive it
   asynchronously — Go's `go-winio`, .NET with `PipeOptions.Asynchronous`,
   or anything built on an IOCP loop. An overlapped handle is not serialised,

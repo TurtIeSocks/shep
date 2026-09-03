@@ -148,11 +148,24 @@ const PIPE_POLL_INTERVAL: core::time::Duration = core::time::Duration::from_mill
 /// real Windows before this type existed -- the write never returned, and
 /// came back only when the pipe was torn down.
 ///
-/// So this half never waits inside the kernel. `PeekNamedPipe` reports what
-/// is already buffered and returns either way, and a `ReadFile` is issued
-/// only for bytes it has just been told are sitting there. The file object
-/// is held for the length of a copy rather than the length of a wait, and
-/// the writer gets in between polls.
+/// So this half never waits FOR DATA inside the kernel. `PeekNamedPipe` does
+/// not block for bytes to arrive, and a `ReadFile` is issued only for bytes
+/// it has just been told are sitting there, so the file object is held for
+/// the length of a copy rather than the length of a wait and the writer gets
+/// in between polls. That is what breaks the startup deadlock above.
+///
+/// It does not make the two halves independent, and the difference is worth
+/// stating rather than discovering. The handle is still synchronous, so the
+/// peek queues behind any operation already running on the same file object.
+/// Microsoft documents `PeekNamedPipe` as able to block in a multithreaded
+/// application for exactly that reason. In practice that means a writer
+/// parked in `WriteFile` on a full pipe buffer delays the next peek until
+/// the shepherd drains, which is a stall bounded by the shepherd's own
+/// reader rather than a wait on the app itself. The shepherd reads and
+/// writes on independent tasks, so it does drain.
+///
+/// Making them genuinely independent needs `FILE_FLAG_OVERLAPPED` on both
+/// handles, which is a larger change than this one and is not done here.
 ///
 /// Opening the pipe a second time would be the other way out, and it is not
 /// available: the shepherd creates a single instance and accepts once, so a
