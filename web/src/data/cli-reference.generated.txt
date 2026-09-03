@@ -871,7 +871,7 @@ Usage: shep enable [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
-          The dog's name — the `[dog.<name>]` config key
+          The dog's name, the `[<name>]` config key in `dogs.toml`
 
 Options:
       --format <FORMAT>
@@ -918,14 +918,14 @@ Options:
 Turn off a registered dog: removes it from `[daemon] enabled_dogs`, and stops it now if a shepherd
 is running.
 
-Leaves `[dog.<name>]` in place — the dog's own configuration survives a disable/enable cycle. `shep
-rehome` is the verb that forgets a dog entirely.
+Leaves `[<name>]` in `dogs.toml` in place: the dog's own configuration survives a disable/enable
+cycle. `shep rehome` is the verb that forgets a dog entirely.
 
 Usage: shep disable [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
-          The dog's name — the `[dog.<name>]` config key
+          The dog's name, the `[<name>]` config key in `dogs.toml`
 
 Options:
       --format <FORMAT>
@@ -999,8 +999,8 @@ Options:
           [default: table]
 
       --name <NAME>
-          The dog's name — the `[dog.<name>]` config key. Defaults to the binary's file stem with a
-          leading `shep-` stripped
+          The dog's name, the `[<name>]` config key in `dogs.toml`. Defaults to the binary's file
+          stem with a leading `shep-` stripped
 
   -q, --quiet
           Suppress non-essential output
@@ -1035,7 +1035,7 @@ Options:
           Print version
 @@VERB:rehome@@
 Forget an adopted dog entirely: stops it if a shepherd is running, and removes it from `[daemon]
-enabled_dogs`, `[daemon] adopted_dogs`, and its own `[dog.<name>]` table.
+enabled_dogs`, `[daemon] adopted_dogs`, and its own `[<name>]` table in `dogs.toml`.
 
 `shep disable` stops a dog without forgetting its configuration; `rehome` is the verb that forgets
 it.
@@ -1044,7 +1044,7 @@ Usage: shep rehome [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
-          The dog's name — the `[dog.<name>]` config key
+          The dog's name, the `[<name>]` config key in `dogs.toml`
 
 Options:
       --format <FORMAT>
