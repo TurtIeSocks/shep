@@ -1331,13 +1331,28 @@ impl SheepDrift {
 /// an app would leave an operator reading a Flockfile that says one thing and
 /// a flock doing another, which is the failure this whole verb exists to fix.
 ///
-/// Field NAMES only, never their values, exactly as [`SheepDrift`] carries
-/// them and for the same reason: this is built to be printed at an operator,
-/// and [`AppConfig::env`](crate::config::AppConfig::env) carries secrets, so
-/// an applied `env` reports `"env"` and nothing more (IR-41). `Debug` is
-/// derived on that basis: there is nothing here to redact. The merged config
+/// [`Self::applied`] and [`Self::pending`] carry field NAMES only, never
+/// their values, exactly as [`SheepDrift`] carries them and for the same
+/// reason: this is built to be printed at an operator, and
+/// [`AppConfig::env`](crate::config::AppConfig::env) carries secrets, so an
+/// applied `env` reports `"env"` and nothing more (IR-41). The merged config
 /// itself never reaches a client at all -- the daemon keeps it, because a
 /// config is not something a client needs and `env` is in it.
+///
+/// **[`Self::refused`] is prose and is deliberately not held to that**, so
+/// the rule above is scoped to the two lists rather than stated of the whole
+/// type. A refusal is a sentence an operator reads, and the useful ones name
+/// the thing that was refused: the daemon's own instance-count refusal
+/// quotes the count the file asked for, and a rejected `{{...}}` template
+/// quotes the offending fragment. Those are values out of the FILE the
+/// caller just sent, not values out of the flock's stored config, which is
+/// what makes them safe to echo; see that field's own doc. A refusal that
+/// needs to name an `env` value is one the daemon must word differently, not
+/// one this type can prevent.
+///
+/// `Debug` is derived on that basis: `refused` holds only what the daemon
+/// chose to put in front of an operator anyway, so there is nothing here to
+/// redact that redacting would help.
 // wire format: changing field names is a breaking change
 //
 // `#[non_exhaustive]`: shep-core is a published library, an out-of-tree
@@ -2773,9 +2788,12 @@ mod tests {
         insta::assert_json_snapshot!("reply_wire_v2", replies);
     }
 
-    /// fails if a `SheepApplied` ever carries a field's VALUE rather than
-    /// its name. This reply is printed at an operator and `env` values are
-    /// secrets, so the wire form has to be names alone (IR-41).
+    /// fails if `applied` or `pending` ever carries a field's VALUE rather
+    /// than its name. This reply is printed at an operator and `env` values
+    /// are secrets, so the wire form of those two lists has to be names
+    /// alone (IR-41). `refused` is prose and is scoped out of that rule at
+    /// the type -- see its own doc for why -- so it is left `None` here
+    /// rather than asserted on.
     ///
     /// Asserts on the serialized JSON rather than on the struct, because the
     /// struct's `Vec<String>` cannot say which of the two a string is: a
