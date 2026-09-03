@@ -155,8 +155,8 @@ impl PipeReader {
     /// # Errors
     ///
     /// Whatever `PeekNamedPipe` reports, except the two codes that mean the
-    /// far end is gone. Those are this channel's end of stream, which the
-    /// reader loop above ends on cleanly, and not a failure to pass up.
+    /// far end is gone. Those are this channel's end of stream, which
+    /// `serve`'s reader loop ends on cleanly, and not a failure to pass up.
     fn buffered(&self) -> std::io::Result<Option<u32>> {
         use std::os::windows::io::AsRawHandle as _;
 
