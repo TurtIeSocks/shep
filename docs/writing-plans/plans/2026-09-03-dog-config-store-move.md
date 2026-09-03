@@ -362,7 +362,7 @@ git commit -m "feat(cli): ShepToml can take the dog sections out"
 - Modify: `crates/shep-cli/src/commands/mod.rs` (or wherever sibling command modules are declared, grep `mod shep_toml;` and follow)
 - Modify: `crates/shep-cli/src/commands/daemon.rs:298-306` (`run_daemon`)
 - Modify: `crates/shep-daemon/src/dogs.rs:337-354` (`dog_section`)
-- Modify: `crates/shep-daemon/src/rpc.rs:69-74` and `:484`
+- Modify: `crates/shep-daemon/src/rpc.rs:69-74` and `:507`
 - Modify: `crates/shep-daemon/src/boot.rs:1379`
 
 **Interfaces:**
@@ -574,7 +574,7 @@ Add a `DogMigration(DogMigrationError)` variant to `DaemonRunError` with its `Di
 
 In `crates/shep-daemon/src/dogs.rs`, `dog_section` currently loads `DaemonConfig` and reads `config.dog.get(name)`. Change it to `DogsConfig::load` and `config.dog.get(name)`, keeping the `NotFound` arm answering `Ok(String::new())` and keeping `toml::to_string(table)` as the return, so the bytes on the wire do not move. Update its doc comment, which names `shep.toml`.
 
-In `crates/shep-daemon/src/rpc.rs`, rename the context field `daemon_config` to `dogs_config` (its doc comment at line 69 says "Where `DogConfig` reads a dog's `[dog.<name>]` section from", which needs rewriting for the new file and the new key shape), and update the call at line 484. Update the test at line 2455 that writes `[dog.bark]` into that path: it now writes `[bark]` into `dogs.toml`.
+In `crates/shep-daemon/src/rpc.rs`, rename the context field `daemon_config` to `dogs_config` (its doc comment at line 69 says "Where `DogConfig` reads a dog's `[dog.<name>]` section from", which needs rewriting for the new file and the new key shape), and update the call at line 507. Update the test at line 2603 that writes `[dog.bark]` into that path: it now writes `[bark]` into `dogs.toml`.
 
 In `crates/shep-daemon/src/boot.rs:1379`, change `daemon_config: paths.daemon_config.clone()` to `dogs_config: paths.dogs_config.clone()`.
 
