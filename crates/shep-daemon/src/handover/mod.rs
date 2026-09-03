@@ -1580,6 +1580,7 @@ mod tests {
             spec,
             pending: None,
             pending_reidentifies: false,
+            overridden: Vec::new(),
             instance: 0,
             status: ProcStatus::Online,
             pid: Some(100),

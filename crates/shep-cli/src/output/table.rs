@@ -943,19 +943,21 @@ mod tests {
     /// `full`, comfortably wide enough: face, word and colour all present,
     /// nothing dropped.
     ///
-    /// Width 97, not this module's usual 80 (`mixed_flock`'s own doc has the
+    /// Width 103, not this module's usual 80 (`mixed_flock`'s own doc has the
     /// exception and the arithmetic): the `EXIT` and `SMIT` columns each
-    /// cost the fixture seven columns they had no slack left to give up, so
-    /// 80 no longer fits `Starting`'s word
-    /// (`"starting"`, the second-longest Butter-role word after
-    /// `WaitingRestart`) alongside them. This test's own job was never
+    /// cost the fixture seven columns they had no slack left to give up, and
+    /// task 12's own `CFG` costs it six more (its content is `-` on every
+    /// row of this fixture, so its width is the three columns of its own
+    /// header plus the three-column separator), so 80 no longer fits
+    /// `Starting`'s word (`"starting"`, the second-longest Butter-role word
+    /// after `WaitingRestart`) alongside them. This test's own job was never
     /// "prove it fits at exactly the realistic fallback" -- that boundary
     /// belongs to the narrow snapshot below, which moved off 80 for the
     /// same reason -- it is "prove nothing drops when there is room", and
-    /// 97 is still an ordinary terminal width, comfortably proving that.
+    /// 103 is still an ordinary terminal width, comfortably proving that.
     #[test]
     fn full_wide_pins_face_word_and_colour_for_a_mixed_flock() {
-        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 97);
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 103);
         let rendered = table_of(&mixed_flock(ProcStatus::Starting), presentation);
         assert!(
             !rendered.contains("hidden"),
@@ -977,10 +979,12 @@ mod tests {
     /// Swapping `mixed_flock`'s Butter row from `Starting` to
     /// `WaitingRestart` grows its STATUS content from `"(o~o) starting"`
     /// (14 columns) to `"(o~o) waiting-restart"` (21) -- seven columns more.
-    /// Width 87, not the module's usual 80: task 7's `SMIT` column (empty
+    /// Width 93, not the module's usual 80: task 7's `SMIT` column (empty
     /// here, same as `EXIT`) costs the fixture another seven columns it had
     /// no slack left to give up, the same arithmetic `mixed_flock`'s own
-    /// doc records. `render_boxed_ex`'s own priority order
+    /// doc records, and task 12's own `CFG` costs it six more on top of that
+    /// (`full_wide_pins_face_word_and_colour_for_a_mixed_flock`'s own doc
+    /// has that arithmetic). `render_boxed_ex`'s own priority order
     /// (`FlockRows::PRIORITIES`) drops SMIT first on the word-included
     /// pass, being the highest priority number, landing back under budget
     /// without a second column needing to go. The retry itself asks for
@@ -991,7 +995,7 @@ mod tests {
     /// FOLD both back, no footer.
     #[test]
     fn full_narrow_drops_the_status_word_before_a_whole_column() {
-        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 87);
+        let presentation = Presentation::new(StyleLevel::Full, None, deep_terminal(), None, 93);
         let rendered = table_of(&mixed_flock(ProcStatus::WaitingRestart), presentation);
         assert!(
             !rendered.contains("waiting-restart"),
@@ -1007,10 +1011,12 @@ mod tests {
     /// The narrowest terminal that still shows every column, including the
     /// smit. Asserted rather than assumed: `table.rs`'s own note at :875
     /// records that adding EXIT cost 7 columns and forced the wide fixture
-    /// from 80 to 90, and a later column will move this too. When it moves,
+    /// from 80 to 90, and task 12's own CFG moved it again, from 93 to 99
+    /// (six columns, `full_wide_pins_face_word_and_colour_for_a_mixed_flock`'s
+    /// own doc has the arithmetic). When a later column moves it again,
     /// that is a decision about the maintainer's full-width condition, not a number to
     /// quietly update.
-    const FULL_WIDTH: usize = 93;
+    const FULL_WIDTH: usize = 99;
 
     /// fails if a smit is dropped at full width. The maintainer's permission to drop
     /// it on a narrow terminal was conditional on it being seen regularly

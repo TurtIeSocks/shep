@@ -58,8 +58,13 @@ pub use table::{human_bytes, human_duration, local_timestamp, render_table};
 // rather than a second implementation of the same rule. `#[cfg_attr(windows,
 // ...)]` for the same reason the block above carries it: `lookout` is
 // `#[cfg(unix)]` (`lib.rs`), so nothing names this import on Windows.
+//
+// `cfg_cell` (task 12) rides the same re-export for the same reason: its
+// only caller outside this module is `lookout::view::flock::cell`'s own
+// CFG column, reusing the pending-over-overridden rule rather than a second
+// copy of it.
 #[cfg_attr(windows, allow(unused_imports))]
-pub(crate) use rows::exit_cell;
+pub(crate) use rows::{cfg_cell, exit_cell};
 
 use crate::cli::Format;
 use crate::style::Presentation;
@@ -541,6 +546,12 @@ fn silence_pointer(dogs: &[ProcessInfo]) -> Option<String> {
 /// word of it, including the part that matters most — whether this shepherd
 /// is still waiting on the dog or has permanently given up on it, which is a
 /// latch no surface reported at all before it was put on the wire.
+/// After the lambs, the same table walk prints a Pending heading and an
+/// Overridden heading per sheep that has either (task 12), each followed by
+/// the field names `ProcessInfo::pending`/`ProcessInfo::overridden` carry.
+/// A sheep with neither prints neither heading, unchanged from before those
+/// fields existed. The Pending heading names `shep reload <name>` as what
+/// promotes it, since that is the one verb that does.
 ///
 /// # The caption
 ///
@@ -596,6 +607,30 @@ pub fn emit_described(
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                 )?;
                 write!(out, "{}", table_of(&LambRows(lambs.clone()), style))?;
+            }
+            for sheep in &flock.0 {
+                if let Some(fields) = sheep.pending.as_deref().filter(|f| !f.is_empty()) {
+                    writeln!(
+                        out,
+                        "\nPending for {} (id {}), parked by a load; `shep reload {}` \
+                         promotes it:",
+                        sheep.name, sheep.id, sheep.name,
+                    )?;
+                    for field in fields {
+                        writeln!(out, "  {field}")?;
+                    }
+                }
+                if let Some(fields) = sheep.overridden.as_deref().filter(|f| !f.is_empty()) {
+                    writeln!(
+                        out,
+                        "\nOverridden for {} (id {}), fields its current Flockfile does \
+                         not declare:",
+                        sheep.name, sheep.id,
+                    )?;
+                    for field in fields {
+                        writeln!(out, "  {field}")?;
+                    }
+                }
             }
             Ok(())
         }
@@ -1569,27 +1604,31 @@ mod tests {
     /// this test stays at the lower level anyway, to pin the exact retry
     /// mechanics rather than `table_of`'s outer wrapping around them.
     ///
-    /// Width 84, not this module's usual 80: task 7's `SMIT` column, empty
+    /// Width 90, not this module's usual 80: task 7's `SMIT` column, empty
     /// here and the highest priority number, is what face-alone now needs
     /// dropped at 80 -- the same seven-column cost `output/table.rs`'s own
-    /// tests record for adding a column nobody's row fills.
+    /// tests record for adding a column nobody's row fills -- and task 12's
+    /// own `CFG` column moved it six columns further still, from 84 to 90,
+    /// for the same reason (`output/table.rs`'s own
+    /// `full_wide_pins_face_word_and_colour_for_a_mixed_flock` has that
+    /// arithmetic).
     #[test]
     fn the_word_drops_before_a_whole_column_does() {
         let flock = FlockRows(vec![
             ProcessInfo::builder(1, "a", ProcStatus::WaitingRestart).build(),
         ]);
-        let presentation = Presentation::new(StyleLevel::Full, None, None, None, 84);
+        let presentation = Presentation::new(StyleLevel::Full, None, None, None, 90);
         let headers = FlockRows::headers();
 
         let wide = table::render_boxed_ex(
             headers,
             &flock.rows_for(presentation, true),
             FlockRows::PRIORITIES,
-            84,
+            90,
         );
         assert!(
             !wide.dropped.is_empty(),
-            "face-plus-word should already force a drop at 84: {}",
+            "face-plus-word should already force a drop at 90: {}",
             wide.rendered
         );
 
@@ -1597,11 +1636,11 @@ mod tests {
             headers,
             &flock.rows_for(presentation, false),
             FlockRows::PRIORITIES,
-            84,
+            90,
         );
         assert!(
             narrow.dropped.is_empty(),
-            "face-alone should fit every column at 84: {}",
+            "face-alone should fit every column at 90: {}",
             narrow.rendered
         );
         assert!(narrow.rendered.contains("FOLD"), "{}", narrow.rendered);

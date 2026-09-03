@@ -869,6 +869,37 @@ pub struct ProcessInfo {
     /// here would be re-committing the bug this field was added during: a
     /// shepherd asserting a cause it never observed.
     pub dog_stale: Option<bool>,
+    /// The [`AppConfig`](crate::config::AppConfig) field NAMES this sheep's
+    /// spec differs from a load's parked config for, in field-name order.
+    /// `None` when nothing is parked (every sheep outside the window
+    /// between a load that changed a `NeedsRespawn` field and the restart
+    /// that picks it up), and also when the peer daemon predates the field,
+    /// the same skew rule [`Self::out_file`] documents for itself.
+    ///
+    /// Names only, never values, for the same reason [`SheepDrift::fields`]
+    /// carries names only: a differing `env` reports `"env"` and stops
+    /// there (IR-41). `shep reload` is what promotes a parked config.
+    ///
+    /// `#[serde(skip_serializing_if = "Option::is_none")]`: most sheep are
+    /// not mid-parking, so this keeps the ordinary reply free of a key that
+    /// would otherwise be `null` on almost every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Vec<String>>,
+    /// The [`AppConfig`](crate::config::AppConfig) field NAMES an operator
+    /// has set on this sheep that its current Flockfile does not declare,
+    /// in field-name order. `None` when there is nothing to report: no
+    /// override on record for this sheep, or a peer daemon that predates
+    /// the field.
+    ///
+    /// Names only, never values, for the reason [`Self::pending`] gives:
+    /// [`crate::overrides::AppOverrides::fields`] can hold an `env` value,
+    /// and nothing in shep sends an app's env to a client (IR-41).
+    ///
+    /// `#[serde(skip_serializing_if = "Option::is_none")]`, for the same
+    /// reason [`Self::pending`] carries it: most sheep carry no override at
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overridden: Option<Vec<String>>,
 }
 
 /// Orders one flock listing the way every operator-facing surface presents
@@ -942,6 +973,8 @@ impl ProcessInfo {
                 instance: None,
                 handshook: None,
                 dog_stale: None,
+                pending: None,
+                overridden: None,
             },
         }
     }
@@ -1058,6 +1091,20 @@ impl ProcessInfoBuilder {
     /// for a sheep, which is never given up on.
     pub fn dog_stale(mut self, dog_stale: Option<bool>) -> Self {
         self.info.dog_stale = dog_stale;
+        self
+    }
+
+    /// Sets the field names a load has parked for this sheep's next spawn;
+    /// `None` when nothing is parked.
+    pub fn pending(mut self, pending: Option<Vec<String>>) -> Self {
+        self.info.pending = pending;
+        self
+    }
+
+    /// Sets the field names an operator has overridden on this sheep;
+    /// `None` when there is nothing to report.
+    pub fn overridden(mut self, overridden: Option<Vec<String>>) -> Self {
+        self.info.overridden = overridden;
         self
     }
 
@@ -1764,6 +1811,14 @@ mod tests {
             instance: None,
             handshook: None,
             dog_stale: None,
+            // Left at the builder's own default, like `dog`/`lambs` above
+            // this fixture: this feeds `reply_wire_snapshots` and
+            // `bus_event_wire_snapshots`, so a `Some(..)` here would move
+            // pinned bytes. `every_setter_writes_its_own_field_and_no_other`
+            // exercises the setter body on its own, the same way it does
+            // for `dog`, `lambs`, `smit` and `handshook`.
+            pending: None,
+            overridden: None,
         }
     }
 
@@ -1893,6 +1948,26 @@ mod tests {
                 .dog_stale,
             Some(true),
             "an empty `dog_stale` setter body is invisible to the comparison above"
+        );
+
+        // `pending` is the sixth field, on the same terms as the five above.
+        assert_eq!(
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .pending(Some(vec!["env".to_string()]))
+                .build()
+                .pending,
+            Some(vec!["env".to_string()]),
+            "an empty `pending` setter body is invisible to the comparison above"
+        );
+
+        // `overridden` is the seventh and last, on the same terms.
+        assert_eq!(
+            ProcessInfo::builder(1, "web", ProcStatus::Online)
+                .overridden(Some(vec!["cwd".to_string()]))
+                .build()
+                .overridden,
+            Some(vec!["cwd".to_string()]),
+            "an empty `overridden` setter body is invisible to the comparison above"
         );
     }
 

@@ -585,6 +585,7 @@ pub(crate) fn armed_entry(
         spec: app,
         pending: None,
         pending_reidentifies: false,
+        overridden: Vec::new(),
         instance,
         status: ProcStatus::Online,
         pid: Some(pid),

@@ -4,7 +4,7 @@ expression: render_text(&buffer)
 ---
 shep lookout   /home/ada/.shep                                                   0 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 no sheep's name contains "zzz"                                                                      
                                                                                                     

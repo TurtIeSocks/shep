@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 
 use super::super::app::{App, GroupTotals, Row, RowKey};
 use crate::output::width::char_columns;
-use crate::output::{exit_cell, human_bytes, human_duration};
+use crate::output::{cfg_cell, exit_cell, human_bytes, human_duration};
 
 /// The narrowest terminal the TABLE will draw into.
 ///
@@ -75,6 +75,11 @@ pub enum Column {
     /// the two surfaces cannot drift on what a code or a signal name looks
     /// like.
     Exit,
+    /// Whether a config load has parked a change for this sheep's next
+    /// spawn, or an operator has overridden a field its Flockfile no longer
+    /// declares -- task 12. Rendered by [`crate::output::cfg_cell`], the
+    /// same function `output::rows::FlockRows`'s own CFG column calls.
+    Cfg,
     /// Tree CPU as a percentage of one core.
     Cpu,
     /// Tree resident set size.
@@ -106,6 +111,7 @@ impl Column {
             Self::Pid => "PID",
             Self::Restarts => "RESTARTS",
             Self::Exit => "EXIT",
+            Self::Cfg => "CFG",
             Self::Cpu => "CPU",
             Self::Mem => "MEM",
             Self::Uptime => "UPTIME",
@@ -134,6 +140,10 @@ impl Column {
             // inside it -- like STATUS above, sized so its longest real
             // value is never truncated.
             Self::Exit => 9,
+            // 4: `!12`/`*12` -- a `cfg_cell`'s own longest realistic value.
+            // `AppConfig` has well under a hundred fields, so two digits
+            // covers it with room to spare, and `-` is one character.
+            Self::Cfg => 4,
             Self::Cpu => 6,
             Self::Mem => 8,
             Self::Uptime => 8,
@@ -157,6 +167,7 @@ const ALL: &[Column] = &[
     Column::Pid,
     Column::Restarts,
     Column::Exit,
+    Column::Cfg,
     Column::Cpu,
     Column::Mem,
     Column::Uptime,
@@ -170,6 +181,7 @@ const NO_SMIT: &[Column] = &[
     Column::Pid,
     Column::Restarts,
     Column::Exit,
+    Column::Cfg,
     Column::Cpu,
     Column::Mem,
     Column::Uptime,
@@ -182,6 +194,7 @@ const NO_FOLD: &[Column] = &[
     Column::Pid,
     Column::Restarts,
     Column::Exit,
+    Column::Cfg,
     Column::Cpu,
     Column::Mem,
     Column::Uptime,
@@ -252,10 +265,16 @@ const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 /// column, so it is the first one to go. That is the same reasoning
 /// `output::rows::FlockRows::PRIORITIES` gives for its own priority 8, the
 /// highest number in that table.
+///
+/// CFG (task 12) drops in the same breath as EXIT rather than getting a
+/// tier of its own: it is absent from `NO_EXIT` and every narrower set, so
+/// a terminal that has already lost EXIT has lost CFG too. Both answer "why
+/// does this row need a second look", and `output::rows::FlockRows::PRIORITIES`
+/// gives CFG the exact number it gives EXIT for the same reason.
 const TIERS: &[(u16, &[Column])] = &[
-    (116, ALL),
-    (101, NO_SMIT),
-    (89, NO_FOLD),
+    (122, ALL),
+    (107, NO_SMIT),
+    (95, NO_FOLD),
     (78, NO_EXIT),
     (68, NO_RESTARTS),
     (59, NO_PID),
@@ -430,13 +449,15 @@ fn group_line(app: &App, name: &str, columns: &[Column], width: u16) -> Line<'st
 
 /// One cell of an app's group header row.
 ///
-/// ID, PID and EXIT are blank -- not `-`: there is no single id, pid or
-/// exit for a group row to have "no honest value" about, the way a real
-/// sheep's absent pid does. FOLD and SMIT read the first member's, since
-/// both are per-app facts every instance shares.
+/// ID, PID, EXIT and CFG are blank -- not `-`: there is no single id, pid,
+/// exit or config-drift state for a group row to have "no honest value"
+/// about, the way a real sheep's absent pid does -- a load can park a
+/// different set of fields on each slot, so CFG joins the per-instance
+/// facts rather than the per-app ones. FOLD and SMIT read the first
+/// member's, since both are per-app facts every instance shares.
 fn group_cell(app: &App, name: &str, column: Column, totals: &GroupTotals) -> String {
     match column {
-        Column::Id | Column::Pid | Column::Exit => String::new(),
+        Column::Id | Column::Pid | Column::Exit | Column::Cfg => String::new(),
         Column::Name => format!("{name} \u{d7}{}", totals.count),
         Column::Status => app.group_status_text(name),
         Column::Restarts => totals.restarts.to_string(),
@@ -532,6 +553,9 @@ fn cell(app: &App, row: &Row, column: Column, grouped: bool) -> String {
         // `crate::output::exit_cell`, not a second implementation of the
         // code/signal split -- see `Column::Exit`'s own doc.
         Column::Exit => exit_cell(info.pid, info.last_exit),
+        // `crate::output::cfg_cell`, not a second implementation of the
+        // pending-over-overridden precedence -- see `Column::Cfg`'s own doc.
+        Column::Cfg => cfg_cell(info.pending.as_deref(), info.overridden.as_deref()),
         Column::Cpu => info
             .cpu_percent
             .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
@@ -582,14 +606,19 @@ mod tests {
     /// those three are the pane.
     #[test]
     fn columns_drop_in_a_fixed_order_as_the_terminal_narrows() {
-        assert_eq!(columns_for(300).len(), 11);
-        assert_eq!(columns_for(116).len(), 11);
-        assert!(!columns_for(115).contains(&Column::Smit));
-        assert!(columns_for(115).contains(&Column::Fold));
-        assert_eq!(columns_for(101).len(), 10);
-        assert!(!columns_for(100).contains(&Column::Fold));
-        assert!(columns_for(100).contains(&Column::Exit));
+        assert_eq!(columns_for(300).len(), 12);
+        assert_eq!(columns_for(122).len(), 12);
+        assert!(!columns_for(121).contains(&Column::Smit));
+        assert!(columns_for(121).contains(&Column::Fold));
+        assert_eq!(columns_for(107).len(), 11);
+        assert!(!columns_for(106).contains(&Column::Fold));
+        assert!(columns_for(106).contains(&Column::Exit));
+        assert!(columns_for(106).contains(&Column::Cfg));
+        assert_eq!(columns_for(95).len(), 10);
+        // CFG (task 12) drops in the same breath as EXIT: both are absent
+        // from `NO_EXIT` and every narrower tier.
         assert!(!columns_for(88).contains(&Column::Exit));
+        assert!(!columns_for(88).contains(&Column::Cfg));
         assert!(columns_for(88).contains(&Column::Restarts));
         assert!(!columns_for(77).contains(&Column::Restarts));
         assert!(!columns_for(67).contains(&Column::Pid));
@@ -917,6 +946,7 @@ mod tests {
             fit("", Column::Pid.width()),          // PID: blank, no single pid
             fit("0", Column::Restarts.width()),    // RESTARTS: summed, all zero
             fit("", Column::Exit.width()),         // EXIT: blank, no single exit
+            fit("", Column::Cfg.width()),          // CFG: blank, per-instance fact
             fit("-", Column::Cpu.width()),         // CPU: no reading on any instance
             // 100 + 150 + 50 = 300 MiB, summed rather than averaged.
             fit("300.0M", Column::Mem.width()),
@@ -972,6 +1002,7 @@ mod tests {
             fit("4002", Column::Pid.width()),
             fit("0", Column::Restarts.width()),
             fit("-", Column::Exit.width()),
+            fit("-", Column::Cfg.width()),
             fit("-", Column::Cpu.width()),
             fit("-", Column::Mem.width()),
             fit("30s", Column::Uptime.width()),

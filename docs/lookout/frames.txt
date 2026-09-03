@@ -30,14 +30,14 @@ All three panes at 120x30: the host strip under the title, the detail pane and t
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -64,14 +64,14 @@ One errored, one waiting to restart, one stopped, with the selection parked on t
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         errored          -        14        1          -       -         1h 18m    edge        -            
-  3     billing-r…  waiting-restart  -        3         1          -       -         1h 19m    -           -            
-  4     cron        stopped          -        0         SIGTERM    -       -         1h 21m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  errored          -        14        1          -     -       -         1h 18m    edge      
+  3     billing-reconcilia…  waiting-restart  -        3         1          -     -       -         1h 19m    -         
+  4     cron                 stopped          -        0         SIGTERM    -     -       -         1h 21m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -98,13 +98,13 @@ Three instances of one app under a group header, with the cursor parked on the h
 
 shep lookout   /home/ada/.shep                                                                            4 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 16.5%   flock mem 781.0M   up 6d 3h           
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  3     api         online           48219    1         -          7.1%    241.0M    1h 29m    edge        -            
->       web ×3      online                    3                    9.4%    540.0M    15m       edge        -            
-  0      ↳ :0       online           48400    0         -          3.4%    182.0M    1h 25m                             
-  1      ↳ :1       online           48401    2         -          2.9%    178.0M    15m                                
-  2      ↳ :2       online           48402    1         -          3.1%    180.0M    2h 40m                             
+  3     api                  online           48219    1         -          -     7.1%    241.0M    1h 29m    edge      
+>       web ×3               online                    3                          9.4%    540.0M    15m       edge      
+  0      ↳ :0                online           48400    0         -          -     3.4%    182.0M    1h 25m              
+  1      ↳ :1                online           48401    2         -          -     2.9%    178.0M    15m                 
+  2      ↳ :2                online           48402    1         -          -     3.1%    180.0M    2h 40m              
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -132,7 +132,7 @@ No sheep registered. Each of the three panes says why it is empty, and the three
 
 shep lookout   /home/ada/.shep                                                        0 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu -   flock mem -   up 6d 3h
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 the flock is empty                                                                                  
                                                                                                     
@@ -195,14 +195,14 @@ The shepherd stopped answering. Five attempts over about eight seconds before th
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 the shepherd stopped answering — reconnecting (attempt 3)                                                               
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -229,14 +229,14 @@ The ladder ran out. Last known values stay, the uptime clock has stopped, and so
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 the shepherd has died — these values are frozen as of 2026-08-14 14:32:07                                               
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         errored          -        14        1          -       -         1h 18m    edge        -            
-  3     billing-r…  waiting-restart  -        3         1          -       -         1h 19m    -           -            
-  4     cron        stopped          -        0         SIGTERM    -       -         1h 21m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 22m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 15m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 16m    edge        -            
+> 2     api                  errored          -        14        1          -     -       -         1h 18m    edge      
+  3     billing-reconcilia…  waiting-restart  -        3         1          -     -       -         1h 19m    -         
+  4     cron                 stopped          -        0         SIGTERM    -     -       -         1h 21m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 22m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 15m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 16m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -262,14 +262,14 @@ q quit   j/k select   g/G first/last   r refresh   / filter                     
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -296,10 +296,10 @@ Mid-type at 100x14. The table has already narrowed to the two sheep whose names 
 
 shep lookout   /home/ada/.shep                                                   2 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-> 0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 0     web          online           48211    0         -          -     3.4%    182.0M    1h 25m  
+  1     web          online           48212    0         -          -     2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -314,10 +314,10 @@ The same query applied. The box is closed, the table is still narrowed, and the 
 
 shep lookout   /home/ada/.shep                                                   2 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-> 0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 0     web          online           48211    0         -          -     3.4%    182.0M    1h 25m  
+  1     web          online           48212    0         -          -     2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -332,7 +332,7 @@ A query nothing matches. The table names the query rather than claiming the floc
 
 shep lookout   /home/ada/.shep                                                   0 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 no sheep's name contains "zzz"                                                                      
                                                                                                     
@@ -350,14 +350,14 @@ filter  zzz▏   enter applies   esc cancels   ctrl-c quits                     
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -373,14 +373,14 @@ q quit   j/k select   g/G first/last   r refresh   / filter                     
 12 rows: no optional panes at all. This is 12a's frame, and the only thing that changed is the two-column gutter the marker sits in.
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
 q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
@@ -390,14 +390,14 @@ The feed under a burst: 3.8 megabytes were never read and some hundreds of lines
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -424,14 +424,14 @@ The selected sheep has never written a log in this $SHEP_HOME. The feed names th
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -488,14 +488,14 @@ q quit   j/k select   … read-only
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  usage is not available on this platform   flock cpu 14.7%   flock mem 716.0M                                      
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -522,14 +522,14 @@ The detail pane with a lamb list: how many descendants the shepherd's walk found
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h           
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api         online           48219    1         -          7.1%    241.0M    1h 28m    edge        -            
-  3     billing-r…  online           48230    0         -          0.8%    96.0M     1h 29m    -           -            
-  4     cron        online           48233    0         -          0.1%    8.0M      1h 31m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+> 2     api                  online           48219    1         -          -     7.1%    241.0M    1h 28m    edge      
+  3     billing-reconcilia…  online           48230    0         -          -     0.8%    96.0M     1h 29m    -         
+  4     cron                 online           48233    0         -          -     0.1%    8.0M      1h 31m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -556,14 +556,14 @@ The same pane on a stopped sheep. The shepherd had no pid to walk from and left 
 
 shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 6.7%   flock mem 371.0M   up 6d 3h            
-  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
+  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  2     api         errored          -        14        1          -       -         1h 18m    edge        -            
-  3     billing-r…  waiting-restart  -        3         1          -       -         1h 19m    -           -            
-> 4     cron        stopped          -        0         SIGTERM    -       -         1h 21m    -           -            
-  5     metrics     online           48240    0         -          0.4%    11.0M     1h 32m    -           -            
-  0     web         online           48211    0         -          3.4%    182.0M    1h 25m    edge        -            
-  1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
+  2     api                  errored          -        14        1          -     -       -         1h 18m    edge      
+  3     billing-reconcilia…  waiting-restart  -        3         1          -     -       -         1h 19m    -         
+> 4     cron                 stopped          -        0         SIGTERM    -     -       -         1h 21m    -         
+  5     metrics              online           48240    0         -          -     0.4%    11.0M     1h 32m    -         
+  0     web                  online           48211    0         -          -     3.4%    182.0M    1h 25m    edge      
+  1     web                  online           48212    0         -          -     2.9%    178.0M    1h 26m    edge      
                                                                                                                         
                                                                                                                         
                                                                                                                         
@@ -590,14 +590,14 @@ q quit   j/k select   g/G first/last   r refresh   / filter                     
 
 shep lookout   /home/ada/.shep                                                        6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api                online           48219    1         -          7.1%    241.0M    1h 28m  
-  3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
-  4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
-  5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 2     api          online           48219    1         -          -     7.1%    241.0M    1h 28m  
+  3     billing-re…  online           48230    0         -          -     0.8%    96.0M     1h 29m  
+  4     cron         online           48233    0         -          -     0.1%    8.0M      1h 31m  
+  5     metrics      online           48240    0         -          -     0.4%    11.0M     1h 32m  
+  0     web          online           48211    0         -          -     3.4%    182.0M    1h 25m  
+  1     web          online           48212    0         -          -     2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -608,14 +608,14 @@ Enter pressed. The request is out and nothing on the table has changed, because 
 
 shep lookout   /home/ada/.shep                                                        6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api                online           48219    1         -          7.1%    241.0M    1h 28m  
-  3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
-  4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
-  5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 2     api          online           48219    1         -          -     7.1%    241.0M    1h 28m  
+  3     billing-re…  online           48230    0         -          -     0.8%    96.0M     1h 29m  
+  4     cron         online           48233    0         -          -     0.1%    8.0M      1h 31m  
+  5     metrics      online           48240    0         -          -     0.4%    11.0M     1h 32m  
+  0     web          online           48211    0         -          -     3.4%    182.0M    1h 25m  
+  1     web          online           48212    0         -          -     2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -626,13 +626,13 @@ The shepherd refused while the request was out, and its own sentence is forwarde
 
 shep lookout   /home/ada/.shep                                                        5 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 7.6%   flock mem 475.0M  …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-> 3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
-  4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
-  5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 3     billing-re…  online           48230    0         -          -     0.8%    96.0M     1h 29m  
+  4     cron         online           48233    0         -          -     0.1%    8.0M      1h 31m  
+  5     metrics      online           48240    0         -          -     0.4%    11.0M     1h 32m  
+  0     web          online           48211    0         -          -     3.4%    182.0M    1h 25m  
+  1     web          online           48212    0         -          -     2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -644,14 +644,14 @@ The shepherd answered. The bar says what it did, in the non-grave style a refusa
 
 shep lookout   /home/ada/.shep                                                        6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api                online           48299    2         -          7.1%    241.0M    1h 18m  
-  3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
-  4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
-  5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 2     api          online           48299    2         -          -     7.1%    241.0M    1h 18m  
+  3     billing-re…  online           48230    0         -          -     0.8%    96.0M     1h 29m  
+  4     cron         online           48233    0         -          -     0.1%    8.0M      1h 31m  
+  5     metrics      online           48240    0         -          -     0.4%    11.0M     1h 32m  
+  0     web          online           48211    0         -          -     3.4%    182.0M    1h 25m  
+  1     web          online           48212    0         -          -     2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
                                                                                                     
@@ -663,14 +663,14 @@ An action key pressed while the link is coming back. The refusal names the same 
 shep lookout   /home/ada/.shep                                                        6 in the flock
 the shepherd stopped answering — reconnecting (attempt 3)                                           
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
-  ID    NAME               STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME  
+  ID    NAME         STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME  
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-> 2     api                online           48219    1         -          7.1%    241.0M    1h 28m  
-  3     billing-reconcil…  online           48230    0         -          0.8%    96.0M     1h 29m  
-  4     cron               online           48233    0         -          0.1%    8.0M      1h 31m  
-  5     metrics            online           48240    0         -          0.4%    11.0M     1h 32m  
-  0     web                online           48211    0         -          3.4%    182.0M    1h 25m  
-  1     web                online           48212    0         -          2.9%    178.0M    1h 26m  
+> 2     api          online           48219    1         -          -     7.1%    241.0M    1h 28m  
+  3     billing-re…  online           48230    0         -          -     0.8%    96.0M     1h 29m  
+  4     cron         online           48233    0         -          -     0.1%    8.0M      1h 31m  
+  5     metrics      online           48240    0         -          -     0.4%    11.0M     1h 32m  
+  0     web          online           48211    0         -          -     3.4%    182.0M    1h 25m  
+  1     web          online           48212    0         -          -     2.9%    178.0M    1h 26m  
                                                                                                     
                                                                                                     
 the shepherd stopped answering — reconnecting (attempt 3)                            control enabled

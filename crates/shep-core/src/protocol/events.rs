@@ -65,6 +65,16 @@ pub enum ProcessEventKind {
 /// (`process.exit`, `log.out`, `daemon.*` — spec §6 grammar).
 /// The daemon's server-side filter globs against `topic()`.
 // wire format: changing existing variants is a breaking change
+//
+// `large_enum_variant` allowed, not fixed, for the same reason
+// `Response`'s own `#[allow]` gives (see that type's doc): `Process` holds
+// a whole `ProcessInfo` inline, and task 12's own `pending`/`overridden`
+// fields are what pushed the spread past the lint's threshold this time.
+// Boxing would be a source break for every `BusEvent::Process { info, .. }`
+// in and out of this workspace, for nothing: an event is built once per
+// transition and serialized onto the bus immediately, so the size it
+// occupies on one stack frame in between is not a cost anybody pays.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // Adjacent tagging chosen because internally-tagged form cannot compile:
 // the `Process` variant has its own `event: ProcessEventKind` field, which
@@ -213,6 +223,8 @@ mod tests {
                     instance: None,
                     handshook: None,
                     dog_stale: None,
+                    pending: None,
+                    overridden: None,
                 },
                 manually: false,
                 at_ms: 1_700_000_000_000,
@@ -364,6 +376,8 @@ mod tests {
                     instance: None,
                     handshook: None,
                     dog_stale: None,
+                    pending: None,
+                    overridden: None,
                 },
                 manually: true,
                 at_ms: 0,

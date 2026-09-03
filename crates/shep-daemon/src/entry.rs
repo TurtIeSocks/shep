@@ -53,6 +53,26 @@ pub struct ProcessEntry {
     /// `false` whenever [`Self::pending`] is `None`, which is every sheep
     /// outside a parking window.
     pub pending_reidentifies: bool,
+    /// The [`AppConfig`](shep_core::config::AppConfig) field NAMES an
+    /// operator has set on this sheep that its current Flockfile does not
+    /// declare, in field-name order. Empty for a sheep no load has ever
+    /// touched, and every sheep before task 12 shipped.
+    ///
+    /// Cached here rather than read from the override store
+    /// (`shep_core::overrides`) at listing time: `Actor::handle_apply_config`
+    /// already does that store's one file read per load, and `to_info` is
+    /// called on every listing -- far more often than a load happens. Written
+    /// in `Actor::apply_one`, from the same `next_overrides` ledger that
+    /// function writes back to the store, so this field and the store agree
+    /// by construction rather than by a second read. Names only, never
+    /// values, for the reason [`ProcessInfo::overridden`](shep_core::protocol::ProcessInfo::overridden)'s
+    /// own doc gives (IR-41).
+    ///
+    /// Not carried across a handover: a successor rebuilds it at the next
+    /// load, and until then reports no overrides for a sheep that has some
+    /// on record. A known gap, not a silent one -- see this crate's own
+    /// handover module for what it does and does not carry.
+    pub overridden: Vec<String>,
     /// Instance number within the app (for clustered apps, 0..instances-1)
     pub instance: u32,
     /// Current lifecycle status
