@@ -2756,6 +2756,42 @@ const EXTRAS_FIELDS: &[&str] = &[
     "liveness_probe",
 ];
 
+/// Records what a load's `env` branch just merged: the file's env keys are
+/// established from here, and an override of one is spent.
+///
+/// Called from the two arms that merge `env` and from neither of the others,
+/// which is the whole of the fix this function exists for. It used to be two
+/// blanket statements below the match, so [`ResetDepth::Settings`] -- the one
+/// depth that touches `env` not at all -- established every env key the file
+/// declared and spent every env override the file named. A `--reset` against
+/// a template that had grown `NEW_KEY` reported nothing, merged nothing, and
+/// recorded `declared_env: ["NEW_KEY"]`, after which no plain load could ever
+/// append it, because it was established. Only `--reset-all` recovered, and
+/// that takes every other env value with it.
+///
+/// One gap is left, and deliberately: under [`ResetDepth::None`] an env key
+/// skipped because an override already holds it is established anyway, so
+/// clearing that override later leaves the key permanently out of scope. It
+/// needs a per-key record the env branch has no arm to hang one on, and it is
+/// not reachable from anything that edits env today, because nothing does.
+///
+/// `declared_env` is a high-water mark, never a snapshot of the current file:
+/// a key this file has stopped declaring is still a key somebody once
+/// established, and a later load must not be able to re-appear with a new
+/// value for it under a depth that promises to overwrite nothing.
+fn establish_env(next: &mut AppOverrides, incoming: &DeclaredApp) {
+    if let Some(serde_json::Value::Object(env)) = next.fields.get_mut("env") {
+        for key in &incoming.declared_env {
+            env.remove(key);
+        }
+        if env.is_empty() {
+            next.fields.remove("env");
+        }
+    }
+    next.declared_env
+        .extend(incoming.declared_env.iter().cloned());
+}
+
 /// Merges what a Flockfile declares into what a sheep is running, returning
 /// the merged config and the override record to write back.
 ///
@@ -2880,6 +2916,7 @@ fn merge_declared(
                     .cloned()
                     .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
             );
+            establish_env(&mut next, incoming);
         }
         _ => {
             let overridden_env: BTreeSet<&String> = overrides
@@ -2901,42 +2938,9 @@ fn merge_declared(
                 "env".to_string(),
                 serde_json::to_value(env).map_err(|err| err.to_string())?,
             );
+            establish_env(&mut next, incoming);
         }
     }
-    // The file's env keys are its own from here, exactly as its top-level
-    // keys are: an override of one is spent.
-    if let Some(serde_json::Value::Object(env)) = next.fields.get_mut("env") {
-        for key in &incoming.declared_env {
-            env.remove(key);
-        }
-        if env.is_empty() {
-            next.fields.remove("env");
-        }
-    }
-
-    // Both sets are a high-water mark, never a snapshot of the current file:
-    // a key this file has stopped declaring is still a key somebody once
-    // established, and a later load must not be able to re-appear with a new
-    // value for it under a depth that promises to overwrite nothing.
-    //
-    // The two are built DIFFERENTLY, and this is the statement that says so.
-    // `declared` is written key by key, up at the arm that actually takes the
-    // file's value, because a key held out of scope was not established by
-    // this load and marking it so would establish a value that never landed.
-    // `declared_env` is the blanket extend below: the env branch above has no
-    // equivalent per-key arm to hang an insert on, since it merges a whole
-    // table rather than assigning one value at a time.
-    //
-    // That asymmetry is a known gap rather than a considered split, and it
-    // has two shapes. Under `Settings` the env branch merges nothing at all
-    // and this line still establishes every env key the file declared. Under
-    // `None` an env key skipped because an override already holds it is
-    // established anyway, so clearing that override later leaves the key
-    // permanently out of scope. Both predate the key-by-key `declared` and
-    // belong with the slice that adds env editing; neither is reachable from
-    // anything that edits env today, because nothing does.
-    next.declared_env
-        .extend(incoming.declared_env.iter().cloned());
 
     let merged: AppConfig =
         serde_json::from_value(serde_json::Value::Object(merged)).map_err(|err| err.to_string())?;
@@ -22431,6 +22435,60 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "--reset-all removes the override record"
+        );
+    }
+
+    /// fails if a `--reset` establishes an env key it never merged. The
+    /// `Settings` depth touches env not at all, so a template that has grown
+    /// `NEW_KEY` reports nothing and merges nothing -- and used to record the
+    /// key as established anyway, after which no plain load could ever append
+    /// it and only `--reset-all` could recover, taking every other env value
+    /// with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_settings_reset_does_not_establish_an_env_key_it_never_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(&["name", "script"], Vec::new()),
+        )
+        .unwrap();
+
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.env = BTreeMap::from([("NEW_KEY".to_string(), "1".to_string())]);
+            declared_app(file, &["name", "script", "env"])
+        };
+        let reset = apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+
+        assert!(
+            actor.sheep[&0].entry.spec.config().env.is_empty(),
+            "a `--reset` merges no env at all: {reset:?}"
+        );
+        assert!(
+            shep_core::overrides::get(&actor.paths.overrides, "web")
+                .unwrap()
+                .expect("the load records what it established")
+                .declared_env
+                .is_empty(),
+            "a key that never merged is not established"
+        );
+
+        // The proof that matters: the plain load after it can still append.
+        let plain = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert_eq!(
+            actor.sheep[&0]
+                .entry
+                .pending
+                .as_ref()
+                .expect("an env change parks for the next spawn")
+                .config()
+                .env
+                .get("NEW_KEY")
+                .map(String::as_str),
+            Some("1"),
+            "{plain:?}"
         );
     }
 
