@@ -656,8 +656,10 @@ pub struct StartArgs {
     /// that same file would give it. Without this flag a load is additive:
     /// it appends keys nobody has set and overwrites nothing. `env` is
     /// operator-supplied data and survives even this reset; everything else
-    /// is operator-tuned policy, and resetting policy is recoverable. Refused when the target is a sheep
-    /// name rather than a Flockfile, since a name reads no file to reset to.
+    /// is operator-tuned policy, and resetting policy is recoverable.
+    /// Refused when the target supplies no template to reset to: a sheep
+    /// name reads no file, and a bare script path is a command line rather
+    /// than a file.
     #[arg(long, conflicts_with = "reset_all")]
     pub reset: bool,
     /// Put everything back to what the Flockfile says, including env, and
@@ -665,9 +667,9 @@ pub struct StartArgs {
     ///
     /// The wider of the two resets: `--reset` keeps `env` because it is
     /// operator-supplied data, not policy, and losing it takes the app's
-    /// database away. This flag drops it too. Refused when the target is a
-    /// sheep name rather than a Flockfile, since a name reads no file to
-    /// reset to.
+    /// database away. This flag drops it too. Refused on the same targets
+    /// `--reset` is: a sheep name reads no file, and a bare script path is a
+    /// command line rather than a file.
     #[arg(long = "reset-all")]
     pub reset_all: bool,
 }
