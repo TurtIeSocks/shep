@@ -1408,8 +1408,8 @@ mod tests {
         let rows: Vec<ProcessInfo> = (0..3)
             .map(|slot| {
                 ProcessInfo::builder(slot, "web", ProcStatus::Online)
-                    .pid(Some(4242 + u32::try_from(slot).unwrap()))
-                    .instance(Some(u32::try_from(slot).unwrap()))
+                    .pid(Some(4242 + slot))
+                    .instance(Some(slot))
                     .pending(Some(vec!["cwd".to_string()]))
                     .overridden(Some(vec!["max_restarts".to_string()]))
                     .build()
