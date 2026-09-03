@@ -28,6 +28,7 @@ mod table;
 // double-width name. The same reasoning `paint` above is public for.
 pub(crate) mod width;
 
+use std::collections::BTreeSet;
 use std::io;
 
 use serde::Serialize;
@@ -608,13 +609,25 @@ pub fn emit_described(
                 )?;
                 write!(out, "{}", table_of(&LambRows(lambs.clone()), style))?;
             }
+            // ONCE PER NAME, not once per row, and neither heading names an
+            // id. A parked or overridden config belongs to the app: the
+            // daemon writes the same store entry onto every slot of a name,
+            // so a three-instance app printed three identical blocks, and a
+            // heading naming one slot's id would say the block applied to
+            // that slot alone. The table above already carries the ids.
+            //
+            // The rows themselves stay per instance. This is a claim about
+            // config, which is shared, not about a process, which is not.
+            let mut said: BTreeSet<&str> = BTreeSet::new();
             for sheep in &flock.0 {
+                if !said.insert(sheep.name.as_str()) {
+                    continue;
+                }
                 if let Some(fields) = sheep.pending.as_deref().filter(|f| !f.is_empty()) {
                     writeln!(
                         out,
-                        "\nPending for {} (id {}), parked by a load; `shep reload {}` \
-                         promotes it:",
-                        sheep.name, sheep.id, sheep.name,
+                        "\nPending for {}, parked by a load; `shep reload {}` promotes it:",
+                        sheep.name, sheep.name,
                     )?;
                     for field in fields {
                         writeln!(out, "  {field}")?;
@@ -623,9 +636,8 @@ pub fn emit_described(
                 if let Some(fields) = sheep.overridden.as_deref().filter(|f| !f.is_empty()) {
                     writeln!(
                         out,
-                        "\nOverridden for {} (id {}), fields its current Flockfile does \
-                         not declare:",
-                        sheep.name, sheep.id,
+                        "\nOverridden for {}, fields its current Flockfile does not declare:",
+                        sheep.name,
                     )?;
                     for field in fields {
                         writeln!(out, "  {field}")?;
@@ -1348,22 +1360,82 @@ mod tests {
     /// follows for lambs.
     #[test]
     fn a_sheep_with_neither_list_renders_neither_heading() {
-        let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
-            .pid(Some(4242))
-            .build();
+        // Both spellings of "nothing to say". `None` is a daemon that
+        // carried no list at all; `Some(vec![])` is one that carried an
+        // empty one, which is what the store answers for an app with no
+        // parked config. The empty filter on each `as_deref` is the only
+        // thing standing between the second and a heading over no fields,
+        // so a test that only passed `None` would not notice its removal.
+        for (pending, overridden) in [
+            (None, None),
+            (Some(Vec::new()), Some(Vec::new())),
+            (None, Some(Vec::new())),
+            (Some(Vec::new()), None),
+        ] {
+            let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
+                .pid(Some(4242))
+                .pending(pending.clone())
+                .overridden(overridden.clone())
+                .build();
+            let mut out = Vec::new();
+            emit_described(
+                &mut out,
+                Format::Table,
+                "describe",
+                vec![info],
+                Presentation::BARE,
+            )
+            .unwrap();
+            let rendered = String::from_utf8(out).unwrap();
+
+            assert!(
+                !rendered.contains("Pending for"),
+                "{pending:?}/{overridden:?}: {rendered}"
+            );
+            assert!(
+                !rendered.contains("Overridden for"),
+                "{pending:?}/{overridden:?}: {rendered}"
+            );
+        }
+    }
+
+    /// fails if a clustered app prints its parked config once per instance.
+    /// `apply_one` writes the same store entry onto every slot of a name, so
+    /// three rows carry three identical lists and the operator reads the
+    /// same block three times.
+    #[test]
+    fn a_clustered_app_prints_each_config_section_once() {
+        let rows: Vec<ProcessInfo> = (0..3)
+            .map(|slot| {
+                ProcessInfo::builder(slot, "web", ProcStatus::Online)
+                    .pid(Some(4242 + u32::try_from(slot).unwrap()))
+                    .instance(Some(u32::try_from(slot).unwrap()))
+                    .pending(Some(vec!["cwd".to_string()]))
+                    .overridden(Some(vec!["max_restarts".to_string()]))
+                    .build()
+            })
+            .collect();
         let mut out = Vec::new();
         emit_described(
             &mut out,
             Format::Table,
             "describe",
-            vec![info],
+            rows,
             Presentation::BARE,
         )
         .unwrap();
         let rendered = String::from_utf8(out).unwrap();
 
-        assert!(!rendered.contains("Pending for"), "{rendered}");
-        assert!(!rendered.contains("Overridden for"), "{rendered}");
+        assert_eq!(
+            rendered.matches("Pending for web").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("Overridden for web").count(),
+            1,
+            "{rendered}"
+        );
     }
 
     /// fails if the JSON surface changes shape for pending/overridden, the
