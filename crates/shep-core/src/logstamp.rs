@@ -68,6 +68,7 @@ pub const LOG_STAMP_BYTES: usize = 30;
 /// width [`LOG_STAMP_BYTES`] no longer describes. Every reader strips the
 /// prefix by that count, so an edit that changed it would otherwise be found
 /// by a reader's mangled output rather than by a test run.
+#[track_caller]
 pub fn stamp_into(buf: &mut String) {
     let start = buf.len();
     // Infallible: the only way `write!` to a `String` fails is a `Display`
