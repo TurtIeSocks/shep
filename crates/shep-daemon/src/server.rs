@@ -1325,6 +1325,12 @@ mod tests {
             ],
             std::process::id(),
         );
+        // This case drives a real socket, so it cannot pause its clock to
+        // walk the attribution warm-up. It is about what the ladder SAYS
+        // about an anonymous connection, not about the gate in front of it,
+        // and `dogs::a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // covers the boundary.
+        h.ctx.peer_contacts.force_warm();
         let dog = start_dog(&h.ctx, "log-rotate").await;
         assert_eq!(
             dog.pid,

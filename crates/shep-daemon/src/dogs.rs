@@ -560,25 +560,33 @@ const PEER_CONTACT_CAPACITY: usize = 1024;
 /// How long this map must have been watching before a pid's ABSENCE from it
 /// means anything.
 ///
-/// `Contact::None` supports exactly one claim, that a dog is not reaching
-/// this shepherd's socket, and that claim is only the map's to make about a
-/// stretch it was actually listening for. A successor built by
-/// [`crate::boot`] starts empty at every `execve`, so without this every dog
-/// carried across a `shep daemon reload` looked, for the first few seconds,
-/// exactly like a dog that had never called: absent from the map, and
-/// therefore `Unreachable`, and therefore told to reinstall a binary that was
-/// fine. That is the message this whole ladder exists to stop shep guessing.
+/// `Contact::None` supports exactly one claim, that a dog is not reaching this
+/// shepherd's socket, and that claim is only the map's to make about a stretch
+/// it was actually listening for. A successor built by [`crate::boot`] starts
+/// empty at every `execve`, so without this every dog carried across a
+/// `shep daemon reload` looked, for its first seconds, exactly like a dog that
+/// had never called: absent from the map, therefore `Unreachable`, therefore
+/// told to reinstall a binary that was fine.
 ///
-/// Three budgets rather than two. The ladder restarts a silent dog at one
-/// [`DOG_SILENCE_BUDGET`] and writes the stale verdict at two, so a dog
-/// judged at boot plus two has been observed for this daemon's entire life
-/// and proves nothing about its own reachability. A third budget is the
-/// margin that makes an absence real: shep was up, listening, and unspoken to
-/// for a whole budget longer than the dog's own silence.
+/// One budget, and the ladder WAITS for it rather than racing it. That
+/// pairing is the whole design and neither half works alone. An earlier
+/// version made this three budgets and left the watch running, which put the
+/// stale verdict at two budgets against a map that was still cold: every
+/// unreachable dog then got the unattributable message, `silent_dogs` dropped
+/// it from later looks because it was stale, and the reinstall advice this
+/// ladder exists to earn became unreachable in practice. Deleting a true
+/// message is as much a defect as inventing one.
+///
+/// So [`spawn_silent_dog_watch`] judges nothing while this is warming, and a
+/// dog's silence is measured from when this shepherd could actually observe
+/// it. The stale verdict lands one warm-up later than it used to and reads a
+/// map that has been listening for two budgets by then.
 ///
 /// Before it elapses `from_pid` answers [`Contact::Unknown`], which routes to
 /// `Silence::Unattributed` and names both candidates instead of picking one.
-const PEER_CONTACT_WARMUP: Duration = DOG_SILENCE_BUDGET.saturating_mul(3);
+/// That arm is still reachable, on the path it is actually for: a platform
+/// that will not name a peer's pid.
+const PEER_CONTACT_WARMUP: Duration = DOG_SILENCE_BUDGET;
 
 /// What this daemon has observed arriving on its socket, keyed by the
 /// connecting process's pid.
@@ -621,32 +629,22 @@ const PEER_CONTACT_WARMUP: Duration = DOG_SILENCE_BUDGET.saturating_mul(3);
 /// `Debug` is derived and needs no redaction (IR-41), for the same reason
 /// [`DogRefusals`]'s is: the map holds pids and two booleans' worth of
 /// fact, and no configuration value can reach it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PeerContacts {
     seen: Arc<Mutex<Contacts>>,
-    /// When this map started watching, which is this daemon's own boot.
-    ///
-    /// Outside the lock because nothing writes it after construction, and
-    /// cloned with the handle so every clone agrees about the same daemon.
-    ///
-    /// [`tokio::time::Instant`], matching `SilentDogs` and for the same
-    /// reason: a test can move that clock rather than sleeping out three
-    /// whole budgets to watch the warm-up expire.
-    watching_since: Instant,
-}
-
-impl Default for PeerContacts {
-    fn default() -> Self {
-        Self {
-            seen: Arc::default(),
-            watching_since: Instant::now(),
-        }
-    }
 }
 
 /// What [`PeerContacts`] holds, under its one lock.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Contacts {
+    /// When this map started watching, which is this daemon's own boot.
+    ///
+    /// [`tokio::time::Instant`], matching `SilentDogs` and for the same
+    /// reason: a paused test moves that clock instead of sleeping out a whole
+    /// budget. Under the lock rather than beside it so a test that cannot
+    /// pause its clock, because it drives a real socket, can back-date it
+    /// through `&self` instead.
+    watching_since: Instant,
     /// One entry per remembered peer pid, at most
     /// [`PEER_CONTACT_CAPACITY`] of them.
     by_pid: BTreeMap<u32, Seen>,
@@ -753,6 +751,27 @@ impl PeerContacts {
         seen.evict_oldest();
     }
 
+    /// Whether this map is still too new for an absence to mean anything.
+    ///
+    /// Read by [`spawn_silent_dog_watch`], which judges no dog while it is
+    /// true. See `PEER_CONTACT_WARMUP` for why the ladder waits rather than
+    /// races.
+    #[must_use]
+    pub fn is_warming(&self) -> bool {
+        self.lock().watching_since.elapsed() < PEER_CONTACT_WARMUP
+    }
+
+    /// Back-dates the watching clock so this map reads as warm.
+    ///
+    /// For the cases that drive a REAL socket and so cannot pause their
+    /// clock. `a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+    /// is the one that walks the boundary, and it does not use this.
+    #[cfg(test)]
+    pub(crate) fn force_warm(&self) {
+        let mut seen = self.lock();
+        seen.watching_since = Instant::now() - PEER_CONTACT_WARMUP * 2;
+    }
+
     /// What has been seen from `pid`, or [`Contact::Unknown`] when there is
     /// no pid to ask about.
     #[must_use]
@@ -760,10 +779,11 @@ impl PeerContacts {
         let Some(pid) = pid else {
             return Contact::Unknown;
         };
-        match self.lock().by_pid.get(&pid) {
+        let seen = self.lock();
+        match seen.by_pid.get(&pid) {
             // Absence is a finding only once this map has been watching long
             // enough for it to be one. See `PEER_CONTACT_WARMUP`.
-            None if self.watching_since.elapsed() < PEER_CONTACT_WARMUP => Contact::Unknown,
+            None if seen.watching_since.elapsed() < PEER_CONTACT_WARMUP => Contact::Unknown,
             None => Contact::None,
             Some(seen) if seen.named_a_dog => Contact::Named,
             Some(_) => Contact::Anonymous,
@@ -778,6 +798,16 @@ impl PeerContacts {
     /// would be the worse failure.
     fn lock(&self) -> std::sync::MutexGuard<'_, Contacts> {
         self.seen.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Default for Contacts {
+    fn default() -> Self {
+        Self {
+            watching_since: Instant::now(),
+            by_pid: BTreeMap::new(),
+            clock: 0,
+        }
     }
 }
 
@@ -1016,6 +1046,16 @@ pub(crate) async fn check_silent_dogs(
     // A stopped engine has no dogs left to wait on. `seen` is left untouched
     // rather than cleared: a look that could not see the flock has learned
     // nothing about it, and must not hand every dog a fresh budget.
+    // Nothing is judged while attribution is still maturing. A verdict
+    // written now would read a cold map, and the stale rung is spent once:
+    // `silent_dogs` drops a stale dog from every later look, so a wrong
+    // answer here is the LAST answer. `seen` is left untouched for the same
+    // reason the stopped-engine arm above leaves it: a look that could not
+    // judge has learned nothing, and each dog's budget starts when this
+    // shepherd could actually observe it. See `PEER_CONTACT_WARMUP`.
+    if contacts.is_warming() {
+        return Vec::new();
+    }
     let Ok(infos) = supervisor.list_checked().await else {
         return Vec::new();
     };
@@ -2063,6 +2103,11 @@ mod tests {
             ProcScript::never_exits(),
         ]);
         start_test_dog(&h.ctx, "metrics").await;
+        // Past the warm-up: the ladder judges nothing while attribution is
+        // still maturing, and this case is about the rungs rather than the
+        // gate. `a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // walks the boundary itself.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
         let refusals = &h.ctx.dog_refusals;
         let contacts = &h.ctx.peer_contacts;
         let events = &h.ctx.events;
@@ -2211,6 +2256,11 @@ mod tests {
     async fn asking_repeatedly_does_not_advance_the_ladder() {
         let h = crate::testing::harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         start_test_dog(&h.ctx, "metrics").await;
+        // Past the warm-up: the ladder judges nothing while attribution is
+        // still maturing, and this case is about the rungs rather than the
+        // gate. `a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // walks the boundary itself.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
         let refusals = &h.ctx.dog_refusals;
         let contacts = &h.ctx.peer_contacts;
         let events = &h.ctx.events;
@@ -2263,10 +2313,102 @@ mod tests {
     /// `tokio::time::advance` wakes a sleeper whose deadline has elapsed,
     /// it does not itself drive the scheduler through everything that
     /// sleeper then does.
+    /// Fails if the warm-up swallows the one verdict it exists to protect.
+    ///
+    /// The regression this exists for: `PEER_CONTACT_WARMUP` was three
+    /// budgets while the ladder kept running, so the stale rung was spent at
+    /// two budgets against a map that was still cold. `Silence::of` answered
+    /// `Unattributed`, `silent_dogs` then dropped the dog because it was
+    /// stale, and no later look ever reclassified it. A dog that genuinely
+    /// never reached the socket could no longer be told to rebuild, which is
+    /// the exact advice this ladder exists to earn.
+    ///
+    /// A unit test over `from_pid` and `stale_verdict` passed throughout,
+    /// because both were right in isolation. That is the same shape as the
+    /// bug this whole branch is about, so this case walks the real watch
+    /// across the real boundary instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up() {
+        let h = crate::testing::harness(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+        ]);
+        start_test_dog(&h.ctx, "metrics").await;
+        let refusals = h.ctx.dog_refusals.clone();
+        let contacts = h.ctx.peer_contacts.clone();
+        assert!(contacts.is_warming(), "a fresh map starts cold");
+
+        let watch = spawn_silent_dog_watch(
+            h.ctx.supervisor.clone(),
+            refusals.clone(),
+            contacts.clone(),
+            h.ctx.events.clone(),
+        );
+        tokio::task::yield_now().await;
+
+        // Nothing may be judged while the map is cold, however long the dog
+        // has been quiet. Walking a whole budget with the watch running is
+        // what proves the gate holds rather than merely exists.
+        let ticks_in_a_budget = (DOG_SILENCE_BUDGET.as_nanos() / DOG_SILENCE_POLL.as_nanos())
+            .try_into()
+            .expect("a silence budget of a few seconds fits in a u32 tick count");
+        for _ in 0..ticks_in_a_budget {
+            tokio::time::advance(DOG_SILENCE_POLL).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            refusals.stale().is_empty() && refusals.restarting().is_empty(),
+            "a cold map must judge nothing at all"
+        );
+
+        // Now warm, and the ladder gets its two rungs: a restart, then the
+        // stale verdict, this time read off a map that has been listening.
+        for _ in 0..(ticks_in_a_budget * 6) {
+            tokio::time::advance(DOG_SILENCE_POLL).await;
+            // A rung awaits a real restart through the supervisor, so the
+            // watch needs more than one yield per step to get through it.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        for _ in 0..512 {
+            if refusals.stale().contains(&"metrics".to_string()) {
+                break;
+            }
+            tokio::time::advance(DOG_SILENCE_POLL).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            refusals.stale().contains(&"metrics".to_string()),
+            "a dog nothing ever connected from must still reach the stale rung"
+        );
+        let info = h
+            .ctx
+            .supervisor
+            .list()
+            .await
+            .into_iter()
+            .find(|info| info.name == "metrics")
+            .expect("the dog fixture is listed");
+        let verdict = stale_verdict("metrics", Silence::of(info.pid, &contacts));
+        assert!(
+            verdict.contains("cannot reach this shep"),
+            "the earned rebuild advice must survive the warm-up: {verdict}"
+        );
+        watch.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_watcher_restarts_a_silent_dog_after_one_budget_of_paused_time() {
         let h = crate::testing::harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         start_test_dog(&h.ctx, "metrics").await;
+        // Past the warm-up: the ladder judges nothing while attribution is
+        // still maturing, and this case is about the rungs rather than the
+        // gate. `a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // walks the boundary itself.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
         let refusals = h.ctx.dog_refusals.clone();
 
         let watch = spawn_silent_dog_watch(
