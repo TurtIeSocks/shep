@@ -1243,6 +1243,13 @@ fn first_failure(earlier: ExitCode, later: ExitCode) -> ExitCode {
 /// A pending field always travels with the verb that promotes it. A list of
 /// names an operator cannot act on is a report nobody can use, and this is
 /// the one place the remedy is known.
+///
+/// The pending clause is a gerund, `waiting on`, rather than a finite verb.
+/// `join(", ")` produces a subject that is singular or plural depending on
+/// what the load parked, and `wait` (what this printed until 2026-09-03) read
+/// as a grammatical error on the common single-field case: `cwd wait for the
+/// next spawn`. A count conditional would agree correctly and would mean two
+/// spellings of one sentence; a gerund agrees with either subject and is one.
 fn applied_line(sheep: &SheepApplied) -> Option<String> {
     let name = &sheep.name;
     let mut parts = Vec::new();
@@ -1251,7 +1258,7 @@ fn applied_line(sheep: &SheepApplied) -> Option<String> {
     }
     if !sheep.pending.is_empty() {
         parts.push(format!(
-            "{} wait for the next spawn (`shep reload {name}` promotes them)",
+            "{} waiting on the next spawn (`shep reload {name}` promotes them)",
             sheep.pending.join(", ")
         ));
     }
