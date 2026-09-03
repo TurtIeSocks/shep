@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-09-03
+
+### Fixed
+
+- Say what to do about a protocol mismatch
+
+
 ### Changed
 
 - `ConnectError::ProtocolMismatch`'s `Display` says what to do about the

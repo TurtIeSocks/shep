@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-09-03
+
+### Added
+
+- Put the shepherd's give-up on a dog on the wire
+
+### Fixed
+
+- Keep a log line meaning one thing on both of its paths
+- Track_caller on stamp_into, as its Panics section requires
+
+
 ### Added
 
 - `ProcessInfo::dog_stale`: whether the shepherd has given up on a dog —

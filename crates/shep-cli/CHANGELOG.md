@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-09-03
+
+### Added
+
+- Stamp every log line with the time it was written
+- Make `silent` lead somewhere
+
+### Fixed
+
+- Keep a log line meaning one thing on both of its paths
+- Flush a narration line, or it can be lost outright
+- Stop prescribing a reinstall for every dog shep gave up on
+- Give `counting_lines` back the cfg its neighbour took
+- Stop the given-up note naming a cause it cannot know
+
+
 ### Added
 
 - `silent` leads somewhere. `shep flock` prints one line under the dogs table

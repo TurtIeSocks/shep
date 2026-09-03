@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.27"
+version = "0.1.28"
 edition = "2024"
 # 1.88 forced by serde-saphyr (let-chains, stabilized 1.88) — a current dep,
 # not a future one. Also the floor for ratatui/sysinfo/rmcp in later phases.
@@ -31,9 +31,9 @@ license = "MIT OR Apache-2.0"
 # the `[package]` table — so this literal is not sourced from
 # `workspace.package.version` above and a release bump has to touch both
 # places by hand. If that drifts, `cargo-release` is the mechanical fix.
-shep-core = { path = "crates/shep-core", version = "0.1.27" }
-shep-daemon = { path = "crates/shep-daemon", version = "0.1.27" }
-shep-client = { path = "crates/shep-client", version = "0.1.27" }
+shep-core = { path = "crates/shep-core", version = "0.1.28" }
+shep-daemon = { path = "crates/shep-daemon", version = "0.1.28" }
+shep-client = { path = "crates/shep-client", version = "0.1.28" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
