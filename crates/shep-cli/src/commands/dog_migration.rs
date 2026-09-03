@@ -7,11 +7,13 @@
 //! left unsupervised at exactly the moment nobody is watching.
 
 use core::fmt;
+use std::io::Write as _;
+use std::path::Path;
 
 use shep_core::config::{DogsConfig, DogsConfigError};
 use shep_core::paths::ShepPaths;
 
-use super::shep_toml::{ShepToml, ShepTomlError};
+use super::shep_toml::{ShepToml, ShepTomlError, create_config_file};
 
 /// Moves every `[dog.<name>]` section into `dogs.toml`, returning the names
 /// moved
@@ -102,9 +104,36 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         // sections only once the new file already holds them. A crash
         // between the two leaves them readable from `shep.toml`, which is
         // the direction that loses nothing.
-        std::fs::write(&paths.dogs_config, rendered).map_err(DogMigrationError::Write)?;
+        write_dogs_config(&paths.dogs_config, &rendered).map_err(DogMigrationError::Write)?;
         Ok(moved)
     })
+}
+
+/// Writes `rendered` to `path`: staged in a sibling temp file at
+/// `CONFIG_FILE_MODE`, `fsync`ed, then `rename`d over `path`.
+///
+/// The same three steps, through the same helper, that
+/// [`ShepToml::save`] writes `shep.toml` with, and for the same two
+/// reasons. **Mode**: these bytes are the ones that used to sit inside
+/// `shep.toml` at `0600`, and they are where `docs/dogs.md` tells an
+/// operator to paste a Discord or Slack webhook URL, which is a bearer
+/// token in a path. A `std::fs::write` here would create the file at the
+/// ambient umask, typically `0644`, so the migration itself would be the
+/// downgrade. `$SHEP_HOME` being `0700` does not answer it: a `tar`, a
+/// `cp -p` or a backup carries a file's own mode somewhere no directory
+/// mode follows. **Atomicity**: `std::fs::write` opens `O_TRUNC`, so a
+/// crash between the truncate and the write leaves a half-written
+/// `dogs.toml` behind; the rename installs the whole file or none of it.
+fn write_dogs_config(path: &Path, rendered: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = create_config_file(parent)?;
+    tmp.write_all(rendered.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    // `persist` is `rename(2)`. On failure the `NamedTempFile` comes back
+    // inside the error and its `Drop` removes the staging file, so a failed
+    // replace leaves nothing behind in `$SHEP_HOME`.
+    tmp.persist(path).map_err(|err| err.error)?;
+    Ok(())
 }
 
 /// Why `[dog.<name>]` could not be moved into `dogs.toml`
@@ -291,6 +320,27 @@ mod tests {
             before
         );
         assert!(!paths.dogs_config.exists(), "no sections means no file");
+    }
+
+    /// `dogs.toml` holds the webhook URLs that used to sit inside
+    /// `shep.toml` at `0600`, so it is created at `0600` too, at the `open`
+    /// rather than by a later `chmod`. Fails if the migration goes back to
+    /// `std::fs::write`, which would leave it at the ambient umask.
+    #[cfg(unix)]
+    #[test]
+    fn the_written_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, paths) = home_with("[dog.metrics]\nbind = \"127.0.0.1:9615\"\n");
+
+        migrate_dog_sections(&paths).expect("migrate");
+
+        let mode = std::fs::metadata(&paths.dogs_config)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
     }
 
     // The one case that must never silently merge: an operator who already

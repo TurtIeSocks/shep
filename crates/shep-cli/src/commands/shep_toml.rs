@@ -51,8 +51,10 @@ use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 use crate::style::StyleLevel;
 
-/// Mode `shep.toml` — and the sibling lock file and staging file it is
-/// written through — is created with: owner read/write, nobody else.
+/// Mode `shep.toml` (and the sibling lock file and staging file it is
+/// written through, and `dogs.toml`, which
+/// `commands::dog_migration` stages through the same helper) is created
+/// with: owner read/write, nobody else.
 ///
 /// Unlike `barks.jsonl`'s own `0600`, this is not belt-and-braces. This
 /// file is where `docs/dogs.md` tells an operator to paste a Discord or
@@ -612,7 +614,7 @@ fn create_home_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// Creates the staging file the config is written through, in `parent` so
+/// Creates the staging file a config is written through, in `parent` so
 /// the later `rename` stays within one filesystem.
 ///
 /// Mode-at-creation rather than a separate `chmod` pass (`tempfile` passes
@@ -620,7 +622,14 @@ fn create_home_dir(dir: &Path) -> std::io::Result<()> {
 /// which the file holding a webhook token sits at whatever the process
 /// umask leaves it. Same shape, and same reasoning, as
 /// `barks::create_ring_file`.
-fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+///
+/// `pub(super)` rather than private, and deliberately shared rather than
+/// copied: `commands::dog_migration` writes `dogs.toml`, which holds the
+/// webhook URLs that used to live in this file and needs the same
+/// [`CONFIG_FILE_MODE`] at the same `open`. A second implementation of
+/// create-at-mode plus `fsync` plus `rename` is how the two would drift,
+/// and the one that drifted would be the one nobody was reading.
+pub(super) fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("shep").suffix(".toml.tmp");
     // `shep.toml` can hold a webhook token, so on unix it is created `0600`
