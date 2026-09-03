@@ -42,6 +42,7 @@ use shep_daemon::tokio_runner::TokioRunner;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::DaemonArgs;
+use crate::commands::dog_migration::{self, DogMigrationError};
 use crate::commands::{admin, muster};
 use crate::exit::ExitCode;
 use crate::output::Streams;
@@ -74,6 +75,10 @@ pub enum DaemonRunError {
     /// The supervisor came up and served, then failed during its run loop
     /// or teardown.
     Run(BootError),
+    /// `[dog.<name>]` sections could not be moved out of `shep.toml` and
+    /// into `dogs.toml`. Raised before the supervisor comes up, so no dog
+    /// has read a section from either file yet.
+    DogMigration(DogMigrationError),
 }
 
 impl core::fmt::Display for DaemonRunError {
@@ -82,6 +87,7 @@ impl core::fmt::Display for DaemonRunError {
             Self::Config(err) => write!(f, "invalid daemon configuration: {err}"),
             Self::Boot(err) => write!(f, "the daemon failed to boot: {err}"),
             Self::Run(err) => write!(f, "the daemon failed while running: {err}"),
+            Self::DogMigration(err) => write!(f, "invalid dog configuration: {err}"),
         }
     }
 }
@@ -91,6 +97,7 @@ impl core::error::Error for DaemonRunError {
         match self {
             Self::Config(err) => Some(err),
             Self::Boot(err) | Self::Run(err) => Some(err),
+            Self::DogMigration(err) => Some(err),
         }
     }
 }
@@ -295,7 +302,32 @@ pub async fn boot_supervisor(
 ///   to boot.
 /// - [`DaemonRunError::Run`] — the supervisor came up and served, then
 ///   failed during its run loop or teardown.
+/// - [`DaemonRunError::DogMigration`]: `[dog.<name>]` sections could not be
+///   moved out of `shep.toml` and into `dogs.toml`.
 pub async fn run_daemon(paths: ShepPaths, args: &DaemonArgs) -> Result<(), DaemonRunError> {
+    // Before the supervisor, because `dog_section` reads the new file from
+    // the first request onward and a dog can connect as soon as the socket
+    // is up. A boot after the first finds nothing and returns immediately.
+    let moved =
+        dog_migration::migrate_dog_sections(&paths).map_err(DaemonRunError::DogMigration)?;
+    if !moved.is_empty() {
+        // Named individually: an operator who did not know this was coming
+        // needs to be able to find where their config went.
+        //
+        // `eprintln!` rather than `tracing::info!`, and only because of
+        // where this sits: `install_log_subscriber` runs inside
+        // `boot_supervisor`, so at this point in the boot there is no
+        // subscriber and a `tracing` record would be dropped on the floor.
+        // Stderr is the same destination that subscriber writes to (see
+        // `launch::launch_daemon`, which is what redirects it into the
+        // shepherd's own log), so the line lands where the rest of the
+        // boot's diagnostics do, one migration only, without a format the
+        // operator has to go looking for.
+        eprintln!(
+            "shep: moved dog config out of shep.toml and into dogs.toml: {}",
+            moved.join(", ")
+        );
+    }
     // A production daemon always keeps its final roll — `shep muster` after
     // a reboot is the entire reason it exists.
     boot_supervisor(paths, args, false)
@@ -422,6 +454,17 @@ pub fn daemon_exit_code(err: &DaemonRunError) -> ExitCode {
             _ => ExitCode::Failure,
         },
         DaemonRunError::Run(_) => ExitCode::Failure,
+        // With `Config`, not with `Boot`. Every refusal this variant
+        // carries is a shep.toml or dogs.toml an operator has to edit
+        // before the daemon will come up (a name in both files, an entry
+        // under `[dog]` that is not a section, a dogs.toml that will not
+        // parse), which is the same fault `InvalidConfig` already names.
+        // Its two I/O arms are the imprecise half of that: a `dogs.toml`
+        // that cannot be written is a disk fault rather than a bad value,
+        // and it exits `InvalidConfig` all the same. One code per variant
+        // is what keeps the mapping readable, and the message on stderr is
+        // what tells the two apart.
+        DaemonRunError::DogMigration(_) => ExitCode::InvalidConfig,
     }
 }
 
@@ -1545,6 +1588,16 @@ otel = "/usr/local/bin/shep-otel"
                 "SHEP_LOG_JSON",
                 "maybe".into()
             ))),
+            ExitCode::InvalidConfig
+        );
+        // A refused dog migration is a file the operator has to edit, so it
+        // shares `Config`'s code rather than falling through to `Failure`.
+        assert_eq!(
+            daemon_exit_code(&DaemonRunError::DogMigration(
+                DogMigrationError::WouldOverwrite {
+                    name: "metrics".to_string(),
+                }
+            )),
             ExitCode::InvalidConfig
         );
     }

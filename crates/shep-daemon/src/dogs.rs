@@ -18,7 +18,7 @@
 //! the socket as `Request::DogConfig`. A dog inherits `$SHEP_HOME` and
 //! `$SHEP_DOG_NAME` and nothing else it did not already need in order to
 //! exec: it connects to the socket the first names, handshakes, and asks for
-//! the `[dog.<name>]` section the second names. The reply is opaque text the
+//! its `[<name>]` section of `dogs.toml`, which the second names. The reply is opaque text the
 //! dog parses, so a third-party dog is bound to the shape of its own section
 //! and not to shep's config model, file discovery, or layering rules.
 //!
@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use shep_core::barks::{self, Bark};
-use shep_core::config::{AppConfig, DaemonConfig, ResolvedApp, normalize};
+use shep_core::config::{AppConfig, DogsConfig, ResolvedApp, normalize};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{BusEvent, DogSource, ProcessEventKind, ProcessInfo};
 use shep_core::selector::ProcessSelector;
@@ -53,7 +53,7 @@ use crate::supervisor::SupervisorHandle;
 /// One dog the daemon knows about: its name, and where its binary comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DogSpec {
-    /// The dog's name — the `[dog.<name>]` key and the entry's name.
+    /// The dog's name — the `[<name>]` key and the entry's name.
     pub name: String,
     /// Where its binary comes from.
     pub source: DogSource,
@@ -63,10 +63,10 @@ pub struct DogSpec {
 ///
 /// `Debug` is derived and needs no redaction: the variants carry a path, a
 /// normalizer complaint about a config this module assembled itself, or a
-/// TOML parser message — never a value read out of a parsed `[dog.<name>]`
+/// TOML parser message — never a value read out of a parsed `[<name>]`
 /// table. The one way a section's own text can reach a message is a *syntax*
 /// error, where the parser quotes the line it failed on; that is the same
-/// exposure [`DaemonConfigError`](shep_core::config::DaemonConfigError)
+/// exposure [`DogsConfigError`](shep_core::config::DogsConfigError)
 /// already carries, and it reaches only the peer that asked, which
 /// peer-cred auth has already established owns the file.
 ///
@@ -194,7 +194,7 @@ fn builtin_program() -> Result<PathBuf, DogError> {
 /// carries exactly two things it did not already need in order to exec:
 /// `SHEP_HOME`, which is how every client locates the socket, and
 /// `SHEP_DOG_NAME`, which is the name this dog was registered under and so
-/// the `name` its `Request::DogConfig` has to carry. No `[dog.<name>]`
+/// the `name` its `Request::DogConfig` has to carry. No `[<name>]`
 /// value is ever placed here — a dog asks for its section over the socket,
 /// because the environment is readable from the process table, inherited by
 /// every child, and captured into crash dumps. The section's KEY is not one
@@ -231,7 +231,7 @@ pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogErro
     config
         .env
         .insert("SHEP_HOME".to_string(), paths.home.display().to_string());
-    // The name the operator registered this dog under — the `[dog.<name>]`
+    // The name the operator registered this dog under — the `[<name>]`
     // key its own section lives beneath, and so the `name` it has to put in
     // `Request::DogConfig`. A built-in dog reads it out of its argv; an
     // adopted one has no argv at all, so it needs another way to learn it —
@@ -249,7 +249,7 @@ pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogErro
     //
     // Safe to place here for the same reason `SHEP_HOME` is, and for no
     // other: a name is not a secret. The rule this does not break is that
-    // no `[dog.<name>]` VALUE travels in the environment — that is the key,
+    // no `[<name>]` VALUE travels in the environment — that is the key,
     // not the section.
     config
         .env
@@ -294,7 +294,7 @@ pub async fn spawn_enabled_dogs(
         // Read before `start_dog` takes the app. This is the one place that
         // knows which file a dog's spawn actually resolved to — a built-in
         // dog's is this shep's own binary, an adopted one's is whatever the
-        // operator's `[dog.<name>]` named — and an operator reading the
+        // operator's `[<name>]` named — and an operator reading the
         // dog's log during an upgrade is usually asking exactly that.
         let script = app.config().script.clone();
         match supervisor.start_dog(app, spec.source.clone()).await {
@@ -321,17 +321,21 @@ pub async fn spawn_enabled_dogs(
     }
 }
 
-/// The `[dog.<name>]` section of `path`, rendered back to TOML text.
+/// The `[<name>]` section of `path`, a `dogs.toml`, rendered back to TOML
+/// text.
 ///
 /// Reads the file on every call rather than serving a copy cached at boot:
 /// one reader can never be stale, and it is what makes
 /// `shep disable X && shep enable X` re-read an edited section.
 ///
 /// A missing file, or a file with no such section, is `Ok(String::new())` —
-/// a dog with no configuration is the ordinary case, not a fault.
+/// a dog with no configuration is the ordinary case, not a fault. That
+/// covers every home that has never had a dog configured: `dogs.toml` is
+/// written by the boot-time migration or by hand, so a home with neither
+/// simply has no file.
 ///
 /// # Errors
-/// - [`DogError::Config`] — the file exists and is not valid `shep.toml`,
+/// - [`DogError::Config`] — the file exists and is not valid `dogs.toml`,
 ///   or its section will not render back to TOML.
 /// - [`DogError::Io`] — the file exists and could not be read.
 pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
@@ -340,13 +344,13 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(err) => return Err(DogError::Io(err)),
     };
-    // Loaded through the daemon's own config loader rather than parsed here,
-    // so a broken `shep.toml` is one named error and not a second parser's
-    // opinion of the same file. No environment closure: `SHEP_*` overrides
-    // govern the daemon's own knobs and have nothing to say about a dog's
-    // section.
-    let config = DaemonConfig::load(Some(&source), &|_| None)
-        .map_err(|err| DogError::Config(err.to_string()))?;
+    // Loaded through shep-core's own type rather than parsed here, so a
+    // broken `dogs.toml` is one named error and not a second parser's
+    // opinion of the same file. The keys are dog names with no prefix:
+    // `[metrics]` here is what `[dog.metrics]` was in `shep.toml` before
+    // the boot-time migration moved it.
+    let config =
+        DogsConfig::load(Some(&source)).map_err(|err| DogError::Config(err.to_string()))?;
     match config.dog.get(name) {
         None => Ok(String::new()),
         Some(table) => toml::to_string(table).map_err(|err| DogError::Config(err.to_string())),
@@ -404,7 +408,7 @@ pub enum Refusal {
 /// a dog it can talk to is not stale by any definition it could apply.
 ///
 /// `Debug` is derived and needs no redaction (IR-41): the map holds dog
-/// names and counts. A dog's name is the `[dog.<name>]` key an operator
+/// names and counts. A dog's name is the `[<name>]` key an operator
 /// typed, which `dogs.rs` already places in the child's environment for the
 /// reason its module doc gives — the section's KEY is not one of its
 /// VALUES, and no value ever reaches this type.
@@ -995,7 +999,7 @@ pub(crate) fn silent_dogs(infos: &[ProcessInfo], refusals: &DogRefusals) -> Vec<
 ///
 /// `Debug` is derived and needs no redaction (IR-41), for the same reason
 /// [`DogRefusals`]'s is: the map holds dog names and instants, and a dog's
-/// name is a `[dog.<name>]` KEY rather than one of its values.
+/// name is a `[<name>]` KEY rather than one of its values.
 #[derive(Debug, Default)]
 pub(crate) struct SilentDogs {
     /// One instant per dog currently silent. A name absent from the map is a
@@ -1680,7 +1684,7 @@ mod tests {
         );
     }
 
-    /// fails if a `[dog.<name>]` value is folded into the child's
+    /// fails if a `[<name>]` value is folded into the child's
     /// environment. That is the design's whole reason for putting config on
     /// the socket: a webhook URL in the environment is readable from the
     /// process table on some systems, inherited by every child the dog
@@ -1698,8 +1702,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(&dir);
         std::fs::write(
-            &paths.daemon_config,
-            "[dog.bark]\nwebhook = \"https://example.invalid/hook\"\n",
+            &paths.dogs_config,
+            "[bark]\nwebhook = \"https://example.invalid/hook\"\n",
         )
         .unwrap();
         let spec = DogSpec {
@@ -1813,10 +1817,10 @@ mod tests {
     #[test]
     fn a_dogs_section_comes_back_as_its_own_table_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shep.toml");
+        let path = dir.path().join("dogs.toml");
         std::fs::write(
             &path,
-            "[daemon]\nlog_json = true\n\n[dog.bark]\ndebounce = \"30s\"\n\n[dog.metrics]\nport = 9615\n",
+            "[bark]\ndebounce = \"30s\"\n\n[metrics]\nport = 9615\n",
         )
         .unwrap();
 
@@ -1826,7 +1830,6 @@ mod tests {
             !bark.contains("9615"),
             "one dog never sees another's config"
         );
-        assert!(!bark.contains("log_json"), "nor the daemon's own");
         // Round-trips as TOML, since that is the contract the dog parses under.
         let parsed: toml::Table = toml::from_str(&bark).unwrap();
         assert_eq!(parsed["debounce"].as_str(), Some("30s"));
@@ -1836,6 +1839,32 @@ mod tests {
             dog_section(&dir.path().join("gone.toml"), "bark").unwrap(),
             ""
         );
+    }
+
+    /// fails if the read that moved to `dogs.toml` changed what a dog is
+    /// served.
+    #[test]
+    fn a_section_reaches_the_wire_exactly_as_it_did_from_shep_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dogs.toml");
+        std::fs::write(&path, "[bark]\ndebounce = \"30s\"\n").expect("write");
+
+        // Byte-for-byte what the old `[dog.bark]` read produced. The
+        // dog-facing contract not moving is the whole of decision 3, so it
+        // is pinned as a string rather than as a parse.
+        assert_eq!(
+            dog_section(&path, "bark").expect("section"),
+            "debounce = \"30s\"\n"
+        );
+    }
+
+    #[test]
+    fn a_dog_with_no_section_still_gets_an_empty_string() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dogs.toml");
+        std::fs::write(&path, "[bark]\ndebounce = \"30s\"\n").expect("write");
+
+        assert_eq!(dog_section(&path, "metrics").expect("section"), "");
     }
 
     /// A minimal `Process` bus event, `name` carrying either a sheep's or a

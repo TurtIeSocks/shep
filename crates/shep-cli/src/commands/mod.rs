@@ -9,6 +9,7 @@ pub mod bleats;
 pub(crate) mod bounded;
 pub mod daemon;
 pub mod dev;
+pub(crate) mod dog_migration;
 pub mod dogs;
 pub(crate) mod empty;
 pub(crate) mod foreground;

@@ -534,7 +534,7 @@ pub(crate) fn harness_with_runner(
             events,
             registry: FlockRegistry::new(),
             snapshot_path: paths.snapshot.clone(),
-            daemon_config: paths.daemon_config.clone(),
+            dogs_config: paths.dogs_config.clone(),
             paths: paths.clone(),
             daemon_version: "0.1.0".to_string(),
             dog_refusals: crate::dogs::DogRefusals::new(),
