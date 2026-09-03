@@ -5751,7 +5751,28 @@ impl<R: ProcessRunner> Actor<R> {
         };
 
         let ids = self.ids_of_name(&name);
-        let Some(slot) = ids.first().and_then(|id| self.sheep.get(id)) else {
+        // The app's stand-in, and NOT `ids.first()`: during a reload the
+        // drainee holds the lower id, so the first id is the instance on its
+        // way out. `running` and `intended` come off this slot and the
+        // `next_spec` derived from them is written onto every slot of the
+        // name, the live replacement included -- which left the replacement's
+        // `spec` describing the config the DRAINEE was spawned from, against
+        // the rule that `spec` keeps describing what the child was actually
+        // spawned from. That is the only account of it anywhere.
+        //
+        // Falling back to `ids.first()` when every slot is draining, so a
+        // load during a serial reload's drain window still finds its app
+        // rather than being told it is not registered.
+        let representative = ids
+            .iter()
+            .copied()
+            .find(|id| {
+                self.sheep
+                    .get(id)
+                    .is_some_and(|slot| !matches!(slot.entry.reload, ReloadState::Drainee { .. }))
+            })
+            .or_else(|| ids.first().copied());
+        let Some(slot) = representative.and_then(|id| self.sheep.get(&id)) else {
             return refuse(format!(
                 "{name} is not registered; `shep start` it before a config can be applied to it"
             ));
@@ -22183,6 +22204,56 @@ mod tests {
             reply.iter().all(|applied| applied.name != "worker"),
             "a load must not claim to have touched an app the file never named: {reply:?}"
         );
+    }
+
+    /// fails if a load during a reload reads the drainee as the app. The
+    /// drainee holds the lower id, so `ids.first()` picked the instance on
+    /// its way out, and the spec derived from it was written onto the live
+    /// replacement -- which then claimed to be running the config it had just
+    /// replaced.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_during_a_reload_reads_the_replacement_and_not_the_drainee() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.instances = 2;
+                app.cwd = Some("/srv/new".to_string());
+            })],
+        );
+        // Instance 0 is the drainee: the lower id, still on the config the
+        // reload is replacing, and already `Stopping`.
+        {
+            let slot = actor
+                .sheep
+                .get_mut(&0)
+                .expect("the fixture registered two slots");
+            slot.entry.status = ProcStatus::Stopping;
+            slot.entry.reload = ReloadState::Drainee { new_id: Some(1) };
+            slot.entry.spec = app_with("web", |app| {
+                app.instances = 2;
+                app.cwd = Some("/srv/old".to_string());
+            });
+        }
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 7;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            actor.sheep[&1].entry.spec.config().cwd.as_deref(),
+            Some("/srv/new"),
+            "the replacement's spec must keep describing what the replacement \
+             was spawned from: {reply:?}"
+        );
+        assert_eq!(actor.sheep[&1].entry.spec.config().max_restarts, 7);
+        assert_eq!(reply[0].applied, vec!["max_restarts".to_string()]);
+        assert!(reply[0].pending.is_empty(), "{reply:?}");
     }
 
     /// fails if a Flockfile can reach a dog. A dog runs at the daemon's own
