@@ -161,7 +161,7 @@ fn is_known_kind(kind: &str) -> bool {
 #[derive(Debug)]
 pub enum RulesError {
     /// Rule at position `index` (0-based, in configuration order) routes
-    /// to a sink name `[dog.bark.sinks]` does not define.
+    /// to a sink name `[bark.sinks]` does not define.
     UnknownSink {
         /// Position in the configured rule list.
         index: usize,
@@ -181,7 +181,7 @@ pub enum RulesError {
         /// The kind string that matches no [`ProcessEventKind`].
         kind: String,
     },
-    /// A `[dog.bark.sinks]` entry is a Discord or Slack webhook configured
+    /// A `[bark.sinks]` entry is a Discord or Slack webhook configured
     /// with `http://`. See [`sinks::require_secure_scheme`].
     InsecureSink(SinkConfigError),
 }
@@ -191,7 +191,8 @@ impl fmt::Display for RulesError {
         match self {
             Self::UnknownSink { index, sink } => write!(
                 f,
-                "rule {index} routes to sink \"{sink}\", which [dog.bark.sinks] does not define"
+                "rule {index} routes to sink \"{sink}\", which [bark.sinks] in dogs.toml does \
+                 not define"
             ),
             Self::NoSinks { index } => write!(f, "rule {index} routes to no sink at all"),
             Self::UnknownKind { index, kind } => write!(
@@ -618,7 +619,16 @@ mod tests {
     fn a_rule_routed_at_a_sink_that_does_not_exist_is_refused_at_startup() {
         let err = Rules::new(vec![rule_to("pager")], &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, RulesError::UnknownSink { .. }));
-        assert!(err.to_string().contains("pager"));
+        // Exact, not a `contains`, because the sink name is not the part
+        // that drifted. This sentence reaches an operator's terminal
+        // through `Display` rather than through an `eprintln!` literal,
+        // which is how it kept sending them to `[dog.bark.sinks]` for a
+        // whole branch after that section moved to `[bark.sinks]` in
+        // dogs.toml: the sweep that fixed the literals could not see it.
+        assert_eq!(
+            err.to_string(),
+            "rule 0 routes to sink \"pager\", which [bark.sinks] in dogs.toml does not define"
+        );
     }
 
     /// fails if `[dog.bark]` with sinks and no rules alerts on nothing.
