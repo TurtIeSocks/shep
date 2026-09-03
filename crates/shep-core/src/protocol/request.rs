@@ -869,7 +869,7 @@ pub struct ProcessInfo {
     /// here would be re-committing the bug this field was added during: a
     /// shepherd asserting a cause it never observed.
     pub dog_stale: Option<bool>,
-    /// The [`AppConfig`](crate::config::AppConfig) field NAMES this sheep's
+    /// The [`AppConfig`] field NAMES this sheep's
     /// spec differs from a load's parked config for, in field-name order.
     /// `None` when nothing is parked (every sheep outside the window
     /// between a load that changed a `NeedsRespawn` field and the restart
@@ -885,7 +885,7 @@ pub struct ProcessInfo {
     /// would otherwise be `null` on almost every row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<Vec<String>>,
-    /// The [`AppConfig`](crate::config::AppConfig) field NAMES an operator
+    /// The [`AppConfig`] field NAMES an operator
     /// has set on this sheep that its current Flockfile does not declare,
     /// in field-name order. `None` when there is nothing to report: no
     /// override on record for this sheep, or a peer daemon that predates
