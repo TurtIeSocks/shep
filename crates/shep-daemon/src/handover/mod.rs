@@ -2035,11 +2035,49 @@ mod tests {
     #[test]
     fn debug_redacts_a_carried_sheeps_environment() {
         // The blob carries env; a log line naming the daemon's own state
-        // must not. An exact-string assertion rather than a field check,
-        // because the risk is a future field printing env by accident
-        // (IR-41).
+        // must not. An EXACT string rather than a `contains` check, because
+        // the risk this pins is a future field printing env by accident
+        // (IR-41), and a field that has not been added yet cannot be named
+        // in a substring check. This assertion fails when a field is added,
+        // which is the point: whoever adds it reads the rendering once.
+        let entry = entry_fixture(|app| {
+            app.env.insert("TOKEN".to_owned(), "hunter2".to_owned());
+        });
+        assert_eq!(
+            format!("{:?}", carried(&entry)),
+            "CarriedSheep { id: 1, name: \"web\", instance: 0, pid: Some(100), restarts: 0, \
+             epoch: 7, status: Online, last_exit: None, credentials: Resolved(None), fds: \
+             CarriedFds { out_pipe: Some(11), err_pipe: Some(12), out_log: Some(13), err_log: \
+             Some(14), stdin: Some(15), channel: Some(16) }, pending_delete: Some(false), \
+             manual: None, reload: Some(None), ready_failed: Some(false), restart_due: None, \
+             dog: None, pending: None, pending_reidentifies: Some(false), app: AppConfig { \
+             name: \"web\", script: \"./srv\", env: <1 vars>, .. } }"
+        );
+        // The whole blob too, since `Handover` is what a daemon log line
+        // actually formats and it holds fields of its own.
         let text = format!("{:?}", sample_handover_with_secret_env());
         assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("TOKEN"), "{text}");
+    }
+
+    #[test]
+    fn debug_redacts_a_process_entrys_environment() {
+        // `ProcessEntry` is the daemon's own live state and derives `Debug`,
+        // so its safety rests entirely on `AppConfig`'s redacted rendering
+        // reaching it through `spec`. Nothing pinned that, which left a
+        // future field on the entry free to print env directly.
+        let entry = entry_fixture(|app| {
+            app.env.insert("TOKEN".to_owned(), "hunter2".to_owned());
+        });
+        assert_eq!(
+            format!("{entry:?}"),
+            "ProcessEntry { id: 1, spec: ResolvedApp { config: AppConfig { name: \"web\", \
+             script: \"./srv\", env: <1 vars>, .. } }, pending: None, pending_reidentifies: \
+             false, overridden: [], instance: 0, status: Online, pid: Some(100), restarts: 0, \
+             started_at: None, budget: RestartBudget { unstable_count: 0 }, reload: None, \
+             credentials: Resolved(None), out_file: \"/tmp/shep-handover-test-out.log\", \
+             err_file: \"/tmp/shep-handover-test-err.log\", dog: None, last_exit: None }"
+        );
     }
 
     #[test]
