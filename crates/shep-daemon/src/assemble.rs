@@ -280,6 +280,7 @@ mod tests {
         ShepPaths {
             home: PathBuf::from("/home/ada/.shep"),
             daemon_config: PathBuf::from("/home/ada/.shep/shep.toml"),
+            dogs_config: PathBuf::from("/home/ada/.shep/dogs.toml"),
             snapshot: PathBuf::from("/home/ada/.shep/flock.json"),
             logs: PathBuf::from("/home/ada/.shep/logs"),
             pids: PathBuf::from("/home/ada/.shep/pids"),

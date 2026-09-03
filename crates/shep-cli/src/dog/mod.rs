@@ -416,6 +416,7 @@ mod tests {
         let home = dir.to_path_buf();
         ShepPaths {
             daemon_config: home.join("shep.toml"),
+            dogs_config: home.join("dogs.toml"),
             snapshot: home.join("flock.json"),
             logs: home.join("logs"),
             pids: home.join("pids"),
