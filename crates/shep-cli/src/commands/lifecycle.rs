@@ -8,15 +8,17 @@
 //! wire; [`resolve_target`] is that resolution, kept pure and separate from
 //! the RPC so it stays fast and hermetic to test.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shep_client::{Client, START_DEADLINE};
-use shep_core::config::{AppConfig, FlockFormat, Flockfile, FlockfileError};
+use shep_core::config::{
+    AppConfig, DeclaredApp, FlockFormat, Flockfile, FlockfileError, ResetDepth,
+};
 use shep_core::paths::ShepPaths;
-use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec};
+use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec, SheepApplied};
 use shep_core::selector::ProcessSelector;
 
 use crate::cli::Format;
@@ -403,6 +405,44 @@ pub fn resolve_target(
     stdin: &[u8],
     as_flockfile: bool,
 ) -> Result<Vec<AppConfig>, TargetError> {
+    Ok(resolve_target_declared(target, name, stdin, as_flockfile)?
+        .into_iter()
+        .map(|declared| declared.config)
+        .collect())
+}
+
+/// [`resolve_target`], keeping the keys each app's document literally wrote.
+///
+/// The same five tiers in the same order, resolved once: [`resolve_target`]
+/// is this function with the key sets dropped, so the two cannot disagree
+/// about what a target means.
+///
+/// A key set exists to answer what a template CLAIMS rather than what its
+/// values are, and only a document makes a claim. The four Flockfile tiers
+/// therefore go through [`Flockfile::parse_declared`], and tier 4 -- a bare
+/// script path, where the command line rather than a document supplied every
+/// value -- reports an EMPTY set. `start` reads that emptiness as "nothing
+/// here asks to be applied", which is the honest reading of both cases it
+/// covers: a command line is not a template, and a document that declared no
+/// keys has nothing to apply either.
+///
+/// A defaulted `cwd` is deliberately NOT declared. [`default_cwd_to_flockfile_dir`]
+/// fills the field so a fresh start lands in the right directory, but the
+/// document did not ask for it, and a load that established `cwd` on every
+/// app would overwrite a `shep start --cwd` an operator set since. Same for
+/// `--cwd`, `--fold` and `--interpreter`, which `start` folds on afterwards:
+/// they change what a FRESH app is registered with and claim nothing about
+/// an app the flock already has.
+///
+/// # Errors
+///
+/// Every error [`resolve_target`] returns, for the same inputs.
+fn resolve_target_declared(
+    target: &str,
+    name: Option<&str>,
+    stdin: &[u8],
+    as_flockfile: bool,
+) -> Result<Vec<DeclaredApp>, TargetError> {
     let path = Path::new(target);
     match (target, FlockFormat::from_path(path)) {
         ("-", _) => {
@@ -412,7 +452,7 @@ pub fn resolve_target(
                     "stdin is not UTF-8",
                 ))
             })?;
-            Ok(Flockfile::parse(&source, FlockFormat::Json)?.apps)
+            Ok(Flockfile::parse_declared(&source, FlockFormat::Json)?)
         }
         (_, format) if as_flockfile => match format {
             Some(format) => {
@@ -420,13 +460,13 @@ pub fn resolve_target(
                     path: path.to_path_buf(),
                     source,
                 })?;
-                let flockfile = Flockfile::parse(&source, format)?;
-                Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
+                let apps = Flockfile::parse_declared(&source, format)?;
+                Ok(default_cwd_to_flockfile_dir(apps, path))
             }
             None if path.extension().and_then(|e| e.to_str()) == Some("js") => {
                 let json = evaluate_js_flockfile(path, JS_EVAL_BUDGET)?;
-                let flockfile = Flockfile::parse(&json, FlockFormat::Json)?;
-                Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
+                let apps = Flockfile::parse_declared(&json, FlockFormat::Json)?;
+                Ok(default_cwd_to_flockfile_dir(apps, path))
             }
             None => Err(TargetError::UnknownFlockfileFormat {
                 path: path.to_path_buf(),
@@ -437,8 +477,8 @@ pub fn resolve_target(
                 path: path.to_path_buf(),
                 source,
             })?;
-            let flockfile = Flockfile::parse(&source, format)?;
-            Ok(default_cwd_to_flockfile_dir(flockfile.apps, path))
+            let apps = Flockfile::parse_declared(&source, format)?;
+            Ok(default_cwd_to_flockfile_dir(apps, path))
         }
         // Absolutised against the CLI's cwd, which is the cwd the `exists`
         // check just above was answered from. Without this the check and the
@@ -479,7 +519,14 @@ pub fn resolve_target(
             app.cwd = std::env::current_dir()
                 .ok()
                 .map(|dir| dir.to_string_lossy().into_owned());
-            Ok(vec![app])
+            // EMPTY key sets, and this function's own doc says why: the
+            // command line is not a template, so there is nothing here a
+            // load could apply to a sheep the flock already has.
+            Ok(vec![DeclaredApp {
+                config: app,
+                declared: BTreeSet::new(),
+                declared_env: BTreeSet::new(),
+            }])
         }
         _ => Err(TargetError::Unresolvable {
             target: target.to_string(),
@@ -992,6 +1039,12 @@ fn any_restart_failed(procs: &[shep_core::protocol::ProcessInfo]) -> bool {
 
 /// Gives every app that set no `cwd` the Flockfile's own directory.
 ///
+/// Fills the field and does NOT add `cwd` to the app's declared key set. The
+/// document did not ask for this directory, so a load must not establish it
+/// on a sheep the flock already has, which would overwrite a `--cwd` an
+/// operator set since. A fresh app still starts in the right place, which is
+/// the whole of what this was added for.
+///
 /// A Flockfile is a file you commit. Before this, an app with a relative
 /// `script` and no `cwd` resolved that script against the DAEMON's working
 /// directory -- whatever directory the shepherd happened to be autostarted
@@ -1009,7 +1062,7 @@ fn any_restart_failed(procs: &[shep_core::protocol::ProcessInfo]) -> bool {
 /// fail on reading the file anyway, and inventing a directory here would
 /// bury that error under a stranger one. An app that sets its own `cwd`
 /// keeps it -- this only fills a blank.
-fn default_cwd_to_flockfile_dir(apps: Vec<AppConfig>, flockfile: &Path) -> Vec<AppConfig> {
+fn default_cwd_to_flockfile_dir(apps: Vec<DeclaredApp>, flockfile: &Path) -> Vec<DeclaredApp> {
     let Some(dir) = std::fs::canonicalize(flockfile)
         .ok()
         .and_then(|abs| abs.parent().map(Path::to_path_buf))
@@ -1020,8 +1073,8 @@ fn default_cwd_to_flockfile_dir(apps: Vec<AppConfig>, flockfile: &Path) -> Vec<A
     let dir = dir.to_string_lossy().into_owned();
     apps.into_iter()
         .map(|mut app| {
-            if app.cwd.is_none() {
-                app.cwd = Some(dir.clone());
+            if app.config.cwd.is_none() {
+                app.config.cwd = Some(dir.clone());
             }
             app
         })
@@ -1047,57 +1100,109 @@ async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
     }
 }
 
-/// Says so when a Flockfile app the flock already has is registered under a
-/// different config, naming the sheep and the fields that differ.
+/// Merges the Flockfile's declaration into each app the flock already has,
+/// and tells the operator what that did.
 ///
 /// The defect this exists for: an operator edits `cwd` on two apps, re-runs
 /// `shep start`, and both keep running the old one. `Request::Start` on a
 /// name the flock already has adds instances rather than reconciling config,
-/// which is what `shep stock` depends on, so the edit is simply not applied.
-/// It was also not reported, which is the half being fixed: the edit
-/// vanished without a word and the apps crash-looped against a path that no
-/// longer applied.
+/// which is what `shep stock` depends on, so the edit was simply not
+/// applied. This is the request that applies it.
 ///
-/// Reports rather than applies. Whether `start` should reconcile by default,
-/// or grow an `--update` flag, is the maintainer's call and neither is taken here; a
-/// running flock changing its cwd or argv underneath an operator would be a
-/// worse surprise than the one being fixed.
+/// Additive, and that is the whole security argument for doing it by default
+/// at all. A Flockfile arrives from the app's own repository, so a load
+/// appends what nobody has established and leaves everything an operator set
+/// since alone; `--reset` is what widens that, and it is something the
+/// operator types.
+///
+/// Only apps whose document DECLARED something are sent. A bare script
+/// target reports an empty key set ([`resolve_target_declared`]), so `shep
+/// start ./thing` against a running `thing` still applies nothing: the
+/// command line is not a template.
 ///
 /// Field NAMES only, never values: this reaches an operator's terminal and
-/// `env` carries secrets, so a differing `env` says `env` and stops (IR-41).
-/// [`AppConfig::drifted_fields`] is where that rule is enforced.
+/// `env` carries secrets, so an applied `env` says `env` and stops (IR-41).
+/// [`SheepApplied`] is where that rule is enforced.
 ///
-/// Silent on an unreachable daemon, an unexpected answer, or a daemon too
-/// old to know the request, the same call [`flock_now`] makes: failing a
-/// `start` over a warning it could not compute would trade a working command
-/// for a defensive one.
+/// Silent on nothing, unlike the drift warning it replaces. A daemon that
+/// could not be reached, answered something else, or is too old to know the
+/// request is REPORTED, because the operator's edit did not land and the
+/// whole point of this verb is that such an edit stops vanishing without a
+/// word. It does not change the exit code: the resumes below it are what
+/// `start` was asked to do, and they still happen.
 ///
 /// One request for the whole invocation, not one per app. The rows beside
-/// each app go unread: drift is a comparison between two CONFIGS, and every
-/// instance of a clustered app shares one.
-async fn report_config_drift(
+/// each app go unread: a merge is a comparison between two CONFIGS, and
+/// every instance of a clustered app shares one.
+async fn apply_declared(
     client: &Client,
     streams: &mut Streams<'_>,
-    resumed: &[(AppConfig, Vec<shep_core::protocol::ProcessInfo>)],
+    resumed: &[(DeclaredApp, Vec<shep_core::protocol::ProcessInfo>)],
+    reset: ResetDepth,
 ) {
-    if resumed.is_empty() {
+    let apps: Vec<DeclaredApp> = resumed
+        .iter()
+        .filter(|(app, _)| !app.declared.is_empty())
+        .map(|(app, _)| app.clone())
+        .collect();
+    if apps.is_empty() {
         return;
     }
-    let apps = resumed.iter().map(|(app, _)| app.clone()).collect();
-    let Ok(Response::Drifted(drifted)) = client.request(Request::ConfigDrift { apps }).await else {
-        return;
+    let report = match client
+        .request_with_deadline(Request::ApplyConfig { apps, reset }, Some(START_DEADLINE))
+        .await
+    {
+        Ok(Response::Applied(report)) => report,
+        Ok(_other) => {
+            let message = "the daemon answered the config load with a response this client does \
+                 not understand; the Flockfile's edits are not in effect";
+            streams.aside("start", message);
+            return;
+        }
+        Err(err) => {
+            let message = format!(
+                "the Flockfile's edits could not be applied, so they are not in effect: {err}"
+            );
+            streams.aside("start", &message);
+            return;
+        }
     };
-    for drift in drifted {
-        let name = &drift.name;
-        let fields = drift.fields.join(", ");
-        let message = format!(
-            "{name} is registered with a different config ({fields}). `shep start` \
-             adds instances to a sheep the flock already has; it does not apply \
-             config edits, so the edit is not in effect. To apply it: `shep \
-             delete {name}`, then start again."
-        );
+    for sheep in report {
+        // An app with nothing to say prints nothing. A deploy re-runs the
+        // same unchanged Flockfile over and over, and eleven "nothing to
+        // apply" lines every time would train an operator to stop reading
+        // the ones that matter.
+        let Some(message) = applied_line(&sheep) else {
+            continue;
+        };
         streams.aside("start", &message);
     }
+}
+
+/// One line for what a load did to one app, or `None` when it did nothing.
+///
+/// A pending field always travels with the verb that promotes it. A list of
+/// names an operator cannot act on is a report nobody can use, and this is
+/// the one place the remedy is known.
+fn applied_line(sheep: &SheepApplied) -> Option<String> {
+    let name = &sheep.name;
+    let mut parts = Vec::new();
+    if !sheep.applied.is_empty() {
+        parts.push(format!("applied {}", sheep.applied.join(", ")));
+    }
+    if !sheep.pending.is_empty() {
+        parts.push(format!(
+            "{} wait for the next spawn (`shep reload {name}` promotes them)",
+            sheep.pending.join(", ")
+        ));
+    }
+    if let Some(refused) = &sheep.refused {
+        parts.push(refused.clone());
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("{name}: {}", parts.join("; ")))
 }
 
 /// `shep.toml`'s `[interpreters]` entry for `script`'s own extension, if it
@@ -1126,22 +1231,22 @@ fn mapped_interpreter(script: &str, interpreters: &BTreeMap<String, String>) -> 
 /// layer, matching `--cwd`/`--fold` immediately above this function's own
 /// call site.
 fn apply_interpreters(
-    apps: &mut [AppConfig],
+    apps: &mut [DeclaredApp],
     interpreters: &BTreeMap<String, String>,
     flag: Option<&str>,
 ) {
     if !interpreters.is_empty() {
         for app in apps.iter_mut() {
-            if app.interpreter.is_none()
-                && let Some(mapped) = mapped_interpreter(&app.script, interpreters)
+            if app.config.interpreter.is_none()
+                && let Some(mapped) = mapped_interpreter(&app.config.script, interpreters)
             {
-                app.interpreter = Some(mapped);
+                app.config.interpreter = Some(mapped);
             }
         }
     }
     if let Some(interpreter) = flag {
         for app in apps.iter_mut() {
-            app.interpreter = Some(interpreter.to_string());
+            app.config.interpreter = Some(interpreter.to_string());
         }
     }
 }
@@ -1285,12 +1390,24 @@ async fn start_one(
             let flock = flock_now(client).await;
             let matched = flock_matches(&selector, &flock);
             if !matched.is_empty() {
-                // No `report_config_drift` on this path, and that is not an
-                // omission: drift is a comparison between a config the
-                // operator just supplied and the one the flock stores. A
-                // selector supplies no config -- `shep start fold:backed`
-                // names sheep, not a Flockfile -- so there is nothing to
-                // compare and nothing that could have been silently ignored.
+                // THE guard the whole apply design rests on, and the reason
+                // this arm returns rather than falling through: a name
+                // target reads no file. Nothing below this line runs, so
+                // whatever Flockfile happens to sit in the operator's
+                // current directory is never opened, let alone applied.
+                //
+                // It is a security boundary rather than a tidiness rule. A
+                // Flockfile arrives from an app's own repository, so what it
+                // says today is what the last commit to that repository
+                // said; a routine `shep start web`, or a CI job restarting a
+                // service, must not apply that. Naming a FILE is the only
+                // way to ask for a load. Pinned by
+                // `start_by_name_sends_no_apply_config_even_with_a_flockfile_present`.
+                //
+                // Nothing is even reported here, and that is not an
+                // omission either: a selector supplies no config -- `shep
+                // start fold:backed` names sheep, not a Flockfile -- so
+                // there is nothing that could have been silently ignored.
                 return resume_all(client, streams, Some(token), &matched, started).await;
             }
             // Held for the failure path below rather than reported here: the
@@ -1321,31 +1438,32 @@ async fn start_one(
         Vec::new()
     };
 
-    let mut apps = match resolve_target(target, args.name.as_deref(), &stdin, args.flockfile) {
-        Ok(apps) => apps,
-        // The last tier refused too, so the token named nothing anywhere. A
-        // token written unmistakably as a selector is reported as one -- `shep
-        // start fold:typo` says no sheep is in a fold called typo, rather than
-        // reporting that no file called `fold:typo` is on disk, which is the
-        // answer to a question nobody asked. Exit 3, matching what every other
-        // verb returns for a selector that matched nothing.
-        Err(TargetError::Unresolvable { .. }) if missed.is_some() => {
-            let message = missed.unwrap_or_default();
-            return streams.fail(ExitCode::NotFound, &message);
-        }
-        Err(err) => return fail_target(streams, &err),
-    };
+    let mut apps =
+        match resolve_target_declared(target, args.name.as_deref(), &stdin, args.flockfile) {
+            Ok(apps) => apps,
+            // The last tier refused too, so the token named nothing anywhere. A
+            // token written unmistakably as a selector is reported as one -- `shep
+            // start fold:typo` says no sheep is in a fold called typo, rather than
+            // reporting that no file called `fold:typo` is on disk, which is the
+            // answer to a question nobody asked. Exit 3, matching what every other
+            // verb returns for a selector that matched nothing.
+            Err(TargetError::Unresolvable { .. }) if missed.is_some() => {
+                let message = missed.unwrap_or_default();
+                return streams.fail(ExitCode::NotFound, &message);
+            }
+            Err(err) => return fail_target(streams, &err),
+        };
 
     if let Some(fold) = &args.fold {
         for app in &mut apps {
-            app.fold = Some(fold.clone());
+            app.config.fold = Some(fold.clone());
         }
     }
     // After the per-app defaults above, so an explicit flag wins over both
     // the script form's "where you are" default and a Flockfile's own value.
     if let Some(cwd) = &args.cwd {
         for app in &mut apps {
-            app.cwd = Some(cwd.clone());
+            app.config.cwd = Some(cwd.clone());
         }
     }
     apply_interpreters(&mut apps, interpreters, args.interpreter.as_deref());
@@ -1368,24 +1486,26 @@ async fn start_one(
     // all. Invisible while respawns went out per name, because a name
     // selector reached the other three anyway; the moment they go out per
     // row, the representative is all this arm would act on.
-    let mut resumed: Vec<(AppConfig, Vec<ProcessInfo>)> = Vec::new();
+    let mut resumed: Vec<(DeclaredApp, Vec<ProcessInfo>)> = Vec::new();
     let mut fresh = Vec::new();
     for app in apps {
         let rows: Vec<ProcessInfo> = flock
             .iter()
-            .filter(|info| info.name == app.name)
+            .filter(|info| info.name == app.config.name)
             .cloned()
             .collect();
         if rows.is_empty() {
-            fresh.push(app);
+            fresh.push(app.config);
         } else {
             resumed.push((app, rows));
         }
     }
     // Before the resumes below, not after: an operator who edited the file
-    // and gets a wall of restart output should read why none of it applied
-    // at the top of the run rather than under it.
-    report_config_drift(client, streams, &resumed).await;
+    // and gets a wall of restart output should read what the edit did at the
+    // top of the run rather than under it. It matters more now than it did
+    // when this was only a warning -- a `NeedsRespawn` field parks for the
+    // next spawn, and the resume immediately below is that spawn.
+    apply_declared(client, streams, &resumed, ResetDepth::None).await;
     if !resumed.is_empty() {
         // `None`, not the operator's token: this arm reached the flock through
         // a Flockfile or a path, so there is no selector to quote back in the
@@ -2650,7 +2770,10 @@ mod tests {
         use shep_core::status::ProcStatus;
         move |request| match request {
             Request::ListFlock => Response::Flock(flock.clone()),
-            Request::ConfigDrift { .. } => Response::Drifted(Vec::new()),
+            // Accepted and reported as a no-op. A load that changed
+            // nothing is the ordinary case for these fixtures, which are
+            // about respawn selectors rather than about config.
+            Request::ApplyConfig { .. } => Response::Applied(Vec::new()),
             Request::Restart { selector } => {
                 let SelectorSpec::Id(id) = selector else {
                     // Never reached by a correct build, and asserted on
@@ -2735,6 +2858,217 @@ mod tests {
             respawns(&mut envelopes),
             vec![SelectorSpec::Id(0)],
             "one respawn, for the row the operator named"
+        );
+    }
+
+    /// fails if a Flockfile load does not apply itself to an app the flock
+    /// already has.
+    ///
+    /// The defect: an operator edits the file, re-runs `shep start`, and the
+    /// app keeps running the old config. `Request::Start` on a name the
+    /// flock already has adds instances rather than reconciling, so the edit
+    /// was not applied -- and, before `Request::ConfigDrift`, not reported
+    /// either.
+    ///
+    /// Asserts on the DECLARED key set as well as the name, because the set
+    /// is what a merge keys on: a build that sent the config with an empty
+    /// set would put the same envelope on the wire and apply nothing.
+    #[tokio::test]
+    async fn a_flockfile_load_applies_its_declared_keys_to_an_app_the_flock_has() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"zam\"\nscript = \"./srv\"\nmax_restarts = 99\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
+
+        let (code, _printed, _said) = start_against(&client, flockfile.to_str().unwrap()).await;
+
+        assert_eq!(code, ExitCode::Success);
+        let mut sent = Vec::new();
+        while let Ok(envelope) = envelopes.try_recv() {
+            if let Request::ApplyConfig { apps, reset } = envelope.body {
+                sent.push((apps, reset));
+            }
+        }
+        assert_eq!(sent.len(), 1, "one request for the whole invocation");
+        let (apps, reset) = &sent[0];
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].config.name, "zam");
+        assert!(
+            apps[0].declared.contains("max_restarts"),
+            "the edited key is declared: {:?}",
+            apps[0].declared
+        );
+        assert_eq!(
+            *reset,
+            ResetDepth::None,
+            "additive by default; --reset is something the operator types"
+        );
+    }
+
+    /// fails if `shep start ./thing` applies config to a running `thing`.
+    ///
+    /// A bare script path is not a template. The command line supplied every
+    /// value in it, including a `cwd` of wherever the operator happened to be
+    /// standing, and applying that to a sheep the flock already has would
+    /// change a running app's directory because somebody restarted it from a
+    /// different terminal.
+    #[tokio::test]
+    async fn a_bare_script_target_applies_nothing() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("zam");
+        std::fs::write(&script, "#!/bin/sh\nsleep 1\n").unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
+
+        let (code, _printed, _said) = start_against(&client, script.to_str().unwrap()).await;
+
+        assert_eq!(code, ExitCode::Success);
+        assert!(
+            applies(&mut envelopes).is_empty(),
+            "a script path declares nothing, so there is nothing to apply"
+        );
+    }
+
+    /// fails if a pending field reaches an operator without the verb that
+    /// promotes it. A list of names nobody can act on is a report nobody can
+    /// use, and this is the one place the remedy is known.
+    #[tokio::test]
+    async fn a_load_names_the_verb_that_promotes_what_is_pending() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"zam\"\nscript = \"./srv\"\nmax_restarts = 99\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let flock = a_clustered_flock(&[0, 1, 2]);
+        let (client, _envelopes) = fake_client_answering(&path, move |request| match request {
+            Request::ListFlock => Response::Flock(flock.clone()),
+            Request::ApplyConfig { .. } => Response::Applied(vec![SheepApplied::new(
+                "zam",
+                vec!["max_restarts".to_string()],
+                vec!["env".to_string()],
+                None,
+            )]),
+            _ => Response::Pong,
+        })
+        .await;
+
+        let (code, _printed, said) = start_against(&client, flockfile.to_str().unwrap()).await;
+
+        assert_eq!(code, ExitCode::Success);
+        assert!(
+            said.contains("applied max_restarts"),
+            "what landed is named: {said}"
+        );
+        assert!(
+            said.contains("shep reload zam"),
+            "and what promotes the rest: {said}"
+        );
+    }
+
+    /// fails if an app a load did nothing to prints a line anyway. A deploy
+    /// re-runs the same unchanged file, and eleven no-op lines every time
+    /// would train an operator to stop reading the ones that matter.
+    #[test]
+    fn a_load_that_did_nothing_to_an_app_says_nothing_about_it() {
+        let quiet = SheepApplied::new("zam", Vec::new(), Vec::new(), None);
+        assert_eq!(applied_line(&quiet), None);
+
+        let refused = SheepApplied::new(
+            "zam",
+            Vec::new(),
+            Vec::new(),
+            Some("zam is not registered".to_string()),
+        );
+        assert_eq!(
+            applied_line(&refused).as_deref(),
+            Some("zam: zam is not registered")
+        );
+    }
+
+    /// Every `Request::ApplyConfig` `start` sent, in order.
+    fn applies(
+        envelopes: &mut tokio::sync::mpsc::UnboundedReceiver<shep_core::protocol::Envelope>,
+    ) -> Vec<Vec<String>> {
+        let mut sent = Vec::new();
+        while let Ok(envelope) = envelopes.try_recv() {
+            if let Request::ApplyConfig { apps, .. } = envelope.body {
+                sent.push(apps.into_iter().map(|app| app.config.name).collect());
+            }
+        }
+        sent
+    }
+
+    /// fails if `shep start <name>` reads a Flockfile.
+    ///
+    /// This is the security boundary the whole apply design rests on, and it
+    /// is a boundary rather than a preference: a Flockfile arrives from an
+    /// app's own repository, so whatever it says today is whatever the last
+    /// commit to that repository said. A routine `shep start web` and a CI
+    /// job that restarts a service must not apply it. A load is something
+    /// the operator asked for by naming a FILE, never a side effect of
+    /// starting a sheep by name.
+    ///
+    /// The Flockfile here declares the same app under a different script, so
+    /// a build that read it would have something to apply and would send it.
+    /// It is handed in as the DISCOVERED file, which is the closest a name
+    /// target ever comes to a document: an operator standing in the app's
+    /// own repository, typing the sheep's name.
+    #[tokio::test]
+    async fn start_by_name_sends_no_apply_config_even_with_a_flockfile_present() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"zam\"\nscript = \"./from-the-repository\"\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        // Every instance ONLINE, so the resume has nothing to respawn and
+        // the only requests this invocation can produce are the listings.
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            start(
+                &client,
+                &mut streams,
+                &start_args("zam"),
+                Some(&flockfile),
+                &BTreeMap::new(),
+            )
+            .await
+        };
+
+        assert_eq!(code, ExitCode::Success, "the name resolved to the flock");
+        assert!(
+            applies(&mut envelopes).is_empty(),
+            "a name target applies nothing"
         );
     }
 

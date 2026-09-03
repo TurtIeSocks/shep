@@ -313,8 +313,7 @@ pub enum Request {
         apps: Vec<DeclaredApp>,
         /// How much of what the operator has set since a template last
         /// loaded this request may overwrite. Default
-        /// [`ResetDepth::None`](crate::config::ResetDepth::None), which
-        /// overwrites nothing.
+        /// [`ResetDepth::None`], which overwrites nothing.
         reset: ResetDepth,
     },
     /// Stop matching sheep (stay registered)

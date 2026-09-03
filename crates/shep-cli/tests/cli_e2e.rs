@@ -6819,20 +6819,25 @@ fn an_unknown_verb_with_no_matching_dog_keeps_claps_own_suggestion() {
 /// not applied. The silence was the bug, and the apps then crash-looped
 /// against a path that no longer applied.
 ///
-/// What a broken implementation this catches: the drift check dropped
-/// entirely (no `cwd` in stderr); the drift computed against an
-/// unnormalized config (every default the file did not spell out reported
-/// as changed, and the `env`/`cwd` assertions drown in noise); the report
-/// carrying values rather than names, which is what the `hunter2` assertion
-/// is for (IR-41). Asserting only that the config was NOT silently replaced
-/// would pass on the broken code, since not replacing it is exactly what
-/// the broken code did.
+/// It is now APPLIED as well as reported, and the report is what that load
+/// did rather than what it declined to do. `cwd` and `env` are both baked
+/// into a running child, so both wait for the next spawn, and the line that
+/// names them names `shep reload` too -- a list of field names an operator
+/// cannot act on is a report nobody can use.
+///
+/// What a broken implementation this catches: the load dropped entirely (no
+/// `cwd` in stderr); the merge computed against an unnormalized config
+/// (every default the file did not spell out reported as changed, and the
+/// `env`/`cwd` assertions drown in noise); the report carrying values rather
+/// than names, which is what the `hunter2` assertion is for (IR-41).
+/// Asserting only that the config was NOT silently replaced would pass on
+/// the broken code, since not replacing it is exactly what the broken code
+/// did.
 ///
 /// A one-app Flockfile where the real report had two: one sheep is enough to
 /// prove the message exists, and the daemon-side unit tier
-/// (`supervisor.rs::config_drift_names_an_edited_sheeps_fields_and_changes_nothing`)
-/// is where multiple fields and an unregistered app are pinned, at no
-/// process-spawning cost.
+/// (`supervisor.rs`'s apply cases) is where multiple fields and an
+/// unregistered app are pinned, at no process-spawning cost.
 #[test]
 fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
     let dir = tempfile::tempdir().unwrap();
@@ -6861,7 +6866,7 @@ fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
     // The edit, over the same path the daemon was told about.
     write_flockfile(&dir, &body(elsewhere.path(), "hunter2-after"));
     let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
-    // Drift is a warning, not a failure. Without this the test reads only
+    // A load reports, it does not fail. Without this the test reads only
     // stderr, so a change that turned the report into a refusal would keep
     // it green while breaking every operator script that runs `shep start`
     // twice.
@@ -6879,6 +6884,14 @@ fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
     assert!(
         !stderr.contains("hunter2"),
         "a field's VALUE must never reach an operator's terminal (IR-41): {stderr}"
+    );
+    // The half that separates a load from the warning it replaced: both
+    // fields are baked into a running child, so the report has to say what
+    // brings them into effect. Naming them and stopping there is the failure
+    // this whole feature set out to fix, one step further along.
+    assert!(
+        stderr.contains("shep reload edited"),
+        "a pending field travels with the verb that promotes it: {stderr}"
     );
 
     graceful_kill(home);
