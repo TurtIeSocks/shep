@@ -1198,7 +1198,7 @@ fn stale_verdict(name: &str, evidence: Silence) -> String {
              build will NOT change that. It is built against shep-client older than 0.1.23, or it \
              connects with `Client::connect` instead of `ReconnectingClient::connect_as_dog`. Rebuild \
              it against shep-client 0.1.23 or newer, then run `shep restart {name}`. It will not be \
-             restarted again in the meantime, and it goes on doing its job"
+             restarted again in the meantime, and it goes on running"
         ),
         Silence::Unattributed => format!(
             "{seen}, and this shepherd could not tell which process opened its connections, so it \
