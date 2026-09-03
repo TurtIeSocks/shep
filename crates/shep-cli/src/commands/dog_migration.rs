@@ -62,29 +62,42 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(DogMigrationError::Read(err)),
     };
-    // Cheap check first, and load-bearing rather than an optimisation.
-    // `ShepToml::edit` and `try_edit` both stage a temp file and rename it
-    // over the original whenever `save` runs, so opening the document at
-    // all would give an untouched `shep.toml` a fresh inode, force
-    // `CONFIG_FILE_MODE` on it, and replace a symlinked path with a plain
-    // file. A boot with nothing to do must not open it.
-    if !existing_source.contains("[dog.") && !existing_source.contains("[dog]") {
-        return Ok(Vec::new());
-    }
-    // The substring above answers "might there be sections"; this answers
-    // "which ones", by name, and both questions have to be asked. Either
-    // spelling can appear in a comment or inside a string, and `[dog]` on
-    // its own is a header with nothing under it: a section neither to move
-    // nor to lose, and refusing on it would leave an operator with a stray
-    // `[dog]` line unable to boot at all. A `[dog.metrics]` holding no
-    // values is the same shape one level down and is skipped for the same
-    // reason -- see [`declared_dog_names`].
+    // One parse of the string already in memory, answering both questions
+    // this function has to ask before it may open the document: is there
+    // anything to move, and which names. A read-only `toml::Table` parse
+    // opens no file and costs nothing next to the boot around it.
     //
-    // `None` means this parser could not read the source. That is not
-    // decided here: it falls through to `ShepToml`, whose own parse error
-    // names the file and the line, and the guard inside the closure falls
-    // back to the only question it can still answer.
-    let declared = declared_dog_names(&existing_source);
+    // Not a substring test, which is what this was. `[dog.` and `[dog]`
+    // are two of the spellings a `[dog]` header has and TOML allows the
+    // others: `[ dog.metrics ]` and `[dog . metrics]` are the same section
+    // and matched neither, so the migration reported nothing to do, the
+    // section stayed in a file nothing reads any more, and the dog came up
+    // on compiled defaults with no warning on any surface. For bark that
+    // is every sink gone. A parse knows the spellings; a substring cannot.
+    //
+    // Skipping the open when there is nothing to move is load-bearing
+    // rather than an optimisation. `ShepToml::edit` and `try_edit` both
+    // stage a temp file and rename it over the original whenever `save`
+    // runs, so opening the document at all would give an untouched
+    // `shep.toml` a fresh inode, force `CONFIG_FILE_MODE` on it, and
+    // replace a symlinked path with a plain file. Every boot after the
+    // first reaches this line, so that cost would land on everyone.
+    //
+    // `[dog]` on its own is a header with nothing under it: a section
+    // neither to move nor to lose, and refusing on it would leave an
+    // operator with a stray `[dog]` line unable to boot at all. A
+    // `[dog.metrics]` holding no values is the same shape one level down
+    // and is skipped for the same reason -- see [`declared_dog_names`].
+    //
+    // `None` means this parser could not read the source at all. That is
+    // not decided here: the document is opened and it falls through to
+    // `ShepToml`, whose own parse error names the file and the line, and
+    // the guard inside the closure falls back to the only question it can
+    // still answer.
+    let declared = existing_source
+        .parse::<toml::Table>()
+        .ok()
+        .map(|table| declared_dog_names(&table));
     if declared.as_ref().is_some_and(BTreeSet::is_empty) {
         return Ok(Vec::new());
     }
@@ -277,14 +290,15 @@ fn read_dogs_document(path: &Path) -> Result<DocumentMut, DogMigrationError> {
     })
 }
 
-/// Every name `source` declares a VALUE for under `[dog]`, or `None` when
-/// `source` is not TOML this parser can read.
+/// Every name `table` declares a VALUE for under `[dog]`.
 ///
-/// A second parse of a file [`ShepToml`] is about to parse again, and
-/// deliberately so: it is the only record of what was there BEFORE
-/// [`ShepToml::take_dog_sections`] struck the table, which is what the
-/// guard inside [`migrate_dog_sections`] compares against. Read-only, over
-/// a string already in memory, and it never opens the file.
+/// Read from a second parse of a file [`ShepToml`] is about to parse
+/// again, and deliberately so: it is the only record of what was there
+/// BEFORE [`ShepToml::take_dog_sections`] struck the table, which is what
+/// the guard inside [`migrate_dog_sections`] compares against. Read-only,
+/// over a string already in memory, and it never opens the file. Empty
+/// also means "do not open the file at all", so this is the whole of that
+/// caller's gate as well as its record.
 ///
 /// A name holding nothing is left out, and that is the whole of
 /// [`declares_nothing`]'s reason to exist. `shep enable metrics` on any
@@ -294,19 +308,17 @@ fn read_dogs_document(path: &Path) -> Result<DocumentMut, DogMigrationError> {
 /// made the new binary refuse to boot against a `dogs.toml` that already
 /// held `metrics`, on a `WouldOverwrite` whose own doc says "two values for
 /// one key". An empty table is not a value.
-fn declared_dog_names(source: &str) -> Option<BTreeSet<String>> {
-    let table = source.parse::<toml::Table>().ok()?;
+fn declared_dog_names(table: &toml::Table) -> BTreeSet<String> {
     match table.get("dog") {
-        Some(toml::Value::Table(dog)) => Some(
-            dog.iter()
-                .filter(|(_, value)| !declares_nothing(value))
-                .map(|(name, _)| name.clone())
-                .collect(),
-        ),
+        Some(toml::Value::Table(dog)) => dog
+            .iter()
+            .filter(|(_, value)| !declares_nothing(value))
+            .map(|(name, _)| name.clone())
+            .collect(),
         // No `[dog]` at all, or a `dog` that is not a table: either way it
-        // declares no dog, and the substring gate that let us this far was
-        // matching a comment or a string.
-        _ => Some(BTreeSet::new()),
+        // declares no dog and there is nothing here to open the document
+        // for.
+        _ => BTreeSet::new(),
     }
 }
 
@@ -966,6 +978,61 @@ mod tests {
             !written.contains("metrics"),
             "an empty scaffold is not carried across: {written}"
         );
+    }
+
+    /// Fails if a header an operator spelled with spaces inside the
+    /// brackets strands its section in `shep.toml` forever.
+    ///
+    /// `[ dog.metrics ]` is ordinary TOML and means exactly what
+    /// `[dog.metrics]` means. A substring test for `"[dog."` matched
+    /// neither it nor `[dog . metrics]`, so the migration returned "nothing
+    /// to do", the section stayed where nothing reads it any more, and the
+    /// dog came up on its compiled defaults with no warning on any surface.
+    /// For bark that is every sink gone and alerting silently off.
+    #[test]
+    fn a_header_spelled_with_whitespace_still_migrates() {
+        let (_dir, paths) = home_with(
+            "[daemon]\nenabled_dogs = [\"metrics\"]\n\n[ dog.metrics ]\nbind = \"127.0.0.1:19615\"\n",
+        );
+
+        let moved = migrate_dog_sections(&paths).expect("migrate");
+
+        assert_eq!(moved, vec!["metrics".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(&paths.daemon_config).expect("read"),
+            "[daemon]\nenabled_dogs = [\"metrics\"]\n",
+            "the section leaves shep.toml"
+        );
+        let written = std::fs::read_to_string(&paths.dogs_config).expect("read");
+        let parsed = DogsConfig::load(Some(&written)).expect("valid");
+        assert_eq!(
+            parsed.dog["metrics"]["bind"].as_str(),
+            Some("127.0.0.1:19615")
+        );
+    }
+
+    /// Fails if a boot with nothing to migrate opens `shep.toml` for
+    /// editing anyway.
+    ///
+    /// The inode is the assertion, not the bytes, because the bytes are
+    /// identical either way. `ShepToml::edit` and `try_edit` stage a temp
+    /// file and rename it over the original whenever `save` runs, so
+    /// opening the document on an idle boot would hand an untouched
+    /// `shep.toml` a fresh inode, force `CONFIG_FILE_MODE` onto it, and
+    /// turn a symlinked path into a plain file. Every boot after the first
+    /// takes this path, so the cost lands on every operator.
+    #[cfg(unix)]
+    #[test]
+    fn a_boot_with_nothing_to_move_never_reopens_the_file() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (_dir, paths) = home_with("[daemon]\nlog_level = \"info\"\n\n[dog]\n");
+        let before = std::fs::metadata(&paths.daemon_config).expect("stat").ino();
+
+        assert!(migrate_dog_sections(&paths).expect("migrate").is_empty());
+
+        let after = std::fs::metadata(&paths.daemon_config).expect("stat").ino();
+        assert_eq!(before, after, "an idle boot must not rewrite shep.toml");
     }
 
     // The one case that must never silently merge: an operator who already
