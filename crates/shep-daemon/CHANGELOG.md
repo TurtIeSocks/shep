@@ -10,6 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-09-03
+
+### Added
+
+- Stamp every log line with the time it was written
+- Write shep's own account of a dog into that dog's log
+- Report the give-up beside the handshake in every listing
+
+### Fixed
+
+- Say what this shepherd saw, not what it inferred, about a silent dog
+- Keep a log line meaning one thing on both of its paths
+- Flush a narration line, or it can be lost outright
+- Write a stamped line in one call, so narration cannot tear it
+- Stop telling an operator an anonymous dog is doing its job
+- Stop linking public docs at private items
+- A map that just started watching must not say a pid never called
+- Serialize a whole record across both writers on a log path
+- Make the ladder wait for attribution instead of racing it
+- Take the record lock in reopen, and name the lossy key it cannot cover
+
+
 ### Added
 
 - Shep writes its own account of a dog into that dog's log file, marked
