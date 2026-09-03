@@ -439,9 +439,17 @@ appends keys nobody has established and overwrites nothing, because a
 Flockfile arrives through a pull request. `--reset` puts non-`env` settings
 back to the template and `--reset-all` puts everything back and drops the
 record; both are refused when the target names a sheep, since a name reads
-no file. A load never registers, never prunes and never kills -- a field the
-running child holds parks as pending and `shep reload`/`shep restart`
-promote it, re-resolving identity only when `user` or `group` moved. A `CFG`
+no file. A load with NO FLAG never registers, never prunes and never kills --
+a field the running child holds parks as pending and `shep reload`/`shep
+restart` promote it, re-resolving identity only when `user` or `group` moved.
+**A reset can kill, and that is deliberate.** `instances` is Structural, held
+out of a plain load entirely and routed through `handle_scale` under either
+reset flag, whose `Ordering::Less` arm deletes the instances above the new
+count on the same path `shep delete` takes (`a_plain_load_never_scales_and_a_reset_does`
+pins it). The sharp edge: a Flockfile that never mentions `instances` still
+means 1 under a reset, because that is the compiled default the reset falls
+back to, so an app stocked to four goes to one against a file that has no
+opinion about the count. The overrides page carries the warning. A `CFG`
 column in `shep flock` and in `shep lookout` marks a sheep with pending
 (`!N`) or overridden (`*N`) fields, and `shep describe` lists the names. A
 per-app refusal exits non-zero. The four-way field classification lives in

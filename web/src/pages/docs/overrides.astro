@@ -25,7 +25,7 @@ ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM    UPTIME  FOLD  SMIT
 0   web   online  18497  0         -     -    -    32.0K  0s      -     -`;
 
 const secondLoad = `$ shep start Flockfile.toml
-notice[start]: web: applied max_memory; cwd wait for the next spawn (\`shep reload web\` promotes them)
+notice[start]: web: applied max_memory; cwd waiting on the next spawn (\`shep reload web\` promotes them)
 notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
 0   web   online  18497  0         -     !1   -    3.0M  4s      -     -`;
@@ -61,8 +61,23 @@ const envHeld = `$ shep start Flockfile.toml
 notice[start]: web is already online; \`shep restart web\` replaces it.
 
 $ shep start Flockfile.toml --reset-all
-notice[start]: web: env wait for the next spawn (\`shep reload web\` promotes them)
+notice[start]: web: env waiting on the next spawn (\`shep reload web\` promotes them)
 notice[start]: web is already online; \`shep restart web\` replaces it.`;
+
+const resetScales = `$ shep flock
+ID  NAME   STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0  online  36922  0         -     -    -    3.0M  2s      -     -
+1   web:1  online  36945  0         -     -    -    3.0M  2s      -     -
+2   web:2  online  36946  0         -     -    -    3.0M  2s      -     -
+3   web:3  online  36947  0         -     -    -    3.0M  2s      -     -
+
+$ shep start Flockfile.toml --reset
+notice[start]: web: applied instances; cwd waiting on the next spawn (\`shep reload web\` promotes them)
+notice[start]: web are already running; \`shep restart web\` replaces them.
+
+$ shep flock
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   web   online  36922  0         -     !1   -    3.0M  7s      -     -`;
 
 const store = `$ cat $SHEP_HOME/overrides.json
 {
@@ -127,12 +142,20 @@ const store = `$ cat $SHEP_HOME/overrides.json
       sitting in the current directory.
     </Callout>
 
-    <h2>Three things a load will not do</h2>
+    <h2>Three things a load with no flag will not do</h2>
     <div class="rows">
       <div class="row"><span>never registers</span><span>An app the file names and the flock does not have is reported and skipped. <code>shep start</code> adds sheep; a load that also started things would make a config file a way to run processes on a host by opening a pull request.</span></div>
       <div class="row"><span>never prunes</span><span>An app the file does not mention is left alone. shep has no record of which Flockfile a sheep came from, so loading <code>./a/Flockfile.toml</code> and then <code>./b/Flockfile.toml</code> would otherwise have the second wipe the first's flock.</span></div>
-      <div class="row"><span>never kills</span><span>Nothing a load does stops a process. A setting the running child is holding waits for that child to be replaced, and says so.</span></div>
+      <div class="row"><span>never kills</span><span>A plain load stops no process. A setting the running child is holding waits for that child to be replaced, and says so.</span></div>
     </div>
+    <p>
+      All three are about the load a merged pull request can cause, which is
+      the one with no flag on it, and that is the bound worth knowing: an
+      unreviewed template cannot cost you a process. The reset flags are a
+      person asking for the template's shape, and a shape includes a count.
+      <a href="#the-reset-flags-reshape-the-flock">One of them can kill</a>,
+      and it has a section of its own below.
+    </p>
 
     <h2>What a load looks like</h2>
     <p>
@@ -205,8 +228,8 @@ const store = `$ cat $SHEP_HOME/overrides.json
     </p>
     <div class="rows">
       <div class="row"><span>no flag</span><span>Append what nobody has established. Overwrite nothing. <code>instances</code> is held out of even this: a plain load never reshapes a flock.</span></div>
-      <div class="row"><span><code>--reset</code></span><span>Every setting but <code>env</code> goes back to what the file says, including the instance count. <code>env</code> and anything added since are kept.</span></div>
-      <div class="row"><span><code>--reset-all</code></span><span>Everything goes back to the file, <code>env</code> included, and the sheep's override record is dropped.</span></div>
+      <div class="row"><span><code>--reset</code></span><span>Every setting but <code>env</code> goes back to what the file says, the instance count included, which is the one that can delete a process. <code>env</code> and anything added since are kept.</span></div>
+      <div class="row"><span><code>--reset-all</code></span><span>Everything goes back to the file, <code>env</code> and the instance count included, and the sheep's override record is dropped.</span></div>
     </div>
     <p>
       The line between the two resets is data against policy.
@@ -221,6 +244,31 @@ const store = `$ cat $SHEP_HOME/overrides.json
       a file: <code>--reset needs a Flockfile to reset to; web names a sheep,
       not a file</code>, exit 2. There is no template to reset to, and doing
       nothing quietly would be worse.
+    </p>
+
+    <h2 id="the-reset-flags-reshape-the-flock">The reset flags reshape the flock, and that can kill</h2>
+    <p>
+      <code>instances</code> is the one setting that changes the shape of a
+      flock rather than the value of a field, which is why a plain load holds
+      it out of scope however unestablished it is. A reset does not. It puts
+      the count back to what the template says, and putting a count back down
+      deletes the instances above it, through the same path
+      <code>shep delete</code> takes.
+    </p>
+    <Callout variant="careful">
+      A Flockfile that never mentions <code>instances</code> still says
+      something about it under a reset flag: it says 1, because that is the
+      compiled default the reset falls back to. So an app you scaled to four
+      with <code>shep stock</code> goes to one on a <code>--reset</code>
+      against a file that has no opinion about instances at all. Write the
+      count you want into the template before you reset against it.
+    </Callout>
+    <CodeBlock>{resetScales}</CodeBlock>
+    <p>
+      Four instances, a reset against a two-line Flockfile, one instance
+      left. Nothing there is a bug and nothing was silent: the report names
+      <code>instances</code> among what it applied. It is still the sharpest
+      edge on this page, because the file that caused it never said the word.
     </p>
 
     <h2>Empty values are the point</h2>
