@@ -1341,6 +1341,15 @@ pub async fn boot<R: ProcessRunner>(
     // across a handover either — a successor has been connected to by
     // nobody, and a pid it has never seen is one it must not claim has
     // never called.
+    //
+    // That last clause was a wish rather than a description until
+    // `PEER_CONTACT_WARMUP` existed. An empty map answered `Contact::None`
+    // for every pid, which routes to `Silence::Unreachable` and prints the
+    // reinstall verdict, so for its first seconds a successor told every dog
+    // carried across the reload that the binary on disk could not reach shep.
+    // The warm-up is what makes starting empty safe: until this map has been
+    // listening long enough for an absence to mean something, it answers
+    // `Contact::Unknown` and the ladder names both candidates instead.
     let peer_contacts = crate::dogs::PeerContacts::new();
     // Spawned at every boot, INCLUDING a successor's after an `execve` --
     // that is why it is anchored here and not to a dog's own spawn (see

@@ -557,6 +557,29 @@ impl DogRefusals {
 /// them came from the one CLI process, so they are one entry.
 const PEER_CONTACT_CAPACITY: usize = 1024;
 
+/// How long this map must have been watching before a pid's ABSENCE from it
+/// means anything.
+///
+/// `Contact::None` supports exactly one claim, that a dog is not reaching
+/// this shepherd's socket, and that claim is only the map's to make about a
+/// stretch it was actually listening for. A successor built by
+/// [`crate::boot`] starts empty at every `execve`, so without this every dog
+/// carried across a `shep daemon reload` looked, for the first few seconds,
+/// exactly like a dog that had never called: absent from the map, and
+/// therefore `Unreachable`, and therefore told to reinstall a binary that was
+/// fine. That is the message this whole ladder exists to stop shep guessing.
+///
+/// Three budgets rather than two. The ladder restarts a silent dog at one
+/// [`DOG_SILENCE_BUDGET`] and writes the stale verdict at two, so a dog
+/// judged at boot plus two has been observed for this daemon's entire life
+/// and proves nothing about its own reachability. A third budget is the
+/// margin that makes an absence real: shep was up, listening, and unspoken to
+/// for a whole budget longer than the dog's own silence.
+///
+/// Before it elapses `from_pid` answers [`Contact::Unknown`], which routes to
+/// `Silence::Unattributed` and names both candidates instead of picking one.
+const PEER_CONTACT_WARMUP: Duration = DOG_SILENCE_BUDGET.saturating_mul(3);
+
 /// What this daemon has observed arriving on its socket, keyed by the
 /// connecting process's pid.
 ///
@@ -598,9 +621,27 @@ const PEER_CONTACT_CAPACITY: usize = 1024;
 /// `Debug` is derived and needs no redaction (IR-41), for the same reason
 /// [`DogRefusals`]'s is: the map holds pids and two booleans' worth of
 /// fact, and no configuration value can reach it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PeerContacts {
     seen: Arc<Mutex<Contacts>>,
+    /// When this map started watching, which is this daemon's own boot.
+    ///
+    /// Outside the lock because nothing writes it after construction, and
+    /// cloned with the handle so every clone agrees about the same daemon.
+    ///
+    /// [`tokio::time::Instant`], matching `SilentDogs` and for the same
+    /// reason: a test can move that clock rather than sleeping out three
+    /// whole budgets to watch the warm-up expire.
+    watching_since: Instant,
+}
+
+impl Default for PeerContacts {
+    fn default() -> Self {
+        Self {
+            seen: Arc::default(),
+            watching_since: Instant::now(),
+        }
+    }
 }
 
 /// What [`PeerContacts`] holds, under its one lock.
@@ -720,6 +761,9 @@ impl PeerContacts {
             return Contact::Unknown;
         };
         match self.lock().by_pid.get(&pid) {
+            // Absence is a finding only once this map has been watching long
+            // enough for it to be one. See `PEER_CONTACT_WARMUP`.
+            None if self.watching_since.elapsed() < PEER_CONTACT_WARMUP => Contact::Unknown,
             None => Contact::None,
             Some(seen) if seen.named_a_dog => Contact::Named,
             Some(_) => Contact::Anonymous,
@@ -2272,9 +2316,15 @@ mod tests {
     /// The whole diagnosis rests on that difference: one means the dog is
     /// not reaching the socket, the other means it is reaching it and not
     /// naming itself, and they have opposite fixes.
-    #[test]
-    fn a_pid_that_never_called_is_told_apart_from_one_that_called_anonymously() {
+    #[tokio::test(start_paused = true)]
+    async fn a_pid_that_never_called_is_told_apart_from_one_that_called_anonymously() {
         let contacts = PeerContacts::new();
+
+        // Past the warm-up first: on a map this new, absence is not yet a
+        // finding, and `a_cold_map_does_not_claim_a_pid_never_called` is the
+        // case that pins that. Here the subject is the None/Anonymous/Named
+        // distinction, so the clock is moved out of the way.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
 
         assert_eq!(
             contacts.from_pid(Some(4242)),
@@ -2298,6 +2348,46 @@ mod tests {
         assert_eq!(contacts.from_pid(Some(4242)), Contact::Named);
     }
 
+    /// A successor's map starts empty at every `execve`, so for its first
+    /// few seconds every dog carried across the handover is absent from it.
+    /// Reading that absence as "this dog never called" put the reinstall
+    /// verdict on a dog that was fine, which is the message this ladder
+    /// exists to stop shep guessing. `crate::boot`'s own comment already
+    /// claimed the property this pins.
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_map_does_not_claim_a_pid_never_called() {
+        let contacts = PeerContacts::new();
+
+        assert_eq!(
+            contacts.from_pid(Some(4242)),
+            Contact::Unknown,
+            "a map this new was not listening long enough for an absence to mean anything"
+        );
+        assert_eq!(
+            stale_verdict("metrics", Silence::of(Some(4242), &contacts)),
+            stale_verdict("metrics", Silence::Unattributed),
+            "an unwarmed map must reach the arm that names both candidates"
+        );
+
+        // One tick short of the warm-up is still too new.
+        tokio::time::advance(PEER_CONTACT_WARMUP - Duration::from_millis(1)).await;
+        assert_eq!(contacts.from_pid(Some(4242)), Contact::Unknown);
+
+        // And past it the absence is earned, so the reinstall advice comes
+        // back. Deleting a true message would be its own defect.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert_eq!(
+            contacts.from_pid(Some(4242)),
+            Contact::None,
+            "shep was listening for a whole budget past the dog's silence"
+        );
+        assert!(
+            stale_verdict("metrics", Silence::of(Some(4242), &contacts))
+                .contains("cannot reach this shep"),
+            "the earned reinstall advice must survive"
+        );
+    }
+
     /// Fails if a later anonymous connection unsays an earlier named one.
     ///
     /// The question is whether this process has EVER named itself. A dog
@@ -2319,9 +2409,13 @@ mod tests {
     /// eviction rule exists so the bound cannot cost the answer: a dog
     /// reconnects, so it is touched, so it survives any amount of churn
     /// from short-lived `shep` invocations.
-    #[test]
-    fn a_full_map_forgets_the_pid_that_stopped_calling() {
+    #[tokio::test(start_paused = true)]
+    async fn a_full_map_forgets_the_pid_that_stopped_calling() {
         let contacts = PeerContacts::new();
+        // An evicted entry reads as `None` only once the map is old enough
+        // for an absence to be a finding at all. The subject here is
+        // eviction, so the warm-up is moved out of the way.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
         let dog = 1;
         contacts.named_a_dog(dog);
 
@@ -2424,9 +2518,12 @@ mod tests {
     /// what sets `handshook`, and `silent_dogs` filters a handshook dog out),
     /// so the only honest reading is that the attribution cannot be trusted
     /// for this dog.
-    #[test]
-    fn evidence_is_read_off_the_record_and_never_guessed() {
+    #[tokio::test(start_paused = true)]
+    async fn evidence_is_read_off_the_record_and_never_guessed() {
         let contacts = PeerContacts::new();
+        // `Unreachable` is only ever read off a map that has been watching
+        // long enough to claim it; see `a_cold_map_does_not_claim_a_pid_never_called`.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
         contacts.connected(11);
         contacts.named_a_dog(12);
 
