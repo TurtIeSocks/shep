@@ -714,6 +714,87 @@ git commit -m "docs: dog config lives in dogs.toml now"
 
 ---
 
+---
+
+### Task 5: the writers the plan forgot
+
+**Added after Task 4's review found a boot-breaking bug this plan had no task for.** Tasks 1 to 3 moved every READER of a dog's config to `dogs.toml` and left three WRITERS pointed at `shep.toml`. The file list for this plan never asked what else touches `[dog.*]`, and Task 2 added a method to the very file holding them.
+
+**Files:**
+- Modify: `crates/shep-cli/src/commands/shep_toml.rs` (`enable_dog` around line 282, `rehome_dog` around line 434, and the doc comments on both plus `disable_dog`)
+- Modify: `crates/shep-cli/src/commands/dogs.rs` (the `rehome` verb, which coordinates across both files)
+- Modify: `crates/shep-cli/src/dog/mod.rs:328` and `crates/shep-cli/src/dog/metrics/mod.rs:172` (operator-facing `eprintln!` strings)
+- Modify: `crates/shep-core/src/config/daemon.rs:192`
+
+**Interfaces:**
+- Consumes: `DogsConfig`, `ShepPaths::dogs_config`, and `dog_migration`'s write path from Tasks 1 and 3.
+- Produces: nothing new for later tasks; this is the last one.
+
+**The bug, reproduced with the release binary:**
+
+```
+shep enable metrics     # writes an empty [dog.metrics] into shep.toml
+# operator configures metrics in dogs.toml, as docs/dogs.md now instructs
+shep muster             # daemon exits 4: configured in both shep.toml and dogs.toml
+```
+
+The flock goes down over a scaffold nobody meant to write. `enable_dog` ends with `self.dog_table_mut(name)`, which creates that table. `rehome_dog` strikes `[dog.<name>]` from `shep.toml` and never touches `dogs.toml`, so rehoming a dog now leaves its config orphaned in a file nothing will clean up.
+
+`disable_dog` is already correct: it deliberately leaves a dog's config alone so it survives a disable and enable cycle, and post-move that means not touching `dogs.toml`, which it does by doing nothing. Only its doc comment is stale.
+
+- [ ] **Step 1: Write the failing test**
+
+The regression test is the sequence above, not a unit assertion. Put it where the CLI's other end-to-end dog tests live and drive the real verbs:
+
+```rust
+#[test]
+fn enabling_a_dog_does_not_leave_a_section_that_refuses_the_next_boot() {
+    // The bug this test exists for: `shep enable` scaffolded `[dog.<name>]`
+    // into `shep.toml` while a dog's config had already moved to
+    // `dogs.toml`, so an operator who enabled a dog and then configured it
+    // where the docs say to had a name in both files. The migration refuses
+    // that, correctly, and the daemon exits 4 with the flock unsupervised.
+    // Enabling must leave nothing behind that a later boot can collide with.
+}
+```
+
+Write the body against whatever harness the neighbouring dog tests already use. Assert on `shep.toml`'s content after `shep enable`, then that a boot with a configured `dogs.toml` succeeds rather than refusing.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Expected: FAIL, the enable leaves a `[dog.<name>]` table behind.
+
+- [ ] **Step 3: Decide where a scaffold belongs, and say why in the code**
+
+`enable_dog` must stop writing into `shep.toml`'s `[dog]` table. Two defensible destinations and the choice is yours to argue at the call site:
+
+- Scaffold nothing. `dog_section` already documents an absent section as legitimate and answers an empty string, so a dog enables and runs on its defaults until someone configures it.
+- Scaffold `[<name>]` into `dogs.toml` instead, keeping the original intent that enabling a dog gives an operator somewhere to write.
+
+The first is smaller and cannot collide. The second preserves a nicety and puts `ShepToml`, which owns one file, in the position of writing another. Whichever you pick, the doc comment says which and why.
+
+- [ ] **Step 4: Make `rehome` forget both files**
+
+`ShepToml` owns `shep.toml` alone, so the cross-file part belongs in the `rehome` verb rather than inside `rehome_dog`. Removing a dog's section from `dogs.toml` must go through the same staged temp, `fsync` and rename path Task 3 built, never a bare `std::fs::write`: that file holds webhook credentials and is `0600`.
+
+- [ ] **Step 5: Fix the operator-facing strings**
+
+`crates/shep-cli/src/dog/mod.rs:328` and `crates/shep-cli/src/dog/metrics/mod.rs:172` print `[dog.bark]` and `[dog.metrics]` at runtime. `crates/shep-core/src/config/daemon.rs:192` says shep-daemon reads a `[dog.<name>]` table from `DaemonConfig`, which is wrong about the struct and not only the notation: `dog_section` reads `DogsConfig` now.
+
+- [ ] **Step 6: Run the tests**
+
+Run: `cargo test --workspace --lib --bins --all-features -- --skip ::slow::`
+Expected: PASS.
+
+- [ ] **Step 7: Prove the regression test is not vacuous**
+
+Restore the `self.dog_table_mut(name)` call in `enable_dog`, watch the new test go red, remove it again.
+
+- [ ] **Step 8: Commit**
+
+One commit per item, per this repository's convention: the enable fix, the rehome fix, and the strings are three separable changes.
+
+
 ## Self-Review
 
 **Spec coverage.** Decision 1 is Tasks 1 and 3. Decision 2 is Task 3, with `RawDaemonConfig::dog` deliberately retained and that argued in the File Structure table. Decision 3 is Task 3 step 6, pinned as an exact string rather than assumed. The spec's Testing section lists eight cases: the migration exact-string, the no-sections no-rewrite, the second-boot no-op, and the byte-identical `dog_section` are Tasks 2 and 3. The remaining four (`probe` answering both flags, the three bad-`--schema` shapes, the secret marker round-trip, and the bus topic publishing once) all belong to decisions 4 through 9 and are releases 2 and 3, correctly absent here. The spec's Docs section is Task 4.
