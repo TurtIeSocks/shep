@@ -222,13 +222,14 @@ pub(crate) fn silence_note(
         // ran for two days in production with every surface reporting it as
         // an unremarkable `online`.
         Some(true) => format!(
-            "silent  `{name}`'s process is up, it has never answered this shepherd, and this \
-             shepherd has GIVEN UP on it: the one restart it earned did not help, so it will \
-             not be restarted again and nothing more will happen on its own. shep wrote what \
-             it saw at that moment into this dog's own log -- run \
-             `shep bleats {name}` and read it, because that line says whether the dog cannot \
-             reach shep at all or reaches it without naming itself, and only one of those two \
-             is fixed by reinstalling."
+            "silent  `{name}`'s process is up and this shepherd has GIVEN UP on it: the one \
+             restart it earned did not help, so it will not be restarted again and nothing \
+             more will happen on its own. shep wrote what it saw at that moment into this \
+             dog's own log -- run `shep bleats {name}` and read it, because that line names \
+             what shep observed and this listing cannot. Three different faults arrive here \
+             looking identical: a dog that never reached the socket, one that reaches it and \
+             never names itself, and one this shepherd turned away on protocol skew. What to \
+             do about them differs, so the log is the surface that says."
         ),
         // A shepherd that predates the field. Says so rather than picking
         // either arm above: guessing "still waiting" would hide a live
@@ -391,17 +392,30 @@ mod tests {
     ///
     /// `Some(true)` is the state that ran for two days in production while
     /// every surface reported an unremarkable `online`. It has to say the
-    /// shepherd has stopped, that nothing further will happen, and -- the
-    /// part that cost the two days -- that reinstalling is not automatically
-    /// the answer.
+    /// shepherd has stopped and that nothing further will happen.
+    ///
+    /// What it must NOT do is name a cause. Three faults reach this arm and
+    /// look the same from a listing: a dog that never reached the socket, one
+    /// that reaches it anonymously, and one refused on protocol skew, which
+    /// latches `stale` through `record_refused_dog`. That last one DID answer
+    /// this shepherd and a rebuild is its fix, so the earlier wording -- "it
+    /// has never answered", and reinstalling fixing "only one of those two" --
+    /// was wrong for it twice.
     #[test]
     fn the_given_up_note_says_the_shepherd_has_stopped_trying() {
         let note = silence_note("log-rotate", Reported::Silent, Some(true)).expect("a silent row");
         assert!(note.contains("GIVEN UP"), "{note}");
         assert!(note.contains("will not be restarted again"), "{note}");
+        assert!(note.contains("shep bleats log-rotate"), "{note}");
+        // The listing cannot tell the three faults apart, so it must not
+        // imply it can. A refused dog reaches this arm too.
         assert!(
-            note.contains("only one of those two is fixed by reinstalling"),
-            "{note}"
+            !note.contains("never answered"),
+            "a refused dog did answer: {note}"
+        );
+        assert!(
+            !note.contains("reinstalling"),
+            "this surface cannot say whether reinstalling helps: {note}"
         );
     }
 
