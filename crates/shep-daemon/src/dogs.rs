@@ -1370,6 +1370,15 @@ pub(crate) async fn narrate(events: &Bus, info: &ProcessInfo, message: &str) {
         // about the dog.
         if let Ok(mut file) = crate::tokio_runner::open_append(Path::new(path)).await {
             use tokio::io::AsyncWriteExt as _;
+            // Taken AFTER the open, deliberately. The pump waits on this lock
+            // for every line it writes, so holding it across a filesystem
+            // open would stall a sheep's output for as long as the open took.
+            // Held across the write and the flush together, which is the
+            // whole record: see `crate::tokio_runner::record_lock` for what
+            // interleaves without it.
+            let _record = crate::tokio_runner::record_lock(Path::new(path))
+                .lock_owned()
+                .await;
             // The flush is not optional and not belt-and-braces.
             // `tokio::fs::File` copies into its own buffer and hands the real
             // `write(2)` to the blocking pool, so `write_all` returning means
