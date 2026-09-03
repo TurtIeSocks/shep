@@ -121,8 +121,8 @@ Expected: FAIL, `unresolved module or unlinked crate 'dogs'` or `cannot find typ
 //! derived state, and an operator on a box with only a shell has to be able
 //! to set one without a dashboard.
 
-use alloc::collections::BTreeMap;
 use core::fmt;
+use std::collections::BTreeMap;
 
 /// Every `[<dog>]` table in `dogs.toml`
 ///
@@ -183,13 +183,13 @@ impl core::error::Error for DogsConfigError {
 }
 ```
 
-Match the crate's existing import style: if `crates/shep-core/src/config/daemon.rs` writes `use std::collections::BTreeMap;` rather than `alloc::`, do the same here. Grep it and follow, do not introduce a second convention.
+`std::collections::BTreeMap` matches `crates/shep-core/src/config/daemon.rs:8`, which is the neighbouring module. Checked, not guessed.
 
 `#[non_exhaustive]` on the error carries a reason comment per IR-20: add `// One variant today. `#[non_exhaustive]` so a second reading failure (a permissions error, once this type learns to open the file itself) is additive rather than breaking.` directly above the attribute.
 
 - [ ] **Step 4: Export it**
 
-In `crates/shep-core/src/config/mod.rs`, add `pub mod dogs;` in alphabetical position (between `pub mod daemon;` and `pub mod flockfile;`), and add `pub use dogs::{DogsConfig, DogsConfigError};` alongside the other re-exports if and only if the neighbouring modules are re-exported that way. Check `pub use daemon::...` first and match it.
+In `crates/shep-core/src/config/mod.rs`, add `pub mod dogs;` between `pub mod daemon;` (line 7) and `pub mod flockfile;` (line 8), and `pub use dogs::{DogsConfig, DogsConfigError};` immediately after `pub use daemon::{...}` on line 19. Every neighbouring module is re-exported that way; checked.
 
 - [ ] **Step 5: Add the path**
 
@@ -293,6 +293,10 @@ fn taking_from_a_file_with_no_dog_sections_changes_nothing() {
     let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
 
     assert!(taken.is_empty());
+    // Content identity, not proof that nothing was written: `edit` always
+    // stages and renames, so the file has a new inode either way. Not
+    // writing at all is the migration's job, and its own early return is
+    // where that is tested.
     assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
 }
 ```
@@ -491,8 +495,12 @@ pub fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrati
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(DogMigrationError::Read(err)),
     };
-    // Cheap check first: parsing tells us whether there is anything to do
-    // without taking a lock or opening the other file.
+    // Cheap check first, and load-bearing rather than an optimisation.
+    // `ShepToml::edit` and `try_edit` both stage a temp file and rename it
+    // over the original whenever `save` runs, so opening the document at
+    // all would give an untouched `shep.toml` a fresh inode, force
+    // `CONFIG_FILE_MODE` on it, and replace a symlinked path with a plain
+    // file. A boot with nothing to do must not open it.
     if !existing_source.contains("[dog.") && !existing_source.contains("[dog]") {
         return Ok(Vec::new());
     }
@@ -503,39 +511,37 @@ pub fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrati
         Err(err) => return Err(DogMigrationError::Read(err)),
     };
 
-    // Read-only pass so a refusal strikes nothing. `take_dog_sections`
-    // mutates, so the collision has to be found before the edit that would
-    // remove the evidence.
-    let incoming = ShepToml::edit(&paths.daemon_config, |doc| {
-        let taken = doc.take_dog_sections();
-        // Not saved: `edit` writes only what the closure leaves behind, and
-        // this pass exists to look rather than to change.
-        taken
+    // `try_edit`, never `edit`. `edit` calls `save` unconditionally
+    // (shep_toml.rs:169), so refusing from inside it would strike the
+    // sections from `shep.toml` and only then fail, leaving them in
+    // neither file. `try_edit`'s own `Err` skips `save` entirely and
+    // leaves `path` exactly as it was found.
+    ShepToml::try_edit(&paths.daemon_config, |doc| {
+        let incoming = doc.take_dog_sections();
+        if let Some(name) = incoming.keys().find(|name| already.dog.contains_key(*name)) {
+            return Err(DogMigrationError::WouldOverwrite { name: name.clone() });
+        }
+        let mut moved: Vec<String> = incoming.keys().cloned().collect();
+        moved.sort();
+
+        let mut merged = already.dog.clone();
+        merged.extend(incoming);
+        let rendered = toml::to_string(&merged).map_err(DogMigrationError::Render)?;
+        // Written before this closure returns, so `save` strikes the old
+        // sections only once the new file already holds them. A crash
+        // between the two leaves them readable from `shep.toml`, which is
+        // the direction that loses nothing.
+        std::fs::write(&paths.dogs_config, rendered).map_err(DogMigrationError::Write)?;
+        Ok(moved)
     })
-    .map_err(DogMigrationError::Edit)?;
-
-    if let Some(name) = incoming.keys().find(|name| already.dog.contains_key(*name)) {
-        return Err(DogMigrationError::WouldOverwrite { name: name.clone() });
-    }
-
-    let mut merged = already.dog;
-    let mut moved: Vec<String> = incoming.keys().cloned().collect();
-    merged.extend(incoming);
-    moved.sort();
-
-    let rendered = toml::to_string(&merged).map_err(DogMigrationError::Render)?;
-    std::fs::write(&paths.dogs_config, rendered).map_err(DogMigrationError::Write)?;
-
-    ShepToml::edit(&paths.daemon_config, |doc| {
-        doc.take_dog_sections();
-    })
-    .map_err(DogMigrationError::Edit)?;
-
-    Ok(moved)
 }
 ```
 
-**Two things to verify against the real `ShepToml` before writing this, because the sketch above is a guess about its contract, not a reading of it.** First, whether `edit` writes unconditionally or only when the closure produces something to save: `shep_toml.rs`'s module doc claims the latter, and the read-only pass above depends on it. If `edit` writes unconditionally, use a separate read-only path (parse the source with `toml_edit::DocumentMut` directly and inspect it) rather than an `edit` that quietly rewrites the file. Second, whether `edit`'s closure return type is what `try_edit` needs instead, given this function can refuse. Grep both signatures and follow them; the error type here should compose the way the other command modules compose `ShepTomlError`.
+`try_edit` is generic as `E: From<ShepTomlError>`, so `DogMigrationError` needs a
+`From<ShepTomlError>` impl rather than an `Edit` variant the caller maps into.
+Give it a `Toml(ShepTomlError)` variant and that `From`.
+
+**`ShepToml::edit` versus `try_edit` was checked before this plan shipped, and the answer is why the code above looks the way it does.** `edit` runs `doc.save()` unconditionally (shep_toml.rs:169); the module doc's "only when the closure actually produced a value to save" describes `try_edit`, whose `f` can return `Err`. An earlier draft of this task used `edit` for a read-only collision pass and would have struck the sections before refusing. Do not reintroduce it.
 
 Write `DogMigrationError` as an enum with the variants the doc names, a `Display`, a `core::error::Error` with `source`, and `#[non_exhaustive]` carrying a reason comment (IR-20). Derived `Debug` is correct here and needs saying in a comment: the variants carry a dog name and an I/O error, never a section's contents, so there is nothing to redact.
 
