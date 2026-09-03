@@ -1,10 +1,14 @@
 ---
 /*
- * The shepherd channel (docs/shepherd-channel.md, 207 lines, ported for an
+ * The shepherd channel (docs/shepherd-channel.md, 248 lines, ported for an
  * app author rather than a shep contributor). Every command and message
  * shape below was run against target/release/shep during page-writing,
  * including a real Python app answering shep trigger over fd 3 — see the
- * commit message for the transcript. Quality bar: getting-started.astro.
+ * commit message for the transcript. The Windows branch of that sample was
+ * run too, on 2026-09-02, against a real named pipe created the way the
+ * daemon creates one: it opened the pipe TWICE until then, which succeeds
+ * and silently drops everything the app writes. Quality bar:
+ * getting-started.astro.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
@@ -146,12 +150,26 @@ for line in r:
       The channel is readable by other accounts on the same machine, so do
       not put anything on it you would not show them.
     </p>
+    <Callout variant="careful">
+      <strong>Open the pipe once, and read and write through that one
+      handle.</strong>{" "}
+      The shepherd creates a single pipe instance, so a second{" "}
+      <code>open</code> lands on an instance the daemon never accepts — and it
+      fails silently: the open succeeds, every write succeeds, the daemon
+      receives none of it, and <code>wait_ready</code> times out with
+      nothing anywhere saying why. Then don't leave a blocking read parked
+      while another thread writes. One handle is one synchronous kernel
+      file object, Windows serialises every operation on one, and a thread
+      waiting inside <code>ReadFile</code> holds it while your writes queue
+      up behind it. Read and reply from a single loop, the way the sample
+      below does, or open the pipe with <code>FILE_FLAG_OVERLAPPED</code>{" "}
+      and drive it asynchronously.
+    </Callout>
     <CodeBlock label="channel_app.py (both platforms)">{`import os, json, sys
 
 pipe = os.environ.get("SHEP_CHANNEL_PIPE")
-if pipe:                      # Windows: open the named pipe by name
-    r = open(pipe, "r", buffering=1)
-    w = open(pipe, "w", buffering=1)
+if pipe:                      # Windows: open the named pipe by name, ONCE
+    r = w = open(pipe, "r+", buffering=1)
 else:                         # unix: fd 3, or whatever SHEP_CHANNEL_FD says
     fd = int(os.environ.get("SHEP_CHANNEL_FD", "3"))
     r, w = os.fdopen(fd, "r", buffering=1), os.fdopen(fd, "w", buffering=1)

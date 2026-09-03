@@ -76,8 +76,40 @@ only that half:
 **The wire format below is unchanged** — same newline-delimited JSON, same
 `ready`/`metric`/`action-reply` outbound and `shutdown`/`action` inbound
 shapes, same correlation id. A named pipe opened in byte mode is a blocking
-byte stream, so "read a line, parse it, act on it" still describes it
-exactly.
+byte stream, so "read a line, parse it, act on it" still describes reading
+it exactly.
+
+### The one way that pipe is not a descriptor
+
+**Read this before you write a reader thread. Getting it wrong deadlocks
+your app, and nothing in the failure tells you that is what happened.** The shepherd creates a
+single pipe instance and accepts once, so the handle you open is one kernel
+file object however many times you duplicate it — and Windows serialises
+every operation on a *synchronous* file object. A thread parked in
+`ReadFile` waiting for a message holds that object for as long as it waits,
+and a write from any other thread queues behind it.
+
+Both sides then wait for each other. The shepherd sends nothing until it has
+heard `ready`; your app cannot send `ready` while its own reader is parked.
+`wait_ready` times out, and nothing anywhere says why. This is not
+hypothetical — it is what `shep-channel` itself did on Windows until
+2026-09-02, and it was invisible because the arm compiled and no test ran it.
+
+Two ways out. Pick one before you write the reader:
+
+- **Never park.** `PeekNamedPipe` reports what is already buffered and
+  returns either way; issue a `ReadFile` only for bytes it has just told you
+  are there. This holds the file object for the length of a copy rather than
+  the length of a wait, so the writer gets in between polls. It is what
+  `shep-channel` does, polling every 20 ms.
+- **Open the pipe with `FILE_FLAG_OVERLAPPED`** and drive it
+  asynchronously — Go's `go-winio`, .NET with `PipeOptions.Asynchronous`,
+  or anything built on an IOCP loop. An overlapped handle is not serialised,
+  so a read and a write overlap freely.
+
+An app that only reads, or only writes, or does both from one thread, needs
+neither. The hazard is specific to reading and writing at the same time,
+which is also the shape almost every real app ends up in.
 
 **This matters more on Windows than on unix**, and it is worth being blunt
 about why. Windows has no way to deliver anything SIGTERM-shaped to another
@@ -206,7 +238,9 @@ with any subscriber seeing, not just the one who asked.
   `wait_ready` / `shutdown_with_message`).
 - Read `SHEP_CHANNEL_FD` on unix or `SHEP_CHANNEL_PIPE` on Windows (exactly
   one is ever set), open it, read/write newline-delimited JSON.
-- A plain blocking read works — no event loop required.
+- A plain blocking read works — no event loop required. On Windows that
+  holds only while nothing else writes; if you read and write from two
+  threads, read the pipe section above first.
 - Reply to every `action` message you receive, even ones you don't
   recognize, and reply exactly once, promptly.
 - Echo the `id` from the action on your reply — one field, and it is what

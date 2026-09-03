@@ -379,12 +379,14 @@ never costs clarity.
   lives in three files across two crates, each carrying its own
   `#![allow(unsafe_code)]` or `#[allow(unsafe_code)]` with per-block
   `// SAFETY:` (IR-22/23): shep-daemon's `sys.rs` (eight sites on unix) and
-  `sys_windows.rs` (ten on Windows), and shep-channel's `endpoint.rs` (one
-  site, taking the descriptor the shepherd names in `SHEP_CHANNEL_FD`, sound
-  because a process-global guard makes it reachable at most once per
-  process). This line said "planned" and named only `sys.rs` for the whole
-  of the Windows port, then said "exactly two files" after shep-channel
-  added a third.
+  `sys_windows.rs` (ten on Windows), and shep-channel's `endpoint.rs` (two
+  sites, one per platform: taking the descriptor the shepherd names in
+  `SHEP_CHANNEL_FD`, sound because a process-global guard makes it reachable
+  at most once per process, and `PeekNamedPipe` on Windows, which
+  `PipeReader`'s own doc comment exists to justify). This line said
+  "planned" and named only `sys.rs` for the whole of the Windows port, then
+  said "exactly two files" after shep-channel added a third, then said "one
+  site" in `endpoint.rs` after it had grown a second.
 - Open design decisions live at the bottom of map.md and in goals.md's open
   questions — check them before making architectural calls; if a decision is
   listed there, it is the maintainer's, not yours.
@@ -656,6 +658,20 @@ What that means for anyone editing this workspace:
   compiles a `cfg(windows)` item, and the `windows-gnu` cross-check is
   `cargo check`, which executes nothing. `.github/workflows/test.yml`'s
   `windows-latest` legs are what actually run this tier. Read the CI result.
+- **A `cfg(windows)` arm that compiles has been checked for spelling, not
+  for behaviour, and the difference has already cost a shipped bug.**
+  shep-channel's named-pipe arm type-checked on every Windows CI run for as
+  long as it existed and deadlocked the first time a process actually
+  executed it: the shepherd hands an app ONE pipe instance, `try_clone` is
+  `DuplicateHandle`, and Windows serialises every operation on a synchronous
+  file object, so the reader thread parked in `ReadFile` held it against the
+  writer thread's `ready()` forever. Fixed 2026-09-02 by `PipeReader`, which
+  peeks rather than parks. **When a platform arm has no test that runs it,
+  say so out loud rather than letting a green CI imply otherwise** — the PR
+  that introduced it did say so, in as many words, which is the only reason
+  anyone went looking. The same audit found the docs site's Python sample
+  opening the pipe twice, which succeeds and silently discards everything
+  the app writes.
 
 The instances redesign merged too: `increment_var` is removed, and refused
 with the replacement named rather than a bare serde error. Env values, args,
