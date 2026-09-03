@@ -338,15 +338,30 @@ impl ShepToml {
         let Some(item) = self.doc.remove("dog") else {
             return BTreeMap::new();
         };
-        let Some(table) = item.as_table() else {
+
+        // A `Table`'s own `to_string()` renders only its direct key/value
+        // pairs -- a nested sub-table, an array of tables, or an inline
+        // table underneath it does not survive that round trip once the
+        // table is detached from the document root. Re-attaching `item`
+        // under a fresh document and rendering THAT is what keeps every
+        // header and array-of-tables marker: the fresh document is exactly
+        // as capable of printing `[dog.bark.sinks]` and `[[dog.bark.rules]]`
+        // as the original one was. Parsing the result with `toml` (not
+        // `toml_edit`) rather than walking `item` by hand is what also
+        // catches the inline-table shape, since `toml`'s deserializer does
+        // not care how a table was spelled.
+        let mut wrapper = DocumentMut::new();
+        wrapper.insert("dog", item);
+        let Ok(mut parsed) = wrapper.to_string().parse::<toml::Table>() else {
             return BTreeMap::new();
         };
-        table
-            .iter()
-            .filter_map(|(name, value)| {
-                let section = value.as_table()?;
-                let parsed = section.to_string().parse::<toml::Table>().ok()?;
-                Some((name.to_string(), parsed))
+        let Some(toml::Value::Table(dog)) = parsed.remove("dog") else {
+            return BTreeMap::new();
+        };
+        dog.into_iter()
+            .filter_map(|(name, value)| match value {
+                toml::Value::Table(section) => Some((name, section)),
+                _ => None,
             })
             .collect()
     }
@@ -1445,5 +1460,50 @@ mod tests {
         // writing at all is the migration's job, and its own early return is
         // where that is tested.
         assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+    }
+
+    #[test]
+    fn taking_dog_sections_keeps_nested_tables_and_arrays_of_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "[dog.bark.sinks]\noncall = { kind = \"discord\", url = \"https://discord.com/api/webhooks/x\" }\n\n[[dog.bark.rules]]\non = \"gave_up\"\nsinks = [\"oncall\"]\n",
+        )
+        .expect("write");
+
+        let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        let bark = &taken["bark"];
+        assert_eq!(
+            bark["sinks"]["oncall"]["url"].as_str(),
+            Some("https://discord.com/api/webhooks/x"),
+            "a nested sub-table's own values must survive the take"
+        );
+        let rules = bark["rules"]
+            .as_array()
+            .expect("rules is an array of tables");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["on"].as_str(), Some("gave_up"));
+        assert_eq!(
+            rules[0]["sinks"][0].as_str(),
+            Some("oncall"),
+            "the array-of-tables entry keeps its own array field"
+        );
+    }
+
+    #[test]
+    fn taking_dog_sections_keeps_an_inline_table_dog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[dog]\nmetrics = { bind = \"127.0.0.1:9615\" }\n").expect("write");
+
+        let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        assert_eq!(
+            taken["metrics"]["bind"].as_str(),
+            Some("127.0.0.1:9615"),
+            "an inline-table dog under [dog] must not be dropped"
+        );
     }
 }
