@@ -140,7 +140,11 @@ $ shep disable metrics`}</CodeBlock>
       Running <code>enable</code> and <code>adopt</code> at once from a
       provisioning script is safe: each takes an exclusive lock on{" "}
       <code>shep.toml</code> for its whole read-edit-write, so the second
-      waits its turn.
+      waits its turn. <code>dogs.toml</code> has its own lock on the same
+      terms, held by both of its writers (<code>rehome</code>, and the
+      migration a boot runs once), so two backgrounded rehomes both land
+      and neither fights a boot. A boot holding both takes{" "}
+      <code>shep.toml</code>'s first.
     </p>
 
     <h2>Configuration lives on the socket, not the environment</h2>

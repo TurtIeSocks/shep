@@ -649,11 +649,19 @@ pub(super) fn create_config_file(parent: &Path) -> std::io::Result<tempfile::Nam
     builder.tempfile_in(parent)
 }
 
-/// An exclusive advisory lock over one `shep.toml`, held for as long as
+/// An exclusive advisory lock over one config file, held for as long as
 /// the value lives and released when it drops (including on an early `?`,
 /// and by the kernel if the process dies holding it).
 ///
-/// The lock is on a sibling `shep.toml.lock`, never on the config itself,
+/// Keyed on the path it is given rather than on `shep.toml` specifically:
+/// [`ShepToml::edit`] takes one over `shep.toml`, and
+/// `commands::dog_migration` takes one over `dogs.toml`, which has two
+/// writers of its own. **Whenever both are held at once, `shep.toml`'s is
+/// taken first**, which is the whole of what keeps the two orderings from
+/// deadlocking; `migrate_dog_sections` is the one caller that holds both,
+/// and it says so at the point it nests them.
+///
+/// The lock is on a sibling `<name>.lock`, never on the config itself,
 /// and that is the whole design decision — the same one `barks::RingLock`
 /// records: [`ShepToml::save`] finishes by `rename`ing a new file over the
 /// config, which replaces the inode. A lock taken on the config would be a
@@ -663,7 +671,7 @@ pub(super) fn create_config_file(parent: &Path) -> std::io::Result<tempfile::Nam
 /// never read; it exists only to be an inode with a stable identity, and
 /// it is left on disk between edits on purpose so both writers keep
 /// agreeing on which one it is.
-struct ConfigLock {
+pub(super) struct ConfigLock {
     /// `flock(2)` is released by this handle's `Drop`. Named with a
     /// leading underscore because it is held, never read.
     #[cfg(unix)]
@@ -683,7 +691,7 @@ impl ConfigLock {
     /// for a reason other than contention (contention blocks rather than
     /// failing).
     #[cfg(windows)]
-    fn acquire(path: &Path) -> std::io::Result<Self> {
+    pub(super) fn acquire(path: &Path) -> std::io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         /// Another handle already holds share access this open denies.
@@ -711,7 +719,7 @@ impl ConfigLock {
     }
 
     #[cfg(unix)]
-    fn acquire(path: &Path) -> std::io::Result<Self> {
+    pub(super) fn acquire(path: &Path) -> std::io::Result<Self> {
         use nix::fcntl::{Flock, FlockArg};
 
         let file = std::fs::OpenOptions::new()

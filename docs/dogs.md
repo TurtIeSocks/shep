@@ -88,6 +88,14 @@ an exclusive lock on `shep.toml` for its whole read-edit-write, so the
 second waits its turn instead of writing back a document it read before
 the first one's edit landed.
 
+`dogs.toml` has a lock of its own on the same terms, and it needs one for
+the same reason: its writers rewrite the whole file rather than a line of
+it. Two of them exist, `shep rehome` and the once-per-home migration a
+boot runs, and each holds that lock across its whole read-edit-write. So
+two backgrounded `shep rehome` calls for two different dogs both land,
+and a rehome that overlaps a boot does not undo the migration or get
+undone by it. A boot that holds both locks takes `shep.toml`'s first.
+
 ## Configuration
 
 A dog's settings live under `[<name>]` in `$SHEP_HOME/dogs.toml`, hand-editable

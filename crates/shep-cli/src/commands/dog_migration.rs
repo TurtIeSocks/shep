@@ -7,7 +7,16 @@
 //! rather than beside that verb because both go through
 //! [`write_dogs_config`]: that file holds webhook credentials at `0600`,
 //! and one staged-temp-`fsync`-`rename` helper with the reasoning attached
-//! is what keeps a second writer from reaching for `std::fs::write`. `RawDaemonConfig` keeps its `dog` field so an un-migrated file
+//! is what keeps a second writer from reaching for `std::fs::write`.
+//!
+//! **Both hold `dogs.toml`'s own [`ConfigLock`] across the whole
+//! read-modify-write**, the same discipline [`ShepToml::edit`] applies to
+//! `shep.toml` and for the same reason: each rewrites the entire file, so
+//! two unserialised writers lose one of each other's edits rather than
+//! colliding visibly. Two `shep rehome` calls for two different dogs, out
+//! of the sort of provisioning script `docs/dogs.md` tells operators is
+//! safe, is the ordinary way to reach that. When both locks are held,
+//! `shep.toml`'s is always the outer one. `RawDaemonConfig` keeps its `dog` field so an un-migrated file
 //! still parses: deleting it would turn `deny_unknown_fields` into a
 //! refused boot for every operator carrying a dog section, with the flock
 //! left unsupervised at exactly the moment nobody is watching.
@@ -20,7 +29,7 @@ use std::path::Path;
 use shep_core::config::{DogsConfig, DogsConfigError};
 use shep_core::paths::ShepPaths;
 
-use super::shep_toml::{ShepToml, ShepTomlError, create_config_file};
+use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 
 /// Moves every `[dog.<name>]` section into `dogs.toml`, returning the names
 /// moved
@@ -42,8 +51,10 @@ use super::shep_toml::{ShepToml, ShepTomlError, create_config_file};
 ///   what did not.
 /// - [`DogMigrationError::Parse`] when `dogs.toml` is not valid TOML,
 ///   [`DogMigrationError::Render`] when the merged sections will not render
-///   back, and [`DogMigrationError::Read`], [`DogMigrationError::Write`]
-///   and [`DogMigrationError::Toml`] for the underlying I/O.
+///   back, and [`DogMigrationError::Read`],
+///   [`DogMigrationError::ReadDogs`], [`DogMigrationError::Lock`],
+///   [`DogMigrationError::Write`] and [`DogMigrationError::Toml`] for the
+///   underlying I/O.
 pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrationError> {
     let existing_source = match std::fs::read_to_string(&paths.daemon_config) {
         Ok(source) => source,
@@ -74,12 +85,6 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
     if declared.as_ref().is_some_and(BTreeSet::is_empty) {
         return Ok(Vec::new());
     }
-
-    let already = match std::fs::read_to_string(&paths.dogs_config) {
-        Ok(source) => DogsConfig::load(Some(&source)).map_err(DogMigrationError::Parse)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => DogsConfig::default(),
-        Err(err) => return Err(DogMigrationError::Read(err)),
-    };
 
     // `try_edit`, never `edit`. `edit` calls `save` unconditionally
     // (shep_toml.rs:173), so refusing from inside it would strike the
@@ -113,6 +118,17 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         if !missing.is_empty() || incoming.is_empty() {
             return Err(DogMigrationError::SectionsUnreadable { names: missing });
         }
+        // `dogs.toml`'s own lock, taken here rather than at the top of the
+        // function so that this whole read-and-merge is one transaction
+        // against the other writer of that file,
+        // [`forget_dog_section`]. Nested INSIDE `shep.toml`'s lock, which
+        // `try_edit` already holds: that is the ordering both call sites
+        // keep, and the reason a deadlock is not reachable. This is the
+        // only place either lock is nested in the other at all, and it
+        // never takes them the other way round.
+        let _dogs_lock =
+            ConfigLock::acquire(&paths.dogs_config).map_err(DogMigrationError::Lock)?;
+        let already = read_dogs_config(&paths.dogs_config)?;
         if let Some(name) = incoming.keys().find(|name| already.dog.contains_key(*name)) {
             return Err(DogMigrationError::WouldOverwrite { name: name.clone() });
         }
@@ -153,25 +169,51 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
 ///   read, and [`DogMigrationError::Parse`] when it is not valid TOML.
 ///   Refused rather than replaced: a file this verb cannot understand is
 ///   not one it may overwrite.
-/// - [`DogMigrationError::Render`] when what is left will not render back,
-///   and [`DogMigrationError::Write`] when the staged replacement fails.
+/// - [`DogMigrationError::Lock`] when this file's sibling lock could not be
+///   taken, [`DogMigrationError::Render`] when what is left will not render
+///   back, and [`DogMigrationError::Write`] when the staged replacement
+///   fails.
 ///
 /// The error type is shared with [`migrate_dog_sections`] rather than
 /// split: every variant either half can produce says which of the two
 /// files failed and how, which is what an operator needs from both.
 pub(crate) fn forget_dog_section(path: &Path, name: &str) -> Result<bool, DogMigrationError> {
-    let source = match std::fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(DogMigrationError::ReadDogs(err)),
-    };
-    let mut config = DogsConfig::load(Some(&source)).map_err(DogMigrationError::Parse)?;
+    // Held across the read, the removal and the rename, and dropped on the
+    // way out of this function. Without it, two `shep rehome` calls for two
+    // different dogs, backgrounded together out of a provisioning script,
+    // both read the file before either writes and the second rename puts
+    // one of the two removals back: a whole-file read-modify-write with
+    // nothing serialising it. `docs/dogs.md` promises a provisioning script
+    // exactly this guarantee. This function takes no other lock, so it can
+    // never be the half of a deadlock that holds `dogs.toml` and waits on
+    // `shep.toml`.
+    let _lock = ConfigLock::acquire(path).map_err(DogMigrationError::Lock)?;
+    let mut config = read_dogs_config(path)?;
     if config.dog.remove(name).is_none() {
         return Ok(false);
     }
     let rendered = toml::to_string(&config.dog).map_err(DogMigrationError::Render)?;
     write_dogs_config(path, &rendered).map_err(DogMigrationError::Write)?;
     Ok(true)
+}
+
+/// Reads `path` as a [`DogsConfig`], treating a missing file as an empty
+/// one.
+///
+/// Both writers of `dogs.toml` read it this way, and both call this with
+/// that file's [`ConfigLock`] already held: a read outside the lock is the
+/// first half of a lost update, not a cheap shortcut.
+///
+/// # Errors
+///
+/// - [`DogMigrationError::ReadDogs`] when the file exists and could not be
+///   read, and [`DogMigrationError::Parse`] when it is not valid TOML.
+fn read_dogs_config(path: &Path) -> Result<DogsConfig, DogMigrationError> {
+    match std::fs::read_to_string(path) {
+        Ok(source) => DogsConfig::load(Some(&source)).map_err(DogMigrationError::Parse),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DogsConfig::default()),
+        Err(err) => Err(DogMigrationError::ReadDogs(err)),
+    }
 }
 
 /// Every name `source` declares under `[dog]`, or `None` when `source` is
@@ -262,6 +304,13 @@ pub(crate) enum DogMigrationError {
     Render(toml::ser::Error),
     /// `dogs.toml` could not be written.
     Write(std::io::Error),
+    /// `dogs.toml`'s sibling lock file could not be created or locked.
+    ///
+    /// Refused rather than pressed on without the lock: the guarantee the
+    /// dogs page makes to a provisioning script is the whole reason the
+    /// lock is taken, and a write that skips it quietly is worse than one
+    /// that says it could not run.
+    Lock(std::io::Error),
     /// Reading, locking or rewriting `shep.toml` failed.
     Toml(ShepTomlError),
 }
@@ -290,6 +339,7 @@ impl fmt::Display for DogMigrationError {
             ),
             Self::Render(err) => write!(f, "dogs.toml could not be rendered: {err}"),
             Self::Write(err) => write!(f, "dogs.toml could not be written: {err}"),
+            Self::Lock(err) => write!(f, "dogs.toml could not be locked: {err}"),
             Self::Toml(err) => write!(f, "shep.toml could not be rewritten: {err}"),
         }
     }
@@ -298,7 +348,7 @@ impl fmt::Display for DogMigrationError {
 impl core::error::Error for DogMigrationError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Read(err) | Self::ReadDogs(err) | Self::Write(err) => Some(err),
+            Self::Read(err) | Self::ReadDogs(err) | Self::Write(err) | Self::Lock(err) => Some(err),
             Self::Parse(err) => Some(err),
             Self::Render(err) => Some(err),
             Self::Toml(err) => Some(err),
@@ -319,6 +369,15 @@ impl From<ShepTomlError> for DogMigrationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How many times [`two_rehomes_at_once_both_land`] re-runs its race.
+    ///
+    /// A lost update needs both threads to read before either renames, and
+    /// on this write path (stage, `fsync`, rename) that window is wide, so
+    /// one round is usually enough. Twenty costs a few milliseconds and
+    /// makes the failure a certainty rather than a likelihood, which is
+    /// what a test guarding a race has to be to be worth having.
+    const ROUNDS_OF_CONTENTION: u32 = 20;
 
     fn home_with(shep_toml: &str) -> (tempfile::TempDir, ShepPaths) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -470,6 +529,117 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "mode was {mode:o}");
+    }
+
+    /// The bug the lock exists for, forced rather than hoped for: two
+    /// `shep rehome` calls for two DIFFERENT dogs, started together the way
+    /// a provisioning script backgrounds them, and both removals have to
+    /// land. Each call is a whole-file read, remove, rename, so without a
+    /// lock both threads read the two-dog file and the second rename puts
+    /// the first one's dog back, with nothing anywhere reporting it.
+    ///
+    /// Two threads and a barrier, not two processes: `flock(2)` is
+    /// per-open-file-description rather than per-process, so two threads
+    /// that each open the lock file contend exactly as two `shep`
+    /// invocations do, and this needs no re-exec harness to prove it.
+    /// Repeated over fresh homes because the losing interleaving is a
+    /// race, and one round of a race that happens to serialise itself
+    /// proves nothing.
+    #[test]
+    fn two_rehomes_at_once_both_land() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..ROUNDS_OF_CONTENTION {
+            let (_dir, paths) = home_with("");
+            std::fs::write(
+                &paths.dogs_config,
+                "[otel]\nendpoint = \"127.0.0.1:4317\"\n\n[watchdog]\nevery = \"30s\"\n",
+            )
+            .expect("write");
+
+            let gate = Arc::new(Barrier::new(2));
+            let removals: Vec<_> = ["otel", "watchdog"]
+                .into_iter()
+                .map(|name| {
+                    let gate = Arc::clone(&gate);
+                    let path = paths.dogs_config.clone();
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        forget_dog_section(&path, name).expect("rehome")
+                    })
+                })
+                .collect();
+            for removal in removals {
+                assert!(removal.join().expect("thread"), "each found its own dog");
+            }
+
+            let left = read_dogs_config(&paths.dogs_config).expect("read");
+            assert!(
+                left.dog.is_empty(),
+                "round {round}: both removals must survive, {:?} came back",
+                left.dog.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The other pair of writers, and the reason the migration takes the
+    /// same lock rather than only the verb that races itself: a boot
+    /// migrating a section INTO `dogs.toml` while an operator's `shep
+    /// rehome` takes a different dog's section out. Whoever renames second
+    /// wins the whole file, so an unlocked pair either resurrects the
+    /// rehomed dog or drops the migrated one, and both are silent.
+    ///
+    /// The migration holds `shep.toml`'s lock while it takes `dogs.toml`'s.
+    /// The rehome half takes only `dogs.toml`'s and holds nothing else, so
+    /// there is no second ordering for the two to deadlock across.
+    #[test]
+    fn a_boot_migration_and_a_rehome_at_once_both_land() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..ROUNDS_OF_CONTENTION {
+            let (_dir, paths) = home_with("[dog.metrics]\nbind = \"127.0.0.1:9615\"\n");
+            std::fs::write(
+                &paths.dogs_config,
+                "[otel]\nendpoint = \"127.0.0.1:4317\"\n",
+            )
+            .expect("write");
+
+            let gate = Arc::new(Barrier::new(2));
+            let migrating = {
+                let gate = Arc::clone(&gate);
+                let paths = paths.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    migrate_dog_sections(&paths).expect("migrate")
+                })
+            };
+            let rehoming = {
+                let gate = Arc::clone(&gate);
+                let path = paths.dogs_config.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    forget_dog_section(&path, "otel").expect("rehome")
+                })
+            };
+            let moved = migrating.join().expect("thread");
+            // Whether the rehome found a section to strike is the one
+            // thing the ordering genuinely decides, so it is not asserted
+            // on; the file left behind is the same either way.
+            let _removed = rehoming.join().expect("thread");
+
+            let left = read_dogs_config(&paths.dogs_config).expect("read");
+            // Which of the two ran first is genuinely undecided, and only
+            // one ordering has a section for the rehome to find: if it
+            // went first, `otel` was struck before the migration merged
+            // `metrics` in beside nothing. Both orderings agree on the
+            // file that has to be left behind, which is the property.
+            assert_eq!(moved, vec!["metrics".to_string()], "round {round}");
+            assert_eq!(
+                left.dog.keys().collect::<Vec<_>>(),
+                vec!["metrics"],
+                "round {round}: the migrated section stays and the rehomed one goes"
+            );
+        }
     }
 
     // The one case that must never silently merge: an operator who already
