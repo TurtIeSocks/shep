@@ -352,42 +352,41 @@ impl ShepToml {
     /// Removes the whole `[dog]` table and hands back what was under it.
     ///
     /// Keyed by dog name with the `dog.` prefix dropped, which is the shape
-    /// `dogs.toml` wants. A document with no `[dog]` table yields an empty
-    /// map and is left byte-identical, so a second call after a migration
-    /// writes nothing.
+    /// `dogs.toml` wants, and handed back as live [`Item`]s rather than
+    /// `toml::Table` values. That is what lets the migration write the
+    /// destination through `toml_edit` as well: an `Item` carries its own
+    /// decor, so a comment an operator wrote above or inside
+    /// `[dog.metrics]` travels with the section instead of being dropped at
+    /// this boundary, and the header re-renders under whatever key the
+    /// section is inserted at, with nothing here rewriting it. Going
+    /// through `toml::Table` used to lose both.
+    ///
+    /// Only table-like entries come back, which covers `[dog.metrics]`, a
+    /// dotted `metrics.bind = ...` under `[dog]`, and an inline
+    /// `metrics = { .. }` alike. `[dog] stray = 5` and `[[dog.x]]` are
+    /// neither, and are dropped here rather than moved. That is not a
+    /// silent loss: the migration's own guard compares these keys against
+    /// what the source declared under `[dog]` and refuses the whole move
+    /// when one does not come back.
+    ///
+    /// A document with no `[dog]` table yields an empty map and is left
+    /// byte-identical, so a second call after a migration writes nothing.
     ///
     /// The one caller is the boot migration. This is not a general editing
     /// primitive: it takes everything, because a partial move would leave
     /// the same key readable from two files.
-    pub fn take_dog_sections(&mut self) -> BTreeMap<String, toml::Table> {
+    pub fn take_dog_sections(&mut self) -> BTreeMap<String, Item> {
         let Some(item) = self.doc.remove("dog") else {
             return BTreeMap::new();
         };
-
-        // A `Table`'s own `to_string()` renders only its direct key/value
-        // pairs -- a nested sub-table, an array of tables, or an inline
-        // table underneath it does not survive that round trip once the
-        // table is detached from the document root. Re-attaching `item`
-        // under a fresh document and rendering THAT is what keeps every
-        // header and array-of-tables marker: the fresh document is exactly
-        // as capable of printing `[dog.bark.sinks]` and `[[dog.bark.rules]]`
-        // as the original one was. Parsing the result with `toml` (not
-        // `toml_edit`) rather than walking `item` by hand is what also
-        // catches the inline-table shape, since `toml`'s deserializer does
-        // not care how a table was spelled.
-        let mut wrapper = DocumentMut::new();
-        wrapper.insert("dog", item);
-        let Ok(mut parsed) = wrapper.to_string().parse::<toml::Table>() else {
+        // `[[dog]]` itself, the one shape with nothing table-like under it
+        // to iterate.
+        let Some(dog) = item.as_table_like() else {
             return BTreeMap::new();
         };
-        let Some(toml::Value::Table(dog)) = parsed.remove("dog") else {
-            return BTreeMap::new();
-        };
-        dog.into_iter()
-            .filter_map(|(name, value)| match value {
-                toml::Value::Table(section) => Some((name, section)),
-                _ => None,
-            })
+        dog.iter()
+            .filter(|(_, value)| value.as_table_like().is_some())
+            .map(|(name, value)| (name.to_owned(), value.clone()))
             .collect()
     }
 
@@ -1515,13 +1514,20 @@ mod tests {
             Some("https://discord.com/api/webhooks/x"),
             "a nested sub-table's own values must survive the take"
         );
+        // `as_array_of_tables`, not `as_array`: `[[dog.bark.rules]]` is a
+        // `toml_edit::ArrayOfTables`, a document construct, where `sinks =
+        // ["oncall"]` below is a `Value::Array`.
         let rules = bark["rules"]
-            .as_array()
+            .as_array_of_tables()
             .expect("rules is an array of tables");
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0]["on"].as_str(), Some("gave_up"));
+        let rule = rules.get(0).expect("one rule");
+        assert_eq!(rule["on"].as_str(), Some("gave_up"));
         assert_eq!(
-            rules[0]["sinks"][0].as_str(),
+            rule["sinks"]
+                .as_array()
+                .and_then(|sinks| sinks.get(0))
+                .and_then(toml_edit::Value::as_str),
             Some("oncall"),
             "the array-of-tables entry keeps its own array field"
         );

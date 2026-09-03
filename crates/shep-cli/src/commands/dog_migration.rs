@@ -28,6 +28,7 @@ use std::path::Path;
 
 use shep_core::config::{DogsConfig, DogsConfigError};
 use shep_core::paths::ShepPaths;
+use toml_edit::{DocumentMut, Item, Table};
 
 use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 
@@ -49,12 +50,11 @@ use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 ///   Refused rather than skipped: `take_dog_sections` has already struck
 ///   the whole `[dog]` table by then, so moving what came back would drop
 ///   what did not.
-/// - [`DogMigrationError::Parse`] when `dogs.toml` is not valid TOML,
-///   [`DogMigrationError::Render`] when the merged sections will not render
-///   back, and [`DogMigrationError::Read`],
-///   [`DogMigrationError::ReadDogs`], [`DogMigrationError::Lock`],
-///   [`DogMigrationError::Write`] and [`DogMigrationError::Toml`] for the
-///   underlying I/O.
+/// - [`DogMigrationError::Parse`] when `dogs.toml` is not valid TOML, and
+///   [`DogMigrationError::Read`], [`DogMigrationError::ReadDogs`],
+///   [`DogMigrationError::Lock`], [`DogMigrationError::Write`] and
+///   [`DogMigrationError::Toml`] for the underlying I/O. There is no
+///   rendering failure to report: a [`DocumentMut`] always renders.
 pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrationError> {
     let existing_source = match std::fs::read_to_string(&paths.daemon_config) {
         Ok(source) => source,
@@ -128,21 +128,42 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         // never takes them the other way round.
         let _dogs_lock =
             ConfigLock::acquire(&paths.dogs_config).map_err(DogMigrationError::Lock)?;
-        let already = read_dogs_config(&paths.dogs_config)?;
-        if let Some(name) = incoming.keys().find(|name| already.dog.contains_key(*name)) {
+        // The destination as a live document, not a `toml::Table`: a
+        // second migration writes into a `dogs.toml` an operator has been
+        // hand-editing since the first one, and a `toml::to_string` of a
+        // parsed map hands that file back with every comment gone (spec
+        // decision 1 calls this file hand-editable, and decision 9 promises
+        // `toml_edit` for exactly this reason).
+        let mut merged = read_dogs_document(&paths.dogs_config)?;
+        if let Some(name) = incoming.keys().find(|name| merged.contains_key(name)) {
             return Err(DogMigrationError::WouldOverwrite { name: name.clone() });
         }
         let mut moved: Vec<String> = incoming.keys().cloned().collect();
         moved.sort();
 
-        let mut merged = already.dog.clone();
-        merged.extend(incoming);
-        let rendered = toml::to_string(&merged).map_err(DogMigrationError::Render)?;
+        // Appended, never wedged into the middle. A table taken out of
+        // `shep.toml` still carries the position it held THERE, and
+        // `toml_edit` renders tables in position order, so a
+        // `[dog.metrics]` that was the first table in `shep.toml` lands
+        // between the first and second tables of an operator's `dogs.toml`
+        // -- inside the blank line that separated them. Renumbering from
+        // one past the destination's own last table is what makes a
+        // migration read like an append.
+        let mut next = merged
+            .iter()
+            .filter_map(|(_, item)| item.as_table().and_then(Table::position))
+            .max()
+            .map_or(0, |last| last + 1);
+        for (name, mut section) in incoming {
+            renumber_tables(&mut section, &mut next);
+            merged.insert(&name, section);
+        }
         // Written before this closure returns, so `save` strikes the old
         // sections only once the new file already holds them. A crash
         // between the two leaves them readable from `shep.toml`, which is
         // the direction that loses nothing.
-        write_dogs_config(&paths.dogs_config, &rendered).map_err(DogMigrationError::Write)?;
+        write_dogs_config(&paths.dogs_config, &merged.to_string())
+            .map_err(DogMigrationError::Write)?;
         Ok(moved)
     })
 }
@@ -170,8 +191,7 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
 ///   Refused rather than replaced: a file this verb cannot understand is
 ///   not one it may overwrite.
 /// - [`DogMigrationError::Lock`] when this file's sibling lock could not be
-///   taken, [`DogMigrationError::Render`] when what is left will not render
-///   back, and [`DogMigrationError::Write`] when the staged replacement
+///   taken, and [`DogMigrationError::Write`] when the staged replacement
 ///   fails.
 ///
 /// The error type is shared with [`migrate_dog_sections`] rather than
@@ -188,32 +208,58 @@ pub(crate) fn forget_dog_section(path: &Path, name: &str) -> Result<bool, DogMig
     // never be the half of a deadlock that holds `dogs.toml` and waits on
     // `shep.toml`.
     let _lock = ConfigLock::acquire(path).map_err(DogMigrationError::Lock)?;
-    let mut config = read_dogs_config(path)?;
-    if config.dog.remove(name).is_none() {
+    let mut doc = read_dogs_document(path)?;
+    if doc.remove(name).is_none() {
         return Ok(false);
     }
-    let rendered = toml::to_string(&config.dog).map_err(DogMigrationError::Render)?;
-    write_dogs_config(path, &rendered).map_err(DogMigrationError::Write)?;
+    write_dogs_config(path, &doc.to_string()).map_err(DogMigrationError::Write)?;
     Ok(true)
 }
 
-/// Reads `path` as a [`DogsConfig`], treating a missing file as an empty
-/// one.
+/// Reads `path` as an editable document, treating a missing file as an
+/// empty one.
 ///
 /// Both writers of `dogs.toml` read it this way, and both call this with
 /// that file's [`ConfigLock`] already held: a read outside the lock is the
 /// first half of a lost update, not a cheap shortcut.
 ///
+/// A [`DocumentMut`] rather than a [`DogsConfig`], because both writers
+/// rewrite the whole file and an operator is invited to hand-edit it. Every
+/// comment, key order and inline table survives a `toml_edit` round trip
+/// and none of them survives a `toml::to_string` of a parsed map, which is
+/// what one `shep rehome` used to do to a commented file.
+///
+/// [`DogsConfig::load`] stays as the gate in front of that, unconditional
+/// and first. It is strictly the stricter of the two parses -- a stray
+/// top-level scalar is a valid document and not a valid `DogsConfig` -- and
+/// it is the same call `shep_daemon::dogs` reads this file with, so a file
+/// this gate refuses is one the daemon could not have served either.
+/// Refusing it here is the rule both writers already followed: a file this
+/// verb cannot understand is not one it may overwrite.
+///
 /// # Errors
 ///
 /// - [`DogMigrationError::ReadDogs`] when the file exists and could not be
 ///   read, and [`DogMigrationError::Parse`] when it is not valid TOML.
-fn read_dogs_config(path: &Path) -> Result<DogsConfig, DogMigrationError> {
-    match std::fs::read_to_string(path) {
-        Ok(source) => DogsConfig::load(Some(&source)).map_err(DogMigrationError::Parse),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DogsConfig::default()),
-        Err(err) => Err(DogMigrationError::ReadDogs(err)),
-    }
+fn read_dogs_document(path: &Path) -> Result<DocumentMut, DogMigrationError> {
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DocumentMut::new());
+        }
+        Err(err) => return Err(DogMigrationError::ReadDogs(err)),
+    };
+    DogsConfig::load(Some(&source)).map_err(DogMigrationError::Parse)?;
+    source.parse::<DocumentMut>().map_err(|_| {
+        // No input reaches this. `toml` 0.8 is a thin layer over
+        // `toml_edit`, so a source the gate above accepted parses here as
+        // well. Reported rather than `expect`ed all the same: this runs at
+        // the top of every daemon boot, and a boot is not a place to
+        // panic on a disagreement between two parsers.
+        DogMigrationError::ReadDogs(std::io::Error::other(
+            "dogs.toml parses as TOML values and not as an editable document",
+        ))
+    })
 }
 
 /// Every name `source` declares under `[dog]`, or `None` when `source` is
@@ -232,6 +278,41 @@ fn declared_dog_names(source: &str) -> Option<BTreeSet<String>> {
         // declares no dog, and the substring gate that let us this far was
         // matching a comment or a string.
         _ => Some(BTreeSet::new()),
+    }
+}
+
+/// Walks `item` depth-first and gives every table it holds the next
+/// document position, so a section moved out of `shep.toml` renders after
+/// everything already in `dogs.toml` rather than at the index it happened
+/// to hold in the file it came from.
+///
+/// Depth-first and over sub-tables too, because `toml_edit` renders every
+/// table by its own position and not by its parent's: renumbering only the
+/// top-level `bark` would leave `[bark.sinks]` back at `shep.toml`'s
+/// index, split away from the header it belongs under.
+///
+/// [`Item::Value`] and [`Item::None`] hold no positioned table --- an
+/// inline `metrics = { .. }` is a key/value pair and renders with the
+/// others, above the tables --- so both are left alone.
+fn renumber_tables(item: &mut Item, next: &mut usize) {
+    match item {
+        Item::Table(table) => {
+            table.set_position(*next);
+            *next += 1;
+            for (_, child) in table.iter_mut() {
+                renumber_tables(child, next);
+            }
+        }
+        Item::ArrayOfTables(array) => {
+            for table in array.iter_mut() {
+                table.set_position(*next);
+                *next += 1;
+                for (_, child) in table.iter_mut() {
+                    renumber_tables(child, next);
+                }
+            }
+        }
+        Item::Value(_) | Item::None => {}
     }
 }
 
@@ -305,8 +386,6 @@ pub(crate) enum DogMigrationError {
         /// section header, and it is already what `WouldOverwrite` carries.
         names: Vec<String>,
     },
-    /// The merged sections would not render back to TOML.
-    Render(toml::ser::Error),
     /// `dogs.toml` could not be written.
     Write(std::io::Error),
     /// `dogs.toml`'s sibling lock file could not be created or locked.
@@ -342,7 +421,6 @@ impl fmt::Display for DogMigrationError {
                  give each dog a table of its own, or delete them",
                 names.join(", ")
             ),
-            Self::Render(err) => write!(f, "dogs.toml could not be rendered: {err}"),
             Self::Write(err) => write!(f, "dogs.toml could not be written: {err}"),
             Self::Lock(err) => write!(f, "dogs.toml could not be locked: {err}"),
             Self::Toml(err) => write!(f, "shep.toml could not be rewritten: {err}"),
@@ -355,7 +433,6 @@ impl core::error::Error for DogMigrationError {
         match self {
             Self::Read(err) | Self::ReadDogs(err) | Self::Write(err) | Self::Lock(err) => Some(err),
             Self::Parse(err) => Some(err),
-            Self::Render(err) => Some(err),
             Self::Toml(err) => Some(err),
             Self::WouldOverwrite { .. } | Self::SectionsUnreadable { .. } => None,
         }
@@ -578,11 +655,11 @@ mod tests {
                 assert!(removal.join().expect("thread"), "each found its own dog");
             }
 
-            let left = read_dogs_config(&paths.dogs_config).expect("read");
+            let left = read_dogs_document(&paths.dogs_config).expect("read");
             assert!(
-                left.dog.is_empty(),
+                left.is_empty(),
                 "round {round}: both removals must survive, {:?} came back",
-                left.dog.keys().collect::<Vec<_>>()
+                left.iter().map(|(name, _)| name).collect::<Vec<_>>()
             );
         }
     }
@@ -632,7 +709,7 @@ mod tests {
             // on; the file left behind is the same either way.
             let _removed = rehoming.join().expect("thread");
 
-            let left = read_dogs_config(&paths.dogs_config).expect("read");
+            let left = read_dogs_document(&paths.dogs_config).expect("read");
             // Which of the two ran first is genuinely undecided, and only
             // one ordering has a section for the rehome to find: if it
             // went first, `otel` was struck before the migration merged
@@ -640,11 +717,106 @@ mod tests {
             // file that has to be left behind, which is the property.
             assert_eq!(moved, vec!["metrics".to_string()], "round {round}");
             assert_eq!(
-                left.dog.keys().collect::<Vec<_>>(),
+                left.iter().map(|(name, _)| name).collect::<Vec<_>>(),
                 vec!["metrics"],
                 "round {round}: the migrated section stays and the rehomed one goes"
             );
         }
+    }
+
+    /// The whole of spec decision 9, at the writer that reproduced its
+    /// absence: `shep rehome` used to turn a commented `dogs.toml` with
+    /// inline tables into header-per-key output with every comment gone.
+    ///
+    /// Exact string, not a parse-and-compare, for the same reason
+    /// `taking_dog_sections_leaves_every_other_section_alone` pins one: a
+    /// reparse agrees on the values, which is precisely what a wrecked
+    /// file also does. The comments, the inline table and the blank lines
+    /// are the assertion.
+    #[test]
+    fn forgetting_a_dog_keeps_every_other_comment_and_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dogs.toml");
+        std::fs::write(
+            &path,
+            "# hand-written, do not clobber\n[otel]\nendpoint = \"127.0.0.1:4317\"\nheaders = { auth = \"x\" }\n\n[metrics]\nbind = \"127.0.0.1:9615\"\n",
+        )
+        .expect("write");
+
+        assert!(forget_dog_section(&path, "metrics").expect("forget"));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "# hand-written, do not clobber\n[otel]\nendpoint = \"127.0.0.1:4317\"\nheaders = { auth = \"x\" }\n"
+        );
+    }
+
+    /// The same promise at the other writer, and the case that says the
+    /// migration's first write is not the only one it makes: a second
+    /// `[dog.<name>]` appearing in `shep.toml` after an operator has spent
+    /// months hand-editing the `dogs.toml` the first migration created.
+    ///
+    /// Two properties in one exact string, because they are two halves of
+    /// the same round trip. The destination keeps its own comment and its
+    /// inline table, and the moved section arrives carrying the comments
+    /// an operator wrote around it in `shep.toml` -- both of which a
+    /// `toml::to_string` of a parsed map dropped.
+    ///
+    /// The moved section lands AFTER everything already there, which is
+    /// what `renumber_tables` is for: without it `[metrics]` carries the
+    /// position it held in `shep.toml` and renders between the
+    /// destination's first and second tables.
+    #[test]
+    fn migrating_into_a_hand_edited_file_keeps_both_files_comments() {
+        let (_dir, paths) = home_with(
+            "[daemon]\nlog_level = \"info\"\n\n# scrape target\n[dog.metrics]\nbind = \"127.0.0.1:9615\" # loopback only\n",
+        );
+        std::fs::write(
+            &paths.dogs_config,
+            "# hand-written, do not clobber\n[otel]\nendpoint = \"127.0.0.1:4317\"\nheaders = { auth = \"x\" }\n",
+        )
+        .expect("write");
+
+        let moved = migrate_dog_sections(&paths).expect("migrate");
+
+        assert_eq!(moved, vec!["metrics".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(&paths.dogs_config).expect("read"),
+            "# hand-written, do not clobber\n[otel]\nendpoint = \"127.0.0.1:4317\"\nheaders = { auth = \"x\" }\n\n# scrape target\n[metrics]\nbind = \"127.0.0.1:9615\" # loopback only\n"
+        );
+    }
+
+    /// Fails if a moved dog with sub-tables and an array of tables is
+    /// split across the destination's own sections.
+    ///
+    /// `toml_edit` renders every table by its own position, not by its
+    /// parent's, so renumbering only the top-level `bark` would leave
+    /// `[bark.sinks]` and `[[bark.rules]]` at the indices they held in
+    /// `shep.toml` -- interleaved with `[a]`, `[b]` and `[c]` here. The
+    /// three destination sections staying consecutive is the property.
+    #[test]
+    fn a_moved_dog_with_sub_tables_lands_in_one_piece_at_the_end() {
+        let (_dir, paths) = home_with(
+            "[dog.bark.sinks]\noncall = { url = \"u\" }\n\n[[dog.bark.rules]]\non = \"gave_up\"\n",
+        );
+        std::fs::write(
+            &paths.dogs_config,
+            "[a]\nk = 1\n\n[b]\nk = 2\n\n[c]\nk = 3\n",
+        )
+        .expect("write");
+
+        migrate_dog_sections(&paths).expect("migrate");
+
+        let written = std::fs::read_to_string(&paths.dogs_config).expect("read");
+        let headers: Vec<&str> = written
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .collect();
+        assert_eq!(
+            headers,
+            vec!["[a]", "[b]", "[c]", "[bark.sinks]", "[[bark.rules]]"],
+            "the migration appends; it does not interleave: {written}"
+        );
     }
 
     // The one case that must never silently merge: an operator who already
