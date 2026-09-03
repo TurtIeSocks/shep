@@ -1303,6 +1303,16 @@ mod tests {
     /// dog run at that same pid, so the daemon's two facts — "this dog runs
     /// at pid P" and "this is what pid P has sent me" — are about one
     /// process, exactly as they are in production.
+    ///
+    /// # Why this is unix only
+    ///
+    /// The whole case turns on the daemon reading a peer's pid off the
+    /// socket, and only the unix tier does that. On Windows `peer_pid`
+    /// answers `None` by design, `from_pid` answers [`Contact::Unknown`],
+    /// and the ladder reaches `Silence::Unattributed` instead, which is
+    /// covered by `dogs`' own tests on every platform. Running this there
+    /// would assert an attribution that tier deliberately does not make.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_dog_that_connects_without_naming_itself_is_not_called_a_stale_binary() {
         // Three: the first spawn, the restart the ladder's first rung asks
