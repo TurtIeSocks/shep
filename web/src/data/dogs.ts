@@ -102,9 +102,9 @@ export interface Dog {
   /**
    * The name this dog expects to be adopted under. A dog is given no argv
    * and cannot be told its own adopted name, so `shep adopt <name> <path>`
-   * with the wrong `<name>` silently discards its whole `[dog.<name>]`
-   * configuration. This field exists so the page's adopt line is correct by
-   * construction instead of a guess.
+   * with the wrong `<name>` silently discards its whole `[<name>]`
+   * configuration in `dogs.toml`. This field exists so the page's adopt
+   * line is correct by construction instead of a guess.
    */
   adopt_as: string;
   /** One line describing what the dog does. */

@@ -1750,3 +1750,13 @@ A config change to a lifecycle extra rebuilds the whole name-group's tasks throu
 **Why:** Recorded explicitly because this is the confusion most likely to produce a wrong doc later: two entries with the word "reload" in the heading, asserting that a reload reads no config, sitting a search away from anybody asking whether the shepherd re-reads its own config file. It does. Nothing in this work changed that, and nothing about the Flockfile side is evidence about it. `getting-started.astro`'s upgrading section now says so where an operator reads rather than only here.
 
 `verified crates/shep-cli/src/commands/daemon.rs (the pre-flight validates shep.toml before the reload) and web/src/pages/docs/getting-started.astro`
+
+## Dog config store
+
+### A dog's section moved out of `shep.toml` into a hand-editable `dogs.toml`, migrated once at boot, and a name in both files is a refusal rather than a merge
+
+A dog's own settings now live under `[<name>]` in `$SHEP_HOME/dogs.toml` instead of under `[dog.<name>]` in `shep.toml`. The daemon migrates any old sections into the new file once, on the first boot that carries the change, and prints which dogs moved. `RawDaemonConfig::dog` stays on the old type on purpose, so an un-migrated `shep.toml` still parses instead of refusing to boot under `deny_unknown_fields`.
+
+**Why:** Making `dogs.toml` hand-editable, the same way `shep.toml` is, means an operator can write a section into it before ever upgrading, so a migration that merged silently would have to pick a winner between two values for the same key with nothing to go on. Refusing is the only answer that does not guess, and it costs nothing but an edit: the fix is deleting one of the two sections and starting the daemon again. This was not in the original spec for the move; it came out of writing the migration itself, once the hand-editable file made the collision possible.
+
+`verified crates/shep-core/src/config/dogs.rs (DogsConfig) and crates/shep-cli/src/commands/dog_migration.rs (migrate_dog_sections, DogMigrationError::WouldOverwrite)`

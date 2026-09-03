@@ -8,18 +8,18 @@ of that sentence.
 
 ## What this is for, and what it is not
 
-Two other files already configure everything shep runs: a **Flockfile**
-configures a sheep (its script, its instances, its restart policy), and
-`shep.toml` configures the shepherd itself and its dogs. Neither has a
-field for "the port the last on-call engineer picked" or "a feature flag a
-provisioning script wants to leave a note about." That is what this store
-is for — ad-hoc operator notes and runtime tweaks a dog reads, not
-anything that shapes how a sheep is supervised.
+Three other files already configure everything shep runs: a **Flockfile**
+configures a sheep (its script, its instances, its restart policy),
+`shep.toml` configures the shepherd itself, and `dogs.toml` configures its
+dogs. None has a field for "the port the last on-call engineer picked" or
+"a feature flag a provisioning script wants to leave a note about." That
+is what this store is for: ad-hoc operator notes and runtime tweaks a dog
+reads, not anything that shapes how a sheep is supervised.
 
 If you are reaching for this store to configure a *sheep*, put it in the
 Flockfile instead. If you are reaching for it to configure a *dog*, put it
-under `[dog.<name>]` in `shep.toml`. This store is what is left over —
-small, flat, and explicitly not the primary config path.
+under `[<name>]` in `dogs.toml`. This store is what is left over: small,
+flat, and explicitly not the primary config path.
 
 ## The three verbs
 

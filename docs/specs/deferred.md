@@ -240,9 +240,9 @@ job was to find the friction rather than resolve it.
 
 Raised 2026-08-20 while designing `shep-log-rotate`, the first fully external
 dog. `shep adopt <name> <path>` vets, registers, enables and starts in one
-command, and then the operator has an adopted dog with no `[dog.<name>]`
-section and nothing telling them what its knobs are. The README is the only
-answer today.
+command, and then the operator has an adopted dog with no `[<name>]`
+section in `dogs.toml` and nothing telling them what its knobs are. The
+README is the only answer today.
 
 The maintainer asked whether a dog's repo could ship a `Flockfile.toml` that `shep adopt`
 reads. It cannot: `RawFlockfile` is `deny_unknown_fields` over exactly

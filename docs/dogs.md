@@ -90,26 +90,37 @@ the first one's edit landed.
 
 ## Configuration
 
-A dog's settings live under `[dog.<name>]` in `shep.toml`, and they never
-travel through the dog's environment. Instead the dog connects to the
-socket and asks for its own section over the wire
-(`Request::DogConfig`) — the daemon reads the file fresh for every such
-request rather than serving a copy it cached at boot.
+A dog's settings live under `[<name>]` in `$SHEP_HOME/dogs.toml`, hand-editable
+and separate from `shep.toml`, and they never travel through the dog's
+environment. Instead the dog connects to the socket and asks for its own
+section over the wire (`Request::DogConfig`), the daemon reads the file
+fresh for every such request rather than serving a copy it cached at boot.
 
-**Editing `[dog.<name>]` in `shep.toml` does not reach a dog that is
-already running.** A running dog asked for its section once, at startup,
-and nothing pushes it a new one. `shep disable <name> && shep enable
-<name>` is what re-reads it: that stop/start cycle is a fresh process
-asking a fresh question, and the daemon answers off the file as it stands
-at that moment.
+**Editing `[<name>]` in `dogs.toml` does not reach a dog that is already
+running.** A running dog asked for its section once, at startup, and
+nothing pushes it a new one. `shep disable <name> && shep enable <name>`
+is what re-reads it: that stop/start cycle is a fresh process asking a
+fresh question, and the daemon answers off the file as it stands at that
+moment.
 
 The reason the section rides the socket instead of the environment is the
 same reason it applies to every dog and not just the ones with obvious
 secrets: an environment variable is readable from the process table,
 inherited by every child the dog spawns, and captured into a crash dump.
-`[dog.bark.sinks]` routinely holds a webhook URL, and a webhook URL is a
-bearer credential — keeping the whole section off the environment means
+`[bark.sinks]` routinely holds a webhook URL, and a webhook URL is a
+bearer credential, keeping the whole section off the environment means
 nobody has to remember which dog's config is sensitive.
+
+**A section that used to live in `shep.toml` migrates to `dogs.toml`
+automatically.** The first boot of a shep carrying this move reads any
+`[dog.<name>]` sections still in `shep.toml`, writes them into `dogs.toml`
+under their bare name, strikes them from `shep.toml`, and prints which
+dogs moved. Every boot after that finds nothing to do. If a name already
+exists in both files, the daemon refuses to boot rather than guess which
+value is right; the fix is to delete one of the two sections and start it
+again. The likeliest way to hit that is hand-writing `[dog.metrics]` back
+into `shep.toml` after it already migrated, so check `dogs.toml` first. A
+dog present in only one file migrates or starts normally either way.
 
 ## The metrics dog
 
@@ -117,7 +128,7 @@ nobody has to remember which dog's config is sensitive.
 bound to `127.0.0.1:9615` by default:
 
 ```toml
-[dog.metrics]
+[metrics]
 bind = "127.0.0.1:9615"
 ```
 
@@ -156,22 +167,22 @@ decision for you by shipping wide and asking you to lock it down.
 the things worth paging someone about, delivering to named webhook sinks:
 
 ```toml
-[dog.bark.sinks]
+[bark.sinks]
 oncall = { kind = "discord", url = "https://discord.com/api/webhooks/..." }
 audit = { kind = "json", url = "https://example.internal/hook" }
 
-[[dog.bark.rules]]
+[[bark.rules]]
 on = "gave_up"
 sinks = ["oncall", "audit"]
 
-[[dog.bark.rules]]
+[[bark.rules]]
 on = "restart_rate"
 restarts = 5
 within = "2m"
 sinks = ["oncall"]
 ```
 
-Leave `[dog.bark.rules]` out entirely and the bark dog does not stay
+Leave `[bark.rules]` out entirely and the bark dog does not stay
 silent — one rule is built in by default, firing on every configured sink
 whenever a sheep reaches `Errored`. That is deliberate: it is the alert
 that must not be missed, keyed to the shepherd's own decision that it has
@@ -261,11 +272,11 @@ The wire a third-party dog speaks is the same client protocol
 [§6](specs/shep-v1.md#6-wire-protocol-v1--protocol-version-1) pins for
 every other client of this daemon: connect to the Unix socket at
 `$SHEP_HOME/run/shep.sock`, send `Hello`, wait for `HelloAck`, then send
-`Request::DogConfig { name }` to fetch your own `[dog.<name>]` section as
+`Request::DogConfig { name }` to fetch your own `[<name>]` section as
 opaque text — parse it however your own config shape wants. Shep sets two
 variables of its own on a dog: `$SHEP_HOME`, which is how it finds that
 socket in the first place, and `$SHEP_DOG_NAME`, which is the `name` to put
-in that request. No `[dog.<name>]` value ever rides along beside them, for
+in that request. No `[<name>]` value ever rides along beside them, for
 the reason given above. A section's key is not one of its values.
 
 **Put that name in the `Hello` too, as `dog_name`.** Optional, and nothing
@@ -306,7 +317,7 @@ that reads wrong rather than an outage.
 Those two are what shep ADDS, not the whole environment. A dog is a
 supervised process like any other, so it also starts from the small base
 every sheep gets: `PATH`, plus whichever of `HOME`, `USER`, `LANG` and `TZ`
-the shepherd itself has, plus `SHEP_INSTANCE`. Nothing from `[dog.<name>]`
+the shepherd itself has, plus `SHEP_INSTANCE`. Nothing from `[<name>]`
 is in there.
 
 **Read `$SHEP_DOG_NAME` rather than hardcoding a name.** It holds the name

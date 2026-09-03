@@ -145,7 +145,8 @@ $ shep disable metrics`}</CodeBlock>
 
     <h2>Configuration lives on the socket, not the environment</h2>
     <p>
-      A dog's settings live under <code>[dog.&lt;name&gt;]</code> in{" "}
+      A dog's settings live under <code>[&lt;name&gt;]</code> in{" "}
+      <code>$SHEP_HOME/dogs.toml</code>, hand-editable and separate from{" "}
       <code>shep.toml</code>, and they never travel through the dog's
       environment. Instead the dog connects to the socket and asks for its
       own section over the wire. The daemon reads the file fresh for every
@@ -154,17 +155,24 @@ $ shep disable metrics`}</CodeBlock>
     <p>
       An environment variable is readable from the process table, inherited
       by every child the dog spawns, and captured into a crash dump.{" "}
-      <code>[dog.bark.sinks]</code> routinely holds a webhook URL, and a
+      <code>[bark.sinks]</code> routinely holds a webhook URL, and a
       webhook URL is a bearer credential. Keeping the whole section off the
       environment means nobody has to remember which dog's config is
       sensitive.
     </p>
     <Callout variant="careful">
-      Editing <code>[dog.&lt;name&gt;]</code> does not reach a dog that's
-      already running. It asked for its section once, at startup, and
-      nothing pushes it a new one. <code>shep disable &lt;name&gt; &amp;&amp;
-      shep enable &lt;name&gt;</code> is what re-reads it: a fresh process
-      asking a fresh question.
+      Editing <code>[&lt;name&gt;]</code> in <code>dogs.toml</code> does not
+      reach a dog that's already running. It asked for its section once, at
+      startup, and nothing pushes it a new one. <code>shep disable
+      &lt;name&gt; &amp;&amp; shep enable &lt;name&gt;</code> is what
+      re-reads it: a fresh process asking a fresh question.
+    </Callout>
+    <Callout variant="careful">
+      A section that used to live in <code>shep.toml</code> migrates to{" "}
+      <code>dogs.toml</code> once, on the first boot of a shep carrying this
+      move, and it prints which dogs moved. If a name exists in both files,
+      the daemon refuses to boot until one of the two sections is deleted; a
+      dog present in only one file migrates or starts normally.
     </Callout>
 
     <h2>The metrics dog</h2>
@@ -172,7 +180,7 @@ $ shep disable metrics`}</CodeBlock>
       <code>shep enable metrics</code> serves Prometheus exposition text over
       plain HTTP, bound to <code>127.0.0.1:9615</code> by default:
     </p>
-    <CodeBlock label="shep.toml">{`[dog.metrics]
+    <CodeBlock label="dogs.toml">{`[metrics]
 bind = "127.0.0.1:9615"`}</CodeBlock>
     <p>
       Nothing accumulates between scrapes. Every request rebuilds the
@@ -220,21 +228,21 @@ shep_host_memory_total_bytes 51539607552`}</CodeBlock>
       <code>shep enable bark</code> subscribes to the shepherd's event bus
       and delivers to named webhook sinks:
     </p>
-    <CodeBlock label="shep.toml">{`[dog.bark.sinks]
+    <CodeBlock label="dogs.toml">{`[bark.sinks]
 oncall = { kind = "discord", url = "https://discord.com/api/webhooks/..." }
 audit = { kind = "json", url = "https://example.internal/hook" }
 
-[[dog.bark.rules]]
+[[bark.rules]]
 on = "gave_up"
 sinks = ["oncall", "audit"]
 
-[[dog.bark.rules]]
+[[bark.rules]]
 on = "restart_rate"
 restarts = 5
 within = "2m"
 sinks = ["oncall"]`}</CodeBlock>
     <p>
-      Leave <code>[dog.bark.rules]</code> out and bark doesn't go quiet:
+      Leave <code>[bark.rules]</code> out and bark doesn't go quiet:
       one rule is built in by default, firing on every configured sink
       whenever a sheep reaches <code>Errored</code>. That's the alert that
       must not be missed, so it needs no opt-in. <code>restart_rate</code>{" "}
@@ -245,7 +253,7 @@ sinks = ["oncall"]`}</CodeBlock>
     </p>
     <Callout variant="careful">
       Verified directly: enable <code>bark</code> with{" "}
-      <code>[dog.bark.sinks]</code> absent entirely and it does not run
+      <code>[bark.sinks]</code> absent entirely and it does not run
       quietly with nowhere to send alerts: the default rule still exists
       with zero sinks to route to, bark logs{" "}
       <code>rule 0 routes to no sink at all</code> on every restart attempt,
@@ -363,7 +371,7 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       section as opaque text. Shep sets two variables of its own on a dog:{" "}
       <code>$SHEP_HOME</code>, which is how it finds that socket in the first
       place, and <code>$SHEP_DOG_NAME</code>, which is the name to put in
-      that request. No <code>[dog.&lt;name&gt;]</code> value rides along
+      that request. No <code>[&lt;name&gt;]</code> value rides along
       beside them.
     </p>
     <p>
@@ -417,7 +425,7 @@ watchdog  adopted  true      stopped`}</CodeBlock>
       <code>HOME</code>, <code>USER</code>, <code>LANG</code> and{" "}
       <code>TZ</code> the shepherd itself has, plus{" "}
       <code>SHEP_INSTANCE</code>. Nothing from{" "}
-      <code>[dog.&lt;name&gt;]</code> is in there.
+      <code>[&lt;name&gt;]</code> is in there.
     </p>
     <Callout variant="careful">
       Read <code>$SHEP_DOG_NAME</code> rather than hardcoding a name. It

@@ -322,9 +322,9 @@ fn home_before(prefix: &[OsString]) -> Option<PathBuf> {
 /// Runs `path` — an adopted dog's binary — the way an operator invoking it
 /// by name expects: `extra_args` passed through exactly as typed, the two
 /// environment variables every dog is promised (`$SHEP_HOME` to find the
-/// shepherd, `$SHEP_DOG_NAME` to name its own `[dog.<name>]` section),
-/// stdio inherited so an interactive dog behaves like any other program run
-/// directly from a shell.
+/// shepherd, `$SHEP_DOG_NAME` to name its own `[<name>]` section in
+/// `dogs.toml`), stdio inherited so an interactive dog behaves like any
+/// other program run directly from a shell.
 ///
 /// `name` is the token the operator typed, which is what
 /// [`dispatch_adopted_dog`] resolved `path` from, so a dog run this way and
@@ -2177,8 +2177,8 @@ mod tests {
     /// shepherd does. Both channels promise the same two variables
     /// (`shep_daemon::dogs::dog_app`), and this is the half an operator
     /// drives by hand -- a dog invoked here to print or check its own
-    /// configuration would otherwise read a different `[dog.<name>]` section
-    /// than the one it runs under, which is the whole failure
+    /// configuration would otherwise read a different `[<name>]` section in
+    /// `dogs.toml` than the one it runs under, which is the whole failure
     /// `SHEP_DOG_NAME` exists to end.
     ///
     /// The name asserted is the token the operator typed, never the script's

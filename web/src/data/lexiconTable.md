@@ -32,7 +32,7 @@ The whole vocabulary, and whether it exists yet.
 | the shepherd channel | a private pipe on fd 3 between daemon and app | `channel = true`, `shep trigger` | yes |
 | a lamb | a child process of a sheep | tree-kill, `describe`'s tree view | yes |
 | a dog | a plugin process the shepherd supervises | `shep enable metrics`, `shep dogs` | yes |
-| a bark | a webhook alert | `[dog.bark.sinks]` config, `shep barks` | yes |
+| a bark | a webhook alert | `[bark.sinks]` config in `dogs.toml`, `shep barks` | yes |
 | a smit | a short mark a dog paints on a sheep | the SMIT column in `shep flock` and the lookout | yes |
 | the whistle | the MCP interface agents talk to | `shep whistle` | yes |
 | the lookout | the terminal dashboard | `shep lookout` (alias `dash`) | partly |
