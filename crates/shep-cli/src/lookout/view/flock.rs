@@ -174,6 +174,24 @@ const ALL: &[Column] = &[
     Column::Fold,
     Column::Smit,
 ];
+// The full set minus CFG: task 12's own column is the first to go, ahead of
+// even SMIT, so this is the same eleven columns `ALL` was before CFG
+// existed. See `TIERS`'s own doc for why CFG gets the newest, least earned
+// spot in the drop order rather than tying itself to EXIT the way the CLI
+// table's `output::rows::FlockRows::PRIORITIES` does.
+const NO_CFG: &[Column] = &[
+    Column::Id,
+    Column::Name,
+    Column::Status,
+    Column::Pid,
+    Column::Restarts,
+    Column::Exit,
+    Column::Cpu,
+    Column::Mem,
+    Column::Uptime,
+    Column::Fold,
+    Column::Smit,
+];
 const NO_SMIT: &[Column] = &[
     Column::Id,
     Column::Name,
@@ -181,7 +199,6 @@ const NO_SMIT: &[Column] = &[
     Column::Pid,
     Column::Restarts,
     Column::Exit,
-    Column::Cfg,
     Column::Cpu,
     Column::Mem,
     Column::Uptime,
@@ -194,7 +211,6 @@ const NO_FOLD: &[Column] = &[
     Column::Pid,
     Column::Restarts,
     Column::Exit,
-    Column::Cfg,
     Column::Cpu,
     Column::Mem,
     Column::Uptime,
@@ -266,15 +282,27 @@ const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 /// `output::rows::FlockRows::PRIORITIES` gives for its own priority 8, the
 /// highest number in that table.
 ///
-/// CFG (task 12) drops in the same breath as EXIT rather than getting a
-/// tier of its own: it is absent from `NO_EXIT` and every narrower set, so
-/// a terminal that has already lost EXIT has lost CFG too. Both answer "why
-/// does this row need a second look", and `output::rows::FlockRows::PRIORITIES`
-/// gives CFG the exact number it gives EXIT for the same reason.
+/// CFG (task 12) gets the newest, least earned spot in this order: the
+/// FIRST column to go, ahead of even SMIT, rather than tying itself to
+/// EXIT's own tier the way `output::rows::FlockRows::PRIORITIES` does for
+/// the CLI table. That is a deliberate departure from the CLI table's own
+/// choice, not an oversight, and the reason is specific to this pane: every
+/// wide fixture in `docs/lookout/frames.txt`'s own gallery is 120 columns,
+/// and the maintainer's own ruling on SMIT (`output::table`'s
+/// `a_smit_is_never_dropped_at_full_width`) is that its droppability was
+/// conditional on it being seen regularly at a wide terminal. Tying CFG to
+/// EXIT would have pushed the full column set's own threshold from 116 to
+/// 122, past 120, and quietly broken that ruling for the one pane whose
+/// gallery is checked into the repository as documentation -- every `SMIT`
+/// occurrence in that file would vanish the moment CFG landed. Dropping CFG
+/// on its own, one tier earlier, keeps `NO_CFG`'s threshold at exactly 116,
+/// where `ALL`'s was before this task, so 120 columns shows everything
+/// this pane showed before CFG existed, CFG included only past 122.
 const TIERS: &[(u16, &[Column])] = &[
     (122, ALL),
-    (107, NO_SMIT),
-    (95, NO_FOLD),
+    (116, NO_CFG),
+    (101, NO_SMIT),
+    (89, NO_FOLD),
     (78, NO_EXIT),
     (68, NO_RESTARTS),
     (59, NO_PID),
@@ -608,17 +636,18 @@ mod tests {
     fn columns_drop_in_a_fixed_order_as_the_terminal_narrows() {
         assert_eq!(columns_for(300).len(), 12);
         assert_eq!(columns_for(122).len(), 12);
-        assert!(!columns_for(121).contains(&Column::Smit));
-        assert!(columns_for(121).contains(&Column::Fold));
-        assert_eq!(columns_for(107).len(), 11);
-        assert!(!columns_for(106).contains(&Column::Fold));
-        assert!(columns_for(106).contains(&Column::Exit));
-        assert!(columns_for(106).contains(&Column::Cfg));
-        assert_eq!(columns_for(95).len(), 10);
-        // CFG (task 12) drops in the same breath as EXIT: both are absent
-        // from `NO_EXIT` and every narrower tier.
+        // CFG (task 12) is the first column gone, ahead of even SMIT --
+        // `TIERS`'s own doc gives the reasoning, tied to the gallery's own
+        // 120-column wide fixtures.
+        assert!(!columns_for(121).contains(&Column::Cfg));
+        assert!(columns_for(121).contains(&Column::Smit));
+        assert_eq!(columns_for(116).len(), 11);
+        assert!(!columns_for(115).contains(&Column::Smit));
+        assert!(columns_for(115).contains(&Column::Fold));
+        assert_eq!(columns_for(101).len(), 10);
+        assert!(!columns_for(100).contains(&Column::Fold));
+        assert!(columns_for(100).contains(&Column::Exit));
         assert!(!columns_for(88).contains(&Column::Exit));
-        assert!(!columns_for(88).contains(&Column::Cfg));
         assert!(columns_for(88).contains(&Column::Restarts));
         assert!(!columns_for(77).contains(&Column::Restarts));
         assert!(!columns_for(67).contains(&Column::Pid));
@@ -635,6 +664,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// fails if a 120-column terminal -- every wide fixture in
+    /// `docs/lookout/frames.txt`'s own gallery -- ever loses SMIT again.
+    /// This is the maintainer's ruling (`output::table`'s own
+    /// `a_smit_is_never_dropped_at_full_width` states it for the CLI
+    /// table) made concrete for the one width the published gallery
+    /// actually renders at, so a future column's own drop-order choice
+    /// gets checked against it directly rather than only against `TIERS`'s
+    /// own doc.
+    #[test]
+    fn smit_survives_the_gallerys_own_wide_fixtures() {
+        assert!(columns_for(120).contains(&Column::Smit));
     }
 
     /// fails if lookout's own column list drifts from

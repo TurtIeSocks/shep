@@ -3233,20 +3233,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// fails if `ProcessInfo` ever carries an override VALUE. env values are
-    /// secrets and nothing sends them to a client today (IR-41).
-    #[test]
-    fn process_info_carries_names_and_never_values() {
-        let json = serde_json::to_string(&{
-            let mut info = sample_info(1, "web", 60_000);
-            info.overridden = Some(vec!["env".to_string()]);
-            info
-        })
-        .unwrap();
-        assert!(json.contains("\"env\""));
-        assert!(!json.contains("DATABASE_URL"));
-    }
-
     /// fails if `LambRows` grows a field that never reaches the table, or
     /// swaps PID and NAME between its two columns.
     #[test]

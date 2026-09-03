@@ -1311,6 +1311,89 @@ mod tests {
         assert_eq!(rows[0]["lambs"][0]["pid"], 4243);
     }
 
+    /// fails if the Pending/Overridden headings stop naming the field lists
+    /// or stop pointing at `shep reload <name>` as what promotes a parked
+    /// config -- the brief's own requirement, and the one fact an operator
+    /// reading this table cannot get anywhere else.
+    #[test]
+    fn describe_names_pending_and_overridden_fields_and_the_promoting_verb() {
+        let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
+            .pid(Some(4242))
+            .pending(Some(vec!["env".to_string(), "cwd".to_string()]))
+            .overridden(Some(vec!["max_restarts".to_string()]))
+            .build();
+        let mut out = Vec::new();
+        emit_described(
+            &mut out,
+            Format::Table,
+            "describe",
+            vec![info],
+            Presentation::BARE,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains("Pending for web"), "{rendered}");
+        assert!(rendered.contains("shep reload web"), "{rendered}");
+        assert!(rendered.contains("env"), "{rendered}");
+        assert!(rendered.contains("cwd"), "{rendered}");
+        assert!(rendered.contains("Overridden for web"), "{rendered}");
+        assert!(rendered.contains("max_restarts"), "{rendered}");
+    }
+
+    /// fails if a sheep with neither a pending config nor an override grows
+    /// either heading. `describe` printed no such section before task 12
+    /// and must print exactly that for the overwhelmingly common sheep --
+    /// the same rule `a_sheep_with_no_lambs_renders_exactly_what_it_did_before`
+    /// follows for lambs.
+    #[test]
+    fn a_sheep_with_neither_list_renders_neither_heading() {
+        let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
+            .pid(Some(4242))
+            .build();
+        let mut out = Vec::new();
+        emit_described(
+            &mut out,
+            Format::Table,
+            "describe",
+            vec![info],
+            Presentation::BARE,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(!rendered.contains("Pending for"), "{rendered}");
+        assert!(!rendered.contains("Overridden for"), "{rendered}");
+    }
+
+    /// fails if the JSON surface changes shape for pending/overridden, the
+    /// same rule `the_json_surface_stays_one_array_with_lambs_on_each_row`
+    /// pins for lambs: one array of `ProcessInfo`, each row carrying its
+    /// own fields, never a second payload the headings above are built
+    /// from.
+    #[test]
+    fn describes_json_surface_carries_pending_and_overridden_on_each_row() {
+        let info = ProcessInfo::builder(3, "web", ProcStatus::Online)
+            .pid(Some(4242))
+            .pending(Some(vec!["env".to_string()]))
+            .overridden(Some(vec!["cwd".to_string()]))
+            .build();
+        let mut out = Vec::new();
+        emit_described(
+            &mut out,
+            Format::Json,
+            "describe",
+            vec![info],
+            Presentation::BARE,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let rows = value["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["pending"][0], "env");
+        assert_eq!(rows[0]["overridden"][0], "cwd");
+    }
+
     /// `Streams` carries `&mut dyn io::Write`, which has no `Debug` of its
     /// own, so the manual impl is the only thing standing between a future
     /// refactor and either a compile error or (worse, if someone works

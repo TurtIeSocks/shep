@@ -4,13 +4,13 @@ expression: render_text(&buffer)
 ---
 shep lookout   /home/ada/.shep                                                                            4 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 16.5%   flock mem 781.0M   up 6d 3h           
-  ID    NAME                 STATUS           PID      RESTARTS  EXIT       CFG   CPU     MEM       UPTIME    FOLD      
+  ID    NAME        STATUS           PID      RESTARTS  EXIT       CPU     MEM       UPTIME    FOLD        SMIT         
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  3     api                  online           48219    1         -          -     7.1%    241.0M    1h 29m    edge      
->       web ×3               online                    3                          9.4%    540.0M    15m       edge      
-  0      ↳ :0                online           48400    0         -          -     3.4%    182.0M    1h 25m              
-  1      ↳ :1                online           48401    2         -          -     2.9%    178.0M    15m                 
-  2      ↳ :2                online           48402    1         -          -     3.1%    180.0M    2h 40m              
+  3     api         online           48219    1         -          7.1%    241.0M    1h 29m    edge        -            
+>       web ×3      online                    3                    9.4%    540.0M    15m       edge        -            
+  0      ↳ :0       online           48400    0         -          3.4%    182.0M    1h 25m                             
+  1      ↳ :1       online           48401    2         -          2.9%    178.0M    15m                                
+  2      ↳ :2       online           48402    1         -          3.1%    180.0M    2h 40m                             
                                                                                                                         
                                                                                                                         
                                                                                                                         

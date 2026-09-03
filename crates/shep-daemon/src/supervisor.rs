@@ -3668,6 +3668,46 @@ impl<R: ProcessRunner> Actor<R> {
             .into_info()
     }
 
+    /// The field names an operator has overridden for `name`, for a
+    /// [`ProcessEntry`] about to be built from scratch -- a fresh
+    /// registration has no history of its own to read the cache off, so
+    /// this is the one place besides [`Actor::apply_one`] that populates
+    /// [`ProcessEntry::overridden`].
+    ///
+    /// Checks a live sibling first, and only reads the override store when
+    /// none exists. That order matters for cost, not just for correctness:
+    /// a scale-up (`Self::spawn_fresh` called for a new instance of an app
+    /// already running) finds one for free, with no file access at all,
+    /// which is the common case and the hot one -- `shep stock web 5` calls
+    /// this once per new instance. A brand-new app, or a muster restore at
+    /// boot registering a name for the first time in this process, has no
+    /// sibling to ask and falls back to [`shep_core::overrides::get`] --
+    /// one locked read, same as the cache-miss cost [`Actor::apply_one`]
+    /// already pays once per load, and one that happens only at the small
+    /// number of moments a name is REGISTERED rather than on every listing.
+    ///
+    /// An unreadable store answers empty here rather than refusing, unlike
+    /// [`Actor::handle_apply_config`]'s own read of the same store: that
+    /// one refuses a whole load rather than risk a template silently
+    /// overwriting an operator's edit, because a load WRITES the store back.
+    /// This function only ever READS it to annotate a listing, so the worst
+    /// an unreadable store costs here is a blank CFG cell until the store
+    /// itself is fixed -- never a lost edit.
+    fn overridden_for(&self, name: &str) -> Vec<String> {
+        if let Some(slot) = self
+            .sheep
+            .values()
+            .find(|slot| slot.entry.spec.config().name == name)
+        {
+            return slot.entry.overridden.clone();
+        }
+        overrides::get(&self.paths.overrides, name)
+            .ok()
+            .flatten()
+            .map(|record| record.fields.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Registers one app as a flock member in `status`, spawning nothing.
     ///
     /// Mechanism, not policy: it registers the status it is handed and has
@@ -3707,6 +3747,7 @@ impl<R: ProcessRunner> Actor<R> {
             return Registration::AlreadyKnown(to_info(&slot.entry, &self.smits));
         }
 
+        let overridden = self.overridden_for(name);
         let id = self.next_id;
         self.next_id += 1;
         // Assembled for its log paths only: nothing is spawned here, but the
@@ -3721,7 +3762,7 @@ impl<R: ProcessRunner> Actor<R> {
             spec: app.clone(),
             pending: None,
             pending_reidentifies: false,
-            overridden: Vec::new(),
+            overridden,
             instance: 0,
             status,
             pid: None,
@@ -3810,6 +3851,10 @@ impl<R: ProcessRunner> Actor<R> {
         credentials: Option<Credentials>,
         dog: Option<DogSource>,
     ) -> Result<ProcessInfo, String> {
+        // Read before the spawn below touches anything: a scale-up's new
+        // instance must show the same overrides its siblings already do,
+        // not a blank cell until the next config load happens to run.
+        let overridden = self.overridden_for(&app.config().name);
         let spec = assemble(app, instance, &self.paths, credentials);
         let id = self.next_id;
         self.next_id += 1;
@@ -3843,7 +3888,7 @@ impl<R: ProcessRunner> Actor<R> {
                     spec: app.clone(),
                     pending: None,
                     pending_reidentifies: false,
-                    overridden: Vec::new(),
+                    overridden,
                     instance,
                     status,
                     pid: Some(pid),
@@ -3922,7 +3967,7 @@ impl<R: ProcessRunner> Actor<R> {
                     spec: app.clone(),
                     pending: None,
                     pending_reidentifies: false,
-                    overridden: Vec::new(),
+                    overridden,
                     instance,
                     status: ProcStatus::Errored,
                     pid: None,
@@ -4184,11 +4229,18 @@ impl<R: ProcessRunner> Actor<R> {
             // `CarriedSheep::dog`.
             dog: carried.dog().cloned(),
             last_exit: carried.last_exit(),
-            // Not carried by `CarriedSheep` (`ProcessEntry::overridden`'s own
-            // doc names this gap): a successor reports no overrides for a
-            // sheep that has some on record until the next load recomputes
-            // them.
-            overridden: Vec::new(),
+            // Not carried by `CarriedSheep` at all (`ProcessEntry::overridden`'s
+            // own doc names why: the blob predates the field and extending
+            // its wire format was its own decision to make separately). Read
+            // from the override store instead, through the same
+            // `Self::overridden_for` a fresh registration uses -- a
+            // handover installs one sheep at a time with no live sibling to
+            // ask yet, so this is a store read per sheep, once, at the
+            // moment this image takes over. Without it, a successor
+            // reported no overrides for a sheep that has some on record
+            // until the next load recomputed the cache; the store itself
+            // was never behind, only this cache of it.
+            overridden: self.overridden_for(&app.config().name),
         };
 
         let Some(pid) = carried.pid() else {
@@ -5925,8 +5977,13 @@ impl<R: ProcessRunner> Actor<R> {
         // gives the reasoning: this store is read once per load, right here,
         // and `to_info` runs once per sheep on every listing, far more
         // often. Read off `next_overrides` before it moves into `changes`
-        // below, so the cache and the store it mirrors can never disagree --
-        // one ledger, read twice, rather than two computations of it.
+        // below, so the two are the same computation rather than a second
+        // one derived separately -- they CAN still drift if the write at
+        // `overrides::update` below fails after this line runs, since a
+        // failed write leaves the on-disk store holding whatever this app's
+        // PREVIOUS load left, while the cache above already moved to
+        // `next_overrides`; the refusal reported alongside `Applied` names
+        // that case rather than hiding it.
         let overridden_names: Vec<String> = if matches!(reset, ResetDepth::All) {
             Vec::new()
         } else {
@@ -6517,6 +6574,13 @@ impl<R: ProcessRunner> Actor<R> {
         // never exited", which is only true the first time an app is ever
         // reloaded.
         let last_exit = drainee.last_exit;
+        // Carried across the swap for the same reason `dog`/`last_exit`
+        // are: a reload is not a config load, so the replacement's honest
+        // answer to "what is overridden" is still whatever the drainee's
+        // was. Without this, `shep reload <name>` -- the very verb
+        // `shep describe`'s own Overridden heading tells an operator to
+        // run -- would blank the cache the moment it ran.
+        let overridden = drainee.overridden.clone();
 
         let new_id = self.next_id;
         self.next_id += 1;
@@ -6544,7 +6608,7 @@ impl<R: ProcessRunner> Actor<R> {
                     spec: app.clone(),
                     pending: None,
                     pending_reidentifies: false,
-                    overridden: Vec::new(),
+                    overridden,
                     instance,
                     status: ProcStatus::Starting,
                     pid: Some(pid),
@@ -9129,18 +9193,23 @@ fn to_info(entry: &ProcessEntry, smits: &Smits) -> ProcessInfo {
         )
         .instance(Some(entry.instance))
         // The field names `spec` and `pending` differ on, or `None` when
-        // nothing is parked. Cheap: an in-memory `AppConfig` comparison, no
-        // disk I/O, unlike `.overridden` below.
-        .pending(
-            entry
-                .pending
-                .as_ref()
-                .map(|parked| entry.spec.config().drifted_fields(parked.config())),
-        )
+        // nothing is parked. `.filter` rather than a bare `Some(vec)`: a
+        // parked config that turned out identical to `spec` (an earlier
+        // load promoted every field an operator cared about, say) must not
+        // report `pending: Some([])` -- the doc on `ProcessInfo::pending`
+        // says `None` means nothing parked, and an empty list is not
+        // nothing parked, it is nothing DIFFERING about what is parked.
+        // Cheap either way: an in-memory `AppConfig` comparison, no disk
+        // I/O.
+        .pending(entry.pending.as_ref().and_then(|parked| {
+            let fields = entry.spec.config().drifted_fields(parked.config());
+            (!fields.is_empty()).then_some(fields)
+        }))
         // Read off the cached field, never the override store directly --
-        // see `ProcessEntry::overridden`'s own doc for why: this function is
-        // called once per sheep on every listing, and a load is rare, so
-        // the store's own file read happens there instead of here.
+        // see `ProcessEntry::overridden`'s own doc for why: that field is
+        // kept correct by every path that can register or replace a sheep,
+        // so this function does no I/O of its own on the far more frequent
+        // listing path.
         .overridden((!entry.overridden.is_empty()).then(|| entry.overridden.clone()))
         .build()
 }
@@ -22964,6 +23033,34 @@ mod tests {
     // promotion moves is `spec`, `pending` and `credentials`, and no reply
     // spelling reports those three together.
 
+    /// fails if a reload zeroes `ProcessEntry::overridden` on the
+    /// replacement it spawns. `spawn_replacement` already carries
+    /// `restarts`/`dog`/`last_exit` off the drainee with the same argument:
+    /// the replacement is the same instance continuing, not a new one --
+    /// `overridden` needed the identical treatment, and its own construction
+    /// site used to hardcode `Vec::new()` instead. `shep reload <name>` is
+    /// also the exact verb `shep describe`'s own Overridden heading tells an
+    /// operator to run, so this is the one path where the bug would have
+    /// been hit constantly rather than at the edges.
+    #[tokio::test(start_paused = true)]
+    async fn reload_carries_the_overridden_cache_to_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        actor.sheep.get_mut(&0).unwrap().entry.overridden = vec!["max_restarts".to_string()];
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        let new_id = actor.reloads["web"]
+            .swap
+            .new_id
+            .expect("an overlapping reload spawns its replacement at once");
+        assert_eq!(
+            actor.sheep[&new_id].entry.overridden,
+            vec!["max_restarts".to_string()],
+            "the replacement must carry the drainee's own overridden cache, not start blank"
+        );
+    }
+
     /// fails if a reload does not pick up config a file load parked. Without
     /// this the pending slot is written and never read, so an operator can
     /// see a pending field forever and has no way to apply it.
@@ -23102,6 +23199,59 @@ mod tests {
         assert_eq!(info.pending, Some(vec!["env".to_string()]));
     }
 
+    /// fails if `Actor::overridden_for` reads the override store when a
+    /// live sibling could answer for free. A scale-up (`shep stock`) calls
+    /// this once per new instance, so a cache-miss there would cost one
+    /// locked file read per new slot on the hot path -- this proves the
+    /// cheap branch actually wins by seeding the STORE with a different
+    /// answer than the sibling's cache and checking the sibling wins.
+    #[tokio::test(start_paused = true)]
+    async fn overridden_for_prefers_a_live_sibling_over_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        actor.sheep.get_mut(&0).unwrap().entry.overridden = vec!["cwd".to_string()];
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("max_restarts", serde_json::json!(9))],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(actor.overridden_for("web"), vec!["cwd".to_string()]);
+    }
+
+    /// fails if `Actor::overridden_for` cannot answer for a name with no
+    /// live sheep at all -- the case a muster restore and a handover
+    /// installation are both in, one sheep at a time, before there is a
+    /// sibling to ask.
+    #[tokio::test(start_paused = true)]
+    async fn overridden_for_reads_the_store_when_no_sibling_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _enforcer) = actor_over(&dir, &[]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("max_restarts", serde_json::json!(9))],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actor.overridden_for("web"),
+            vec!["max_restarts".to_string()]
+        );
+        assert_eq!(
+            actor.overridden_for("nobody-has-heard-of-this-app"),
+            Vec::<String>::new(),
+            "an unreadable-or-empty answer for a name the store has never seen"
+        );
+    }
+
     /// fails if `ProcessEntry::overridden` drifts from what the override
     /// store actually holds after a load, or if `to_info` does not read the
     /// cache back. An override with nothing to show it is a silent
@@ -23138,6 +23288,59 @@ mod tests {
         );
         let info = to_info(entry, &actor.smits);
         assert_eq!(info.overridden, Some(vec!["max_restarts".to_string()]));
+    }
+
+    /// fails if `ProcessInfo` ever carries an override VALUE, at the actual
+    /// producer -- unlike a test that hands a hand-built `ProcessInfo` a
+    /// value and checks the value is still there, which no code path can
+    /// even produce and which proves nothing. This seeds the override store
+    /// itself with a real secret-shaped value, the way `env` genuinely
+    /// arrives there, applies a load over it, and reads `to_info`'s own
+    /// output back. `AppOverrides::fields` is a `serde_json::Map` that can
+    /// hold anything (the module's own doc says so), so the only real
+    /// guarantee is that `Actor::apply_one`/`Actor::overridden_for` extract
+    /// `.keys()` and never a value (IR-41).
+    #[tokio::test(start_paused = true)]
+    async fn to_info_never_carries_an_override_value() {
+        const SENTINEL: &str = "postgres://sentinel-value-that-must-never-appear";
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.env = BTreeMap::from([("DATABASE_URL".to_string(), SENTINEL.to_string())]);
+            })],
+        );
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("env", serde_json::json!({ "DATABASE_URL": SENTINEL }))],
+            ),
+        )
+        .unwrap();
+
+        let file = AppConfig::minimal("web", "./srv");
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let entry = &actor.sheep[&0].entry;
+        let info = to_info(entry, &actor.smits);
+        assert_eq!(
+            info.overridden,
+            Some(vec!["env".to_string()]),
+            "the name must still reach the operator"
+        );
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(
+            !json.contains(SENTINEL),
+            "an override value reached the wire: {json}"
+        );
     }
 
     /// fails if promoting a `user` change reuses the identity resolved at the

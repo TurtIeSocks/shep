@@ -58,20 +58,30 @@ pub struct ProcessEntry {
     /// declare, in field-name order. Empty for a sheep no load has ever
     /// touched, and every sheep before task 12 shipped.
     ///
-    /// Cached here rather than read from the override store
-    /// (`shep_core::overrides`) at listing time: `Actor::handle_apply_config`
-    /// already does that store's one file read per load, and `to_info` is
-    /// called on every listing -- far more often than a load happens. Written
-    /// in `Actor::apply_one`, from the same `next_overrides` ledger that
-    /// function writes back to the store, so this field and the store agree
-    /// by construction rather than by a second read. Names only, never
-    /// values, for the reason [`ProcessInfo::overridden`](shep_core::protocol::ProcessInfo::overridden)'s
-    /// own doc gives (IR-41).
+    /// Cached rather than read from the override store
+    /// (`shep_core::overrides`) at listing time, because `to_info` is
+    /// called on every listing -- far more often than the store actually
+    /// changes. Kept correct across every path that can put a sheep on this
+    /// list, not only the load that first sets it:
     ///
-    /// Not carried across a handover: a successor rebuilds it at the next
-    /// load, and until then reports no overrides for a sheep that has some
-    /// on record. A known gap, not a silent one -- see this crate's own
-    /// handover module for what it does and does not carry.
+    /// - A config load writes it in `Actor::apply_one`, from the same
+    ///   `next_overrides` ledger that function writes back to the store, so
+    ///   this field and the store agree by construction there.
+    /// - `Actor::spawn_replacement` (`shep reload`/`shep restart`) carries
+    ///   it off the drainee, the same way it carries `dog`/`last_exit`: a
+    ///   reload is not a config load, so the old value is still the true
+    ///   one.
+    /// - A fresh registration (`Actor::spawn_fresh`, `Actor::
+    ///   register_without_spawning`, and the handover restore in
+    ///   `Actor::install_adopted`) has no history of its own, so all three
+    ///   read `Actor::overridden_for`: a live sibling's copy when a
+    ///   scale-up leaves one to ask, else one locked read of the store,
+    ///   which is the cost boot, muster and a handover already pay once per
+    ///   name they register rather than once per listing.
+    ///
+    /// Names only, never values, for the reason
+    /// [`ProcessInfo::overridden`](shep_core::protocol::ProcessInfo::overridden)'s
+    /// own doc gives (IR-41).
     pub overridden: Vec<String>,
     /// Instance number within the app (for clustered apps, 0..instances-1)
     pub instance: u32,
