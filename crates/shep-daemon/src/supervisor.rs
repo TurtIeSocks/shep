@@ -5589,23 +5589,45 @@ impl<R: ProcessRunner> Actor<R> {
     /// # What a load may not do
     ///
     /// Three things, and all three are what makes this safe to point at a
-    /// running flock:
+    /// running flock. The first two hold at every depth. The third holds for
+    /// [`ResetDepth::None`] alone, which is the depth a merged pull request
+    /// can cause, and a reset parts company with it deliberately.
     ///
     /// - **It never registers.** An app the file names and the flock does not
-    ///   have is reported and skipped. `shep start` is the verb that adds
-    ///   sheep, and a load that also started things would make a config
-    ///   template a way to start processes on a host by opening a pull
-    ///   request against the app.
+    ///   have is reported and skipped: [`Self::apply_one`] refuses it with
+    ///   `<name> is not registered` before it merges anything. `shep start`
+    ///   is the verb that adds sheep, and a load that also started things
+    ///   would make a config template a way to start processes on a host by
+    ///   opening a pull request against the app. This is about APPS and not
+    ///   about processes: a reset's scale-up reaches `spawn_fresh` through
+    ///   [`Self::handle_scale`] and does start new instances of an app the
+    ///   flock already has.
     /// - **It never prunes.** An app the file does not mention is left
-    ///   running, untouched and unmentioned. The daemon has no record of
-    ///   which Flockfile an app came from, so `shep start ./a/Flockfile.toml`
-    ///   followed by `./b/Flockfile.toml` would otherwise have the second
-    ///   wipe the first's flock.
-    /// - **It never kills.** A field the running child holds -- its argv, its
-    ///   environment, its log paths -- parks in [`ProcessEntry::pending`] and
-    ///   reaches the process at its next spawn. `spec` keeps describing what
-    ///   the child was actually spawned from, which is the only account of
-    ///   that anywhere.
+    ///   running, untouched and unmentioned, and the mechanism is simply that
+    ///   the loop walks the DECLARED apps and never the flock. The daemon has
+    ///   no record of which Flockfile an app came from, so `shep start
+    ///   ./a/Flockfile.toml` followed by `./b/Flockfile.toml` would otherwise
+    ///   have the second wipe the first's flock.
+    /// - **A load with NO FLAG never kills.** A field the running child holds
+    ///   -- its argv, its environment, its log paths -- parks in
+    ///   [`ProcessEntry::pending`] and reaches the process at its next spawn.
+    ///   `spec` keeps describing what the child was actually spawned from,
+    ///   which is the only account of that anywhere.
+    ///
+    ///   **A reset can kill, and that is the ruling rather than an
+    ///   oversight.** `instances` is [`ApplyGroup::Structural`], held out of
+    ///   [`ResetDepth::None`] however unestablished it is and routed through
+    ///   [`Self::handle_scale`] under either reset flag. That function's
+    ///   `Ordering::Less` arm calls [`Self::begin_manual_ids`] with
+    ///   [`ManualKind::Delete`], the same path `shep delete` takes, so
+    ///   reducing a count deletes the instances above it.
+    ///   `a_plain_load_never_scales_and_a_reset_does` pins both halves.
+    ///
+    ///   This bullet read "It never kills", unqualified, until 2026-09-03.
+    ///   `web/src/pages/docs/overrides.astro` was written from it and
+    ///   inherited the same false claim, which a reviewer caught on the page
+    ///   rather than here. Anybody documenting this function next is reading
+    ///   this list, so the exception belongs in it.
     ///
     /// # Per app, in order
     ///
