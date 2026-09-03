@@ -41,6 +41,7 @@
 // a genuinely large variant, which is a different fact from the one here.
 #![allow(clippy::result_large_err)]
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -321,6 +322,33 @@ impl ShepToml {
             Item::Value(exec.to_string_lossy().into_owned().into()),
         );
         self.enable_dog(name);
+    }
+
+    /// Removes the whole `[dog]` table and hands back what was under it.
+    ///
+    /// Keyed by dog name with the `dog.` prefix dropped, which is the shape
+    /// `dogs.toml` wants. A document with no `[dog]` table yields an empty
+    /// map and is left byte-identical, so a second call after a migration
+    /// writes nothing.
+    ///
+    /// The one caller is the boot migration. This is not a general editing
+    /// primitive: it takes everything, because a partial move would leave
+    /// the same key readable from two files.
+    pub fn take_dog_sections(&mut self) -> BTreeMap<String, toml::Table> {
+        let Some(item) = self.doc.remove("dog") else {
+            return BTreeMap::new();
+        };
+        let Some(table) = item.as_table() else {
+            return BTreeMap::new();
+        };
+        table
+            .iter()
+            .filter_map(|(name, value)| {
+                let section = value.as_table()?;
+                let parsed = section.to_string().parse::<toml::Table>().ok()?;
+                Some((name.to_string(), parsed))
+            })
+            .collect()
     }
 
     /// The binary path recorded for `name` in `[daemon] adopted_dogs`, if
@@ -1363,5 +1391,59 @@ mod tests {
             2 * EDITS_PER_WRITER,
             "the config enables dogs nobody asked for"
         );
+    }
+
+    #[test]
+    fn taking_dog_sections_returns_them_keyed_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "[daemon]\nenabled_dogs = [\"metrics\"]\n\n[dog.metrics]\nbind = \"127.0.0.1:9615\"\n\n[dog.bark.sinks]\noncall = { kind = \"discord\" }\n",
+        )
+        .expect("write");
+
+        let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        assert_eq!(taken.keys().collect::<Vec<_>>(), vec!["bark", "metrics"]);
+        assert_eq!(taken["metrics"]["bind"].as_str(), Some("127.0.0.1:9615"));
+    }
+
+    #[test]
+    fn taking_dog_sections_leaves_every_other_section_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "# keep me\n[daemon]\nenabled_dogs = [\"metrics\"]\n\n[dog.metrics]\nbind = \"127.0.0.1:9615\"\n\n[style]\nlevel = \"full\"\n",
+        )
+        .expect("write");
+
+        ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        // Exact string: the whole reason this goes through `toml_edit` rather
+        // than a `toml::Table` round-trip is that a comment or a reordered key
+        // would be a reason not to run the upgrade.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "# keep me\n[daemon]\nenabled_dogs = [\"metrics\"]\n\n[style]\nlevel = \"full\"\n"
+        );
+    }
+
+    #[test]
+    fn taking_from_a_file_with_no_dog_sections_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        let before = "[daemon]\nlog_level = \"info\"\n";
+        std::fs::write(&path, before).expect("write");
+
+        let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        assert!(taken.is_empty());
+        // Content identity, not proof that nothing was written: `edit` always
+        // stages and renames, so the file has a new inode either way. Not
+        // writing at all is the migration's job, and its own early return is
+        // where that is tested.
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
     }
 }
