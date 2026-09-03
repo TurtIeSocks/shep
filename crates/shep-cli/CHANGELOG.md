@@ -13,6 +13,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-09-03
+
+### Added
+
+- The override store, locked and owner-only like the KV store
+- Shep start <file> applies a template additively; shep start <name> reads nothing
+- --reset and --reset-all on a Flockfile load
+- A CFG column and a describe section, so pending config is visible
+- A Flockfile is a template, and a load applies it without killing anything ([#104](https://github.com/shep-pm/shep/pull/104))
+
+### Fixed
+
+- Validate shep.toml before a daemon reload, not after the predecessor is gone
+- Make the reload pre-flight file-only, not env-layered
+- Move the env-layer pin from an unfalsifiable unit test to a real e2e case
+- A Flockfile load that refused an app exits non-zero
+- Keep the overridden cache correct across reload, scale-up and restore
+- The pending clause is a gerund, so it agrees with one field or many
+- A reset resolves an undeclared key to the file, not to the default
+- A Flockfile that names a dog is refused, not merged onto it
+- A fresh start establishes the keys its Flockfile declared
+- A reset flag on a bare script target is refused, not ignored
+- Describe prints a clustered app's config sections once
+
+
 ## [0.1.29] - 2026-09-03
 
 
