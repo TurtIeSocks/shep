@@ -184,8 +184,17 @@ pub(crate) fn connect(endpoint: &Endpoint) -> Result<(Transport, Transport), Cha
     let writer = match transport.try_clone() {
         Ok(writer) => writer,
         Err(error) => {
+            // Release the handle before the claim, in that order. Without
+            // the explicit drop, `transport` lives until this function
+            // returns, which leaves a window where the channel reads as
+            // unclaimed while this thread still holds the pipe open. A
+            // caller that claimed it in that window would then fail to
+            // open a busy pipe, which is a worse answer than waiting.
             #[cfg(windows)]
-            CHANNEL_TAKEN.store(false, Ordering::SeqCst);
+            {
+                drop(transport);
+                CHANNEL_TAKEN.store(false, Ordering::SeqCst);
+            }
             return Err(ChannelError::Io(error));
         }
     };
