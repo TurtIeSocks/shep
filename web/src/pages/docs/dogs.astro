@@ -638,11 +638,18 @@ the dog against protocol 2, and restart it again`}</CodeBlock>
         <span>How it was built</span>
         <span>Which protocol</span>
       </div>
-      <div class="row"><span><code>cargo install &lt;dog&gt;</code>, first time</span> <span><code>shep-core</code> is re-resolved to the newest compatible release, so the protocol is current.</span></div>
-      <div class="row"><span><code>cargo install &lt;dog&gt;</code>, already installed</span> <span>Nothing is built. Cargo prints <em>already installed, use --force to override</em> and exits 0, so the protocol stays exactly as stale as it was.</span></div>
-      <div class="row"><span><code>cargo install &lt;dog&gt; --force</code></span> <span>Rebuilt and re-resolved, so the protocol is current. This is the one that upgrades a dog after you upgrade shep.</span></div>
+      <div class="row"><span><code>cargo install &lt;crate&gt;</code>, first time</span> <span><code>shep-core</code> is re-resolved to the newest compatible release, so the protocol is current.</span></div>
+      <div class="row"><span><code>cargo install &lt;crate&gt;</code>, already installed</span> <span>Nothing is built. Cargo prints <em>already installed, use --force to override</em> and exits 0, so the protocol stays exactly as stale as it was.</span></div>
+      <div class="row"><span><code>cargo install &lt;crate&gt; --force</code></span> <span>Rebuilt and re-resolved, so the protocol is current. This is the one that upgrades a dog after you upgrade shep.</span></div>
       <div class="row"><span><code>cargo install --locked</code>, and most CI</span> <span>The shipped lockfile is honoured, so the protocol is whatever was pinned on publish day.</span></div>
     </div>
+    <p class="fine">
+      <code>&lt;crate&gt;</code> is the package name on crates.io, which is not
+      always what you call the dog. A dog's adopted name, its binary name and
+      its crate name are three separate things: <code>shep-log-rotate</code>
+      installs a binary of the same name that is usually adopted as{" "}
+      <code>log-rotate</code>. Cargo wants the crate.
+    </p>
     <p class="fine">
       The middle row is the one that catches people, because it looks like it
       worked. A dog's own version does not change when the shep it was built

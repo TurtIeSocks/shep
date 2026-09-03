@@ -2650,14 +2650,16 @@ mod tests {
         );
 
         let unattributed = stale_verdict("metrics", Silence::Unattributed);
-        // Naming the flag is the point: `cargo install <dog>` on a dog whose
-        // version has not moved prints "already installed", builds nothing,
-        // and exits 0, so an operator following the advice sees success and
-        // gets the same stale binary back.
+        // The WHOLE command, not the flag on its own. `contains("--force")`
+        // would pass on any sentence that happened to mention it, and the
+        // point is that an operator can copy what they are shown: a plain
+        // `cargo install <crate>` on a dog whose version has not moved prints
+        // "already installed", builds nothing, and exits 0, so advice missing
+        // this is advice that silently does nothing.
         for verdict in [&unreachable, &anonymous] {
             assert!(
-                verdict.contains("--force"),
-                "reinstall advice that omits --force is advice that silently does nothing: {verdict}"
+                verdict.contains("`cargo install <crate> --force`"),
+                "an actionable verdict must carry the whole forced reinstall command: {verdict}"
             );
         }
         assert!(
