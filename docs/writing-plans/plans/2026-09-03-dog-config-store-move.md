@@ -325,21 +325,36 @@ Add to `impl ShepToml`, next to the other dog mutators:
         let Some(item) = self.doc.remove("dog") else {
             return BTreeMap::new();
         };
-        let Some(table) = item.as_table() else {
+
+        // A `Table`'s own `to_string()` renders only its direct key/value
+        // pairs -- a nested sub-table, an array of tables, or an inline
+        // table underneath it does not survive that round trip once the
+        // table is detached from the document root. Re-attaching `item`
+        // under a fresh document and rendering THAT is what keeps every
+        // header and array-of-tables marker: the fresh document is exactly
+        // as capable of printing `[dog.bark.sinks]` and `[[dog.bark.rules]]`
+        // as the original one was. Parsing the result with `toml` (not
+        // `toml_edit`) rather than walking `item` by hand is what also
+        // catches the inline-table shape, since `toml`'s deserializer does
+        // not care how a table was spelled.
+        let mut wrapper = DocumentMut::new();
+        wrapper.insert("dog", item);
+        let Ok(mut parsed) = wrapper.to_string().parse::<toml::Table>() else {
             return BTreeMap::new();
         };
-        table
-            .iter()
-            .filter_map(|(name, value)| {
-                let section = value.as_table()?;
-                let parsed = section.to_string().parse::<toml::Table>().ok()?;
-                Some((name.to_string(), parsed))
+        let Some(toml::Value::Table(dog)) = parsed.remove("dog") else {
+            return BTreeMap::new();
+        };
+        dog.into_iter()
+            .filter_map(|(name, value)| match value {
+                toml::Value::Table(section) => Some((name, section)),
+                _ => None,
             })
             .collect()
     }
 ```
 
-If `self.doc` is not the field name on `ShepToml`, grep the struct and use whatever it is. `disable_dog` reads `self.doc.get_mut("daemon")`, so `doc` is the expected name.
+**The body above is the one that shipped, and it is not the one this plan first carried.** The original used `section.to_string().parse::<toml::Table>()` per section, which renders only a table's own direct key/value pairs: the documented `[dog.bark.sinks]` plus `[[dog.bark.rules]]` shape came back as an empty table while `remove("dog")` had already struck the original, and an inline table under `[dog]` was dropped whole by `as_table()`. Re-attaching the removed item under a fresh `DocumentMut` and parsing that render once is what keeps every header and array marker, and parsing with `toml` rather than `toml_edit` is what makes the inline-table spelling stop mattering. Do not reintroduce the per-section round trip.
 
 - [ ] **Step 4: Run the tests**
 
