@@ -7,6 +7,7 @@
 //! left unsupervised at exactly the moment nobody is watching.
 
 use core::fmt;
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -28,8 +29,11 @@ use super::shep_toml::{ShepToml, ShepTomlError, create_config_file};
 /// - [`DogMigrationError::WouldOverwrite`] when a name is present in both
 ///   files. Two values for one key is a question shep cannot answer, so it
 ///   refuses and changes nothing.
-/// - [`DogMigrationError::SectionsUnreadable`] when `shep.toml` holds
-///   entries under `[dog]` and none of them came back as a section.
+/// - [`DogMigrationError::SectionsUnreadable`] when `shep.toml` declares a
+///   name under `[dog]` that did not come back as a section to move.
+///   Refused rather than skipped: `take_dog_sections` has already struck
+///   the whole `[dog]` table by then, so moving what came back would drop
+///   what did not.
 /// - [`DogMigrationError::Parse`] when `dogs.toml` is not valid TOML,
 ///   [`DogMigrationError::Render`] when the merged sections will not render
 ///   back, and [`DogMigrationError::Read`], [`DogMigrationError::Write`]
@@ -50,21 +54,18 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         return Ok(Vec::new());
     }
     // The substring above answers "might there be sections"; this answers
-    // "are there". Both spellings can appear in a comment or inside a
-    // string, and `[dog]` on its own is a header with nothing under it: a
-    // section neither to move nor to lose. Getting that second case wrong
-    // in the other direction is what the refusal below would do to it, and
-    // an operator with a stray `[dog]` line would then be unable to boot at
-    // all. A source this parser rejects is not decided here: it falls
-    // through to `ShepToml`, whose own parse error names the file and the
-    // line.
-    let has_entries = match existing_source.parse::<toml::Table>() {
-        Ok(table) => {
-            matches!(table.get("dog"), Some(toml::Value::Table(dog)) if !dog.is_empty())
-        }
-        Err(_) => true,
-    };
-    if !has_entries {
+    // "which ones", by name, and both questions have to be asked. Either
+    // spelling can appear in a comment or inside a string, and `[dog]` on
+    // its own is a header with nothing under it: a section neither to move
+    // nor to lose, and refusing on it would leave an operator with a stray
+    // `[dog]` line unable to boot at all.
+    //
+    // `None` means this parser could not read the source. That is not
+    // decided here: it falls through to `ShepToml`, whose own parse error
+    // names the file and the line, and the guard inside the closure falls
+    // back to the only question it can still answer.
+    let declared = declared_dog_names(&existing_source);
+    if declared.as_ref().is_some_and(BTreeSet::is_empty) {
         return Ok(Vec::new());
     }
 
@@ -81,15 +82,30 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
     // leaves `path` exactly as it was found.
     ShepToml::try_edit(&paths.daemon_config, |doc| {
         let incoming = doc.take_dog_sections();
-        // The document held entries a moment ago and none of them came
-        // back, so one of `take_dog_sections`' two lossy exits was taken:
-        // a failed internal reparse, or a value under `[dog]` that is not a
-        // table. It has already struck the sections from the document, and
-        // proceeding would write an empty `dogs.toml` over a `shep.toml`
-        // stripped of the only copy. Refusing here is what makes that a
-        // `save` that never happens.
-        if incoming.is_empty() {
-            return Err(DogMigrationError::SectionsUnreadable);
+        // `take_dog_sections` removes the WHOLE `[dog]` table and then
+        // decides what to hand back, so anything it drops on the way is
+        // gone from the document with nothing written in its place: a
+        // failed internal reparse hands back nothing at all, and its filter
+        // drops a non-table entry while keeping the tables beside it. That
+        // second shape is the one a count cannot see, since `[dog] stray =
+        // 5` next to `[dog.metrics]` comes back one entry long and not
+        // empty. So the guard is over NAMES, comparing what the source
+        // declared against what came back, and it refuses before anything
+        // is written: `try_edit`'s own `Err` is what makes that a `save`
+        // that never happens.
+        //
+        // With no readable source there are no names to compare, and the
+        // fallback is the weaker question: did anything come back at all.
+        let missing: Vec<String> = match &declared {
+            Some(names) => names
+                .iter()
+                .filter(|name| !incoming.contains_key(*name))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        if !missing.is_empty() || incoming.is_empty() {
+            return Err(DogMigrationError::SectionsUnreadable { names: missing });
         }
         if let Some(name) = incoming.keys().find(|name| already.dog.contains_key(*name)) {
             return Err(DogMigrationError::WouldOverwrite { name: name.clone() });
@@ -107,6 +123,25 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         write_dogs_config(&paths.dogs_config, &rendered).map_err(DogMigrationError::Write)?;
         Ok(moved)
     })
+}
+
+/// Every name `source` declares under `[dog]`, or `None` when `source` is
+/// not TOML this parser can read.
+///
+/// A second parse of a file [`ShepToml`] is about to parse again, and
+/// deliberately so: it is the only record of what was there BEFORE
+/// [`ShepToml::take_dog_sections`] struck the table, which is what the
+/// guard inside [`migrate_dog_sections`] compares against. Read-only, over
+/// a string already in memory, and it never opens the file.
+fn declared_dog_names(source: &str) -> Option<BTreeSet<String>> {
+    let table = source.parse::<toml::Table>().ok()?;
+    match table.get("dog") {
+        Some(toml::Value::Table(dog)) => Some(dog.keys().cloned().collect()),
+        // No `[dog]` at all, or a `dog` that is not a table: either way it
+        // declares no dog, and the substring gate that let us this far was
+        // matching a comment or a string.
+        _ => Some(BTreeSet::new()),
+    }
 }
 
 /// Writes `rendered` to `path`: staged in a sibling temp file at
@@ -159,9 +194,15 @@ pub(crate) enum DogMigrationError {
         /// The dog named in both `shep.toml` and `dogs.toml`.
         name: String,
     },
-    /// `shep.toml` holds entries under `[dog]` and none of them came back
-    /// as a section to move.
-    SectionsUnreadable,
+    /// `shep.toml` declares names under `[dog]` that did not come back as
+    /// sections to move.
+    SectionsUnreadable {
+        /// The names that were declared and did not come back, empty when
+        /// the source could not be parsed closely enough to name them.
+        /// Keys, never values: a dog's name is what an operator typed as a
+        /// section header, and it is already what `WouldOverwrite` carries.
+        names: Vec<String>,
+    },
     /// The merged sections would not render back to TOML.
     Render(toml::ser::Error),
     /// `dogs.toml` could not be written.
@@ -180,10 +221,16 @@ impl fmt::Display for DogMigrationError {
                 "dog '{name}' is configured in both shep.toml and dogs.toml; \
                  delete one of the two sections and start the daemon again"
             ),
-            Self::SectionsUnreadable => write!(
+            Self::SectionsUnreadable { names } if names.is_empty() => write!(
                 f,
                 "shep.toml has entries under [dog] that are not dog sections; \
                  give each dog a table of its own, or delete them"
+            ),
+            Self::SectionsUnreadable { names } => write!(
+                f,
+                "shep.toml has entries under [dog] that are not dog sections ({}); \
+                 give each dog a table of its own, or delete them",
+                names.join(", ")
             ),
             Self::Render(err) => write!(f, "dogs.toml could not be rendered: {err}"),
             Self::Write(err) => write!(f, "dogs.toml could not be written: {err}"),
@@ -199,7 +246,7 @@ impl core::error::Error for DogMigrationError {
             Self::Parse(err) => Some(err),
             Self::Render(err) => Some(err),
             Self::Toml(err) => Some(err),
-            Self::WouldOverwrite { .. } | Self::SectionsUnreadable => None,
+            Self::WouldOverwrite { .. } | Self::SectionsUnreadable { .. } => None,
         }
     }
 }
@@ -293,7 +340,7 @@ mod tests {
 
         let err = migrate_dog_sections(&paths).expect_err("a section that will not travel");
 
-        assert!(matches!(err, DogMigrationError::SectionsUnreadable));
+        assert!(matches!(err, DogMigrationError::SectionsUnreadable { .. }));
         assert_eq!(
             std::fs::read_to_string(&paths.daemon_config).expect("read"),
             "[dog]\nmetrics = 5\n",
@@ -320,6 +367,32 @@ mod tests {
             before
         );
         assert!(!paths.dogs_config.exists(), "no sections means no file");
+    }
+
+    // Partial loss, which a count cannot see and a name can: the whole
+    // `[dog]` table is struck, `metrics` comes back, `stray` does not, and
+    // a migration that shipped what came back would drop `stray` from disk
+    // with no error and no warning. Refused instead, with the name in the
+    // message, because nothing else on the machine holds that line.
+    #[test]
+    fn an_entry_that_comes_back_beside_a_section_but_not_as_one_makes_the_migration_refuse() {
+        let (_dir, paths) =
+            home_with("[dog]\nstray = 5\n\n[dog.metrics]\nbind = \"127.0.0.1:9615\"\n");
+
+        let err = migrate_dog_sections(&paths).expect_err("stray would be dropped");
+
+        let DogMigrationError::SectionsUnreadable { names } = &err else {
+            panic!("expected a refusal naming what would be lost, got {err:?}");
+        };
+        assert_eq!(names, &vec!["stray".to_string()]);
+        assert!(err.to_string().contains("stray"), "{err}");
+        assert!(
+            std::fs::read_to_string(&paths.daemon_config)
+                .expect("read")
+                .contains("stray = 5"),
+            "a refused migration strikes nothing"
+        );
+        assert!(!paths.dogs_config.exists(), "nor writes anything");
     }
 
     /// `dogs.toml` holds the webhook URLs that used to sit inside
