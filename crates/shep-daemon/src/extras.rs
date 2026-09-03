@@ -495,9 +495,24 @@ impl ExtrasRegistry {
     /// are read when the task is built, so a task that survives keeps the old
     /// values for as long as it lives.
     ///
-    /// Takes every entry of the name rather than one id, because the group is
+    /// Takes a slice of entries rather than one id, because the group is
     /// per-name: disarming a single instance of a multi-instance app leaves
     /// the group standing, by design.
+    ///
+    /// `entries` is what the caller wants ARMED, not every entry the name
+    /// has. The sole production caller, [`crate::supervisor`]'s own
+    /// `rearm_name`, passes only the entries that are `Online` with a live
+    /// pid, and that filter is load-bearing rather than tidy: [`Self::arm`]
+    /// decides group membership from the configuration rather than from
+    /// whether anything is running, so an entry passed here for a stopped
+    /// instance joins a group whose next cron occurrence or watch event
+    /// restarts every member, and a config load would then start a process
+    /// the operator had stopped, with no operator action and no report.
+    ///
+    /// An empty slice is correct input, not a caller mistake: it aborts the
+    /// group and rebuilds nothing, which is what a name whose instances are
+    /// all momentarily down needs, so that the group holding the OLD config
+    /// does not outlive the load.
     ///
     /// # What this loses
     ///
