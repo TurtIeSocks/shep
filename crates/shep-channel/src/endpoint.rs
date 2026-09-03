@@ -292,8 +292,11 @@ pub(crate) fn connect(endpoint: &Endpoint) -> Result<(ReadHalf, Transport), Chan
                 .open(path)
                 .map_err(ChannelError::Io)?;
             if CHANNEL_TAKEN.swap(true, Ordering::SeqCst) {
-                // Another caller claimed it while this one was opening.
-                // Drop this handle rather than return a second owner.
+                // Defensive rather than expected. The shepherd creates
+                // one pipe instance, so a second caller's `open` above
+                // should fail busy long before it reaches this swap.
+                // Dropping is still the right answer if it ever does:
+                // two owners of one pipe is worse than a refusal.
                 drop(opened);
                 return Err(ChannelError::AlreadyTaken);
             }
@@ -333,12 +336,15 @@ pub(crate) fn connect(endpoint: &Endpoint) -> Result<(ReadHalf, Transport), Chan
     let writer = match transport.try_clone() {
         Ok(writer) => writer,
         Err(error) => {
-            // Release the handle before the claim, in that order. Without
-            // the explicit drop, `transport` lives until this function
-            // returns, which leaves a window where the channel reads as
-            // unclaimed while this thread still holds the pipe open. A
-            // caller that claimed it in that window would then fail to
-            // open a busy pipe, which is a worse answer than waiting.
+            // Drop the handle before clearing the claim, in that order,
+            // so the pipe is actually free at the moment the channel
+            // reads as free. Without the explicit drop, `transport`
+            // lives until this function returns and the flag goes false
+            // while this thread still holds the pipe open.
+            //
+            // A racing caller fails at its `open`, not at its claim:
+            // this arm opens first and claims second, so in that window
+            // the other thread never reaches the swap.
             #[cfg(windows)]
             {
                 drop(transport);
