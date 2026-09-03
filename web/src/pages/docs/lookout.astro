@@ -289,9 +289,19 @@ restart api (id 2): the shepherd restarted it                                   
       detail pane goes (everything on it but the log paths already sits in
       the row above it). Below 18 the feed goes with it, and below 14 the
       host strip goes too, leaving only the flock table. Within the table,
-      narrow widths drop columns in this order: FOLD, then RESTARTS and PID
-      together, then MEM, then CPU, then UPTIME, leaving
+      narrow widths drop columns one at a time, in this order: CFG, SMIT,
+      FOLD, EXIT, RESTARTS, PID, MEM, CPU, and finally UPTIME, leaving
       <code>ID NAME STATUS</code> as the floor.
+    </p>
+    <p class="fine">
+      <code>CFG</code> goes first, ahead of even <code>SMIT</code>, which is
+      not where the <a href="/docs/output">CLI table</a> puts it. The frames
+      on this page are 120 columns wide, and tying <code>CFG</code> to
+      <code>EXIT</code>'s tier the way that table does would have pushed the
+      full set past 120 and quietly taken <code>SMIT</code> off every frame
+      in the gallery. Dropping <code>CFG</code> on its own leaves a
+      120-column terminal showing exactly what it showed before the column
+      existed; you see <code>CFG</code> past 122.
     </p>
     <CodeBlock label="51×14">{narrow}</CodeBlock>
     <p>

@@ -1,0 +1,441 @@
+---
+/*
+ * Overrides (crates/shep-core/src/overrides.rs, crates/shep-core/src/config/apply.rs
+ * for ApplyGroup and ResetDepth, crates/shep-daemon/src/supervisor.rs for
+ * merge_declared and handle_apply_config, `shep start --help`). Every
+ * transcript below was run for real against target/release/shep on
+ * 2026-09-03, one sheep in a throwaway $SHEP_HOME.
+ */
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import ReferencePills from "../../components/docs/ReferencePills.astro";
+import Callout from "../../components/docs/Callout.astro";
+import CodeBlock from "../../components/docs/CodeBlock.astro";
+
+const template = `[[app]]
+name       = "web"
+script     = "./server.sh"
+max_memory = "512M"
+
+[app.env]
+DB_HOST     = ""
+DB_PASSWORD = ""`;
+
+const firstLoad = `$ shep start Flockfile.toml
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM    UPTIME  FOLD  SMIT
+0   web   online  18497  0         -     -    -    32.0K  0s      -     -`;
+
+const secondLoad = `$ shep start Flockfile.toml
+notice[start]: web: applied max_memory; cwd wait for the next spawn (\`shep reload web\` promotes them)
+notice[start]: web is already online; \`shep restart web\` replaces it.
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   web   online  18497  0         -     !1   -    3.0M  4s      -     -`;
+
+const describePending = `$ shep describe web
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   web   online  18497  0         -     !1   -    3.0M  4s      -     -
+
+Pending for web (id 0), parked by a load; \`shep reload web\` promotes it:
+  cwd`;
+
+const promote = `$ shep reload web
+ID  NAME   STATUS    PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0  stopping  18497  0         -     !1   -    3.0M  4s      -     -
+1   web:0  starting  18594  0         -     -    -    -     0s      -     -
+
+$ shep flock
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+1   web   online  18594  0         -     -    -    3.0M  7s      -     -`;
+
+const established = `$ shep start Flockfile.toml
+notice[start]: web is already online; \`shep restart web\` replaces it.
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+1   web   online  18594  0         -     -    -    3.0M  8s      -     -
+
+$ shep start Flockfile.toml --reset
+notice[start]: web: applied max_memory
+notice[start]: web is already online; \`shep restart web\` replaces it.
+ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+1   web   online  18594  0         -     -    -    3.0M  8s      -     -`;
+
+const envHeld = `$ shep start Flockfile.toml
+notice[start]: web is already online; \`shep restart web\` replaces it.
+
+$ shep start Flockfile.toml --reset-all
+notice[start]: web: env wait for the next spawn (\`shep reload web\` promotes them)
+notice[start]: web is already online; \`shep restart web\` replaces it.`;
+
+const store = `$ cat $SHEP_HOME/overrides.json
+{
+  "version": 1,
+  "apps": {
+    "web": {
+      "fields": {},
+      "declared": [
+        "cwd",
+        "max_memory",
+        "name",
+        "script"
+      ],
+      "declared_env": [
+        "DB_HOST",
+        "DB_PASSWORD"
+      ]
+    }
+  }
+}`;
+---
+
+<DocsLayout
+  title="Overrides"
+  description="A Flockfile is a template your app's repository owns. What you tune on a running flock lives somewhere shep owns, and a load appends rather than overwrites."
+  crumb="Concepts / Overrides"
+  activeSlug="overrides"
+>
+  <article>
+    <h1>Overrides</h1>
+    <ReferencePills slug="overrides" />
+    <p class="lede">
+      A Flockfile is committed to the app's repository, and shep never writes
+      to it. So a load has to answer one question before it can be safe to
+      run against a flock that is already up: when the file and the running
+      config disagree, who wins? The answer is the file, but only for
+      settings nobody has spoken for yet.
+    </p>
+
+    <h2>Why a template and not just config</h2>
+    <p>
+      The alternative was letting <code>shep start Flockfile.toml</code>
+      overwrite whatever it found. That reads fine on a laptop and is
+      indefensible on a host: a Flockfile arrives through the app's own
+      repository, so anybody who can merge a pull request could lower a
+      memory ceiling an operator raised at 3am, and the operator would find
+      out from the incident rather than from the diff.
+    </p>
+    <p>
+      So a load appends. It writes the settings nobody has established yet
+      and leaves everything else exactly as it is, which means the worst a
+      merged change can do to a running flock is nothing.
+      <code>--reset</code> is how you say the file wins, and it is something
+      a person types.
+    </p>
+    <Callout variant="note">
+      A Flockfile is read when you name a file, or when
+      <code>shep start</code> with no target finds one in the directory you
+      ran it from. Naming a <em>sheep</em> reads no file at all:
+      <code>shep start web</code> starts <code>web</code> from the config the
+      shepherd already holds, and cannot be turned into a load by anything
+      sitting in the current directory.
+    </Callout>
+
+    <h2>Three things a load will not do</h2>
+    <div class="rows">
+      <div class="row"><span>never registers</span><span>An app the file names and the flock does not have is reported and skipped. <code>shep start</code> adds sheep; a load that also started things would make a config file a way to run processes on a host by opening a pull request.</span></div>
+      <div class="row"><span>never prunes</span><span>An app the file does not mention is left alone. shep has no record of which Flockfile a sheep came from, so loading <code>./a/Flockfile.toml</code> and then <code>./b/Flockfile.toml</code> would otherwise have the second wipe the first's flock.</span></div>
+      <div class="row"><span>never kills</span><span>Nothing a load does stops a process. A setting the running child is holding waits for that child to be replaced, and says so.</span></div>
+    </div>
+
+    <h2>What a load looks like</h2>
+    <p>
+      One app, a memory ceiling, and two environment variables with no values
+      in them. The empty strings are deliberate and there is a section on
+      them below:
+    </p>
+    <CodeBlock label="Flockfile.toml">{template}</CodeBlock>
+    <CodeBlock>{firstLoad}</CodeBlock>
+    <p>
+      Nothing to report on a first load: the app was not in the flock, so
+      <code>shep start</code> registered and started it, and every key in the
+      file became one somebody has now spoken for. Raise
+      <code>max_memory</code> to <code>1G</code>, add a <code>cwd</code>, and
+      load the same file again:
+    </p>
+    <CodeBlock>{secondLoad}</CodeBlock>
+    <p>
+      Two different outcomes in one line, which is the whole model in
+      miniature. <code>max_memory</code> is read fresh every time the memory
+      enforcer makes a decision, so writing it down is enough and it is
+      applied. <code>cwd</code> is baked into the child at exec and there is
+      no way to change it under a running process, so it is parked, and the
+      report names the verb that promotes it rather than leaving you to
+      guess.
+    </p>
+
+    <h2>The CFG column</h2>
+    <p>
+      <code>!1</code> in <code>CFG</code> means one field is parked on this
+      sheep. <code>*1</code> would mean one field an operator set that the
+      current Flockfile does not declare, and <code>-</code> means neither.
+      It is a count rather than a list because the cell is three characters
+      wide; <code>shep describe</code> is where the names are:
+    </p>
+    <CodeBlock>{describePending}</CodeBlock>
+    <p>
+      A parked field takes the cell when a sheep has both. It is the more
+      urgent of the two: an override has been true since the last load,
+      while a parked field is one command away from taking effect and the
+      sheep is not on it yet.
+    </p>
+    <p>
+      <code>shep reload</code> and <code>shep restart</code> both promote.
+      Reload is the one the report names because it is the one that keeps
+      the flock up:
+    </p>
+    <CodeBlock>{promote}</CodeBlock>
+    <p class="fine">
+      Identity is the one thing a promotion re-resolves. Changing
+      <code>user</code> or <code>group</code> sends shep back to the passwd
+      database, because an operator who changed who a sheep runs as means
+      it; every other promotion reuses the credentials resolved at the
+      sheep's original start and costs no lookup.
+    </p>
+
+    <h2>A second load does not repeat the first</h2>
+    <p>
+      Once a key has been established, the file stops speaking for it. Move
+      <code>max_memory</code> to <code>2G</code> and load again and shep says
+      nothing at all, because the key is one somebody has already set:
+    </p>
+    <CodeBlock>{established}</CodeBlock>
+    <p>
+      <code>--reset</code> is what puts the file back in charge. It resets
+      settings, keeps <code>env</code>, and keeps any field established
+      since. <code>--reset-all</code> is the wider one: it resets
+      <code>env</code> too and drops the record entirely, so the next plain
+      load starts from a clean sheet.
+    </p>
+    <div class="rows">
+      <div class="row"><span>no flag</span><span>Append what nobody has established. Overwrite nothing. <code>instances</code> is held out of even this: a plain load never reshapes a flock.</span></div>
+      <div class="row"><span><code>--reset</code></span><span>Every setting but <code>env</code> goes back to what the file says, including the instance count. <code>env</code> and anything added since are kept.</span></div>
+      <div class="row"><span><code>--reset-all</code></span><span>Everything goes back to the file, <code>env</code> included, and the sheep's override record is dropped.</span></div>
+    </div>
+    <p>
+      The line between the two resets is data against policy.
+      <code>env</code> is the one field holding something an operator
+      supplied rather than tuned, and a <code>--reset</code> that took an
+      app's database credentials away would be a different kind of event
+      from one that put its restart budget back. Resetting policy is
+      recoverable; resetting data is not.
+    </p>
+    <p class="fine">
+      Both flags are refused outright when the target is a sheep rather than
+      a file: <code>--reset needs a Flockfile to reset to; web names a sheep,
+      not a file</code>, exit 2. There is no template to reset to, and doing
+      nothing quietly would be worse.
+    </p>
+
+    <h2>Empty values are the point</h2>
+    <p>
+      <code>env = &#123; DB_HOST = "", DB_PASSWORD = "" &#125;</code> is doing
+      what a committed <code>.env.example</code> does. It says which
+      variables the app needs without putting a value for either one in a
+      repository other people can read. The first load establishes both keys,
+      and from that moment the file cannot write to them however often it is
+      loaded:
+    </p>
+    <CodeBlock>{envHeld}</CodeBlock>
+    <p>
+      The first command there set <code>DB_HOST</code> to a real hostname in
+      the Flockfile and loaded it. Nothing happened, and nothing was
+      supposed to: the key was established, so the template no longer speaks
+      for it. <code>--reset-all</code> is the only thing that hands
+      <code>env</code> back to the file.
+    </p>
+
+    <h2>A template may add, never overwrite</h2>
+    <p>
+      That is the sentence the whole design reduces to, and it is worth
+      stating on its own because every awkward consequence on this page
+      follows from it. A Flockfile can introduce a setting nobody had.
+      It cannot change one somebody has. A person at a terminal, holding a
+      flag, can do both.
+    </p>
+    <p>
+      The awkward consequence is deletion. Removing a line from a Flockfile
+      does not remove the setting, once the setting is established: the file
+      has stopped mentioning it, and a load that acted on an absence would
+      be overwriting by omission. <code>--reset</code> puts a deleted
+      setting back to shep's own default, and <code>--reset-all</code> does
+      the same for a deleted <code>env</code> key.
+    </p>
+
+    <h2>Where it is kept</h2>
+    <p>
+      <code>$SHEP_HOME/overrides.json</code>, one entry per sheep name,
+      mode <code>0600</code>, written through the same read-modify-rename
+      under an exclusive lock the <a href="/docs/kv">KV store</a> uses. Keys
+      are in sorted order, so two writes of the same content produce
+      byte-identical files and the store diffs like any other small config
+      file:
+    </p>
+    <CodeBlock>{store}</CodeBlock>
+    <p>
+      <code>declared</code> and <code>declared_env</code> are not overrides.
+      They are the record of what the Flockfile has established, kept so a
+      later load can tell "the file used to say this and no longer does"
+      apart from "the file never mentioned it". <code>fields</code> is the
+      other half: settings an operator has that the current file does not
+      declare, which is what a <code>*N</code> in <code>CFG</code> counts.
+    </p>
+    <Callout variant="note">
+      The verb that sets one field on a running sheep is not in this
+      release, so <code>fields</code> is empty in practice today and
+      <code>CFG</code> reads <code>!N</code> or <code>-</code>. The merge
+      already honours the half of the store that verb will write; what is
+      missing is the door.
+    </Callout>
+    <p class="fine">
+      A store carrying a version number higher than this shep understands is
+      refused rather than read or rewritten. It holds an operator's live
+      edits with no copy anywhere else, and there is no undo for a downgrade
+      that overwrites it.
+    </p>
+
+    <h2>When a load refuses</h2>
+    <p>
+      Per app, and the rest of the file still loads: one bad app in a file of
+      eleven costing the other ten their load is the failure that would make
+      people stop running this against anything real. What changes is the
+      exit code, which goes non-zero the moment any app was refused, so
+      <code>shep start Flockfile.toml &amp;&amp; deploy</code> stops instead
+      of carrying on with a config that did not land.
+    </p>
+    <p class="fine">
+      Every refusal is a sentence naming what happened, and several of them
+      name the remedy. They share one exit code, 4, because the sentence is
+      what travels on the wire and matching on its exact wording would break
+      the first time anybody improved it.
+    </p>
+
+    <h2>Where to go next</h2>
+    <div class="next-grid">
+      <a href="/docs/first-flockfile" class="next-card">
+        <div class="next-title">Your first Flockfile →</div>
+        <div class="next-body">
+          Every field a template can carry, and the grammars that reject a
+          typo before it reaches a sheep.
+        </div>
+      </a>
+      <a href="/docs/lifecycle" class="next-card">
+        <div class="next-title">Stopping and replacing a sheep →</div>
+        <div class="next-body">
+          What <code>shep reload</code> actually does to a running process,
+          and when it overlaps rather than drains.
+        </div>
+      </a>
+      <a href="/docs/output" class="next-card">
+        <div class="next-title">Terminal output →</div>
+        <div class="next-body">
+          Where <code>CFG</code> sits in the table, and which column your
+          window drops first.
+        </div>
+      </a>
+    </div>
+  </article>
+</DocsLayout>
+
+<style>
+  h1 {
+    font-size: clamp(36px, 4.6vw, 56px);
+    line-height: 1;
+    letter-spacing: -0.04em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 27px;
+    letter-spacing: -0.03em;
+    margin: 44px 0 12px;
+  }
+
+  h2:first-of-type {
+    margin-top: 0;
+  }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    margin: 0 0 30px;
+    text-wrap: pretty;
+  }
+
+  p {
+    font-size: 16.5px;
+    line-height: 1.65;
+    color: var(--ink-2);
+    margin: 0 0 18px;
+  }
+
+  .fine {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--ink-3);
+    margin: -8px 0 30px;
+  }
+
+  .rows {
+    border: 3px solid var(--line);
+    border-radius: 14px;
+    overflow: hidden;
+    margin: 0 0 30px;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 2.4fr);
+    gap: 14px;
+    padding: 12px 16px;
+    border-bottom: 2px solid var(--line);
+    font-size: 15px;
+    line-height: 1.55;
+    color: var(--ink-2);
+  }
+
+  .row:last-child {
+    border-bottom: none;
+  }
+
+  .row span:first-child {
+    font-family: "Space Mono", monospace;
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .next-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .next-card {
+    text-align: left;
+    background: var(--paper-2);
+    border: 3px solid var(--line);
+    border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--shadow);
+    padding: 20px;
+    color: var(--ink);
+    text-decoration: none;
+    display: block;
+  }
+
+  .next-card:hover {
+    transform: translate(2px, 2px);
+    box-shadow: 3px 3px 0 var(--shadow);
+    color: var(--ink);
+  }
+
+  .next-title {
+    font-family: "Bricolage Grotesque", sans-serif;
+    font-weight: 800;
+    font-size: 17px;
+    margin-bottom: 7px;
+  }
+
+  .next-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-2);
+  }
+</style>

@@ -1189,3 +1189,91 @@ property completely no matter how good the sanitiser is, because the content
 a reviewer approved and the content actually being served are free to
 diverge starting with the very next upstream commit.
 
+### A config edit reaches nothing, and the warning about it is wrong -- FIXED, 2026-09-03
+
+Found 2026-08-30, from the maintainer's question: an app running four
+instances, `instances = 5` edited into the Flockfile, and no way to get the
+fifth without restarting the other four.
+
+For `instances` alone there is a way. `shep stock web 5` fills the lowest free
+slot and leaves 0 through 3 running, writing the new count onto the stored
+spec and into the muster roll. For every other field there is nothing.
+`handle_reload` and the restart path both say so in as many words --
+*"Nothing here re-reads configuration."* The only route is `shep delete`
+followed by `shep start`, which restarts every instance.
+
+`Request::ConfigDrift` closed half of this: an edit that will not apply is
+reported rather than vanishing without a word. Applying it was left open
+deliberately, in the code -- *"Whether `start` should reconcile by default, or
+grow an `--update` flag, is the maintainer's call and neither is taken here."*
+
+**The fields split three ways, and the first group is larger than "a config
+change needs a restart" suggests.**
+
+- **Read at decision time, so nothing need be restarted.** `autorestart`,
+  `max_restarts`, `min_uptime`, `restart_delay`, `exp_backoff_restart_delay`
+  and `stop_exit_codes` are read by `brain::decide` when a sheep exits;
+  `kill_signal`, `kill_timeout` and `graceful_timeout` when a kill ladder
+  runs; `max_memory`, `cron_restart`, `cron_timezone`, `watch` and the
+  liveness probe when `extras` arms a worker, which it already does through
+  `arm_instance`/`disarm_instance`. A write-back takes effect at the next such
+  decision with no disruption at all.
+- **Consumed at spawn, so they reach the next process rather than the running
+  one.** `listen_timeout` and `readiness_probe`.
+- **Baked into the child, so one instance swap each.** `script`, `args`,
+  `cwd`, `interpreter`, `env`, `user`, `group`, `out_file`, `err_file`,
+  `merge_logs`, `channel`, `stdin`, `wait_ready`.
+
+**`shep stock` already proves every mechanism a wider verb needs**: normalize
+before write, write-back onto the stored spec, partial-failure handling, and
+muster-roll persistence. `AppConfig::drifted_fields` already computes which
+fields moved. What is missing is the routing between the three groups.
+
+**One part of this is a bug rather than a gap.** The drift warning tells the
+operator that "`shep start` adds instances to a sheep the flock already has".
+True of the daemon's `Request::Start`, false of the `shep start` an operator
+types: the CLI sorts apps into resumed and fresh, and only fresh ones reach
+that request. The sentence describes something no terminal can produce.
+
+**What shipped.** `Request::ApplyConfig`, answered by `Response::Applied`, sent
+by `shep start <Flockfile>` and by a Flockfile discovered in the working
+directory. It merges each declared app into the sheep of the same name:
+nothing is registered, nothing is pruned, and nothing running is killed. A
+field the daemon reads fresh takes effect immediately, and a field the running
+child holds parks for the sheep's next spawn, where `shep reload` and `shep
+restart` promote it. A `CFG` column in `shep flock` and a pending section in
+`shep describe` are where an operator sees the parked half. `web/src/pages/docs/overrides.astro`
+is the operator-facing account.
+
+**Be exact about the complaint that opened this entry.** An `instances = 5`
+edit reaching nothing is fixed by `shep start <Flockfile> --reset`, NOT by the
+default. A plain load is additive and holds `instances` out of scope however
+unestablished it is, because appending a count is not a value change: a
+scale-down through a load would DELETE instances, and the store cannot yet
+tell `shep stock`'s deliberate count apart from a count nobody has touched. So
+the answer to the original question is a flag, and `shep stock web 5` is still
+the shortest route to that one field.
+
+**Three corrections to the field split above**, all measured against the read
+sites rather than inferred from the field names, and all now carried in
+`crates/shep-core/src/config/apply.rs`:
+
+- `kill_signal` is NOT read at decision time, despite sitting beside
+  `kill_timeout` and `graceful_timeout`, which are. It is read inside
+  `kill_process` from the `app` parameter of the long-lived per-sheep task,
+  whose `ResolvedApp` is moved in once at `spawn_sheep_task` and never
+  refreshed. So an edit reaches the next spawn, not the next kill.
+- `shutdown_with_message` belongs with the baked-in group, not with the kill
+  ladder: `assemble` ORs it into whether fd 3 is opened, and that is the
+  child's own fd table.
+- The eight fields a lifecycle extra reads when it is ARMED (`max_memory`,
+  `watch`, `ignore_watch`, `watch_delay`, `watch_options`, `cron_restart`,
+  `cron_timezone`, `liveness_probe`) are read at decision time in the sense
+  above, but a write to the stored spec is not enough on its own: the worker
+  already armed against the old value keeps it for as long as it lives, and
+  `ExtrasRegistry::arm` PRESERVES a live name-group task by design. They need
+  a force-replacing re-arm, which is why `rearm_name` exists.
+
+**The wrong warning is gone rather than reworded.** The drift warning was
+deleted outright once the load path could apply the edit it was warning about.
+

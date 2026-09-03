@@ -34,6 +34,7 @@ go for the full argument. The commit that removed them names itself.
 - [Config and packaging](#config-and-packaging) (5)
 - [serve, dev and runtime](#serve-dev-and-runtime) (8)
 - [Output and first run](#output-and-first-run) (7)
+- [Config overrides](#config-overrides) (6)
 
 ## Core types and the daemon's shape
 
@@ -309,21 +310,21 @@ Reload marks the outgoing instance ProcStatus::Stopping (already on the wire, pr
 
 `docs/writing-plans/plans/2026-08-10-shep-phase6-reload.md:30`
 
-### Reload does not re-read config
+### Reload does not re-read config - **superseded**
 
 A reload reuses the stored ResolvedApp and the credentials resolved at the sheep's original Start, rather than re-parsing the Flockfile.
 
 **Why:** ProcessEntry::credentials is documented as resolved once-only; re-reading would collide with that contract and would also change reload's argument shape into something closer to a distinct 'apply new config' verb, which was deliberately treated as a different feature.
 
-`docs/writing-plans/plans/2026-08-10-shep-phase6-reload.md:74`
+`docs/writing-plans/plans/2026-08-10-shep-phase6-reload.md:74`. Replaced by: half of it, and the half that held is the half that mattered. A reload still parses no file. The credentials clause gained one deliberate exception on 2026-09-03: a reload that promotes a config parked by a Flockfile load resets `credentials` to `Unresolved` when `user` or `group` is among the promoted fields, and only then. That distinct 'apply new config' verb was in fact built, as `Request::ApplyConfig` rather than as a change to reload, so the entry's own reasoning about scope is intact; what moved is the once-only rule, narrowly, so an operator who changed identity gets the identity they asked for while every other config change still costs no passwd lookup. Verified crates/shep-daemon/src/supervisor.rs (the promotion path) and crates/shep-daemon/src/entry.rs (`ProcessEntry::credentials`).
 
-### Reload does not re-read config from disk
+### Reload does not re-read config from disk - **superseded**
 
 A reload reuses the already-stored ResolvedApp and the credentials resolved at the sheep's original Start, rather than re-parsing the Flockfile.
 
 **Why:** Re-reading would collide with ProcessEntry::credentials' documented once-only resolution rule, and changing that contract mid-reload is really a different feature (a config-reloading verb) that wasn't in scope.
 
-`docs/writing-plans/plans/2026-08-10-shep-phase6-reload.md:68`
+`docs/writing-plans/plans/2026-08-10-shep-phase6-reload.md:68`. Replaced by: the same narrow exception the entry above records, for the same reason. The two entries are near-duplicates extracted from two plans, and they were superseded together rather than one of them being quietly left standing.
 
 ### Reload provides an overlap, not zero downtime - and the reason is the accept backlog
 
@@ -1696,3 +1697,56 @@ on_first_run fires as a side effect on whichever command created the home, writi
 **Why:** A provisioning script running `shep start server.js | jq` on a cold machine must get clean stdout; suppression governs the diagnostic text, never the side effect (the home still gets created). An explicitly-invoked verb that printed nothing under --format json would read as broken, so the spec's suppress-under-json rule was deliberately narrowed to the side-effect path only.
 
 `docs/writing-plans/plans/2026-08-17-first-run-experience.md:900`
+
+
+## Config overrides
+
+### A Flockfile load is additive by default: the file may add, and may never overwrite
+
+`shep start <Flockfile>` merges the file into the sheep of the same name rather than replacing it. A key the file declares that nobody has established yet takes the file's value; every other key keeps exactly what it has, defaults included. `--reset` widens that to every setting but `env`, and `--reset-all` to everything.
+
+**Why:** The alternative, letting a load overwrite whatever it found, is the shape a laptop wants and a host cannot have. A Flockfile arrives through the app's own repository, so overwrite-by-default would make a merged pull request a way to change a running flock's config out from under the operator who tuned it, and the operator would learn about it from the incident rather than from the diff. Append-only makes the worst case of an unreviewed merge "nothing happened". Rejected alongside it: making `--reset` the default and requiring a flag to be additive, which puts the safe behaviour behind a flag nobody types under pressure.
+
+An unrecognised `ResetDepth` from a newer client falls back to additive for the same reason: append-only is the depth that cannot destroy something an operator set.
+
+`verified crates/shep-daemon/src/supervisor.rs (merge_declared) and crates/shep-core/src/config/apply.rs (ResetDepth)`
+
+### env is data and everything else is policy, which is where --reset stops
+
+`--reset` puts every setting but `env` back to the template. `--reset-all` is a second flag rather than an argument to the first.
+
+**Why:** Resetting policy is recoverable and resetting data is not. A `--reset` that also cleared `env` would take an app's database credentials away as a side effect of putting its restart budget back, and the operator asking for the second thing is almost never asking for the first. Two flags, because a single flag with a modifier reads as one act with a switch rather than as two different sizes of act.
+
+`verified crates/shep-core/src/config/apply.rs (ResetDepth::Settings vs ResetDepth::All)`
+
+### rearm_name is a force-replacing sibling to ExtrasRegistry::arm, not a flag on it
+
+A config change to a lifecycle extra rebuilds the whole name-group's tasks through `rearm_name`, rather than calling `arm` again.
+
+**Why:** `arm` deliberately PRESERVES a live cron or watch task, so a reload's replacement instance arming before the drainee disarms does not tear down a watcher the drainee still needs. That is right for the transition it was written for and exactly wrong for a config change: the group-scoped fields are read when the task is built, so a preserved task keeps the old values for as long as it lives. Adding a "replace" flag to `arm` was rejected because the two callers want opposite things from the same word, and a boolean at the call site is how that gets read backwards a year later. What it costs is recorded at the function: the OS watch is torn down and rebuilt with a real gap and no rescan, and the CPU baseline clears for one poll interval.
+
+`verified crates/shep-daemon/src/extras.rs (rearm_name's own doc, "What this loses")`
+
+### A liveness epoch on the extras registry, separate from the supervisor's respawn epoch
+
+`ExtrasRegistry` counts an epoch per id, bumped every time an id is armed, and a `LivenessReport` carrying a stale one is dropped.
+
+**Why:** A config-only re-arm replaces a liveness probe without the process underneath it changing at all, so the supervisor's existing pid guard cannot see it: the old probe's in-flight failure would restart a sheep whose probe had already been replaced. The respawn epoch could not be overloaded for this, in either direction. Bumping it on a config change would move a respawn-generation counter without a respawn; leaving it alone would leave a config-only re-arm unable to move it. So a second counter, and it lives on the registry because that is the one type that knows when a probe is actually replaced.
+
+`verified crates/shep-daemon/src/extras.rs (ExtrasRegistry::liveness_epochs)`
+
+### PROTOCOL_VERSION stayed 2 for Request::ApplyConfig, and the skew is louder than the six precedents
+
+`Request` gained an `ApplyConfig` variant and `Response` an `Applied`, additively, with no version bump. Six prior additions in shep-core's changelog set that precedent.
+
+**Why:** The rule the constant answers is whether an older peer can still be understood, and an added variant that an older client never sends does not break one. Bumping would refuse every older client for every verb to improve the error message for one. What is sharper here than in the six precedents: a NEW CLI against an OLDER daemon passes the handshake, sends `ApplyConfig`, and the daemon ends the connection on an envelope it cannot decode, so `shep start <Flockfile>` fails on a dead client rather than on a named version refusal. The remedy is `shep daemon reload` after upgrading, which is why it is now said in the docs rather than left to be discovered.
+
+`verified crates/shep-core/src/protocol/mod.rs (PROTOCOL_VERSION = 2) and crates/shep-core/CHANGELOG.md`
+
+### The two "reload does not re-read config" entries are about shep reload <sheep>, not shep daemon reload
+
+`shep daemon reload` re-reads `shep.toml`, and always has. The superseded entries under Reload above are about `shep reload <sheep>` and a Flockfile, which are different files read by a different verb.
+
+**Why:** Recorded explicitly because this is the confusion most likely to produce a wrong doc later: two entries with the word "reload" in the heading, asserting that a reload reads no config, sitting a search away from anybody asking whether the shepherd re-reads its own config file. It does. Nothing in this work changed that, and nothing about the Flockfile side is evidence about it. `getting-started.astro`'s upgrading section now says so where an operator reads rather than only here.
+
+`verified crates/shep-cli/src/commands/daemon.rs (the pre-flight validates shep.toml before the reload) and web/src/pages/docs/getting-started.astro`

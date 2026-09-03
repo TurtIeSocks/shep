@@ -330,6 +330,13 @@ an address cannot say which of two overlapping instances answered it. Anything
 else still overlaps (SpawnNew, AwaitReady, DrainOld, ReapOld): no probe,
 `wait_ready`, or `reuse_port = true`. See `ReloadMode` in `supervisor.rs`, and
 `docs/specs/deferred.md` for the three residuals that fix does not cover.
+A reload also PROMOTES config a Flockfile load parked (see the config-override
+paragraph below), which is new as of 2026-09-03 and is the one thing that
+makes `shep reload <sheep>` about config at all. Separately, `shep daemon
+reload` now validates `shep.toml` BEFORE it touches the predecessor: the
+handover arm execs a successor that re-reads that file, and a value that
+fails to load there used to exit the successor with the predecessor already
+gone, leaving the flock running with nothing supervising it.
 Phase 11 merged too: the six remaining daemon-surface
 verbs — `shep stock` (alias `scale`), `shep signal`, `shep whisper` (alias
 `sendline`), the KV store's `set`/`get`/`unset`, lambs in `describe`, and
@@ -421,6 +428,36 @@ DAEMON-initiated restart gets no warning, since the check is CLI-side, so a
 crash or an autorestart respawn still walks into G12 row 5 unannounced. And
 `Child::kill` does not reach descendants, so a probe's grandchild can
 outlive it; closing that needs a process group rather than a patch.
+
+**Config overrides merged on 2026-09-03, and it changes what a Flockfile
+IS.** A Flockfile is a project template committed to the app's repository,
+never written by shep, and what an operator tunes afterwards lives in a
+shep-owned store at `$SHEP_HOME/overrides.json` (locked and `0600`, like the
+KV store). `shep start <Flockfile>` now sends `Request::ApplyConfig` and
+merges the file into the sheep of the same name: additive by default, so it
+appends keys nobody has established and overwrites nothing, because a
+Flockfile arrives through a pull request. `--reset` puts non-`env` settings
+back to the template and `--reset-all` puts everything back and drops the
+record; both are refused when the target names a sheep, since a name reads
+no file. A load never registers, never prunes and never kills -- a field the
+running child holds parks as pending and `shep reload`/`shep restart`
+promote it, re-resolving identity only when `user` or `group` moved. A `CFG`
+column in `shep flock` and in `shep lookout` marks a sheep with pending
+(`!N`) or overridden (`*N`) fields, and `shep describe` lists the names. A
+per-app refusal exits non-zero. The four-way field classification lives in
+`crates/shep-core/src/config/apply.rs` and is measured against read sites,
+not guessed from field names: `kill_signal` is NextSpawn rather than Live,
+and `shutdown_with_message` needs a respawn. `web/src/pages/docs/overrides.astro`
+is the operator-facing account.
+
+**Restart the shepherd after upgrading to it.** `PROTOCOL_VERSION` did NOT
+move (the variant is additive, and six precedents in shep-core's changelog
+agree), but the consequence is sharper than those precedents had: a CLI from
+this commit against an older daemon passes the handshake, sends
+`ApplyConfig`, and the daemon ends the connection on an envelope it cannot
+decode, so `shep start <Flockfile>` fails on a dead client rather than on a
+named version refusal. `shep daemon reload` is the whole fix, and
+`getting-started.astro` says so where an operator reads.
 
 **Verb count: 40 generated, 41 listed, and the difference is `help`.**
 `./web/scripts/generate-cli-reference.sh` prints its own number every time it
