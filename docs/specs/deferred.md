@@ -365,52 +365,6 @@ tell it apart from a shep bug.
 The full postmortem, including the wrong diagnosis it took to get here, is in
 [deferred-history.md](deferred-history.md).
 
-### A config edit reaches nothing, and the warning about it is wrong
-
-Found 2026-08-30, from the maintainer's question: an app running four
-instances, `instances = 5` edited into the Flockfile, and no way to get the
-fifth without restarting the other four.
-
-For `instances` alone there is a way. `shep stock web 5` fills the lowest free
-slot and leaves 0 through 3 running, writing the new count onto the stored
-spec and into the muster roll. For every other field there is nothing.
-`handle_reload` and the restart path both say so in as many words --
-*"Nothing here re-reads configuration."* The only route is `shep delete`
-followed by `shep start`, which restarts every instance.
-
-`Request::ConfigDrift` closed half of this: an edit that will not apply is
-reported rather than vanishing without a word. Applying it was left open
-deliberately, in the code -- *"Whether `start` should reconcile by default, or
-grow an `--update` flag, is the maintainer's call and neither is taken here."*
-
-**The fields split three ways, and the first group is larger than "a config
-change needs a restart" suggests.**
-
-- **Read at decision time, so nothing need be restarted.** `autorestart`,
-  `max_restarts`, `min_uptime`, `restart_delay`, `exp_backoff_restart_delay`
-  and `stop_exit_codes` are read by `brain::decide` when a sheep exits;
-  `kill_signal`, `kill_timeout` and `graceful_timeout` when a kill ladder
-  runs; `max_memory`, `cron_restart`, `cron_timezone`, `watch` and the
-  liveness probe when `extras` arms a worker, which it already does through
-  `arm_instance`/`disarm_instance`. A write-back takes effect at the next such
-  decision with no disruption at all.
-- **Consumed at spawn, so they reach the next process rather than the running
-  one.** `listen_timeout` and `readiness_probe`.
-- **Baked into the child, so one instance swap each.** `script`, `args`,
-  `cwd`, `interpreter`, `env`, `user`, `group`, `out_file`, `err_file`,
-  `merge_logs`, `channel`, `stdin`, `wait_ready`.
-
-**`shep stock` already proves every mechanism a wider verb needs**: normalize
-before write, write-back onto the stored spec, partial-failure handling, and
-muster-roll persistence. `AppConfig::drifted_fields` already computes which
-fields moved. What is missing is the routing between the three groups.
-
-**One part of this is a bug rather than a gap.** The drift warning tells the
-operator that "`shep start` adds instances to a sheep the flock already has".
-True of the daemon's `Request::Start`, false of the `shep start` an operator
-types: the CLI sorts apps into resumed and fresh, and only fresh ones reach
-that request. The sentence describes something no terminal can produce.
-
 ### The handover blob's compatibility tests never load an old blob
 
 Raised in review on #84, 2026-08-31, and agreed rather than argued away.
@@ -695,11 +649,12 @@ rather than a fix to apply on the way past.
 
 Everything this file used to carry that is now FIXED, STALE, resolved or
 rejected, plus the record of what shipped instead of being deferred, moved to
-[deferred-history.md](deferred-history.md) on 2026-08-29. That is 1191 lines
-against the 705 left here, and a reader had to get past all of it to reach
-the 12 entries under "Known debt" that are actually still open. All three
+[deferred-history.md](deferred-history.md) on 2026-08-29. That is 1279 lines
+against the 660 left here, and a reader had to get past all of it to reach
+the 11 entries under "Known debt" that are actually still open. All three
 numbers were stated once and then drifted, which is the failure this file
-warns about elsewhere; they are counted, not remembered.
+warns about elsewhere; they are counted, not remembered, and they were
+recounted on 2026-09-03 when the config-edit entry moved next door.
 
 This file answers "what is not built". That one answers "what was not built,
 and what happened to it".

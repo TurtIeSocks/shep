@@ -69,6 +69,8 @@ mod tests {
                 instance: None,
                 handshook: None,
                 dog_stale: None,
+                pending: None,
+                overridden: None,
             },
             manually: false,
             at_ms: 1_700_000_000_000,

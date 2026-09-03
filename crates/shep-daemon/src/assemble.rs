@@ -287,6 +287,7 @@ mod tests {
             socket: PathBuf::from("/home/ada/.shep/run/shep.sock"),
             barks: PathBuf::from("/home/ada/.shep/barks.jsonl"),
             kv: PathBuf::from("/home/ada/.shep/kv.json"),
+            overrides: PathBuf::from("/home/ada/.shep/overrides.json"),
         }
     }
 

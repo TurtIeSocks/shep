@@ -27,26 +27,26 @@ const initScaffold = `# Manage your app in a Flockfile
 #cwd = "/srv/app"`;
 
 const stockDemo = `$ shep stock web 4
-ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM     UPTIME  FOLD  SMIT
-0   web:0   online  62888  0         -     -    3.0M    0s      -     -
-1   web:1   online  62889  0         -     -    3.0M    0s      -     -
-3   web:2   online  62936  0         -     -    176.0K  0s      -     -
-4   web:3   online  62937  0         -     -    144.0K  0s      -     -
-2   worker  online  62890  0         -     -    3.0M    0s      -     -
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM     UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    -    3.0M    0s      -     -
+1   web:1   online  62889  0         -     -    -    3.0M    0s      -     -
+3   web:2   online  62936  0         -     -    -    176.0K  0s      -     -
+4   web:3   online  62937  0         -     -    -    144.0K  0s      -     -
+2   worker  online  62890  0         -     -    -    3.0M    0s      -     -
 
 $ shep stock web 2
-ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
-0   web:0   online  62888  0         -     -    3.0M  1s      -     -
-1   web:1   online  62889  0         -     -    3.0M  1s      -     -
-3   web:2   online  62936  0         -     -    0B    1s      -     -
-4   web:3   online  62937  0         -     -    0B    1s      -     -
-2   worker  online  62890  0         -     -    3.0M  1s      -     -
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    -    3.0M  1s      -     -
+1   web:1   online  62889  0         -     -    -    3.0M  1s      -     -
+3   web:2   online  62936  0         -     -    -    0B    1s      -     -
+4   web:3   online  62937  0         -     -    -    0B    1s      -     -
+2   worker  online  62890  0         -     -    -    3.0M  1s      -     -
 
 $ shep flock
-ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
-0   web:0   online  62888  0         -     -    3.0M  2s      -     -
-1   web:1   online  62889  0         -     -    3.0M  2s      -     -
-2   worker  online  62890  0         -     -    3.0M  2s      -     -`;
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   web:0   online  62888  0         -     -    -    3.0M  2s      -     -
+1   web:1   online  62889  0         -     -    -    3.0M  2s      -     -
+2   worker  online  62890  0         -     -    -    3.0M  2s      -     -`;
 
 const initJsonRefusal = `$ shep init deploy.json --all
 error[usage]: JSON has no comment syntax, so a full scaffold would pin every default instead of explaining it; write a .json5 Flockfile for the same syntax with comments, or drop --all`;
@@ -175,6 +175,32 @@ const fieldGroups: FieldGroup[] = [
     <CodeBlock label="Flockfile.toml">{`[[app]]
 name   = "web"
 script = "./server"`}</CodeBlock>
+
+    <h2>A Flockfile is a template, not live config</h2>
+    <p>
+      A Flockfile lives in the repository of the app it starts, committed
+      like anything else there, and shep never writes to it. That is what
+      makes it safe to load one onto a flock that is already running without
+      reading the diff first: <code>shep start Flockfile.toml</code> appends
+      the settings nobody has established yet and overwrites nothing. A
+      merged pull request cannot quietly lower a memory ceiling somebody
+      raised at 3am.
+    </p>
+    <p>
+      The corollary is the part worth remembering. Editing a line in a
+      Flockfile and loading it again does not move a setting that is already
+      established; <code>shep start Flockfile.toml --reset</code> is how you
+      say the file wins. <a href="/docs/overrides">Overrides</a> is that
+      whole story, including which settings change under a running process
+      and which wait for the next spawn.
+    </p>
+    <p class="fine">
+      Naming a sheep reads no Flockfile at all. <code>shep start web</code>
+      starts the sheep called <code>web</code> from the config the shepherd
+      already holds. Three things are a load, and nothing else is: a path you
+      name, a Flockfile discovered in the directory you ran the command from,
+      and <code>-</code>, which reads Flockfile JSON on stdin.
+    </p>
 
     <h2>Or start from a generated one</h2>
     <VerbSignature verb="init" usage="shep init [path] [--all] [--force]">
@@ -551,6 +577,13 @@ Z_DEVICE_ID = "z-{{instance}}d"`}</CodeBlock>
 
     <h2>Where to go next</h2>
     <div class="next-grid">
+      <a href="/docs/overrides" class="next-card">
+        <div class="next-title">Overrides →</div>
+        <div class="next-body">
+          What a second load of the same file does, and the two flags that
+          hand a setting back to the template.
+        </div>
+      </a>
       <a href="/docs/folds" class="next-card">
         <div class="next-title">Folds →</div>
         <div class="next-body">

@@ -19,6 +19,70 @@ pub struct ProcessEntry {
     pub id: u32,
     /// Resolved application spec
     pub spec: ResolvedApp,
+    /// The config a file load left for this sheep's next spawn.
+    ///
+    /// `None` for every sheep outside the window between a load that changed
+    /// a `NeedsRespawn` field and the restart that picks it up. `spec` keeps
+    /// describing what the running child was spawned from, which is the only
+    /// account of that anywhere; overwriting it would erase it.
+    ///
+    /// A whole config, and not the same thing as the `pending` list on a
+    /// load's per-app report, which shares its name: that one is field NAMES
+    /// for an operator to read and includes fields already on `spec`. This is
+    /// the config a respawn promotes.
+    pub pending: Option<ResolvedApp>,
+    /// Whether the config in [`Self::pending`] changes who this sheep runs
+    /// as, so that promoting it must re-resolve [`Self::credentials`].
+    ///
+    /// Recorded by the load that PARKED the config, against the spec this
+    /// entry held at that moment, and not recomputed later. A promotion can
+    /// only diff `pending` against `spec`, and `spec` is not a fixed point:
+    /// a load writes one spec, derived from the app's first instance, onto
+    /// every instance of the name. Restart instance 0 alone -- a crash, a
+    /// memory breach and a liveness failure all do that with nobody asking
+    /// -- and the next load reads its promoted spec as the base for its
+    /// siblings, so the `user` change instance 1 has still not applied is no
+    /// longer visible as a difference to instance 1. Answering the question
+    /// while the answer is still there is what makes it survive that.
+    ///
+    /// STICKY, for the same reason: it stays set through every later load
+    /// until [`Self::pending`] is actually promoted, because a second load
+    /// that changes nothing about identity has not undone the first one's
+    /// change. Cleared in exactly one place, the promotion itself.
+    ///
+    /// `false` whenever [`Self::pending`] is `None`, which is every sheep
+    /// outside a parking window.
+    pub pending_reidentifies: bool,
+    /// The [`AppConfig`](shep_core::config::AppConfig) field NAMES an
+    /// operator has set on this sheep that its current Flockfile does not
+    /// declare, in field-name order. Empty for a sheep no load has ever
+    /// touched, and every sheep before task 12 shipped.
+    ///
+    /// Cached rather than read from the override store
+    /// (`shep_core::overrides`) at listing time, because `to_info` is
+    /// called on every listing -- far more often than the store actually
+    /// changes. Kept correct across every path that can put a sheep on this
+    /// list, not only the load that first sets it:
+    ///
+    /// - A config load writes it in `Actor::apply_one`, from the same
+    ///   `next_overrides` ledger that function writes back to the store, so
+    ///   this field and the store agree by construction there.
+    /// - `Actor::spawn_replacement` (`shep reload`/`shep restart`) carries
+    ///   it off the drainee, the same way it carries `dog`/`last_exit`: a
+    ///   reload is not a config load, so the old value is still the true
+    ///   one.
+    /// - A fresh registration (`Actor::spawn_fresh`, `Actor::
+    ///   register_without_spawning`, and the handover restore in
+    ///   `Actor::install_adopted`) has no history of its own, so all three
+    ///   read `Actor::overridden_for`: a live sibling's copy when a
+    ///   scale-up leaves one to ask, else one locked read of the store,
+    ///   which is the cost boot, muster and a handover already pay once per
+    ///   name they register rather than once per listing.
+    ///
+    /// Names only, never values, for the reason
+    /// [`ProcessInfo::overridden`](shep_core::protocol::ProcessInfo::overridden)'s
+    /// own doc gives (IR-41).
+    pub overridden: Vec<String>,
     /// Instance number within the app (for clustered apps, 0..instances-1)
     pub instance: u32,
     /// Current lifecycle status
@@ -43,9 +107,10 @@ pub struct ProcessEntry {
     ///
     /// Resolved once — at the initial `Start` for an entry that got one, at
     /// the first spawn otherwise — and reused for every later respawn, so a
-    /// restart never re-touches the passwd database and never changes a
-    /// running app's identity underneath it (see
-    /// [`crate::privilege::resolve`]).
+    /// restart neither re-touches the passwd database nor changes a running
+    /// app's identity underneath it (see [`crate::privilege::resolve`]).
+    /// There is exactly one exception, two paragraphs down, and it is an
+    /// operator asking for the change rather than an accident.
     ///
     /// [`SpawnIdentity::Unresolved`] until that happens, and that is a
     /// different fact from an app that asked for no user at all: an entry
@@ -53,6 +118,14 @@ pub struct ProcessEntry {
     /// because its `user` could not be resolved, has never been looked up,
     /// and starting it as the shepherd would be a silent privilege
     /// downgrade rather than the configured behaviour.
+    ///
+    /// One exception, and only one: a config load that parks a `user` or
+    /// `group` change sets [`Self::pending_reidentifies`], and the promotion
+    /// of that config puts this back to [`SpawnIdentity::Unresolved`] so the
+    /// spawn it precedes resolves the new name. That is an operator asking
+    /// for the change on purpose, which is the case the once-only rule was
+    /// never protecting against; every other promoted field keeps the
+    /// resolved value and costs no passwd lookup.
     pub credentials: SpawnIdentity,
     /// Where this instance's stdout is appended, copied from the
     /// [`SpawnSpec`](crate::runner::SpawnSpec) that

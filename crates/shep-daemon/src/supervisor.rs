@@ -46,7 +46,10 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-use shep_core::config::{AppConfig, ResolvedApp, normalize};
+use shep_core::config::{
+    AppConfig, ApplyGroup, DeclaredApp, ResetDepth, ResolvedApp, apply_group, normalize,
+};
+use shep_core::overrides::{self, AppOverrides};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{
     ActionOutcome, ActionReply, BusEvent, DogSource, ExitInfo, LineOutcome, LineReply,
@@ -55,6 +58,7 @@ use shep_core::protocol::{
 use shep_core::selector::ProcessSelector;
 use shep_core::signals::OperatorSignal;
 use shep_core::status::ProcStatus;
+use shep_core::values::MemSize;
 
 use crate::assemble::{assemble, instance_slots};
 use crate::brain::{Decision, decide_on_exit};
@@ -389,6 +393,22 @@ pub(crate) enum Command {
         id: u32,
         /// The pid the report was raised against, used as a generation token.
         pid: u32,
+        /// The liveness epoch the reporting probe was armed under, or `None`
+        /// for a memory breach, which has nothing equivalent that can go
+        /// stale; see `Actor::handle_extra_restart`'s fifth guard.
+        epoch: Option<u64>,
+        /// The tree size a memory breach was measured at, or `None` for a
+        /// liveness failure, which measures nothing.
+        ///
+        /// A memory breach's own staleness token, and the mirror of `epoch`
+        /// above: a breach is computed against the ceiling armed at that
+        /// moment and delivered later, so this is what lets
+        /// `Actor::handle_extra_restart`'s sixth guard re-ask the question
+        /// against the ceiling in force NOW. `Option` for `epoch`'s reason
+        /// too -- a liveness failure has no measurement to check, and
+        /// inventing one would make the guard answer for a report it knows
+        /// nothing about.
+        observed: Option<MemSize>,
     },
     /// Replaces every matched sheep with a fresh instance, one instance of
     /// each app at a time.
@@ -416,6 +436,17 @@ pub(crate) enum Command {
         count: u32,
         /// Answers with the app's surviving instances and its new config.
         reply: oneshot::Sender<Result<Scaled, SupervisorError>>,
+    },
+    /// Merges a Flockfile's apps into the running flock. See
+    /// [`Actor::handle_apply_config`].
+    ApplyConfig {
+        /// One entry per app the document declared, carrying the keys it
+        /// literally wrote as well as the values behind them.
+        apps: Vec<DeclaredApp>,
+        /// How much of the load overwrites what an operator has set since.
+        reset: ResetDepth,
+        /// Answers with one report per app given, in the order given.
+        reply: oneshot::Sender<Result<Vec<Applied>, SupervisorError>>,
     },
     /// Attaches a marker to one sheep by name, or clears it.
     ///
@@ -925,6 +956,38 @@ impl SupervisorHandle {
         rx.await.map_err(|_| SupervisorError::EngineStopped)?
     }
 
+    /// Merges each app a Flockfile declared into the sheep of the same name.
+    ///
+    /// Additive by default, which is what [`Self::config_drift`] exists to
+    /// report on and this is the verb that acts on: a Flockfile arrives from
+    /// the app's own repository, so a load appends what nobody has
+    /// established and leaves everything else alone unless `reset` says
+    /// otherwise. Nothing is registered, nothing is pruned, and nothing that
+    /// is running is killed -- a field the running child holds parks in
+    /// [`ProcessEntry::pending`] for its next spawn instead. See
+    /// [`Actor::handle_apply_config`].
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::EngineStopped`] - the actor is gone. Every
+    ///   per-app refusal rides inside the reply instead, in
+    ///   [`Applied::refused`]: one app that cannot be applied must not cost
+    ///   the rest of the file its load.
+    // `rpc.rs`'s `Request::ApplyConfig` arm is the only door into
+    // `Command::ApplyConfig`.
+    pub(crate) async fn apply_config(
+        &self,
+        apps: Vec<DeclaredApp>,
+        reset: ResetDepth,
+    ) -> Result<Vec<Applied>, SupervisorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Command(Command::ApplyConfig { apps, reset, reply }))
+            .await
+            .map_err(|_| SupervisorError::EngineStopped)?;
+        rx.await.map_err(|_| SupervisorError::EngineStopped)?
+    }
+
     /// Registers and starts one dog, marked as coming from `source`.
     ///
     /// Idempotent by name: a dog already registered under `app`'s name is
@@ -1054,10 +1117,21 @@ impl SupervisorHandle {
     /// like [`Self::restart_automatic`] it goes in as
     /// `CommandOrigin::Automatic` — displaceable by an operator's command,
     /// and reported on the bus with `manually: false`.
-    pub(crate) async fn extra_restart(&self, id: u32, pid: u32) {
+    pub(crate) async fn extra_restart(
+        &self,
+        id: u32,
+        pid: u32,
+        epoch: Option<u64>,
+        observed: Option<MemSize>,
+    ) {
         let _ = self
             .tx
-            .send(Msg::Command(Command::ExtraRestart { id, pid }))
+            .send(Msg::Command(Command::ExtraRestart {
+                id,
+                pid,
+                epoch,
+                observed,
+            }))
             .await;
     }
 
@@ -2572,6 +2646,366 @@ impl Scaled {
     }
 }
 
+/// What one app's [`Command::ApplyConfig`] did.
+///
+/// One of these per app the file named, whether or not the app was found and
+/// whether or not anything about it changed: a load that quietly skipped an
+/// app would leave an operator reading a Flockfile that says one thing and a
+/// flock doing another.
+// Every field is read by `rpc.rs`'s `Request::ApplyConfig` arm: the first
+// four become the `SheepApplied` it replies with, and `app` is what it hands
+// the registry.
+#[derive(Debug)]
+pub(crate) struct Applied {
+    /// The app's name, exactly as the file spells it.
+    pub(crate) name: String,
+    /// Fields now in force, in field-name order.
+    ///
+    /// [`ApplyGroup::Live`] only. A field is named here when the daemon will
+    /// read the new value at its next decision without anything having to be
+    /// restarted first.
+    pub(crate) applied: Vec<String>,
+    /// Fields the app picks up at its next spawn, in field-name order.
+    ///
+    /// **Not the same set as [`ProcessEntry::pending`], which shares its
+    /// name.** That one is a whole parked `ResolvedApp` and holds only what a
+    /// respawn has to pick up; this one is a list of field NAMES for an
+    /// operator to read, and it also carries the `NextSpawn` fields, which
+    /// are already on the stored spec and need no promotion. Task 9 promotes
+    /// the entry's, never this.
+    ///
+    /// Both [`ApplyGroup::NextSpawn`] and [`ApplyGroup::NeedsRespawn`] land
+    /// here, and the difference between them is invisible to an operator:
+    /// either way the running process keeps the old value until it is
+    /// replaced. What differs is where the new value is kept in the
+    /// meantime -- a `NextSpawn` field goes straight onto the stored spec,
+    /// while a `NeedsRespawn` one parks in [`ProcessEntry::pending`], because
+    /// the stored spec is the only account of what the running child was
+    /// spawned from.
+    pub(crate) pending: Vec<String>,
+    /// Why some or all of this app's change did not land, in the daemon's own
+    /// words, or `None` when the whole of it did.
+    ///
+    /// Five refusals mean the app was not touched at all, and they are the
+    /// five raised before [`Actor::apply_one`] routes the instance count,
+    /// which is the only thing in a load that reshapes a flock:
+    ///
+    /// 1. the flock has no app of this name,
+    /// 2. the override store could not be read,
+    /// 3. the merge could not be built at all (an override value of the wrong
+    ///    shape for its field is the way that happens),
+    /// 4. the merged config does not normalize,
+    /// 5. `handle_scale` itself refused the scale, and every refusal of its
+    ///    own precedes anything it spawns or removes.
+    ///
+    /// All five leave [`Self::applied`] and [`Self::pending`] empty.
+    ///
+    /// **The two empty lists are not themselves that promise**, because four
+    /// later refusals produce the same shape without meaning it: a load whose
+    /// only change was a `NeedsRespawn` field that could not be parked, a
+    /// load with no change of its own whose earlier parked config could not
+    /// be rebuilt, a plain load whose only declared change was the instance
+    /// count it declines to reshape, and the same skip while `shutting_down`.
+    /// Read the message, which names what happened in every case; the shape
+    /// does not tell them apart.
+    ///
+    /// Everything discoverable only after the count is routed is reported
+    /// HERE while the two lists still carry what did land: a partial
+    /// scale-up's shortfall, a count that was not reshaped, a change that
+    /// could not be parked, a store that could not be written.
+    pub(crate) refused: Option<String>,
+    /// The merged, normalized app. `rpc.rs` hands this to
+    /// `FlockRegistry::record`, the way the `Scale` arm hands it
+    /// `Scaled::app`, so a reboot comes up on the applied config.
+    ///
+    /// The FULL merge, `NeedsRespawn` fields included, rather than what the
+    /// running processes are on right now: a reboot spawns every one of them
+    /// afresh, so the config it comes up on is the one a respawn would pick
+    /// up anyway.
+    ///
+    /// `None` for an app whose merge never produced one: the three refusals
+    /// above that touch nothing, plus the one case where something WAS
+    /// touched and there is still no honest config to record -- a merge that
+    /// does not normalize at the instance count really running. Recording an
+    /// invented `ResolvedApp`, or one carrying a count that has never run,
+    /// would put exactly that row in the muster roll, which is the thing
+    /// `handle_scale`'s write-back ordering exists to prevent. The refusal
+    /// names which fields went nowhere.
+    pub(crate) app: Option<ResolvedApp>,
+}
+
+/// The `AppConfig` fields a lifecycle extra reads when it is ARMED, rather
+/// than at each decision.
+///
+/// All eight are [`ApplyGroup::Live`] -- a write to the stored spec is enough
+/// for everything that reads the spec -- but the worker already armed against
+/// the old value keeps it for as long as that worker lives. Changing one of
+/// these is therefore the one Live change that needs
+/// [`ExtrasRegistry::rearm_name`] on top of the spec write. Kept as one list
+/// here rather than re-derived from [`apply_group`], which answers a
+/// different question: `fold` and `action_timeout` are Live too and need no
+/// re-arm at all.
+const EXTRAS_FIELDS: &[&str] = &[
+    "max_memory",
+    "watch",
+    "ignore_watch",
+    "watch_delay",
+    "watch_options",
+    "cron_restart",
+    "cron_timezone",
+    "liveness_probe",
+];
+
+/// Records what a load's `env` branch just merged: the file's env keys are
+/// established from here, and an override of one is spent.
+///
+/// Called from the two arms that merge `env` and from neither of the others,
+/// which is the whole of the fix this function exists for. It used to be two
+/// blanket statements below the match, so [`ResetDepth::Settings`] -- the one
+/// depth that touches `env` not at all -- established every env key the file
+/// declared and spent every env override the file named. A `--reset` against
+/// a template that had grown `NEW_KEY` reported nothing, merged nothing, and
+/// recorded `declared_env: ["NEW_KEY"]`, after which no plain load could ever
+/// append it, because it was established. Only `--reset-all` recovered, and
+/// that takes every other env value with it.
+///
+/// One gap is left, and deliberately: under [`ResetDepth::None`] an env key
+/// skipped because an override already holds it is established anyway, so
+/// clearing that override later leaves the key permanently out of scope. It
+/// needs a per-key record the env branch has no arm to hang one on, and it is
+/// not reachable from anything that edits env today, because nothing does.
+///
+/// `declared_env` is a high-water mark, never a snapshot of the current file:
+/// a key this file has stopped declaring is still a key somebody once
+/// established, and a later load must not be able to re-appear with a new
+/// value for it under a depth that promises to overwrite nothing.
+fn establish_env(next: &mut AppOverrides, incoming: &DeclaredApp) {
+    if let Some(serde_json::Value::Object(env)) = next.fields.get_mut("env") {
+        for key in &incoming.declared_env {
+            env.remove(key);
+        }
+        if env.is_empty() {
+            next.fields.remove("env");
+        }
+    }
+    next.declared_env
+        .extend(incoming.declared_env.iter().cloned());
+}
+
+/// Merges what a Flockfile declares into what a sheep is running, returning
+/// the merged config and the override record to write back.
+///
+/// One rule, per field: a key in scope takes the file's value and gives up
+/// its override. `reset` decides which keys are in scope at all, and that is
+/// the whole of the difference between the depths:
+///
+/// - [`ResetDepth::None`] puts in scope only a key the file declares that
+///   nobody has established yet, so a load can APPEND and can never
+///   overwrite. Every other key keeps exactly what it has, defaults
+///   included: "overwrite nothing" is the depth's own promise, and a key
+///   nobody ever declared has no template value to be put back to.
+///   `instances` is excluded from this depth however unestablished it is:
+///   see the `in_scope` arm below for why appending a count is not the same
+///   kind of act as appending a value.
+/// - [`ResetDepth::Settings`] puts every key but `env` in scope.
+/// - [`ResetDepth::All`] puts every key in scope, `env` included, and drops
+///   the whole override record afterwards.
+///
+/// `env` merges one level deeper than the rest, because it is a table rather
+/// than a value: under `None` an env key the file declares and nobody
+/// established is appended and the rest are left alone, under `All` the
+/// file's table replaces it whole, and under `Settings` it is not touched at
+/// all (see [`ResetDepth::Settings`] for why data and policy part company
+/// here).
+///
+/// # Errors
+///
+/// A description of the failure, for [`Applied::refused`], if either config
+/// fails to travel through serde -- which is how an override value of the
+/// wrong shape for its field reaches an operator instead of a panic.
+fn merge_declared(
+    stored: &AppConfig,
+    incoming: &DeclaredApp,
+    overrides: &AppOverrides,
+    reset: ResetDepth,
+) -> Result<(AppConfig, AppOverrides), String> {
+    // Through serde rather than field by field, for `AppConfig::drifted_fields`'
+    // own reason: 40 hand-written assignments is exactly the list that goes
+    // stale when a field is added to the struct.
+    let object = |config: &AppConfig| match serde_json::to_value(config) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err("an app config must serialize as an object".to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    let mut merged = object(stored)?;
+    let file = object(&incoming.config)?;
+    let defaults = object(&AppConfig::default())?;
+
+    let mut next = overrides.clone();
+    // What the file has established on an earlier load, plus what the
+    // operator has set since. Either one makes a key established: the point
+    // of the set is to tell "nobody has ever spoken for this" apart from
+    // "somebody has", and both halves are somebody.
+    let established: BTreeSet<&String> = overrides
+        .declared
+        .iter()
+        .chain(overrides.fields.keys())
+        .collect();
+
+    for key in defaults.keys() {
+        if key == "env" {
+            continue;
+        }
+        let in_scope = match reset {
+            ResetDepth::Settings | ResetDepth::All => true,
+            // `ResetDepth::None`, and any depth a newer client knows that
+            // this build does not: append-only is the rule that cannot
+            // overwrite something an operator set, so it is the one an
+            // unrecognised depth falls back to. `instances` is held out of
+            // it entirely, because appending that field is not a value
+            // change but a reshaping of the flock -- a scale-down through a
+            // plain load would DELETE instances, and `shep stock` is an
+            // operator setting the count that the store cannot yet tell
+            // apart from a count nobody has touched.
+            _ => {
+                key != "instances" && incoming.declared.contains(key) && !established.contains(key)
+            }
+        };
+        if !in_scope {
+            continue;
+        }
+        // The file's value, whether or not the file declared the key, and
+        // that is the whole of what a reset means: become the template as it
+        // was loaded. `incoming.config` is the app the CLI resolved, so an
+        // undeclared key reads back the value a fresh `shep start` of this
+        // same file would have registered -- the `cwd` defaulted to the
+        // Flockfile's own directory, the fold from `--fold`, the interpreter
+        // from `[interpreters]`. Resolving it to the COMPILED default instead
+        // is what made `shep start Flockfile.toml --reset` against an
+        // unmodified file park `cwd` as `None` and leave the app unable to
+        // come back up.
+        //
+        // The override is spent either way. A key just put back to the
+        // template is not a key an operator is still holding a value for, and
+        // leaving one in `fields` would keep `ProcessEntry::overridden`
+        // reporting a field that no longer differs from the file.
+        next.fields.remove(key);
+        // `declared` grows only where the file really spoke. It is the set a
+        // later plain load reads to decide what is already established, so
+        // marking an undeclared key would establish a value the file never
+        // asked for and lock a later append out of it.
+        if incoming.declared.contains(key) {
+            next.declared.insert(key.clone());
+        }
+        if let Some(value) = file.get(key) {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+
+    match reset {
+        // `env` is operator-supplied data where the rest is operator-tuned
+        // policy: a `--reset` that took an app's database credentials away
+        // would be a different kind of event from one that put its restart
+        // budget back.
+        ResetDepth::Settings => {}
+        ResetDepth::All => {
+            next.fields.remove("env");
+            merged.insert(
+                "env".to_string(),
+                file.get("env")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+            );
+            establish_env(&mut next, incoming);
+        }
+        _ => {
+            let overridden_env: BTreeSet<&String> = overrides
+                .fields
+                .get("env")
+                .and_then(serde_json::Value::as_object)
+                .map(|env| env.keys().collect())
+                .unwrap_or_default();
+            let mut env = stored.env.clone();
+            for key in &incoming.declared_env {
+                if overrides.declared_env.contains(key) || overridden_env.contains(key) {
+                    continue;
+                }
+                if let Some(value) = incoming.config.env.get(key) {
+                    env.insert(key.clone(), value.clone());
+                }
+            }
+            merged.insert(
+                "env".to_string(),
+                serde_json::to_value(env).map_err(|err| err.to_string())?,
+            );
+            establish_env(&mut next, incoming);
+        }
+    }
+
+    let merged: AppConfig =
+        serde_json::from_value(serde_json::Value::Object(merged)).map_err(|err| err.to_string())?;
+    Ok((merged, next))
+}
+
+/// The spec a load leaves on a running instance: what that instance was
+/// spawned from, plus every merged field that can reach it without a
+/// replacement, plus the instance count actually achieved.
+///
+/// `reaching` is the drifted [`ApplyGroup::Live`] and
+/// [`ApplyGroup::NextSpawn`] field names, as [`Actor::apply_one`] partitioned
+/// them: the first because the daemon reads it fresh at each decision, the
+/// second because it is read when a process spawns and the stored spec is
+/// what a spawn reads. A [`ApplyGroup::NeedsRespawn`] field is deliberately
+/// left behind -- it lives in [`ProcessEntry::pending`] until the instance is
+/// replaced.
+///
+/// # Errors
+///
+/// A description of the failure if the rebuilt config does not travel through
+/// serde or does not normalize.
+///
+/// **Normalizing can genuinely fail here, on a config whose full merge is
+/// perfectly valid**, because `normalize` checks fields against each other
+/// and this is a SUBSET: a file declaring both `watch` and `cwd` brings the
+/// `watch` forward and leaves the `cwd` behind, and a watch with no directory
+/// to watch is refused. The caller treats that as "this app needs a restart"
+/// and parks everything, never as an invalid file.
+fn reached_spec(
+    stored: &AppConfig,
+    merged: &AppConfig,
+    reaching: &[String],
+    instances: u32,
+) -> Result<ResolvedApp, String> {
+    let object = |config: &AppConfig| match serde_json::to_value(config) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err("an app config must serialize as an object".to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    let mut next = object(stored)?;
+    let source = object(merged)?;
+    for field in reaching {
+        if let Some(value) = source.get(field) {
+            next.insert(field.clone(), value.clone());
+        }
+    }
+    let mut config: AppConfig =
+        serde_json::from_value(serde_json::Value::Object(next)).map_err(|err| err.to_string())?;
+    config.instances = instances;
+    normalize(config).map_err(|err| err.to_string())
+}
+
+/// `app` with its instance count set to `instances`, or `None` if the result
+/// does not normalize.
+///
+/// Re-normalized rather than mutated in place for `handle_scale`'s reason: a
+/// [`ResolvedApp`] is a proof token that its config passed `normalize`, and
+/// the one place in the tree holding one that had not would be here.
+fn with_count(app: &ResolvedApp, instances: u32) -> Option<ResolvedApp> {
+    let mut config = app.config().clone();
+    config.instances = instances;
+    normalize(config).ok()
+}
+
 /// One command's aggregation state: which ids are still outstanding, the
 /// terminal snapshots collected so far, and where to reply once `remaining`
 /// is empty.
@@ -2742,6 +3176,16 @@ impl<R: ProcessRunner> Actor<R> {
                 self.handle_scale(&name, count, reply);
                 false
             }
+            // Answered during a shutdown, like ConfigDrift and for the mirror
+            // of CRITICAL-1's reason: it registers nothing and starts nothing
+            // that a shutdown aggregation could miss. The one thing it does
+            // that CAN spawn is the instance count, which it declines to
+            // route while `shutting_down` -- see `handle_apply_config`.
+            Command::ApplyConfig { apps, reset, reply } => {
+                let report = self.handle_apply_config(apps, reset);
+                let _ = reply.send(Ok(report));
+                false
+            }
             // Neither is rejected while `shutting_down`: a smit registers
             // nothing and spawns nothing, and a daemon on its way down is
             // about to drop the whole map anyway.
@@ -2856,8 +3300,13 @@ impl<R: ProcessRunner> Actor<R> {
                 }
                 false
             }
-            Command::ExtraRestart { id, pid } => {
-                self.handle_extra_restart(id, pid);
+            Command::ExtraRestart {
+                id,
+                pid,
+                epoch,
+                observed,
+            } => {
+                self.handle_extra_restart(id, pid, epoch, observed);
                 false
             }
             // Rejected while `shutting_down` for CRITICAL-1's reason, the
@@ -3233,6 +3682,46 @@ impl<R: ProcessRunner> Actor<R> {
             .into_info()
     }
 
+    /// The field names an operator has overridden for `name`, for a
+    /// [`ProcessEntry`] about to be built from scratch -- a fresh
+    /// registration has no history of its own to read the cache off, so
+    /// this is the one place besides [`Actor::apply_one`] that populates
+    /// [`ProcessEntry::overridden`].
+    ///
+    /// Checks a live sibling first, and only reads the override store when
+    /// none exists. That order matters for cost, not just for correctness:
+    /// a scale-up (`Self::spawn_fresh` called for a new instance of an app
+    /// already running) finds one for free, with no file access at all,
+    /// which is the common case and the hot one -- `shep stock web 5` calls
+    /// this once per new instance. A brand-new app, or a muster restore at
+    /// boot registering a name for the first time in this process, has no
+    /// sibling to ask and falls back to [`shep_core::overrides::get`] --
+    /// one locked read, same as the cache-miss cost [`Actor::apply_one`]
+    /// already pays once per load, and one that happens only at the small
+    /// number of moments a name is REGISTERED rather than on every listing.
+    ///
+    /// An unreadable store answers empty here rather than refusing, unlike
+    /// [`Actor::handle_apply_config`]'s own read of the same store: that
+    /// one refuses a whole load rather than risk a template silently
+    /// overwriting an operator's edit, because a load WRITES the store back.
+    /// This function only ever READS it to annotate a listing, so the worst
+    /// an unreadable store costs here is a blank CFG cell until the store
+    /// itself is fixed -- never a lost edit.
+    fn overridden_for(&self, name: &str) -> Vec<String> {
+        if let Some(slot) = self
+            .sheep
+            .values()
+            .find(|slot| slot.entry.spec.config().name == name)
+        {
+            return slot.entry.overridden.clone();
+        }
+        overrides::get(&self.paths.overrides, name)
+            .ok()
+            .flatten()
+            .map(|record| record.fields.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Registers one app as a flock member in `status`, spawning nothing.
     ///
     /// Mechanism, not policy: it registers the status it is handed and has
@@ -3272,6 +3761,7 @@ impl<R: ProcessRunner> Actor<R> {
             return Registration::AlreadyKnown(to_info(&slot.entry, &self.smits));
         }
 
+        let overridden = self.overridden_for(name);
         let id = self.next_id;
         self.next_id += 1;
         // Assembled for its log paths only: nothing is spawned here, but the
@@ -3284,6 +3774,9 @@ impl<R: ProcessRunner> Actor<R> {
         let entry = ProcessEntry {
             id,
             spec: app.clone(),
+            pending: None,
+            pending_reidentifies: false,
+            overridden,
             instance: 0,
             status,
             pid: None,
@@ -3372,6 +3865,10 @@ impl<R: ProcessRunner> Actor<R> {
         credentials: Option<Credentials>,
         dog: Option<DogSource>,
     ) -> Result<ProcessInfo, String> {
+        // Read before the spawn below touches anything: a scale-up's new
+        // instance must show the same overrides its siblings already do,
+        // not a blank cell until the next config load happens to run.
+        let overridden = self.overridden_for(&app.config().name);
         let spec = assemble(app, instance, &self.paths, credentials);
         let id = self.next_id;
         self.next_id += 1;
@@ -3403,6 +3900,9 @@ impl<R: ProcessRunner> Actor<R> {
                 let entry = ProcessEntry {
                     id,
                     spec: app.clone(),
+                    pending: None,
+                    pending_reidentifies: false,
+                    overridden,
                     instance,
                     status,
                     pid: Some(pid),
@@ -3479,6 +3979,9 @@ impl<R: ProcessRunner> Actor<R> {
                 let entry = ProcessEntry {
                     id,
                     spec: app.clone(),
+                    pending: None,
+                    pending_reidentifies: false,
+                    overridden,
                     instance,
                     status: ProcStatus::Errored,
                     pid: None,
@@ -3661,9 +4164,45 @@ impl<R: ProcessRunner> Actor<R> {
         // anyway — the field is new, the assumption is not. See
         // `CarriedSheep::ready_failed`.
         let ready_failed = carried.ready_failed().unwrap_or(false);
+        // Restored, and as a PAIR: a parked config promoted without its
+        // reset flag comes up on the identity that flag exists to replace.
+        // See `CarriedSheep::pending_reidentifies`.
+        //
+        // A parked config that no longer normalizes is DROPPED rather than
+        // refusing the adoption, which is the opposite of what `app` above
+        // does, and the two differ because what they cost differs. `app` is
+        // the config a live child is already running: there is no version of
+        // this adoption without it. This is a change nobody has applied yet,
+        // so a successor whose `normalize` has tightened can lose it and
+        // still take over a healthy flock, where refusing would strand one.
+        // Logged at `warn` rather than dropped quietly, because this is the
+        // only account an operator gets of a change that will now never
+        // arrive.
+        let pending = carried
+            .pending()
+            .and_then(|parked| match normalize(parked.clone()) {
+                Ok(app) => Some(app),
+                Err(source) => {
+                    tracing::warn!(
+                        sheep = carried.name(),
+                        %source,
+                        "a config this sheep was owed did not survive the handover: this daemon \
+                         will not accept it, so the change is gone and the file must be loaded \
+                         again"
+                    );
+                    None
+                }
+            });
+        // `false` when the config was dropped just above as well as for a
+        // blob written before the flag existed: there is nothing left to
+        // promote, so there is nothing to re-resolve for.
+        let pending_reidentifies =
+            pending.is_some() && carried.pending_reidentifies().unwrap_or(false);
         let mut entry = ProcessEntry {
             id,
             spec: app.clone(),
+            pending,
+            pending_reidentifies,
             instance: carried.instance(),
             status,
             pid: carried.pid(),
@@ -3704,6 +4243,18 @@ impl<R: ProcessRunner> Actor<R> {
             // `CarriedSheep::dog`.
             dog: carried.dog().cloned(),
             last_exit: carried.last_exit(),
+            // Not carried by `CarriedSheep` at all (`ProcessEntry::overridden`'s
+            // own doc names why: the blob predates the field and extending
+            // its wire format was its own decision to make separately). Read
+            // from the override store instead, through the same
+            // `Self::overridden_for` a fresh registration uses -- a
+            // handover installs one sheep at a time with no live sibling to
+            // ask yet, so this is a store read per sheep, once, at the
+            // moment this image takes over. Without it, a successor
+            // reported no overrides for a sheep that has some on record
+            // until the next load recomputed the cache; the store itself
+            // was never behind, only this cache of it.
+            overridden: self.overridden_for(&app.config().name),
         };
 
         let Some(pid) = carried.pid() else {
@@ -4129,6 +4680,94 @@ impl<R: ProcessRunner> Actor<R> {
         }
     }
 
+    /// The config `id`'s next child will be spawned from: what a load parked
+    /// for it, or its stored spec when nothing is parked.
+    ///
+    /// The one reader of [`ProcessEntry::pending`] that does not consume it,
+    /// and the reason a reload can make every decision about a replacement --
+    /// its readiness source, its ordering, the identity it runs under, the
+    /// config it is assembled from -- off the config the replacement will
+    /// actually carry, while leaving the drainee's own entry untouched in
+    /// case the swap is abandoned. Deciding one of those from `spec` and
+    /// another from `pending` is the shape that put two probe-gated instances
+    /// on one address; there is one accessor so there is one answer.
+    fn intended_spec(&self, id: u32) -> Option<&ResolvedApp> {
+        let slot = self.sheep.get(&id)?;
+        Some(slot.entry.pending.as_ref().unwrap_or(&slot.entry.spec))
+    }
+
+    /// The identity `id`'s next child runs under, resolving it if the config
+    /// it is about to be spawned from asks for a different one.
+    ///
+    /// Reads and never writes, so a caller that may not go through with the
+    /// spawn does not leave the entry claiming an identity it never used.
+    /// [`Self::credentials_for_spawn`] is the writing twin, for the callers
+    /// that respawn an entry in place.
+    ///
+    /// # Errors
+    ///
+    /// - Whatever [`privilege::resolve`] refused the intended config's
+    ///   `user`/`group`.
+    fn intended_credentials(&self, id: u32) -> Result<Option<Credentials>, PrivilegeError> {
+        // `expect` rather than an `Ok(None)` fallback: `None` here means "the
+        // app asked for nobody", so a missing slot would spawn as the
+        // shepherd, which is the silent privilege downgrade
+        // [`SpawnIdentity`] exists to make unspellable.
+        let slot = self
+            .sheep
+            .get(&id)
+            .expect("intended_credentials: the instance was found replaceable a moment ago");
+        match slot.entry.credentials {
+            SpawnIdentity::Resolved(credentials) if !slot.entry.pending_reidentifies => {
+                Ok(credentials)
+            }
+            SpawnIdentity::Resolved(_) | SpawnIdentity::Unresolved => privilege::resolve(
+                self.intended_spec(id)
+                    .expect("intended_credentials: the slot was read a moment ago")
+                    .config(),
+            ),
+        }
+    }
+
+    /// Moves a sheep's pending config onto its stored spec, if it has any.
+    ///
+    /// Called where a child is about to be replaced UNDER THE SAME ENTRY,
+    /// which is the only moment a [`ApplyGroup::NeedsRespawn`] field can take
+    /// effect without a new id. A reload does not come here: its replacement
+    /// is a different entry, so it reads the intended config through
+    /// [`Self::intended_spec`] and leaves the drainee's parked copy where it
+    /// is until the drainee is deregistered. Nothing in either path re-reads
+    /// a file: the pending config was put there by a file load that already
+    /// happened, so `shep reload`'s documented promise not to re-parse a
+    /// Flockfile is untouched.
+    fn promote_pending(&mut self, id: u32) {
+        let Some(slot) = self.sheep.get_mut(&id) else {
+            return;
+        };
+        let Some(pending) = slot.entry.pending.take() else {
+            return;
+        };
+
+        // The one exception to [`ProcessEntry::credentials`] being resolved
+        // once. That rule exists so a restart never changes a running app's
+        // identity by accident; an operator who edited `user` or `group` is
+        // asking for exactly that change, and reusing the old identity would
+        // silently ignore them. Narrow on purpose: any other promoted field
+        // keeps the resolved value, so an ordinary config change costs no
+        // passwd lookup.
+        //
+        // The decision is READ here, never made here. It was made against
+        // this entry's own spec by the load that parked the config, because
+        // by now that spec may have been rewritten by a later load from a
+        // sibling instance that already promoted -- see
+        // `ProcessEntry::pending_reidentifies`, which is also why this is the
+        // only place it is cleared.
+        if core::mem::take(&mut slot.entry.pending_reidentifies) {
+            slot.entry.credentials = SpawnIdentity::Unresolved;
+        }
+        slot.entry.spec = pending;
+    }
+
     /// Respawns an already-registered id in place: reassembles from its
     /// stored spec + instance, bumps `restarts` and resets timing on
     /// success, or marks the entry `Errored` on failure. Used for both the
@@ -4143,13 +4782,22 @@ impl<R: ProcessRunner> Actor<R> {
     /// failure. Callers pass `origin == CommandOrigin::Operator`, never a
     /// literal, wherever a command is what got them here.
     fn respawn(&mut self, id: u32, manually: bool) -> ProcessInfo {
-        // Reused as-is once resolved (never re-resolved): a restart must
-        // never re-touch the passwd database, and must never silently change
-        // identity out from under an already-running app. An entry that has
-        // never been resolved -- restored from the muster roll, or left
-        // `Errored` by a refused start -- resolves HERE, because coming up
-        // as the shepherd instead would be a privilege downgrade nothing
-        // reports.
+        // Before the identity below is read, because a promoted `user` or
+        // `group` is what clears it. Here rather than in the `Restart` arms
+        // that call this, because every door a replacement child comes
+        // through is one: an operator's restart, the crash loop, a cron
+        // occurrence, a watched file, a memory breach. `pending` promises the
+        // parked config reaches the process at its NEXT spawn, and each of
+        // those is one.
+        self.promote_pending(id);
+        // Reused as-is once resolved: a restart must never re-touch the
+        // passwd database, and must never silently change identity out from
+        // under an already-running app. The one exception is the line above,
+        // which clears the resolution when the config it promoted is what
+        // changed `user` or `group`. An entry that has never been resolved
+        // -- restored from the muster roll, or left `Errored` by a refused
+        // start -- resolves HERE, because coming up as the shepherd instead
+        // would be a privilege downgrade nothing reports.
         let credentials = match self.credentials_for_spawn(id) {
             Ok(credentials) => credentials,
             Err(err) => return self.respawn_failed(id, manually, &err),
@@ -4882,9 +5530,51 @@ impl<R: ProcessRunner> Actor<R> {
         // this name regardless of status, so any slot left holding a stale
         // config keeps lying to everything that reads it, `shep describe`
         // included.
+        //
+        // The parked config travels the same way, onto the slots this call
+        // created and only those. `spawn_fresh` registers `pending: None`,
+        // and the config it spawned from was read off `slots[0]` -- which is
+        // the config the OLD instances are running, not the one a load has
+        // parked for them. Without this, `shep stock web 5` during a parking
+        // window brings up two instances on superseded config with nothing
+        // recording that a restart is owed, and the next load sees no drift
+        // against them and reports nothing to do.
+        //
+        // One field of it is not an earlier load's to keep: the COUNT. Copied
+        // verbatim, every slot carried `pending.instances = 1` against a spec
+        // of 5, so `drifted_fields` reported `instances` pending on every row
+        // forever, `shep describe` told the operator a reload would promote
+        // it, and the reload that promoted rewrote the count back down --
+        // over a number `registry.record` had already put in the muster roll.
+        // `with_count` keeps every slot agreeing AND correct. It re-normalizes,
+        // so it can refuse (a shared explicit `out_file` at the new count);
+        // the verbatim copy is the fallback, since an instance that owes a
+        // restart must go on owing it.
+        let owed = self.sheep.get(&slots[0].1).and_then(|slot| {
+            let parked = slot.entry.pending.clone()?;
+            let parked = with_count(&parked, achieved).unwrap_or(parked);
+            Some((parked, slot.entry.pending_reidentifies))
+        });
         for id in survivors.iter().chain(orphaned_by_failed_spawn.iter()) {
             if let Some(slot) = self.sheep.get_mut(id) {
                 slot.entry.spec = stored.clone();
+                match &mut slot.entry.pending {
+                    // A slot that was already owed a config keeps it, with
+                    // the count brought forward for the same reason the copy
+                    // above carries one: a parked count of 2 against a spec
+                    // of 4 is drift that never clears.
+                    Some(parked) => {
+                        if let Some(recounted) = with_count(parked, achieved) {
+                            *parked = recounted;
+                        }
+                    }
+                    None => {
+                        if let Some((parked, reidentifies)) = &owed {
+                            slot.entry.pending = Some(parked.clone());
+                            slot.entry.pending_reidentifies = *reidentifies;
+                        }
+                    }
+                }
             }
         }
 
@@ -4908,6 +5598,633 @@ impl<R: ProcessRunner> Actor<R> {
             requested: count,
             shortfall: failure,
         }));
+    }
+
+    /// Every registered id of `name`, in instance order.
+    ///
+    /// Not [`Self::matching_ids`] over a name selector: this is a lookup of
+    /// one app's own slots for a command that already holds the exact name a
+    /// config declares, where a selector's matching rules (folds, wildcards,
+    /// a slot suffix) would be a second way to answer the same question.
+    fn ids_of_name(&self, name: &str) -> Vec<u32> {
+        let mut slots: Vec<(u32, u32)> = self
+            .sheep
+            .iter()
+            .filter(|(_, slot)| slot.entry.spec.config().name == name)
+            .map(|(id, slot)| (slot.entry.instance, *id))
+            .collect();
+        slots.sort_unstable();
+        slots.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Merges each declared app into the sheep of the same name, one app at a
+    /// time.
+    ///
+    /// # What a load may not do
+    ///
+    /// Three things, and all three are what makes this safe to point at a
+    /// running flock. The first two hold at every depth. The third holds for
+    /// [`ResetDepth::None`] alone, which is the depth a merged pull request
+    /// can cause, and a reset parts company with it deliberately.
+    ///
+    /// - **It never registers.** An app the file names and the flock does not
+    ///   have is reported and skipped: [`Self::apply_one`] refuses it with
+    ///   `<name> is not registered` before it merges anything. `shep start`
+    ///   is the verb that adds sheep, and a load that also started things
+    ///   would make a config template a way to start processes on a host by
+    ///   opening a pull request against the app. This is about APPS and not
+    ///   about processes: a reset's scale-up reaches `spawn_fresh` through
+    ///   [`Self::handle_scale`] and does start new instances of an app the
+    ///   flock already has.
+    /// - **It never prunes.** An app the file does not mention is left
+    ///   running, untouched and unmentioned, and the mechanism is simply that
+    ///   the loop walks the DECLARED apps and never the flock. The daemon has
+    ///   no record of which Flockfile an app came from, so `shep start
+    ///   ./a/Flockfile.toml` followed by `./b/Flockfile.toml` would otherwise
+    ///   have the second wipe the first's flock.
+    /// - **A load with NO FLAG never kills.** A field the running child holds
+    ///   -- its argv, its environment, its log paths -- parks in
+    ///   [`ProcessEntry::pending`] and reaches the process at its next spawn.
+    ///   `spec` keeps describing what the child was actually spawned from,
+    ///   which is the only account of that anywhere.
+    ///
+    ///   **A reset can kill, and that is the ruling rather than an
+    ///   oversight.** `instances` is [`ApplyGroup::Structural`], held out of
+    ///   [`ResetDepth::None`] however unestablished it is and routed through
+    ///   [`Self::handle_scale`] under either reset flag. That function's
+    ///   `Ordering::Less` arm calls [`Self::begin_manual_ids`] with
+    ///   [`ManualKind::Delete`], the same path `shep delete` takes, so
+    ///   reducing a count deletes the instances above it.
+    ///   `a_plain_load_never_scales_and_a_reset_does` pins both halves.
+    ///
+    ///   This bullet read "It never kills", unqualified, until 2026-09-03.
+    ///   `web/src/pages/docs/overrides.astro` was written from it and
+    ///   inherited the same false claim, which a reviewer caught on the page
+    ///   rather than here. Anybody documenting this function next is reading
+    ///   this list, so the exception belongs in it.
+    ///
+    /// # Per app, in order
+    ///
+    /// Find the slots, merge, normalize, then split the drifted fields by
+    /// [`apply_group`] and route each group. A merge that does not normalize
+    /// refuses that app whole and touches nothing, leaving the rest of the
+    /// file to apply: one bad app in a file of eleven costing the other ten
+    /// their load is the failure `BatchPolicy::PerApp` already exists to
+    /// avoid on the start path.
+    ///
+    /// The override store is read once for the whole file and written once at
+    /// the end, around that loop rather than inside it.
+    ///
+    /// The instance count is the one field that reshapes the flock rather
+    /// than changing a value, and it is routed through [`Self::handle_scale`]
+    /// rather than reimplemented: slot allocation, the dog refusal, the
+    /// reload-in-flight refusal, the still-departing refusal and the
+    /// partial-scale write-back are all that function's, and a second
+    /// spelling of them here is a second thing to keep in step. Two depths
+    /// never reach it at all: [`ResetDepth::None`], which never reshapes a
+    /// flock, and any depth while `shutting_down`, because a scale-up spawns
+    /// and CRITICAL-1 forbids a child the shutdown aggregation cannot know
+    /// about.
+    fn handle_apply_config(&mut self, apps: Vec<DeclaredApp>, reset: ResetDepth) -> Vec<Applied> {
+        // One locked read for the whole file and one locked write at the end,
+        // never a pair per app. The store is rewritten whole on every write,
+        // so a per-app pair made an eleven-app Flockfile 22 lock acquisitions
+        // and 11 full rewrites on the thread that supervises the flock. It
+        // also makes the record of a load atomic per file rather than per app.
+        let store = match overrides::all(&self.paths.overrides) {
+            Ok(store) => store,
+            Err(err) => {
+                // Nothing is applied at all, and this is the one refusal that
+                // covers the whole file: the merge cannot tell what an
+                // operator has set without this store, and applying a
+                // template over an unreadable one is exactly how those edits
+                // get silently overwritten.
+                let message = format!("overrides could not be read: {err}");
+                return apps
+                    .iter()
+                    .map(|incoming| Applied {
+                        name: incoming.config.name.clone(),
+                        applied: Vec::new(),
+                        pending: Vec::new(),
+                        refused: Some(message.clone()),
+                        app: None,
+                    })
+                    .collect();
+            }
+        };
+
+        let mut changes = BTreeMap::new();
+        let mut report = Vec::with_capacity(apps.len());
+        for incoming in &apps {
+            let overrides = store
+                .get(&incoming.config.name)
+                .cloned()
+                .unwrap_or_default();
+            report.push(self.apply_one(incoming, reset, &overrides, &mut changes));
+        }
+
+        if let Err(err) = overrides::update(&self.paths.overrides, &changes) {
+            // Reported next to what landed rather than as a refusal: the
+            // flock has already been changed by the time this runs, and an
+            // `Applied` claiming nothing happened would be the one thing this
+            // function must never say untruthfully.
+            let note = format!("overrides could not be written: {err}");
+            for applied in &mut report {
+                if !changes.contains_key(&applied.name) {
+                    continue;
+                }
+                applied.refused = Some(match applied.refused.take() {
+                    Some(existing) => format!("{existing}; {note}"),
+                    None => note.clone(),
+                });
+            }
+        }
+        report
+    }
+
+    /// One app's half of [`Self::handle_apply_config`].
+    ///
+    /// `overrides` is this app's record as the one store read found it, and
+    /// `changes` is where its replacement goes: the write is the caller's, so
+    /// that a file of eleven apps costs one lock rather than eleven.
+    ///
+    /// # Where a refusal may be raised
+    ///
+    /// Every refusal that answers "this app was not touched" is raised BEFORE
+    /// the instance count is routed, and that ordering is the whole of this
+    /// function's care about a partial apply. A refusal after the scale would
+    /// report an untouched app while the flock had already been reshaped --
+    /// the divergence `handle_scale`'s spawn-before-write-back ordering exists
+    /// to prevent, arriving through a door it does not cover. Anything that
+    /// can only be discovered after the scale is reported alongside what did
+    /// land instead, never as a refusal.
+    fn apply_one(
+        &mut self,
+        incoming: &DeclaredApp,
+        reset: ResetDepth,
+        overrides: &AppOverrides,
+        changes: &mut BTreeMap<String, Option<AppOverrides>>,
+    ) -> Applied {
+        let name = incoming.config.name.clone();
+        let refuse = |message: String| Applied {
+            name: name.clone(),
+            applied: Vec::new(),
+            pending: Vec::new(),
+            refused: Some(message),
+            app: None,
+        };
+
+        let ids = self.ids_of_name(&name);
+        // The app's stand-in, and NOT `ids.first()`: during a reload the
+        // drainee holds the lower id, so the first id is the instance on its
+        // way out. `running` and `intended` come off this slot and the
+        // `next_spec` derived from them is written onto every slot of the
+        // name, the live replacement included -- which left the replacement's
+        // `spec` describing the config the DRAINEE was spawned from, against
+        // the rule that `spec` keeps describing what the child was actually
+        // spawned from. That is the only account of it anywhere.
+        //
+        // Falling back to `ids.first()` when every slot is draining, so a
+        // load during a serial reload's drain window still finds its app
+        // rather than being told it is not registered.
+        let representative = ids
+            .iter()
+            .copied()
+            .find(|id| {
+                self.sheep
+                    .get(id)
+                    .is_some_and(|slot| !matches!(slot.entry.reload, ReloadState::Drainee { .. }))
+            })
+            .or_else(|| ids.first().copied());
+        let Some(slot) = representative.and_then(|id| self.sheep.get(&id)) else {
+            return refuse(format!(
+                "{name} is not registered; `shep start` it before a config can be applied to it"
+            ));
+        };
+        // Mirroring `handle_scale`'s guard, and for a sharper reason. A dog
+        // runs at the daemon's own trust level and its binary is what `shep
+        // adopt` vetted; a Flockfile that happened to name `metrics` merged
+        // its own `script` onto the built-in dog and the next restart ran it,
+        // while `shep dogs` still said `built-in`. Nothing else could stop
+        // it: a dog is never in the override store, so every key a file
+        // declares for one is unestablished forever and the additive rule
+        // that protects a sheep can never engage.
+        if slot.entry.dog.is_some() {
+            return refuse(format!(
+                "{name} is a dog, and a dog's config comes from `shep adopt` rather than \
+                 from a Flockfile"
+            ));
+        }
+        // Two configs, and the difference between them is this function's
+        // whole subject. `running` is what the child was spawned from;
+        // `intended` is what the app is meant to be, which is an earlier
+        // load's parked config when there is one. The merge builds on
+        // `intended`, because a second load of the same file would otherwise
+        // find its own key established, skip it, and merge the RUNNING value
+        // over the parked one -- erasing the first load's change. Two
+        // identical `shep start Flockfile.toml` calls is what a deploy does.
+        let running = slot.entry.spec.config().clone();
+        let intended = slot
+            .entry
+            .pending
+            .as_ref()
+            .map_or_else(|| running.clone(), |parked| parked.config().clone());
+
+        let (merged, mut next_overrides) =
+            match merge_declared(&intended, incoming, overrides, reset) {
+                Ok(merged) => merged,
+                Err(message) => return refuse(message),
+            };
+        let merged = match normalize(merged) {
+            Ok(merged) => merged,
+            Err(err) => return refuse(err.to_string()),
+        };
+
+        let mut live = Vec::new();
+        let mut next_spawn = Vec::new();
+        let mut respawn = Vec::new();
+        let mut instances = false;
+        for field in intended.drifted_fields(merged.config()) {
+            match apply_group(&field) {
+                ApplyGroup::Live => live.push(field),
+                ApplyGroup::NextSpawn => next_spawn.push(field),
+                ApplyGroup::NeedsRespawn => respawn.push(field),
+                // `name` cannot drift (the app was found BY it) and
+                // `increment_var` is refused by `normalize`, so `instances`
+                // is the only structural field that reaches here.
+                ApplyGroup::Structural => instances |= field == "instances",
+                // A group a later shep-core adds. Treated as the table's own
+                // fallback treats an unknown field: the conservative answer
+                // is that the running process does not have the new value.
+                _ => respawn.push(field),
+            }
+        }
+
+        let mut refusals = Vec::new();
+        let mut count = running.instances;
+        // A plain load never reshapes a flock, so `merge_declared` keeps
+        // `instances` out of the merge under that depth entirely and this
+        // only has a note to make. `shep stock` is an operator setting the
+        // count, and the additive default exists so that a template cannot
+        // change what an operator set; the store cannot yet tell a stocked
+        // count from an untouched one, so no plain load may act on the field.
+        if !matches!(reset, ResetDepth::Settings | ResetDepth::All)
+            && incoming.declared.contains("instances")
+            && incoming.config.instances != running.instances
+        {
+            refusals.push(format!(
+                "instances: a plain load never reshapes a flock; `shep start --reset` to take \
+                 the file's count of {}",
+                incoming.config.instances
+            ));
+        }
+        if instances {
+            if self.shutting_down {
+                refusals.push(
+                    "instances: the daemon is shutting down and cannot reshape a flock".to_string(),
+                );
+            } else {
+                let (reply, mut answer) = oneshot::channel();
+                self.handle_scale(&name, merged.config().instances, reply);
+                match answer
+                    .try_recv()
+                    .expect("handle_scale answers before it returns")
+                {
+                    Ok(scaled) => {
+                        count = scaled.achieved();
+                        if let Some(shortfall) = scaled.shortfall {
+                            refusals.push(format!("instances: {shortfall}"));
+                        }
+                    }
+                    // Refused whole, and honestly: every `Err` `handle_scale`
+                    // answers with is raised before it spawns or removes
+                    // anything, so the flock really is as it was. It is
+                    // refused rather than applied around because a scale is
+                    // refused exactly when the app's SHAPE is already being
+                    // changed by something else (a reload, an earlier scale's
+                    // departures), and writing this file's other fields onto
+                    // slots mid-move is what `handle_scale`'s own guards
+                    // exist to stop. The operator retries once it settles.
+                    Err(err) => return refuse(err.to_string()),
+                }
+            }
+        }
+
+        // Built from the RUNNING config, plus only the fields that can reach a
+        // running process: a `NeedsRespawn` field written here would erase the
+        // record of what the child was actually spawned from, which nothing
+        // else keeps.
+        let reaching: Vec<String> = live.iter().chain(next_spawn.iter()).cloned().collect();
+        // A subset of a config that normalized can still fail, because
+        // normalize checks fields against each other: `watch` needs a `cwd`
+        // to watch, and a file declaring both leaves the `cwd` behind (it is
+        // `NeedsRespawn`) while bringing the `watch` forward. That is a
+        // change this app needs a restart for, not an invalid file, so
+        // everything parks instead of anything refusing.
+        let next_spec = reached_spec(&running, merged.config(), &reaching, count).ok();
+        let park_all = next_spec.is_none();
+
+        // The whole merge, for a next spawn to pick up. Recomputed even when
+        // this load changed no `NeedsRespawn` field of its own, whenever an
+        // earlier load left one parked: that parked config predates this
+        // load's Live changes, and promoting it later would put them back.
+        let parked_wanted = park_all
+            || !respawn.is_empty()
+            || ids.iter().any(|id| {
+                self.sheep
+                    .get(id)
+                    .is_some_and(|slot| slot.entry.pending.is_some())
+            });
+        let parked = if parked_wanted {
+            with_count(&merged, count)
+        } else {
+            None
+        };
+        // Nothing could be parked, so nothing may be REPORTED as parked
+        // either, and the previous parked config is left exactly as it is
+        // rather than cleared: it is an earlier load's change and still the
+        // one a respawn should pick up. Reachable through the instance count
+        // alone: a merge based on a parked config of one instance normalizes
+        // against one, and the same config against the two really running can
+        // refuse (a shared explicit `out_file`, say).
+        let parked_failed = parked_wanted && parked.is_none();
+
+        // Re-read, and by `get_mut` rather than by index: a scale-up
+        // registered ids this app did not have a moment ago, and a scale-down
+        // deregistered some it did -- synchronously, for an instance with no
+        // live task, so the pre-scale list can name a slot that is already
+        // gone.
+        for id in self.ids_of_name(&name) {
+            let Some(slot) = self.sheep.get_mut(&id) else {
+                continue;
+            };
+            // BEFORE the spec is overwritten below, and against THIS slot's
+            // own spec rather than the one `next_spec` was derived from. Both
+            // halves are load-bearing, and both are answers to the same
+            // thing: `next_spec` comes from the app's first instance, so
+            // writing it here makes every sibling look like instance 0.
+            // Instance 0 is also the one most likely to have already promoted
+            // -- a crash, a memory breach or a liveness failure restarts it
+            // with nobody asking -- so a promotion that diffed `pending`
+            // against `spec` later would find the `user` change instance 1
+            // has still not applied already sitting on instance 1's spec, and
+            // conclude there was nothing to re-resolve. Read
+            // `ProcessEntry::pending_reidentifies` for why it is `|=` and
+            // never `=`.
+            if let Some(parked) = &parked {
+                let running = slot.entry.spec.config();
+                slot.entry.pending_reidentifies |=
+                    running.user != parked.config().user || running.group != parked.config().group;
+            }
+            if let Some(next_spec) = next_spec.clone() {
+                slot.entry.spec = next_spec;
+            }
+            if let Some(parked) = parked.clone() {
+                slot.entry.pending = Some(parked);
+            }
+        }
+
+        if !park_all
+            && live
+                .iter()
+                .any(|field| EXTRAS_FIELDS.contains(&field.as_str()))
+        {
+            self.rearm_name(&name);
+        }
+
+        // `autostart` is the one `NextSpawn` field that reports as APPLIED.
+        // It is read by `restorable()` at muster or boot rather than at a
+        // spawn, so it is in force the moment it lands on the stored spec,
+        // and telling an operator to restart for it would be telling them to
+        // do nothing useful. Its three group-mates (`kill_signal`,
+        // `listen_timeout`, `readiness_probe`) really are read at a spawn.
+        let (autostart, later): (Vec<String>, Vec<String>) = next_spawn
+            .into_iter()
+            .partition(|field| field == "autostart");
+        // What could not be parked, for the refusal below to name. Under
+        // `park_all` that is every field, since nothing reached the running
+        // spec either; otherwise it is the `NeedsRespawn` ones alone, because
+        // a `NextSpawn` field is already ON the stored spec and needs no
+        // parking to reach the next spawn.
+        let unparked: Vec<String> = if !parked_failed {
+            Vec::new()
+        } else if park_all {
+            live.iter()
+                .cloned()
+                .chain(autostart.iter().cloned())
+                .chain(later.iter().cloned())
+                .chain(respawn.iter().cloned())
+                .collect()
+        } else {
+            respawn.clone()
+        };
+        // Unconditional on `parked_failed`, never on `unparked` being
+        // non-empty. The two come apart: `parked_wanted` is also set by an
+        // EARLIER load having left a config parked, so a load whose only
+        // drift is a Live field can fail to rebuild that parked config while
+        // having no field of its own to name. It reported success, and the
+        // stale parked config then reverts this load's Live change at the
+        // next respawn -- the exact thing the rebuild exists to prevent.
+        if parked_failed {
+            let what = if unparked.is_empty() {
+                "an earlier load's parked config could not be rebuilt, so a respawn will put \
+                 its values back"
+                    .to_string()
+            } else {
+                format!(
+                    "{} could not be parked for a next spawn",
+                    unparked.join(", ")
+                )
+            };
+            refusals.push(format!(
+                "{what}: the merged config does not hold at {count} instance(s)"
+            ));
+        }
+        // A field that went nowhere was established by nobody, so this app's
+        // record goes back to what it was for each of them. Without this the
+        // high-water mark absorbs the refused key, and an operator who reads
+        // the refusal and retries the identical file gets silence: the second
+        // load finds the key established, holds it out of scope, and reports
+        // nothing to do.
+        for field in &unparked {
+            match overrides.fields.get(field) {
+                Some(previous) => next_overrides
+                    .fields
+                    .insert(field.clone(), previous.clone()),
+                None => next_overrides.fields.remove(field),
+            };
+            if !overrides.declared.contains(field) {
+                next_overrides.declared.remove(field);
+            }
+            if field == "env" {
+                next_overrides
+                    .declared_env
+                    .clone_from(&overrides.declared_env);
+            }
+        }
+
+        // Cached on every instance of this app for `to_info` to read with no
+        // file access of its own -- `ProcessEntry::overridden`'s own doc
+        // gives the reasoning: this store is read once per load, right here,
+        // and `to_info` runs once per sheep on every listing, far more
+        // often. Read off `next_overrides` before it moves into `changes`
+        // below, so the two are the same computation rather than a second
+        // one derived separately -- they CAN still drift if the write at
+        // `overrides::update` below fails after this line runs, since a
+        // failed write leaves the on-disk store holding whatever this app's
+        // PREVIOUS load left, while the cache above already moved to
+        // `next_overrides`; the refusal reported alongside `Applied` names
+        // that case rather than hiding it.
+        let overridden_names: Vec<String> = if matches!(reset, ResetDepth::All) {
+            Vec::new()
+        } else {
+            next_overrides.fields.keys().cloned().collect()
+        };
+        for id in self.ids_of_name(&name) {
+            if let Some(slot) = self.sheep.get_mut(&id) {
+                slot.entry.overridden.clone_from(&overridden_names);
+            }
+        }
+
+        // Handed to the caller rather than written here, so one file costs
+        // one lock. Recorded only for an app that got this far: the record
+        // says what this load established, and a load that refused
+        // established nothing.
+        changes.insert(
+            name.clone(),
+            (!matches!(reset, ResetDepth::All)).then_some(next_overrides),
+        );
+        let (mut applied, mut pending): (Vec<String>, Vec<String>) = if park_all {
+            // Nothing reached the running instances at all, so nothing may be
+            // reported as applied.
+            (
+                Vec::new(),
+                if parked_failed {
+                    Vec::new()
+                } else {
+                    live.iter()
+                        .cloned()
+                        .chain(autostart)
+                        .chain(later)
+                        .chain(respawn)
+                        .collect()
+                },
+            )
+        } else {
+            (
+                live.iter().cloned().chain(autostart).collect(),
+                if parked_failed {
+                    later
+                } else {
+                    later.into_iter().chain(respawn).collect()
+                },
+            )
+        };
+        if instances && count != running.instances {
+            applied.push("instances".to_string());
+        }
+        applied.sort_unstable();
+        pending.sort_unstable();
+
+        let app = if count == merged.config().instances {
+            Some(merged)
+        } else {
+            with_count(&merged, count)
+        };
+        Applied {
+            name,
+            applied,
+            pending,
+            refused: (!refusals.is_empty()).then(|| refusals.join("; ")),
+            app,
+        }
+    }
+
+    /// Rebuilds every lifecycle extra armed for `name`, so a changed
+    /// [`EXTRAS_FIELDS`] value reaches the worker enforcing it.
+    ///
+    /// [`ExtrasRegistry::rearm_name`] rather than [`Self::arm_extras`] per
+    /// id: `arm` deliberately PRESERVES a live cron or watch task, which is
+    /// right for a reload's overlap and wrong here -- those tasks read
+    /// `watch`, `cron_restart` and their neighbours when they are built, so a
+    /// task that survives keeps the old values for as long as it lives.
+    ///
+    /// # Only what is online
+    ///
+    /// Gated on `Online` with a live pid, exactly as every other arming site
+    /// in this crate is (they all hang off the `went_online` transition).
+    /// [`ExtrasRegistry::arm`] decides group membership from the
+    /// CONFIGURATION rather than from whether anything is running, so arming
+    /// a stopped instance puts it in a group whose cron occurrence and whose
+    /// watch both restart every member -- a config apply would then start a
+    /// process the operator had stopped, with no operator action and no
+    /// report. `ExtrasRegistry::disarm`'s own doc names that mechanism as
+    /// what keeps a stopped sheep down.
+    ///
+    /// # One prober per instance
+    ///
+    /// [`assemble`] bakes `SHEP_INSTANCE` and every `{{instance}}` template
+    /// into the environment a prober runs with, so a shared prober would run
+    /// every instance's liveness probe against one instance's environment.
+    /// The normal arming path gives each instance its own, and so does this.
+    fn rearm_name(&mut self, name: &str) {
+        let Some(extras) = self.extras.as_ref() else {
+            return;
+        };
+        // Constructed inline, as `arm_extras` does, so the registry can be
+        // borrowed mutably while the flock is read.
+        let supervisor = SupervisorHandle {
+            tx: self.tx.clone(),
+        };
+        let mut armable: Vec<(u32, &ProcessEntry)> = self
+            .sheep
+            .iter()
+            .filter(|(_, slot)| {
+                slot.entry.spec.config().name == name
+                    && slot.entry.status == ProcStatus::Online
+                    && slot.entry.pid.is_some()
+            })
+            .map(|(id, slot)| (*id, &slot.entry))
+            .collect();
+        // No early return on an empty list, and that is the point rather than
+        // an oversight. A name whose instances are ALL momentarily
+        // non-`Online` -- every one of them inside a crash-restart backoff
+        // during a deploy load, which is ordinary -- still has to reach
+        // `rearm_name`, because that is what aborts the group holding the OLD
+        // config. Returning here left a cron worker or a watch running on the
+        // config the load just replaced, reported to the operator as applied,
+        // and it does not heal: `Self::disarm_extras` deliberately leaves a
+        // sheep on its way to `WaitingRestart` armed, so it stays a group
+        // member, nothing ever tears the group down, and `arm` preserves the
+        // live handle when it respawns. The worst shape is `watch = false`: a
+        // load turning a watcher off during a backoff window would leave it
+        // watching forever. `rearm_name` takes an empty slice correctly --
+        // abort the group, rebuild nothing -- and the next `went_online`
+        // builds it from the new spec.
+        //
+        // Sorted, so the order the group is rebuilt in does not depend on a
+        // `HashMap`'s iteration order.
+        armable.sort_unstable_by_key(|(id, _)| *id);
+        let entries: Vec<&ProcessEntry> = armable.into_iter().map(|(_, entry)| entry).collect();
+        let paths = &self.paths;
+        self.registry.rearm_name(
+            name,
+            &entries,
+            |entry| {
+                // `Credentials` is `Copy`, which is why this needs no clone.
+                // This spec is assembled for the prober alone and is never
+                // spawned, so the unresolved arm costs nothing: an entry
+                // reached here is already running, and resolved its identity
+                // before it could start.
+                let credentials = match entry.credentials {
+                    SpawnIdentity::Resolved(credentials) => credentials,
+                    SpawnIdentity::Unresolved => None,
+                };
+                spec_prober(&assemble(&entry.spec, entry.instance, paths, credentials))
+            },
+            extras,
+            &supervisor,
+        );
     }
 
     /// Accepts a reload: answers the caller at once, then starts one swap per
@@ -5132,16 +6449,21 @@ impl<R: ProcessRunner> Actor<R> {
 
     /// The reload ordering the instance `old_id` occupies asks for.
     ///
-    /// Read off that instance's own stored `ResolvedApp`, which is the config
-    /// its replacement will be spawned from, so the mode and the spawn can
-    /// never be deciding from two different files.
+    /// Read off [`Self::intended_spec`], which is the config the replacement
+    /// will be spawned from, so the mode and the spawn can never be deciding
+    /// from two different files. Not off the stored spec: `readiness_probe`
+    /// is a [`ApplyGroup::NextSpawn`] field and lands there the moment a load
+    /// arrives, while `wait_ready` is [`ApplyGroup::NeedsRespawn`] and parks,
+    /// so an app being migrated from channel readiness to an HTTP probe holds
+    /// BOTH on its stored spec at once. `wait_ready` wins in
+    /// [`ReadinessSource::of`], so a mode read from there says `Channel`,
+    /// hence overlap, while the replacement comes up probe-gated -- two
+    /// instances on one address with a probe the DRAINEE can answer, which is
+    /// the false-ready [`ReloadMode::Serial`] exists to prevent.
     fn reload_mode_of(&self, old_id: u32) -> ReloadMode {
         let config = self
-            .sheep
-            .get(&old_id)
+            .intended_spec(old_id)
             .expect("reload_mode_of: the instance was found replaceable a moment ago")
-            .entry
-            .spec
             .config();
         let source = ReadinessSource::of(config)
             .expect("ResolvedApp already passed ProbeTarget::parse in normalize");
@@ -5288,16 +6610,46 @@ impl<R: ProcessRunner> Actor<R> {
     /// between — the actor is synchronous here and emits no event. An
     /// identity that will not resolve returns before the mark is made at all,
     /// which leaves the drainee where it stood by never moving it.
+    ///
+    /// # Why nothing here writes to the drainee
+    ///
+    /// Everything this function takes off the drainee is READ: its instance
+    /// slot, its restart count, its dog marker, its last exit, the config it
+    /// is owed, and the identity that config asks for. A reload can be
+    /// abandoned at four separate points after this returns, and at every one
+    /// of them the drainee goes back to serving. An entry mutated on the way
+    /// past would still be mutated afterwards: a config promoted in place
+    /// would leave a running child whose entry claimed a config it was never
+    /// spawned with and no parked copy to say a restart was owed, and an
+    /// identity cleared in place would leave a running child recorded as
+    /// [`SpawnIdentity::Unresolved`], which that variant means "never looked
+    /// up" rather than "looked up and running as this". The promotion happens
+    /// by the replacement being BUILT from the drainee's intended config
+    /// instead, and lands when the drainee is deregistered and its parked
+    /// copy goes with it.
     fn spawn_replacement(&mut self, old_id: u32, mode: ReloadMode) -> Result<u32, String> {
-        // `Credentials` is `Copy`; reused, never re-resolved. A drainee is
-        // by definition running, so the seam finds a resolved identity and
+        // `Credentials` is `Copy`; reused, and re-resolved only when the
+        // config being promoted is what changed `user` or `group`. A drainee
+        // is by definition running, so the seam finds a resolved identity and
         // touches nothing -- but a reload must not be the one path that
         // would fall back to the shepherd if that ever stopped holding.
         let credentials = self
-            .credentials_for_spawn(old_id)
+            .intended_credentials(old_id)
             .map_err(|err| err.to_string())?;
+        // The promotion, and it is a READ. A reload's replacement is a
+        // different entry under a new id, so there is nothing to promote in
+        // place: the replacement is simply built from the config the drainee
+        // was owed, and the drainee keeps its own copy until it is
+        // deregistered. That is what makes an abandoned reload harmless --
+        // `abort_reload` puts a drainee back to `Online` and the config it is
+        // still owed is right where the load left it. Taking it here instead
+        // would leave a running child whose entry claimed a config it was
+        // never spawned with, and no parked copy to say a restart was due.
+        let app = self
+            .intended_spec(old_id)
+            .expect("spawn_replacement: the instance was found replaceable a moment ago")
+            .clone();
         let drainee = &self.sheep[&old_id].entry;
-        let app = drainee.spec.clone();
         let instance = drainee.instance;
         let restarts = drainee.restarts;
         // Carried across the swap for the same reason `restarts` is: the
@@ -5313,6 +6665,13 @@ impl<R: ProcessRunner> Actor<R> {
         // never exited", which is only true the first time an app is ever
         // reloaded.
         let last_exit = drainee.last_exit;
+        // Carried across the swap for the same reason `dog`/`last_exit`
+        // are: a reload is not a config load, so the replacement's honest
+        // answer to "what is overridden" is still whatever the drainee's
+        // was. Without this, `shep reload <name>` -- the very verb
+        // `shep describe`'s own Overridden heading tells an operator to
+        // run -- would blank the cache the moment it ran.
+        let overridden = drainee.overridden.clone();
 
         let new_id = self.next_id;
         self.next_id += 1;
@@ -5338,6 +6697,9 @@ impl<R: ProcessRunner> Actor<R> {
                 let entry = ProcessEntry {
                     id: new_id,
                     spec: app.clone(),
+                    pending: None,
+                    pending_reidentifies: false,
+                    overridden,
                     instance,
                     status: ProcStatus::Starting,
                     pid: Some(pid),
@@ -6999,10 +8361,11 @@ impl<R: ProcessRunner> Actor<R> {
     }
 
     /// A memory breach or a liveness failure asked for a restart. Guarded the
-    /// same way `RestartDue` is, on the **pid** rather than the epoch — the
-    /// epoch lives on the private [`SheepSlot`], while the pid is already on
-    /// both reports and is just as good a generation token (`None` while not
-    /// running, different after every respawn):
+    /// same way `RestartDue` is, on the **pid** rather than [`SheepSlot`]'s
+    /// own respawn epoch: the pid is already on both reports and is just as
+    /// good a generation token for a RESPAWN (`None` while not running,
+    /// different after every respawn). It says nothing about a probe
+    /// replaced without a respawn, which is guard 5 below:
     ///
     /// 1. NOT shutting down — a graceful shutdown forbids any new spawn.
     ///    Defence in depth, and deliberately untested rather than tested by a
@@ -7035,6 +8398,20 @@ impl<R: ProcessRunner> Actor<R> {
     ///    above is this guard's alone, so it is not redundant; a drainee is
     ///    covered twice over, and that is the right amount for the one case
     ///    where getting it wrong ends the instance being replaced.
+    /// 5. For a liveness report only (`epoch.is_some()`): the reporting
+    ///    probe's own epoch still matching `ExtrasRegistry::liveness_epoch`.
+    ///    `InstanceExtras::disarm` calls `liveness.abort()`, which does not
+    ///    await the aborted task, so a probe already inside
+    ///    `failures.send(..).await` when it is replaced can still deliver its
+    ///    failure after a fresh probe is already running against the SAME
+    ///    pid in the SAME `Online` status; a config-only re-arm changes
+    ///    neither, so guards 3 and 4 both pass it. Without this, changing any
+    ///    config field on a sheep with a `liveness_probe` could restart it,
+    ///    and a config apply must never kill a process. `None` (a memory
+    ///    breach) skips this guard entirely rather than being checked against
+    ///    it: `PollingEnforcer` is one shared long-lived task that reads the
+    ///    CURRENT registered pid and threshold fresh on every tick, so there
+    ///    is no equivalent in-flight task whose report can go stale this way.
     ///
     /// Delegates to `begin_manual` rather than `respawn`: that keeps the kill
     /// ladder, the marker rule, the `pending_delete` interaction and the budget
@@ -7044,7 +8421,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// It goes in as [`CommandOrigin::Automatic`], which is what lets an
     /// operator's `stop` or `delete` take the sheep back off a restart already
     /// mid-ladder — see `claim_manual`.
-    fn handle_extra_restart(&mut self, id: u32, pid: u32) {
+    fn handle_extra_restart(
+        &mut self,
+        id: u32,
+        pid: u32,
+        epoch: Option<u64>,
+        observed: Option<MemSize>,
+    ) {
         if self.shutting_down {
             tracing::debug!(id, pid, "extra restart dropped: engine is shutting down");
             return;
@@ -7070,6 +8453,56 @@ impl<R: ProcessRunner> Actor<R> {
                 "extra restart dropped: the sheep is no longer online"
             );
             return;
+        }
+        // A fifth guard, and the two above cannot stand in for it. A probe
+        // replaced because its CONFIG changed leaves the pid and the status
+        // exactly as they were, so a failure already in flight from the
+        // aborted task passes both. `liveness.abort()` does not await, so
+        // that in-flight failure is a real case and not a theoretical one.
+        // Without this, changing any config field on a sheep with a liveness
+        // probe could restart it, and a config apply must never kill a
+        // process. `epoch` is `None` for a memory breach, which has no
+        // per-instance task that can go stale this way (see
+        // `spawn_extras_reporter`'s breach arm), so this guard never applies
+        // to it.
+        if let Some(epoch) = epoch {
+            let current = self.registry.liveness_epoch(id);
+            if current != epoch {
+                tracing::debug!(
+                    id,
+                    pid,
+                    epoch,
+                    current,
+                    "extra restart dropped: the reporting probe has been replaced"
+                );
+                return;
+            }
+        }
+        // A sixth guard, and the memory breach's half of the fifth. A breach
+        // is computed under `PollingEnforcer`'s lock and SENT after that lock
+        // is released, so a ceiling re-armed in between (which is what a
+        // config apply changing `max_memory` does, through
+        // `Actor::rearm_name`) leaves a report in flight that was measured
+        // against a ceiling nobody is enforcing any more. The pid and the
+        // status are both untouched by that, so neither guard above sees it,
+        // and a config apply must never kill a process. Re-asking the
+        // question rather than comparing the two ceilings is deliberate: a
+        // LOWERED ceiling makes an old measurement a genuine breach, and
+        // dropping it for having been computed early would miss one.
+        if let Some(observed) = observed {
+            let ceiling = self
+                .sheep
+                .get(&id)
+                .and_then(|slot| slot.entry.spec.config().max_memory);
+            if ceiling.is_none_or(|limit| observed <= limit) {
+                tracing::debug!(
+                    id,
+                    pid,
+                    observed = observed.bytes(),
+                    "extra restart dropped: the ceiling it breached is no longer in force"
+                );
+                return;
+            }
         }
         // A throwaway reply: `send_reply` already ignores a closed receiver,
         // and there is nobody to answer — the reporter is fire-and-forget by
@@ -7850,6 +9283,25 @@ fn to_info(entry: &ProcessEntry, smits: &Smits) -> ProcessInfo {
                 .map(|(_, smit)| smit.clone()),
         )
         .instance(Some(entry.instance))
+        // The field names `spec` and `pending` differ on, or `None` when
+        // nothing is parked. `.filter` rather than a bare `Some(vec)`: a
+        // parked config that turned out identical to `spec` (an earlier
+        // load promoted every field an operator cared about, say) must not
+        // report `pending: Some([])` -- the doc on `ProcessInfo::pending`
+        // says `None` means nothing parked, and an empty list is not
+        // nothing parked, it is nothing DIFFERING about what is parked.
+        // Cheap either way: an in-memory `AppConfig` comparison, no disk
+        // I/O.
+        .pending(entry.pending.as_ref().and_then(|parked| {
+            let fields = entry.spec.config().drifted_fields(parked.config());
+            (!fields.is_empty()).then_some(fields)
+        }))
+        // Read off the cached field, never the override store directly --
+        // see `ProcessEntry::overridden`'s own doc for why: that field is
+        // kept correct by every path that can register or replace a sheep,
+        // so this function does no I/O of its own on the far more frequent
+        // listing path.
+        .overridden((!entry.overridden.is_empty()).then(|| entry.overridden.clone()))
         .build()
 }
 
@@ -8929,14 +10381,14 @@ mod tests {
     use shep_core::config::{AppConfig, ProbeConfig, ProbeKind, normalize};
     use shep_core::protocol::DogSource;
     use shep_core::status::ProcStatus;
-    use shep_core::values::UpDuration;
+    use shep_core::values::{MemSize, UpDuration};
 
     use super::*;
     use crate::fake::{ProcScript, ScriptedRunner};
     // the one crate-root fixture (IR-33)
     use crate::testing::{
-        Harness, RecordingEnforcer, SharedRunner, app_with, armed_entry, harness, idle_stats,
-        probe_config, test_paths,
+        Harness, RecordingEnforcer, ScriptedProber, SharedRunner, app_with, armed_entry, harness,
+        idle_stats, probe_config, test_paths,
     };
     // Only `a_restart_that_starts_nothing_says_why_in_the_log` uses this,
     // and that test is unix-only: its second route drives an unresolvable
@@ -8948,6 +10400,10 @@ mod tests {
     // put the daemon's own reporter behind them.
     use crate::cron::{DEFAULT_MAX_CRON_SLEEP, SystemClock};
     use crate::extras::{ExtrasReports, spawn_extras_reporter};
+    // Test-only: the apply cases arm real extras over a recording enforcer,
+    // which needs the trait in scope to coerce it behind the `Arc<dyn ..>`
+    // `Extras` holds.
+    use crate::limits::LimitEnforcer;
     // Test-only: `SilentPumpRunner` counts the requests its pumps receive so
     // a case can order itself against the actor. Imported here rather than
     // beside the module's other `tokio::sync` uses, which do not need it.
@@ -10574,7 +12030,7 @@ mod tests {
         // Both sends land in the same mailbox in this order, so the actor sets
         // the restart's marker and starts its ladder before it ever sees the
         // stop -- no second task and no yielding needed.
-        handle.extra_restart(running.id, pid).await;
+        handle.extra_restart(running.id, pid, None, None).await;
         let stopped = handle.stop(ProcessSelector::All).await.unwrap();
 
         assert_eq!(stopped.len(), 1);
@@ -10619,7 +12075,7 @@ mod tests {
         let running = handle.list().await.remove(0);
         let pid = running.pid.expect("an online sheep has a pid");
 
-        handle.extra_restart(running.id, pid).await;
+        handle.extra_restart(running.id, pid, None, None).await;
         let deleted = handle
             .delete(ProcessSelector::Id(running.id))
             .await
@@ -10800,7 +12256,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut actor, mut ctl_rx) = actor_with_stopping_drainee(&dir, 4242, 0);
 
-        actor.handle_extra_restart(0, 4242);
+        actor.handle_extra_restart(0, 4242, None, None);
 
         let slot = actor.sheep.get(&0).expect("the sheep stays registered");
         assert_eq!(
@@ -10815,6 +12271,142 @@ mod tests {
         assert!(
             ctl_rx.try_recv().is_err(),
             "a Stopping sheep must never receive a second Kill"
+        );
+    }
+
+    /// fails if a liveness failure from an ABORTED probe can still restart a
+    /// sheep. A config-only re-arm changes neither the pid nor the status, so
+    /// `handle_extra_restart`'s first two guards both pass and the sheep is
+    /// restarted by a probe that no longer exists. A config apply must never
+    /// kill a process.
+    ///
+    /// `slot.manual` is this test's observable, not the restart count or the
+    /// pid the brief's own sketch reaches for: this actor is driven directly
+    /// rather than through a running supervisor, so nothing here ever
+    /// actually kills or respawns the (nonexistent) child. `begin_manual`
+    /// claiming `slot.manual` is the synchronous, always-observable proof
+    /// that guard 5 let a restart through, matching
+    /// `a_stopping_sheep_rejects_an_extra_restart` right above, which asserts
+    /// the same field for the same reason.
+    #[tokio::test]
+    async fn a_stale_liveness_failure_from_a_replaced_probe_does_not_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let mut app = AppConfig::minimal("web", "./srv");
+        app.liveness_probe = Some(ProbeConfig {
+            failure_threshold: 1,
+            ..probe_config(ProbeKind::Tcp, "localhost:5432")
+        });
+        let app = normalize(app).unwrap();
+        let pid = 1111;
+        let entry = armed_entry(0, 0, pid, app, &paths);
+        // A live `ctl`, unlike `actor_with_one_online_sheep`'s fixture: guard
+        // 5 is meant to stop `begin_manual` from claiming a marker and
+        // queuing a `Kill` on a sheep that really is running, and
+        // `begin_manual_ids` reads `ctl.is_some()` to decide it is. Without
+        // one this case would take the "already stopped" synchronous path
+        // instead and prove nothing about the guard under test.
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(1);
+        let mut sheep = HashMap::new();
+        sheep.insert(
+            0,
+            SheepSlot {
+                entry,
+                ctl: Some(ctl_tx),
+                log_ctl: None,
+                to_child: None,
+                signals: None,
+                to_stdin: None,
+                manual: None,
+                pending_delete: false,
+                epoch: 0,
+                ready_tx: None,
+                actions: ActionWaits::default(),
+                ready_failed: false,
+                restart_due: None,
+            },
+        );
+        let (events, _events_rx) = crate::bus::test_bus(16);
+        let (tx, _mailbox) = mpsc::channel(16);
+        let mut actor = Actor {
+            runner: ScriptedRunner::new(vec![]),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id: 1,
+            next_deadline: 0,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: None,
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+            smits: Smits::new(),
+        };
+        let entry = actor
+            .sheep
+            .get(&0)
+            .expect("the fixture registers id 0")
+            .entry
+            .clone();
+
+        let supervisor = SupervisorHandle {
+            tx: actor.tx.clone(),
+        };
+        let (breach_tx, _breaches) = mpsc::channel(1);
+        let (live_tx, _liveness) = mpsc::channel(1);
+        let extras = Extras {
+            clock: Arc::new(SystemClock),
+            enforcer: Arc::new(RecordingEnforcer::default()),
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports: ExtrasReports {
+                breaches: breach_tx,
+                liveness: live_tx,
+            },
+            stats: idle_stats(),
+        };
+        // Never fails on its own: this test drives the epoch mismatch
+        // directly rather than waiting on a real probe to raise one.
+        let prober: Arc<dyn Prober> = Arc::new(ScriptedProber::new(vec![]));
+
+        // Arm the entry's liveness probe; the epoch it gets is the STALE
+        // one this test will feed back in.
+        actor
+            .registry
+            .arm(&entry, Arc::clone(&prober), &extras, &supervisor);
+        let stale_epoch = actor.registry.liveness_epoch(0);
+
+        // The config changes: re-arm the SAME id. Neither the pid nor the
+        // status moves, but the epoch does.
+        actor.registry.arm(&entry, prober, &extras, &supervisor);
+        assert_ne!(
+            actor.registry.liveness_epoch(0),
+            stale_epoch,
+            "a re-arm must advance the epoch"
+        );
+
+        // A failure from the now-replaced probe, carrying the epoch it was
+        // armed under, the CURRENT pid and status Online.
+        actor.handle_extra_restart(0, pid, Some(stale_epoch), None);
+
+        let slot = actor.sheep.get(&0).expect("the sheep stays registered");
+        assert!(
+            slot.manual.is_none(),
+            "a stale liveness failure from a replaced probe must never claim the manual marker"
+        );
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "a stale liveness failure from a replaced probe must never queue a Kill"
+        );
+        assert_eq!(
+            slot.entry.restarts, 0,
+            "a dropped report must never bump the restart count"
+        );
+        assert_eq!(
+            slot.entry.pid,
+            Some(pid),
+            "a dropped report must never touch the running pid"
         );
     }
 
@@ -13092,7 +14684,7 @@ mod tests {
         )
         .await;
         let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
-        handle.extra_restart(0, pid).await;
+        handle.extra_restart(0, pid, None, None).await;
 
         let reloaded = handle
             .reload(ProcessSelector::Name("web".to_string()))
@@ -13157,7 +14749,7 @@ mod tests {
             .await
             .expect("the reload is accepted");
         expect_event(&mut rx, 1, ProcessEventKind::Start).await;
-        handle.extra_restart(0, pid).await;
+        handle.extra_restart(0, pid, None, None).await;
 
         // `Restart`, not `Delete`, and the difference is the whole assertion:
         // the bug kills the drainee and RESPAWNS it into a slot its
@@ -17833,7 +19425,7 @@ mod tests {
                             if let Some(first) = handle.list().await.first()
                                 && let Some(pid) = first.pid
                             {
-                                handle.extra_restart(first.id, pid).await;
+                                handle.extra_restart(first.id, pid, None, None).await;
                             }
                         }
                         Step::StaleReport => {
@@ -17843,7 +19435,7 @@ mod tests {
                                 // sheep would be just as stale here: the guard
                                 // compares against THIS id's entry.
                                 let stale = first.pid.unwrap_or(0).wrapping_add(1);
-                                handle.extra_restart(first.id, stale).await;
+                                handle.extra_restart(first.id, stale, None, None).await;
                             }
                         }
                         Step::List => {}
@@ -18566,6 +20158,9 @@ mod tests {
         let mut entry = ProcessEntry {
             id,
             spec: normalize(app).unwrap(),
+            pending: None,
+            pending_reidentifies: false,
+            overridden: Vec::new(),
             instance: 0,
             status: ProcStatus::Online,
             pid,
@@ -18616,6 +20211,9 @@ mod tests {
         let entry = ProcessEntry {
             id,
             spec: normalize(app).unwrap(),
+            pending: None,
+            pending_reidentifies: false,
+            overridden: Vec::new(),
             instance: 0,
             status: ProcStatus::WaitingRestart,
             pid: None,
@@ -20270,5 +21868,2311 @@ mod tests {
         app.listen_timeout = UpDuration::from_millis(200);
         mutate(&mut app);
         entry.spec = normalize(app).unwrap();
+    }
+
+    // --- `ApplyConfig`: a Flockfile merged onto a running flock ---
+    //
+    // Actor-tier, all but one of them, for the reason the drainee cases
+    // above are: what a load left behind is `spec`, `pending` and a pid that
+    // must not have moved, and no reply spelling reports those three
+    // together. The one exception arms real extras, and says so.
+
+    /// The pid the first fixture instance carries. Distinctive enough that a
+    /// test asserting the running child was left alone cannot be reading a
+    /// default.
+    const APPLY_FIRST_PID: u32 = 7100;
+
+    /// An actor over one `Online` instance of each app, plus the recording
+    /// enforcer its extras are armed against.
+    ///
+    /// One slot per instance the app's config declares, so a case can reach
+    /// the multi-instance paths; ids are handed out in order, which makes the
+    /// first app's instances 0.., then the next app's.
+    ///
+    /// The extras are real rather than `None` so a case can assert that a
+    /// changed ceiling reached the registry; nothing is armed at
+    /// construction, because no instance here went through `went_online`.
+    ///
+    /// Every slot is `Online` with a pid and no `ctl`. A case wanting a
+    /// stopped instance writes that onto the entry itself, which is also what
+    /// makes its removal synchronous (no live task owns its exit).
+    fn actor_over(
+        dir: &tempfile::TempDir,
+        apps: &[ResolvedApp],
+    ) -> (Actor<ScriptedRunner>, Arc<RecordingEnforcer>) {
+        let paths = test_paths(dir);
+        let mut sheep = HashMap::new();
+        let mut next_id = 0;
+        for app in apps {
+            for instance in 0..app.config().instances {
+                let id = next_id;
+                next_id += 1;
+                sheep.insert(
+                    id,
+                    SheepSlot {
+                        entry: armed_entry(id, instance, APPLY_FIRST_PID + id, app.clone(), &paths),
+                        ctl: None,
+                        log_ctl: None,
+                        to_child: None,
+                        signals: None,
+                        to_stdin: None,
+                        manual: None,
+                        pending_delete: false,
+                        epoch: 0,
+                        ready_tx: None,
+                        actions: ActionWaits::default(),
+                        ready_failed: false,
+                        restart_due: None,
+                    },
+                );
+            }
+        }
+        let enforcer = Arc::new(RecordingEnforcer::default());
+        let (breach_tx, _breaches) = mpsc::channel(1);
+        let (live_tx, _liveness) = mpsc::channel(1);
+        let extras = Extras {
+            clock: Arc::new(SystemClock),
+            enforcer: Arc::clone(&enforcer) as Arc<dyn LimitEnforcer>,
+            max_cron_sleep: DEFAULT_MAX_CRON_SLEEP,
+            reports: ExtrasReports {
+                breaches: breach_tx,
+                liveness: live_tx,
+            },
+            stats: idle_stats(),
+        };
+        let (events, _events_rx) = crate::bus::test_bus(64);
+        let (tx, _rx) = mpsc::channel(MAILBOX_CAPACITY);
+        let actor = Actor {
+            // Enough scripts for a scale-up to actually come up: a case that
+            // spawns nothing pays nothing for them, and one that scales would
+            // otherwise be asserting on a shortfall rather than on the apply.
+            runner: ScriptedRunner::new(vec![ProcScript::never_exits(); 4]),
+            paths,
+            events,
+            tx,
+            sheep,
+            next_id,
+            next_deadline: 0,
+            next_action_stamp: 0,
+            pending: Vec::new(),
+            shutting_down: false,
+            extras: Some(extras),
+            registry: ExtrasRegistry::default(),
+            reloads: HashMap::new(),
+            smits: Smits::new(),
+        };
+        (actor, enforcer)
+    }
+
+    /// A [`DeclaredApp`] whose document wrote exactly `keys`, plus every key
+    /// of its own `env` table when `keys` names `env`.
+    fn declared_app(config: AppConfig, keys: &[&str]) -> DeclaredApp {
+        let declared: BTreeSet<String> = keys.iter().map(|key| (*key).to_string()).collect();
+        let declared_env = if declared.contains("env") {
+            config.env.keys().cloned().collect()
+        } else {
+            BTreeSet::new()
+        };
+        DeclaredApp {
+            config,
+            declared,
+            declared_env,
+        }
+    }
+
+    /// The override record an earlier load of `keys` would have left, with
+    /// `fields` set since by an operator.
+    fn established(
+        keys: &[&str],
+        fields: Vec<(&str, serde_json::Value)>,
+    ) -> shep_core::overrides::AppOverrides {
+        shep_core::overrides::AppOverrides {
+            fields: fields
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            declared: keys.iter().map(|key| (*key).to_string()).collect(),
+            declared_env: BTreeSet::new(),
+        }
+    }
+
+    /// Drives one `ApplyConfig` through the actor.
+    ///
+    /// `handle_command` answers synchronously, before it returns, which is
+    /// what makes the `await` here resolve rather than hope (IR-46).
+    async fn apply_config(
+        actor: &mut Actor<ScriptedRunner>,
+        apps: Vec<DeclaredApp>,
+        reset: ResetDepth,
+    ) -> Vec<Applied> {
+        let (reply, answer) = oneshot::channel();
+        actor.handle_command(Command::ApplyConfig { apps, reset, reply });
+        answer
+            .await
+            .expect("the actor answers an apply before it returns")
+            .expect("the fixture flock is registered")
+    }
+
+    /// fails if a later file load overwrites a key the operator set. Additive
+    /// is the default precisely because a Flockfile arrives from the app's own
+    /// repository, so a merged pull request must not be able to change a
+    /// running flock's config.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_load_does_not_overwrite_an_established_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&dir, &[app_with("web", |app| app.max_restarts = 3)]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script", "max_restarts"],
+                vec![("max_restarts", serde_json::json!(3))],
+            ),
+        )
+        .unwrap();
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 99;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().max_restarts,
+            3,
+            "the file overwrote a key the operator had set"
+        );
+        assert!(
+            reply[0].applied.is_empty(),
+            "nothing applied, so nothing may be reported as applied: {reply:?}"
+        );
+    }
+
+    /// fails if a key absent from the established set is not appended. This is
+    /// what makes a template update reach an app at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_load_appends_a_key_nobody_had_established() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(&["name", "script"], Vec::new()),
+        )
+        .unwrap();
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_memory = Some(MemSize::from_bytes(512 << 20));
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_memory"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().max_memory,
+            Some(MemSize::from_bytes(512 << 20)),
+            "a key nobody had established must be appended"
+        );
+        assert_eq!(reply[0].applied, vec!["max_memory".to_string()]);
+    }
+
+    /// fails if a Live field does not take effect on the stored spec.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_field_lands_on_the_stored_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 42;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(actor.sheep[&0].entry.spec.config().max_restarts, 42);
+        assert_eq!(reply[0].applied, vec!["max_restarts".to_string()]);
+        assert!(reply[0].pending.is_empty(), "{reply:?}");
+    }
+
+    /// fails if a NeedsRespawn field touches the running child rather than
+    /// parking. A load must never kill a process.
+    #[tokio::test(start_paused = true)]
+    async fn a_needs_respawn_field_parks_as_pending_and_leaves_the_child_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(
+            entry.pid,
+            Some(APPLY_FIRST_PID),
+            "the running child must not have been replaced"
+        );
+        assert!(
+            entry.spec.config().env.is_empty(),
+            "the running child's own config must keep describing what it was spawned from"
+        );
+        assert_eq!(
+            entry
+                .pending
+                .as_ref()
+                .expect("a NeedsRespawn change parks as pending")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue")
+        );
+        assert_eq!(reply[0].pending, vec!["env".to_string()]);
+        assert!(reply[0].applied.is_empty(), "{reply:?}");
+        assert_eq!(
+            reply[0]
+                .app
+                .as_ref()
+                .expect("an applied app is recorded")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "a reboot spawns everything afresh, so what it comes up on is the \
+             full merge and not what the running child is on"
+        );
+    }
+
+    /// fails if a merged config that cannot normalize is half-applied. An app
+    /// whose merge is invalid refuses whole; the rest of the flock still
+    /// applies.
+    #[tokio::test(start_paused = true)]
+    async fn an_unnormalizable_merge_refuses_one_app_and_applies_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&dir, &[app_with("web", |_| {}), app_with("worker", |_| {})]);
+
+        // Two instances sharing one explicit log path, with no `{{instance}}`
+        // in it and no `merge_logs`: the one refusal a merge can produce out
+        // of two individually-legal keys.
+        let mut broken = AppConfig::minimal("web", "./srv");
+        broken.instances = 2;
+        broken.out_file = Some("/tmp/web.log".to_string());
+        let mut worker = AppConfig::minimal("worker", "./srv");
+        worker.max_restarts = 7;
+
+        // `Settings`, not `None`: a plain load holds `instances` out of the
+        // merge entirely (it never reshapes a flock), so the two keys could
+        // not meet under it and the merge would be perfectly valid.
+        let reply = apply_config(
+            &mut actor,
+            vec![
+                declared_app(broken, &["name", "script", "instances", "out_file"]),
+                declared_app(worker, &["name", "script", "max_restarts"]),
+            ],
+            ResetDepth::Settings,
+        )
+        .await;
+
+        assert!(
+            reply[0].refused.is_some(),
+            "an unnormalizable merge must refuse: {reply:?}"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().instances,
+            1,
+            "a refused app's stored config must be untouched"
+        );
+        assert!(actor.sheep[&0].entry.spec.config().out_file.is_none());
+        assert_eq!(actor.sheep[&1].entry.spec.config().max_restarts, 7);
+        assert_eq!(reply[1].applied, vec!["max_restarts".to_string()]);
+    }
+
+    /// fails if an app the file no longer mentions is deleted. A load never
+    /// prunes: the daemon has no record of which Flockfile an app came from,
+    /// so `shep start ./a/Flockfile.toml` followed by `./b/Flockfile.toml`
+    /// would have the second wipe the first's flock.
+    #[tokio::test(start_paused = true)]
+    async fn an_app_absent_from_the_file_is_left_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&dir, &[app_with("web", |_| {}), app_with("worker", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 5;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let worker = &actor.sheep[&1].entry;
+        assert_eq!(worker.spec.config().name, "worker");
+        assert_eq!(worker.status, ProcStatus::Online);
+        assert_eq!(worker.pid, Some(APPLY_FIRST_PID + 1));
+        assert!(
+            reply.iter().all(|applied| applied.name != "worker"),
+            "a load must not claim to have touched an app the file never named: {reply:?}"
+        );
+    }
+
+    /// fails if a load during a reload reads the drainee as the app. The
+    /// drainee holds the lower id, so `ids.first()` picked the instance on
+    /// its way out, and the spec derived from it was written onto the live
+    /// replacement -- which then claimed to be running the config it had just
+    /// replaced.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_during_a_reload_reads_the_replacement_and_not_the_drainee() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.instances = 2;
+                app.cwd = Some("/srv/new".to_string());
+            })],
+        );
+        // Instance 0 is the drainee: the lower id, still on the config the
+        // reload is replacing, and already `Stopping`.
+        {
+            let slot = actor
+                .sheep
+                .get_mut(&0)
+                .expect("the fixture registered two slots");
+            slot.entry.status = ProcStatus::Stopping;
+            slot.entry.reload = ReloadState::Drainee { new_id: Some(1) };
+            slot.entry.spec = app_with("web", |app| {
+                app.instances = 2;
+                app.cwd = Some("/srv/old".to_string());
+            });
+        }
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 7;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            actor.sheep[&1].entry.spec.config().cwd.as_deref(),
+            Some("/srv/new"),
+            "the replacement's spec must keep describing what the replacement \
+             was spawned from: {reply:?}"
+        );
+        assert_eq!(actor.sheep[&1].entry.spec.config().max_restarts, 7);
+        assert_eq!(reply[0].applied, vec!["max_restarts".to_string()]);
+        assert!(reply[0].pending.is_empty(), "{reply:?}");
+    }
+
+    /// fails if a Flockfile can reach a dog. A dog runs at the daemon's own
+    /// trust level, so a file that names one and carries a `script` was a way
+    /// to replace an adopted binary without adopting anything, and `shep
+    /// dogs` went on reporting the dog it used to be.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_naming_a_dog_is_refused_rather_than_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("metrics", |_| {})]);
+        actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registered one slot")
+            .entry
+            .dog = Some(DogSource::BuiltIn);
+
+        let mut file = AppConfig::minimal("metrics", "/opt/evil");
+        file.max_restarts = 42;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            reply[0].refused.as_deref(),
+            Some(
+                "metrics is a dog, and a dog's config comes from `shep adopt` rather than \
+                 from a Flockfile"
+            ),
+            "{reply:?}"
+        );
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(entry.spec.config().script, "./srv");
+        assert_eq!(
+            entry.spec.config().max_restarts,
+            AppConfig::default().max_restarts
+        );
+        assert!(entry.pending.is_none(), "a refused app parks nothing");
+        assert!(
+            shep_core::overrides::get(&actor.paths.overrides, "metrics")
+                .unwrap()
+                .is_none(),
+            "a refused app establishes nothing"
+        );
+    }
+
+    /// fails if a reset resolves an undeclared key to the compiled default
+    /// rather than to the file as loaded. The CLI defaults `cwd` to the
+    /// Flockfile's own directory without the document declaring it, so a
+    /// reset that reached for the default parked `cwd: None` on an app whose
+    /// file had not changed at all, and the next restart could not find the
+    /// script. `fold` and `interpreter` arrive the same way.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_against_an_unchanged_file_keeps_a_defaulted_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.cwd = Some("/srv/web".to_string());
+                app.fold = Some("edge".to_string());
+            })],
+        );
+
+        // What `shep start Flockfile.toml --reset` sends for an unmodified
+        // two-line file: the resolved config carries the defaulted `cwd` and
+        // the `--fold`, and the document declared neither.
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.cwd = Some("/srv/web".to_string());
+        file.fold = Some("edge".to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script"])],
+            ResetDepth::Settings,
+        )
+        .await;
+
+        // `cwd` is a `NeedsRespawn` field, so the damage lands in `pending`
+        // rather than on the running spec: the child kept the directory it
+        // was spawned in and the next restart was the one that could not
+        // find the script.
+        assert!(
+            actor.sheep[&0].entry.pending.is_none(),
+            "an unchanged file has nothing to park: {reply:?}"
+        );
+        assert!(reply[0].pending.is_empty(), "{reply:?}");
+        let config = actor.sheep[&0].entry.spec.config().clone();
+        assert_eq!(config.cwd.as_deref(), Some("/srv/web"));
+        assert_eq!(config.fold.as_deref(), Some("edge"));
+    }
+
+    /// fails if a reset does not put every non-env setting back to the file,
+    /// or if the two depths do not part company over env. `--reset` restores
+    /// settings, declared or not, and leaves env; `--reset-all` takes env
+    /// with it and drops the record.
+    #[tokio::test(start_paused = true)]
+    async fn reset_restores_every_setting_and_only_reset_all_takes_env() {
+        // The operator's three edits since the file established name, script
+        // and max_restarts: one over a key the file declares, one env key and
+        // one field the file has never mentioned.
+        let stored = |name: &str| {
+            app_with(name, |app| {
+                app.max_restarts = 3;
+                app.env = BTreeMap::from([("OPERATOR".to_string(), "1".to_string())]);
+                app.min_uptime = UpDuration::from_millis(9000);
+            })
+        };
+        let record = || {
+            established(
+                &["name", "script", "max_restarts"],
+                vec![
+                    ("max_restarts", serde_json::json!(3)),
+                    ("env", serde_json::json!({ "OPERATOR": "1" })),
+                    ("min_uptime", serde_json::json!("9000ms")),
+                ],
+            )
+        };
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.max_restarts = 10;
+            declared_app(file, &["name", "script", "max_restarts"])
+        };
+
+        let settings_dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&settings_dir, &[stored("web")]);
+        shep_core::overrides::put(&actor.paths.overrides, "web", &record()).unwrap();
+        apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+        let settings = actor.sheep[&0].entry.spec.config().clone();
+        let settings_pending = actor.sheep[&0].entry.pending.clone();
+        assert_eq!(
+            settings.max_restarts, 10,
+            "--reset puts a declared setting back to the file's"
+        );
+        assert_eq!(
+            settings.min_uptime,
+            AppConfig::default().min_uptime,
+            "--reset puts a field the file never declared back to the file's \
+             own value, which for an undeclared key is the compiled default"
+        );
+        assert_eq!(
+            settings_pending
+                .as_ref()
+                .map_or(&settings.env, |app| &app.config().env)
+                .get("OPERATOR")
+                .map(String::as_str),
+            Some("1"),
+            "--reset keeps env"
+        );
+
+        let all_dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&all_dir, &[stored("web")]);
+        shep_core::overrides::put(&actor.paths.overrides, "web", &record()).unwrap();
+        apply_config(&mut actor, vec![file()], ResetDepth::All).await;
+        let all = actor.sheep[&0].entry.spec.config().clone();
+        let all_pending = actor.sheep[&0].entry.pending.clone();
+        assert_eq!(all.max_restarts, 10);
+        assert_eq!(
+            all.min_uptime,
+            AppConfig::default().min_uptime,
+            "--reset-all drops a field the operator added"
+        );
+        assert!(
+            all_pending
+                .as_ref()
+                .expect("dropping an env key needs a respawn")
+                .config()
+                .env
+                .is_empty(),
+            "--reset-all drops an env key the operator added"
+        );
+        assert!(
+            shep_core::overrides::get(&actor.paths.overrides, "web")
+                .unwrap()
+                .is_none(),
+            "--reset-all removes the override record"
+        );
+    }
+
+    /// fails if a `--reset` establishes an env key it never merged. The
+    /// `Settings` depth touches env not at all, so a template that has grown
+    /// `NEW_KEY` reports nothing and merges nothing -- and used to record the
+    /// key as established anyway, after which no plain load could ever append
+    /// it and only `--reset-all` could recover, taking every other env value
+    /// with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_settings_reset_does_not_establish_an_env_key_it_never_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(&["name", "script"], Vec::new()),
+        )
+        .unwrap();
+
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.env = BTreeMap::from([("NEW_KEY".to_string(), "1".to_string())]);
+            declared_app(file, &["name", "script", "env"])
+        };
+        let reset = apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+
+        assert!(
+            actor.sheep[&0].entry.spec.config().env.is_empty(),
+            "a `--reset` merges no env at all: {reset:?}"
+        );
+        assert!(
+            shep_core::overrides::get(&actor.paths.overrides, "web")
+                .unwrap()
+                .expect("the load records what it established")
+                .declared_env
+                .is_empty(),
+            "a key that never merged is not established"
+        );
+
+        // The proof that matters: the plain load after it can still append.
+        let plain = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert_eq!(
+            actor.sheep[&0]
+                .entry
+                .pending
+                .as_ref()
+                .expect("an env change parks for the next spawn")
+                .config()
+                .env
+                .get("NEW_KEY")
+                .map(String::as_str),
+            Some("1"),
+            "{plain:?}"
+        );
+    }
+
+    /// fails if a changed memory ceiling never reaches the extras registry.
+    /// `max_memory`, `watch` and the cron pair are read when a worker is
+    /// ARMED, so a spec write alone leaves the old value enforced for as long
+    /// as that arming lives.
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_extras_field_rearms_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(100 << 20));
+            })],
+        );
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_memory = Some(MemSize::from_bytes(512 << 20));
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_memory"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            enforcer
+                .arms()
+                .last()
+                .expect("a changed ceiling re-arms the name")
+                .limit,
+            MemSize::from_bytes(512 << 20),
+            "the registry was re-armed with the old ceiling"
+        );
+    }
+
+    /// fails if a breach measured under a ceiling the operator has since
+    /// RAISED still restarts the sheep. `PollingEnforcer` computes a breach
+    /// under its lock and sends it after releasing that lock, so a re-arm
+    /// landing in between leaves a report in flight that speaks for a limit
+    /// nobody enforces any more. The pid and the status are untouched by
+    /// that, so neither of the guards before this one sees it, and a config
+    /// apply must never kill a process.
+    ///
+    /// Reachable only since a load re-arms: nothing before it called
+    /// `arm` on an id that was already armed.
+    #[tokio::test(start_paused = true)]
+    async fn a_breach_measured_under_a_since_raised_ceiling_does_not_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(100 << 20));
+            })],
+        );
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_memory = Some(MemSize::from_bytes(512 << 20));
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_memory"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        // Over the ceiling that was armed when the sample was taken, well
+        // under the one the load just put in force.
+        actor.handle_extra_restart(
+            0,
+            APPLY_FIRST_PID,
+            None,
+            Some(MemSize::from_bytes(200 << 20)),
+        );
+
+        let slot = &actor.sheep[&0];
+        assert!(
+            slot.manual.is_none(),
+            "a breach against a ceiling the operator has raised must never claim the manual marker"
+        );
+        assert_eq!(slot.entry.pid, Some(APPLY_FIRST_PID));
+    }
+
+    /// fails if a second load of the same file erases what the first one
+    /// parked. The merge builds on the app's INTENDED config, which is the
+    /// parked one when there is one, not on what the running child was
+    /// spawned from: on the second load the key is established, a plain load
+    /// skips it, and a merge based on the running config would carry the OLD
+    /// value forward over the parked one. Two `shep start Flockfile.toml`
+    /// calls is what a deploy does.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_load_of_the_same_file_keeps_the_first_loads_parked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+            declared_app(file, &["name", "script", "env"])
+        };
+
+        let first = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert_eq!(first[0].pending, vec!["env".to_string()]);
+
+        let second = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+
+        assert_eq!(
+            actor.sheep[&0]
+                .entry
+                .pending
+                .as_ref()
+                .expect("the parked config survives a second load")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "the second load erased what the first parked"
+        );
+        assert_eq!(
+            second[0]
+                .app
+                .as_ref()
+                .expect("an applied app is recorded")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "the recorded app lost it too, so a reboot would come up without it"
+        );
+        assert!(
+            second[0].pending.is_empty(),
+            "the second load changes nothing that was not already coming: {second:?}"
+        );
+    }
+
+    /// fails if a scale-down that removes a non-running instance panics the
+    /// actor, which closes its mailbox and takes the engine down with it. An
+    /// instance with no live task is deregistered SYNCHRONOUSLY inside
+    /// `handle_scale`, so the id list read before the scale can name a slot
+    /// that is already gone by the time the spec write walks it.
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_down_removing_a_non_running_instance_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        // The ordinary case: one instance exited and never came back. No
+        // `ctl`, so its delete resolves on the spot rather than through a
+        // kill ladder.
+        let stopped = actor.sheep.get_mut(&1).expect("the fixture registers two");
+        stopped.entry.status = ProcStatus::Stopped;
+        stopped.entry.pid = None;
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 1;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "instances"])],
+            ResetDepth::Settings,
+        )
+        .await;
+
+        assert_eq!(actor.ids_of_name("web"), vec![0]);
+        assert_eq!(reply[0].applied, vec!["instances".to_string()]);
+        assert_eq!(actor.sheep[&0].entry.spec.config().instances, 1);
+    }
+
+    /// fails if a load that has already reshaped the flock then reports the
+    /// app as untouched. `Applied::refused` with two empty lists is a promise
+    /// that nothing happened, and a scale had happened: the reply said
+    /// nothing landed, `app` was `None` so the muster roll would keep the old
+    /// count, and a second instance was registered and running.
+    ///
+    /// The shape that used to produce it is the same one IMPORTANT 1 names: a
+    /// file declaring `watch` and `cwd` together merges cleanly and cannot be
+    /// reached by a running instance, because `cwd` needs a respawn and
+    /// `watch` does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_that_scales_and_cannot_reach_the_running_spec_reports_what_landed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 2;
+        file.watch = true;
+        file.cwd = Some(root.path().display().to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(
+                file,
+                &["name", "script", "instances", "watch", "cwd"],
+            )],
+            ResetDepth::Settings,
+        )
+        .await;
+
+        assert_eq!(
+            actor.ids_of_name("web").len(),
+            2,
+            "the scale really did happen"
+        );
+        assert!(
+            reply[0].refused.is_none(),
+            "a merge that normalizes is not an invalid file: {reply:?}"
+        );
+        assert!(
+            reply[0].app.is_some(),
+            "the muster roll must not be left on the pre-load config: {reply:?}"
+        );
+        assert_eq!(reply[0].applied, vec!["instances".to_string()]);
+        assert!(
+            reply[0].pending.contains(&"watch".to_string())
+                && reply[0].pending.contains(&"cwd".to_string()),
+            "a change no running instance can take must park, not vanish: {reply:?}"
+        );
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "and it must be parked on the entry, not only reported"
+        );
+    }
+
+    /// fails if a load arms a stopped instance into its name group. Group
+    /// membership is decided by the CONFIG rather than by what is running,
+    /// and both group triggers restart every member, so arming one is arming
+    /// a cron occurrence or a file save to start a process the operator
+    /// stopped. Nothing would tear it down again either: the stopped member
+    /// is already terminal, so no transition calls `disarm` for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_does_not_arm_a_stopped_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+            })],
+        );
+        let stopped = actor.sheep.get_mut(&0).expect("the fixture registers one");
+        stopped.entry.status = ProcStatus::Stopped;
+        stopped.entry.pid = None;
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.cron_restart = Some("*/5 * * * *".to_string());
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "cron_restart"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(
+            actor.registry.group_members("web"),
+            None,
+            "a load armed a schedule that will start a sheep the operator stopped"
+        );
+    }
+
+    /// fails if a plain load reshapes a flock, in either direction: it must
+    /// skip the count and say why, and a `--reset` must take it.
+    /// `shep stock` is an operator setting the count, the additive default
+    /// exists so a template cannot change what an operator set, and the
+    /// override store cannot yet tell a stocked count from an untouched one.
+    /// A plain load acting on the field would DELETE instances.
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_load_never_scales_and_a_reset_does() {
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.instances = 1;
+            declared_app(file, &["name", "script", "instances"])
+        };
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&plain_dir, &[app_with("web", |app| app.instances = 2)]);
+        let reply = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert_eq!(
+            actor.ids_of_name("web").len(),
+            2,
+            "a plain load deleted an instance"
+        );
+        assert!(!reply[0].applied.contains(&"instances".to_string()));
+        assert!(
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("instances")),
+            "an operator whose count did not move must be told why: {reply:?}"
+        );
+        assert_eq!(
+            reply[0]
+                .app
+                .as_ref()
+                .expect("an applied app is recorded")
+                .config()
+                .instances,
+            2,
+            "the recorded count must be the one really running"
+        );
+
+        let reset_dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&reset_dir, &[app_with("web", |app| app.instances = 2)]);
+        let reply = apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+        assert_eq!(actor.ids_of_name("web"), vec![0], "--reset must take it");
+        assert_eq!(reply[0].applied, vec!["instances".to_string()]);
+    }
+
+    /// fails if any one of the eight [`EXTRAS_FIELDS`] stops triggering a
+    /// re-arm. All eight are read when a worker is ARMED, so a spec write
+    /// alone leaves the old value enforced for the life of that worker, and
+    /// deleting any single entry from that list must turn this red rather
+    /// than only the `max_memory` case.
+    ///
+    /// The observable is the memory ceiling, which every one of these apps
+    /// carries unchanged: a re-arm arms every instance, so an arming recorded
+    /// at all is proof the name was re-armed.
+    #[tokio::test(start_paused = true)]
+    async fn every_extras_field_triggers_a_rearm() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().display().to_string();
+        let ceiling = MemSize::from_bytes(100 << 20);
+        // The "before" values every case edits away from.
+        let base = |cwd: &str| {
+            let cwd = cwd.to_string();
+            move |app: &mut AppConfig| {
+                app.max_memory = Some(ceiling);
+                app.cwd = Some(cwd.clone());
+                app.watch = true;
+                app.ignore_watch = vec!["target/**".to_string()];
+                app.watch_delay = Some(UpDuration::from_millis(1000));
+                app.watch_options = vec!["src/**".to_string()];
+                app.cron_restart = Some("0 * * * *".to_string());
+                app.cron_timezone = Some("UTC".to_string());
+                // An interval no paused-clock case advances to, so the probe
+                // never runs and this stays a test about arming.
+                app.liveness_probe = Some(ProbeConfig {
+                    failure_threshold: 3,
+                    interval: UpDuration::from_millis(600_000),
+                    timeout: UpDuration::from_millis(1000),
+                    ..probe_config(ProbeKind::Tcp, "127.0.0.1:1")
+                });
+            }
+        };
+        // One edit per entry in `EXTRAS_FIELDS`, named by the field it
+        // moves, so a field removed from that list has a case with its own
+        // name that goes red.
+        type Edit = (&'static str, fn(&mut AppConfig));
+        let edits: Vec<Edit> = vec![
+            ("max_memory", |app| {
+                app.max_memory = Some(MemSize::from_bytes(512 << 20));
+            }),
+            ("watch", |app| app.watch = false),
+            ("ignore_watch", |app| {
+                app.ignore_watch = vec!["dist/**".to_string()];
+            }),
+            ("watch_delay", |app| {
+                app.watch_delay = Some(UpDuration::from_millis(2500));
+            }),
+            ("watch_options", |app| {
+                app.watch_options = vec!["lib/**".to_string()];
+            }),
+            ("cron_restart", |app| {
+                app.cron_restart = Some("*/5 * * * *".to_string());
+            }),
+            ("cron_timezone", |app| {
+                app.cron_timezone = Some("Europe/Berlin".to_string());
+            }),
+            ("liveness_probe", |app| app.liveness_probe = None),
+        ];
+
+        for (field, edit) in edits {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut actor, enforcer) = actor_over(&dir, &[app_with("web", base(&cwd))]);
+            let mut file = AppConfig::minimal("web", "./srv");
+            base(&cwd)(&mut file);
+            edit(&mut file);
+            let reply = apply_config(
+                &mut actor,
+                vec![declared_app(
+                    file,
+                    &[
+                        "name",
+                        "script",
+                        "cwd",
+                        "max_memory",
+                        "watch",
+                        "ignore_watch",
+                        "watch_delay",
+                        "watch_options",
+                        "cron_restart",
+                        "cron_timezone",
+                        "liveness_probe",
+                    ],
+                )],
+                ResetDepth::Settings,
+            )
+            .await;
+            assert!(
+                reply[0].applied.contains(&field.to_string()),
+                "{field} did not apply at all: {reply:?}"
+            );
+            assert!(
+                !enforcer.arms().is_empty(),
+                "changing {field} left the armed worker on the old value"
+            );
+        }
+    }
+
+    /// fails if a load leaves a group task running on the config it just
+    /// replaced. A name whose instances are all momentarily non-`Online` --
+    /// every one of them inside a crash-restart backoff, which a deploy load
+    /// walks into routinely -- has nothing to arm, and the tempting early
+    /// return there also skips the TEARDOWN. Nothing heals it afterwards:
+    /// `disarm_extras` deliberately leaves a `WaitingRestart` sheep armed, so
+    /// it stays a group member, the group is never torn down, and `arm`
+    /// preserves the live handle when it respawns. A load turning `watch` off
+    /// during that window would leave the watcher restarting the app forever
+    /// while reporting the field as applied.
+    ///
+    /// Arms FIRST, which is what makes it a test of the teardown.
+    /// `a_load_does_not_arm_a_stopped_instance` cannot catch this: its
+    /// fixture arms nothing, so its assertion holds either way.
+    #[tokio::test(start_paused = true)]
+    async fn a_load_tears_down_a_group_whose_instances_are_all_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.cron_restart = Some("0 * * * *".to_string());
+            })],
+        );
+        actor.arm_extras(0);
+        assert_eq!(
+            actor.registry.group_members("web"),
+            Some(vec![0]),
+            "the fixture must really be armed, or this pins nothing"
+        );
+
+        // Mid-backoff: no pid, not online, still registered and still a group
+        // member.
+        let waiting = actor.sheep.get_mut(&0).expect("the fixture registers one");
+        waiting.entry.status = ProcStatus::WaitingRestart;
+        waiting.entry.pid = None;
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.cron_restart = Some("*/5 * * * *".to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "cron_restart"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(reply[0].applied, vec!["cron_restart".to_string()]);
+        assert_eq!(
+            actor.registry.group_members("web"),
+            None,
+            "a worker built from the replaced config survived a load that reported the \
+             field as applied"
+        );
+    }
+
+    /// fails if a load reports a change as parked that it could not park. The
+    /// merge is built on the app's INTENDED config, so it normalizes against
+    /// the count that config carries; the flock can be running a different
+    /// one, and the same config against that count can refuse. The previous
+    /// parked config is left alone (it is an earlier load's change and still
+    /// the one a respawn should pick up), which is exactly why the report
+    /// must not claim this load's fields are in it.
+    #[tokio::test(start_paused = true)]
+    async fn a_change_that_cannot_be_parked_is_not_reported_as_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        // An earlier load parked a one-instance config. Two are running.
+        let earlier = app_with("web", |app| {
+            app.instances = 1;
+            app.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        });
+        for id in [0, 1] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers two")
+                .entry
+                .pending = Some(earlier.clone());
+        }
+
+        // One explicit log path, no `{{instance}}` and no `merge_logs`: legal
+        // for the one instance the parked config declares, refused for the
+        // two really running.
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.out_file = Some("/tmp/web.log".to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "out_file"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert!(
+            !reply[0].pending.contains(&"out_file".to_string()),
+            "a field that went nowhere must not be reported as coming: {reply:?}"
+        );
+        assert!(
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("out_file")),
+            "and the operator must be told which field it was: {reply:?}"
+        );
+        assert_eq!(
+            actor.sheep[&0]
+                .entry
+                .pending
+                .as_ref()
+                .expect("the earlier load's parked config survives")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "the earlier load's parked config must not be cleared"
+        );
+        assert!(
+            reply[0].app.is_none(),
+            "there is no config that holds at the count really running, so nothing may be \
+             recorded: {reply:?}"
+        );
+    }
+
+    /// fails if a merge refusal is unreachable at the DEFAULT depth. The
+    /// sibling case above it reaches one through `instances`, which a plain
+    /// load holds out of the merge entirely, so without this nothing would
+    /// cover the depth every `shep start` actually uses. An app already
+    /// running two instances plus a file declaring one shared explicit
+    /// `out_file` is the reachable shape.
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_load_whose_merge_cannot_normalize_refuses_and_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.out_file = Some("/tmp/web.log".to_string());
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "out_file"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert!(reply[0].refused.is_some(), "{reply:?}");
+        assert!(reply[0].applied.is_empty() && reply[0].pending.is_empty());
+        assert!(reply[0].app.is_none());
+        assert!(actor.sheep[&0].entry.spec.config().out_file.is_none());
+        assert!(actor.sheep[&0].entry.pending.is_none());
+        assert_eq!(actor.ids_of_name("web").len(), 2);
+    }
+
+    /// fails if a load that could not rebuild an earlier load's parked config
+    /// reports success. `parked_wanted` is set by an earlier parked config as
+    /// well as by this load's own `NeedsRespawn` drift, so a load whose only
+    /// drift is a LIVE field can fail the rebuild with no field of its own to
+    /// name -- and a refusal keyed on having a field to name says nothing at
+    /// all. The stale parked config then puts the old value back at the next
+    /// respawn, which is the exact thing the rebuild exists to prevent.
+    ///
+    /// Reachable whenever the instance count moved between two loads, which
+    /// `shep stock` and a `--reset` load both do.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_config_that_cannot_be_rebuilt_is_reported_even_with_no_field_to_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        // Parked when the app ran ONE instance: a shared explicit log path is
+        // legal for one and refused for the two running now.
+        let earlier = app_with("web", |app| {
+            app.instances = 1;
+            app.max_restarts = 10;
+            app.out_file = Some("/tmp/web.log".to_string());
+        });
+        for id in [0, 1] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers two")
+                .entry
+                .pending = Some(earlier.clone());
+        }
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.max_restarts = 99;
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "max_restarts"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        assert_eq!(actor.sheep[&0].entry.spec.config().max_restarts, 99);
+        assert!(
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("could not be rebuilt")),
+            "a respawn is going to put max_restarts back to 10 and nobody was told: {reply:?}"
+        );
+        assert_eq!(
+            actor.sheep[&0]
+                .entry
+                .pending
+                .as_ref()
+                .expect("the earlier parked config is still there")
+                .config()
+                .max_restarts,
+            10,
+            "and that is what makes the refusal true"
+        );
+    }
+
+    /// fails if a key whose apply refused is recorded as established. The
+    /// store's `declared` set is what `ResetDepth::None` skips over, so a
+    /// refused key entering it makes the refusal's own advice useless: the
+    /// operator retries the identical file and gets silence rather than the
+    /// same refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_key_is_not_established_so_the_same_file_still_tries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        let earlier = app_with("web", |app| app.instances = 1);
+        for id in [0, 1] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers two")
+                .entry
+                .pending = Some(earlier.clone());
+        }
+        let file = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.out_file = Some("/tmp/web.log".to_string());
+            declared_app(file, &["name", "script", "out_file"])
+        };
+
+        let names_it = |why: &str| why.contains("out_file");
+        let first = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert!(
+            first[0].refused.as_deref().is_some_and(names_it),
+            "{first:?}"
+        );
+
+        let second = apply_config(&mut actor, vec![file()], ResetDepth::None).await;
+        assert!(
+            second[0].refused.as_deref().is_some_and(names_it),
+            "a retry of the same file must meet the same refusal, not silence: {second:?}"
+        );
+        assert!(
+            !shep_core::overrides::get(&actor.paths.overrides, "web")
+                .unwrap()
+                .expect("the load recorded what it established")
+                .declared
+                .contains("out_file"),
+            "a key that went nowhere was established by nobody"
+        );
+    }
+
+    /// fails if a load never establishes the keys it took, which is the whole
+    /// of the additive default: `ResetDepth::None` skips a key somebody has
+    /// established, so a load that records nothing leaves every key
+    /// permanently re-writable and a Flockfile can change a running flock on
+    /// every load.
+    ///
+    /// Three loads, because two cannot tell the difference. The first
+    /// establishes the key, the second drops it from the file, and the third
+    /// re-adds it with a different value: only a record written by the FIRST
+    /// load can refuse the third. `a_file_load_appends_a_key_nobody_had_established`
+    /// asserts the spec and the report and never reads the store, and
+    /// `a_file_load_does_not_overwrite_an_established_key` reads a record its
+    /// own fixture wrote by hand, so the write side is invisible to both.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_a_load_took_is_established_against_the_next_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        let with_budget = |budget: u32| {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.max_restarts = budget;
+            declared_app(file, &["name", "script", "max_restarts"])
+        };
+
+        let first = apply_config(&mut actor, vec![with_budget(99)], ResetDepth::None).await;
+        assert_eq!(first[0].applied, vec!["max_restarts".to_string()]);
+        assert_eq!(actor.sheep[&0].entry.spec.config().max_restarts, 99);
+
+        // The key leaves the file. Nothing happens, and nothing may forget
+        // that it was established.
+        let dropped = apply_config(
+            &mut actor,
+            vec![declared_app(
+                AppConfig::minimal("web", "./srv"),
+                &["name", "script"],
+            )],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(dropped[0].applied.is_empty(), "{dropped:?}");
+
+        // And comes back with a different value. A plain load must not take
+        // it: the app has been running on 99 since the first load, and an
+        // operator may have set that 99 by hand for all this daemon knows.
+        let third = apply_config(&mut actor, vec![with_budget(5)], ResetDepth::None).await;
+
+        assert_eq!(
+            actor.sheep[&0].entry.spec.config().max_restarts,
+            99,
+            "a file overwrote a key an earlier load had established"
+        );
+        assert!(third[0].applied.is_empty(), "{third:?}");
+        assert!(
+            shep_core::overrides::get(&actor.paths.overrides, "web")
+                .unwrap()
+                .expect("a load records what it established")
+                .declared
+                .contains("max_restarts"),
+            "and the record is what makes that true"
+        );
+    }
+
+    /// fails if a load that refused keeps the override it spent on the way.
+    /// A key the file declares gives up its override during the merge, on the
+    /// grounds that the file speaks for it now; a load that then fails to
+    /// park has to hand it back, or an operator loses a value to a load that
+    /// changed nothing.
+    ///
+    /// `env` is the one field that can reach this under the default depth:
+    /// the top-level keys hold their override by being established, so they
+    /// are never in scope and never spend anything, while `env` merges one
+    /// key at a time and spends the whole override table for any key the file
+    /// declares.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_env_change_gives_the_operators_override_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+        // Parked when the app ran ONE instance, with a shared explicit log
+        // path: legal for one, refused for the two running now, so this
+        // load's own change cannot be parked.
+        let earlier = app_with("web", |app| {
+            app.instances = 1;
+            app.out_file = Some("/tmp/web.log".to_string());
+        });
+        for id in [0, 1] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers two")
+                .entry
+                .pending = Some(earlier.clone());
+        }
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("env", serde_json::json!({ "OPERATOR": "1" }))],
+            ),
+        )
+        .unwrap();
+
+        // Two env keys: the one the operator already holds, which spends the
+        // override table, and one nobody has, which is what makes `env`
+        // drift at all.
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([
+            ("OPERATOR".to_string(), "2".to_string()),
+            ("MODE".to_string(), "blue".to_string()),
+        ]);
+        let reply = apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("env")),
+            "the fixture must really refuse the env change: {reply:?}"
+        );
+
+        let record = shep_core::overrides::get(&actor.paths.overrides, "web")
+            .unwrap()
+            .expect("a load records what it established");
+        assert_eq!(
+            record
+                .fields
+                .get("env")
+                .and_then(|env| env.get("OPERATOR"))
+                .and_then(serde_json::Value::as_str),
+            Some("1"),
+            "a load that changed nothing spent the operator's override"
+        );
+        assert!(
+            record.declared_env.is_empty(),
+            "and it established env keys that never landed: {:?}",
+            record.declared_env
+        );
+    }
+
+    // --- Promotion: a parked config reaching the process that replaces the
+    // one it was parked behind ---
+    //
+    // Actor-tier for the same reason the load cases above are: what a
+    // promotion moves is `spec`, `pending` and `credentials`, and no reply
+    // spelling reports those three together.
+
+    /// fails if a reload zeroes `ProcessEntry::overridden` on the
+    /// replacement it spawns. `spawn_replacement` already carries
+    /// `restarts`/`dog`/`last_exit` off the drainee with the same argument:
+    /// the replacement is the same instance continuing, not a new one --
+    /// `overridden` needed the identical treatment, and its own construction
+    /// site used to hardcode `Vec::new()` instead. `shep reload <name>` is
+    /// also the exact verb `shep describe`'s own Overridden heading tells an
+    /// operator to run, so this is the one path where the bug would have
+    /// been hit constantly rather than at the edges.
+    #[tokio::test(start_paused = true)]
+    async fn reload_carries_the_overridden_cache_to_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        actor.sheep.get_mut(&0).unwrap().entry.overridden = vec!["max_restarts".to_string()];
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        let new_id = actor.reloads["web"]
+            .swap
+            .new_id
+            .expect("an overlapping reload spawns its replacement at once");
+        assert_eq!(
+            actor.sheep[&new_id].entry.overridden,
+            vec!["max_restarts".to_string()],
+            "the replacement must carry the drainee's own overridden cache, not start blank"
+        );
+    }
+
+    /// fails if a reload does not pick up config a file load parked. Without
+    /// this the pending slot is written and never read, so an operator can
+    /// see a pending field forever and has no way to apply it.
+    #[tokio::test(start_paused = true)]
+    async fn reload_promotes_pending_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        let new_id = actor.reloads["web"]
+            .swap
+            .new_id
+            .expect("an overlapping reload spawns its replacement at once");
+        assert_eq!(
+            actor.sheep[&new_id]
+                .entry
+                .spec
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue"),
+            "the replacement must come up on the config the load parked"
+        );
+        assert!(
+            actor.sheep[&new_id].entry.pending.is_none(),
+            "and it is owed nothing further, having been built from what was owed"
+        );
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the drainee keeps its copy until it is deregistered: this swap can still be \
+             abandoned, and the child it would go back to serving has not got the change"
+        );
+        assert_ne!(
+            actor.sheep[&new_id].entry.pid,
+            Some(APPLY_FIRST_PID),
+            "a promotion is only reachable through a process that actually replaced the old one"
+        );
+    }
+
+    /// fails if a restart does not promote. Both verbs replace the child, so
+    /// both are chances to apply what is owed.
+    #[tokio::test(start_paused = true)]
+    async fn restart_promotes_pending_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+
+        // The door an operator's `shep restart` really takes on a RUNNING
+        // sheep: `begin_manual` claims the next exit, and the respawn happens
+        // in `handle_exited` when that exit lands. `apply_immediate`'s
+        // `Restart` arm is the other half of the same verb, for a sheep with
+        // no live task; both end in `respawn`, which is where the promotion
+        // is.
+        let (reply, _answer) = oneshot::channel();
+        actor.begin_manual(
+            ProcessSelector::Name("web".to_string()),
+            ManualKind::Restart,
+            CommandOrigin::Operator,
+            ReplyKind::Info(reply),
+        );
+        actor.handle_exited(
+            0,
+            ExitOutcome {
+                code: Some(0),
+                signal: None,
+            },
+        );
+
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(
+            entry.spec.config().env.get("MODE").map(String::as_str),
+            Some("blue"),
+            "the restarted child must come up on the config the load parked"
+        );
+        assert!(
+            entry.pending.is_none(),
+            "a promoted config is owed no longer, so the slot must be empty"
+        );
+        assert_ne!(
+            entry.pid,
+            Some(APPLY_FIRST_PID),
+            "a promotion is only reachable through a process that actually replaced the old one"
+        );
+    }
+
+    /// fails if `to_info` does not turn a parked config back into field
+    /// NAMES. A pending field an operator cannot see is a silent
+    /// divergence, which is worse than the problem task 12 set out to fix.
+    #[tokio::test(start_paused = true)]
+    async fn to_info_reports_the_pending_fields_names_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let entry = &actor.sheep[&0].entry;
+        assert!(
+            entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+        let info = to_info(entry, &actor.smits);
+        assert_eq!(info.pending, Some(vec!["env".to_string()]));
+    }
+
+    /// fails if `Actor::overridden_for` reads the override store when a
+    /// live sibling could answer for free. A scale-up (`shep stock`) calls
+    /// this once per new instance, so a cache-miss there would cost one
+    /// locked file read per new slot on the hot path -- this proves the
+    /// cheap branch actually wins by seeding the STORE with a different
+    /// answer than the sibling's cache and checking the sibling wins.
+    #[tokio::test(start_paused = true)]
+    async fn overridden_for_prefers_a_live_sibling_over_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        actor.sheep.get_mut(&0).unwrap().entry.overridden = vec!["cwd".to_string()];
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("max_restarts", serde_json::json!(9))],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(actor.overridden_for("web"), vec!["cwd".to_string()]);
+    }
+
+    /// fails if `Actor::overridden_for` cannot answer for a name with no
+    /// live sheep at all -- the case a muster restore and a handover
+    /// installation are both in, one sheep at a time, before there is a
+    /// sibling to ask.
+    #[tokio::test(start_paused = true)]
+    async fn overridden_for_reads_the_store_when_no_sibling_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (actor, _enforcer) = actor_over(&dir, &[]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("max_restarts", serde_json::json!(9))],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actor.overridden_for("web"),
+            vec!["max_restarts".to_string()]
+        );
+        assert_eq!(
+            actor.overridden_for("nobody-has-heard-of-this-app"),
+            Vec::<String>::new(),
+            "an unreadable-or-empty answer for a name the store has never seen"
+        );
+    }
+
+    /// fails if `ProcessEntry::overridden` drifts from what the override
+    /// store actually holds after a load, or if `to_info` does not read the
+    /// cache back. An override with nothing to show it is a silent
+    /// divergence too, the same class of bug `pending`'s own test above
+    /// closes.
+    #[tokio::test(start_paused = true)]
+    async fn to_info_reports_the_overridden_field_names_the_store_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&dir, &[app_with("web", |app| app.max_restarts = 7)]);
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("max_restarts", serde_json::json!(7))],
+            ),
+        )
+        .unwrap();
+
+        let file = AppConfig::minimal("web", "./srv");
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(
+            entry.overridden,
+            vec!["max_restarts".to_string()],
+            "the cache must mirror what this load wrote back to the override store"
+        );
+        let info = to_info(entry, &actor.smits);
+        assert_eq!(info.overridden, Some(vec!["max_restarts".to_string()]));
+    }
+
+    /// fails if `ProcessInfo` ever carries an override VALUE, at the actual
+    /// producer -- unlike a test that hands a hand-built `ProcessInfo` a
+    /// value and checks the value is still there, which no code path can
+    /// even produce and which proves nothing. This seeds the override store
+    /// itself with a real secret-shaped value, the way `env` genuinely
+    /// arrives there, applies a load over it, and reads `to_info`'s own
+    /// output back. `AppOverrides::fields` is a `serde_json::Map` that can
+    /// hold anything (the module's own doc says so), so the only real
+    /// guarantee is that `Actor::apply_one`/`Actor::overridden_for` extract
+    /// `.keys()` and never a value (IR-41).
+    #[tokio::test(start_paused = true)]
+    async fn to_info_never_carries_an_override_value() {
+        const SENTINEL: &str = "postgres://sentinel-value-that-must-never-appear";
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.env = BTreeMap::from([("DATABASE_URL".to_string(), SENTINEL.to_string())]);
+            })],
+        );
+        shep_core::overrides::put(
+            &actor.paths.overrides,
+            "web",
+            &established(
+                &["name", "script"],
+                vec![("env", serde_json::json!({ "DATABASE_URL": SENTINEL }))],
+            ),
+        )
+        .unwrap();
+
+        let file = AppConfig::minimal("web", "./srv");
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let entry = &actor.sheep[&0].entry;
+        let info = to_info(entry, &actor.smits);
+        assert_eq!(
+            info.overridden,
+            Some(vec!["env".to_string()]),
+            "the name must still reach the operator"
+        );
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(
+            !json.contains(SENTINEL),
+            "an override value reached the wire: {json}"
+        );
+    }
+
+    /// fails if promoting a `user` change reuses the identity resolved at the
+    /// original start. `credentials` is resolved once precisely so a restart
+    /// does not change a running app's identity by accident; an operator
+    /// editing `user` is asking for it on purpose, and that is the one case
+    /// that must re-resolve.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn promoting_a_user_change_re_resolves_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.user = Some(own_user_name());
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "user"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        let wanted = Credentials {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: None,
+        };
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(wanted),
+            "the replacement must carry the identity the promoted `user` resolves to; `None` \
+             here is the fixture's stale resolution, which is the change being ignored"
+        );
+        let new_id = actor.reloads["web"]
+            .swap
+            .new_id
+            .expect("an overlapping reload spawns its replacement at once");
+        assert_eq!(
+            actor.sheep[&new_id].entry.credentials,
+            SpawnIdentity::Resolved(Some(wanted)),
+            "and the replacement records it, so the restart after this one reuses it"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.credentials,
+            SpawnIdentity::Resolved(None),
+            "while the drainee's own identity is untouched: it is still serving under it, and \
+             an abandoned swap must not leave it recorded as never looked up"
+        );
+    }
+
+    /// fails if promotion resets credentials for a field that has nothing to
+    /// do with identity. Re-resolving on every promotion would mean a passwd
+    /// lookup per config change and would defeat the once-only rule for no
+    /// reason.
+    #[tokio::test(start_paused = true)]
+    async fn promoting_an_unrelated_change_keeps_the_resolved_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(
+            &dir,
+            &[app_with("web", |app| {
+                app.user = Some(NO_SUCH_USER.to_string())
+            })],
+        );
+        // Resolved back when that passwd entry still existed. A name that no
+        // longer resolves is what makes reuse observable at all: this value
+        // cannot be re-derived, so a spawn carrying it is a spawn that reused
+        // it, and a re-resolution could only fail.
+        let settled = Credentials {
+            uid: 4242,
+            gid: None,
+        };
+        actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registers one instance")
+            .entry
+            .credentials = SpawnIdentity::Resolved(Some(settled));
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.args = vec!["--port=8080".to_string()];
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "args"])],
+            ResetDepth::None,
+        )
+        .await;
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the fixture must really park the change, or this case proves nothing"
+        );
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        assert_eq!(
+            actor.runner.spawn_count(),
+            1,
+            "the replacement must have been spawned at all: an identity re-resolved here could \
+             only refuse, and a refusal would abandon the reload"
+        );
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(settled),
+            "an `args` change is not an identity change, so the replacement runs as whoever the \
+             instance was already running as"
+        );
+        assert_eq!(
+            actor.sheep[&0].entry.credentials,
+            SpawnIdentity::Resolved(Some(settled)),
+            "and the stored resolution is untouched, so no passwd lookup was spent"
+        );
+        assert!(
+            actor.sheep[&0].entry.pending.is_some(),
+            "the drainee keeps what it was owed; the replacement is what carries it"
+        );
+        let new_id = actor.reloads["web"]
+            .swap
+            .new_id
+            .expect("an overlapping reload spawns its replacement at once");
+        assert_eq!(
+            actor.sheep[&new_id].entry.spec.config().args,
+            vec!["--port=8080".to_string()],
+            "the promotion itself must still have happened"
+        );
+    }
+
+    /// fails if a sibling instance that has not yet promoted loses its
+    /// re-resolution to a later load. The bug this pins needs no operator: a
+    /// crash, a memory breach or a liveness failure restarts one instance on
+    /// its own, and `apply_one` derives one spec from `ids_of_name`'s FIRST
+    /// id, which is always instance 0, and writes it onto every sibling. A
+    /// promotion that diffed `pending` against `spec` would then find the
+    /// `user` change instance 1 has still not applied already sitting on
+    /// instance 1's spec, and reuse the identity it was supposed to replace.
+    ///
+    /// Three loads, not two, because that is what separates a sticky flag
+    /// from one recomputed per load: by the third, instance 1's spec is
+    /// already flattened, so a load that recomputed would clear a decision
+    /// the first load correctly made.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_sibling_that_has_not_promoted_yet_still_re_resolves_after_later_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 3)]);
+        // The identity the three instances are already running under, and one
+        // no lookup could produce, so a spawn carrying it is a spawn that
+        // reused it.
+        let settled = Credentials {
+            uid: 4242,
+            gid: None,
+        };
+        for id in [0, 1, 2] {
+            actor
+                .sheep
+                .get_mut(&id)
+                .expect("the fixture registers three")
+                .entry
+                .credentials = SpawnIdentity::Resolved(Some(settled));
+        }
+
+        let user_change = || {
+            let mut file = AppConfig::minimal("web", "./srv");
+            file.instances = 3;
+            file.user = Some(own_user_name());
+            vec![declared_app(file, &["name", "script", "instances", "user"])]
+        };
+        apply_config(&mut actor, user_change(), ResetDepth::None).await;
+
+        // Instance 0 alone. Nothing an operator did: this is the shape every
+        // automatic restart takes.
+        actor.respawn(0, true);
+
+        // The same file again, twice. Each reads its base config off instance
+        // 0, which has now promoted, and writes it over instances 1 and 2.
+        apply_config(&mut actor, user_change(), ResetDepth::None).await;
+        apply_config(&mut actor, user_change(), ResetDepth::None).await;
+
+        actor.respawn(1, true);
+
+        let wanted = Credentials {
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: None,
+        };
+        assert_eq!(
+            actor.runner.spawned_as(1),
+            Some(wanted),
+            "instance 1 has still never applied the `user` change, so its promotion must \
+             re-resolve; the settled 4242 here is the change being silently dropped"
+        );
+        assert_eq!(
+            actor.sheep[&1].entry.spec.config().user,
+            Some(own_user_name()),
+            "and its own spec must record what it came up on"
+        );
+    }
+
+    /// fails if an abandoned reload eats the parked config. The drainee goes
+    /// back to serving the child it already had, which was never spawned with
+    /// that config; an entry claiming it, with an empty pending slot, leaves
+    /// the next load seeing no drift and nothing owed while the child runs
+    /// superseded code. Ordinary trigger: a replacement that does not signal
+    /// ready inside `listen_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_reload_leaves_the_parked_config_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        // A live control sender is what says this instance's task is still
+        // there to go back to; the fixture leaves it `None`.
+        let (ctl_tx, _ctl_rx) = mpsc::channel(SHEEP_CTL_CAPACITY);
+        actor.sheep.get_mut(&0).expect("the fixture's sheep").ctl = Some(ctl_tx);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        actor.advance_reload("web", VecDeque::from([0]));
+        actor.handle_reload_deadline("web", actor.reloads["web"].deadline);
+
+        assert!(actor.reloads.is_empty(), "the swap must really be off");
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(
+            entry.status,
+            ProcStatus::Online,
+            "the drainee is serving again, so it is the child spawned before the load"
+        );
+        assert!(
+            entry.spec.config().env.is_empty(),
+            "and its spec must still describe what that child was spawned from"
+        );
+        assert_eq!(
+            entry
+                .pending
+                .as_ref()
+                .expect("the config is still owed: no child ever came up on it")
+                .config()
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue")
+        );
+    }
+
+    /// fails if an abandoned reload leaves a serving instance recorded as
+    /// never having had its identity looked up. `SpawnIdentity::Unresolved`
+    /// means exactly that, and a later spawn reading it resolves from
+    /// scratch: for a `user` that has since stopped resolving, that is a
+    /// running app whose next restart is refused over an identity it is
+    /// already running under.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_reload_leaves_the_drainees_identity_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |_| {})]);
+        let settled = Credentials {
+            uid: 4242,
+            gid: None,
+        };
+        actor
+            .sheep
+            .get_mut(&0)
+            .expect("the fixture registers one instance")
+            .entry
+            .credentials = SpawnIdentity::Resolved(Some(settled));
+
+        // A `user` that cannot resolve, so the reload is abandoned at the one
+        // point that runs before anything else in `spawn_replacement`.
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.user = Some(NO_SUCH_USER.to_string());
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "user"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        assert_eq!(
+            actor.runner.spawn_count(),
+            0,
+            "the fixture must really refuse the replacement, or this case proves nothing"
+        );
+        let entry = &actor.sheep[&0].entry;
+        assert_eq!(
+            entry.credentials,
+            SpawnIdentity::Resolved(Some(settled)),
+            "the drainee is still serving under this identity, so the abandoned swap must not \
+             record it as never looked up"
+        );
+        assert!(
+            entry.pending.is_some(),
+            "and it is still owed the config that swap was going to bring"
+        );
+    }
+
+    /// fails if a reload decides its ordering from the config the drainee is
+    /// on rather than the one its replacement will carry. `readiness_probe`
+    /// is a `NextSpawn` field and lands on the stored spec the moment a load
+    /// arrives, while `wait_ready` is `NeedsRespawn` and parks, so an app
+    /// being moved from channel readiness to an HTTP probe holds both at
+    /// once. `wait_ready` wins in `ReadinessSource::of`, so an ordering read
+    /// from the stored spec says overlap while the replacement comes up
+    /// probe-gated: two instances on one address, with a probe the DRAINEE
+    /// answers, which is the false-ready the serial ordering exists to
+    /// prevent.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_orders_itself_by_the_config_its_replacement_will_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) =
+            actor_over(&dir, &[app_with("web", |app| app.wait_ready = true)]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.wait_ready = false;
+        file.readiness_probe = Some(probe_config(ProbeKind::Tcp, "127.0.0.1:9"));
+        apply_config(
+            &mut actor,
+            vec![declared_app(
+                file,
+                &["name", "script", "wait_ready", "readiness_probe"],
+            )],
+            ResetDepth::None,
+        )
+        .await;
+        let entry = &actor.sheep[&0].entry;
+        assert!(
+            entry.spec.config().wait_ready && entry.spec.config().readiness_probe.is_some(),
+            "the fixture must really hold both at once, or this case proves nothing"
+        );
+
+        actor.advance_reload("web", VecDeque::from([0]));
+
+        let job = &actor.reloads["web"];
+        assert_eq!(
+            job.mode,
+            ReloadMode::Serial,
+            "the replacement is probe-gated, and a probe cannot say which of two overlapping \
+             instances answered it"
+        );
+        assert_eq!(
+            job.swap.phase,
+            ReloadPhase::DrainFirst,
+            "so the drain runs first and nothing is spawned yet"
+        );
+        assert_eq!(
+            actor.runner.spawn_count(),
+            0,
+            "an overlap here would put a second instance on the drainee's address"
+        );
+    }
+
+    /// fails if a scale-up creates instances that are owed nothing. The new
+    /// instances are spawned from the config the OLD ones are running, read
+    /// off instance 0, and `spawn_fresh` registers no pending slot -- so
+    /// `shep stock web 4` during a parking window would leave two instances
+    /// on superseded config with nothing anywhere saying a restart is due,
+    /// and the next load would see no drift against them and report nothing
+    /// to do.
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_up_carries_the_parked_config_onto_the_instances_it_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 2;
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "instances", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        // The standalone verb, not the count inside a load: `apply_one` parks
+        // onto every slot AFTER its own scale, so only this door can create an
+        // instance nothing has parked for.
+        let (reply, mut answer) = oneshot::channel();
+        actor.handle_scale("web", 4, reply);
+        answer
+            .try_recv()
+            .expect("handle_scale answers before it returns")
+            .expect("the fixture has scripts enough to scale to four");
+
+        for id in [2, 3] {
+            assert_eq!(
+                actor.sheep[&id]
+                    .entry
+                    .pending
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("instance {id} must be owed the parked config"))
+                    .config()
+                    .env
+                    .get("MODE")
+                    .map(String::as_str),
+                Some("blue"),
+                "an instance created during a parking window is owed the same config as its \
+                 siblings"
+            );
+            assert!(
+                actor.sheep[&id].entry.spec.config().env.is_empty(),
+                "and its own spec still describes what it was actually spawned from"
+            );
+        }
+    }
+
+    /// fails if a scale leaves a stale count inside the config it carries
+    /// onto the slots it created. The parked config was copied verbatim, so
+    /// after `shep stock web 4` during a parking window every slot held
+    /// `pending.instances = 2` against a spec of 4: `drifted_fields` reported
+    /// `instances` pending on every row forever, `shep describe` told the
+    /// operator a reload would promote it, and the reload that promoted
+    /// rewrote the count back down over a number the muster roll already had.
+    #[tokio::test(start_paused = true)]
+    async fn a_scale_updates_the_count_inside_the_config_it_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 2)]);
+
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 2;
+        file.env = BTreeMap::from([("MODE".to_string(), "blue".to_string())]);
+        apply_config(
+            &mut actor,
+            vec![declared_app(file, &["name", "script", "instances", "env"])],
+            ResetDepth::None,
+        )
+        .await;
+
+        let (reply, mut answer) = oneshot::channel();
+        actor.handle_scale("web", 4, reply);
+        answer
+            .try_recv()
+            .expect("handle_scale answers before it returns")
+            .expect("the fixture has scripts enough to scale to four");
+
+        for id in 0..4 {
+            let entry = &actor.sheep[&id].entry;
+            assert_eq!(
+                entry
+                    .pending
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("instance {id} must be owed the parked config"))
+                    .config()
+                    .instances,
+                4,
+                "the count a scale achieved, not the one an earlier load parked"
+            );
+            assert!(
+                !to_info(entry, &actor.smits)
+                    .pending
+                    .unwrap_or_default()
+                    .contains(&"instances".to_string()),
+                "a reload owes this instance nothing about the count"
+            );
+        }
+    }
+
+    /// fails if a parked config, or the reset decision that travels with it,
+    /// does not survive a daemon handover.
+    ///
+    /// Design spec: `ProcessEntry` gains `pending` and `CarriedSheep` gains
+    /// it too. The cost of losing it is silent config erasure through the
+    /// one door nobody watches: an operator loads a Flockfile, sees fields
+    /// reported pending, then runs `shep daemon reload` to pick up a new
+    /// binary. The `Live` fields ride across on the carried `AppConfig` and
+    /// survive; everything parked would vanish, and the next load would
+    /// compare against a spec that already matched and report nothing to do.
+    ///
+    /// The two fields are asserted through a promotion rather than by
+    /// reading them back, because reading them back is the handover module's
+    /// own case. What this adds is the property that case cannot reach: a
+    /// config that arrives without its flag promotes on the identity the
+    /// flag exists to replace, and only a spawn shows that.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_config_and_its_reset_decision_survive_a_handover() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[]);
+
+        // The predecessor's entry: registered, not running, owed a `user`
+        // change, and settled on an identity no lookup could produce -- so a
+        // spawn carrying 4242 is a spawn that reused it.
+        let settled = Credentials {
+            uid: 4242,
+            gid: None,
+        };
+        let entry = ProcessEntry {
+            id: 7,
+            spec: app_with("web", |_| {}),
+            pending: Some(app_with("web", |app| app.user = Some(own_user_name()))),
+            pending_reidentifies: true,
+            overridden: Vec::new(),
+            instance: 0,
+            status: ProcStatus::Stopped,
+            pid: None,
+            restarts: 0,
+            started_at: None,
+            budget: RestartBudget::default(),
+            reload: ReloadState::None,
+            credentials: SpawnIdentity::Resolved(Some(settled)),
+            out_file: PathBuf::new(),
+            err_file: PathBuf::new(),
+            dog: None,
+            last_exit: None,
+        };
+        let carried =
+            CarriedSheep::from_entry(&entry, 0, CarriedFds::none(), false, None, false, None);
+
+        // Through serde, which is the boundary a handover actually crosses:
+        // an accessor that read the entry it was built from would prove
+        // nothing about the blob.
+        let crossed: CarriedSheep = serde_json::from_value(serde_json::to_value(&carried).unwrap())
+            .expect("this daemon reads what it writes");
+
+        actor
+            .install_adopted(without_handles(crossed), &Arc::new(AdoptedReaper::new()))
+            .expect("a registered-and-stopped sheep installs with nothing to adopt");
+
+        assert!(
+            actor.sheep[&7].entry.pending.is_some(),
+            "the successor must still owe this sheep the change its predecessor parked"
+        );
+
+        actor.respawn(7, true);
+
+        assert_eq!(
+            actor.runner.spawned_as(0),
+            Some(Credentials {
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: None,
+            }),
+            "and promoting it must re-resolve: the settled 4242 here is the reset decision \
+             lost in the blob, which is the identity change silently dropped"
+        );
+        assert_eq!(
+            actor.sheep[&7].entry.spec.config().user,
+            Some(own_user_name()),
+            "and the promoted config is what the successor now records"
+        );
     }
 }

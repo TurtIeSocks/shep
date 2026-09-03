@@ -103,6 +103,20 @@ export const docsNav: DocsNavGroup[] = [
         spec: { anchor: "5-configuration", label: "§5 Configuration" },
       },
       {
+        slug: "overrides",
+        label: "Overrides",
+        built: true,
+        source: [
+          "crates/shep-core/src/overrides.rs",
+          "crates/shep-core/src/config/apply.rs",
+        ],
+        spec: { anchor: "5-configuration", label: "§5 Configuration" },
+        api: {
+          path: "overrides/struct.AppOverrides.html",
+          label: "shep_core::overrides::AppOverrides",
+        },
+      },
+      {
         slug: "shepherd-channel",
         label: "The shepherd channel",
         built: true,

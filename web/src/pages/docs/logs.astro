@@ -32,9 +32,9 @@ noisy | to stderr`;
 const reopenDemo = `$ mv /tmp/shepdocs/home/logs/web-0-out.log /tmp/shepdocs/home/logs/web-0-out.log.1
 $ mv /tmp/shepdocs/home/logs/web-1-out.log /tmp/shepdocs/home/logs/web-1-out.log.1
 $ shep reopen web
-ID  NAME   STATUS  PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
-0   web:0  online  54244  0         -     -    -    43s     -     -
-1   web:1  online  54338  1         -     -    -    37s     -     -`;
+ID  NAME   STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM  UPTIME  FOLD  SMIT
+0   web:0  online  54244  0         -     -    -    -    43s     -     -
+1   web:1  online  54338  1         -     -    -    -    37s     -     -`;
 
 const logrotate = `/home/shepherd/.shep/logs/*.log {
     daily

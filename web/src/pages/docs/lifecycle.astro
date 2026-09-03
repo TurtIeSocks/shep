@@ -23,12 +23,12 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
 import VerbSignature from "../../components/docs/VerbSignature.astro";
 
 const stopSurvivesDemo = `$ shep stop parked
-ID  NAME    STATUS   PID    RESTARTS  EXIT     CPU  MEM   UPTIME  FOLD  SMIT
-0   keeper  online   79454  0         -        -    1.4M  6s      -     -
-1   parked  stopped  -      0         SIGTERM  -    -     0s      -     -
-4   probed  online   79458  0         -        -    1.5M  6s      -     -
-2   web     online   79456  0         -        -    1.4M  6s      -     -
-3   worker  online   79457  0         -        -    1.4M  6s      -     -
+ID  NAME    STATUS   PID    RESTARTS  EXIT     CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   keeper  online   79454  0         -        -    -    1.4M  6s      -     -
+1   parked  stopped  -      0         SIGTERM  -    -    -     0s      -     -
+4   probed  online   79458  0         -        -    -    1.5M  6s      -     -
+2   web     online   79456  0         -        -    -    1.4M  6s      -     -
+3   worker  online   79457  0         -        -    -    1.4M  6s      -     -
 
 $ shep save
 FILE                                     APPS
@@ -39,20 +39,20 @@ PID    SOCKET_REMOVED
 79433  true
 
 $ shep muster
-ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
-1   keeper  online    79631  0         -     -    -    0s      -     -
-0   parked  stopped   -      0         -     -    -    0s      -     -
-2   probed  starting  79632  0         -     -    -    0s      -     -
-3   web     online    79633  0         -     -    -    0s      -     -
-4   worker  online    79634  0         -     -    -    0s      -     -`;
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CFG  CPU  MEM  UPTIME  FOLD  SMIT
+1   keeper  online    79631  0         -     -    -    -    0s      -     -
+0   parked  stopped   -      0         -     -    -    -    0s      -     -
+2   probed  starting  79632  0         -     -    -    -    0s      -     -
+3   web     online    79633  0         -     -    -    -    0s      -     -
+4   worker  online    79634  0         -     -    -    -    0s      -     -`;
 
 const deleteRemovesDemo = `$ shep delete parked
 notice[delete]: deleted 1 sheep, id 0
-ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
-1   keeper  online  79631  0         -     -    1.4M  5s      -     -
-2   probed  online  79632  0         -     -    1.5M  5s      -     -
-3   web     online  79633  0         -     -    1.4M  5s      -     -
-4   worker  online  79634  0         -     -    1.4M  5s      -     -
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+1   keeper  online  79631  0         -     -    -    1.4M  5s      -     -
+2   probed  online  79632  0         -     -    -    1.5M  5s      -     -
+3   web     online  79633  0         -     -    -    1.4M  5s      -     -
+4   worker  online  79634  0         -     -    -    1.4M  5s      -     -
 
 $ shep save
 FILE                                     APPS
@@ -63,41 +63,41 @@ PID    SOCKET_REMOVED
 79610  true
 
 $ shep muster
-ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU  MEM  UPTIME  FOLD  SMIT
-0   keeper  online    79791  0         -     -    -    0s      -     -
-1   probed  starting  79792  0         -     -    -    0s      -     -
-2   web     online    79793  0         -     -    -    0s      -     -
-3   worker  online    79794  0         -     -    -    0s      -     -`;
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CFG  CPU  MEM  UPTIME  FOLD  SMIT
+0   keeper  online    79791  0         -     -    -    -    0s      -     -
+1   probed  starting  79792  0         -     -    -    -    0s      -     -
+2   web     online    79793  0         -     -    -    -    0s      -     -
+3   worker  online    79794  0         -     -    -    -    0s      -     -`;
 
 const restartDemo = `$ shep restart keeper
-ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM     UPTIME  FOLD  SMIT
-0   keeper  online  79867  1         -     -    640.0K  0s      -     -
-1   probed  online  79792  0         -     -    1.5M    5s      -     -
-2   web     online  79793  0         -     -    1.4M    5s      -     -
-3   worker  online  79794  0         -     -    1.4M    5s      -     -`;
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM     UPTIME  FOLD  SMIT
+0   keeper  online  79867  1         -     -    -    640.0K  0s      -     -
+1   probed  online  79792  0         -     -    -    1.5M    5s      -     -
+2   web     online  79793  0         -     -    -    1.4M    5s      -     -
+3   worker  online  79794  0         -     -    -    1.4M    5s      -     -`;
 
 const overlapDemo = `$ shep reload worker
-ID  NAME      STATUS    PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
-0   keeper    online    79867  1         -     -    1.4M  2s      -     -
-1   probed    online    79792  0         -     -    1.5M  7s      -     -
-2   web       online    79793  0         -     -    1.4M  7s      -     -
-3   worker:0  stopping  79794  0         -     -    1.4M  7s      -     -
-4   worker:0  starting  79907  0         -     -    -     0s      -     -
+ID  NAME      STATUS    PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   keeper    online    79867  1         -     -    -    1.4M  2s      -     -
+1   probed    online    79792  0         -     -    -    1.5M  7s      -     -
+2   web       online    79793  0         -     -    -    1.4M  7s      -     -
+3   worker:0  stopping  79794  0         -     -    -    1.4M  7s      -     -
+4   worker:0  starting  79907  0         -     -    -    -     0s      -     -
 
 $ shep flock
-ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU  MEM   UPTIME  FOLD  SMIT
-0   keeper  online  79867  1         -     -    1.4M  4s      -     -
-1   probed  online  79792  0         -     -    1.5M  10s     -     -
-2   web     online  79793  0         -     -    1.4M  10s     -     -
-4   worker  online  79907  0         -     -    1.4M  2s      -     -`;
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
+0   keeper  online  79867  1         -     -    -    1.4M  4s      -     -
+1   probed  online  79792  0         -     -    -    1.5M  10s     -     -
+2   web     online  79793  0         -     -    -    1.4M  10s     -     -
+4   worker  online  79907  0         -     -    -    1.4M  2s      -     -`;
 
 const brokenOverlapDemo = `$ shep reload web
-ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
-0   keeper  online    79867  1         -     0.0%  1.4M  10s     -     -
-1   probed  online    79792  0         -     0.0%  1.5M  15s     -     -
-2   web:0   stopping  79793  0         -     0.0%  1.4M  15s     -     -
-5   web:0   starting  80029  0         -     -     -     0s      -     -
-4   worker  online    79907  0         -     0.0%  1.4M  7s      -     -
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CFG  CPU   MEM   UPTIME  FOLD  SMIT
+0   keeper  online    79867  1         -     -    0.0%  1.4M  10s     -     -
+1   probed  online    79792  0         -     -    0.0%  1.5M  15s     -     -
+2   web:0   stopping  79793  0         -     -    0.0%  1.4M  15s     -     -
+5   web:0   starting  80029  0         -     -    -     -     0s      -     -
+4   worker  online    79907  0         -     -    0.0%  1.4M  7s      -     -
 
 $ shep bleats web --no-follow --lines 4
 web | http_server pid=79456 listening on 127.0.0.1:19293
@@ -109,18 +109,18 @@ web | could not bind 127.0.0.1:19293: Address already in use (os error 48)
 web | note: run with \`RUST_BACKTRACE=1\` environment variable to display a backtrace
 
 $ shep flock
-ID  NAME    STATUS  PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
-0   keeper  online  79867  1         -     0.0%  1.4M  12s     -     -
-1   probed  online  79792  0         -     0.0%  1.5M  17s     -     -
-2   web     online  79793  0         -     0.0%  1.4M  17s     -     -
-4   worker  online  79907  0         -     0.0%  1.4M  10s     -     -`;
+ID  NAME    STATUS  PID    RESTARTS  EXIT  CFG  CPU   MEM   UPTIME  FOLD  SMIT
+0   keeper  online  79867  1         -     -    0.0%  1.4M  12s     -     -
+1   probed  online  79792  0         -     -    0.0%  1.5M  17s     -     -
+2   web     online  79793  0         -     -    0.0%  1.4M  17s     -     -
+4   worker  online  79907  0         -     -    0.0%  1.4M  10s     -     -`;
 
 const serialGapDemo = `$ shep reload probed
-ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
-0   keeper  online    79867  1         -     0.0%  1.4M  3m 42s  -     -
-7   probed  stopping  80436  0         -     0.0%  0B    2m 56s  -     -
-2   web     online    79793  0         -     0.0%  1.4M  3m 48s  -     -
-4   worker  online    79907  0         -     0.0%  1.4M  3m 40s  -     -
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CFG  CPU   MEM   UPTIME  FOLD  SMIT
+0   keeper  online    79867  1         -     -    0.0%  1.4M  3m 42s  -     -
+7   probed  stopping  80436  0         -     -    0.0%  0B    2m 56s  -     -
+2   web     online    79793  0         -     -    0.0%  1.4M  3m 48s  -     -
+4   worker  online    79907  0         -     -    0.0%  1.4M  3m 40s  -     -
 
 $ while sleep 0.3; do curl -m 0.5 -s -o /dev/null -w "%{http_code}\\n" http://127.0.0.1:19294/; done
 000
@@ -137,11 +137,11 @@ $ while sleep 0.3; do curl -m 0.5 -s -o /dev/null -w "%{http_code}\\n" http://12
 200
 
 $ shep flock
-ID  NAME    STATUS    PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
-0   keeper  online    79867  1         -     0.0%  1.4M  3m 46s  -     -
-8   probed  starting  82373  0         -     -     -     3s      -     -
-2   web     online    79793  0         -     0.0%  1.4M  3m 51s  -     -
-4   worker  online    79907  0         -     0.0%  1.4M  3m 44s  -     -`;
+ID  NAME    STATUS    PID    RESTARTS  EXIT  CFG  CPU   MEM   UPTIME  FOLD  SMIT
+0   keeper  online    79867  1         -     -    0.0%  1.4M  3m 46s  -     -
+8   probed  starting  82373  0         -     -    -     -     3s      -     -
+2   web     online    79793  0         -     -    0.0%  1.4M  3m 51s  -     -
+4   worker  online    79907  0         -     -    0.0%  1.4M  3m 44s  -     -`;
 ---
 
 <DocsLayout

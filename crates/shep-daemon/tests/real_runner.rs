@@ -905,6 +905,7 @@ async fn a_bare_interpreter_resolves_via_the_seeded_path() {
         socket: dir.path().join("run/shep.sock"),
         barks: dir.path().join("barks.jsonl"),
         kv: dir.path().join("kv.json"),
+        overrides: dir.path().join("overrides.json"),
     };
     let app_config = AppConfig {
         name: "bare".to_string(),

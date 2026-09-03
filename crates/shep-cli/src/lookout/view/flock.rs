@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 
 use super::super::app::{App, GroupTotals, Row, RowKey};
 use crate::output::width::char_columns;
-use crate::output::{exit_cell, human_bytes, human_duration};
+use crate::output::{cfg_cell, exit_cell, human_bytes, human_duration};
 
 /// The narrowest terminal the TABLE will draw into.
 ///
@@ -75,6 +75,11 @@ pub enum Column {
     /// the two surfaces cannot drift on what a code or a signal name looks
     /// like.
     Exit,
+    /// Whether a config load has parked a change for this sheep's next
+    /// spawn, or an operator has overridden a field its Flockfile no longer
+    /// declares -- task 12. Rendered by [`crate::output::cfg_cell`], the
+    /// same function `output::rows::FlockRows`'s own CFG column calls.
+    Cfg,
     /// Tree CPU as a percentage of one core.
     Cpu,
     /// Tree resident set size.
@@ -106,6 +111,7 @@ impl Column {
             Self::Pid => "PID",
             Self::Restarts => "RESTARTS",
             Self::Exit => "EXIT",
+            Self::Cfg => "CFG",
             Self::Cpu => "CPU",
             Self::Mem => "MEM",
             Self::Uptime => "UPTIME",
@@ -134,6 +140,10 @@ impl Column {
             // inside it -- like STATUS above, sized so its longest real
             // value is never truncated.
             Self::Exit => 9,
+            // 4: `!12`/`*12` -- a `cfg_cell`'s own longest realistic value.
+            // `AppConfig` has well under a hundred fields, so two digits
+            // covers it with room to spare, and `-` is one character.
+            Self::Cfg => 4,
             Self::Cpu => 6,
             Self::Mem => 8,
             Self::Uptime => 8,
@@ -151,6 +161,25 @@ impl Column {
 }
 
 const ALL: &[Column] = &[
+    Column::Id,
+    Column::Name,
+    Column::Status,
+    Column::Pid,
+    Column::Restarts,
+    Column::Exit,
+    Column::Cfg,
+    Column::Cpu,
+    Column::Mem,
+    Column::Uptime,
+    Column::Fold,
+    Column::Smit,
+];
+// The full set minus CFG: task 12's own column is the first to go, ahead of
+// even SMIT, so this is the same eleven columns `ALL` was before CFG
+// existed. See `TIERS`'s own doc for why CFG gets the newest, least earned
+// spot in the drop order rather than tying itself to EXIT the way the CLI
+// table's `output::rows::FlockRows::PRIORITIES` does.
+const NO_CFG: &[Column] = &[
     Column::Id,
     Column::Name,
     Column::Status,
@@ -252,8 +281,26 @@ const FLOOR: &[Column] = &[Column::Id, Column::Name, Column::Status];
 /// column, so it is the first one to go. That is the same reasoning
 /// `output::rows::FlockRows::PRIORITIES` gives for its own priority 8, the
 /// highest number in that table.
+///
+/// CFG (task 12) gets the newest, least earned spot in this order: the
+/// FIRST column to go, ahead of even SMIT, rather than tying itself to
+/// EXIT's own tier the way `output::rows::FlockRows::PRIORITIES` does for
+/// the CLI table. That is a deliberate departure from the CLI table's own
+/// choice, not an oversight, and the reason is specific to this pane: every
+/// wide fixture in `docs/lookout/frames.txt`'s own gallery is 120 columns,
+/// and the maintainer's own ruling on SMIT (`output::table`'s
+/// `a_smit_is_never_dropped_at_full_width`) is that its droppability was
+/// conditional on it being seen regularly at a wide terminal. Tying CFG to
+/// EXIT would have pushed the full column set's own threshold from 116 to
+/// 122, past 120, and quietly broken that ruling for the one pane whose
+/// gallery is checked into the repository as documentation -- every `SMIT`
+/// occurrence in that file would vanish the moment CFG landed. Dropping CFG
+/// on its own, one tier earlier, keeps `NO_CFG`'s threshold at exactly 116,
+/// where `ALL`'s was before this task, so 120 columns shows everything
+/// this pane showed before CFG existed, CFG included only past 122.
 const TIERS: &[(u16, &[Column])] = &[
-    (116, ALL),
+    (122, ALL),
+    (116, NO_CFG),
     (101, NO_SMIT),
     (89, NO_FOLD),
     (78, NO_EXIT),
@@ -430,13 +477,15 @@ fn group_line(app: &App, name: &str, columns: &[Column], width: u16) -> Line<'st
 
 /// One cell of an app's group header row.
 ///
-/// ID, PID and EXIT are blank -- not `-`: there is no single id, pid or
-/// exit for a group row to have "no honest value" about, the way a real
-/// sheep's absent pid does. FOLD and SMIT read the first member's, since
-/// both are per-app facts every instance shares.
+/// ID, PID, EXIT and CFG are blank -- not `-`: there is no single id, pid,
+/// exit or config-drift state for a group row to have "no honest value"
+/// about, the way a real sheep's absent pid does -- a load can park a
+/// different set of fields on each slot, so CFG joins the per-instance
+/// facts rather than the per-app ones. FOLD and SMIT read the first
+/// member's, since both are per-app facts every instance shares.
 fn group_cell(app: &App, name: &str, column: Column, totals: &GroupTotals) -> String {
     match column {
-        Column::Id | Column::Pid | Column::Exit => String::new(),
+        Column::Id | Column::Pid | Column::Exit | Column::Cfg => String::new(),
         Column::Name => format!("{name} \u{d7}{}", totals.count),
         Column::Status => app.group_status_text(name),
         Column::Restarts => totals.restarts.to_string(),
@@ -532,6 +581,9 @@ fn cell(app: &App, row: &Row, column: Column, grouped: bool) -> String {
         // `crate::output::exit_cell`, not a second implementation of the
         // code/signal split -- see `Column::Exit`'s own doc.
         Column::Exit => exit_cell(info.pid, info.last_exit),
+        // `crate::output::cfg_cell`, not a second implementation of the
+        // pending-over-overridden precedence -- see `Column::Cfg`'s own doc.
+        Column::Cfg => cfg_cell(info.pending.as_deref(), info.overridden.as_deref()),
         Column::Cpu => info
             .cpu_percent
             .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
@@ -582,7 +634,13 @@ mod tests {
     /// those three are the pane.
     #[test]
     fn columns_drop_in_a_fixed_order_as_the_terminal_narrows() {
-        assert_eq!(columns_for(300).len(), 11);
+        assert_eq!(columns_for(300).len(), 12);
+        assert_eq!(columns_for(122).len(), 12);
+        // CFG (task 12) is the first column gone, ahead of even SMIT --
+        // `TIERS`'s own doc gives the reasoning, tied to the gallery's own
+        // 120-column wide fixtures.
+        assert!(!columns_for(121).contains(&Column::Cfg));
+        assert!(columns_for(121).contains(&Column::Smit));
         assert_eq!(columns_for(116).len(), 11);
         assert!(!columns_for(115).contains(&Column::Smit));
         assert!(columns_for(115).contains(&Column::Fold));
@@ -606,6 +664,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// fails if a 120-column terminal -- every wide fixture in
+    /// `docs/lookout/frames.txt`'s own gallery -- ever loses SMIT again.
+    /// This is the maintainer's ruling (`output::table`'s own
+    /// `a_smit_is_never_dropped_at_full_width` states it for the CLI
+    /// table) made concrete for the one width the published gallery
+    /// actually renders at, so a future column's own drop-order choice
+    /// gets checked against it directly rather than only against `TIERS`'s
+    /// own doc.
+    #[test]
+    fn smit_survives_the_gallerys_own_wide_fixtures() {
+        assert!(columns_for(120).contains(&Column::Smit));
     }
 
     /// fails if lookout's own column list drifts from
@@ -917,6 +988,7 @@ mod tests {
             fit("", Column::Pid.width()),          // PID: blank, no single pid
             fit("0", Column::Restarts.width()),    // RESTARTS: summed, all zero
             fit("", Column::Exit.width()),         // EXIT: blank, no single exit
+            fit("", Column::Cfg.width()),          // CFG: blank, per-instance fact
             fit("-", Column::Cpu.width()),         // CPU: no reading on any instance
             // 100 + 150 + 50 = 300 MiB, summed rather than averaged.
             fit("300.0M", Column::Mem.width()),
@@ -972,6 +1044,7 @@ mod tests {
             fit("4002", Column::Pid.width()),
             fit("0", Column::Restarts.width()),
             fit("-", Column::Exit.width()),
+            fit("-", Column::Cfg.width()),
             fit("-", Column::Cpu.width()),
             fit("-", Column::Mem.width()),
             fit("30s", Column::Uptime.width()),

@@ -51,11 +51,11 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       need.
     </p>
     <CodeBlock label="shep flock">{`┌────┬──────┬───────────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┬──────┐
-│ ID │ NAME │ STATUS        │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ FOLD    │ SMIT │
-├────┼──────┼───────────────┼───────┼──────────┼──────┼──────┼──────┼────────┼─────────┼──────┤
-│ 1  │ api  │ (x.x) errored │ -     │ 15       │ 1    │ -    │ -    │ 0s     │ -       │ -    │
-│ 0  │ web  │ (o.o) online  │ 68630 │ 0        │ -    │ 0.0% │ 3.0M │ 18s    │ backend │ -    │
-└────┴──────┴───────────────┴───────┴──────────┴──────┴──────┴──────┴────────┴─────────┴──────┘`}</CodeBlock>
+│ ID │ NAME │ STATUS        │ PID   │ RESTARTS │ EXIT │ CFG │ CPU  │ MEM  │ UPTIME │ FOLD    │ SMIT │
+├────┼──────┼───────────────┼───────┼──────────┼──────┼─────┼──────┼──────┼────────┼─────────┼──────┤
+│ 1  │ api  │ (x.x) errored │ -     │ 15       │ 1    │ -   │ -    │ -    │ 0s     │ -       │ -    │
+│ 0  │ web  │ (o.o) online  │ 68630 │ 0        │ -    │ -   │ 0.0% │ 3.0M │ 18s    │ backend │ -    │
+└────┴──────┴───────────────┴───────┴──────────┴──────┴─────┴──────┴──────┴────────┴─────────┴──────┘`}</CodeBlock>
     <p>
       <code>SMIT</code> is a marker a dog attaches to a sheep over the client
       protocol — <code>-</code> for every sheep here because none carries
@@ -99,6 +99,32 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       on that same row says it never started at all.
     </p>
 
+    <h3 id="the-cfg-column">The CFG column</h3>
+    <p>
+      A sheep with config waiting on it is marked here; every other sheep
+      reads <code>-</code>. <code>!2</code> means two fields are parked for
+      this sheep's next spawn, left there by a Flockfile load that would have
+      had to kill the process to apply them, and
+      <code>shep reload &lt;name&gt;</code> promotes them.
+    </p>
+    <p>
+      A count and not the names, because the names are what
+      <code>shep describe</code> lists underneath its table and a
+      three-character cell has room for one number. See
+      <a href="/docs/overrides">Overrides</a>.
+    </p>
+    <p class="fine">
+      The cell has a second marker, <code>*2</code>, for fields an operator
+      has set that the sheep's current Flockfile does not declare. No
+      release can print it yet. No verb writes an operator-set value into the
+      override store today, so on any flock shep itself built the count is
+      zero and the cell reads <code>-</code> or <code>!N</code>. It is documented here because
+      it arrives with the verb that writes one, and because pending will take
+      the cell ahead of it when a sheep has both: a parked field is one
+      command away from taking effect, while an override has been true since
+      the last load.
+    </p>
+
     <h2 id="grouped-instances">Multi-instance apps group</h2>
     <p>
       An app with <code>instances</code> above 1 gets a header row above its
@@ -108,13 +134,13 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       single-instance app is unchanged, no group row and no suffix:
     </p>
     <CodeBlock label="shep flock">{`┌────┬────────┬──────────────┬───────┬──────────┬──────┬──────┬──────┬────────┬──────┬──────┐
-│ ID │ NAME   │ STATUS       │ PID   │ RESTARTS │ EXIT │ CPU  │ MEM  │ UPTIME │ FOLD │ SMIT │
-├────┼────────┼──────────────┼───────┼──────────┼──────┼──────┼──────┼────────┼──────┼──────┤
-│    │ web ×3 │ (o.o) online │       │ 0        │      │ 0.0% │ 9.1M │ 33s    │ -    │ -    │
-│ 0  │  ↳ :0  │ (o.o) online │ 74802 │ 0        │ -    │ 0.0% │ 3.0M │ 33s    │      │      │
-│ 1  │  ↳ :1  │ (o.o) online │ 74803 │ 0        │ -    │ 0.0% │ 3.0M │ 33s    │      │      │
-│ 2  │  ↳ :2  │ (o.o) online │ 74804 │ 0        │ -    │ 0.0% │ 3.0M │ 33s    │      │      │
-└────┴────────┴──────────────┴───────┴──────────┴──────┴──────┴──────┴────────┴──────┴──────┘`}</CodeBlock>
+│ ID │ NAME   │ STATUS       │ PID   │ RESTARTS │ EXIT │ CFG │ CPU  │ MEM  │ UPTIME │ FOLD │ SMIT │
+├────┼────────┼──────────────┼───────┼──────────┼──────┼─────┼──────┼──────┼────────┼──────┼──────┤
+│    │ web ×3 │ (o.o) online │       │ 0        │      │     │ 0.0% │ 9.1M │ 33s    │ -    │ -    │
+│ 0  │  ↳ :0  │ (o.o) online │ 74802 │ 0        │ -    │ -   │ 0.0% │ 3.0M │ 33s    │      │      │
+│ 1  │  ↳ :1  │ (o.o) online │ 74803 │ 0        │ -    │ -   │ 0.0% │ 3.0M │ 33s    │      │      │
+│ 2  │  ↳ :2  │ (o.o) online │ 74804 │ 0        │ -    │ -   │ 0.0% │ 3.0M │ 33s    │      │      │
+└────┴────────┴──────────────┴───────┴──────────┴──────┴─────┴──────┴──────┴────────┴──────┴──────┘`}</CodeBlock>
     <p>
       The group row rolls up rather than picking a winner: <code>STATUS</code>
       is the shared word when every instance agrees, else a count per state
@@ -134,10 +160,10 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       the name, <code>web:2</code>, and only for an app with more than one
       instance:
     </p>
-    <CodeBlock label="shep flock --style bare">{`ID  NAME   STATUS  PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD  SMIT
-0   web:0  online  74802  0         -     0.0%  3.0M  38s     -     -
-1   web:1  online  74803  0         -     0.0%  3.0M  38s     -     -
-2   web:2  online  74804  0         -     0.0%  3.0M  38s     -     -`}</CodeBlock>
+    <CodeBlock label="shep flock --style bare">{`ID  NAME   STATUS  PID    RESTARTS  EXIT  CFG  CPU   MEM   UPTIME  FOLD  SMIT
+0   web:0  online  74802  0         -     -    0.0%  3.0M  38s     -     -
+1   web:1  online  74803  0         -     -    0.0%  3.0M  38s     -     -
+2   web:2  online  74804  0         -     -    0.0%  3.0M  38s     -     -`}</CodeBlock>
     <p>
       JSON rows carry the slot as its own field, <code>"instance": 0</code>,
       rather than folding it into the name.
@@ -151,14 +177,14 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
     </p>
     <div class="rows">
       <div class="row"><span>both</span><span><code>ID NAME STATUS PID RESTARTS EXIT CPU MEM UPTIME</code></span></div>
-      <div class="row"><span>sheep only</span><span><code>FOLD SMIT</code></span></div>
+      <div class="row"><span>sheep only</span><span><code>CFG FOLD SMIT</code></span></div>
       <div class="row"><span>dogs only</span><span><code>SOURCE</code></span></div>
     </div>
     <CodeBlock label="shep flock">{`┌────┬────────┬──────────────┬───────┬──────────┬──────┬─────┬──────┬────────┬────────┬──────┐
-│ ID │ NAME   │ STATUS       │ PID   │ RESTARTS │ EXIT │ CPU │ MEM  │ UPTIME │ FOLD   │ SMIT │
-├────┼────────┼──────────────┼───────┼──────────┼──────┼─────┼──────┼────────┼────────┼──────┤
-│ 0  │ golbat │ (o.o) online │ 48182 │ 0        │ -    │ -   │ 3.0M │ 2s     │ backed │ -    │
-└────┴────────┴──────────────┴───────┴──────────┴──────┴─────┴──────┴────────┴────────┴──────┘
+│ ID │ NAME   │ STATUS       │ PID   │ RESTARTS │ EXIT │ CFG │ CPU │ MEM  │ UPTIME │ FOLD   │ SMIT │
+├────┼────────┼──────────────┼───────┼──────────┼──────┼─────┼─────┼──────┼────────┼────────┼──────┤
+│ 0  │ golbat │ (o.o) online │ 48182 │ 0        │ -    │ -   │ -   │ 3.0M │ 2s     │ backed │ -    │
+└────┴────────┴──────────────┴───────┴──────────┴──────┴─────┴─────┴──────┴────────┴────────┴──────┘
 
 Dogs
 ┌────┬────────────┬──────────────┬───────┬──────────┬──────┬─────┬──────┬────────┬─────────┐
@@ -167,10 +193,12 @@ Dogs
 │ 1  │ log-rotate │ (o.o) online │ 48207 │ 0        │ -    │ -   │ 6.6M │ 2s     │ adopted │
 └────┴────────────┴──────────────┴───────┴──────────┴──────┴─────┴──────┴────────┴─────────┘`}</CodeBlock>
     <p>
-      <code>FOLD</code> and <code>SMIT</code> are missing from the dogs table
-      because they are impossible for a dog rather than merely empty: a dog
-      belongs to no fold, and a smit is a mark a dog paints <em>on</em> a
-      sheep. A column that reads <code>-</code> on every row teaches nothing.
+      <code>CFG</code>, <code>FOLD</code> and <code>SMIT</code> are missing
+      from the dogs table because they are impossible for a dog rather than
+      merely empty: a dog belongs to no fold, a smit is a mark a dog paints
+      <em>on</em> a sheep, and no Flockfile load ever reaches a dog, so
+      nothing can park config on one. A column that reads <code>-</code> on
+      every row teaches nothing.
     </p>
     <p>
       Colours match too, column for column. Same face and status colour, same
@@ -277,11 +305,11 @@ Dogs
       doing, and the exit code already said whether the one you named worked.
     </p>
     <CodeBlock label="shep restart golbat">{`┌────┬────────┬─────────┬───────┬──────────┬─────────┬─────┬────────┬────────┬────────┬──────┐
-│ ID │ NAME   │ STATUS  │ PID   │ RESTARTS │ EXIT    │ CPU │ MEM    │ UPTIME │ FOLD   │ SMIT │
-├────┼────────┼─────────┼───────┼──────────┼─────────┼─────┼────────┼────────┼────────┼──────┤
-│ 4  │ golbat │ online  │ 14459 │ 5        │ -       │ -   │ 416.0K │ 0s     │ backed │ -    │
-│ 5  │ koji   │ stopped │ -     │ 2        │ SIGTERM │ -   │ -      │ 0s     │ backed │ -    │
-└────┴────────┴─────────┴───────┴──────────┴─────────┴─────┴────────┴────────┴────────┴──────┘
+│ ID │ NAME   │ STATUS  │ PID   │ RESTARTS │ EXIT    │ CFG │ CPU │ MEM    │ UPTIME │ FOLD   │ SMIT │
+├────┼────────┼─────────┼───────┼──────────┼─────────┼─────┼─────┼────────┼────────┼────────┼──────┤
+│ 4  │ golbat │ online  │ 14459 │ 5        │ -       │ -   │ -   │ 416.0K │ 0s     │ backed │ -    │
+│ 5  │ koji   │ stopped │ -     │ 2        │ SIGTERM │ -   │ -   │ -      │ 0s     │ backed │ -    │
+└────┴────────┴─────────┴───────┴──────────┴─────────┴─────┴─────┴────────┴────────┴────────┴──────┘
 
 Dogs
 ┌────┬────────────┬────────┬───────┬──────────┬──────┬──────┬──────┬────────┬─────────┐
@@ -339,12 +367,13 @@ Dogs
 │ 1  │ api  │ (x.x)  │ -     │ 15       │ -    │ 0s     │
 │ 0  │ web  │ (o.o)  │ 68630 │ 0        │ 3.0M │ 18s    │
 └────┴──────┴────────┴───────┴──────────┴──────┴────────┘
-  CPU, EXIT, FOLD, SMIT hidden. Widen the window, or use --format json.`}</CodeBlock>
+  CFG, CPU, EXIT, FOLD, SMIT hidden. Widen the window, or use --format json.`}</CodeBlock>
     <p>
       Two things narrowed there. The status word went before any whole
       column did, leaving the face, which is five columns rather than
-      fifteen. Then <code>SMIT</code>, <code>FOLD</code>, <code>EXIT</code>
-      and <code>CPU</code> dropped, in that order, and the footer says so.
+      fifteen. Then <code>SMIT</code>, <code>FOLD</code>, <code>CFG</code>,
+      <code>EXIT</code> and <code>CPU</code> dropped, in that order, and the
+      footer says so.
       <code>SMIT</code> goes first: it is by far the widest column, so
       dropping it buys back the most room.
     </p>
@@ -366,13 +395,13 @@ Dogs
       setting; a non-terminal stdout forces it, and so does
       <code>--format json</code>:
     </p>
-    <CodeBlock label="shep flock | cat">{`ID  NAME  STATUS   PID    RESTARTS  EXIT  CPU   MEM   UPTIME  FOLD     SMIT
-1   api   errored  -      15        1     -     -     0s      -        -
-0   web   online   68630  0         -     0.0%  3.0M  5m 10s  backend  -`}</CodeBlock>
+    <CodeBlock label="shep flock | cat">{`ID  NAME  STATUS   PID    RESTARTS  EXIT  CFG  CPU   MEM   UPTIME  FOLD     SMIT
+1   api   errored  -      15        1     -    -     -     0s      -        -
+0   web   online   68630  0         -     -    0.0%  3.0M  5m 10s  backend  -`}</CodeBlock>
     <p>
       None of the pretty rendering survives a pipe, which is the point. The
-      columns themselves do move between releases though. <code>EXIT</code>
-      and <code>SMIT</code> are both recent, so parse
+      columns themselves do move between releases though. <code>CFG</code>,
+      <code>EXIT</code> and <code>SMIT</code> are all recent, so parse
       <code>--format json</code> instead if a script depends on the shape.
     </p>
 

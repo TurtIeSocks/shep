@@ -22,13 +22,13 @@ use crate::assemble::assemble;
 use crate::bus::SharedEvent;
 use crate::cron::{Clock, DEFAULT_MAX_CRON_SLEEP};
 use crate::entry::{ProcessEntry, ReloadState, RestartBudget};
-use crate::extras::{Extras, ExtrasReports};
+use crate::extras::{Extras, ExtrasReports, LivenessReport};
 use crate::fake::{FIRST_SCRIPTED_PID, ProcScript, ScriptedRunner};
 use crate::limits::sample::{MemorySampler, ProcessIdentity, ProcessRss};
 use crate::limits::stats::StatsState;
 use crate::limits::{LimitBreach, LimitEnforcer};
 use crate::privilege::SpawnIdentity;
-use crate::probes::{LivenessFailure, ProbeFailure, Prober};
+use crate::probes::{ProbeFailure, Prober};
 use crate::rpc::RpcContext;
 use crate::runner::{ProcIo, ProcessRunner, RunnerError, SpawnSpec};
 use crate::snapshot::FlockRegistry;
@@ -339,7 +339,7 @@ pub(crate) struct Harness {
     pub(crate) breaches: mpsc::Receiver<LimitBreach>,
     /// Liveness-failure reports, for tests that assert a probe threshold
     /// tripped.
-    pub(crate) liveness: mpsc::Receiver<LivenessFailure>,
+    pub(crate) liveness: mpsc::Receiver<LivenessReport>,
     /// The same [`StatsState`] the extras and [`Self::ctx`] share, so a test
     /// can plant the periodic CPU baseline an on-demand reading measures
     /// against instead of waiting a poll interval for the enforcer's own
@@ -583,6 +583,9 @@ pub(crate) fn armed_entry(
     ProcessEntry {
         id,
         spec: app,
+        pending: None,
+        pending_reidentifies: false,
+        overridden: Vec::new(),
         instance,
         status: ProcStatus::Online,
         pid: Some(pid),

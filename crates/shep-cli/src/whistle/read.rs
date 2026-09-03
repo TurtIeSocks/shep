@@ -260,6 +260,7 @@ mod tests {
             socket,
             barks,
             kv: std::path::PathBuf::new(),
+            overrides: std::path::PathBuf::new(),
         }
     }
 

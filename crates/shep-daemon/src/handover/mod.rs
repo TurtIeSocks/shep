@@ -699,6 +699,65 @@ pub struct CarriedSheep {
     /// path the operator typed into `shep adopt`, which the blob's own
     /// `AppConfig` already carries as the program to run (IR-41).
     dog: Option<DogSource>,
+    /// The config a load parked for this instance's next spawn, or `None`
+    /// for an instance nothing is owed.
+    ///
+    /// An `AppConfig` and not a `ResolvedApp`, for the reason [`Self::app`]
+    /// gives at length: that type is a proof token with no `Deserialize`, so
+    /// the successor rebuilds it by normalizing this again. The two travel
+    /// as the same shape because they are the same kind of thing, one config
+    /// the instance is running and one it is owed.
+    ///
+    /// One `Option`, not the two [`Self::pending_delete`] needs, for the
+    /// reason [`Self::manual`] gives: a missing key loads as `None`, and
+    /// `None` is already this field's own word for "nothing is owed" -- the
+    /// same thing a predecessor from before the parking slot existed was
+    /// saying, since it had no way to park anything. There is no third state
+    /// to distinguish, so [`VERSION`] stays unmoved.
+    ///
+    /// Losing it is silent config erasure, which is why it is carried at
+    /// all. An operator loads a Flockfile, sees fields reported pending,
+    /// then runs `shep daemon reload` to pick up a new binary: the `Live`
+    /// fields are on [`Self::app`] and survive, and every parked change
+    /// would vanish with nothing anywhere recording that it was ever owed.
+    /// The next load would compare against a spec that already matched and
+    /// report nothing to do.
+    ///
+    /// It carries the app's whole environment, exactly as [`Self::app`]
+    /// does, and the blob is written with the same permissions for the same
+    /// reason (IR-41). It adds no class of secret that file did not already
+    /// hold.
+    pending: Option<AppConfig>,
+    /// Whether promoting [`Self::pending`] must re-resolve
+    /// [`Self::credentials`].
+    ///
+    /// `None` means two different things and both read as `false`, which is
+    /// why one `Option` covers them. A blob written before this field
+    /// existed has no key at all, and a sheep with nothing parked writes no
+    /// key either, because the pairing below makes the two absent together.
+    /// Neither has a promotion coming, so neither has an identity to
+    /// re-resolve, and a reader that treats the absence as `false` is right
+    /// about both without having to tell them apart.
+    ///
+    /// `Option` for the reason [`Self::ready_failed`] gives rather than the
+    /// one [`Self::pending_delete`] gives, and it is the same distinction: a
+    /// predecessor from before the field existed was not refusing anything,
+    /// it simply had nothing to say. [`VERSION`] stays unmoved.
+    ///
+    /// **Carried with [`Self::pending`] and never without it.** The decision
+    /// is made by the load that parks the config, against the spec that
+    /// entry held at that moment, precisely because it cannot be recomputed
+    /// later from a diff -- a load derives one spec from an app's first
+    /// instance and writes it onto every sibling, so a `user` change a
+    /// sibling has not applied stops being visible as a difference. A parked
+    /// config arriving without its flag would promote on the identity it was
+    /// supposed to replace, which is that same defect reintroduced through
+    /// this file. See `ProcessEntry::pending_reidentifies` (crate-internal,
+    /// hence code font) for the full argument.
+    ///
+    /// Nothing on it is sensitive: one boolean saying whether a name is due
+    /// a passwd lookup, never the name (IR-41).
+    pending_reidentifies: Option<bool>,
     /// The resolved config this instance runs under, environment included.
     ///
     /// This is the `AppConfig` beneath [`ProcessEntry::spec`]'s
@@ -772,6 +831,17 @@ impl CarriedSheep {
             // either side of it: these two do live on `ProcessEntry`.
             reload: Some(entry.reload),
             dog: entry.dog.clone(),
+            // Read off the entry for the reason `reload` and `dog` above
+            // are, and written as a pair for the reason
+            // `Self::pending_reidentifies` gives: a config without its flag
+            // promotes on the wrong identity.
+            pending: entry.pending.as_ref().map(|parked| parked.config().clone()),
+            // Derived from the same `Option` the line above is, so the two
+            // keys are absent together and present together. Writing the
+            // flag unconditionally put `Some(false)` on the wire beside a
+            // `pending` of `None`: a flag with no config to promote, which
+            // is the mirror of the pairing this comment warns about.
+            pending_reidentifies: entry.pending.as_ref().map(|_| entry.pending_reidentifies),
             ready_failed: Some(ready_failed),
             // Gated on the status rather than carried verbatim, unlike every
             // marker above. The slot's own field is written on the one
@@ -834,6 +904,28 @@ impl CarriedSheep {
     #[must_use]
     pub const fn dog(&self) -> Option<&DogSource> {
         self.dog.as_ref()
+    }
+
+    /// The config a load parked for this instance's next spawn, or `None`
+    /// for an instance nothing is owed -- which is also what a blob written
+    /// before this field existed says, and truthfully, since its predecessor
+    /// had no parking slot to fill. See the field's own doc.
+    ///
+    /// Borrowed rather than cloned: the one caller normalizes it into a
+    /// [`ResolvedApp`] of its own.
+    #[must_use]
+    pub const fn pending(&self) -> Option<&AppConfig> {
+        self.pending.as_ref()
+    }
+
+    /// Whether promoting [`Self::pending`] must re-resolve the identity, or
+    /// `None` for a blob written before this field existed. That `None`
+    /// reads as `false`, which is not the claim [`Self::pending`]'s own
+    /// getter makes about its own; the field's doc says why, and why the two
+    /// are never carried apart.
+    #[must_use]
+    pub const fn pending_reidentifies(&self) -> Option<bool> {
+        self.pending_reidentifies
     }
 
     /// Whether a reload's readiness verification has already failed against
@@ -1496,6 +1588,9 @@ mod tests {
         ProcessEntry {
             id: 1,
             spec,
+            pending: None,
+            pending_reidentifies: false,
+            overridden: Vec::new(),
             instance: 0,
             status: ProcStatus::Online,
             pid: Some(100),
@@ -1950,11 +2045,49 @@ mod tests {
     #[test]
     fn debug_redacts_a_carried_sheeps_environment() {
         // The blob carries env; a log line naming the daemon's own state
-        // must not. An exact-string assertion rather than a field check,
-        // because the risk is a future field printing env by accident
-        // (IR-41).
+        // must not. An EXACT string rather than a `contains` check, because
+        // the risk this pins is a future field printing env by accident
+        // (IR-41), and a field that has not been added yet cannot be named
+        // in a substring check. This assertion fails when a field is added,
+        // which is the point: whoever adds it reads the rendering once.
+        let entry = entry_fixture(|app| {
+            app.env.insert("TOKEN".to_owned(), "hunter2".to_owned());
+        });
+        assert_eq!(
+            format!("{:?}", carried(&entry)),
+            "CarriedSheep { id: 1, name: \"web\", instance: 0, pid: Some(100), restarts: 0, \
+             epoch: 7, status: Online, last_exit: None, credentials: Resolved(None), fds: \
+             CarriedFds { out_pipe: Some(11), err_pipe: Some(12), out_log: Some(13), err_log: \
+             Some(14), stdin: Some(15), channel: Some(16) }, pending_delete: Some(false), \
+             manual: None, reload: Some(None), ready_failed: Some(false), restart_due: None, \
+             dog: None, pending: None, pending_reidentifies: None, app: AppConfig { \
+             name: \"web\", script: \"./srv\", env: <1 vars>, .. } }"
+        );
+        // The whole blob too, since `Handover` is what a daemon log line
+        // actually formats and it holds fields of its own.
         let text = format!("{:?}", sample_handover_with_secret_env());
         assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("TOKEN"), "{text}");
+    }
+
+    #[test]
+    fn debug_redacts_the_environment_on_a_process_entry() {
+        // `ProcessEntry` is the daemon's own live state and derives `Debug`,
+        // so its safety rests entirely on `AppConfig`'s redacted rendering
+        // reaching it through `spec`. Nothing pinned that, which left a
+        // future field on the entry free to print env directly.
+        let entry = entry_fixture(|app| {
+            app.env.insert("TOKEN".to_owned(), "hunter2".to_owned());
+        });
+        assert_eq!(
+            format!("{entry:?}"),
+            "ProcessEntry { id: 1, spec: ResolvedApp { config: AppConfig { name: \"web\", \
+             script: \"./srv\", env: <1 vars>, .. } }, pending: None, pending_reidentifies: \
+             false, overridden: [], instance: 0, status: Online, pid: Some(100), restarts: 0, \
+             started_at: None, budget: RestartBudget { unstable_count: 0 }, reload: None, \
+             credentials: Resolved(None), out_file: \"/tmp/shep-handover-test-out.log\", \
+             err_file: \"/tmp/shep-handover-test-err.log\", dog: None, last_exit: None }"
+        );
     }
 
     #[test]
@@ -2088,6 +2221,106 @@ mod tests {
             loaded.sheep[0].id(),
             sample_handover().sheep[0].id(),
             "the rest of the row is unchanged by the one field that was absent"
+        );
+    }
+
+    /// fails if a blob written before this daemon carried a parked config
+    /// stops loading, or if the config and its reset flag do not survive one
+    /// that has them.
+    ///
+    /// Same shape and same stakes as the pending-delete case above. A
+    /// predecessor from before [`CarriedSheep::pending`] existed had no
+    /// parking slot at all, so its blobs never have the key and `None` is
+    /// the truthful reading of that: this sheep is owed nothing. A hard
+    /// parse failure instead would leave the successor refusing to boot
+    /// after the predecessor had already exec'd itself away.
+    ///
+    /// The sample is given a parked config first, so the removal below
+    /// removes something: a blob whose `pending` was `None` all along could
+    /// not tell an absent key from a present `null`.
+    /// fails if the two parking keys stop travelling as a pair.
+    ///
+    /// The sibling above pins the half that matters most, a parked config
+    /// arriving with its reset flag. This pins the other half: a sheep with
+    /// nothing parked writes NEITHER key, rather than a flag with no config
+    /// for it to apply to.
+    ///
+    /// It reads as a tidiness point and it is not. The comment at the
+    /// construction site argues the pairing in one direction, and a
+    /// `Some(false)` sitting beside a `pending` of `None` is that same
+    /// argument failing in the other: a reader of the blob, or of that
+    /// comment, is told the two are written together while one of them is
+    /// written always. `install_adopted` happens to be defensive about it
+    /// today, so nothing breaks; the invariant is what this pins, before
+    /// something starts relying on the flag alone.
+    #[test]
+    fn a_sheep_with_nothing_parked_carries_neither_parking_key() {
+        let entry = entry_fixture(|_| {});
+        assert!(
+            entry.pending.is_none(),
+            "fixture check: this case is about a sheep with nothing parked"
+        );
+        let blob = handover_over(&entry);
+
+        let round_tripped = Handover::load_value(serde_json::to_value(&blob).unwrap())
+            .expect("a blob this daemon wrote must load");
+        assert_eq!(round_tripped.sheep[0].pending(), None);
+        assert_eq!(
+            round_tripped.sheep[0].pending_reidentifies(),
+            None,
+            "a reset flag with no parked config to apply it to is a key that means nothing"
+        );
+    }
+
+    #[test]
+    fn a_blob_written_before_pending_was_carried_still_loads() {
+        let mut entry = entry_fixture(|_| {});
+        entry.pending = Some(app_with("web", |app| {
+            app.env.insert("MODE".to_owned(), "blue".to_owned());
+        }));
+        entry.pending_reidentifies = true;
+        let blob = handover_over(&entry);
+
+        // First: a blob that HAS the two keys carries both, which is the
+        // half the eight siblings' shape does not assert for its own field.
+        let round_tripped = Handover::load_value(serde_json::to_value(&blob).unwrap())
+            .expect("a blob this daemon wrote must load");
+        assert_eq!(
+            round_tripped.sheep[0]
+                .pending()
+                .expect("the parked config crosses the exec")
+                .env
+                .get("MODE")
+                .map(String::as_str),
+            Some("blue")
+        );
+        assert_eq!(
+            round_tripped.sheep[0].pending_reidentifies(),
+            Some(true),
+            "and its reset flag crosses with it: a config that arrived without one would \
+             promote on the identity the flag exists to replace"
+        );
+
+        // Then: an older blob, which has neither key.
+        let mut value = serde_json::to_value(&blob).unwrap();
+        let sheep = value["sheep"][0]
+            .as_object_mut()
+            .expect("a carried sheep is an object");
+        for key in ["pending", "pending_reidentifies"] {
+            assert!(
+                sheep.remove(key).is_some(),
+                "the field this case removes must be there to remove: {key}"
+            );
+        }
+
+        let loaded = Handover::load_value(value).expect("an older blob must still load");
+
+        assert_eq!(loaded.sheep[0].pending(), None);
+        assert_eq!(loaded.sheep[0].pending_reidentifies(), None);
+        assert_eq!(
+            loaded.sheep[0].id(),
+            blob.sheep[0].id(),
+            "the rest of the row is unchanged by the two fields that were absent"
         );
     }
 

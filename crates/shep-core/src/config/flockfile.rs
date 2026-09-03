@@ -7,13 +7,13 @@
 
 use core::fmt;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "schema")]
 use schemars::Schema;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 
@@ -22,6 +22,33 @@ use crate::config::AppConfig;
 pub struct Flockfile {
     /// App entries in declaration order
     pub apps: Vec<AppConfig>,
+}
+
+/// One app as the document declared it: the validated config, plus the keys
+/// the document literally wrote.
+///
+/// The key set cannot be recovered from [`AppConfig`] afterwards.
+/// `#[serde(default)]` gives every field a value, so a document naming four
+/// keys deserializes identically to one naming forty. A later merge into a
+/// running flock keys on what a template CLAIMS rather than on what its
+/// values are, so the claim has to be carried out of the parser (see
+/// [`Flockfile::parse_declared`]).
+///
+/// `Serialize`/`Deserialize` because this type is meant to travel inside a
+/// wire request; the key sets are the whole reason such a request carries
+/// this rather than a bare [`AppConfig`].
+///
+/// Derived `Debug` does not reach for [`AppConfig::env`]'s values: `config`'s
+/// own manual `Debug` already redacts them (IR-41), and `declared_env` holds
+/// only the env table's key NAMES, never the values behind them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredApp {
+    /// The app, validated the same way [`Flockfile::parse`] validates one
+    pub config: AppConfig,
+    /// Top-level keys this app's table wrote, whatever their values
+    pub declared: BTreeSet<String>,
+    /// Keys inside this app's `env` table. Empty when `env` was not declared.
+    pub declared_env: BTreeSet<String>,
 }
 
 // Forward-compat decision: application entries are locked to the `app` key
@@ -216,25 +243,7 @@ impl Flockfile {
     ///   deeply nested input rather than returning an error).
     /// - [`FlockfileError::NoApps`] — parsed fine but declared no apps.
     pub fn parse(source: &str, format: FlockFormat) -> Result<Self, FlockfileError> {
-        let raw: RawFlockfile = match format {
-            FlockFormat::Toml => {
-                toml::from_str(source).map_err(|e| FlockfileError::Toml(e.to_string()))?
-            }
-            FlockFormat::Yaml => {
-                serde_saphyr::from_str(source).map_err(|e| FlockfileError::Yaml(e.to_string()))?
-            }
-            FlockFormat::Json => {
-                serde_json::from_str(source).map_err(|e| FlockfileError::Json(e.to_string()))?
-            }
-            FlockFormat::Json5 => {
-                if json5_nesting_depth(source) > MAX_JSON5_NESTING_DEPTH {
-                    return Err(FlockfileError::Json5(
-                        "nesting depth exceeds 64".to_string(),
-                    ));
-                }
-                json5::from_str(source).map_err(|e| FlockfileError::Json5(e.to_string()))?
-            }
-        };
+        let raw = parse_into::<RawFlockfile>(source, format)?;
         let RawFlockfile {
             schema: _schema,
             // Discarded here, deliberately and by name. Whatever a dog wrote
@@ -247,6 +256,97 @@ impl Flockfile {
             return Err(FlockfileError::NoApps);
         }
         Ok(Self { apps })
+    }
+
+    /// Parses `text` and reports, per app, which keys the document wrote.
+    ///
+    /// Runs the exact same per-format parse and validation [`Flockfile::parse`]
+    /// does, so a document that `parse` accepts or refuses is accepted or
+    /// refused here for the same reason, then separately deserializes the
+    /// same source into a [`serde_json::Value`] and reads each app table's
+    /// keys off it. `AppConfig`'s `#[serde(default)]` erases which keys a
+    /// document actually named, which is exactly the information the value
+    /// pass recovers.
+    ///
+    /// # Errors
+    ///
+    /// Every error [`Flockfile::parse`] returns, for the same inputs.
+    pub fn parse_declared(
+        text: &str,
+        format: FlockFormat,
+    ) -> Result<Vec<DeclaredApp>, FlockfileError> {
+        let raw = parse_into::<RawFlockfile>(text, format)?;
+        let RawFlockfile {
+            schema: _schema,
+            dog: _dog,
+            apps,
+        } = raw;
+        if apps.is_empty() {
+            return Err(FlockfileError::NoApps);
+        }
+
+        // A document that reached this point already parsed successfully
+        // into `RawFlockfile` above, so the same source deserializing into a
+        // generic `Value` cannot fail for a reason the `RawFlockfile` pass
+        // would not already have caught.
+        let value = parse_into::<serde_json::Value>(text, format)?;
+        let tables: Vec<Option<&serde_json::Map<String, serde_json::Value>>> = value
+            .get("app")
+            .and_then(serde_json::Value::as_array)
+            .map(|apps| apps.iter().map(serde_json::Value::as_object).collect())
+            .unwrap_or_default();
+
+        Ok(apps
+            .into_iter()
+            .enumerate()
+            .map(|(index, config)| {
+                let table = tables.get(index).copied().flatten();
+                let declared = table
+                    .map(|t| t.keys().cloned().collect())
+                    .unwrap_or_default();
+                let declared_env = table
+                    .and_then(|t| t.get("env"))
+                    .and_then(serde_json::Value::as_object)
+                    .map(|e| e.keys().cloned().collect())
+                    .unwrap_or_default();
+                DeclaredApp {
+                    config,
+                    declared,
+                    declared_env,
+                }
+            })
+            .collect())
+    }
+}
+
+// The per-format deserialize `Flockfile::parse` and `Flockfile::parse_declared`
+// both start from, generic over the target type so the same four backends
+// serve both `RawFlockfile` (validation) and `serde_json::Value` (recovering
+// the document's literal keys). Kept as the ONE place that knows the four
+// backends, so the two callers cannot drift on what a valid document looks
+// like.
+fn parse_into<T: serde::de::DeserializeOwned>(
+    source: &str,
+    format: FlockFormat,
+) -> Result<T, FlockfileError> {
+    match format {
+        FlockFormat::Toml => {
+            toml::from_str(source).map_err(|e| FlockfileError::Toml(e.to_string()))
+        }
+        FlockFormat::Yaml => {
+            serde_saphyr::from_str(source).map_err(|e| FlockfileError::Yaml(e.to_string()))
+        }
+        FlockFormat::Json => {
+            serde_json::from_str(source).map_err(|e| FlockfileError::Json(e.to_string()))
+        }
+        FlockFormat::Json5 => {
+            if json5_nesting_depth(source) > MAX_JSON5_NESTING_DEPTH {
+                return Err(FlockfileError::Json5(
+                    "nesting depth exceeds 64".to_string(),
+                ));
+            }
+            json5::from_str(source).map_err(|e| FlockfileError::Json5(e.to_string()))
+        }
     }
 }
 
@@ -828,5 +928,84 @@ script = "./srv"
             Flockfile::parse(src, FlockFormat::Toml).unwrap().apps.len(),
             1
         );
+    }
+
+    /// fails if the declared key set is inferred from values rather than read
+    /// from the document. `autorestart = true` is also the DEFAULT, so a
+    /// parser that reports "fields that differ from Default" would miss it,
+    /// and a later file load would then overwrite an operator who had
+    /// deliberately turned it off.
+    #[test]
+    fn declared_reports_keys_the_document_wrote_even_at_their_default() {
+        let text = r#"
+[[app]]
+name = "web"
+script = "./srv"
+autorestart = true
+"#;
+        let apps = Flockfile::parse_declared(text, FlockFormat::Toml).unwrap();
+        assert_eq!(apps.len(), 1);
+        let declared = &apps[0].declared;
+        assert!(declared.contains("autorestart"), "declared: {declared:?}");
+        assert!(declared.contains("name"));
+        assert!(declared.contains("script"));
+        assert!(
+            !declared.contains("max_memory"),
+            "a key nobody wrote is not declared"
+        );
+        assert_eq!(declared.len(), 3);
+    }
+
+    /// fails if env keys are not reported separately. `env` is the only map
+    /// of user-supplied keys in `AppConfig`, so the merge treats it one
+    /// level deeper than every other field.
+    #[test]
+    fn declared_env_reports_the_keys_inside_the_env_table() {
+        let text = r#"
+[[app]]
+name = "web"
+script = "./srv"
+env = { DB_HOST = "", NODE_ENV = "production" }
+"#;
+        let apps = Flockfile::parse_declared(text, FlockFormat::Toml).unwrap();
+        assert_eq!(
+            apps[0].declared_env.iter().collect::<Vec<_>>(),
+            vec!["DB_HOST", "NODE_ENV"]
+        );
+        assert!(apps[0].declared.contains("env"));
+    }
+
+    /// fails if a format other than TOML loses the key set. All four go
+    /// through one generic intermediate, so a regression here means the
+    /// intermediate was bypassed for a format.
+    #[test]
+    fn declared_survives_every_parse_format() {
+        let cases: [(FlockFormat, &str); 4] = [
+            (
+                FlockFormat::Toml,
+                "[[app]]\nname = \"web\"\nscript = \"./srv\"\nautorestart = true\n",
+            ),
+            (
+                FlockFormat::Yaml,
+                "app:\n  - name: web\n    script: ./srv\n    autorestart: true\n",
+            ),
+            (
+                FlockFormat::Json,
+                r#"{"app":[{"name":"web","script":"./srv","autorestart":true}]}"#,
+            ),
+            (
+                FlockFormat::Json5,
+                "{ app: [{ name: \"web\", script: \"./srv\", autorestart: true }] }",
+            ),
+        ];
+        for (format, text) in cases {
+            let apps = Flockfile::parse_declared(text, format)
+                .unwrap_or_else(|e| panic!("{format:?} failed to parse: {e}"));
+            assert!(
+                apps[0].declared.contains("autorestart"),
+                "{format:?}: declared {:?}",
+                apps[0].declared
+            );
+        }
     }
 }

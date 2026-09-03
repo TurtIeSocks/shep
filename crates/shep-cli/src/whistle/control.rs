@@ -244,6 +244,7 @@ mod tests {
             socket,
             barks: std::path::PathBuf::from("/nonexistent/barks.jsonl"),
             kv: std::path::PathBuf::new(),
+            overrides: std::path::PathBuf::new(),
         };
         Whistle::new(paths, gate::Control::Allowed)
     }

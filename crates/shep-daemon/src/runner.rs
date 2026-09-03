@@ -1015,7 +1015,7 @@ pub enum Preflight {
 }
 
 /// Everything a spawn needs, pre-assembled by the assembler (a later task)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SpawnSpec {
     /// Sheep name (for logging/tracing, not passed to the child)
     pub name: String,
@@ -1041,6 +1041,21 @@ pub struct SpawnSpec {
     /// identity). Resolved once per `Start` by `crate::privilege::resolve`;
     /// see that module for how `user`/`group` config names become this.
     pub credentials: Option<Credentials>,
+}
+
+/// Redacted: `env` carries whatever the operator configured, and this type is
+/// the one handed to `Command::envs` at exec. Every other env-carrying type
+/// in the workspace redacts (IR-41), and this was the one that did not.
+impl fmt::Debug for SpawnSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpawnSpec")
+            .field("name", &self.name)
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env", &format_args!("<{} vars>", self.env.len()))
+            .finish_non_exhaustive()
+    }
 }
 
 /// Error type returned from spawn and process control
@@ -1230,6 +1245,38 @@ mod tests {
             rendered.matches("log path sits below").count(),
             1,
             "an unprivileged shepherd warns once per path, not once per open: {rendered}"
+        );
+    }
+
+    /// fails if `SpawnSpec`'s Debug ever prints an env VALUE. This type sits
+    /// on the exec boundary, so a `tracing` call that formats it would put
+    /// every secret an operator configured into the daemon's log (IR-41).
+    /// Exact string pinned so a lazy `derive(Debug)` refactor fails here.
+    #[test]
+    fn debug_redacts_env_values() {
+        let mut spec = SpawnSpec {
+            name: "web".to_string(),
+            program: "./srv".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            out_file: PathBuf::from("/tmp/web-out.log"),
+            err_file: PathBuf::from("/tmp/web-err.log"),
+            channel: false,
+            stdin: false,
+            credentials: None,
+        };
+        spec.env.insert(
+            "DATABASE_URL".to_string(),
+            "postgres://user:hunter2@db".to_string(),
+        );
+        spec.env
+            .insert("API_KEY".to_string(), "sk-live-abc".to_string());
+
+        assert_eq!(
+            format!("{spec:?}"),
+            "SpawnSpec { name: \"web\", program: \"./srv\", args: [], cwd: None, env: <2 vars>, \
+             .. }"
         );
     }
 }

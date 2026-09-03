@@ -26,6 +26,7 @@ pub mod kv;
 // One definition of the log-line timestamp for the writer and every reader:
 // the daemon stamps, and three different file readers in shep-cli strip.
 pub mod logstamp;
+pub mod overrides;
 pub mod paths;
 pub mod protocol;
 pub mod selector;
@@ -42,7 +43,7 @@ pub mod values;
 /// One-import surface for downstream crates
 pub mod prelude {
     #[doc(no_inline)]
-    pub use crate::config::{AppConfig, Flockfile};
+    pub use crate::config::{AppConfig, DeclaredApp, Flockfile};
     #[doc(no_inline)]
     pub use crate::paths::ShepPaths;
     #[doc(no_inline)]

@@ -112,6 +112,23 @@ pub struct SheepRow {
     /// own log (`shep bleats <name>`), which is the only place the shepherd
     /// recorded what it actually saw.
     pub dog_stale: Option<bool>,
+    /// The `AppConfig` field names this sheep's spec differs from a load's
+    /// parked config for; absent when nothing is parked. Names only, never
+    /// values (IR-41), the same guarantee `ProcessInfo::pending` carries.
+    ///
+    /// `skip_serializing_if`, matching `ProcessInfo::pending` exactly: this
+    /// type's own doc promises byte-identical JSON, and `ProcessInfo`
+    /// carries this field the same way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Vec<String>>,
+    /// The `AppConfig` field names an operator has overridden on this sheep
+    /// that its current Flockfile does not declare; absent when there is
+    /// nothing to report. Names only, never values (IR-41), the same
+    /// guarantee `ProcessInfo::overridden` carries.
+    ///
+    /// `skip_serializing_if`, for the same reason `Self::pending` carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overridden: Option<Vec<String>>,
 }
 
 /// Where a dog came from. Mirrors `DogSource`'s tagged wire shape exactly.
@@ -179,6 +196,8 @@ impl From<&ProcessInfo> for SheepRow {
             instance: info.instance,
             handshook: info.handshook,
             dog_stale: info.dog_stale,
+            pending: info.pending.clone(),
+            overridden: info.overridden.clone(),
         }
     }
 }
@@ -343,6 +362,15 @@ mod tests {
     /// It also catches the additive case, which is the likely one: a
     /// fourteenth field on `ProcessInfo` makes this fail with a missing key
     /// until `SheepRow` carries it or a comment here says why it does not.
+    ///
+    /// That claim only holds when every `Option` field on the fixture below
+    /// is `Some`, `pending`/`overridden` included: both carry
+    /// `skip_serializing_if`, the first two `ProcessInfo` fields to, and a
+    /// `None` value omits the key entirely on BOTH sides rather than
+    /// serializing `null` -- which is exactly how the two omitted fields
+    /// stayed invisible to this test for one commit after they were added.
+    /// A missing `SheepRow` field is only caught the moment the source
+    /// value it would carry is actually present to compare.
     #[test]
     fn a_sheep_row_serializes_exactly_as_process_info_does() {
         let info = ProcessInfo::builder(7, "api", ProcStatus::WaitingRestart)
@@ -358,6 +386,8 @@ mod tests {
                 path: "/usr/local/bin/dog".to_string(),
             }))
             .lambs(Some(vec![Lamb::new(4243, "node")]))
+            .pending(Some(vec!["env".to_string()]))
+            .overridden(Some(vec!["cwd".to_string()]))
             .build();
 
         assert_eq!(
@@ -383,11 +413,34 @@ mod tests {
     /// fails if the schema stops describing what the struct emits. rmcp
     /// hands this schema to the model as the tool's declared output shape;
     /// a schema missing a field the tool returns teaches the model wrong.
+    ///
+    /// Fully populated, not the all-`None` idle sheep the other tests use
+    /// for a "stopped sheep" case: `emitted`'s keys are what this loop
+    /// checks against the schema, and a `skip_serializing_if` field is
+    /// simply absent from `emitted` when its value is `None` -- an all-`None`
+    /// fixture would never ask whether `pending`/`overridden` are in the
+    /// schema at all, the exact way this guard stayed blind to both for one
+    /// commit.
     #[test]
     fn the_generated_schema_names_every_field_the_row_carries() {
         let schema = serde_json::to_value(schemars::schema_for!(SheepRow)).unwrap();
         let properties = schema["properties"].as_object().expect("an object schema");
-        let info = ProcessInfo::builder(1, "idle", ProcStatus::Stopped).build();
+        let info = ProcessInfo::builder(7, "api", ProcStatus::WaitingRestart)
+            .pid(Some(4242))
+            .restarts(3)
+            .uptime_ms(61_000)
+            .fold(Some("web".to_string()))
+            .out_file(Some("/tmp/api-out.log".to_string()))
+            .err_file(Some("/tmp/api-err.log".to_string()))
+            .cpu_percent(Some(12.5))
+            .memory_bytes(Some(1024 * 1024))
+            .dog(Some(DogSource::Adopted {
+                path: "/usr/local/bin/dog".to_string(),
+            }))
+            .lambs(Some(vec![Lamb::new(4243, "node")]))
+            .pending(Some(vec!["env".to_string()]))
+            .overridden(Some(vec!["cwd".to_string()]))
+            .build();
         let emitted = serde_json::to_value(&info).unwrap();
         for key in emitted.as_object().unwrap().keys() {
             assert!(

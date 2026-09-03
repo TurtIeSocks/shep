@@ -49,6 +49,27 @@ use crate::watch::{
     DEFAULT_WATCH_DELAY, MIN_WATCH_DELAY, WatchFilter, own_log_ignores, spawn_watch_group,
 };
 
+/// A [`LivenessFailure`] paired with the epoch its probe was armed under.
+///
+/// `InstanceExtras::disarm` calls `liveness.abort()`, which does not await
+/// the aborted task: a probe already inside `failures.send(..).await` when
+/// it is replaced (a config-only re-arm, which changes neither the pid nor
+/// the status the two older guards check) can still deliver its failure
+/// after a fresh probe is already running against the same process. This
+/// carries the epoch [`ExtrasRegistry::arm`] captured when THIS probe was
+/// spawned, so `Actor::handle_extra_restart` can tell that stale failure
+/// apart from a genuine one raised by the CURRENT probe, even though pid and
+/// status agree on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LivenessReport {
+    /// The sheep's id.
+    pub id: u32,
+    /// The pid this loop was armed against.
+    pub pid: u32,
+    /// The epoch the reporting probe was armed under.
+    pub epoch: u64,
+}
+
 /// Where the lifecycle extras send the two out-of-band failure reports.
 ///
 /// The matching receivers belong to the reporting task, never to the actor.
@@ -57,7 +78,7 @@ pub struct ExtrasReports {
     /// Memory-limit breaches, from the enforcer.
     pub breaches: mpsc::Sender<LimitBreach>,
     /// Sheep whose liveness probe hit `failure_threshold`.
-    pub liveness: mpsc::Sender<LivenessFailure>,
+    pub liveness: mpsc::Sender<LivenessReport>,
 }
 
 /// The four lifecycle extras, the seams they run on, and where their two
@@ -163,7 +184,7 @@ impl fmt::Debug for Extras {
 /// reporting task immediately.
 pub fn spawn_extras_reporter(
     mut breaches: mpsc::Receiver<LimitBreach>,
-    mut liveness: mpsc::Receiver<LivenessFailure>,
+    mut liveness: mpsc::Receiver<LivenessReport>,
     supervisor: SupervisorHandle,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -185,18 +206,37 @@ pub fn spawn_extras_reporter(
                             limit = %breach.limit,
                             "process tree exceeded its max_memory; restarting"
                         );
-                        supervisor.extra_restart(breach.id, breach.root_pid).await;
+                        // No epoch to carry: a memory breach has nothing
+                        // equivalent to a probe task that can be aborted
+                        // mid-`send`. What it carries instead is the size it
+                        // measured, which is its own staleness token -- the
+                        // breach was computed under `PollingEnforcer`'s lock
+                        // and is sent after that lock is released, so a
+                        // ceiling re-armed in between leaves this report
+                        // speaking for a limit nobody enforces any more. The
+                        // actor re-asks the question against the ceiling in
+                        // force when it arrives.
+                        supervisor
+                            .extra_restart(
+                                breach.id,
+                                breach.root_pid,
+                                None,
+                                Some(breach.observed),
+                            )
+                            .await;
                     }
                     None => breaches_open = false,
                 },
                 maybe_failure = liveness.recv(), if liveness_open => match maybe_failure {
-                    Some(failure) => {
+                    Some(report) => {
                         tracing::warn!(
-                            id = failure.id,
-                            pid = failure.pid,
+                            id = report.id,
+                            pid = report.pid,
                             "liveness probe hit its failure_threshold; restarting"
                         );
-                        supervisor.extra_restart(failure.id, failure.pid).await;
+                        supervisor
+                            .extra_restart(report.id, report.pid, Some(report.epoch), None)
+                            .await;
                     }
                     None => liveness_open = false,
                 },
@@ -218,6 +258,31 @@ pub struct ExtrasRegistry {
     /// One instance's per-pid extras, keyed by sheep id. Present only while
     /// at least one of them is armed.
     instances: HashMap<u32, InstanceExtras>,
+    /// The epoch each id's liveness probe is CURRENTLY armed under, bumped
+    /// every time [`Self::arm`] (re)arms an id, whether or not that id
+    /// configures a `liveness_probe` at all, so an app that adds one later
+    /// never inherits a stale count from before it did.
+    ///
+    /// Deliberately not the supervisor's own private `SheepSlot::epoch`: that
+    /// one is bumped on a RESPAWN, when the pid changes, which is exactly
+    /// the case `Actor::handle_extra_restart`'s existing pid guard already
+    /// catches. This counter answers a narrower question a pid check
+    /// cannot: has THIS id's liveness probe been replaced without the
+    /// process underneath it changing at all, the case a config-only re-arm
+    /// produces. Overloading the respawn epoch for that would either bump it
+    /// on every config change too (a respawn-generation counter moving
+    /// without a respawn) or leave a config-only re-arm unable to move it at
+    /// all, so this is a second counter rather than a second use of the
+    /// first.
+    ///
+    /// Lives on the registry, not on `SheepSlot`, because that is the one
+    /// type that already knows when a liveness probe is actually replaced:
+    /// `SheepSlot` has no visibility into an arming `ExtrasRegistry::arm`
+    /// performs, and `rearm_name` (this registry's own config-only re-arm)
+    /// has no visibility into `SheepSlot` the other way. Keeping the counter
+    /// where the arming decision is made avoids two structs that would
+    /// otherwise need to agree on it.
+    liveness_epochs: HashMap<u32, u64>,
 }
 
 /// One name-group's per-name tasks, plus the armed instances keeping them
@@ -328,7 +393,16 @@ impl ExtrasRegistry {
         let id = entry.id;
 
         self.disarm_instance(id);
-        if let Some(instance) = arm_instance(entry, prober, extras) {
+        // Bumped unconditionally, ahead of `arm_instance` even for an entry
+        // configuring no `liveness_probe` at all; see
+        // `Self::liveness_epochs`'s doc for why this lives here rather than
+        // on `SheepSlot`. `arm_instance` only ever reads it for a probe it is
+        // about to spawn, so an id that never arms a probe pays nothing for
+        // an epoch nothing consults.
+        let liveness_epoch = self.liveness_epochs.entry(id).or_insert(0);
+        *liveness_epoch += 1;
+        let liveness_epoch = *liveness_epoch;
+        if let Some(instance) = arm_instance(entry, prober, extras, liveness_epoch) {
             self.instances.insert(id, instance);
         }
 
@@ -385,6 +459,14 @@ impl ExtrasRegistry {
     /// is needed and none is available.
     pub fn disarm(&mut self, id: u32, name: &str) {
         self.disarm_instance(id);
+        // Not inside `disarm_instance`: `Self::arm` calls that first and
+        // would otherwise reset the very counter it is about to bump,
+        // pinning every id's epoch at 1 forever and defeating the whole
+        // point of it. This is the FULL teardown (a sheep going terminal),
+        // so nothing left in `self.sheep` will ever compare against `id`
+        // again; removing it here is hygiene against an unbounded map on a
+        // daemon that runs for months, not a correctness requirement.
+        self.liveness_epochs.remove(&id);
 
         let Some(group) = self.groups.get_mut(name) else {
             return;
@@ -401,12 +483,101 @@ impl ExtrasRegistry {
         }
     }
 
+    /// Rebuilds everything armed for `name`, replacing live tasks rather than
+    /// keeping them.
+    ///
+    /// [`Self::arm`] deliberately preserves a running cron or watch task, so
+    /// that a reload's replacement instance arming before the drainee disarms
+    /// does not tear down a watcher the drainee still needs. That is right for
+    /// the transition it was written for and wrong for a config change: the
+    /// group-scoped fields (`watch`, `ignore_watch`, `watch_delay`,
+    /// `watch_options`) and the cron ones (`cron_restart`, `cron_timezone`)
+    /// are read when the task is built, so a task that survives keeps the old
+    /// values for as long as it lives.
+    ///
+    /// Takes a slice of entries rather than one id, because the group is
+    /// per-name: disarming a single instance of a multi-instance app leaves
+    /// the group standing, by design.
+    ///
+    /// `entries` is what the caller wants ARMED, not every entry the name
+    /// has. The sole production caller, [`crate::supervisor`]'s own
+    /// `rearm_name`, passes only the entries that are `Online` with a live
+    /// pid, and that filter is load-bearing rather than tidy: [`Self::arm`]
+    /// decides group membership from the configuration rather than from
+    /// whether anything is running, so an entry passed here for a stopped
+    /// instance joins a group whose next cron occurrence or watch event
+    /// restarts every member, and a config load would then start a process
+    /// the operator had stopped, with no operator action and no report.
+    ///
+    /// An empty slice is correct input, not a caller mistake: it aborts the
+    /// group and rebuilds nothing, which is what a name whose instances are
+    /// all momentarily down needs, so that the group holding the OLD config
+    /// does not outlive the load.
+    ///
+    /// # What this loses
+    ///
+    /// The OS watch is torn down and rebuilt with a real gap and no rescan, so
+    /// a file saved during it is missed. Same gap any watcher restart has.
+    /// `stats.watch()` clears the pid's CPU baseline, so `shep flock` shows a
+    /// blank CPU cell for one poll interval. Both are documented rather than
+    /// closed; see the design spec.
+    /// `prober` is called once per entry rather than shared, because
+    /// `assemble` bakes `SHEP_INSTANCE` and every `{{instance}}` template
+    /// into the environment a prober runs with: one prober for a
+    /// multi-instance app would run every instance's liveness probe against a
+    /// single instance's environment.
+    pub fn rearm_name(
+        &mut self,
+        name: &str,
+        entries: &[&ProcessEntry],
+        prober: impl Fn(&ProcessEntry) -> Arc<dyn Prober>,
+        extras: &Extras,
+        supervisor: &SupervisorHandle,
+    ) {
+        // Abort the group's own tasks before rebuilding, which is the whole
+        // difference from `arm`. Removing the entry rather than mutating it
+        // means the rebuild below takes `arm`'s own "no task yet" path, so
+        // there is one construction site rather than two.
+        if let Some(group) = self.groups.remove(name) {
+            group.abort();
+        }
+        for entry in entries {
+            self.arm(entry, prober(entry), extras, supervisor);
+        }
+    }
+
     /// Undoes one instance's per-pid arming: the memory limit and the
     /// liveness loop. A no-op for an id that had neither.
     fn disarm_instance(&mut self, id: u32) {
         if let Some(instance) = self.instances.remove(&id) {
             instance.disarm(id);
         }
+    }
+
+    /// The epoch `id`'s liveness probe is CURRENTLY armed under, or `0` for
+    /// an id that has never been armed. `Actor::handle_extra_restart` drops a
+    /// [`LivenessReport`] whose own epoch does not match this, which is what
+    /// tells a failure raised by a since-replaced probe apart from one raised
+    /// by the probe running now.
+    pub(crate) fn liveness_epoch(&self, id: u32) -> u64 {
+        self.liveness_epochs.get(&id).copied().unwrap_or(0)
+    }
+
+    /// The ids in `name`'s armed group, or `None` when nothing of that name is
+    /// armed at all.
+    ///
+    /// Test-facing, and it exists because `groups` is private to this module
+    /// while the decision about WHICH entries get armed lives in
+    /// `supervisor.rs`. A stopped instance in a group is armed to be
+    /// restarted by that group's cron occurrence or file save, so
+    /// "who is in the group" is the exact question a case there has to ask.
+    #[cfg(test)]
+    pub(crate) fn group_members(&self, name: &str) -> Option<Vec<u32>> {
+        self.groups.get(name).map(|group| {
+            let mut members: Vec<u32> = group.members.iter().copied().collect();
+            members.sort_unstable();
+            members
+        })
     }
 }
 
@@ -447,6 +618,7 @@ fn arm_instance(
     entry: &ProcessEntry,
     prober: Arc<dyn Prober>,
     extras: &Extras,
+    liveness_epoch: u64,
 ) -> Option<InstanceExtras> {
     let config = entry.spec.config();
     let wants_anything = config.max_memory.is_some() || config.liveness_probe.is_some();
@@ -476,13 +648,37 @@ fn arm_instance(
     if let Some(probe) = config.liveness_probe.as_ref() {
         match ProbeTarget::parse(probe) {
             Ok(target) => {
+                // `spawn_liveness_task` only ever knows `LivenessFailure`;
+                // it lives in `probes`, which has no business knowing about
+                // an epoch this module invented. So the probe reports into a
+                // private one-shot channel instead of `extras.reports`
+                // directly, and this relay tags the single failure it may
+                // ever produce (the probe's own doc: it reports once, then
+                // ends) with the epoch THIS probe was spawned under, before
+                // forwarding it on to the shared reporter. Capturing the
+                // epoch here rather than reading it back off the registry at
+                // delivery time is the whole point: by delivery time a
+                // config-only re-arm may already have moved it on.
+                let (raw_tx, mut raw_rx) = mpsc::channel::<LivenessFailure>(1);
+                let reports_liveness = extras.reports.liveness.clone();
+                tokio::spawn(async move {
+                    if let Some(failure) = raw_rx.recv().await {
+                        let _ = reports_liveness
+                            .send(LivenessReport {
+                                id: failure.id,
+                                pid: failure.pid,
+                                epoch: liveness_epoch,
+                            })
+                            .await;
+                    }
+                });
                 instance.liveness = Some(spawn_liveness_task(
                     entry.id,
                     pid,
                     probe.clone(),
                     target,
                     prober,
-                    extras.reports.liveness.clone(),
+                    raw_tx,
                 ));
             }
             Err(err) => {
@@ -707,7 +903,7 @@ mod tests {
         extras: Extras,
         enforcer: Arc<RecordingEnforcer>,
         clock: Arc<TestClock>,
-        liveness: mpsc::Receiver<LivenessFailure>,
+        liveness: mpsc::Receiver<LivenessReport>,
         _breaches: mpsc::Receiver<LimitBreach>,
     }
 
@@ -872,9 +1068,9 @@ mod tests {
     }
 
     async fn expect_liveness(
-        rx: &mut mpsc::Receiver<LivenessFailure>,
+        rx: &mut mpsc::Receiver<LivenessReport>,
         window: Duration,
-    ) -> LivenessFailure {
+    ) -> LivenessReport {
         match tokio::time::timeout(window, rx.recv()).await {
             Ok(Some(failure)) => failure,
             Ok(None) => panic!("the liveness channel closed before a failure arrived"),
@@ -885,7 +1081,7 @@ mod tests {
     /// Waits up to `window` for a liveness failure, panicking if one arrives.
     /// A bounded `timeout` + `recv` for the same reason as
     /// [`assert_no_restart_within`].
-    async fn assert_no_liveness_within(rx: &mut mpsc::Receiver<LivenessFailure>, window: Duration) {
+    async fn assert_no_liveness_within(rx: &mut mpsc::Receiver<LivenessReport>, window: Duration) {
         match tokio::time::timeout(window, rx.recv()).await {
             Err(_) => {} // window elapsed with nothing arriving — expected
             Ok(Some(failure)) => panic!("unexpected liveness failure observed: {failure:?}"),
@@ -1582,7 +1778,11 @@ mod tests {
         let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
         assert_eq!(
             failure,
-            LivenessFailure { id: 8, pid: 5678 },
+            LivenessReport {
+                id: 8,
+                pid: 5678,
+                epoch: 1
+            },
             "only the registry that is still alive may report"
         );
         assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
@@ -1687,7 +1887,11 @@ mod tests {
         let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
         assert_eq!(
             failure,
-            LivenessFailure { id: 1, pid: 1001 },
+            LivenessReport {
+                id: 1,
+                pid: 1001,
+                epoch: 1
+            },
             "only the instance that is still armed may report"
         );
         assert_no_liveness_within(&mut rig.liveness, interval * 3).await;
@@ -1726,7 +1930,14 @@ mod tests {
         );
 
         let failure = expect_liveness(&mut rig.liveness, EVENT_WAIT).await;
-        assert_eq!(failure, LivenessFailure { id: 7, pid: 1234 });
+        assert_eq!(
+            failure,
+            LivenessReport {
+                id: 7,
+                pid: 1234,
+                epoch: 1
+            }
+        );
         // The scripted prober repeats its last outcome forever, so a loop
         // that kept probing after reporting would report again inside this
         // window.
@@ -1786,7 +1997,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_breach_naming_the_running_pid_restarts_that_sheep() {
         let (handle, mut rx, _fixture) = spawn_test_fixture();
-        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+        // The ceiling the synthetic breach below names. Carried on the app
+        // rather than left at `None` so the fixture describes a sheep that
+        // could really have produced that report: the actor now re-asks a
+        // breach against the ceiling in force, and an app configuring none
+        // has none in force.
+        handle
+            .start(vec![app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(500));
+            })])
+            .await
+            .unwrap();
         let pid = handle.list().await[0].pid.expect("a live sheep has a pid");
         let (breach_tx, breach_rx) = mpsc::channel(4);
         let (_live_tx, live_rx) = mpsc::channel(4);
@@ -1826,7 +2047,20 @@ mod tests {
         let (live_tx, live_rx) = mpsc::channel(4);
         let _reporter = spawn_extras_reporter(breach_rx, live_rx, handle.clone());
 
-        live_tx.send(LivenessFailure { id: 0, pid }).await.unwrap();
+        // `spawn_test_fixture` wires no `Extras` at all, so the actor's own
+        // registry never arms anything and its epoch for id 0 stays at the
+        // default `0` `ExtrasRegistry::liveness_epoch` reports for an id it
+        // has never seen. This report is injected straight past the
+        // (nonexistent) real probe, so it has to agree with that default
+        // rather than with the `1` a real arm would produce.
+        live_tx
+            .send(LivenessReport {
+                id: 0,
+                pid,
+                epoch: 0,
+            })
+            .await
+            .unwrap();
 
         let (info, manually) = expect_restart_event(&mut rx, "web", EVENT_WAIT).await;
         assert_eq!(info.id, 0);
@@ -1847,7 +2081,7 @@ mod tests {
         let (handle, _rx, _fixture) = spawn_test_fixture();
         handle.start(vec![app_with("web", |_| {})]).await.unwrap();
 
-        handle.extra_restart(99, 4242).await;
+        handle.extra_restart(99, 4242, None, None).await;
 
         assert_eq!(
             handle.list().await.len(),
@@ -1883,7 +2117,7 @@ mod tests {
         );
         let pid = listing[0].pid.expect("a spawned sheep has a pid");
 
-        handle.extra_restart(0, pid).await;
+        handle.extra_restart(0, pid, None, None).await;
 
         assert_no_restart_within(&mut rx, "web", Duration::from_secs(30)).await;
         assert_eq!(handle.list().await[0].restarts, 0);
@@ -1935,7 +2169,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_breach_carrying_the_previous_pid_restarts_nothing() {
         let (handle, mut rx, _fixture) = spawn_test_fixture();
-        handle.start(vec![app_with("web", |_| {})]).await.unwrap();
+        // The ceiling both synthetic breaches below name; see the case above
+        // for why the fixture carries it.
+        handle
+            .start(vec![app_with("web", |app| {
+                app.max_memory = Some(MemSize::from_bytes(500));
+            })])
+            .await
+            .unwrap();
         let stale_pid = handle.list().await[0].pid.expect("a live sheep has a pid");
         let (breach_tx, breach_rx) = mpsc::channel(4);
         let (_live_tx, live_rx) = mpsc::channel(4);
@@ -2484,7 +2725,258 @@ mod tests {
             .expect("a live sheep has a pid");
 
         let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
-        assert_eq!(failure, LivenessFailure { id: 0, pid });
+        assert_eq!(
+            failure,
+            LivenessReport {
+                id: 0,
+                pid,
+                epoch: 1
+            }
+        );
+    }
+
+    /// fails if re-arming leaves the old group tasks running. `arm` deliberately
+    /// keeps a live cron or watch task, which is right for a reload's overlap and
+    /// wrong for a config change: those tasks read `watch`, `ignore_watch`,
+    /// `watch_delay`, `watch_options`, `cron_restart` and `cron_timezone` when
+    /// they are BUILT, so a task that survives keeps the old values forever.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_name_replaces_a_live_group_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        let entry = armed_entry(0, 0, 1000, app.clone(), &paths);
+        registry.arm(&entry, idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let before_cron = registry.groups["web"].cron.as_ref().unwrap().abort_handle();
+        let before_watch = registry.groups["web"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+
+        registry.rearm_name("web", &[&entry], |_| idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let after_cron = registry.groups["web"].cron.as_ref().unwrap().abort_handle();
+        let after_watch = registry.groups["web"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        assert_ne!(
+            before_cron.id(),
+            after_cron.id(),
+            "the cron worker survived a rearm"
+        );
+        assert_ne!(
+            before_watch.id(),
+            after_watch.id(),
+            "the watch task survived a rearm"
+        );
+    }
+
+    /// fails if rearm_name tears a group down without rebuilding it. An app left
+    /// with no watcher at all is worse than one left with a stale watcher.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_name_leaves_the_group_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        let entry = armed_entry(0, 0, 1000, app.clone(), &paths);
+        registry.arm(&entry, idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        registry.rearm_name("web", &[&entry], |_| idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let group = &registry.groups["web"];
+        assert!(
+            group.cron.as_ref().is_some_and(|cron| !cron.is_finished()),
+            "the group must still have a live cron worker after a rearm"
+        );
+        assert!(
+            group
+                .watch
+                .as_ref()
+                .is_some_and(|watch| !watch.is_finished()),
+            "the group must still have a live watch task after a rearm"
+        );
+    }
+
+    /// fails if rearm_name reaches into another app's group. The registry is
+    /// keyed by name and a rebuild stays inside one name.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_name_leaves_another_apps_group_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let web_root = tempfile::tempdir().unwrap();
+        let worker_root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let web = app_with("web", |app| {
+            app.watch = true;
+            app.cwd = Some(web_root.path().display().to_string());
+        });
+        let worker = app_with("worker", |app| {
+            app.watch = true;
+            app.cwd = Some(worker_root.path().display().to_string());
+        });
+        handle
+            .start(vec![web.clone(), worker.clone()])
+            .await
+            .unwrap();
+
+        let web_entry = armed_entry(0, 0, 1000, web.clone(), &paths);
+        let worker_entry = armed_entry(1, 0, 1001, worker.clone(), &paths);
+        registry.arm(&web_entry, idle_prober(), &rig.extras, &handle);
+        registry.arm(&worker_entry, idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let worker_watch_before = registry.groups["worker"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+
+        registry.rearm_name(
+            "web",
+            &[&web_entry],
+            |_| idle_prober(),
+            &rig.extras,
+            &handle,
+        );
+        tokio::task::yield_now().await;
+
+        let worker_watch_after = registry.groups["worker"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        assert_eq!(
+            worker_watch_before.id(),
+            worker_watch_after.id(),
+            "rearming \"web\" must not touch \"worker\"'s group"
+        );
+    }
+
+    /// fails if `rearm_name`'s delegation to `arm` per entry stops sharing
+    /// one group across a name's own instances. Today that sharing is only
+    /// TRANSITIVELY protected, by `arm`'s own idempotency test, because
+    /// `rearm_name` never builds a task itself; a future refactor that stops
+    /// delegating and builds per entry instead would orphan a multi-instance
+    /// app's membership with nothing in this diff to catch it. Task 8 calls
+    /// `rearm_name` with every entry of a name, so this is the path any app
+    /// running more than one instance actually exercises.
+    #[tokio::test(start_paused = true)]
+    async fn rearm_name_rebuilds_a_multi_instance_group_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _rx, _fixture) = spawn_test_fixture();
+        let rig = rig(DEFAULT_MAX_CRON_SLEEP);
+        let mut registry = ExtrasRegistry::default();
+        let app = app_with("web", |app| {
+            app.instances = 2;
+            app.cron_restart = Some("0 * * * *".to_string());
+            app.watch = true;
+            app.cwd = Some(root.path().display().to_string());
+        });
+        handle.start(vec![app.clone()]).await.unwrap();
+
+        let entry_a = armed_entry(0, 0, 1000, app.clone(), &paths);
+        let entry_b = armed_entry(1, 1, 1001, app.clone(), &paths);
+        registry.arm(&entry_a, idle_prober(), &rig.extras, &handle);
+        registry.arm(&entry_b, idle_prober(), &rig.extras, &handle);
+        tokio::task::yield_now().await;
+
+        let before_cron = registry.groups["web"].cron.as_ref().unwrap().abort_handle();
+        let before_watch = registry.groups["web"]
+            .watch
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+
+        // The prober closure is also the seam that pins ONE PROBER PER
+        // ENTRY. `assemble` bakes `SHEP_INSTANCE` and every `{{instance}}`
+        // template into the environment a prober runs with, so a shared
+        // prober would run every instance's liveness probe against a single
+        // instance's environment. Nothing observes which environment an
+        // `OsProber` ended up holding, but the number of calls and their
+        // order are observable right here.
+        let probed = std::sync::Mutex::new(Vec::new());
+        registry.rearm_name(
+            "web",
+            &[&entry_a, &entry_b],
+            |entry| {
+                probed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(entry.id);
+                idle_prober()
+            },
+            &rig.extras,
+            &handle,
+        );
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            probed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            [0, 1],
+            "each instance must get its own prober, in id order"
+        );
+
+        let group = &registry.groups["web"];
+        assert_eq!(
+            group.members,
+            HashSet::from([0, 1]),
+            "both instances must still be members after a rearm, not just the last one arm'd"
+        );
+        assert!(
+            group.cron.is_some(),
+            "the group must hold exactly one cron task, not zero"
+        );
+        assert!(
+            group.watch.is_some(),
+            "the group must hold exactly one watch task, not zero"
+        );
+        let after_cron = group.cron.as_ref().unwrap().abort_handle();
+        let after_watch = group.watch.as_ref().unwrap().abort_handle();
+        assert_ne!(
+            before_cron.id(),
+            after_cron.id(),
+            "the cron worker must be rebuilt by the rearm, not left over"
+        );
+        assert_ne!(
+            before_watch.id(),
+            after_watch.id(),
+            "the watch task must be rebuilt by the rearm, not left over"
+        );
     }
 
     /// Tests that wait on real filesystem events or real elapsed time.
@@ -3014,9 +3506,10 @@ mod tests {
             let failure = expect_liveness(&mut h.liveness, LIVENESS_DEADLINE).await;
             assert_eq!(
                 failure,
-                LivenessFailure {
+                LivenessReport {
                     id: 1,
-                    pid: instance_one_pid
+                    pid: instance_one_pid,
+                    epoch: 1,
                 },
                 "only the instance whose own marker is missing may report"
             );

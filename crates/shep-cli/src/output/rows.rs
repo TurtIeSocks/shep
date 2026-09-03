@@ -44,8 +44,8 @@ pub struct FlockRows(pub Vec<ProcessInfo>);
 impl Render for FlockRows {
     fn headers() -> &'static [&'static str] {
         &[
-            "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME", "FOLD",
-            "SMIT",
+            "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CFG", "CPU", "MEM", "UPTIME",
+            "FOLD", "SMIT",
         ]
     }
 
@@ -165,6 +165,12 @@ impl Render for FlockRows {
             "PID" => "pid",
             "RESTARTS" => "restarts",
             "EXIT" => "last_exit",
+            // CFG carries two facts (`pending`, `overridden`) in one cell;
+            // `pending` maps here and `overridden` rides in `JSON_ONLY`
+            // instead -- see `cfg_cell`'s own doc for the cell rule, and
+            // `Self::JSON_ONLY`'s `overridden` entry for why the second
+            // field has no `json_key_for` arm of its own.
+            "CFG" => "pending",
             "CPU" => "cpu_percent",
             "MEM" => "memory_bytes",
             "UPTIME" => "uptime_ms",
@@ -205,6 +211,12 @@ impl Render for FlockRows {
         // `instance` riding along -- so a programmatic consumer never has to
         // learn a nested shape.
         "instance",
+        // The CFG cell reads `pending` and `overridden` together
+        // (`cfg_cell`'s own doc), and `json_key_for` above can only name
+        // one field per header. `pending` takes that slot; `overridden`
+        // rides the JSON here instead of dropping out of the coverage
+        // check entirely.
+        "overridden",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
@@ -235,7 +247,16 @@ impl Render for FlockRows {
     // column, so dropping it recovers the most space for one column lost.
     // The maintainer's ruling is that it belongs among the first columns to yield, and
     // 8 is the literal reading of that.
-    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 5, 3, 1, 7, 8];
+    //
+    // CFG (task 12) shares EXIT's own `6` rather than taking a number of its
+    // own: both answer "why does this row need a second look", and a
+    // pending or overridden field is exactly the kind of fact `render_boxed_ex`
+    // should give up no sooner than the last exit does. Tied priorities drop
+    // in `keep` order (`render_boxed_ex`'s own `max_by_key` picks the LAST
+    // of an equal pair), and CFG sits after EXIT in `headers()`, so a
+    // narrowing terminal loses CFG first between the two -- "at EXIT's
+    // priority or lower" read literally.
+    const PRIORITIES: &'static [u8] = &[0, 0, 0, 2, 4, 6, 6, 5, 3, 1, 7, 8];
 }
 
 /// Splits a listing into runs of one app's adjacent rows, keyed on NAME.
@@ -317,6 +338,11 @@ fn group_row(group: &[ProcessInfo], totals: &GroupTotals) -> Vec<String> {
         String::new(),
         totals.restarts.to_string(),
         String::new(),
+        // Blank, not `-`, for the same reason ID/PID/EXIT are above: pending
+        // and overridden fields are per-instance facts (a load can park a
+        // different set on each slot), so there is no single group-level
+        // answer to summarize.
+        String::new(),
         totals
             .cpu
             .map_or_else(|| "-".to_string(), |c| format!("{c:.1}%")),
@@ -351,6 +377,10 @@ fn slot_row(p: &ProcessInfo) -> Vec<String> {
         p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
         p.restarts.to_string(),
         exit_cell(p.pid, p.last_exit),
+        // Unlike FOLD/SMIT below, this is a real per-instance fact -- a load
+        // can park a different set of fields on each slot -- so it renders
+        // like a real sheep's cell rather than going blank.
+        cfg_cell(p.pending.as_deref(), p.overridden.as_deref()),
         p.cpu_percent
             .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
         p.memory_bytes
@@ -385,6 +415,7 @@ fn plain_row(p: &ProcessInfo, slotted: bool) -> Vec<String> {
         p.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
         p.restarts.to_string(),
         exit_cell(p.pid, p.last_exit),
+        cfg_cell(p.pending.as_deref(), p.overridden.as_deref()),
         p.cpu_percent
             .map_or_else(|| "-".to_string(), |cpu| format!("{cpu:.1}%")),
         p.memory_bytes
@@ -949,6 +980,35 @@ pub(crate) fn exit_cell(pid: Option<u32>, last_exit: Option<ExitInfo>) -> String
     }
 }
 
+/// The CFG column's cell: whether this sheep has a config parked for its
+/// next spawn, or an operator override on record.
+///
+/// `pending` takes precedence over `overridden` when both are non-empty:
+/// a parked field is one `shep reload` away from taking effect, so it is
+/// the more urgent of the two facts to surface in a one-cell summary. `!N`
+/// marks it, N being the count of parked field names -- a count rather than
+/// the names themselves, because the names are what `shep describe`'s own
+/// pending heading lists in full (task 12's own step 4) and a table cell
+/// has no room for them.
+///
+/// `*N` marks an override with nothing parked, N being the count of
+/// overridden field names. `-` when neither carries anything to report,
+/// the same "no honest value" convention [`exit_cell`] uses.
+///
+/// `pub(crate)`, matching [`exit_cell`]'s own visibility, for the same
+/// reason: `lookout::view::flock`'s CFG column calls this directly rather
+/// than re-deriving the precedence rule a second time.
+pub(crate) fn cfg_cell(pending: Option<&[String]>, overridden: Option<&[String]>) -> String {
+    match pending {
+        Some(fields) if !fields.is_empty() => return format!("!{}", fields.len()),
+        _ => {}
+    }
+    match overridden {
+        Some(fields) if !fields.is_empty() => format!("*{}", fields.len()),
+        _ => "-".to_string(),
+    }
+}
+
 /// Renders a raw unix signal number as its canonical name (`SIGKILL`), or
 /// the bare number when this platform's own signal table has none for it.
 ///
@@ -1146,6 +1206,16 @@ impl Render for DogRows {
         // Rides in the JSON only for the same shape-consistency reason as
         // the rest of this list.
         "instance",
+        // No CFG column here: a dog is built-in or adopted, and
+        // `Actor::apply_one` refuses an entry that is one, so a config load
+        // can neither park nor override a dog and both fields stay empty.
+        // That refusal is what makes the sentence true. Before it, a
+        // Flockfile naming `metrics` really did replace the built-in dog's
+        // binary on the next restart, and this table was the surface the
+        // drift would have shown on. Both fields ride the JSON for the same
+        // shape-consistency reason as the rest of this list.
+        "pending",
+        "overridden",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "STATUS", "PID",
@@ -1686,6 +1756,12 @@ impl Render for FlushedRows {
         // Same shape-consistency reason as the rest of this list: a flush
         // neither reads nor changes which slot a sheep occupies.
         "instance",
+        // No CFG column here either: `flush` truncates log files, and
+        // neither reads nor changes a sheep's pending or overridden config.
+        // Both fields ride the JSON for shape consistency with every other
+        // verb answering `ProcessInfo`.
+        "pending",
+        "overridden",
     ];
 
     // Parallel to `headers()` above: `["ID", "NAME", "OUT_FILE",
@@ -2936,6 +3012,17 @@ pub(crate) mod tests {
             // bogus string still passed the drift test until this line
             // existed.
             .smit(Some("\u{25b2} main@a1b2c3".to_string()))
+            // `pending` and `overridden`, task 12's own fields, populated
+            // for the same "every `Option` field `Some`" reason as the rest
+            // of this fixture. `cfg_cell` shows `pending` over `overridden`
+            // when both are set (its own doc gives the precedence), so this
+            // fixture cannot exercise `overridden`'s cell text through
+            // `sample_flock` alone -- `overridden` is `JSON_ONLY` for CFG
+            // (see `FlockRows::JSON_ONLY`) precisely because a shared cell
+            // has room for only one of the two facts, and the key-coverage
+            // check that matters here does not need the cell text besides.
+            .pending(Some(vec!["env".to_string()]))
+            .overridden(Some(vec!["cwd".to_string()]))
             .build()
     }
 
@@ -3067,11 +3154,13 @@ pub(crate) mod tests {
         // object, not a scalar `assert_no_drift`'s per-cell comparison knows
         // how to stringify, and every `sample_flock` row is `pid: Some(..)`
         // besides, so the honest cell is always `-` regardless of what
-        // `last_exit` says.
+        // `last_exit` says. CFG joins them for a third reason: its own cell
+        // is a derived summary (`cfg_cell`'s own doc) of two fields,
+        // `pending` and `overridden`, not a raw echo of either.
         assert_no_drift(
             &sample_flock(),
             |j| &j[0],
-            &["UPTIME", "CPU", "MEM", "EXIT"],
+            &["UPTIME", "CPU", "MEM", "EXIT", "CFG"],
         );
     }
 
@@ -3127,6 +3216,25 @@ pub(crate) mod tests {
         #[cfg(not(unix))]
         assert_eq!(at(&rows[2], "EXIT"), "9");
         assert_eq!(at(&rows[3], "EXIT"), "-");
+    }
+
+    /// fails if a sheep with pending config is indistinguishable from one
+    /// without. A pending field an operator cannot see is a silent divergence,
+    /// which is worse than the problem this feature set out to fix.
+    #[test]
+    fn the_cfg_cell_marks_a_sheep_with_pending_config() {
+        let mut info = sample_info(1, "web", 60_000);
+        info.pending = Some(vec!["env".to_string()]);
+        assert_eq!(
+            cfg_cell(info.pending.as_deref(), info.overridden.as_deref()),
+            "!1"
+        );
+
+        let clean = ProcessInfo::builder(1, "web", ProcStatus::Online).build();
+        assert_eq!(
+            cfg_cell(clean.pending.as_deref(), clean.overridden.as_deref()),
+            "-"
+        );
     }
 
     /// fails if `LambRows` grows a field that never reaches the table, or
@@ -3395,7 +3503,7 @@ pub(crate) mod tests {
                 .collect(),
         );
         let rendered = rows.rows_for(full_presentation(), true);
-        assert_eq!(rendered[0][8], "5m", "300_000ms, the shortest of the three");
+        assert_eq!(rendered[0][9], "5m", "300_000ms, the shortest of the three");
     }
 
     /// fails if a group with no readings at all reports zero.
@@ -3419,8 +3527,8 @@ pub(crate) mod tests {
                 .collect(),
         );
         let rendered = rows.rows_for(full_presentation(), true);
-        assert_eq!(rendered[0][6], "-", "cpu");
-        assert_eq!(rendered[0][7], "-", "mem");
+        assert_eq!(rendered[0][7], "-", "cpu");
+        assert_eq!(rendered[0][8], "-", "mem");
 
         // And one live reading among absent ones IS a claim, about the slot
         // that made it: the fold leaves `None` only when nothing measured.
@@ -3437,8 +3545,8 @@ pub(crate) mod tests {
                 .build(),
         ]);
         let rendered = mixed.rows_for(full_presentation(), true);
-        assert_eq!(rendered[0][6], "2.5%", "cpu");
-        assert_eq!(rendered[0][7], "64.0M", "mem");
+        assert_eq!(rendered[0][7], "2.5%", "cpu");
+        assert_eq!(rendered[0][8], "64.0M", "mem");
     }
 
     /// fails if `shep flock`'s group header and `shep lookout`'s group row
@@ -4319,7 +4427,7 @@ pub(crate) mod tests {
                 // (ascending priority; the real give-up order is the
                 // reverse of this): the ones answering "is it healthy"
                 // outlast the ones answering "which one is it".
-                "UPTIME", "PID", "MEM", "RESTARTS", "CPU", "EXIT", "FOLD", "SMIT",
+                "UPTIME", "PID", "MEM", "RESTARTS", "CPU", "EXIT", "CFG", "FOLD", "SMIT",
             ],
             "the flock listing's drop order changed; if that is deliberate, \
              change this test and say why in the commit"
@@ -4504,18 +4612,30 @@ pub(crate) mod tests {
         let sheep = FlockRows::headers();
         let dogs = DogRows::headers();
 
+        // CFG (task 12) is a sheep concept -- a dog is built-in or adopted,
+        // never loaded from a Flockfile a config load can park or override
+        // (`FlockRows::JSON_ONLY`'s own `pending`/`overridden` entries give
+        // the reasoning) -- so it is filtered out before comparing the
+        // shared prefix rather than folded into `common` below.
+        let sheep_without_cfg: Vec<&str> = sheep.iter().copied().filter(|h| *h != "CFG").collect();
+        assert_eq!(
+            sheep.iter().position(|h| *h == "CFG"),
+            sheep.iter().position(|h| *h == "EXIT").map(|at| at + 1),
+            "CFG sits directly after EXIT in the sheep table"
+        );
+
         let common = [
             "ID", "NAME", "STATUS", "PID", "RESTARTS", "EXIT", "CPU", "MEM", "UPTIME",
         ];
         assert_eq!(
-            &sheep[..common.len()],
+            &sheep_without_cfg[..common.len()],
             &common,
-            "the sheep table leads with them"
+            "the sheep table leads with them, CFG aside"
         );
         assert_eq!(&dogs[..common.len()], &common, "and so does the dogs table");
 
         assert_eq!(
-            &sheep[common.len()..],
+            &sheep_without_cfg[common.len()..],
             &["FOLD", "SMIT"],
             "the sheep table's own"
         );
@@ -5090,8 +5210,8 @@ pub(crate) mod tests {
         assert!(!rows[0][3].contains('\u{1b}'), "{:?}", rows[0][3]);
         assert!(rows[1][3].contains('\u{1b}'), "{:?}", rows[1][3]);
         // FOLD: chrome, always coloured, `-` here on both rows.
-        assert!(rows[0][9].contains('\u{1b}'), "{:?}", rows[0][9]);
-        assert!(rows[1][9].contains('\u{1b}'), "{:?}", rows[1][9]);
+        assert!(rows[0][10].contains('\u{1b}'), "{:?}", rows[0][10]);
+        assert!(rows[1][10].contains('\u{1b}'), "{:?}", rows[1][10]);
     }
 
     // --- A dog that has never answered the shepherd ----------------------
