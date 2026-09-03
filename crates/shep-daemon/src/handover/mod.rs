@@ -2061,7 +2061,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_a_process_entrys_environment() {
+    fn debug_redacts_the_environment_on_a_process_entry() {
         // `ProcessEntry` is the daemon's own live state and derives `Debug`,
         // so its safety rests entirely on `AppConfig`'s redacted rendering
         // reaching it through `spec`. Nothing pinned that, which left a
