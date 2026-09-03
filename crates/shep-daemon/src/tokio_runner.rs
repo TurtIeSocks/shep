@@ -1245,10 +1245,17 @@ impl LogFile<tokio::fs::File> {
     /// by a working one, so the sheep keeps logging.
     async fn reopen(&mut self) -> Result<(), ReopenError> {
         self.buffered_since = None;
-        if let Some(handle) = self.handle.as_mut()
-            && let Err(error) = handle.flush().await
-        {
-            tracing::error!(path = ?self.path, %error, "log file flush failed");
+        if let Some(handle) = self.handle.as_mut() {
+            // The same lock `Self::flush` takes, for the same reason: this
+            // pushes whatever the buffer holds, up to a whole `LOG_BUFFER`,
+            // which is precisely the at-or-over-capacity case `record_lock`
+            // documents as spanning several `poll_write` calls. Rotation is
+            // when this runs and also when the buffer is most likely to be
+            // full, so it is not the rare corner of the hole.
+            let _record = self.record.lock().await;
+            if let Err(error) = handle.flush().await {
+                tracing::error!(path = ?self.path, %error, "log file flush failed");
+            }
         }
         // Closed before the reopen, so the pump never holds two descriptors
         // on one log at the same time.
@@ -1296,7 +1303,17 @@ impl LogFile<tokio::fs::File> {
 /// which is the one an operator is most likely to be reading.
 ///
 /// Keyed by path rather than held by the pump, because narration reaches a log
-/// through a path and never sees the `LogFile`. The map grows one entry per log
+/// through a path and never sees the `LogFile`.
+///
+/// The key is only as good as the path each side holds, and the two do not
+/// hold the same type. `LogFile` has the assembler's `PathBuf`, while
+/// `dogs::narrate` is handed `ProcessInfo::err_file`, which crossed the wire
+/// as a `String` and reaches `Path::new` through `to_string_lossy`. A log path
+/// that is not valid UTF-8 therefore hashes to two different keys and is not
+/// serialized. That is not fixed here on purpose: `err_file` is a `String` on
+/// the protocol itself, so such a path is already degraded everywhere it is
+/// reported, and widening the wire type for this alone would be the tail
+/// wagging the dog. Worth knowing rather than worth hiding. The map grows one entry per log
 /// path this daemon has opened, which is bounded by the flock and never freed;
 /// a `LogFile` is dropped on a reopen and the lock has to outlive it, so
 /// reference counting the entries away would cost more than the few hundred
