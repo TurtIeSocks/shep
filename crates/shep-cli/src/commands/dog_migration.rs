@@ -1,7 +1,13 @@
-//! Moving `[dog.<name>]` out of `shep.toml` and into `dogs.toml`, once.
+//! Moving `[dog.<name>]` out of `shep.toml` and into `dogs.toml`, once,
+//! and the one write path `dogs.toml` has.
 //!
-//! Runs at the top of every daemon boot and does nothing on all but the
-//! first. `RawDaemonConfig` keeps its `dog` field so an un-migrated file
+//! [`migrate_dog_sections`] runs at the top of every daemon boot and does
+//! nothing on all but the first. [`forget_dog_section`] is the other
+//! writer, `shep rehome`'s half of forgetting a dog, and it lives here
+//! rather than beside that verb because both go through
+//! [`write_dogs_config`]: that file holds webhook credentials at `0600`,
+//! and one staged-temp-`fsync`-`rename` helper with the reasoning attached
+//! is what keeps a second writer from reaching for `std::fs::write`. `RawDaemonConfig` keeps its `dog` field so an un-migrated file
 //! still parses: deleting it would turn `deny_unknown_fields` into a
 //! refused boot for every operator carrying a dog section, with the flock
 //! left unsupervised at exactly the moment nobody is watching.
@@ -125,6 +131,49 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
     })
 }
 
+/// Removes `name`'s section from `dogs.toml`, answering whether there was
+/// one to remove.
+///
+/// `shep rehome <name>`'s half of the cross-file forget: [`ShepToml`] owns
+/// `shep.toml` alone, so `rehome_dog` strikes the registration and this
+/// strikes the configuration. A missing `dogs.toml`, or one with no
+/// section under `name`, is `Ok(false)` and writes nothing: rehoming a dog
+/// that was never configured is an ordinary thing to do, not a fault.
+///
+/// Called after `shep.toml` has already been rewritten, deliberately. The
+/// two writes are not one transaction, and of the two ways a crash between
+/// them can land, this is the harmless one: a section nothing reads, since
+/// the name is out of `enabled_dogs` and `adopted_dogs` by then. The other
+/// order loses an operator's webhook URLs while the dog is still enabled
+/// and still running, and says nothing about it.
+///
+/// # Errors
+///
+/// - [`DogMigrationError::ReadDogs`] when `dogs.toml` exists and cannot be
+///   read, and [`DogMigrationError::Parse`] when it is not valid TOML.
+///   Refused rather than replaced: a file this verb cannot understand is
+///   not one it may overwrite.
+/// - [`DogMigrationError::Render`] when what is left will not render back,
+///   and [`DogMigrationError::Write`] when the staged replacement fails.
+///
+/// The error type is shared with [`migrate_dog_sections`] rather than
+/// split: every variant either half can produce says which of the two
+/// files failed and how, which is what an operator needs from both.
+pub(crate) fn forget_dog_section(path: &Path, name: &str) -> Result<bool, DogMigrationError> {
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(DogMigrationError::ReadDogs(err)),
+    };
+    let mut config = DogsConfig::load(Some(&source)).map_err(DogMigrationError::Parse)?;
+    if config.dog.remove(name).is_none() {
+        return Ok(false);
+    }
+    let rendered = toml::to_string(&config.dog).map_err(DogMigrationError::Render)?;
+    write_dogs_config(path, &rendered).map_err(DogMigrationError::Write)?;
+    Ok(true)
+}
+
 /// Every name `source` declares under `[dog]`, or `None` when `source` is
 /// not TOML this parser can read.
 ///
@@ -186,6 +235,12 @@ fn write_dogs_config(path: &Path, rendered: &str) -> std::io::Result<()> {
 pub(crate) enum DogMigrationError {
     /// `shep.toml` itself could not be read.
     Read(std::io::Error),
+    /// `dogs.toml` exists and could not be read.
+    ///
+    /// Its own variant rather than [`Self::Read`]: both are the same I/O
+    /// failure, and an operator's next move depends entirely on which of
+    /// the two files it was.
+    ReadDogs(std::io::Error),
     /// `dogs.toml` already exists and is not valid TOML.
     Parse(DogsConfigError),
     /// `name` has a section in both files, so the move would silently pick
@@ -215,6 +270,7 @@ impl fmt::Display for DogMigrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Read(err) => write!(f, "shep.toml could not be read: {err}"),
+            Self::ReadDogs(err) => write!(f, "dogs.toml could not be read: {err}"),
             Self::Parse(err) => write!(f, "dogs.toml could not be read: {err}"),
             Self::WouldOverwrite { name } => write!(
                 f,
@@ -242,7 +298,7 @@ impl fmt::Display for DogMigrationError {
 impl core::error::Error for DogMigrationError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Read(err) | Self::Write(err) => Some(err),
+            Self::Read(err) | Self::ReadDogs(err) | Self::Write(err) => Some(err),
             Self::Parse(err) => Some(err),
             Self::Render(err) => Some(err),
             Self::Toml(err) => Some(err),
