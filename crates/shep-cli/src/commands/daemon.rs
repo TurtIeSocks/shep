@@ -263,7 +263,7 @@ fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
 /// - [`DaemonRunError::Boot`] — the config file itself could not be read
 ///   (any IO error other than "does not exist"), or the supervisor failed
 ///   to boot.
-/// - [`DaemonRunError::DogMigration`] — `[dog.<name>]` sections could not
+/// - [`DaemonRunError::DogMigration`]: `[dog.<name>]` sections could not
 ///   be moved out of `shep.toml` and into `dogs.toml`.
 pub async fn boot_supervisor(
     paths: ShepPaths,
