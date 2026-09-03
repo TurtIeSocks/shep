@@ -476,19 +476,35 @@ it: which request a fresh app goes out as, whether an app the flock already
 has is resumed after the merge, what a name target that resolves to a
 registered sheep does, and the notice code. `Request::Add` /
 `Response::Added` are additive, so `PROTOCOL_VERSION` stays at 2 and the
-paragraph below applies to `shep add` word for word. **The fill-in half of
+paragraph below applies to `shep add` too. **The fill-in half of
 "register, fill in, start" does not exist yet**: an established `env` key
 today moves only through the file plus `--reset-all`, and editing one in
 place is a later slice (spec decisions 10 and 11).
 
 **Restart the shepherd after upgrading to it.** `PROTOCOL_VERSION` did NOT
-move (the variant is additive, and six precedents in shep-core's changelog
-agree), but the consequence is sharper than those precedents had: a CLI from
-this commit against an older daemon passes the handshake, sends
-`ApplyConfig`, and the daemon ends the connection on an envelope it cannot
-decode, so `shep start <Flockfile>` fails on a dead client rather than on a
-named version refusal. `shep daemon reload` is the whole fix, and
-`getting-started.astro` says so where an operator reads.
+move for `ApplyConfig` or for `Add` (both variants are additive, and six
+precedents in shep-core's changelog agree), so an older shepherd cannot
+decode either one. **This paragraph said the operator meets a dead client,
+full stop, and that is wrong: it skips the skew guard, which fires first in
+the common case.** `refuse_version_skew` compares the shepherd's reported
+crate version against the client's own and refuses every verb but the three
+in `RECOVERY_VERBS` (`kill`, `ping`, `daemon reload`), at the connect site,
+before any request is sent. So the two cases are:
+
+- **Versions differ**, which is every release upgrade through cargo or brew:
+  `error[version_skew]`, naming `shep daemon reload` as the remedy. No
+  request is sent and nothing is ambiguous.
+- **Versions match**, which is a client built from a commit that added the
+  variant against a shepherd built from an earlier commit of the same
+  version, so every development build and every branch: the guard passes,
+  the request goes out, and the shepherd ends the connection on an envelope
+  it cannot decode. THAT is the dead client, and it is a working-tree
+  hazard rather than an operator one.
+
+`shep daemon reload` is the fix in both, and `getting-started.astro` says so
+where an operator reads. `every_exempt_verb_is_one_of_the_documented_recovery_verbs`
+pins `add` at `Enforce`, since it reaches that through the `_` arm rather
+than by being named.
 
 **Verb count: 41 generated, 42 listed, and the difference is `help`.**
 `./web/scripts/generate-cli-reference.sh` prints its own number every time it

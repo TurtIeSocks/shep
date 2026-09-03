@@ -3169,6 +3169,21 @@ mod tests {
         assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
     }
 
+    /// An empty [`StartArgs`], for asking which guard `add` gets. Its
+    /// fields do not reach the guard, which reads the verb alone.
+    fn add_args() -> StartArgs {
+        StartArgs {
+            targets: Vec::new(),
+            name: None,
+            fold: None,
+            cwd: None,
+            interpreter: None,
+            flockfile: false,
+            reset: false,
+            reset_all: false,
+        }
+    }
+
     /// A [`DaemonArgs`] carrying `cmd` and nothing else, for asking which
     /// guard the `daemon` verb's two shapes get.
     fn daemon_args(cmd: Option<cli::DaemonCmd>) -> DaemonArgs {
@@ -3218,6 +3233,17 @@ mod tests {
         assert_eq!(
             VersionGuard::for_command(&Commands::Kill),
             VersionGuard::Exempt
+        );
+        // `add` carries a request an older shepherd cannot decode
+        // (`Request::Add`, added without moving `PROTOCOL_VERSION`), so the
+        // skew refusal is the whole of what stands between an operator who
+        // upgraded and a client that dies on the reply. It reaches
+        // `Enforce` through the `_` arm rather than by being named, which
+        // is the right default and an easy one to lose: pinned here so a
+        // future exemption for `add` has to be argued rather than typed.
+        assert_eq!(
+            VersionGuard::for_command(&Commands::Add(add_args())),
+            VersionGuard::Enforce
         );
     }
 
