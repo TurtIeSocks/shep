@@ -273,12 +273,29 @@ impl ShepToml {
         })
     }
 
-    /// Adds `name` to `[daemon] enabled_dogs` (idempotently) and ensures a
-    /// `[dog.<name>]` table exists for the dog to be configured through.
+    /// Adds `name` to `[daemon] enabled_dogs` (idempotently), and writes
+    /// nothing else anywhere.
     ///
-    /// Never truncates a `[dog.<name>]` table that already exists — a
-    /// dog's own configuration is not this writer's to touch, only its
-    /// existence.
+    /// **It used to scaffold an empty `[dog.<name>]` here, and that is now
+    /// a boot-breaking bug rather than a nicety.** A dog's configuration
+    /// lives in `dogs.toml`, so an operator who enabled a dog and then
+    /// configured it where `docs/dogs.md` says to had that name in both
+    /// files, and `commands::dog_migration` refuses on exactly that: two
+    /// values for one key is a question shep cannot answer. The daemon
+    /// exits 4 and the flock is left unsupervised, over a table nobody
+    /// asked for.
+    ///
+    /// Scaffolding into `dogs.toml` instead would keep the nicety, and is
+    /// the wrong trade. It puts this type, which owns `shep.toml` and only
+    /// that, in the business of writing a second file behind a second lock,
+    /// and every write of that file has to hold the staged-temp, `fsync`
+    /// and `rename` discipline `dog_migration::write_dogs_config` carries
+    /// because webhook credentials live there at `0600`. The nicety it
+    /// buys is thin: `shep-daemon`'s `dog_section` already documents an
+    /// absent section as legitimate and answers an empty string, so a dog
+    /// enabled with no section runs on its defaults, and an empty table
+    /// tells an operator nothing a documented example does not tell them
+    /// better. Writing nothing cannot collide with anything.
     pub fn enable_dog(&mut self, name: &str) {
         let daemon = self.daemon_table_mut();
         let enabled_dogs = daemon
@@ -289,12 +306,18 @@ impl ShepToml {
         if !enabled_dogs.iter().any(|v| v.as_str() == Some(name)) {
             enabled_dogs.push(name);
         }
-        self.dog_table_mut(name);
     }
 
-    /// Removes `name` from `[daemon] enabled_dogs`, leaving `[dog.<name>]`
-    /// in place: an operator who disables a dog to restart it must not lose
-    /// the configuration they wrote for it.
+    /// Removes `name` from `[daemon] enabled_dogs` and touches nothing
+    /// else: an operator who disables a dog to restart it must not lose the
+    /// configuration they wrote for it.
+    ///
+    /// That configuration lives in `dogs.toml` now, so keeping it is
+    /// something this method achieves by doing nothing at all rather than
+    /// by leaving a `[dog.<name>]` table alone. The behaviour is unchanged;
+    /// only the file the promise is about moved. [`Self::rehome_dog`] is
+    /// the half that forgets a dog for real, and `commands::dogs::rehome`
+    /// is where the other file is reached.
     pub fn disable_dog(&mut self, name: &str) {
         if let Some(enabled_dogs) = self
             .doc
@@ -569,21 +592,6 @@ impl ShepToml {
             .or_insert_with(|| Item::Table(Table::new()))
             .as_table_mut()
             .expect("daemon is only ever written as a table")
-    }
-
-    /// `[dog.<name>]`, creating it (empty) if it does not exist yet — never
-    /// touched again once it does, per [`Self::enable_dog`]'s own doc.
-    fn dog_table_mut(&mut self, name: &str) -> &mut Table {
-        let dog = self
-            .doc
-            .entry("dog")
-            .or_insert_with(|| Item::Table(Table::new()))
-            .as_table_mut()
-            .expect("dog is only ever written as a table");
-        dog.entry(name)
-            .or_insert_with(|| Item::Table(Table::new()))
-            .as_table_mut()
-            .expect("a dog's own section is only ever written as a table")
     }
 }
 
@@ -878,8 +886,9 @@ mod tests {
         let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
         assert_eq!(cfg.daemon.enabled_dogs, vec!["metrics"]);
         assert!(
-            cfg.dog.contains_key("metrics"),
-            "a table to configure it through"
+            cfg.dog.is_empty(),
+            "enable writes no dog section at all; the next boot refuses a \
+             name held in both files: {written}"
         );
     }
 
@@ -937,6 +946,10 @@ mod tests {
     fn rehoming_a_dog_forgets_it_entirely() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
+        // Seeded by hand, since no writer here creates one any more: a
+        // `[dog.<name>]` in `shep.toml` is what an un-migrated file carries,
+        // and striking it is still this method's job.
+        std::fs::write(&path, "[dog.otel]\ndebounce = \"30s\"\n").unwrap();
         ShepToml::edit(&path, |doc| {
             doc.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
         })

@@ -1824,6 +1824,35 @@ mod tests {
         );
     }
 
+    /// The bug this test exists for: `shep enable` scaffolded `[dog.<name>]`
+    /// into `shep.toml` while a dog's config had already moved to
+    /// `dogs.toml`, so an operator who enabled a dog and then configured it
+    /// where the docs say to had a name in both files. The migration refuses
+    /// that, correctly, and the daemon exits 4 with the flock unsupervised.
+    /// Enabling must leave nothing behind that a later boot can collide with.
+    #[tokio::test]
+    async fn enabling_a_dog_does_not_leave_a_section_that_refuses_the_next_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = enable(&mut streams(&mut out, &mut err), &paths, "metrics").await;
+
+        assert_eq!(code, ExitCode::Success);
+        let written = std::fs::read_to_string(&paths.daemon_config).unwrap();
+        assert!(
+            !written.contains("[dog"),
+            "enable must write no dog section into shep.toml: {written}"
+        );
+
+        // The operator then configures the dog where `docs/dogs.md` now
+        // tells them to, and the next `shep muster` runs the migration.
+        std::fs::write(&paths.dogs_config, "[metrics]\nbind = \"127.0.0.1:9615\"\n").unwrap();
+        crate::commands::dog_migration::migrate_dog_sections(&paths)
+            .expect("a boot after an enable must not refuse over a section enable wrote");
+    }
+
     /// Task 6 / spec G4, the `dogs.rs` spelling of the same bug `shep flock`
     /// had: `Client::connect(..).ok()` folded a handshake REFUSAL into
     /// `None`, exactly as it folds a genuine absence into `None` — so a live
