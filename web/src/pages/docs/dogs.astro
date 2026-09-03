@@ -174,8 +174,12 @@ $ shep disable metrics`}</CodeBlock>
     <Callout variant="careful">
       A section that used to live in <code>shep.toml</code> migrates to{" "}
       <code>dogs.toml</code> once, on the first boot of a shep carrying this
-      move, and it prints which dogs moved. If a name exists in both files,
-      the daemon refuses to boot until one of the two sections is deleted; a
+      move, and it prints which dogs moved. Any boot does it, including{" "}
+      <code>shep runtime</code> and <code>shep dev</code>. If a name carries
+      values in both files, the daemon refuses to boot until one of the two
+      sections is deleted, and <code>shep daemon reload</code> refuses before
+      it signals the shepherd it was going to replace. An empty{" "}
+      <code>[dog.&lt;name&gt;]</code> is not a value and refuses nothing. A
       dog present in only one file migrates or starts normally.
     </Callout>
 

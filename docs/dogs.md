@@ -123,12 +123,16 @@ nobody has to remember which dog's config is sensitive.
 automatically.** The first boot of a shep carrying this move reads any
 `[dog.<name>]` sections still in `shep.toml`, writes them into `dogs.toml`
 under their bare name, strikes them from `shep.toml`, and prints which
-dogs moved. Every boot after that finds nothing to do. If a name already
-exists in both files, the daemon refuses to boot rather than guess which
-value is right; the fix is to delete one of the two sections and start it
-again. The likeliest way to hit that is hand-writing `[dog.metrics]` back
-into `shep.toml` after it already migrated, so check `dogs.toml` first. A
-dog present in only one file migrates or starts normally either way.
+dogs moved. Every boot after that finds nothing to do. `shep runtime` and
+`shep dev` migrate too: any boot does. If a name carries values in both
+files, the daemon refuses to boot rather than guess which is right, and
+`shep daemon reload` refuses before it signals the shepherd it was going
+to replace. Delete one of the two sections. The likeliest way to hit that
+is hand-writing `[dog.metrics]` back into `shep.toml` after it already
+migrated, so check `dogs.toml` first. An empty `[dog.<name>]`, which
+`shep enable` scaffolded before this move, is not a value and refuses
+nothing. A dog present in only one file migrates or starts normally
+either way.
 
 ## The metrics dog
 
