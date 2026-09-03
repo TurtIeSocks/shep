@@ -47,7 +47,8 @@ export interface CliReferenceData {
 // groups against this list rather than against the generated file, so the
 // two agreed with each other while both disagreed with the binary. The
 // generator's `VERBS` array has a Rust test holding it to the real command
-// tree (`verbs_the_reference_generator_misses`); this list has nothing, and
+// tree (`every_visible_verb_reaches_the_docs_site_generator` in
+// crates/shep-cli/src/cli.rs); this list has nothing, and
 // the only thing standing between it and the same drift is the build error
 // you get when the groups and this list disagree.
 const VERB_NAMES = [
