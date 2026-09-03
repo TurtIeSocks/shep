@@ -22,13 +22,13 @@
 //! left unsupervised at exactly the moment nobody is watching.
 
 use core::fmt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::Path;
 
 use shep_core::config::{DogsConfig, DogsConfigError};
 use shep_core::paths::ShepPaths;
-use toml_edit::{DocumentMut, Item, Table};
+use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 
@@ -42,9 +42,10 @@ use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 ///
 /// # Errors
 ///
-/// - [`DogMigrationError::WouldOverwrite`] when a name is present in both
-///   files. Two values for one key is a question shep cannot answer, so it
-///   refuses and changes nothing.
+/// - [`DogMigrationError::WouldOverwrite`] when a name holding VALUES is
+///   present in both files. Two values for one key is a question shep
+///   cannot answer, so it refuses and changes nothing. An empty
+///   `[dog.<name>]` is not one of the two -- see [`declared_dog_names`].
 /// - [`DogMigrationError::SectionsUnreadable`] when `shep.toml` declares a
 ///   name under `[dog]` that did not come back as a section to move.
 ///   Refused rather than skipped: `take_dog_sections` has already struck
@@ -75,7 +76,9 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
     // spelling can appear in a comment or inside a string, and `[dog]` on
     // its own is a header with nothing under it: a section neither to move
     // nor to lose, and refusing on it would leave an operator with a stray
-    // `[dog]` line unable to boot at all.
+    // `[dog]` line unable to boot at all. A `[dog.metrics]` holding no
+    // values is the same shape one level down and is skipped for the same
+    // reason -- see [`declared_dog_names`].
     //
     // `None` means this parser could not read the source. That is not
     // decided here: it falls through to `ShepToml`, whose own parse error
@@ -92,7 +95,19 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
     // neither file. `try_edit`'s own `Err` skips `save` entirely and
     // leaves `path` exactly as it was found.
     ShepToml::try_edit(&paths.daemon_config, |doc| {
-        let incoming = doc.take_dog_sections();
+        // Empty sections dropped here, matching what [`declared_dog_names`]
+        // already left out of `declared`, so the two agree on what there
+        // was to move. An empty one is not moved and not counted as
+        // missing: there is nothing in it to arrive at the other end. It
+        // does still go, because `take_dog_sections` removes the whole
+        // `[dog]` table, and striking an empty header an older `shep
+        // enable` scaffolded is the right outcome anyway. Only the sections
+        // beside it are what made this boot open the file at all.
+        let incoming: BTreeMap<String, Item> = doc
+            .take_dog_sections()
+            .into_iter()
+            .filter(|(_, section)| !section.as_table_like().is_some_and(TableLike::is_empty))
+            .collect();
         // `take_dog_sections` removes the WHOLE `[dog]` table and then
         // decides what to hand back, so anything it drops on the way is
         // gone from the document with nothing written in its place: a
@@ -262,22 +277,57 @@ fn read_dogs_document(path: &Path) -> Result<DocumentMut, DogMigrationError> {
     })
 }
 
-/// Every name `source` declares under `[dog]`, or `None` when `source` is
-/// not TOML this parser can read.
+/// Every name `source` declares a VALUE for under `[dog]`, or `None` when
+/// `source` is not TOML this parser can read.
 ///
 /// A second parse of a file [`ShepToml`] is about to parse again, and
 /// deliberately so: it is the only record of what was there BEFORE
 /// [`ShepToml::take_dog_sections`] struck the table, which is what the
 /// guard inside [`migrate_dog_sections`] compares against. Read-only, over
 /// a string already in memory, and it never opens the file.
+///
+/// A name holding nothing is left out, and that is the whole of
+/// [`declares_nothing`]'s reason to exist. `shep enable metrics` on any
+/// binary older than this branch scaffolds an EMPTY `[dog.metrics]`, and
+/// this branch's own `enable` no longer does -- but a mixed-version host is
+/// ordinary, so the shape keeps arriving. Counting it as a declared name
+/// made the new binary refuse to boot against a `dogs.toml` that already
+/// held `metrics`, on a `WouldOverwrite` whose own doc says "two values for
+/// one key". An empty table is not a value.
 fn declared_dog_names(source: &str) -> Option<BTreeSet<String>> {
     let table = source.parse::<toml::Table>().ok()?;
     match table.get("dog") {
-        Some(toml::Value::Table(dog)) => Some(dog.keys().cloned().collect()),
+        Some(toml::Value::Table(dog)) => Some(
+            dog.iter()
+                .filter(|(_, value)| !declares_nothing(value))
+                .map(|(name, _)| name.clone())
+                .collect(),
+        ),
         // No `[dog]` at all, or a `dog` that is not a table: either way it
         // declares no dog, and the substring gate that let us this far was
         // matching a comment or a string.
         _ => Some(BTreeSet::new()),
+    }
+}
+
+/// Whether `value` holds nothing an operator could lose by not moving it.
+///
+/// An empty table, an empty array, and an array of tables that are all
+/// empty. That last one is why this recurses rather than testing
+/// `Table::is_empty` directly: `[[dog.metrics]]` with nothing under it used
+/// to reach [`DogMigrationError::SectionsUnreadable`], because the name was
+/// declared and [`ShepToml::take_dog_sections`] hands back no array. Under
+/// the pre-flight that refusal is a boot the operator has to repair by
+/// hand, over a header holding nothing.
+///
+/// A `[[dog.metrics]]` that DOES carry values is a different question and
+/// still refuses: there is no one section for it to become, and dropping it
+/// silently is the outcome the name guard exists to prevent.
+fn declares_nothing(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(table) => table.is_empty(),
+        toml::Value::Array(items) => items.iter().all(declares_nothing),
+        _ => false,
     }
 }
 
@@ -371,8 +421,12 @@ pub(crate) enum DogMigrationError {
     ReadDogs(std::io::Error),
     /// `dogs.toml` already exists and is not valid TOML.
     Parse(DogsConfigError),
-    /// `name` has a section in both files, so the move would silently pick
-    /// one of two values for it.
+    /// `name` has a section carrying values in both files, so the move
+    /// would silently pick one of the two.
+    ///
+    /// An empty `[dog.<name>]` never raises this. It is not a value, it is
+    /// what every `shep enable` before this branch scaffolded, and refusing
+    /// on it took a mixed-version host to a shepherd that would not boot.
     WouldOverwrite {
         /// The dog named in both `shep.toml` and `dogs.toml`.
         name: String,
@@ -816,6 +870,101 @@ mod tests {
             headers,
             vec!["[a]", "[b]", "[c]", "[bark.sinks]", "[[bark.rules]]"],
             "the migration appends; it does not interleave: {written}"
+        );
+    }
+
+    /// Fails if an empty `[dog.<name>]` can stop a shepherd booting.
+    ///
+    /// Reproduced with a pre-branch `0.1.30` binary: its `shep enable
+    /// metrics` scaffolds an empty `[dog.metrics]`, and the new binary then
+    /// refused the whole migration on `WouldOverwrite` against a
+    /// `dogs.toml` that already held `metrics` -- so `shep start` exited 5
+    /// on a daemon that exited 4. This branch stopped the new `enable` from
+    /// scaffolding, but every older binary still on a box does it and a
+    /// mixed-version host is ordinary.
+    ///
+    /// Nothing written on either side is the assertion: the configured
+    /// `dogs.toml` is the one that wins, untouched, and `shep.toml` keeps
+    /// its stray header rather than being rewritten to strike it.
+    #[test]
+    fn an_empty_section_colliding_with_a_configured_one_is_not_a_refusal() {
+        let before = "[daemon]\nenabled_dogs = [\"metrics\"]\n\n[dog.metrics]\n";
+        let (_dir, paths) = home_with(before);
+        let dogs = "[metrics]\nbind = \"127.0.0.1:19616\"\n";
+        std::fs::write(&paths.dogs_config, dogs).expect("write");
+
+        let moved = migrate_dog_sections(&paths).expect("an empty table is not a second value");
+
+        assert!(moved.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&paths.daemon_config).expect("read"),
+            before
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.dogs_config).expect("read"),
+            dogs
+        );
+    }
+
+    /// The item this subsumes: `[[dog.metrics]]` with nothing under it.
+    ///
+    /// `take_dog_sections` hands back no array, so the name guard used to
+    /// call it `SectionsUnreadable` -- which under the reload pre-flight is
+    /// a refused boot over a header holding nothing.
+    #[test]
+    fn an_empty_array_of_tables_under_dog_is_skipped_rather_than_refused() {
+        let before = "[[dog.metrics]]\n";
+        let (_dir, paths) = home_with(before);
+
+        let moved = migrate_dog_sections(&paths).expect("nothing declared, nothing to lose");
+
+        assert!(moved.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&paths.daemon_config).expect("read"),
+            before
+        );
+    }
+
+    /// The other half of the same ruling, and the reason the skip is over
+    /// values rather than over the spelling: an array of tables that DOES
+    /// carry values has no one section to become, and dropping it silently
+    /// is what the name guard exists to prevent.
+    #[test]
+    fn an_array_of_tables_with_values_still_makes_the_migration_refuse() {
+        let before = "[[dog.metrics]]\nbind = \"127.0.0.1:9615\"\n";
+        let (_dir, paths) = home_with(before);
+
+        let err = migrate_dog_sections(&paths).expect_err("values with nowhere to go");
+
+        assert!(matches!(
+            err,
+            DogMigrationError::SectionsUnreadable { ref names } if names == &["metrics".to_string()]
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&paths.daemon_config).expect("read"),
+            before
+        );
+    }
+
+    /// An empty section beside a real one still lets the real one move, and
+    /// the empty header goes with it: `take_dog_sections` strikes the whole
+    /// `[dog]` table, and an empty scaffold is not something to preserve.
+    #[test]
+    fn an_empty_section_beside_a_real_one_does_not_block_it() {
+        let (_dir, paths) =
+            home_with("[dog.metrics]\n\n[dog.bark.sinks]\noncall = { url = \"u\" }\n");
+
+        let moved = migrate_dog_sections(&paths).expect("migrate");
+
+        assert_eq!(moved, vec!["bark".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(&paths.daemon_config).expect("read"),
+            ""
+        );
+        let written = std::fs::read_to_string(&paths.dogs_config).expect("read");
+        assert!(
+            !written.contains("metrics"),
+            "an empty scaffold is not carried across: {written}"
         );
     }
 
