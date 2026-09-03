@@ -831,7 +831,12 @@ impl CarriedSheep {
             // `Self::pending_reidentifies` gives: a config without its flag
             // promotes on the wrong identity.
             pending: entry.pending.as_ref().map(|parked| parked.config().clone()),
-            pending_reidentifies: Some(entry.pending_reidentifies),
+            // Derived from the same `Option` the line above is, so the two
+            // keys are absent together and present together. Writing the
+            // flag unconditionally put `Some(false)` on the wire beside a
+            // `pending` of `None`: a flag with no config to promote, which
+            // is the mirror of the pairing this comment warns about.
+            pending_reidentifies: entry.pending.as_ref().map(|_| entry.pending_reidentifies),
             ready_failed: Some(ready_failed),
             // Gated on the status rather than carried verbatim, unlike every
             // marker above. The slot's own field is written on the one
@@ -2050,7 +2055,7 @@ mod tests {
              CarriedFds { out_pipe: Some(11), err_pipe: Some(12), out_log: Some(13), err_log: \
              Some(14), stdin: Some(15), channel: Some(16) }, pending_delete: Some(false), \
              manual: None, reload: Some(None), ready_failed: Some(false), restart_due: None, \
-             dog: None, pending: None, pending_reidentifies: Some(false), app: AppConfig { \
+             dog: None, pending: None, pending_reidentifies: None, app: AppConfig { \
              name: \"web\", script: \"./srv\", env: <1 vars>, .. } }"
         );
         // The whole blob too, since `Handover` is what a daemon log line
@@ -2228,6 +2233,40 @@ mod tests {
     /// The sample is given a parked config first, so the removal below
     /// removes something: a blob whose `pending` was `None` all along could
     /// not tell an absent key from a present `null`.
+    /// fails if the two parking keys stop travelling as a pair.
+    ///
+    /// The sibling above pins the half that matters most, a parked config
+    /// arriving with its reset flag. This pins the other half: a sheep with
+    /// nothing parked writes NEITHER key, rather than a flag with no config
+    /// for it to apply to.
+    ///
+    /// It reads as a tidiness point and it is not. The comment at the
+    /// construction site argues the pairing in one direction, and a
+    /// `Some(false)` sitting beside a `pending` of `None` is that same
+    /// argument failing in the other: a reader of the blob, or of that
+    /// comment, is told the two are written together while one of them is
+    /// written always. `install_adopted` happens to be defensive about it
+    /// today, so nothing breaks; the invariant is what this pins, before
+    /// something starts relying on the flag alone.
+    #[test]
+    fn a_sheep_with_nothing_parked_carries_neither_parking_key() {
+        let entry = entry_fixture(|_| {});
+        assert!(
+            entry.pending.is_none(),
+            "fixture check: this case is about a sheep with nothing parked"
+        );
+        let blob = handover_over(&entry);
+
+        let round_tripped = Handover::load_value(serde_json::to_value(&blob).unwrap())
+            .expect("a blob this daemon wrote must load");
+        assert_eq!(round_tripped.sheep[0].pending(), None);
+        assert_eq!(
+            round_tripped.sheep[0].pending_reidentifies(),
+            None,
+            "a reset flag with no parked config to apply it to is a key that means nothing"
+        );
+    }
+
     #[test]
     fn a_blob_written_before_pending_was_carried_still_loads() {
         let mut entry = entry_fixture(|_| {});
