@@ -6809,53 +6809,58 @@ fn an_unknown_verb_with_no_matching_dog_keeps_claps_own_suggestion() {
     );
 }
 
-/// A Flockfile edit to a sheep the flock already has is reported, naming the
-/// sheep and every field that changed, and naming no VALUE.
+/// A Flockfile edit reaches a registered sheep only where the first load
+/// established nothing, and what it reaches is reported, naming the sheep and
+/// every field that changed and naming no VALUE.
 ///
-/// The defect: changing `cwd` on two apps and re-running `shep start` left
-/// both running the old one, with no error and no warning. `Request::Start`
-/// on an existing name adds instances rather than reconciling config, which
-/// is deliberate and is what `shep stock` depends on, so the edit was simply
-/// not applied. The silence was the bug, and the apps then crash-looped
-/// against a path that no longer applied.
+/// The defect this verb replaced: changing `cwd` on two apps and re-running
+/// `shep start` left both running the old one, with no error and no warning.
+/// `Request::Start` on an existing name adds instances rather than
+/// reconciling config, so the edit was simply not applied, and the apps then
+/// crash-looped against a path that no longer applied.
 ///
-/// It is now APPLIED as well as reported, and the report is what that load
-/// did rather than what it declined to do. `cwd` and `env` are both baked
-/// into a running child, so both wait for the next spawn, and the line that
-/// names them names `shep reload` too -- a list of field names an operator
-/// cannot act on is a report nobody can use.
+/// The rule that decides which half an edit gets is the additive default. A
+/// key the first load established belongs to whoever set it, and a later file
+/// may not overwrite it however often it is loaded -- a Flockfile arrives
+/// through a pull request, so that bound is the whole point. A key nobody has
+/// established is appended, applied where it can be and parked where it
+/// cannot, and the line that names a parked field names `shep reload` too: a
+/// list an operator cannot act on is a report nobody can use.
 ///
-/// What a broken implementation this catches: the load dropped entirely (no
-/// `cwd` in stderr); the merge computed against an unnormalized config
-/// (every default the file did not spell out reported as changed, and the
-/// `env`/`cwd` assertions drown in noise); the report carrying values rather
-/// than names, which is what the `hunter2` assertion is for (IR-41).
-/// Asserting only that the config was NOT silently replaced would pass on
-/// the broken code, since not replacing it is exactly what the broken code
-/// did.
+/// This test asserted the opposite until 2026-09-02, and was green because
+/// the migration clause was never implemented: a fresh `shep start` wrote
+/// nothing to the override store, so the SECOND load found every key
+/// unestablished and overwrote all of them. It now pins the silence on the
+/// second load and the report on the third.
+///
+/// What a broken implementation this catches: the establishment dropped (the
+/// second load reports `cwd` and parks it); the load dropped entirely (no
+/// `max_memory` in stderr on the third); the merge computed against an
+/// unnormalized config (every default the file did not spell out reported as
+/// changed); the report carrying values rather than names, which is what the
+/// `hunter2` assertion is for (IR-41).
 ///
 /// A one-app Flockfile where the real report had two: one sheep is enough to
 /// prove the message exists, and the daemon-side unit tier
 /// (`supervisor.rs`'s apply cases) is where multiple fields and an
 /// unregistered app are pinned, at no process-spawning cost.
 #[test]
-fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
+fn a_flockfile_edit_reaches_a_sheep_only_where_the_first_load_established_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let elsewhere = tempfile::tempdir().unwrap();
     let script = write_test_script(&dir);
-    // `env` carries a value that must never be printed, and `cwd` a second
-    // changed field, so a report that stopped at the first difference fails
-    // here too.
-    let body = |cwd: &Path, token: &str| {
+    // `env` carries a value that must never be printed, and the third file
+    // changes two fields at once, so a report that stopped at the first
+    // difference fails here too.
+    let body = |cwd: &Path, env: &str, extra: &str| {
         format!(
-            "[[app]]\nname = \"edited\"\nscript = '{}'\ncwd = '{}'\n\
-             env = {{ API_TOKEN = \"{token}\" }}\n",
+            "[[app]]\nname = \"edited\"\nscript = '{}'\ncwd = '{}'\n{extra}env = {{ {env} }}\n",
             script.display(),
             cwd.display(),
         )
     };
-    let flockfile = write_flockfile(&dir, &body(home, "hunter2-before"));
+    let flockfile = write_flockfile(&dir, &body(home, "API_TOKEN = \"hunter2-before\"", ""));
     let mut guard = DaemonGuard::default();
 
     let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
@@ -6863,32 +6868,65 @@ fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
     assert_success(&boot);
     poll_flock(home, |info| info["status"] == "online");
 
-    // The edit, over the same path the daemon was told about.
-    write_flockfile(&dir, &body(elsewhere.path(), "hunter2-after"));
+    // The edit, over the same path the daemon was told about. Both keys are
+    // ones the first load established, so both belong to whoever set them
+    // and this load may do nothing at all.
+    write_flockfile(
+        &dir,
+        &body(elsewhere.path(), "API_TOKEN = \"hunter2-after\"", ""),
+    );
     let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
     // A load reports, it does not fail. Without this the test reads only
     // stderr, so a change that turned the report into a refusal would keep
     // it green while breaking every operator script that runs `shep start`
     // twice.
     assert_success(&again);
-
     let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        !stderr.contains("cwd") && !stderr.contains("env"),
+        "an established key is not the file's to change, so there is nothing \
+         to report: {stderr}"
+    );
+    let info = poll_flock(home, |info| info["status"] == "online");
+    assert!(
+        info["pending"].is_null(),
+        "an established key must not be parked either: {info}"
+    );
+
+    // A third load, adding a key nobody has established: one that reaches the
+    // running child and one that cannot.
+    write_flockfile(
+        &dir,
+        &body(
+            elsewhere.path(),
+            "API_TOKEN = \"hunter2-after\", MODE = \"blue\"",
+            "max_memory = \"512M\"\n",
+        ),
+    );
+    let third = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    assert_success(&third);
+
+    let stderr = String::from_utf8_lossy(&third.stderr);
     assert!(
         stderr.contains("edited"),
         "the report must name the sheep: {stderr}"
     );
     assert!(
-        stderr.contains("cwd") && stderr.contains("env"),
+        stderr.contains("max_memory") && stderr.contains("env"),
         "the report must name every field that changed: {stderr}"
     );
     assert!(
-        !stderr.contains("hunter2"),
+        !stderr.contains("cwd"),
+        "the established key is still nobody's to change: {stderr}"
+    );
+    assert!(
+        !stderr.contains("hunter2") && !stderr.contains("blue"),
         "a field's VALUE must never reach an operator's terminal (IR-41): {stderr}"
     );
-    // The half that separates a load from the warning it replaced: both
-    // fields are baked into a running child, so the report has to say what
-    // brings them into effect. Naming them and stopping there is the failure
-    // this whole feature set out to fix, one step further along.
+    // The half that separates a load from the warning it replaced: an env
+    // change is baked into a running child, so the report has to say what
+    // brings it into effect. Naming the field and stopping there is the
+    // failure this whole feature set out to fix, one step further along.
     assert!(
         stderr.contains("shep reload edited"),
         "a pending field travels with the verb that promotes it: {stderr}"

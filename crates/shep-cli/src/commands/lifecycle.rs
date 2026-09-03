@@ -1137,13 +1137,13 @@ async fn flock_now(client: &Client) -> Vec<shep_core::protocol::ProcessInfo> {
 async fn apply_declared(
     client: &Client,
     streams: &mut Streams<'_>,
-    resumed: &[(DeclaredApp, Vec<shep_core::protocol::ProcessInfo>)],
+    declared: &[DeclaredApp],
     reset: ResetDepth,
 ) -> ExitCode {
-    let apps: Vec<DeclaredApp> = resumed
+    let apps: Vec<DeclaredApp> = declared
         .iter()
-        .filter(|(app, _)| !app.declared.is_empty())
-        .map(|(app, _)| app.clone())
+        .filter(|app| !app.declared.is_empty())
+        .cloned()
         .collect();
     if apps.is_empty() {
         return ExitCode::Success;
@@ -1610,7 +1610,7 @@ async fn start_one(
             .cloned()
             .collect();
         if rows.is_empty() {
-            fresh.push(app.config);
+            fresh.push(app);
         } else {
             resumed.push((app, rows));
         }
@@ -1625,7 +1625,8 @@ async fn start_one(
     // `start` was asked to do, they are what an operator running this in a
     // deploy needs to happen, and the refusal is reported the moment it
     // arrives either way. What it changes is what the verb EXITS with.
-    let applied = apply_declared(client, streams, &resumed, reset_depth(args)).await;
+    let declared: Vec<DeclaredApp> = resumed.iter().map(|(app, _)| app.clone()).collect();
+    let applied = apply_declared(client, streams, &declared, reset_depth(args)).await;
     if !resumed.is_empty() {
         // `None`, not the operator's token: this arm reached the flock through
         // a Flockfile or a path, so there is no selector to quote back in the
@@ -1643,7 +1644,7 @@ async fn start_one(
     if fresh.is_empty() {
         return applied;
     }
-    let apps = fresh;
+    let apps: Vec<AppConfig> = fresh.iter().map(|app| app.config.clone()).collect();
 
     let (procs, failure) = request_each(
         client,
@@ -1659,8 +1660,36 @@ async fn start_one(
         },
     )
     .await;
+    // The load that establishes what a FRESH app's file declared, and the
+    // whole of the spec's migration clause: "first load of an existing app
+    // establishes its current keys". `Request::Start` registers an app and
+    // writes nothing to the override store, so without this the app has an
+    // empty established set and the SECOND load of the same file treats every
+    // key as unestablished and overwrites the lot -- the one thing the
+    // additive default exists to prevent, arriving on the load after the one
+    // everybody tests.
+    //
+    // `ResetDepth::None` whatever flag the operator passed, because there is
+    // nothing to reset: the app was registered from this very file a moment
+    // ago, so every declared key already holds the file's value and the merge
+    // is a no-op that reports nothing. `--reset-all` would be worse than a
+    // no-op, since it drops the record this call exists to write.
+    //
+    // Only the apps the daemon really registered. An app whose spawn failed
+    // is not in `procs`, and sending its name here would earn an `is not
+    // registered` refusal and a non-zero exit for an app that already
+    // reported its own failure.
+    let registered: BTreeSet<&str> = procs.iter().map(|info| info.name.as_str()).collect();
+    let established: Vec<DeclaredApp> = fresh
+        .into_iter()
+        .filter(|app| registered.contains(app.config.name.as_str()))
+        .collect();
+    let recorded = apply_declared(client, streams, &established, ResetDepth::None).await;
     started.extend(procs);
-    first_failure(applied, failure.unwrap_or(ExitCode::Success))
+    first_failure(
+        applied,
+        first_failure(failure.unwrap_or(ExitCode::Success), recorded),
+    )
 }
 
 /// Stops the sheep matching `args.selector`.
