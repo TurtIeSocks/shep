@@ -29,6 +29,7 @@
 //! rather than being kept artificially open by our own leftover reference.
 
 use core::time::Duration;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 #[cfg(unix)]
@@ -37,7 +38,8 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-#[cfg(unix)]
+// Not `#[cfg(unix)]` any more: `record_lock` and the `LogFile` field holding
+// its handle are portable, and only the fd plumbing below is unix-only.
 use std::sync::Arc;
 
 #[cfg(unix)]
@@ -90,6 +92,22 @@ const LOG_BUFFER: usize = 8 * 1024;
 /// sheep that logged one line and went quiet would leave that line in the
 /// buffer until its next one, which for some sheep is never.
 const IDLE_FLUSH: Duration = Duration::from_millis(50);
+
+/// The per-line timestamp, re-exported from where the readers find it.
+///
+/// The format, its fixed width, and the function that takes it back off all
+/// live in [`shep_core::logstamp`], because they are a contract between this
+/// writer and three different file readers in `shep-cli` — see that module's
+/// own doc for why one definition and not four, and for what the stamp is
+/// worth.
+///
+/// The one thing that stays here is the decision about the LINE: what
+/// [`LogFile::append`] writes to the file is stamped, and what the pump
+/// forwards to `Bus::publish_log` is the sheep's own bytes, unstamped. That
+/// split is why this needs no opt-out — an unstamped feed already exists for
+/// anything post-processing lines, and `bleats`' file readers strip the
+/// prefix so the two paths report a sheep as having said the same thing.
+use shep_core::logstamp::stamp_into;
 
 /// Bytes each stream's reader may hold ahead of the lines it has emitted.
 ///
@@ -1109,6 +1127,12 @@ fn carried_sink(path: PathBuf, handle: Option<tokio::fs::File>) -> LogSink {
 struct LogFile<W = tokio::fs::File> {
     path: PathBuf,
     handle: Option<BufWriter<W>>,
+    /// Serializes a whole record against the other writer on this path.
+    ///
+    /// From [`record_lock`], which carries the argument. Taken at open and
+    /// kept rather than looked up per line: the path never changes, a reopen
+    /// keeps it, and the pump should not pay a map lookup per logged line.
+    record: Arc<tokio::sync::Mutex<()>>,
     /// When the oldest line the pump has not tried to flush yet was
     /// appended; the pump reads it as an [`IDLE_FLUSH`] deadline.
     ///
@@ -1116,6 +1140,14 @@ struct LogFile<W = tokio::fs::File> {
     /// be written must not turn the idle flush into a twenty-per-second
     /// retry loop, and the next appended line re-arms it either way.
     buffered_since: Option<Instant>,
+    /// Scratch the timestamp of the line being appended is formatted into,
+    /// cleared and refilled per line rather than reallocated — see
+    /// [`stamp_into`] for why the hot path is worth one field.
+    ///
+    /// Not state: nothing outside [`LogFile::append`] may read this, and
+    /// what it holds between two calls is whatever the last line was
+    /// stamped with.
+    stamp: String,
 }
 
 /// Where one stream's log handle comes from when a pump starts.
@@ -1157,9 +1189,13 @@ impl LogFile<tokio::fs::File> {
     #[cfg(unix)]
     fn from_file(path: PathBuf, file: tokio::fs::File) -> Self {
         Self {
+            // Same path, therefore the same lock as any other handle on it.
+            // A carried descriptor is still one of two writers.
+            record: record_lock(&path),
             path,
             handle: Some(BufWriter::with_capacity(LOG_BUFFER, file)),
             buffered_since: None,
+            stamp: String::new(),
         }
     }
 
@@ -1175,9 +1211,11 @@ impl LogFile<tokio::fs::File> {
             .ok()
             .map(|file| BufWriter::with_capacity(LOG_BUFFER, file));
         Self {
+            record: record_lock(&path),
             path,
             handle,
             buffered_since: None,
+            stamp: String::new(),
         }
     }
 
@@ -1207,10 +1245,17 @@ impl LogFile<tokio::fs::File> {
     /// by a working one, so the sheep keeps logging.
     async fn reopen(&mut self) -> Result<(), ReopenError> {
         self.buffered_since = None;
-        if let Some(handle) = self.handle.as_mut()
-            && let Err(error) = handle.flush().await
-        {
-            tracing::error!(path = ?self.path, %error, "log file flush failed");
+        if let Some(handle) = self.handle.as_mut() {
+            // The same lock `Self::flush` takes, for the same reason: this
+            // pushes whatever the buffer holds, up to a whole `LOG_BUFFER`,
+            // which is precisely the at-or-over-capacity case `record_lock`
+            // documents as spanning several `poll_write` calls. Rotation is
+            // when this runs and also when the buffer is most likely to be
+            // full, so it is not the rare corner of the hole.
+            let _record = self.record.lock().await;
+            if let Err(error) = handle.flush().await {
+                tracing::error!(path = ?self.path, %error, "log file flush failed");
+            }
         }
         // Closed before the reopen, so the pump never holds two descriptors
         // on one log at the same time.
@@ -1240,23 +1285,97 @@ impl LogFile<tokio::fs::File> {
     }
 }
 
+/// The lock that serializes one whole record written to one log path.
+///
+/// Two things write a sheep's log file and they are not the same writer.
+/// [`LogFile::append`] goes through a [`BufWriter`] owned by the pump, while
+/// [`crate::dogs::narrate`] opens its own handle to put shep's account of a
+/// dog into that dog's log. Joining a line into one `write_all` was not enough
+/// to keep them apart: `write_all` on a `BufWriter` flushes the buffer and
+/// then writes through directly when the input is at or over capacity, and a
+/// short write means several `poll_write` calls, so the other handle can still
+/// land between them and split a line in half.
+///
+/// A split line is not cosmetic. `shep_core::logstamp::strip` is built on one
+/// stamp per line and every file reader in `shep-cli` calls it, so a tear
+/// gives one line two stamps and leaves the other half unstamped, corrupting
+/// what `shep bleats` shows. The line it hit in practice was the stale verdict,
+/// which is the one an operator is most likely to be reading.
+///
+/// Keyed by path rather than held by the pump, because narration reaches a log
+/// through a path and never sees the `LogFile`.
+///
+/// The key is only as good as the path each side holds, and the two do not
+/// hold the same type. `LogFile` has the assembler's `PathBuf`, while
+/// `dogs::narrate` is handed `ProcessInfo::err_file`, which crossed the wire
+/// as a `String` and reaches `Path::new` through `to_string_lossy`. A log path
+/// that is not valid UTF-8 therefore hashes to two different keys and is not
+/// serialized. That is not fixed here on purpose: `err_file` is a `String` on
+/// the protocol itself, so such a path is already degraded everywhere it is
+/// reported, and widening the wire type for this alone would be the tail
+/// wagging the dog. Worth knowing rather than worth hiding. The map grows one entry per log
+/// path this daemon has opened, which is bounded by the flock and never freed;
+/// a `LogFile` is dropped on a reopen and the lock has to outlive it, so
+/// reference counting the entries away would cost more than the few hundred
+/// bytes it saved.
+///
+/// Poison is recovered from rather than propagated, the same call
+/// [`crate::dogs::DogRefusals`] makes: a panic while holding this map says
+/// nothing about whether the map is still usable.
+pub(crate) fn record_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(locks.entry(path.to_path_buf()).or_default())
+}
+
 impl<W: AsyncWrite + Unpin> LogFile<W> {
-    /// Appends one line and its newline to the buffer, logging (never
-    /// propagating) a write failure — a log we cannot write to must not stop
-    /// the pump draining the child's pipes.
+    /// Appends one timestamped line and its newline to the buffer, logging
+    /// (never propagating) a write failure — a log we cannot write to must
+    /// not stop the pump draining the child's pipes.
     ///
-    /// The newline is a second write into that same buffer rather than a
-    /// joined copy of the line: the file sees one contiguous run of bytes
-    /// either way, so the copy bought nothing but an allocation per line.
+    /// The stamp, the line and the newline are joined in `self.stamp` and
+    /// handed to ONE `write_all`, which is load-bearing rather than a
+    /// micro-optimisation. [`crate::dogs::narrate`] writes shep's own
+    /// account of a dog through a SECOND handle on this same path, so a
+    /// flush boundary falling between three separate writes let a whole
+    /// narration line land between a stamp and the body it belongs to. That
+    /// tore the pump's line in half and left it unstamped, breaking the
+    /// one-stamp-per-line contract [`shep_core::logstamp::strip`] reads on.
+    /// Measured before the join at roughly one tear per narration written
+    /// while a dog was talking, and zero after it. The scratch buffer is
+    /// reused, so joining costs no allocation per line and saves two
+    /// syscalls.
+    ///
+    /// # What the stamp does NOT change
+    ///
+    /// The line forwarded on `logs_tx` — and from there onto the bus, to
+    /// `shep bleats --follow` and to every dog subscribed to `log.*` — is
+    /// the sheep's own bytes, unstamped. [`LOG_TIMESTAMP_FORMAT`] argues why
+    /// that split is the whole reason this needs no opt-out. It also means
+    /// `O_APPEND`'s guarantee is untouched: one stamped line reaches the
+    /// buffer as one write, so [`open_append`]'s reasoning about several
+    /// writers on one file holds exactly as it did.
     async fn append(&mut self, line: &str) {
         let Some(handle) = self.handle.as_mut() else {
             return;
         };
-        let written = async {
-            handle.write_all(line.as_bytes()).await?;
-            handle.write_all(b"\n").await
-        }
-        .await;
+        self.stamp.clear();
+        stamp_into(&mut self.stamp);
+        self.stamp.push_str(line);
+        self.stamp.push('\n');
+        // Held across the write, not merely around the buffer copy. See
+        // `record_lock`: one `write_all` is still several syscalls when the
+        // line is at or over the buffer's capacity, and the other writer on
+        // this path must not land between them.
+        let written = {
+            let _record = self.record.lock().await;
+            handle.write_all(self.stamp.as_bytes()).await
+        };
         self.buffered_since.get_or_insert_with(Instant::now);
         if let Err(error) = written {
             tracing::error!(path = ?self.path, %error, "log file append failed");
@@ -1288,6 +1407,10 @@ impl<W: AsyncWrite + Unpin> LogFile<W> {
         let Some(handle) = self.handle.as_mut() else {
             return Ok(());
         };
+        // A flush pushes whatever the buffer holds at the file, so it is as
+        // capable of landing inside the other writer's record as an append
+        // is. See `record_lock`.
+        let _record = self.record.lock().await;
         handle.flush().await.map_err(|error| FlushError {
             message: format!("{}: {error}", self.path.display()),
         })
@@ -2060,7 +2183,7 @@ fn spawn_log_pump<O, E>(
 /// through it, so a check that ran after it would leave a root shepherd
 /// having created `0700` directories at a path someone else chose before
 /// refusing to write the log file there.
-async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
+pub(crate) async fn open_append(path: &Path) -> io::Result<tokio::fs::File> {
     check_log_ancestry(path)
         .inspect_err(|error| tracing::error!(?path, %error, "log ancestry check failed"))?;
 
@@ -2219,6 +2342,108 @@ fn spawn_channel_pumps<S>(
 
 #[cfg(test)]
 mod tests {
+
+    /// Fails if the pump and shep's own narration can tear one line in half.
+    ///
+    /// The regression, in full: `LogFile::append` writes through a
+    /// `BufWriter` and `crate::dogs::narrate` opens its own handle to the
+    /// same path. Joining stamp, body and newline into one `write_all` cut
+    /// the tears from eight per 3.8M lines to none in a 4M-line stress run,
+    /// which is what made it look fixed. It was not: `write_all` on a
+    /// `BufWriter` flushes and then writes through when the input is at or
+    /// over capacity, and a short write is several `poll_write` calls, so the
+    /// other handle can still land between them.
+    ///
+    /// The detector is `logstamp::strip` itself, which is what every reader
+    /// in `shep-cli` uses. A whole line carries exactly one stamp, so
+    /// stripping once must change the line and stripping twice must not
+    /// change it again. A torn line fails one of those: the half carrying two
+    /// stamps fails the second, and the orphaned half fails the first.
+    ///
+    /// The lines are deliberately longer than `LOG_BUFFER`, because that is
+    /// the case a single `write_all` does NOT make atomic and the joined
+    /// write therefore never covered.
+    ///
+    /// # What this case does and does not prove
+    ///
+    /// It does NOT prove the lock. Removing `record_lock` from
+    /// [`LogFile::append`] leaves it passing, five runs out of five, on a
+    /// four-thread runtime with 1200 pump records racing 600 narrations. That
+    /// was checked rather than assumed, and it is worth writing down instead
+    /// of leaving a later reader to discover the case is toothless.
+    ///
+    /// The reason is `O_APPEND`: it makes one `write(2)` atomic against the
+    /// file offset, so once the stamp, the body and the newline are joined
+    /// into a single `write_all`, a record that fits one syscall cannot be
+    /// split by the other handle. That is why joining them took a measured
+    /// 8 tears per 3.8M lines to 0 per 4M.
+    ///
+    /// What the lock still closes is the case underneath that, which this
+    /// test could not construct: `write_all` loops on a short write, and a
+    /// record at or over `LOG_BUFFER` makes `BufWriter` flush and then write
+    /// through separately. Regular-file writes on Linux and macOS do not
+    /// short-write readily, so the hole is real and rare rather than
+    /// reachable on demand.
+    ///
+    /// So this guards the invariant every reader depends on, one stamp per
+    /// line and no record lost, which is what a future change to the write
+    /// path would break. It is a regression guard, not a proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn narration_cannot_tear_a_line_the_pump_is_writing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("torn.log");
+
+        let long = "x".repeat(LOG_BUFFER + 512);
+        let pump = {
+            let path = path.clone();
+            let long = long.clone();
+            tokio::spawn(async move {
+                let mut log = LogFile::open(path).await;
+                for i in 0..1200 {
+                    log.append(&format!("{i} {long}")).await;
+                    if i % 4 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                log.flush().await.expect("the pump's own flush");
+            })
+        };
+        let narrator = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                for i in 0..600 {
+                    let mut written = String::new();
+                    stamp_into(&mut written);
+                    written.push_str(&format!("[shep] narration {i}\n"));
+                    let file = open_append(&path).await.expect("the narration handle");
+                    let _record = record_lock(&path).lock_owned().await;
+                    let mut file = file;
+                    use tokio::io::AsyncWriteExt as _;
+                    file.write_all(written.as_bytes()).await.expect("write");
+                    file.flush().await.expect("flush");
+                }
+            })
+        };
+        pump.await.expect("the pump task");
+        narrator.await.expect("the narration task");
+
+        let text = std::fs::read_to_string(&path).expect("the log is readable");
+        let mut lines = 0_usize;
+        for line in text.lines() {
+            lines += 1;
+            let once = shep_core::logstamp::strip(line);
+            assert_ne!(
+                once, line,
+                "a line reached the file with no stamp: {line:.80}"
+            );
+            assert_eq!(
+                shep_core::logstamp::strip(once),
+                once,
+                "a line carries two stamps, so a record was torn: {line:.80}"
+            );
+        }
+        assert_eq!(lines, 1800, "every record reached the file exactly once");
+    }
     use core::pin::Pin;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use core::task::{Context, Poll};
@@ -2464,7 +2689,40 @@ mod tests {
         }
     }
 
-    /// Waits for `path` to hold exactly `expected`.
+    use shep_core::logstamp::LOG_STAMP_BYTES;
+
+    /// One log file's contents with [`LogFile::append`]'s per-line stamp
+    /// taken back off, so a test can assert on the bytes the SHEEP produced.
+    ///
+    /// Every assertion in this module wants the sheep's own text: the stamp
+    /// is the daemon's, it moves every run, and a test that pinned it would
+    /// be asserting on the clock. [`a_line_carries_the_time_it_was_written`]
+    /// is the one that asserts the stamp itself is there and well formed —
+    /// which this function also does, per line, as a side effect of parsing
+    /// it (see [`unstamped`]).
+    fn log_text(path: &Path) -> String {
+        unstamped(&fs::read_to_string(path).unwrap())
+    }
+
+    /// Drops the per-line stamp from every line of `text` that carries one,
+    /// leaving the rest of the line untouched.
+    ///
+    /// Through [`shep_core::logstamp::strip`], which is the same call
+    /// `bleats` makes when it reads one of these files — so what these tests
+    /// compare against is what an operator is shown. It recognises a stamp
+    /// rather than assuming one, which matters here because some of these
+    /// tests write a line into a log file directly, ahead of any pump.
+    fn unstamped(text: &str) -> String {
+        let mut out = String::new();
+        for line in text.lines() {
+            out.push_str(shep_core::logstamp::strip(line));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Waits for `path` to hold exactly `expected`, ignoring the per-line
+    /// stamps (see [`log_text`]).
     ///
     /// A line observed on `logs` has reached the stream's BUFFER, not
     /// necessarily the file (see [`spawn_log_pump`]'s ordering note), so this
@@ -2475,7 +2733,7 @@ mod tests {
     /// handle does, since a reopen replaces it.
     async fn assert_file_settles(path: &Path, expected: &str) {
         let settled = timeout(PUMP_DEADLINE, async {
-            while fs::read_to_string(path).unwrap_or_default() != expected {
+            while unstamped(&fs::read_to_string(path).unwrap_or_default()) != expected {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -2692,14 +2950,8 @@ mod tests {
 
         let _ = pump.report_fds().await;
 
-        assert_eq!(
-            fs::read_to_string(&pump.out_path).unwrap(),
-            "before-the-blob\n"
-        );
-        assert_eq!(
-            fs::read_to_string(&pump.err_path).unwrap(),
-            "and-on-stderr\n"
-        );
+        assert_eq!(log_text(&pump.out_path), "before-the-blob\n");
+        assert_eq!(log_text(&pump.err_path), "and-on-stderr\n");
     }
 
     /// How long a case watches a parked pump before believing it.
@@ -2731,7 +2983,7 @@ mod tests {
         for window in 1..=STILL_WINDOWS {
             tokio::time::sleep(IDLE_FLUSH).await;
             assert_eq!(
-                fs::read_to_string(path).unwrap(),
+                log_text(path),
                 expected,
                 "{}: a parked pump wrote during flush window {window}",
                 path.display()
@@ -2812,7 +3064,7 @@ mod tests {
         let _ = pump.report_fds().await;
 
         assert_eq!(
-            fs::read_to_string(&pump.out_path).unwrap(),
+            log_text(&pump.out_path),
             burst,
             "every line the reader held must be on disk once, in order, \
              before the report is answered"
@@ -2889,7 +3141,7 @@ mod tests {
         // than waiting for a writer that outlives the test.
         drop(writer);
         let rest = read_to_eof(inherited).await;
-        let written = fs::read_to_string(&out_path).unwrap();
+        let written = log_text(&out_path);
         assert!(
             run.starts_with(&written),
             "the pump must write the run's own bytes, in order"
@@ -2982,10 +3234,18 @@ mod tests {
             drained > 0,
             "the report must rescue what the reader was holding"
         );
+        // The bound is on the SHEEP's bytes — one bufferful, plus the line
+        // `Lines` may have been part-way through — but it is measured on the
+        // file, and every line reaches the file with a [`LOG_STAMP_BYTES`]
+        // stamp ahead of it. Counting those in is what keeps this a bound on
+        // how far the drain follows the sheep rather than on how wide the
+        // stamp is.
+        const RESCUED: usize = READ_BUFFER + RUN_LINE;
+        let ceiling = u64::try_from(RESCUED + RESCUED / RUN_LINE * LOG_STAMP_BYTES).unwrap();
         assert!(
-            drained <= u64::try_from(READ_BUFFER + RUN_LINE).unwrap(),
-            "the report drained {drained} bytes, which is more than one \
-             bufferful: it is following the sheep rather than catching up"
+            drained <= ceiling,
+            "the report drained {drained} bytes against a ceiling of {ceiling}, which is \
+             more than one bufferful: it is following the sheep rather than catching up"
         );
     }
 
@@ -3048,16 +3308,21 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_run_of_lines_costs_one_write_per_bufferful_not_one_per_line() {
         // 69 characters, so `append`'s newline makes the 70-byte line the
-        // measurement behind `LOG_BUFFER` used.
+        // measurement behind `LOG_BUFFER` used. The stamp `append` now
+        // writes ahead of it is counted separately rather than folded into
+        // the literal, so the 70 bytes stay the number that measurement
+        // names.
         const LINE: &str = "012345678901234567890123456789012345678901234567890123456789012345678";
-        const LINE_BYTES: usize = LINE.len() + 1;
+        const LINE_BYTES: usize = LOG_STAMP_BYTES + LINE.len() + 1;
         let lines = 3 * LOG_BUFFER / LINE_BYTES;
 
         let sink = WriteCounter::default();
         let mut log = LogFile {
+            record: record_lock(std::path::Path::new("test")),
             path: PathBuf::from("counted.log"),
             handle: Some(BufWriter::with_capacity(LOG_BUFFER, sink.clone())),
             buffered_since: None,
+            stamp: String::new(),
         };
         for _ in 0..lines {
             log.append(LINE).await;
@@ -3103,9 +3368,11 @@ mod tests {
         const LINE: &str = "the-only-line";
         let sink = WriteCounter::default();
         let mut log = LogFile {
+            record: record_lock(std::path::Path::new("test")),
             path: PathBuf::from("quiet.log"),
             handle: Some(BufWriter::with_capacity(LOG_BUFFER, sink.clone())),
             buffered_since: None,
+            stamp: String::new(),
         };
 
         log.append(LINE).await;
@@ -3123,12 +3390,55 @@ mod tests {
 
         assert_eq!(
             sink.bytes(),
-            LINE.len() + 1,
-            "the line and its newline must reach the file once the window closes"
+            LOG_STAMP_BYTES + LINE.len() + 1,
+            "the stamp, the line and its newline must reach the file once the window closes"
         );
         assert_eq!(
             log.buffered_since, None,
             "a flush must retire the deadline, or the pump re-arms it every window"
+        );
+    }
+
+    /// Fails if a line reaches its file without the time it was written.
+    ///
+    /// The incident this exists for: a 341 KB log of byte-identical lines
+    /// whose newest entry was two days old, and an operator with no way to
+    /// see that. `mtime` answers for the whole file and only until something
+    /// touches it, and shep's own rotation touches it — so the line itself
+    /// has to carry the answer.
+    ///
+    /// Asserts the SHAPE and the width rather than a value: the value is the
+    /// wall clock, and pinning it would make this a test of the clock. The
+    /// width is what every reader stripping the prefix depends on, and it is
+    /// what [`LOG_STAMP_BYTES`] claims.
+    #[tokio::test]
+    async fn a_line_carries_the_time_it_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stamped.log");
+        let mut log = LogFile::open(path.clone()).await;
+
+        log.append("the-sheep-said-this").await;
+        log.flush().await.expect("the file must be writable");
+
+        let written = fs::read_to_string(&path).unwrap();
+        let line = written.strip_suffix('\n').expect("one whole line");
+        let (stamp, rest) = line.split_at(LOG_STAMP_BYTES);
+        assert_eq!(
+            rest, "the-sheep-said-this",
+            "the sheep's own bytes must survive the prefix, whole and unaltered"
+        );
+        let stamp = stamp
+            .strip_suffix(' ')
+            .expect("one space must separate the stamp from the line");
+        let parsed = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap_or_else(|err| panic!("{stamp:?} must parse as RFC 3339: {err}"));
+        // A minute of slack, against a line written a moment ago: wide
+        // enough that a loaded runner cannot fail it, narrow enough that a
+        // stamp reading the epoch, the wrong unit, or the wrong offset does.
+        let drift = (chrono::Utc::now() - parsed.to_utc()).num_seconds().abs();
+        assert!(
+            drift < 60,
+            "{stamp:?} is {drift}s from now; the stamp must be the moment the line was written"
         );
     }
 
@@ -3207,8 +3517,8 @@ mod tests {
         fs::rename(&pump.out_path, &rotated).unwrap();
         pump.reopen().await;
 
-        assert_eq!(fs::read_to_string(&rotated).unwrap(), before);
-        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), "");
+        assert_eq!(log_text(&rotated), before);
+        assert_eq!(log_text(&pump.out_path), "");
 
         let mut after = String::new();
         for n in 0..40 {
@@ -3219,9 +3529,9 @@ mod tests {
         }
         pump.flush().await;
 
-        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), after);
+        assert_eq!(log_text(&pump.out_path), after);
         assert_eq!(
-            fs::read_to_string(&rotated).unwrap(),
+            log_text(&rotated),
             before,
             "the archive must have stopped growing at the swap"
         );
@@ -3252,20 +3562,20 @@ mod tests {
 
         // No polling here: the acknowledgement is a real barrier, because
         // the reopen flushes the old handle before dropping it.
-        assert_eq!(fs::read_to_string(&rotated_out).unwrap(), "before-out\n");
-        assert_eq!(fs::read_to_string(&rotated_err).unwrap(), "before-err\n");
-        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), "");
-        assert_eq!(fs::read_to_string(&pump.err_path).unwrap(), "");
+        assert_eq!(log_text(&rotated_out), "before-out\n");
+        assert_eq!(log_text(&rotated_err), "before-err\n");
+        assert_eq!(log_text(&pump.out_path), "");
+        assert_eq!(log_text(&pump.err_path), "");
 
         pump.feed(false, "after-out").await;
         pump.feed(true, "after-err").await;
         pump.reopen().await; // second reopen, wanted here only as the flush
 
-        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), "after-out\n");
-        assert_eq!(fs::read_to_string(&pump.err_path).unwrap(), "after-err\n");
+        assert_eq!(log_text(&pump.out_path), "after-out\n");
+        assert_eq!(log_text(&pump.err_path), "after-err\n");
         // Both archives stopped growing the moment the handles were swapped.
-        assert_eq!(fs::read_to_string(&rotated_out).unwrap(), "before-out\n");
-        assert_eq!(fs::read_to_string(&rotated_err).unwrap(), "before-err\n");
+        assert_eq!(log_text(&rotated_out), "before-out\n");
+        assert_eq!(log_text(&rotated_err), "before-err\n");
     }
 
     /// Fails if the reopen opens the path without `.append(true)`: the
@@ -3594,8 +3904,8 @@ mod tests {
         // No polling: the acknowledgement is the barrier this half of `shep
         // flush` exists to provide, and a test that polled for the content
         // would pass against a pump that never provided it.
-        assert_eq!(fs::read_to_string(&pump.out_path).unwrap(), "out-before\n");
-        assert_eq!(fs::read_to_string(&pump.err_path).unwrap(), "err-before\n");
+        assert_eq!(log_text(&pump.out_path), "out-before\n");
+        assert_eq!(log_text(&pump.err_path), "err-before\n");
 
         // A flush keeps the handle, where a reopen replaces it — so the next
         // line appends to what is already there rather than starting a file.
@@ -3627,12 +3937,14 @@ mod tests {
         let path = dir.path().join("out.log");
         fs::write(&path, "").unwrap();
         let mut log = LogFile {
+            record: record_lock(std::path::Path::new("test")),
             path: path.clone(),
             handle: Some(BufWriter::with_capacity(
                 LOG_BUFFER,
                 tokio::fs::File::open(&path).await.unwrap(),
             )),
             buffered_since: None,
+            stamp: String::new(),
         };
 
         // Swallowed by design — the pump must keep draining a child whose
@@ -3680,7 +3992,7 @@ mod tests {
         log.flush().await.expect("the carried handle must be live");
 
         assert_eq!(
-            fs::read_to_string(&path).unwrap(),
+            log_text(&path),
             "first\nsecond\n",
             "a carried handle must append, not write at its own offset"
         );

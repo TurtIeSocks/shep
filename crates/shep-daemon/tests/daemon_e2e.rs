@@ -772,6 +772,23 @@ async fn log_lines_reach_a_log_subscriber() {
     fixture.shutdown().await;
 }
 
+/// A log file's contents with the daemon's per-line timestamp taken back
+/// off, so an assertion is about what the SHEEP wrote.
+///
+/// Through `shep_core::logstamp::strip`, the same call `shep bleats` makes
+/// when it reads one of these files. A missing or unreadable file is the
+/// empty string, which is what the poll below wants from one that has not
+/// been created yet.
+fn unstamped_file(path: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::new();
+    for line in text.lines() {
+        out.push_str(shep_core::logstamp::strip(line));
+        out.push('\n');
+    }
+    out
+}
+
 /// Waits for `path` to hold exactly `expected`, failing at [`RECV_TIMEOUT`].
 ///
 /// Polls rather than sleeping a fixed guess. A line observed on the bus has
@@ -782,7 +799,7 @@ async fn log_lines_reach_a_log_subscriber() {
 /// crates, as that file's own helpers already note.
 async fn await_file_contents(path: &std::path::Path, expected: &str) {
     let settled = tokio::time::timeout(RECV_TIMEOUT, async {
-        while std::fs::read_to_string(path).unwrap_or_default() != expected {
+        while unstamped_file(path) != expected {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -873,14 +890,14 @@ async fn reopen_moves_a_running_sheeps_log_onto_the_recreated_path() {
 
     // The reply is the barrier: it lands only after the pump has flushed
     // the old handle and opened the path again, so neither of these polls.
-    assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "");
-    assert_eq!(std::fs::read_to_string(&archive).unwrap(), "before\n");
+    assert_eq!(unstamped_file(&out_file), "");
+    assert_eq!(unstamped_file(&archive), "before\n");
 
     std::fs::write(&marker, "").unwrap();
     assert_eq!(client.await_log_line(id).await, "after");
     await_file_contents(&out_file, "after\n").await;
     assert_eq!(
-        std::fs::read_to_string(&archive).unwrap(),
+        unstamped_file(&archive),
         "before\n",
         "the renamed file must stop growing the moment the handle is swapped"
     );
@@ -1061,12 +1078,12 @@ async fn flush_empties_the_recorded_path_and_leaves_a_renamed_archive_alone() {
     // answered and every recorded path has been truncated, so neither of
     // these polls.
     assert_eq!(
-        std::fs::read_to_string(&out_file).unwrap(),
+        unstamped_file(&out_file),
         "",
         "the recorded path is what a flush empties"
     );
     assert_eq!(
-        std::fs::read_to_string(&archive).unwrap(),
+        unstamped_file(&archive),
         "before\n",
         "the renamed file is not the daemon's to empty — a flush that chased \
          the pump's inode would have emptied this one instead"

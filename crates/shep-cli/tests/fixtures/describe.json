@@ -24,7 +24,8 @@
       "last_exit": null,
       "smit": null,
       "instance": 0,
-      "handshook": null
+      "handshook": null,
+      "dog_stale": null
     }
   ]
 }

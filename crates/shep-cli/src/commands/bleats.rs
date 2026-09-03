@@ -44,13 +44,16 @@
 //! **The ordering limitation is real and is stated, not hidden.** Within one
 //! file, lines print in file order (append order, chronological). Across a
 //! sheep's two files there is no merge: `out_file` prints in full, then
-//! `err_file` starts. A log line carries no timestamp, so there is no key to
-//! interleave the two files on, and guessing one from arrival order would be
-//! wrong exactly when a sheep writes to both streams at once — seeing all of
-//! `out` before any of `err` must not be read as "everything on stdout
-//! happened first". `--out`/`--err` sidestep the seam by reducing a sheep to
-//! the one file that matters. `--follow` has no such limitation: the bus
-//! delivers in arrival order, which is chronological across both streams.
+//! `err_file` starts. The FILES now carry the time shep wrote each line, so
+//! a merge key exists on disk — but [`read_tail`] strips it before anything
+//! here sees a line (a line has to mean the same thing as it does on the
+//! bus), and nothing merges on one. Until something does, guessing an order
+//! from file order would be wrong exactly when a sheep writes to both
+//! streams at once: seeing all of `out` before any of `err` must not be read
+//! as "everything on stdout happened first".
+//! `--out`/`--err` sidestep the seam by reducing a sheep to the one file that
+//! matters. `--follow` has no such limitation: the bus delivers in arrival
+//! order, which is chronological across both streams.
 //!
 //! No-follow can also show a **stopped** sheep's last output, which
 //! `--follow` cannot: the daemon creates both files at spawn and keeps
@@ -276,6 +279,11 @@ const TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 /// feature, and this is a bounded read on a one-shot command with nothing
 /// else on the runtime.
 ///
+/// Each line comes back with the daemon's per-line timestamp stripped
+/// ([`shep_core::logstamp`]), so a line means the same thing here as it does
+/// on the bus — which is what `--follow` reads, and what `--format json`
+/// commits to.
+///
 /// A window boundary can land mid-line. When the seek away from the start
 /// of the file was non-zero, the bytes up to and including the first `\n`
 /// in the window are discarded rather than rendered as a fragment — half a
@@ -313,7 +321,18 @@ pub(crate) fn read_tail(path: &Path, limit: usize) -> io::Result<(Vec<String>, b
     };
 
     let text = String::from_utf8_lossy(window);
-    let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
+    // The daemon's per-line stamp comes back off here, and this is the one
+    // place it can: a `line` has one meaning across both of this verb's
+    // paths, and the follow path reads the bus, which carries a sheep's own
+    // bytes. Leaving it on would make `--no-follow --format json` report a
+    // sheep as having said something it did not, and make the same line
+    // differ between the two spellings of the same command. The stamp is
+    // still in the file for `tail`, `less` and `grep`, which is what it is
+    // for. (`shep_core::logstamp` argues both halves.)
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|line| shep_core::logstamp::strip(line).to_string())
+        .collect();
     if lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }

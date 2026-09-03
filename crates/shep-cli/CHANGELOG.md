@@ -13,6 +13,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `silent` leads somewhere. `shep flock` prints one line under the dogs table
+  naming every silent dog, and `shep describe <dog>` carries the long form:
+  whether the shepherd is still waiting on that dog or has given up on it,
+  and which command answers the rest. The give-up had no surface at all
+  before — an operator could watch a dog read `silent` forever with nothing
+  telling them shep had stopped trying. Neither addition touches a column:
+  the pointer is prose under the finished table. `--format json` carries
+  `dog_stale` on every dog row.
+
+### Fixed
+
+- `shep daemon reload`'s report about dogs that could not come back no longer
+  prescribes a reinstall. It is handed names and nothing else, and that
+  population includes dogs a reinstall cannot fix — one of them cost an
+  operator two days. It now says the shepherd gave up and sends the reader to
+  `shep bleats <dog>`, which is where the shepherd wrote what it actually
+  saw. The daemon's version is still named, as the thing a rebuild would
+  target rather than as an instruction to rebuild.
+
+- `shep bleats --no-follow` and `shep lookout`'s tail pane strip the daemon's
+  new per-line timestamp before rendering, so a line means the same thing
+  there as it does on the bus. Without this, `--follow` and `--no-follow`
+  would report a sheep as having said two different things, and
+  `--format json`'s `line` would have carried a prefix the sheep never wrote.
+
 ## [0.1.27] - 2026-09-02
 
 ### Fixed

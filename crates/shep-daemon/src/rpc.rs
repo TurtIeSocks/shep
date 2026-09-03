@@ -82,6 +82,15 @@ pub struct RpcContext {
     /// refused dog earns its one restart from disk or has already had it
     /// (the handover design's G8; [`crate::dogs::DogRefusals`]).
     pub(crate) dog_refusals: crate::dogs::DogRefusals,
+    /// What has connected to this daemon's socket, by peer pid.
+    ///
+    /// Written by the connection layer — the one place that can see a
+    /// peer's credentials — and read by [`crate::dogs::record_silent_dog`],
+    /// which is the only thing that asks. It is what lets a dog that never
+    /// reached the socket be told apart from one that reached it and did
+    /// not name itself: two silences with opposite fixes, which this daemon
+    /// used to report as one.
+    pub(crate) peer_contacts: crate::dogs::PeerContacts,
     /// This daemon's OS pid, echoed in the handshake.
     pub(crate) pid: u32,
     /// Flips to `true` to start graceful daemon shutdown; see [`Self::shutdown`].
@@ -487,26 +496,50 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                     message: err.to_string(),
                     daemon_version: None,
                 })),
-                Ok(app) => match ctx.supervisor.start_dog(app, spec.source).await {
-                    // `start_dog` is idempotent by NAME, so what comes back
-                    // is whatever already holds that name. An unmarked
-                    // entry means a sheep holds it: no dog was started, and
-                    // none can be while the name is taken. Answering with
-                    // the sheep would report a success that never happened,
-                    // so it is refused instead — and there is nothing to
-                    // undo, because the supervisor returns the squatter
-                    // without spawning anything.
-                    Ok(info) if info.dog.is_none() => reply(Err(RpcError {
-                        code: RpcErrorCode::InvalidConfig,
-                        message: format!(
-                            "a sheep is already registered as `{}`; rename it or give the dog another name",
-                            spec.name
-                        ),
-                        daemon_version: None,
-                    })),
-                    Ok(info) => reply(Ok(Response::DogStarted(info))),
-                    Err(err) => reply(Err(rpc_error(&err))),
-                },
+                Ok(app) => {
+                    // Read before `start_dog` takes the app. This arm and
+                    // `dogs::spawn_enabled_dogs` are the two places that know
+                    // which file a dog's spawn resolved to, and an operator
+                    // reading the dog's log during an upgrade is usually
+                    // asking exactly that.
+                    let script = app.config().script.clone();
+                    match ctx.supervisor.start_dog(app, spec.source).await {
+                        // `start_dog` is idempotent by NAME, so what comes back
+                        // is whatever already holds that name. An unmarked
+                        // entry means a sheep holds it: no dog was started, and
+                        // none can be while the name is taken. Answering with
+                        // the sheep would report a success that never happened,
+                        // so it is refused instead — and there is nothing to
+                        // undo, because the supervisor returns the squatter
+                        // without spawning anything.
+                        Ok(info) if info.dog.is_none() => reply(Err(RpcError {
+                            code: RpcErrorCode::InvalidConfig,
+                            message: format!(
+                                "a sheep is already registered as `{}`; rename it or give the dog another name",
+                                spec.name
+                            ),
+                            daemon_version: None,
+                        })),
+                        Ok(info) => {
+                            // Wording is about the binary this shepherd
+                            // resolved, not about a spawn having happened:
+                            // `start_dog` is idempotent by name, so this may be
+                            // a dog that was already running. `spawn_dog_watch`
+                            // narrates the spawns themselves, off the bus, where
+                            // that distinction is not a guess.
+                            crate::dogs::narrate(
+                                &ctx.events,
+                                &info,
+                                &format!(
+                                    "shep has this dog enabled, running the binary at {script}"
+                                ),
+                            )
+                            .await;
+                            reply(Ok(Response::DogStarted(info)))
+                        }
+                        Err(err) => reply(Err(rpc_error(&err))),
+                    }
+                }
             }
         }
         // Through `delete` with an exact `Name` selector, which is the whole
@@ -685,14 +718,32 @@ async fn with_live_stats(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -
     infos
 }
 
-/// Fills in each dog's handshake fact, which no sheep has and the supervisor
-/// does not hold.
+/// Fills in each dog's two connection facts, which no sheep has and the
+/// supervisor does not hold: whether it has ever answered this shepherd, and
+/// whether this shepherd has given up on it.
 ///
 /// The supervisor knows what a PROCESS is doing; whether a dog has ever
 /// spoken to this shepherd is connection state, and it lives in
 /// [`DogRefusals`](crate::dogs::DogRefusals) on the RPC context. So this is
 /// joined here for the same structural reason `with_live_stats` is, minus
-/// its cost: one map lookup per row under one lock, and no syscall at all.
+/// its cost: two map lookups per row under one lock, and no syscall at all.
+///
+/// **Why both, when `handshook` alone used to do.** They are not the same
+/// question and a listing that carried only the first could not tell two
+/// opposite situations apart: a dog spawned a moment ago that has not dialled
+/// back yet, and a dog this shepherd restarted, watched stay silent, and
+/// permanently stopped restarting. Both are `handshook: Some(false)` with a
+/// live process. The give-up was a latch inside
+/// [`DogRefusals`](crate::dogs::DogRefusals) that nothing on the wire could
+/// see, so every listing rendered the incident and the ordinary case as one
+/// word.
+///
+/// [`DogRefusals::stale`](crate::dogs::DogRefusals::stale) is called ONCE for
+/// the whole listing rather than per row, which is what keeps this to one
+/// lock acquisition per field instead of one per dog. The set it returns is
+/// small by construction — it holds only dogs this shepherd has given up on,
+/// and a flock with more than a handful of those has a bigger problem than a
+/// linear scan.
 ///
 /// **Applied to `ListFlock` and `Describe` and to nothing else**, which is
 /// the same pair `with_live_stats` covers and not a coincidence. Those are
@@ -705,14 +756,16 @@ async fn with_live_stats(stats: &Arc<StatsState>, mut infos: Vec<ProcessInfo>) -
 /// A sheep is skipped rather than set to `Some(false)`: it has no handshake
 /// and no version relationship with this shepherd at all, so `None` is the
 /// honest answer and it is what keeps every sheep row rendering exactly as
-/// it did before this field existed.
+/// it did before these fields existed.
 fn with_dog_contact(
     refusals: &crate::dogs::DogRefusals,
     mut infos: Vec<ProcessInfo>,
 ) -> Vec<ProcessInfo> {
+    let stale = refusals.stale();
     for info in &mut infos {
         if info.dog.is_some() {
             info.handshook = Some(refusals.has_handshook(&info.name));
+            info.dog_stale = Some(stale.contains(&info.name));
         }
     }
     infos
@@ -2465,6 +2518,67 @@ mod tests {
         let infos = list_flock(&h.ctx, 1).await;
         assert_eq!(infos[0].name, "web");
         assert_eq!(infos[0].handshook, None);
+        assert_eq!(
+            infos[0].dog_stale, None,
+            "a sheep is never given up on, because it was never asked to answer"
+        );
+    }
+
+    /// fails if a listing cannot tell a silence this shepherd is still
+    /// waiting out from one it has stopped waiting on.
+    ///
+    /// Both rows are `handshook: Some(false)` with a live process, and until
+    /// `dog_stale` existed that was the whole of what a listing said about
+    /// either. One of them needs nothing done about it — the dog was spawned
+    /// a moment ago — and the other is a dog this shepherd will never restart
+    /// again. Rendering them the same word is what left an operator with no
+    /// surface that reported the give-up at all.
+    #[tokio::test]
+    async fn a_listing_says_which_silent_dogs_this_shepherd_gave_up_on() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_dog(&h.ctx, "metrics").await;
+
+        let waiting = list_flock(&h.ctx, 1).await;
+        let dog = waiting
+            .iter()
+            .find(|info| info.name == "metrics")
+            .expect("the dog must be listed");
+        assert_eq!(dog.handshook, Some(false));
+        assert_eq!(
+            dog.dog_stale,
+            Some(false),
+            "a dog that has not answered YET is not one this shepherd gave up on"
+        );
+
+        // The ladder, driven the same way `a_dog_being_restarted_is_pending_
+        // and_then_stale` drives it: one refusal buys the restart, the second
+        // is the give-up.
+        h.ctx.dog_refusals.refused("metrics");
+        h.ctx.dog_refusals.refused("metrics");
+
+        let given_up = list_flock(&h.ctx, 2).await;
+        let dog = given_up
+            .iter()
+            .find(|info| info.name == "metrics")
+            .expect("still listed");
+        assert_eq!(dog.dog_stale, Some(true));
+        assert_eq!(
+            dog.status,
+            ProcStatus::Online,
+            "the process is still up, and the listing still says so"
+        );
+
+        // And it heals: a dog that gets in clears everything held against
+        // it, so the listing must stop reporting a give-up that no longer
+        // holds.
+        h.ctx.dog_refusals.handshook("metrics");
+        let talking = list_flock(&h.ctx, 3).await;
+        let dog = talking
+            .iter()
+            .find(|info| info.name == "metrics")
+            .expect("still listed");
+        assert_eq!(dog.handshook, Some(true));
+        assert_eq!(dog.dog_stale, Some(false));
     }
 
     /// fails if `describe` answers a different question from `flock` about

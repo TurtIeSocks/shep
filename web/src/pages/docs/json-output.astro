@@ -55,7 +55,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       "last_exit": null,
       "smit": null,
       "instance": 0,
-      "handshook": null
+      "handshook": null,
+      "dog_stale": null
     },
     {
       "id": 1,
@@ -74,7 +75,8 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       "last_exit": null,
       "smit": null,
       "instance": 0,
-      "handshook": null
+      "handshook": null,
+      "dog_stale": null
     }
   ]
 }`}</CodeBlock>
@@ -162,6 +164,17 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
         not doing its job. <code>status</code> still reads
         <code>online</code> there, truthfully — it describes the process.
         Table format shows this row as <code>silent</code>.
+      </li>
+      <li>
+        <code>dog_stale</code> is the other half of that and is
+        <code>null</code> for every sheep. <code>true</code> means the
+        shepherd has given up: it restarted the dog once for never answering,
+        that did not help, and it will not restart it again. You cannot work
+        this out from <code>handshook</code> — a dog spawned a second ago and
+        a dog the shepherd will never touch again are both
+        <code>false</code>. Why it gave up is in that dog's own log rather
+        than on the row, because the shepherd could only see the evidence at
+        the moment it happened: <code>shep bleats &lt;dog&gt;</code>.
       </li>
       <li>
         <code>smit</code> is <code>null</code> until a dog attaches one over

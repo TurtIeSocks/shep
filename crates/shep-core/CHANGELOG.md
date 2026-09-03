@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ProcessInfo::dog_stale`: whether the shepherd has given up on a dog —
+  restarted it once for never answering, watched that not help, and stopped
+  restarting it. `None` for a sheep and for a peer daemon that predates the
+  field, the same additive-optional rule `handshook` follows, so
+  `PROTOCOL_VERSION` stays at 2. It is not derivable from `handshook`, which
+  is the point: a dog spawned a second ago and a dog the shepherd will never
+  touch again are both `handshook: Some(false)` with a live process, and the
+  give-up was a latch inside the daemon that nothing on the wire could see.
+- `logstamp`: the timestamp the daemon writes ahead of every line in a log
+  file, its fixed 30-byte width, and `strip`, which takes it back off. One
+  definition for the writer and every reader — the daemon stamps, and three
+  separate file readers in `shep-cli` strip — so the two cannot drift.
+
 ## [0.1.27] - 2026-09-02
 
 

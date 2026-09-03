@@ -226,6 +226,46 @@ pub fn check_peer(stream: &tokio::net::UnixStream, daemon_uid: u32) -> Result<u3
     }
 }
 
+/// The connecting peer's pid, when the OS will name one.
+///
+/// # Why this is not folded into [`check_peer`]
+///
+/// It reads the same [`UCred`](tokio::net::unix::UCred) that function
+/// already throws all but the uid away from, so folding the two would save
+/// one `getsockopt` per connection. It stays separate because `check_peer`
+/// is an AUTHORISATION decision — its answer either admits the peer or ends
+/// the connection — and this is a diagnostic that must never do either. A
+/// pid the OS declines to report is a `None` here and nothing more; making
+/// it a `check_peer` variant would put a refusal one careless `?` away from
+/// a question that has no security content at all. The saved syscall is
+/// paid back many times over by the handshake round trip that follows.
+///
+/// # What `None` means, and what it does not
+///
+/// Not "no process is there" — that peer exists and has already passed the
+/// uid check. It means the platform has no answer: tokio fills the pid on
+/// Linux, macOS, the BSDs, Solaris and several more, and returns `None`
+/// everywhere else. Callers must degrade honestly rather than treat it as a
+/// fact, which is what [`Contact::Unknown`](crate::dogs::Contact::Unknown)
+/// exists to make hard to get wrong.
+///
+/// # Platform
+///
+/// Unix only, alongside [`check_peer`]. There is no Windows counterpart and
+/// there is not meant to be one: `shep_core::transport`'s module doc argues
+/// that establishing an admitted peer's identity there would need
+/// `ImpersonateNamedPipeClient` and raw FFI, which `#![forbid(unsafe_code)]`
+/// does not permit.
+#[cfg(unix)]
+#[must_use]
+pub fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    // Every failure is the same answer: an OS that would not say. A pid
+    // wide enough to overflow `u32` is not a thing any of these platforms
+    // produces, and inventing one here rather than dropping it would be
+    // worse than admitting ignorance.
+    u32::try_from(stream.peer_cred().ok()?.pid()?).ok()
+}
+
 /// The daemon's effective uid.
 ///
 /// # Platform
@@ -383,6 +423,22 @@ async fn handle_conn(stream: ServerStream, ctx: RpcContext) -> Result<(), ConnEr
     // raw FFI to re-answer a question the OS already answered.
     #[cfg(unix)]
     check_peer(&stream, daemon_uid())?;
+    // Read once here, off the stream, and carried down to the handshake:
+    // this is the whole of what lets the silence ladder tell a dog that
+    // never reached the socket from one that reached it and would not say
+    // who it was. `None` on Windows, and on any unix whose OS declines to
+    // name a pid — see `peer_pid`, and `dogs::Contact::Unknown` for what a
+    // reader must do with that.
+    #[cfg(unix)]
+    let peer = peer_pid(&stream);
+    #[cfg(not(unix))]
+    let peer: Option<u32> = None;
+    // Recorded BEFORE a byte is read, deliberately: a peer that connects
+    // and then says nothing at all has still reached this daemon, and that
+    // is exactly the fact the ladder is missing today.
+    if let Some(pid) = peer {
+        ctx.peer_contacts.connected(pid);
+    }
     // Minted after the peer check, not before: a connection refused for its
     // uid never reaches a handler, so it has nothing to scope.
     let conn = ConnId::next();
@@ -391,7 +447,7 @@ async fn handle_conn(stream: ServerStream, ctx: RpcContext) -> Result<(), ConnEr
     let (out_tx, out_rx) = mpsc::channel::<Bytes>(CONN_QUEUE);
     let writer = tokio::spawn(write_loop(FramedWrite::new(write_half, codec()), out_rx));
 
-    let outcome = converse(&mut frames, &out_tx, conn, &ctx).await;
+    let outcome = converse(&mut frames, &out_tx, conn, peer, &ctx).await;
 
     // Drop the queue's sender and JOIN the writer before returning, on EVERY
     // path: a protocol-skew refusal is written by that task, so returning the
@@ -411,9 +467,10 @@ async fn converse(
     frames: &mut Frames,
     out: &mpsc::Sender<Bytes>,
     conn: ConnId,
+    peer: Option<u32>,
     ctx: &RpcContext,
 ) -> Result<(), ConnError> {
-    handshake(frames, out, ctx).await?;
+    handshake(frames, out, peer, ctx).await?;
     let mut forwarder: Option<JoinHandle<()>> = None;
     let outcome = read_loop(frames, out, conn, ctx, &mut forwarder).await;
     // EVERY path out of read_loop — Ok or any `?`-propagated Err — lands
@@ -465,6 +522,7 @@ async fn read_loop(
 async fn handshake(
     frames: &mut Frames,
     out: &mpsc::Sender<Bytes>,
+    peer: Option<u32>,
     ctx: &RpcContext,
 ) -> Result<(), ConnError> {
     let frame = tokio::time::timeout(Duration::from_millis(HANDSHAKE_TIMEOUT_MS), frames.next())
@@ -472,6 +530,16 @@ async fn handshake(
         .map_err(|_| ConnError::HandshakeTimeout)?
         .ok_or(ConnError::NoHandshake)??;
     let hello: Hello = decode_frame(&frame).map_err(ConnError::Decode)?;
+    // Ahead of the protocol check, and that ordering is the point: this
+    // records what the peer SENT, not what this daemon made of it. A dog
+    // refused on protocol skew still named itself, and a diagnosis that
+    // forgot so would put it back in the anonymous pile it does not belong
+    // in.
+    if hello.dog_name.is_some()
+        && let Some(pid) = peer
+    {
+        ctx.peer_contacts.named_a_dog(pid);
+    }
     if hello.protocol != PROTOCOL_VERSION {
         // Version skew is a typed error, not silence (spec §6).
         let refusal: HelloReply = Err(RpcError {
@@ -505,6 +573,19 @@ async fn handshake(
                     &ctx.dog_refusals,
                     &ctx.supervisor,
                 );
+                // Into the dog's own log as well as the daemon's. Both
+                // protocol numbers, because "protocol mismatch" without
+                // them tells an operator nothing they can act on, and the
+                // dog's log is where they will look first.
+                crate::dogs::narrate_by_name(
+                    &ctx.supervisor,
+                    &ctx.events,
+                    dog,
+                    format!(
+                        "shep REFUSED this dog's handshake: this shepherd speaks protocol {PROTOCOL_VERSION} and the dog sent {}. Its own build is shep-client {}. Rebuild or reinstall it against this shep and run `shep restart {dog}`",
+                        hello.protocol, hello.client_version
+                    ),
+                );
             }
             // A refused client this daemon cannot restart and would not
             // want to: an operator running an older `shep` against a newer
@@ -531,7 +612,21 @@ async fn handshake(
     // before — including the restart it was just given, which is exactly
     // the case that has to clear.
     if let Some(dog) = &hello.dog_name {
-        ctx.dog_refusals.handshook(dog);
+        // Only the TRANSITION is narrated. A dog reconnects — after a
+        // handover, after a daemon restart, after any dropped connection —
+        // and a line per connection would bury the dog's own output in its
+        // own log. `handshook` answers whether this shepherd had already
+        // heard from it.
+        if ctx.dog_refusals.handshook(dog) {
+            crate::dogs::narrate_by_name(
+                &ctx.supervisor,
+                &ctx.events,
+                dog,
+                format!(
+                    "shep accepted this dog's handshake; it is registered with this shepherd as `{dog}`, on protocol {PROTOCOL_VERSION}"
+                ),
+            );
+        }
     }
     let ack: HelloReply = Ok(HelloAck {
         daemon_version: ctx.daemon_version.clone(),
@@ -1171,5 +1266,175 @@ mod tests {
             "a nameless refusal must not restart anything"
         );
         assert_eq!(after.status, ProcStatus::Online);
+    }
+
+    // --- The incident: a dog that reaches shep and never names itself ---
+
+    /// fails if a dog that is CONNECTED to this shepherd is reported as a
+    /// binary that cannot talk to it.
+    ///
+    /// # The incident, in full
+    ///
+    /// An operator ran a log-rotation dog under shep. shep rendered it
+    /// `silent`, restarted it once, then said: *the binary on disk cannot
+    /// talk to this shep either, so this dog is stale — rebuild or reinstall
+    /// it*. Every clause after "has still not answered it" was false. The
+    /// dog was connected the whole time and correctly serving `DogConfig`
+    /// and `ListFlock`; it was never refused anything. Its only defect was
+    /// `Client::connect`, which sends `Hello.dog_name: None`, so the
+    /// handshake's `handshook` call never fired. The operator spent two days
+    /// reinstalling, because the message told them to, and reinstalling
+    /// could never have fixed it.
+    ///
+    /// # Why this is not a `DogRefusals` test
+    ///
+    /// Because the isolated logic was already RIGHT. `has_handshook` was
+    /// correctly false, the ladder correctly fired, and the verdict was
+    /// correctly `Stale`. What was wrong was the sentence drawn from it. So
+    /// the case has to run the real pieces end to end — a real socket whose
+    /// peer credentials this daemon really reads, a real `Hello` with no
+    /// `dog_name`, a real request served over that same connection, and the
+    /// real ladder — and then read what the operator would have read.
+    ///
+    /// # Why the harness pins a pid
+    ///
+    /// Peer credentials on a real socket name the process that opened it,
+    /// which here is the test itself. `harness_at_pid` makes the scripted
+    /// dog run at that same pid, so the daemon's two facts — "this dog runs
+    /// at pid P" and "this is what pid P has sent me" — are about one
+    /// process, exactly as they are in production.
+    ///
+    /// # Why this is unix only
+    ///
+    /// The whole case turns on the daemon reading a peer's pid off the
+    /// socket, and only the unix tier does that. On Windows `peer_pid`
+    /// answers `None` by design, `from_pid` answers [`Contact::Unknown`],
+    /// and the ladder reaches `Silence::Unattributed` instead, which is
+    /// covered by `dogs`' own tests on every platform. Running this there
+    /// would assert an attribution that tier deliberately does not make.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dog_that_connects_without_naming_itself_is_not_called_a_stale_binary() {
+        // Three: the first spawn, the restart the ladder's first rung asks
+        // for, and one spare so a spawn is never refused for want of script.
+        let h = crate::testing::harness_at_pid(
+            vec![
+                ProcScript::never_exits(),
+                ProcScript::never_exits(),
+                ProcScript::never_exits(),
+            ],
+            std::process::id(),
+        );
+        // This case drives a real socket, so it cannot pause its clock to
+        // walk the attribution warm-up. It is about what the ladder SAYS
+        // about an anonymous connection, not about the gate in front of it,
+        // and `dogs::a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // covers the boundary.
+        h.ctx.peer_contacts.force_warm();
+        let dog = start_dog(&h.ctx, "log-rotate").await;
+        assert_eq!(
+            dog.pid,
+            Some(std::process::id()),
+            "the fixture only means anything if the dog and this test are one process"
+        );
+        let err_log = dog
+            .err_file
+            .clone()
+            .expect("a dog's listing resolves its log paths");
+
+        // Exactly what the dog in the incident sent: the current protocol,
+        // a real client version, and no `dog_name` at all.
+        let mut client = connected(h.ctx.clone()).await;
+        client
+            .send(&Hello {
+                protocol: PROTOCOL_VERSION,
+                client_version: "0.1.22".to_string(),
+                dog_name: None,
+            })
+            .await;
+        let ack: HelloReply = client.recv().await;
+        ack.expect("an anonymous handshake on the current protocol is ACCEPTED, not refused");
+
+        // And it works. This is the half the old message denied outright,
+        // so the test states it rather than assuming it.
+        client
+            .send(&Envelope {
+                id: 1,
+                deadline_ms: None,
+                body: Request::ListFlock,
+            })
+            .await;
+        match client.recv::<ServerFrame>().await {
+            ServerFrame::Reply(reply) => match reply.result {
+                Ok(Response::Flock(flock)) => assert!(
+                    flock.iter().any(|info| info.name == "log-rotate"),
+                    "the connection this daemon is about to call stale is serving requests"
+                ),
+                other => panic!("ListFlock must answer with the flock, got {other:?}"),
+            },
+            other => panic!("an accepted connection must serve ListFlock, got {other:?}"),
+        }
+
+        assert_eq!(
+            h.ctx.peer_contacts.from_pid(Some(std::process::id())),
+            crate::dogs::Contact::Anonymous,
+            "the handshake path must record what actually arrived"
+        );
+        assert!(
+            !h.ctx.dog_refusals.has_handshook("log-rotate"),
+            "no `dog_name` means no handshake was recorded, which is the whole trap"
+        );
+
+        // The real ladder, walked over two whole budgets. Instants rather
+        // than a paused clock: the connection above is a real socket, and a
+        // paused runtime auto-advances whenever it idles.
+        let mut seen = crate::dogs::SilentDogs::default();
+        let t0 = tokio::time::Instant::now();
+        let ladder = async |seen: &mut crate::dogs::SilentDogs, at| {
+            crate::dogs::check_silent_dogs(
+                &h.ctx.supervisor,
+                &h.ctx.dog_refusals,
+                &h.ctx.peer_contacts,
+                &h.ctx.events,
+                seen,
+                at,
+            )
+            .await
+        };
+        assert!(ladder(&mut seen, t0).await.is_empty());
+        assert_eq!(
+            ladder(&mut seen, t0 + crate::dogs::DOG_SILENCE_BUDGET).await,
+            vec![("log-rotate".to_string(), crate::dogs::Refusal::Restart)]
+        );
+        assert_eq!(
+            ladder(&mut seen, t0 + 2 * crate::dogs::DOG_SILENCE_BUDGET).await,
+            vec![("log-rotate".to_string(), crate::dogs::Refusal::Stale)],
+            "the ladder's verdict is unchanged; what changes is what it SAYS"
+        );
+
+        // What the operator reads. The dog's own log, which is the file the
+        // verdict tells them to open and which could not hold a word of this
+        // before.
+        let written = std::fs::read_to_string(&err_log).expect("the narration must reach the log");
+        assert!(
+            written.contains("[shep]"),
+            "shep's voice in a dog's log has to be marked as shep's: {written}"
+        );
+        assert!(
+            written.contains("HAS connected to this shepherd"),
+            "the verdict must say what this shepherd watched arrive: {written}"
+        );
+        assert!(
+            written.contains("reinstalling the same build will NOT"),
+            "the two days were spent on advice this line has to refuse: {written}"
+        );
+        assert!(
+            !written.contains("cannot talk to this shep either"),
+            "the sentence that cost two days must not appear on this path: {written}"
+        );
+        assert!(
+            !written.contains("cannot reach this shep"),
+            "this dog reached shep; nothing here may claim otherwise: {written}"
+        );
     }
 }

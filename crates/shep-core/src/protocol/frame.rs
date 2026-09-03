@@ -68,6 +68,7 @@ mod tests {
                 smit: None,
                 instance: None,
                 handshook: None,
+                dog_stale: None,
             },
             manually: false,
             at_ms: 1_700_000_000_000,

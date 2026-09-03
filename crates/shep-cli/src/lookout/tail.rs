@@ -78,11 +78,13 @@ pub struct TailLine {
 pub struct Tail {
     /// The newest lines, oldest first — `out`'s tail, then `err`'s.
     ///
-    /// **There is no merge, and that is stated rather than hidden.** A log
-    /// line carries no timestamp, so there is no key to interleave the two
-    /// files on, and guessing one from file order would be wrong exactly when
-    /// a sheep writes to both at once. `bleats`' module doc records the same
-    /// limitation for the same reason. The pane renders the LAST rows of this
+    /// **There is no merge, and that is stated rather than hidden.** The
+    /// files carry a per-line timestamp, so a key exists on disk — but this
+    /// reader strips it (a line has to mean the same thing here as on the
+    /// bus) and nothing merges on one. Until something does, guessing an
+    /// order from file order would be wrong exactly when a sheep writes to
+    /// both at once. `bleats`' module doc records the same limitation for the
+    /// same reason. The pane renders the LAST rows of this
     /// list, so a crash on stderr survives a chatty stdout — and its header
     /// says `out then err` rather than `out+err`, because `+` reads as one
     /// merged stream and this is two files end to end.
@@ -261,7 +263,14 @@ fn read_window(seen: &mut BTreeMap<PathBuf, u64>, path: &Path) -> std::io::Resul
     };
 
     let text = String::from_utf8_lossy(bytes);
-    let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
+    // Stripped here for the same reason `commands::bleats::read_tail` strips
+    // it: this pane and the live feed show one sheep's output side by side,
+    // and a line that grew a 30-character prefix on only one of those two
+    // paths would read as two different sheep.
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|line| shep_core::logstamp::strip(line).to_string())
+        .collect();
     if lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }

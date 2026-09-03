@@ -1,5 +1,6 @@
 ---
 source: crates/shep-cli/src/output/mod.rs
+assertion_line: 810
 expression: out
 ---
 {
@@ -26,7 +27,8 @@ expression: out
       },
       "smit": "▲ main@a1b2c3",
       "instance": null,
-      "handshook": null
+      "handshook": null,
+      "dog_stale": null
     },
     {
       "id": 2,
@@ -48,7 +50,8 @@ expression: out
       },
       "smit": "▲ main@a1b2c3",
       "instance": null,
-      "handshook": null
+      "handshook": null,
+      "dog_stale": null
     },
     {
       "id": 3,
@@ -70,7 +73,8 @@ expression: out
       },
       "smit": "▲ main@a1b2c3",
       "instance": null,
-      "handshook": null
+      "handshook": null,
+      "dog_stale": null
     }
   ]
 }

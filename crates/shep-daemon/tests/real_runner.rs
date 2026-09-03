@@ -68,6 +68,22 @@ fn spec_for(dir: &tempfile::TempDir, program: &str, args: &[&str]) -> SpawnSpec 
 /// for a loaded runner, not an expected duration.
 const LOG_WRITE_DEADLINE: Duration = Duration::from_secs(5);
 
+/// A log file's contents with the daemon's per-line timestamp taken back
+/// off, so an assertion is about what the SHEEP wrote.
+///
+/// Through `shep_core::logstamp::strip`, the same call `shep bleats` makes
+/// when it reads one of these files. A missing or unreadable file is the
+/// empty string, which is what a poll on a file not yet created wants.
+fn unstamped_file(path: &Path) -> String {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::new();
+    for line in text.lines() {
+        out.push_str(shep_core::logstamp::strip(line));
+        out.push('\n');
+    }
+    out
+}
+
 /// Waits for `path` to hold exactly `expected`, failing at
 /// [`LOG_WRITE_DEADLINE`].
 ///
@@ -76,7 +92,7 @@ const LOG_WRITE_DEADLINE: Duration = Duration::from_secs(5);
 /// what must eventually be true, not by a number someone picked.
 async fn await_file_contents(path: &Path, expected: &str) {
     let settled = tokio::time::timeout(LOG_WRITE_DEADLINE, async {
-        while fs::read_to_string(path).unwrap_or_default() != expected {
+        while unstamped_file(path) != expected {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -212,8 +228,8 @@ async fn a_reopen_moves_a_real_childs_output_onto_the_recreated_path() {
 
     // No polling: the acknowledgement is a real barrier, since the reopen
     // flushes the old handle before dropping it.
-    assert_eq!(fs::read_to_string(&out_file).unwrap(), "");
-    assert_eq!(fs::read_to_string(&archive).unwrap(), "before\n");
+    assert_eq!(unstamped_file(&out_file), "");
+    assert_eq!(unstamped_file(&archive), "before\n");
 
     fs::write(&marker, "").unwrap();
     let line = tokio::time::timeout(LOG_WRITE_DEADLINE, io.logs.recv())
@@ -224,7 +240,7 @@ async fn a_reopen_moves_a_real_childs_output_onto_the_recreated_path() {
 
     await_file_contents(&out_file, "after\n").await;
     assert_eq!(
-        fs::read_to_string(&archive).unwrap(),
+        unstamped_file(&archive),
         "before\n",
         "the renamed file must stop growing the moment the handle is swapped"
     );

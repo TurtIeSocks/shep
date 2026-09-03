@@ -47,7 +47,7 @@ use shep_core::status::ProcStatus;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
-use crate::bus::SharedEvent;
+use crate::bus::{Bus, SharedEvent};
 use crate::supervisor::SupervisorHandle;
 
 /// One dog the daemon knows about: its name, and where its binary comes from.
@@ -281,6 +281,7 @@ pub async fn spawn_enabled_dogs(
     specs: &[DogSpec],
     paths: &ShepPaths,
     supervisor: &SupervisorHandle,
+    events: &Bus,
 ) {
     for spec in specs {
         let app = match dog_app(spec, paths) {
@@ -290,12 +291,31 @@ pub async fn spawn_enabled_dogs(
                 continue;
             }
         };
+        // Read before `start_dog` takes the app. This is the one place that
+        // knows which file a dog's spawn actually resolved to — a built-in
+        // dog's is this shep's own binary, an adopted one's is whatever the
+        // operator's `[dog.<name>]` named — and an operator reading the
+        // dog's log during an upgrade is usually asking exactly that.
+        let script = app.config().script.clone();
         match supervisor.start_dog(app, spec.source.clone()).await {
             Ok(info) if info.dog.is_none() => tracing::warn!(
                 dog = %spec.name,
                 "a sheep is already registered under this name; the dog did not start"
             ),
-            Ok(_) => {}
+            Ok(info) => {
+                // `start_dog` is idempotent by name, so this reply may be a
+                // dog that was already running rather than one just spawned
+                // — which is why the wording is about the binary this
+                // shepherd resolved and not about a spawn having happened.
+                // `spawn_dog_watch` narrates the spawns, off the bus, where
+                // that distinction is not a guess.
+                narrate(
+                    events,
+                    &info,
+                    &format!("shep has this dog enabled, running the binary at {script}"),
+                )
+                .await;
+            }
             Err(err) => tracing::warn!(dog = %spec.name, %err, "a dog did not start"),
         }
     }
@@ -450,10 +470,16 @@ impl DogRefusals {
     ///
     /// A dog that is talking to this daemon is not stale by any definition
     /// this daemon can apply, whatever happened before.
-    pub fn handshook(&self, name: &str) {
+    ///
+    /// Answers whether this CHANGED anything — whether the dog was not
+    /// already marked as having got in. A dog reconnects, and often; the
+    /// caller writes a line into that dog's own log the first time this
+    /// shepherd hears from it, and a boolean is what keeps that from
+    /// becoming one line per reconnect for the life of the daemon.
+    pub fn handshook(&self, name: &str) -> bool {
         let mut seen = self.lock();
         seen.refusals.remove(name);
-        seen.handshook.insert(name.to_string());
+        seen.handshook.insert(name.to_string())
     }
 
     /// Whether `name` has handshook with this daemon and not been refused
@@ -508,6 +534,304 @@ impl DogRefusals {
     /// [`FlockRegistry`](crate::snapshot) already makes for its own map.
     fn lock(&self) -> std::sync::MutexGuard<'_, Links> {
         self.seen.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How many distinct peer pids [`PeerContacts`] remembers at once.
+///
+/// The question this state answers is only ever asked about a dog the
+/// supervisor is running RIGHT NOW, and only ever a few seconds after that
+/// dog was first seen silent ([`DOG_SILENCE_BUDGET`]). So what has to
+/// survive eviction is a handful of long-lived dog processes against
+/// whatever else dialled the socket recently, and a dog that reconnects
+/// refreshes its own entry every time it does.
+///
+/// A thousand DISTINCT peer pids inside one silence budget would take about
+/// two hundred `shep` invocations a second, which is not a workload — and if
+/// it happened, the honest degradation is the "could not attribute this"
+/// arm of `record_silent_dog`, which names both candidates instead of
+/// picking one. That is why this is a bound and not a promise.
+///
+/// Note what does NOT churn this map: a poll loop. One `shep daemon reload`
+/// was measured opening 442 connections in 9.8 seconds, and every one of
+/// them came from the one CLI process, so they are one entry.
+const PEER_CONTACT_CAPACITY: usize = 1024;
+
+/// How long this map must have been watching before a pid's ABSENCE from it
+/// means anything.
+///
+/// `Contact::None` supports exactly one claim, that a dog is not reaching this
+/// shepherd's socket, and that claim is only the map's to make about a stretch
+/// it was actually listening for. A successor built by [`crate::boot`] starts
+/// empty at every `execve`, so without this every dog carried across a
+/// `shep daemon reload` looked, for its first seconds, exactly like a dog that
+/// had never called: absent from the map, therefore `Unreachable`, therefore
+/// told to reinstall a binary that was fine.
+///
+/// One budget, and the ladder WAITS for it rather than racing it. That
+/// pairing is the whole design and neither half works alone. An earlier
+/// version made this three budgets and left the watch running, which put the
+/// stale verdict at two budgets against a map that was still cold: every
+/// unreachable dog then got the unattributable message, `silent_dogs` dropped
+/// it from later looks because it was stale, and the reinstall advice this
+/// ladder exists to earn became unreachable in practice. Deleting a true
+/// message is as much a defect as inventing one.
+///
+/// So [`spawn_silent_dog_watch`] judges nothing while this is warming, and a
+/// dog's silence is measured from when this shepherd could actually observe
+/// it. The stale verdict lands one warm-up later than it used to and reads a
+/// map that has been listening for two budgets by then.
+///
+/// Before it elapses `from_pid` answers [`Contact::Unknown`], which routes to
+/// `Silence::Unattributed` and names both candidates instead of picking one.
+/// That arm is still reachable, on the path it is actually for: a platform
+/// that will not name a peer's pid.
+const PEER_CONTACT_WARMUP: Duration = DOG_SILENCE_BUDGET;
+
+/// What this daemon has observed arriving on its socket, keyed by the
+/// connecting process's pid.
+///
+/// # What it is for
+///
+/// One question, asked by `record_silent_dog` and by nothing else: when a
+/// dog has been running without ever handshaking, is it failing to REACH
+/// this daemon, or is it reaching it and not saying who it is? Those two
+/// have opposite fixes — the first is answered by reinstalling the binary,
+/// and the second cannot be, because the binary is working and is merely
+/// too old (or too casually written) to name itself in its `Hello`.
+///
+/// Before this existed the daemon could not tell them apart and asserted
+/// the first. A real operator followed that advice for two days against a
+/// dog that was connected the whole time and serving every request it was
+/// asked, whose only defect was a `Hello` with no `dog_name` in it.
+///
+/// # Why a pid and not a connection count
+///
+/// A pid is the one identifier both sides of the question already have:
+/// the supervisor knows the pid it spawned the dog as, and `SO_PEERCRED`
+/// (or `getpeereid`'s macOS sibling) tells the connection layer the pid on
+/// the other end of the socket. Nothing has to be added to the protocol,
+/// which matters because the dogs this is diagnosing are exactly the ones
+/// too old to have sent anything new.
+///
+/// # Platform
+///
+/// Unix only in practice. Windows has no post-accept peer check by design
+/// (`shep_core::transport`'s module doc is the canonical writeup: the pipe's
+/// ACL answers the same-user question earlier and in the kernel, and
+/// establishing an admitted peer's IDENTITY would need
+/// `ImpersonateNamedPipeClient` and raw FFI that `#![forbid(unsafe_code)]`
+/// does not permit), so this map stays empty there and every lookup answers
+/// [`Contact::Unknown`]. That is not a gap being papered over — it is the
+/// reason `record_silent_dog` has a message for "could not attribute
+/// this" rather than guessing.
+///
+/// `Debug` is derived and needs no redaction (IR-41), for the same reason
+/// [`DogRefusals`]'s is: the map holds pids and two booleans' worth of
+/// fact, and no configuration value can reach it.
+#[derive(Debug, Clone, Default)]
+pub struct PeerContacts {
+    seen: Arc<Mutex<Contacts>>,
+}
+
+/// What [`PeerContacts`] holds, under its one lock.
+#[derive(Debug)]
+struct Contacts {
+    /// When this map started watching, which is this daemon's own boot.
+    ///
+    /// [`tokio::time::Instant`], matching `SilentDogs` and for the same
+    /// reason: a paused test moves that clock instead of sleeping out a whole
+    /// budget. Under the lock rather than beside it so a test that cannot
+    /// pause its clock, because it drives a real socket, can back-date it
+    /// through `&self` instead.
+    watching_since: Instant,
+    /// One entry per remembered peer pid, at most
+    /// [`PEER_CONTACT_CAPACITY`] of them.
+    by_pid: BTreeMap<u32, Seen>,
+    /// Ticks once per recorded connection, and is what
+    /// [`Contacts::evict_oldest`] compares.
+    ///
+    /// A counter rather than an `Instant` because the only thing anything
+    /// asks of it is which of two entries was touched later, and a counter
+    /// answers that without a clock read per connection.
+    clock: u64,
+}
+
+/// What has been seen from one peer pid.
+#[derive(Debug)]
+struct Seen {
+    /// Whether any connection from this pid carried a `Hello.dog_name`.
+    ///
+    /// Recorded whatever the handshake's verdict was: this says what the
+    /// peer SENT, and a dog refused on protocol skew still named itself.
+    named_a_dog: bool,
+    /// [`Contacts::clock`] as of the most recent connection from this pid.
+    touched: u64,
+}
+
+/// What [`PeerContacts`] has seen from one pid.
+///
+/// `#[non_exhaustive]`: `shep-daemon` is a published library, and a fourth
+/// answer — a peer seen but refused before it could speak, say — would
+/// otherwise be a breaking change for an out-of-tree matcher (IR-20).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Contact {
+    /// Nothing has ever connected from this pid.
+    ///
+    /// A dog running as this pid is not reaching the socket at all, which
+    /// is the one case where reinstalling the binary is the right advice.
+    None,
+    /// Connections have arrived from this pid, and not one of them named a
+    /// dog in its `Hello`.
+    ///
+    /// The dog is reaching this daemon and may be serving every request
+    /// it is asked. It is built against shep-client older than 0.1.23, or
+    /// it connects with `Client::connect` rather than
+    /// `ReconnectingClient::connect_as_dog`.
+    Anonymous,
+    /// A connection from this pid named a dog in its `Hello`.
+    Named,
+    /// There is nothing recorded either way: no pid was available (Windows,
+    /// or a `peer_cred` that reported none), or this pid's entry has been
+    /// evicted.
+    ///
+    /// Distinct from [`Self::None`] and the distinction is the whole point:
+    /// "nothing has connected" is a finding, and "I could not look" is not.
+    Unknown,
+}
+
+impl PeerContacts {
+    /// Builds an empty record — a daemon nothing has connected to yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one connection arriving from `pid`.
+    ///
+    /// Called before a byte is read, so a peer that connects and then says
+    /// nothing at all still counts as having reached this daemon — which is
+    /// exactly the distinction the silence ladder needs.
+    pub fn connected(&self, pid: u32) {
+        let mut seen = self.lock();
+        seen.clock = seen.clock.saturating_add(1);
+        let clock = seen.clock;
+        match seen.by_pid.get_mut(&pid) {
+            Some(entry) => entry.touched = clock,
+            None => {
+                seen.by_pid.insert(
+                    pid,
+                    Seen {
+                        named_a_dog: false,
+                        touched: clock,
+                    },
+                );
+                seen.evict_oldest();
+            }
+        }
+    }
+
+    /// Records that a connection from `pid` named a dog in its `Hello`.
+    ///
+    /// Sticky: once a pid has named a dog, a later anonymous connection from
+    /// the same pid does not unsay it. The question being answered is "has
+    /// this process EVER named itself", and a dog that names itself on one
+    /// connection is not the dog this diagnosis is about.
+    pub fn named_a_dog(&self, pid: u32) {
+        let mut seen = self.lock();
+        seen.clock = seen.clock.saturating_add(1);
+        let clock = seen.clock;
+        let entry = seen.by_pid.entry(pid).or_insert(Seen {
+            named_a_dog: false,
+            touched: clock,
+        });
+        entry.named_a_dog = true;
+        entry.touched = clock;
+        seen.evict_oldest();
+    }
+
+    /// Whether this map is still too new for an absence to mean anything.
+    ///
+    /// Read by [`spawn_silent_dog_watch`], which judges no dog while it is
+    /// true. See `PEER_CONTACT_WARMUP` for why the ladder waits rather than
+    /// races.
+    #[must_use]
+    pub fn is_warming(&self) -> bool {
+        self.lock().watching_since.elapsed() < PEER_CONTACT_WARMUP
+    }
+
+    /// Back-dates the watching clock so this map reads as warm.
+    ///
+    /// For the cases that drive a REAL socket and so cannot pause their
+    /// clock. `a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+    /// is the one that walks the boundary, and it does not use this.
+    #[cfg(test)]
+    pub(crate) fn force_warm(&self) {
+        let mut seen = self.lock();
+        seen.watching_since = Instant::now() - PEER_CONTACT_WARMUP * 2;
+    }
+
+    /// What has been seen from `pid`, or [`Contact::Unknown`] when there is
+    /// no pid to ask about.
+    #[must_use]
+    pub fn from_pid(&self, pid: Option<u32>) -> Contact {
+        let Some(pid) = pid else {
+            return Contact::Unknown;
+        };
+        let seen = self.lock();
+        match seen.by_pid.get(&pid) {
+            // Absence is a finding only once this map has been watching long
+            // enough for it to be one. See `PEER_CONTACT_WARMUP`.
+            None if seen.watching_since.elapsed() < PEER_CONTACT_WARMUP => Contact::Unknown,
+            None => Contact::None,
+            Some(seen) if seen.named_a_dog => Contact::Named,
+            Some(_) => Contact::Anonymous,
+        }
+    }
+
+    /// Takes the lock, recovering from a poisoned one rather than
+    /// propagating the panic — the same call [`DogRefusals::lock`] makes,
+    /// for the same reason: every critical section here is a lookup or an
+    /// increment on a plain `BTreeMap`, so a panic elsewhere cannot leave a
+    /// torn value, and taking down a daemon whose whole job is staying up
+    /// would be the worse failure.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Contacts> {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Default for Contacts {
+    fn default() -> Self {
+        Self {
+            watching_since: Instant::now(),
+            by_pid: BTreeMap::new(),
+            clock: 0,
+        }
+    }
+}
+
+impl Contacts {
+    /// Drops the least recently touched entry, if the map has outgrown
+    /// [`PEER_CONTACT_CAPACITY`].
+    ///
+    /// A scan rather than a second index: it runs only on the insert that
+    /// overflows a full map, over at most a thousand entries of two words
+    /// each, and the alternative is a heap to keep in step with every
+    /// touch — which is more code to be wrong in for a cost nothing here
+    /// can measure.
+    fn evict_oldest(&mut self) {
+        if self.by_pid.len() <= PEER_CONTACT_CAPACITY {
+            return;
+        }
+        let oldest = self
+            .by_pid
+            .iter()
+            .min_by_key(|(_, seen)| seen.touched)
+            .map(|(pid, _)| *pid);
+        if let Some(pid) = oldest {
+            self.by_pid.remove(&pid);
+        }
     }
 }
 
@@ -673,7 +997,7 @@ pub(crate) fn silent_dogs(infos: &[ProcessInfo], refusals: &DogRefusals) -> Vec<
 /// [`DogRefusals`]'s is: the map holds dog names and instants, and a dog's
 /// name is a `[dog.<name>]` KEY rather than one of its values.
 #[derive(Debug, Default)]
-struct SilentDogs {
+pub(crate) struct SilentDogs {
     /// One instant per dog currently silent. A name absent from the map is a
     /// dog that was talking, stopped, or deleted at the last look.
     first_seen: BTreeMap<String, Instant>,
@@ -711,25 +1035,92 @@ impl SilentDogs {
 ///
 /// Returns what it acted on, which is what its tests assert against; the
 /// loop that calls it discards the answer.
-async fn check_silent_dogs(
+pub(crate) async fn check_silent_dogs(
     supervisor: &SupervisorHandle,
     refusals: &DogRefusals,
+    contacts: &PeerContacts,
+    events: &Bus,
     seen: &mut SilentDogs,
     now: Instant,
 ) -> Vec<(String, Refusal)> {
     // A stopped engine has no dogs left to wait on. `seen` is left untouched
     // rather than cleared: a look that could not see the flock has learned
     // nothing about it, and must not hand every dog a fresh budget.
+    // Nothing is judged while attribution is still maturing. A verdict
+    // written now would read a cold map, and the stale rung is spent once:
+    // `silent_dogs` drops a stale dog from every later look, so a wrong
+    // answer here is the LAST answer. `seen` is left untouched for the same
+    // reason the stopped-engine arm above leaves it: a look that could not
+    // judge has learned nothing, and each dog's budget starts when this
+    // shepherd could actually observe it. See `PEER_CONTACT_WARMUP`.
+    if contacts.is_warming() {
+        return Vec::new();
+    }
     let Ok(infos) = supervisor.list_checked().await else {
         return Vec::new();
     };
     let silent = silent_dogs(&infos, refusals);
     let mut acted = Vec::new();
     for name in seen.due(&silent, now) {
-        let verdict = record_silent_dog(&name, refusals, supervisor).await;
+        // Read off the SAME listing the silence was judged from, so the pid
+        // a message names is the process that was silent rather than
+        // whatever holds the name by the time the message is written.
+        let info = infos.iter().find(|info| info.name == name);
+        let evidence = Silence::of(info.and_then(|info| info.pid), contacts);
+        let verdict = record_silent_dog(&name, info, evidence, refusals, events, supervisor).await;
         acted.push((name, verdict));
     }
     acted
+}
+
+/// What this shepherd actually observed about a silent dog's connections —
+/// the difference between two silences that look identical in a listing and
+/// have opposite fixes.
+///
+/// Built from two facts and no inference: the pid the supervisor spawned the
+/// dog as, and what [`PeerContacts`] has seen arrive from that pid. Every
+/// arm below is something the daemon watched happen; there is deliberately
+/// no arm for a cause it merely suspects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Silence {
+    /// Nothing has ever connected from the dog's pid. The dog is not
+    /// reaching this shepherd's socket at all.
+    Unreachable {
+        /// The pid nothing has arrived from.
+        pid: u32,
+    },
+    /// Connections HAVE arrived from the dog's pid, and not one of them
+    /// named a dog. The dog reaches this shepherd and may be serving every
+    /// request it is asked; what it does not do is say who it is.
+    Anonymous {
+        /// The pid those connections came from.
+        pid: u32,
+    },
+    /// There is no pid to attribute by, so neither of the above can be
+    /// ruled in or out. Windows, a unix whose OS declines to name a peer's
+    /// pid, a dog whose process had already gone by the time the listing was
+    /// read, or an entry aged out of a full [`PeerContacts`].
+    Unattributed,
+}
+
+impl Silence {
+    /// What `pid`'s connection history says, if anything.
+    ///
+    /// [`Contact::Named`] lands in [`Self::Unattributed`] rather than in an
+    /// arm of its own, and that is the honest answer rather than a lazy one.
+    /// A pid that named a dog and is nonetheless being judged silent is a
+    /// contradiction: naming a dog is what sets `handshook`, and
+    /// [`silent_dogs`] filters a handshook dog out before it can be seen
+    /// quiet. The ways to reach it are pid reuse and a race with an entry
+    /// being evicted — both of which mean the attribution is not to be
+    /// trusted for THIS dog, which is precisely what `Unattributed` says.
+    fn of(pid: Option<u32>, contacts: &PeerContacts) -> Self {
+        match (pid, contacts.from_pid(pid)) {
+            (Some(pid), Contact::None) => Self::Unreachable { pid },
+            (Some(pid), Contact::Anonymous) => Self::Anonymous { pid },
+            _ => Self::Unattributed,
+        }
+    }
 }
 
 /// Enters a dog that has gone quiet into G8's ladder — the same ladder a
@@ -742,10 +1133,18 @@ async fn check_silent_dogs(
 /// anonymous and the ladder is never entered. G8's one restart therefore
 /// reached only dogs new enough to name themselves, which is the exact
 /// complement of the dogs that need it. The set difference this rides on
-/// needs no cooperation from the client — and no peer credentials, which
-/// would have meant `SO_PEERCRED` on unix against
-/// `GetNamedPipeClientProcessId` on Windows, re-forking a transport phase 15
-/// deliberately unified into `shep_core::transport`.
+/// needs no cooperation from the client.
+///
+/// **Peer credentials are read, but only to EXPLAIN the silence — never to
+/// detect it.** Which dogs are silent is still the set difference above, and
+/// still works identically on Windows, where there is no post-accept peer
+/// check at all. What `SO_PEERCRED` (and `getpeereid`'s macOS sibling) buys
+/// is the `evidence` parameter: whether anything has ever connected from
+/// this dog's pid, and whether any of it named a dog. That turns one verdict
+/// asserting a cause into three saying what was seen — see [`stale_verdict`]
+/// for the incident that makes the difference worth a syscall. Where the
+/// platform will not name a pid, [`Silence::Unattributed`] says so instead
+/// of guessing.
 ///
 /// **The tradeoff, named where the decision is.** A dog that is merely SLOW
 /// to connect is restarted once, for nothing. That is bounded by the ladder
@@ -758,17 +1157,33 @@ async fn check_silent_dogs(
 /// its own log without end.
 async fn record_silent_dog(
     name: &str,
+    info: Option<&ProcessInfo>,
+    evidence: Silence,
     refusals: &DogRefusals,
+    events: &Bus,
     supervisor: &SupervisorHandle,
 ) -> Refusal {
     let verdict = refusals.refused(name);
     match verdict {
         Refusal::Restart => {
+            let seen = first_rung_evidence(evidence);
             tracing::warn!(
                 dog = %name,
                 silent_for_secs = DOG_SILENCE_BUDGET.as_secs(),
+                evidence = %seen,
                 "a dog has been running without ever answering this shepherd; restarting it once from the binary on disk"
             );
+            if let Some(info) = info {
+                narrate(
+                    events,
+                    info,
+                    &format!(
+                        "this dog has been running for {}s without ever answering this shepherd: {seen}. Restarting it once from the binary on disk",
+                        DOG_SILENCE_BUDGET.as_secs()
+                    ),
+                )
+                .await;
+            }
             // Awaited rather than spawned, which is the one difference from
             // `record_refused_dog`: that caller is a connection handler
             // holding a socket, and this one is a background loop with
@@ -777,10 +1192,16 @@ async fn record_silent_dog(
             // judged mid-restart.
             restart_refused_dog(supervisor, name).await;
         }
-        Refusal::Stale => tracing::error!(
-            dog = %name,
-            "a dog restarted for never answering this shepherd has still not answered it: the binary on disk cannot talk to this shep either, so this dog is stale and will not be restarted again. Read its own log with `shep bleats`, then rebuild or reinstall it and restart it"
-        ),
+        Refusal::Stale => {
+            let verdict = stale_verdict(name, evidence);
+            tracing::error!(dog = %name, "{verdict}");
+            // Into the dog's OWN log as well, because that is the file the
+            // verdict tells the operator to read. Before this it could not
+            // hold a word of the reason it was being read for.
+            if let Some(info) = info {
+                narrate(events, info, &verdict).await;
+            }
+        }
         // Unreachable through this path, because `silent_dogs` filters a
         // stale dog out before it can be seen quiet again. Kept as a real
         // arm anyway: it is the honest thing to do with a rung the ladder
@@ -792,6 +1213,87 @@ async fn record_silent_dog(
         ),
     }
     verdict
+}
+
+/// The one clause the first rung adds about what this shepherd has seen.
+///
+/// Short, because the restart it accompanies happens either way and the
+/// operator has nothing to decide yet. It is here so that the `journalctl`
+/// record of the first rung already carries the fact the second rung's
+/// verdict will turn on — an operator reading backwards after the fact
+/// should not have to take the verdict's word for it.
+fn first_rung_evidence(evidence: Silence) -> String {
+    match evidence {
+        Silence::Unreachable { pid } => {
+            format!("nothing has connected to this shepherd from pid {pid}")
+        }
+        Silence::Anonymous { pid } => format!(
+            "pid {pid} has connected to this shepherd without naming a dog, so the restart is unlikely to help"
+        ),
+        Silence::Unattributed => {
+            "this shepherd cannot tell which process opened a connection".to_string()
+        }
+    }
+}
+
+/// The stale verdict, written from what this shepherd OBSERVED.
+///
+/// # The bug this replaces
+///
+/// One message served all three cases and asserted the harshest of them:
+/// *the binary on disk cannot talk to this shep either, so this dog is
+/// stale — rebuild or reinstall it*. That is earned only when the dog never
+/// reached the socket. A real operator was given it about a dog that was
+/// connected the whole time and correctly serving `DogConfig` and
+/// `ListFlock`, whose only defect was a `Hello` with no `dog_name` in it,
+/// and spent two days reinstalling a binary that reinstalling could never
+/// have fixed.
+///
+/// So each arm below says what was seen, and then the step that actually
+/// follows from it. The sentence *the binary on disk cannot talk to this
+/// shep either* appears on exactly one path, and it is the path where this
+/// shepherd watched nothing arrive.
+///
+/// # Why every arm ends in a command
+///
+/// The reader is an operator mid-incident with no agent helping them and no
+/// reason to know what a handshake is. A verdict that names a cause and
+/// stops leaves them to invent the next step, which is how the original
+/// message turned into two days of reinstalling.
+///
+/// [`Refusal::Stale`]'s sibling ladder in [`record_refused_dog`] is
+/// deliberately NOT softened to match. There the daemon watched a handshake
+/// be refused on protocol skew and then watched the restarted binary be
+/// refused the same way, so *rebuild or reinstall it against this shep* is
+/// a conclusion from evidence rather than a guess.
+fn stale_verdict(name: &str, evidence: Silence) -> String {
+    let seen = "a dog restarted for never answering this shepherd has still not answered it";
+    match evidence {
+        Silence::Unreachable { pid } => format!(
+            "{seen}, and nothing has ever connected to this shepherd's socket from its process (pid {pid}): \
+             the binary on disk cannot reach this shep either, so this dog is stale and will not be \
+             restarted again. Read its own log with `shep bleats {name}` for what it says about \
+             connecting, then rebuild or reinstall it and run `shep restart {name}`"
+        ),
+        Silence::Anonymous { pid } => format!(
+            "{seen}, but its process (pid {pid}) HAS connected to this shepherd — every time without \
+             naming a dog in its handshake, which is the only thing this shepherd waits for. The dog \
+             is reaching shep and may be serving every request it is asked; reinstalling the same \
+             build will NOT change that. It is built against shep-client older than 0.1.23, or it \
+             connects with `Client::connect` instead of `ReconnectingClient::connect_as_dog`. Rebuild \
+             it against shep-client 0.1.23 or newer, then run `shep restart {name}`. It will not be \
+             restarted again in the meantime, and it goes on running"
+        ),
+        Silence::Unattributed => format!(
+            "{seen}, and this shepherd could not tell which process opened its connections, so it \
+             cannot say which of two things is wrong. Either the dog is not reaching the socket at \
+             all — rebuild or reinstall it — or it is reaching it and never names itself in the \
+             handshake, which means a build against shep-client older than 0.1.23 and which \
+             reinstalling the same build will not fix. Run `shep bleats {name}` to tell them apart: \
+             a dog that cannot reach the socket says so in its own log, and one that is connected \
+             and merely anonymous does not. It will not be restarted again"
+        ),
+    }
 }
 
 /// Watches for dogs that are running and have never once spoken to this
@@ -815,6 +1317,8 @@ async fn record_silent_dog(
 pub fn spawn_silent_dog_watch(
     supervisor: SupervisorHandle,
     refusals: DogRefusals,
+    contacts: PeerContacts,
+    events: Bus,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(DOG_SILENCE_POLL);
@@ -825,9 +1329,183 @@ pub fn spawn_silent_dog_watch(
         let mut seen = SilentDogs::default();
         loop {
             let now = ticks.tick().await;
-            check_silent_dogs(&supervisor, &refusals, &mut seen, now).await;
+            check_silent_dogs(&supervisor, &refusals, &contacts, &events, &mut seen, now).await;
         }
     })
+}
+
+/// The marker every line shep writes into a dog's own log begins with, once
+/// the timestamp is past.
+///
+/// A dog's log is the dog's voice, and an operator reading it is entitled to
+/// assume every line came from the process they started. Shep now writes
+/// into that file too, so the file has to say which lines are whose.
+///
+/// Short and bracketed because it sits at the head of a line already
+/// carrying a 30-character timestamp, and an operator scanning a long file
+/// has to be able to pick these out without reading them. A dog that emits
+/// `[shep]` at the start of a line of its own is impersonating the shepherd
+/// in its own log, which is its problem rather than something this can
+/// defend against.
+const SHEP_VOICE: &str = "[shep]";
+
+/// Writes one line of shep's own narration into `info`'s log, and publishes
+/// it to whoever is following that log live.
+///
+/// # Why this exists
+///
+/// Every message about the incident this subsystem was rebuilt for went to
+/// `shepd.err.log`. The dog's own log — the file shep's own error message
+/// told the operator to read — could not contain a word of it. So `shep
+/// bleats log-rotate` showed a dog repeating itself into an empty room, and
+/// nothing about why shep had given up on it.
+///
+/// # Why it writes the file directly rather than through the pump
+///
+/// The pump owns a buffered handle and forwards what it writes to the bus,
+/// so routing narration through it would put both halves in one place. It
+/// is not used, for one reason that decides it: the pump ends when its
+/// sheep's streams reach EOF, so the last thing there is to say about a dog
+/// — how it exited — arrives after the only thing that could write it is
+/// gone. A narration that silently vanished for exactly the events worth
+/// narrating would be worse than none.
+///
+/// Writing directly is safe because of the property [`open_append`]
+/// documents at length: `O_APPEND` makes every write seek to end atomically,
+/// which is what already lets several instances share one log file. The
+/// whole line is assembled and written in one call for that reason. It also
+/// inherits `O_NOFOLLOW` and the ancestry check from that same function, so
+/// narration cannot be redirected through a planted symlink any more than a
+/// sheep's own output can.
+///
+/// The cost is ordering, and it is named rather than hidden: a narration
+/// line can land ahead of dog output that was appended earlier and is still
+/// in the pump's buffer, which is bounded by `IDLE_FLUSH` at 50 ms. The
+/// timestamps say which came first even when the file order does not.
+///
+/// # The live half
+///
+/// [`Bus::publish_log`] is the same call a sheep's own line takes to reach
+/// `shep bleats --follow`, so a follower sees the narration interleaved
+/// with the dog's output in arrival order, marked exactly as the file marks
+/// it. It carries the marker but not the timestamp: the stamp is a property
+/// of the file (see `LOG_TIMESTAMP_FORMAT`), and a follower is watching the
+/// line arrive.
+///
+/// A dog with no `err_file` — a peer daemon predating the field, in a
+/// listing this daemon did not resolve — still gets the live half. Nothing
+/// is logged about the missing path: it is not a failure, it is a listing
+/// that did not carry one.
+pub(crate) async fn narrate(events: &Bus, info: &ProcessInfo, message: &str) {
+    let line = format!("{SHEP_VOICE} {message}");
+    if let Some(path) = &info.err_file {
+        let mut written = String::with_capacity(line.len() + 32);
+        shep_core::logstamp::stamp_into(&mut written);
+        written.push_str(&line);
+        written.push('\n');
+        // A failed open is already logged by `open_append`, with the path
+        // and the OS error; there is nothing this could add. A failed write
+        // is not, so it is reported here — and neither is propagated,
+        // because a log shep cannot write to must not change what shep does
+        // about the dog.
+        if let Ok(mut file) = crate::tokio_runner::open_append(Path::new(path)).await {
+            use tokio::io::AsyncWriteExt as _;
+            // Taken AFTER the open, deliberately. The pump waits on this lock
+            // for every line it writes, so holding it across a filesystem
+            // open would stall a sheep's output for as long as the open took.
+            // Held across the write and the flush together, which is the
+            // whole record: see `crate::tokio_runner::record_lock` for what
+            // interleaves without it.
+            let _record = crate::tokio_runner::record_lock(Path::new(path))
+                .lock_owned()
+                .await;
+            // The flush is not optional and not belt-and-braces.
+            // `tokio::fs::File` copies into its own buffer and hands the real
+            // `write(2)` to the blocking pool, so `write_all` returning means
+            // the bytes were ACCEPTED, not that they reached the file — and
+            // the type does not flush on drop, which is stated in tokio's own
+            // docs. Without this, the line is written on a best-effort basis
+            // and is lost outright often enough for a test reading the file
+            // straight afterwards to catch it. That would be the original
+            // defect all over again: shep with something to say and an empty
+            // log where it should have said it.
+            let written = async {
+                file.write_all(written.as_bytes()).await?;
+                file.flush().await
+            }
+            .await;
+            if let Err(error) = written {
+                tracing::warn!(
+                    dog = %info.name,
+                    %error,
+                    "shep's own narration did not reach this dog's log"
+                );
+            }
+        }
+    }
+    events.publish_log(BusEvent::LogErr { id: info.id, line });
+}
+
+/// `narrate`, for a caller that knows a dog's NAME and not its listing.
+///
+/// Spawned rather than awaited, and that is the reason this is a second
+/// function rather than a parameter. Both callers are connection handlers
+/// mid-handshake: one is about to send an ack the dog is waiting on, and
+/// the other has a refusal already queued behind it. Neither may be held up
+/// by a listing round trip and a file open, and neither has anything to do
+/// with the answer.
+///
+/// A name that does not resolve to a dog is silently nothing. By the time
+/// this runs the dog may have been stopped, deleted, or replaced by a sheep
+/// of the same name; narrating into whatever holds the name now would be a
+/// worse answer than saying nothing.
+pub(crate) fn narrate_by_name(
+    supervisor: &SupervisorHandle,
+    events: &Bus,
+    name: &str,
+    message: String,
+) {
+    let supervisor = supervisor.clone();
+    let events = events.clone();
+    let name = name.to_string();
+    tokio::spawn(async move {
+        let Ok(infos) = supervisor.list_checked().await else {
+            return;
+        };
+        if let Some(info) = infos
+            .iter()
+            .find(|info| info.name == name && info.dog.is_some())
+        {
+            narrate(&events, info, &message).await;
+        }
+    });
+}
+
+/// How a dog's process stopped existing, in the plainest words there are.
+///
+/// A signal number rather than a name, which is the rule
+/// [`ExitInfo::signal`](shep_core::protocol::ExitInfo::signal) states for
+/// itself: the number is what the OS reported, and shep-core deliberately
+/// carries no table to turn it into `SIGKILL`. The daemon is an OS-aware
+/// layer and could, but a dog's log is read next to `journalctl`, and one
+/// spelling in both places is worth more than a nicer one in this.
+fn exit_words(info: &ProcessInfo) -> String {
+    match info.last_exit {
+        Some(exit) => match (exit.code, exit.signal) {
+            (Some(code), _) => format!("this dog's process exited with code {code}"),
+            (None, Some(signal)) => {
+                format!("this dog's process was killed by signal {signal}")
+            }
+            (None, None) => {
+                "this dog's process stopped, and the OS reported neither an exit code nor a signal"
+                    .to_string()
+            }
+        },
+        // Reachable rather than defensive: `last_exit` is `None` when the
+        // peer that built this listing predates the field, and a successor
+        // reading a carried entry can see one.
+        None => "this dog's process stopped, and this shepherd has no record of how".to_string(),
+    }
 }
 
 /// Watches the bus and records, locally, every enabled dog that exhausts
@@ -837,6 +1515,14 @@ pub fn spawn_silent_dog_watch(
 /// sinks and no webhook code, by design. What it can guarantee is a local
 /// trail, so an operator reading `shep barks` after an outage finds the
 /// moment alerting stopped rather than a gap they have to infer.
+///
+/// It also writes a dog's own spawn and exit into that dog's log, in shep's
+/// voice (see `narrate`). Read from the bus rather than from the two
+/// places that cause them, and for the same reason the bark record above is:
+/// a `Start` on the bus is a spawn that really happened, while a call site
+/// answering `Ok` covers `start_dog`'s idempotent no-op as well, and the
+/// pump that could have carried an exit is already ending when the exit
+/// fires.
 ///
 /// A bus WATCHER rather than a branch inside the supervisor, and the
 /// distinction is the phase's own tripwire: this answers *who should see
@@ -850,27 +1536,50 @@ pub fn spawn_silent_dog_watch(
 /// than dependent on sender count.
 pub fn spawn_dog_watch(
     mut events: broadcast::Receiver<SharedEvent>,
+    publish: Bus,
     barks: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match events.recv().await {
-                // Only a DOG's Errored is this watcher's business. A sheep's
+                // Only a DOG's Errored earns a bark record. A sheep's
                 // Errored is bark's job — bark writes those records over its
                 // own client connection — and duplicating that write here
                 // would leave one event with two authors in one file. Exit
-                // is excluded too: it fires on every restart a dog survives,
-                // and a `barks.jsonl` full of those is one an operator stops
-                // reading.
+                // is excluded from the BARKS file too: it fires on every
+                // restart a dog survives, and a `barks.jsonl` full of those
+                // is one an operator stops reading. It is not excluded from
+                // the dog's own log, which is where an operator goes looking
+                // for exactly that.
                 Ok(event) => {
-                    if let BusEvent::Process {
-                        event: ProcessEventKind::Errored,
-                        info,
-                        ..
+                    let BusEvent::Process {
+                        event: kind, info, ..
                     } = &*event
-                        && info.dog.is_some()
-                    {
-                        record_dog_errored(&barks, &info.name, info.restarts);
+                    else {
+                        continue;
+                    };
+                    if info.dog.is_none() {
+                        continue;
+                    }
+                    match kind {
+                        ProcessEventKind::Errored => {
+                            record_dog_errored(&barks, &info.name, info.restarts);
+                        }
+                        ProcessEventKind::Start => {
+                            let pid = info
+                                .pid
+                                .map_or_else(|| "unknown".to_string(), |pid| pid.to_string());
+                            narrate(
+                                &publish,
+                                info,
+                                &format!("shep started this dog; its process is pid {pid}"),
+                            )
+                            .await;
+                        }
+                        ProcessEventKind::Exit => {
+                            narrate(&publish, info, &exit_words(info)).await;
+                        }
+                        _ => {}
                     }
                 }
                 // The bus DROPS events for a lagging subscriber rather than
@@ -1170,7 +1879,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
         let (events, rx) = crate::bus::test_bus(16);
-        let watch = spawn_dog_watch(rx, barks_path.clone());
+        let watch = spawn_dog_watch(rx, events.clone(), barks_path.clone());
 
         events.send(errored_event("web", None)).unwrap();
         events
@@ -1197,7 +1906,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
         let (events, rx) = crate::bus::test_bus(16);
-        let watch = spawn_dog_watch(rx, barks_path.clone());
+        let watch = spawn_dog_watch(rx, events.clone(), barks_path.clone());
 
         events
             .send(process_event(
@@ -1394,12 +2103,19 @@ mod tests {
             ProcScript::never_exits(),
         ]);
         start_test_dog(&h.ctx, "metrics").await;
+        // Past the warm-up: the ladder judges nothing while attribution is
+        // still maturing, and this case is about the rungs rather than the
+        // gate. `a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // walks the boundary itself.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
         let refusals = &h.ctx.dog_refusals;
+        let contacts = &h.ctx.peer_contacts;
+        let events = &h.ctx.events;
         let mut seen = SilentDogs::default();
         let t0 = Instant::now();
 
         assert!(
-            check_silent_dogs(&h.ctx.supervisor, refusals, &mut seen, t0)
+            check_silent_dogs(&h.ctx.supervisor, refusals, contacts, events, &mut seen, t0)
                 .await
                 .is_empty(),
             "a dog seen quiet for the first time has not yet been quiet for any length of time"
@@ -1409,6 +2125,8 @@ mod tests {
             check_silent_dogs(
                 &h.ctx.supervisor,
                 refusals,
+                contacts,
+                events,
                 &mut seen,
                 t0 + DOG_SILENCE_BUDGET
             )
@@ -1426,12 +2144,14 @@ mod tests {
             check_silent_dogs(
                 &h.ctx.supervisor,
                 refusals,
+                contacts,
+                events,
                 &mut seen,
                 t0 + 2 * DOG_SILENCE_BUDGET
             )
             .await,
             vec![("metrics".to_string(), Refusal::Stale)],
-            "the restart ran and the dog still has not spoken: the binary on disk cannot talk to this shep either"
+            "the restart ran and the dog still has not spoken, so the ladder ends here"
         );
         assert_eq!(refusals.stale(), vec!["metrics".to_string()]);
 
@@ -1439,6 +2159,8 @@ mod tests {
             check_silent_dogs(
                 &h.ctx.supervisor,
                 refusals,
+                contacts,
+                events,
                 &mut seen,
                 t0 + 3 * DOG_SILENCE_BUDGET
             )
@@ -1459,6 +2181,8 @@ mod tests {
         let h = crate::testing::harness(vec![ProcScript::never_exits()]);
         start_test_dog(&h.ctx, "metrics").await;
         let refusals = &h.ctx.dog_refusals;
+        let contacts = &h.ctx.peer_contacts;
+        let events = &h.ctx.events;
         refusals.handshook("metrics");
         let mut seen = SilentDogs::default();
         let t0 = Instant::now();
@@ -1468,6 +2192,8 @@ mod tests {
                 check_silent_dogs(
                     &h.ctx.supervisor,
                     refusals,
+                    contacts,
+                    events,
                     &mut seen,
                     t0 + elapsed * DOG_SILENCE_BUDGET
                 )
@@ -1491,6 +2217,8 @@ mod tests {
         let h = crate::testing::harness(vec![ProcScript::never_exits()]);
         start_test_dog(&h.ctx, "metrics").await;
         let refusals = &h.ctx.dog_refusals;
+        let contacts = &h.ctx.peer_contacts;
+        let events = &h.ctx.events;
         refusals.refused("metrics");
         refusals.refused("metrics");
         assert_eq!(refusals.stale(), vec!["metrics".to_string()]);
@@ -1502,6 +2230,8 @@ mod tests {
                 check_silent_dogs(
                     &h.ctx.supervisor,
                     refusals,
+                    contacts,
+                    events,
                     &mut seen,
                     t0 + elapsed * DOG_SILENCE_BUDGET
                 )
@@ -1526,7 +2256,14 @@ mod tests {
     async fn asking_repeatedly_does_not_advance_the_ladder() {
         let h = crate::testing::harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         start_test_dog(&h.ctx, "metrics").await;
+        // Past the warm-up: the ladder judges nothing while attribution is
+        // still maturing, and this case is about the rungs rather than the
+        // gate. `a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // walks the boundary itself.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
         let refusals = &h.ctx.dog_refusals;
+        let contacts = &h.ctx.peer_contacts;
+        let events = &h.ctx.events;
         let mut seen = SilentDogs::default();
         let t0 = Instant::now();
 
@@ -1535,6 +2272,8 @@ mod tests {
                 check_silent_dogs(
                     &h.ctx.supervisor,
                     refusals,
+                    contacts,
+                    events,
                     &mut seen,
                     t0 + (DOG_SILENCE_BUDGET / 20) * look
                 )
@@ -1549,6 +2288,8 @@ mod tests {
             check_silent_dogs(
                 &h.ctx.supervisor,
                 refusals,
+                contacts,
+                events,
                 &mut seen,
                 t0 + DOG_SILENCE_BUDGET
             )
@@ -1572,13 +2313,110 @@ mod tests {
     /// `tokio::time::advance` wakes a sleeper whose deadline has elapsed,
     /// it does not itself drive the scheduler through everything that
     /// sleeper then does.
+    /// Fails if the warm-up swallows the one verdict it exists to protect.
+    ///
+    /// The regression this exists for: `PEER_CONTACT_WARMUP` was three
+    /// budgets while the ladder kept running, so the stale rung was spent at
+    /// two budgets against a map that was still cold. `Silence::of` answered
+    /// `Unattributed`, `silent_dogs` then dropped the dog because it was
+    /// stale, and no later look ever reclassified it. A dog that genuinely
+    /// never reached the socket could no longer be told to rebuild, which is
+    /// the exact advice this ladder exists to earn.
+    ///
+    /// A unit test over `from_pid` and `stale_verdict` passed throughout,
+    /// because both were right in isolation. That is the same shape as the
+    /// bug this whole branch is about, so this case walks the real watch
+    /// across the real boundary instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up() {
+        let h = crate::testing::harness(vec![
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+            ProcScript::never_exits(),
+        ]);
+        start_test_dog(&h.ctx, "metrics").await;
+        let refusals = h.ctx.dog_refusals.clone();
+        let contacts = h.ctx.peer_contacts.clone();
+        assert!(contacts.is_warming(), "a fresh map starts cold");
+
+        let watch = spawn_silent_dog_watch(
+            h.ctx.supervisor.clone(),
+            refusals.clone(),
+            contacts.clone(),
+            h.ctx.events.clone(),
+        );
+        tokio::task::yield_now().await;
+
+        // Nothing may be judged while the map is cold, however long the dog
+        // has been quiet. Walking a whole budget with the watch running is
+        // what proves the gate holds rather than merely exists.
+        let ticks_in_a_budget = (DOG_SILENCE_BUDGET.as_nanos() / DOG_SILENCE_POLL.as_nanos())
+            .try_into()
+            .expect("a silence budget of a few seconds fits in a u32 tick count");
+        for _ in 0..ticks_in_a_budget {
+            tokio::time::advance(DOG_SILENCE_POLL).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            refusals.stale().is_empty() && refusals.restarting().is_empty(),
+            "a cold map must judge nothing at all"
+        );
+
+        // Now warm, and the ladder gets its two rungs: a restart, then the
+        // stale verdict, this time read off a map that has been listening.
+        for _ in 0..(ticks_in_a_budget * 6) {
+            tokio::time::advance(DOG_SILENCE_POLL).await;
+            // A rung awaits a real restart through the supervisor, so the
+            // watch needs more than one yield per step to get through it.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        for _ in 0..512 {
+            if refusals.stale().contains(&"metrics".to_string()) {
+                break;
+            }
+            tokio::time::advance(DOG_SILENCE_POLL).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            refusals.stale().contains(&"metrics".to_string()),
+            "a dog nothing ever connected from must still reach the stale rung"
+        );
+        let info = h
+            .ctx
+            .supervisor
+            .list()
+            .await
+            .into_iter()
+            .find(|info| info.name == "metrics")
+            .expect("the dog fixture is listed");
+        let verdict = stale_verdict("metrics", Silence::of(info.pid, &contacts));
+        assert!(
+            verdict.contains("cannot reach this shep"),
+            "the earned rebuild advice must survive the warm-up: {verdict}"
+        );
+        watch.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_watcher_restarts_a_silent_dog_after_one_budget_of_paused_time() {
         let h = crate::testing::harness(vec![ProcScript::never_exits(), ProcScript::never_exits()]);
         start_test_dog(&h.ctx, "metrics").await;
+        // Past the warm-up: the ladder judges nothing while attribution is
+        // still maturing, and this case is about the rungs rather than the
+        // gate. `a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up`
+        // walks the boundary itself.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
         let refusals = h.ctx.dog_refusals.clone();
 
-        let watch = spawn_silent_dog_watch(h.ctx.supervisor.clone(), refusals.clone());
+        let watch = spawn_silent_dog_watch(
+            h.ctx.supervisor.clone(),
+            refusals.clone(),
+            h.ctx.peer_contacts.clone(),
+            h.ctx.events.clone(),
+        );
 
         // The watcher's own interval fires an immediate first tick, which
         // records the dog as seen-silent-since-now the same way every
@@ -1621,5 +2459,319 @@ mod tests {
         );
 
         watch.abort();
+    }
+
+    /// Fails if a pid nothing has ever connected from cannot be told apart
+    /// from one that has connected and said nothing useful.
+    ///
+    /// The whole diagnosis rests on that difference: one means the dog is
+    /// not reaching the socket, the other means it is reaching it and not
+    /// naming itself, and they have opposite fixes.
+    #[tokio::test(start_paused = true)]
+    async fn a_pid_that_never_called_is_told_apart_from_one_that_called_anonymously() {
+        let contacts = PeerContacts::new();
+
+        // Past the warm-up first: on a map this new, absence is not yet a
+        // finding, and `a_cold_map_does_not_claim_a_pid_never_called` is the
+        // case that pins that. Here the subject is the None/Anonymous/Named
+        // distinction, so the clock is moved out of the way.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
+
+        assert_eq!(
+            contacts.from_pid(Some(4242)),
+            Contact::None,
+            "nothing has connected from this pid, and that is a finding"
+        );
+        assert_eq!(
+            contacts.from_pid(None),
+            Contact::Unknown,
+            "no pid to ask about is not the same as a pid nothing came from"
+        );
+
+        contacts.connected(4242);
+        assert_eq!(
+            contacts.from_pid(Some(4242)),
+            Contact::Anonymous,
+            "a connection that named no dog is exactly the case the operator lost two days to"
+        );
+
+        contacts.named_a_dog(4242);
+        assert_eq!(contacts.from_pid(Some(4242)), Contact::Named);
+    }
+
+    /// A successor's map starts empty at every `execve`, so for its first
+    /// few seconds every dog carried across the handover is absent from it.
+    /// Reading that absence as "this dog never called" put the reinstall
+    /// verdict on a dog that was fine, which is the message this ladder
+    /// exists to stop shep guessing. `crate::boot`'s own comment already
+    /// claimed the property this pins.
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_map_does_not_claim_a_pid_never_called() {
+        let contacts = PeerContacts::new();
+
+        assert_eq!(
+            contacts.from_pid(Some(4242)),
+            Contact::Unknown,
+            "a map this new was not listening long enough for an absence to mean anything"
+        );
+        assert_eq!(
+            stale_verdict("metrics", Silence::of(Some(4242), &contacts)),
+            stale_verdict("metrics", Silence::Unattributed),
+            "an unwarmed map must reach the arm that names both candidates"
+        );
+
+        // One tick short of the warm-up is still too new.
+        tokio::time::advance(PEER_CONTACT_WARMUP - Duration::from_millis(1)).await;
+        assert_eq!(contacts.from_pid(Some(4242)), Contact::Unknown);
+
+        // And past it the absence is earned, so the reinstall advice comes
+        // back. Deleting a true message would be its own defect.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert_eq!(
+            contacts.from_pid(Some(4242)),
+            Contact::None,
+            "shep was listening for a whole budget past the dog's silence"
+        );
+        assert!(
+            stale_verdict("metrics", Silence::of(Some(4242), &contacts))
+                .contains("cannot reach this shep"),
+            "the earned reinstall advice must survive"
+        );
+    }
+
+    /// Fails if a later anonymous connection unsays an earlier named one.
+    ///
+    /// The question is whether this process has EVER named itself. A dog
+    /// that does so once is not the dog this diagnosis is about, and a
+    /// reconnect that happened to be read before its `Hello` must not move
+    /// it back into the pile.
+    #[test]
+    fn a_pid_that_has_named_a_dog_goes_on_having_named_one() {
+        let contacts = PeerContacts::new();
+        contacts.named_a_dog(7);
+        contacts.connected(7);
+        assert_eq!(contacts.from_pid(Some(7)), Contact::Named);
+    }
+
+    /// Fails if a full map forgets a pid that is still calling rather than
+    /// the one that stopped.
+    ///
+    /// The bound exists so this state cannot grow without limit, and the
+    /// eviction rule exists so the bound cannot cost the answer: a dog
+    /// reconnects, so it is touched, so it survives any amount of churn
+    /// from short-lived `shep` invocations.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_map_forgets_the_pid_that_stopped_calling() {
+        let contacts = PeerContacts::new();
+        // An evicted entry reads as `None` only once the map is old enough
+        // for an absence to be a finding at all. The subject here is
+        // eviction, so the warm-up is moved out of the way.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
+        let dog = 1;
+        contacts.named_a_dog(dog);
+
+        // Every stranger arrives after the dog's first call, and the dog
+        // calls again partway through — which is what a live dog does.
+        for pid in 2..=u32::try_from(PEER_CONTACT_CAPACITY).unwrap() {
+            contacts.connected(pid);
+            if pid % 8 == 0 {
+                contacts.connected(dog);
+            }
+        }
+        let stranger = 2;
+        for pid in 1_000_000..1_000_100 {
+            contacts.connected(pid);
+        }
+
+        assert_eq!(
+            contacts.from_pid(Some(dog)),
+            Contact::Named,
+            "a peer that keeps calling must outlive a hundred that called once"
+        );
+        assert_eq!(
+            contacts.from_pid(Some(stranger)),
+            Contact::None,
+            "the oldest untouched entry is the one the bound spends"
+        );
+        assert!(
+            contacts.lock().by_pid.len() <= PEER_CONTACT_CAPACITY,
+            "the map must not grow past its bound"
+        );
+    }
+
+    /// Fails if the stale verdict asserts a cause this shepherd did not
+    /// watch happen.
+    ///
+    /// The regression this exists for, in full: one message served all three
+    /// cases and claimed *the binary on disk cannot talk to this shep
+    /// either, so rebuild or reinstall it*. A dog that was connected the
+    /// whole time and serving every request was reported that way, and its
+    /// operator spent two days reinstalling a binary that reinstalling could
+    /// never have fixed.
+    ///
+    /// So the assertion is not that the wording is nice. It is that the
+    /// stale-binary claim appears on the ONE path where nothing was ever
+    /// seen to arrive, and that the path it cost two days on says the
+    /// opposite out loud.
+    #[test]
+    fn the_stale_verdict_claims_only_what_this_shepherd_watched() {
+        let unreachable = stale_verdict("metrics", Silence::Unreachable { pid: 900 });
+        assert!(
+            unreachable.contains("nothing has ever connected"),
+            "the reinstall advice has to be earned by an observation: {unreachable}"
+        );
+        assert!(unreachable.contains("pid 900"), "{unreachable}");
+        assert!(
+            unreachable.contains("rebuild or reinstall it"),
+            "a dog that never reached the socket is the case reinstalling does fix: {unreachable}"
+        );
+
+        let anonymous = stale_verdict("log-rotate", Silence::Anonymous { pid: 901 });
+        assert!(
+            !anonymous.contains("cannot reach this shep"),
+            "this dog reached shep; claiming otherwise is the whole defect: {anonymous}"
+        );
+        assert!(
+            anonymous.contains("reinstalling the same build will NOT"),
+            "the two days were spent on advice this line has to refuse: {anonymous}"
+        );
+        assert!(
+            anonymous.contains("0.1.23"),
+            "the fix is a newer shep-client, and the message has to name it: {anonymous}"
+        );
+        assert!(
+            anonymous.contains("`shep restart log-rotate`"),
+            "every verdict ends in something the reader can run: {anonymous}"
+        );
+
+        let unattributed = stale_verdict("metrics", Silence::Unattributed);
+        assert!(
+            unattributed.contains("could not tell which process"),
+            "not knowing has to be said rather than papered over: {unattributed}"
+        );
+        assert!(
+            unattributed.contains("`shep bleats metrics`"),
+            "the one command that separates the two candidates: {unattributed}"
+        );
+
+        for verdict in [&unreachable, &anonymous, &unattributed] {
+            assert!(
+                !verdict.contains("the binary on disk cannot talk to this shep either"),
+                "the sentence that was asserted on every path is gone: {verdict}"
+            );
+        }
+    }
+
+    /// Fails if evidence is read as anything but what was observed.
+    ///
+    /// [`Contact::Named`] is the interesting row: a pid that named a dog and
+    /// is nonetheless being judged silent is a contradiction (naming one is
+    /// what sets `handshook`, and `silent_dogs` filters a handshook dog out),
+    /// so the only honest reading is that the attribution cannot be trusted
+    /// for this dog.
+    #[tokio::test(start_paused = true)]
+    async fn evidence_is_read_off_the_record_and_never_guessed() {
+        let contacts = PeerContacts::new();
+        // `Unreachable` is only ever read off a map that has been watching
+        // long enough to claim it; see `a_cold_map_does_not_claim_a_pid_never_called`.
+        tokio::time::advance(PEER_CONTACT_WARMUP * 2).await;
+        contacts.connected(11);
+        contacts.named_a_dog(12);
+
+        assert_eq!(
+            Silence::of(Some(10), &contacts),
+            Silence::Unreachable { pid: 10 }
+        );
+        assert_eq!(
+            Silence::of(Some(11), &contacts),
+            Silence::Anonymous { pid: 11 }
+        );
+        assert_eq!(
+            Silence::of(Some(12), &contacts),
+            Silence::Unattributed,
+            "a pid that named a dog and is silent anyway is a contradiction, not a diagnosis"
+        );
+        assert_eq!(
+            Silence::of(None, &contacts),
+            Silence::Unattributed,
+            "no pid is no attribution, which is a different answer from no contact"
+        );
+    }
+
+    /// Fails if shep's own account of a dog stays in `shepd.err.log`, where
+    /// the dog's operator was never told to look.
+    ///
+    /// Every message in the incident behind this module went to the daemon's
+    /// log. The dog's own log — the file shep's error message told the
+    /// operator to read — could not hold a word of it, so `shep bleats
+    /// log-rotate` showed a dog repeating itself into an empty room and
+    /// nothing about why shep had given up on it.
+    ///
+    /// Both halves are asserted, because they have different failure modes:
+    /// the file is what survives to be read afterwards, and the bus is what
+    /// a `shep bleats --follow` sees live.
+    #[tokio::test]
+    async fn shep_s_own_account_of_a_dog_reaches_that_dog_s_log() {
+        let h = crate::testing::harness(vec![ProcScript::never_exits()]);
+        start_test_dog(&h.ctx, "log-rotate").await;
+        let info = h
+            .ctx
+            .supervisor
+            .list()
+            .await
+            .into_iter()
+            .find(|info| info.name == "log-rotate")
+            .expect("the dog fixture must be listed");
+        let err_log = info
+            .err_file
+            .clone()
+            .expect("a dog's log paths are resolved");
+
+        // A real `log.*` forwarder, the same one a `shep bleats --follow`
+        // gets: `Bus::publish_log` skips the whole publish while nothing has
+        // registered an interest in log topics, so a plain `subscribe()`
+        // would assert that the gate is shut rather than that the narration
+        // travels. Registered before the narration, because a broadcast
+        // receiver starts at the channel's current tail.
+        let (out_tx, mut following) = tokio::sync::mpsc::channel(16);
+        let forwarder = crate::bus::spawn_forwarder(
+            &h.ctx.events,
+            crate::bus::TopicFilter::new(&["log.*".to_string()]).unwrap(),
+            out_tx,
+        );
+
+        narrate(&h.ctx.events, &info, "shep did a thing worth saying").await;
+
+        let written = std::fs::read_to_string(&err_log).expect("the narration must reach the log");
+        let line = written
+            .strip_suffix('\n')
+            .expect("one whole line, newline included");
+        assert!(
+            line.ends_with("[shep] shep did a thing worth saying"),
+            "the line must be marked as shep's voice, not the dog's: {line:?}"
+        );
+        let (stamp, rest) = line.split_at(shep_core::logstamp::LOG_STAMP_BYTES);
+        assert_eq!(
+            rest, "[shep] shep did a thing worth saying",
+            "the stamp is the same fixed-width prefix every other line carries: {line:?}"
+        );
+        chrono::DateTime::parse_from_rfc3339(stamp.trim_end())
+            .unwrap_or_else(|err| panic!("{stamp:?} must parse as RFC 3339: {err}"));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), following.recv())
+            .await
+            .expect("a follower must be told inside the budget")
+            .expect("the forwarder must deliver rather than end");
+        match shep_core::protocol::decode_frame::<BusEvent>(&frame).unwrap() {
+            BusEvent::LogErr { id, line } => {
+                assert_eq!(id, info.id, "the line belongs to the dog it is about");
+                assert_eq!(
+                    line, "[shep] shep did a thing worth saying",
+                    "a follower sees the marker and not the file's stamp"
+                );
+            }
+            other => panic!("narration must reach a follower as a log line, got {other:?}"),
+        }
+        forwarder.abort();
     }
 }

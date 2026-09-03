@@ -1066,25 +1066,50 @@ async fn report_dog_staleness(
 /// reader checking the wording should not have to run the ternaries in
 /// their head to see what either one says.
 ///
-/// **Names the restart, not just the reinstall.** The production incident
-/// this whole phase traces to turned on exactly this gap: `cargo install`
-/// alone left the old code running, because a rename leaves the running
-/// inode mapped (G10) and the process that inode belongs to is never
-/// touched by installing a new one over it. The spec's own fix is two
-/// commands (`docs/brainstorming/specs/2026-08-29-daemon-handover-design.md`
-/// line 504); a sentence naming only the first leaves an operator one step
-/// short of it, exactly as this one did before this phase.
+/// **It no longer prescribes the reinstall, and that is the fix rather than
+/// a softening.** This sentence used to end *rebuild or reinstall it against
+/// shep X, then restart it*, on the reasoning that naming only the reinstall
+/// left an operator one step short — `cargo install` alone leaves the old
+/// code running, because a rename leaves the running inode mapped (G10). The
+/// two-command remedy is still right where a rebuild is the answer. The
+/// error was asserting that it always is.
+///
+/// [`Request::DogStaleness`](shep_core::protocol::Request::DogStaleness)
+/// answers with NAMES. The population it names is
+/// `shep_daemon::dogs::DogRefusals::stale`, which holds two kinds of dog: one
+/// whose handshake this shepherd watched be refused twice, where a rebuild
+/// genuinely is the remedy, and one that simply never spoke, where it may not
+/// be. A dog reaching this shepherd on every connection and never naming
+/// itself in the `Hello` is in the second set, is doing its job perfectly,
+/// and is not fixed by reinstalling the same build — an operator given this
+/// sentence about exactly that dog spent two days reinstalling it.
+///
+/// So this reports what happened and sends the reader to the one place that
+/// knows which case they have. `shep_daemon::dogs::stale_verdict` writes its
+/// finding into the dog's own log at the moment of the give-up, from peer
+/// credentials only the shepherd could read and only then; nothing reaches
+/// this function but a name. Restating a fork this side of the wire cannot
+/// resolve would be a second, worse account of a state the log already
+/// describes exactly.
+///
+/// The daemon's version is still named, as a fact rather than an
+/// instruction: it is what a rebuild would have to target, and the dog's log
+/// is where the reader learns whether a rebuild is what they need.
 fn stale_dog_report(stale: &[String], daemon_version: &str) -> String {
     match stale {
         [only] => format!(
             "the `{only}` dog cannot talk to this shepherd; restarting it from the binary on \
-             disk did not help, so rebuild or reinstall it against shep {daemon_version}, then \
-             restart it"
+             disk did not help, so shep has given up and will not restart it again. \
+             `shep bleats {only}` holds what shep saw when it gave up, and the fix follows from \
+             that -- reinstalling the same build is not always it. This shepherd is shep \
+             {daemon_version}, if a rebuild is what that log calls for"
         ),
         many => format!(
             "these dogs cannot talk to this shepherd: {}; restarting them from the binaries on \
-             disk did not help, so rebuild or reinstall them against shep {daemon_version}, then \
-             restart them",
+             disk did not help, so shep has given up and will not restart them again. \
+             `shep bleats <dog>` holds what shep saw when it gave up on each, and the fix \
+             follows from that -- reinstalling the same build is not always it. This shepherd \
+             is shep {daemon_version}, if a rebuild is what those logs call for",
             quoted_names(many)
         ),
     }
@@ -1848,7 +1873,7 @@ otel = "/usr/local/bin/shep-otel"
 
         let text = String::from_utf8(err).unwrap();
         assert!(
-            text.contains("metrics") && text.contains("rebuild or reinstall"),
+            text.contains("metrics") && text.contains("shep has given up"),
             "the dog that could not come back must be named: {text}"
         );
         assert!(
@@ -1963,24 +1988,33 @@ otel = "/usr/local/bin/shep-otel"
     /// fails if the report claims something shep did not do. It knows two
     /// handshakes were refused and that a restart ran the binary on disk in
     /// between; it does NOT know what version that file holds, and cannot
-    /// until a dog answers `--version` (G11, a later phase). Pinned as an
-    /// exact string in both shapes, because the singular and the plural are
-    /// written out separately and a copy-paste between them is invisible.
+    /// until a dog answers `--version` (G11, a later phase). Nor does it
+    /// know WHY any named dog stayed silent -- it is handed names, and the
+    /// evidence exists only in each dog's own log -- so a sentence
+    /// prescribing a reinstall would be a verdict on a question this side of
+    /// the wire never asked. Pinned as an exact string in both shapes,
+    /// because the singular and the plural are written out separately and a
+    /// copy-paste between them is invisible.
     #[test]
     fn the_stale_report_says_what_happened_and_never_reads_the_disk() {
         let one = stale_dog_report(&["metrics".to_string()], "0.1.22");
         assert_eq!(
             one,
             "the `metrics` dog cannot talk to this shepherd; restarting it from the binary on \
-             disk did not help, so rebuild or reinstall it against shep 0.1.22, then restart it"
+             disk did not help, so shep has given up and will not restart it again. \
+             `shep bleats metrics` holds what shep saw when it gave up, and the fix follows \
+             from that -- reinstalling the same build is not always it. This shepherd is shep \
+             0.1.22, if a rebuild is what that log calls for"
         );
 
         let two = stale_dog_report(&["bark".to_string(), "metrics".to_string()], "0.1.22");
         assert_eq!(
             two,
             "these dogs cannot talk to this shepherd: `bark`, `metrics`; restarting them from \
-             the binaries on disk did not help, so rebuild or reinstall them against shep \
-             0.1.22, then restart them"
+             the binaries on disk did not help, so shep has given up and will not restart them \
+             again. `shep bleats <dog>` holds what shep saw when it gave up on each, and the \
+             fix follows from that -- reinstalling the same build is not always it. This \
+             shepherd is shep 0.1.22, if a rebuild is what those logs call for"
         );
     }
 

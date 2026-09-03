@@ -10,6 +10,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Shep writes its own account of a dog into that dog's log file, marked
+  `[shep]` so it cannot be read as the dog's own output: the spawn and the
+  resolved binary path, an accepted handshake (once per episode, not per
+  reconnect), a refused one with both protocol numbers, the silence warning,
+  the stale verdict, and the exit code or signal. Every one of those used to
+  go only to `shepd.err.log` — which is not the file shep's own error message
+  tells the operator to read. `shep bleats --follow` sees the same lines live.
+
+### Changed
+
+- `ListFlock` and `Describe` now report `ProcessInfo::dog_stale` beside
+  `handshook`, so a listing can tell a dog this shepherd is still waiting on
+  from one it has permanently stopped restarting. Both were
+  `handshook: false` with a live process before, and the give-up was visible
+  nowhere outside this daemon's own memory.
+
+### Fixed
+
+- The stale verdict for a silent dog no longer asserts a cause the shepherd
+  never observed. It now records which process each connection arrived from
+  and whether that connection named a dog, and says one of three things: the
+  dog has never reached the socket (rebuild or reinstall it), it reaches the
+  socket and never names itself (a build against shep-client older than
+  0.1.23, which reinstalling the same build will not fix), or the platform
+  would not name the peer's process and so neither can be ruled out. Every
+  one ends in a command to run. Previously all three got *the binary on disk
+  cannot talk to this shep either*, which cost one operator two days of
+  reinstalling a dog that was connected and serving requests the whole time.
+
+### Changed
+
+- Every line written to a sheep's or a dog's log file now starts with the
+  time shep wrote it, RFC 3339 in local time with the offset spelled out
+  (`2026-09-02T14:22:31.412+02:00 `). The stamp is a fixed 30 bytes
+  (`shep_core::logstamp::LOG_STAMP_BYTES`), so `tail`, `less` and `grep` show
+  the time and anything that wants the raw line strips a constant prefix.
+  What a sheep is REPORTED to have said does not change: the bus carries its
+  line verbatim, and `shep bleats` strips the stamp when it reads a file, so
+  `--follow` and `--no-follow` still agree and `--format json`'s `line` means
+  what it always did. That split is why this needs no opt-out.
+
 ## [0.1.27] - 2026-09-02
 
 
