@@ -1459,8 +1459,28 @@ async fn start_one(
                 // Flockfile arrives from an app's own repository, so what it
                 // says today is what the last commit to that repository
                 // said; a routine `shep start web`, or a CI job restarting a
-                // service, must not apply that. Naming a FILE is the only
-                // way to ask for a load. Pinned by
+                // service, must not apply that.
+                //
+                // The line is naming a SHEEP versus reading a FLOCKFILE, and
+                // it is not naming a file versus not naming one: bare `shep
+                // start` in a directory holding a Flockfile discovers that
+                // file, and a discovered load applies exactly as an explicit
+                // one does (pinned by
+                // `a_discovered_flockfile_applies_to_an_app_the_flock_already_has`).
+                // Three reasons, and the third is the decisive one. A bare
+                // start already READS that file to decide what to run, so
+                // applying it extends no trust the invocation had not
+                // extended already. A bare start is in the file family: it
+                // reads a Flockfile and names no sheep. And `shep start` and
+                // `shep start Flockfile.toml`, run in the same directory
+                // against the same file, must not differ in whether they
+                // apply -- two commands that read the same document and
+                // start the same apps behaving differently on config is a
+                // distinction no operator would predict and none could
+                // remember.
+                //
+                // What survives all of that is this arm: a token that
+                // resolved to a sheep reads nothing. Pinned by
                 // `start_by_name_sends_no_apply_config_even_with_a_flockfile_present`.
                 //
                 // Nothing is even reported here, and that is not an
@@ -3186,6 +3206,72 @@ mod tests {
             }
         }
         sent
+    }
+
+    /// fails if bare `shep start` in a directory holding a Flockfile does
+    /// not apply that file to an app the flock already runs.
+    ///
+    /// The line this pins is naming a SHEEP versus reading a FLOCKFILE, and
+    /// NOT naming a file versus not naming one. Discovery counts as naming
+    /// it: a bare start already reads that file to decide what to run, so
+    /// applying it extends no trust the invocation had not extended already,
+    /// and `shep start` and `shep start Flockfile.toml` run in the same
+    /// directory against the same file must not differ in whether they
+    /// apply. Two commands that read the same document and start the same
+    /// apps behaving differently on config is a distinction no operator
+    /// would predict and none could remember.
+    ///
+    /// The route had nothing on it. Every other case here hands `start` a
+    /// target; this is the only one that reaches the apply through
+    /// `discovered`, which is the substitution at the top of `start_one`.
+    #[tokio::test]
+    async fn a_discovered_flockfile_applies_to_an_app_the_flock_already_has() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"zam\"\nscript = \"./srv\"\nmax_restarts = 99\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, mut envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
+
+        let args = StartArgs {
+            targets: Vec::new(),
+            name: None,
+            fold: None,
+            cwd: None,
+            interpreter: None,
+            flockfile: false,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = {
+            let mut streams = Streams {
+                out: &mut out,
+                err: &mut err,
+                style: crate::style::Presentation::BARE,
+                fmt: Format::Table,
+            };
+            start(
+                &client,
+                &mut streams,
+                &args,
+                Some(flockfile.as_path()),
+                &BTreeMap::new(),
+            )
+            .await
+        };
+
+        assert_eq!(code, ExitCode::Success);
+        assert_eq!(
+            applies(&mut envelopes),
+            vec![vec!["zam".to_string()]],
+            "a discovered load applies exactly as an explicit one does"
+        );
     }
 
     /// fails if `shep start <name>` reads a Flockfile.
