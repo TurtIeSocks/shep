@@ -549,7 +549,7 @@ impl DogRefusals {
 /// A thousand DISTINCT peer pids inside one silence budget would take about
 /// two hundred `shep` invocations a second, which is not a workload — and if
 /// it happened, the honest degradation is the "could not attribute this"
-/// arm of [`record_silent_dog`], which names both candidates instead of
+/// arm of `record_silent_dog`, which names both candidates instead of
 /// picking one. That is why this is a bound and not a promise.
 ///
 /// Note what does NOT churn this map: a poll loop. One `shep daemon reload`
@@ -562,7 +562,7 @@ const PEER_CONTACT_CAPACITY: usize = 1024;
 ///
 /// # What it is for
 ///
-/// One question, asked by [`record_silent_dog`] and by nothing else: when a
+/// One question, asked by `record_silent_dog` and by nothing else: when a
 /// dog has been running without ever handshaking, is it failing to REACH
 /// this daemon, or is it reaching it and not saying who it is? Those two
 /// have opposite fixes — the first is answered by reinstalling the binary,
@@ -592,7 +592,7 @@ const PEER_CONTACT_CAPACITY: usize = 1024;
 /// `ImpersonateNamedPipeClient` and raw FFI that `#![forbid(unsafe_code)]`
 /// does not permit), so this map stays empty there and every lookup answers
 /// [`Contact::Unknown`]. That is not a gap being papered over — it is the
-/// reason [`record_silent_dog`] has a message for "could not attribute
+/// reason `record_silent_dog` has a message for "could not attribute
 /// this" rather than guessing.
 ///
 /// `Debug` is derived and needs no redaction (IR-41), for the same reason
@@ -1353,7 +1353,7 @@ pub(crate) async fn narrate(events: &Bus, info: &ProcessInfo, message: &str) {
     events.publish_log(BusEvent::LogErr { id: info.id, line });
 }
 
-/// [`narrate`], for a caller that knows a dog's NAME and not its listing.
+/// `narrate`, for a caller that knows a dog's NAME and not its listing.
 ///
 /// Spawned rather than awaited, and that is the reason this is a second
 /// function rather than a parameter. Both callers are connection handlers
@@ -1424,7 +1424,7 @@ fn exit_words(info: &ProcessInfo) -> String {
 /// moment alerting stopped rather than a gap they have to infer.
 ///
 /// It also writes a dog's own spawn and exit into that dog's log, in shep's
-/// voice (see [`narrate`]). Read from the bus rather than from the two
+/// voice (see `narrate`). Read from the bus rather than from the two
 /// places that cause them, and for the same reason the bark record above is:
 /// a `Start` on the bus is a spawn that really happened, while a call site
 /// answering `Ok` covers `start_dog`'s idempotent no-op as well, and the
