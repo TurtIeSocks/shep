@@ -38,11 +38,12 @@ is one class of test.
 cargo test -p shep-daemon --lib --all-features -- --skip ::slow::
 ```
 
-**~2.3s, 711 of 730 lib tests as of 2026-08-31** — the exact counts drift
+**~3.2s, 766 of 785 lib tests as of 2026-09-03**. The exact counts drift
 every time a task adds one, so treat them as a shape, not a checksum. Three
 briefs have now shipped a stale figure, this file carried "437 of 454"
-for long enough to be wrong by fifty, and it then carried "619 of 638" while
-the real number climbed by ninety-two. The 19 tests this skips live in a nested `mod slow`
+for long enough to be wrong by fifty, then "619 of 638" while the real number
+climbed by ninety-two, then "711 of 730" while the config-overrides branch
+added fifty-five. The 19 tests this skips live in a nested `mod slow`
 inside each file's `mod tests` — `extras.rs` has 9, `watch/source.rs` 7, and
 `watch/mod.rs`, `limits/sample.rs` and `handover/mod.rs` one each — and wait on real macOS
 FSEvents or real elapsed time; they are the reason the unfiltered lib run
