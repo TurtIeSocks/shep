@@ -440,7 +440,10 @@ appends keys nobody has established and overwrites nothing, because a
 Flockfile arrives through a pull request. `--reset` puts non-`env` settings
 back to the template and `--reset-all` puts everything back and drops the
 record; both are refused when the target names a sheep, since a name reads
-no file. A load with NO FLAG never registers, never prunes and never kills --
+no file. Both are refused on a bare script path too, for the same reason. A
+load with NO FLAG never prunes and never kills, and the merge itself registers
+nothing, though the `shep start` carrying it still registers and starts an app
+the flock does not have, by its own fresh path --
 a field the running child holds parks as pending and `shep reload`/`shep
 restart` promote it, re-resolving identity only when `user` or `group` moved.
 **A reset can kill, and that is deliberate.** `instances` is Structural, held
