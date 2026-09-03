@@ -1271,10 +1271,18 @@ impl<W: AsyncWrite + Unpin> LogFile<W> {
     /// (never propagating) a write failure — a log we cannot write to must
     /// not stop the pump draining the child's pipes.
     ///
-    /// The stamp, the line and the newline are three writes into that same
-    /// buffer rather than one joined copy: the file sees one contiguous run
-    /// of bytes either way, so the copy bought nothing but an allocation per
-    /// line.
+    /// The stamp, the line and the newline are joined in `self.stamp` and
+    /// handed to ONE `write_all`, which is load-bearing rather than a
+    /// micro-optimisation. [`crate::dogs::narrate`] writes shep's own
+    /// account of a dog through a SECOND handle on this same path, so a
+    /// flush boundary falling between three separate writes let a whole
+    /// narration line land between a stamp and the body it belongs to. That
+    /// tore the pump's line in half and left it unstamped, breaking the
+    /// one-stamp-per-line contract [`shep_core::logstamp::strip`] reads on.
+    /// Measured before the join at roughly one tear per narration written
+    /// while a dog was talking, and zero after it. The scratch buffer is
+    /// reused, so joining costs no allocation per line and saves two
+    /// syscalls.
     ///
     /// # What the stamp does NOT change
     ///
@@ -1282,8 +1290,8 @@ impl<W: AsyncWrite + Unpin> LogFile<W> {
     /// `shep bleats --follow` and to every dog subscribed to `log.*` — is
     /// the sheep's own bytes, unstamped. [`LOG_TIMESTAMP_FORMAT`] argues why
     /// that split is the whole reason this needs no opt-out. It also means
-    /// `O_APPEND`'s guarantee is untouched: this still writes whole lines
-    /// through one buffer, so [`open_append`]'s reasoning about several
+    /// `O_APPEND`'s guarantee is untouched: one stamped line reaches the
+    /// buffer as one write, so [`open_append`]'s reasoning about several
     /// writers on one file holds exactly as it did.
     async fn append(&mut self, line: &str) {
         let Some(handle) = self.handle.as_mut() else {
@@ -1291,12 +1299,9 @@ impl<W: AsyncWrite + Unpin> LogFile<W> {
         };
         self.stamp.clear();
         stamp_into(&mut self.stamp);
-        let written = async {
-            handle.write_all(self.stamp.as_bytes()).await?;
-            handle.write_all(line.as_bytes()).await?;
-            handle.write_all(b"\n").await
-        }
-        .await;
+        self.stamp.push_str(line);
+        self.stamp.push('\n');
+        let written = handle.write_all(self.stamp.as_bytes()).await;
         self.buffered_since.get_or_insert_with(Instant::now);
         if let Err(error) = written {
             tracing::error!(path = ?self.path, %error, "log file append failed");
