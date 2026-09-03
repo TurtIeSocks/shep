@@ -53,7 +53,7 @@ use crate::supervisor::SupervisorHandle;
 /// One dog the daemon knows about: its name, and where its binary comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DogSpec {
-    /// The dog's name — the `[<name>]` key and the entry's name.
+    /// The dog's name: the `[<name>]` key and the entry's name.
     pub name: String,
     /// Where its binary comes from.
     pub source: DogSource,
@@ -63,7 +63,7 @@ pub struct DogSpec {
 ///
 /// `Debug` is derived and needs no redaction: the variants carry a path, a
 /// normalizer complaint about a config this module assembled itself, or a
-/// TOML parser message — never a value read out of a parsed `[<name>]`
+/// TOML parser message, never a value read out of a parsed `[<name>]`
 /// table. The one way a section's own text can reach a message is a *syntax*
 /// error, where the parser quotes the line it failed on; that is the same
 /// exposure [`DogsConfigError`](shep_core::config::DogsConfigError)
@@ -231,7 +231,7 @@ pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogErro
     config
         .env
         .insert("SHEP_HOME".to_string(), paths.home.display().to_string());
-    // The name the operator registered this dog under — the `[<name>]`
+    // The name the operator registered this dog under: the `[<name>]`
     // key its own section lives beneath, and so the `name` it has to put in
     // `Request::DogConfig`. A built-in dog reads it out of its argv; an
     // adopted one has no argv at all, so it needs another way to learn it —
@@ -249,7 +249,7 @@ pub fn dog_app(spec: &DogSpec, paths: &ShepPaths) -> Result<ResolvedApp, DogErro
     //
     // Safe to place here for the same reason `SHEP_HOME` is, and for no
     // other: a name is not a secret. The rule this does not break is that
-    // no `[<name>]` VALUE travels in the environment — that is the key,
+    // no `[<name>]` VALUE travels in the environment. That is the key,
     // not the section.
     config
         .env
@@ -292,9 +292,9 @@ pub async fn spawn_enabled_dogs(
             }
         };
         // Read before `start_dog` takes the app. This is the one place that
-        // knows which file a dog's spawn actually resolved to — a built-in
+        // knows which file a dog's spawn actually resolved to (a built-in
         // dog's is this shep's own binary, an adopted one's is whatever the
-        // operator's `[<name>]` named — and an operator reading the
+        // operator's `[<name>]` named), and an operator reading the
         // dog's log during an upgrade is usually asking exactly that.
         let script = app.config().script.clone();
         match supervisor.start_dog(app, spec.source.clone()).await {
@@ -335,7 +335,7 @@ pub async fn spawn_enabled_dogs(
 /// simply has no file.
 ///
 /// # Errors
-/// - [`DogError::Config`] — the file exists and is not valid `dogs.toml`,
+/// - [`DogError::Config`]: the file exists and is not valid `dogs.toml`,
 ///   or its section will not render back to TOML.
 /// - [`DogError::Io`] — the file exists and could not be read.
 pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
