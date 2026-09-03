@@ -169,9 +169,9 @@ schemars can express this without shep shipping anything:
 ergonomics that is twenty-three characters and not worth a proc-macro crate.
 
 The reason to ship one anyway is that `x-shep-secret` is a string shep parses,
-hand-typed by the author. Spell it `x-shep-secert` and it compiles, the schema
-validates, the field is not marked, and lookout paints a webhook credential on
-screen. Nothing fails and nothing warns. It cannot be linted either, because
+hand-typed by the author. Transpose two of its letters and it compiles, the
+schema validates, the field is not marked, and lookout paints a webhook
+credential on screen. Nothing fails and nothing warns. It cannot be linted either, because
 schemars takes a string literal for the extension key, so a shep-exported const
 cannot go in that position.
 
