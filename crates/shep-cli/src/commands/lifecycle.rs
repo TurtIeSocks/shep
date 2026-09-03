@@ -1310,6 +1310,20 @@ fn apply_interpreters(
     }
 }
 
+/// The depth of an `apply_declared` call chosen by `--reset`/`--reset-all`.
+///
+/// `clap`'s `conflicts_with` already refuses the two together, so at most one
+/// of `args.reset`/`args.reset_all` is ever set here.
+fn reset_depth(args: &StartArgs) -> ResetDepth {
+    if args.reset_all {
+        ResetDepth::All
+    } else if args.reset {
+        ResetDepth::Settings
+    } else {
+        ResetDepth::None
+    }
+}
+
 pub async fn start(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -1487,6 +1501,21 @@ async fn start_one(
                 // omission either: a selector supplies no config -- `shep
                 // start fold:backed` names sheep, not a Flockfile -- so
                 // there is nothing that could have been silently ignored.
+                //
+                // A reset flag here would be meaningless rather than a
+                // no-op: this arm reads no file, so there is no template to
+                // reset to. Refusing rather than silently doing nothing.
+                if args.reset || args.reset_all {
+                    let flag = if args.reset_all {
+                        "--reset-all"
+                    } else {
+                        "--reset"
+                    };
+                    let message = format!(
+                        "{flag} needs a Flockfile to reset to; {token} names a sheep, not a file"
+                    );
+                    return streams.fail(ExitCode::Usage, &message);
+                }
                 return resume_all(client, streams, Some(token), &matched, started).await;
             }
             // Held for the failure path below rather than reported here: the
@@ -1589,7 +1618,7 @@ async fn start_one(
     // `start` was asked to do, they are what an operator running this in a
     // deploy needs to happen, and the refusal is reported the moment it
     // arrives either way. What it changes is what the verb EXITS with.
-    let applied = apply_declared(client, streams, &resumed, ResetDepth::None).await;
+    let applied = apply_declared(client, streams, &resumed, reset_depth(args)).await;
     if !resumed.is_empty() {
         // `None`, not the operator's token: this arm reached the flock through
         // a Flockfile or a path, so there is no selector to quote back in the
@@ -1892,6 +1921,8 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
+            reset: false,
+            reset_all: false,
         };
         {
             let mut streams = Streams {
@@ -2035,6 +2066,8 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
+            reset: false,
+            reset_all: false,
         }
     }
 
@@ -2902,6 +2935,13 @@ mod tests {
     /// Runs `start` against `daemon` and hands back the code, stdout and
     /// stderr, in that order.
     async fn start_against(client: &Client, target: &str) -> (ExitCode, String, String) {
+        start_against_with_args(client, &start_args(target)).await
+    }
+
+    async fn start_against_with_args(
+        client: &Client,
+        args: &StartArgs,
+    ) -> (ExitCode, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = {
@@ -2911,14 +2951,7 @@ mod tests {
                 style: crate::style::Presentation::BARE,
                 fmt: Format::Table,
             };
-            start(
-                client,
-                &mut streams,
-                &start_args(target),
-                None,
-                &BTreeMap::new(),
-            )
-            .await
+            start(client, &mut streams, args, None, &BTreeMap::new()).await
         };
         (
             code,
@@ -3004,6 +3037,69 @@ mod tests {
             *reset,
             ResetDepth::None,
             "additive by default; --reset is something the operator types"
+        );
+    }
+
+    /// fails if `--reset`/`--reset-all` do not reach the wire as the depth
+    /// they name. `reset_depth` is the only place that mapping happens, and
+    /// nothing else in this file would notice if it collapsed to `None`.
+    #[tokio::test]
+    async fn reset_flags_choose_the_apply_config_depth_on_the_wire() {
+        use shep_client::testing::fake_client_answering;
+
+        async fn sent_depth(reset: bool, reset_all: bool) -> ResetDepth {
+            let dir = tempfile::tempdir().unwrap();
+            let flockfile = dir.path().join("Flockfile.toml");
+            std::fs::write(
+                &flockfile,
+                "[[app]]\nname = \"zam\"\nscript = \"./srv\"\nmax_restarts = 99\n",
+            )
+            .unwrap();
+            let path = shep_client::testing::control_address(dir.path());
+            let (client, mut envelopes) =
+                fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[]))
+                    .await;
+            let mut args = start_args(flockfile.to_str().unwrap());
+            args.reset = reset;
+            args.reset_all = reset_all;
+            let (code, _printed, _said) = start_against_with_args(&client, &args).await;
+            assert_eq!(code, ExitCode::Success);
+            let mut sent = Vec::new();
+            while let Ok(envelope) = envelopes.try_recv() {
+                if let Request::ApplyConfig { reset, .. } = envelope.body {
+                    sent.push(reset);
+                }
+            }
+            assert_eq!(sent.len(), 1, "one request for the whole invocation");
+            sent[0]
+        }
+
+        assert_eq!(sent_depth(false, false).await, ResetDepth::None);
+        assert_eq!(sent_depth(true, false).await, ResetDepth::Settings);
+        assert_eq!(sent_depth(false, true).await, ResetDepth::All);
+    }
+
+    /// fails if a reset flag is accepted when the target is a NAME. There is
+    /// no file to reset to, so the flag is meaningless and silently doing
+    /// nothing would be worse than refusing.
+    #[tokio::test]
+    async fn a_reset_flag_on_a_name_target_is_refused() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let (client, _envelopes) =
+            fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
+
+        let mut args = start_args("zam");
+        args.reset = true;
+        let (code, printed, said) = start_against_with_args(&client, &args).await;
+
+        assert_eq!(code, ExitCode::Usage);
+        assert!(printed.is_empty(), "a refusal prints no data envelope");
+        assert!(
+            said.contains("--reset") && said.contains("zam"),
+            "the refusal names the flag and the token it was refused for: {said}"
         );
     }
 
@@ -3329,6 +3425,8 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
+            reset: false,
+            reset_all: false,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();

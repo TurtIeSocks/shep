@@ -649,6 +649,26 @@ pub struct StartArgs {
     /// `server.js` as a script, which is what it has always meant.
     #[arg(long)]
     pub flockfile: bool,
+    /// Put process settings back to what the Flockfile says, keeping env and
+    /// any fields added since.
+    ///
+    /// Without this flag a load is additive: it appends keys nobody has set
+    /// and overwrites nothing. `env` is operator-supplied data and survives
+    /// even this reset; everything else is operator-tuned policy, and
+    /// resetting policy is recoverable. Refused when the target is a sheep
+    /// name rather than a Flockfile, since a name reads no file to reset to.
+    #[arg(long, conflicts_with = "reset_all")]
+    pub reset: bool,
+    /// Put everything back to what the Flockfile says, including env, and
+    /// drop fields added since.
+    ///
+    /// The wider of the two resets: `--reset` keeps `env` because it is
+    /// operator-supplied data, not policy, and losing it takes the app's
+    /// database away. This flag drops it too. Refused when the target is a
+    /// sheep name rather than a Flockfile, since a name reads no file to
+    /// reset to.
+    #[arg(long = "reset-all")]
+    pub reset_all: bool,
 }
 
 /// Arguments to `shep serve`.
@@ -1675,6 +1695,41 @@ mod tests {
             }
             other => panic!("expected two Start commands, got {other:?}"),
         }
+    }
+
+    /// fails if the two flags map to the same depth, or if either can be
+    /// combined with the other. They differ on two axes and a caller must
+    /// pick one.
+    #[test]
+    fn the_reset_flags_are_mutually_exclusive_and_map_to_distinct_depths() {
+        use clap::Parser;
+
+        fn parse_start(argv: &[&str]) -> StartArgs {
+            match Cli::try_parse_from(argv).unwrap().command {
+                Commands::Start(args) => args,
+                other => panic!("expected start, got {other:?}"),
+            }
+        }
+
+        fn depth_of(args: &StartArgs) -> (bool, bool) {
+            (args.reset, args.reset_all)
+        }
+
+        assert_eq!(
+            depth_of(&parse_start(&["shep", "start", "F.toml"])),
+            (false, false)
+        );
+        assert_eq!(
+            depth_of(&parse_start(&["shep", "start", "F.toml", "--reset"])),
+            (true, false)
+        );
+        assert_eq!(
+            depth_of(&parse_start(&["shep", "start", "F.toml", "--reset-all"])),
+            (false, true)
+        );
+        assert!(
+            Cli::try_parse_from(["shep", "start", "F.toml", "--reset", "--reset-all"]).is_err()
+        );
     }
 
     /// fails if serve stops binding loopback by default. Spec §10 fixes it and
