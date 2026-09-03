@@ -86,6 +86,155 @@ pub(crate) type Transport = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 pub(crate) type Transport = std::fs::File;
 
+/// The half the reader thread owns.
+///
+/// The duplex itself on unix, where a socketpair's two ends are independent
+/// open file descriptions and a `read` parked on one costs a concurrent
+/// `write` on the other nothing at all.
+#[cfg(unix)]
+pub(crate) type ReadHalf = Transport;
+/// The half the reader thread owns.
+///
+/// [`PipeReader`] on Windows, which is not a refinement -- see that type for
+/// the deadlock it exists to avoid.
+#[cfg(windows)]
+pub(crate) type ReadHalf = PipeReader;
+
+/// How long the Windows reader sleeps between peeks at an empty pipe.
+///
+/// The price of not being able to park inside `ReadFile`. What arrives on
+/// this half is an operator triggering an action or asking the app to stop,
+/// measured against `action_timeout` and `kill_timeout` -- both seconds --
+/// so 20 ms is invisible where a deadlock is not. Much shorter spins for
+/// nothing; much longer starts to show in how quickly an app answers
+/// `shep trigger`.
+#[cfg(windows)]
+const PIPE_POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(20);
+
+/// Reads the channel's named pipe without ever parking inside `ReadFile`.
+///
+/// The shepherd hands a Windows app **one** pipe instance, so the reader and
+/// the writer are two handles onto one kernel file object: `try_clone` is
+/// `DuplicateHandle`, which duplicates the handle and not the object beneath
+/// it. That object is opened synchronously, and the I/O manager serialises
+/// every operation on a synchronous file object. A `ReadFile` waiting for a
+/// message that has no reason to be coming holds the object for as long as
+/// it waits, and the writer thread's `WriteFile` queues behind it.
+///
+/// Nothing breaks that on its own, because the two sides are each waiting
+/// for the other: the shepherd will not send anything until it has heard
+/// `ready`, and the app cannot send `ready` until the shepherd sends
+/// something. An app linking this crate would hang at startup and
+/// `wait_ready` would time out with nothing anywhere saying why. Measured on
+/// real Windows before this type existed -- the write never returned, and
+/// came back only when the pipe was torn down.
+///
+/// So this half never waits inside the kernel. `PeekNamedPipe` reports what
+/// is already buffered and returns either way, and a `ReadFile` is issued
+/// only for bytes it has just been told are sitting there. The file object
+/// is held for the length of a copy rather than the length of a wait, and
+/// the writer gets in between polls.
+///
+/// Opening the pipe a second time would be the other way out, and it is not
+/// available: the shepherd creates a single instance and accepts once, so a
+/// second `CreateFile` reaches an instance nothing on the far side will ever
+/// read.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct PipeReader {
+    /// The channel's pipe. Also duplicated for the writer thread, which is
+    /// the whole reason this type cannot simply block.
+    pipe: std::fs::File,
+}
+
+#[cfg(windows)]
+impl PipeReader {
+    /// How many bytes are buffered, or `None` once the shepherd has closed
+    /// its end and everything it sent has been drained.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `PeekNamedPipe` reports, except the two codes that mean the
+    /// far end is gone. Those are this channel's end of stream, which the
+    /// reader loop above ends on cleanly, and not a failure to pass up.
+    fn buffered(&self) -> std::io::Result<Option<u32>> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED};
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+        let mut available: u32 = 0;
+        // SAFETY: `self.pipe` is this process's open channel, borrowed for
+        // the length of the call, so its handle cannot be closed underneath
+        // it. `connect` opened it for reading, which is what `PeekNamedPipe`
+        // requires of a handle. A null `lpBuffer` with a zero `nBufferSize`
+        // is the documented way to ask for the counts without copying any
+        // data out, and the three count pointers this call does not want are
+        // null, which the same documentation permits. The one it does want
+        // is `&raw mut available`, which points at an initialised `u32` this
+        // frame owns and outlives the call.
+        #[allow(unsafe_code)]
+        let reported = unsafe {
+            PeekNamedPipe(
+                self.pipe.as_raw_handle(),
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                &raw mut available,
+                core::ptr::null_mut(),
+            )
+        };
+        if reported == 0 {
+            let error = std::io::Error::last_os_error();
+            let ended = matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == ERROR_BROKEN_PIPE as i32
+                        || code == ERROR_PIPE_NOT_CONNECTED as i32
+            );
+            return if ended { Ok(None) } else { Err(error) };
+        }
+        Ok(Some(available))
+    }
+}
+
+#[cfg(windows)]
+impl std::io::Read for PipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let Some(buffered) = self.buffered()? else {
+                return Ok(0);
+            };
+            if buffered == 0 {
+                std::thread::sleep(PIPE_POLL_INTERVAL);
+                continue;
+            }
+            // Never more than the peek just reported. Asking for more is
+            // what would park this thread in the kernel again and bring
+            // back the deadlock this type exists to avoid.
+            let want = buf.len().min(buffered as usize);
+            return self.pipe.read(&mut buf[..want]);
+        }
+    }
+}
+
+/// Hands the reader thread its half, wrapped in whatever this platform
+/// needs it to be.
+#[cfg(unix)]
+fn read_half(transport: Transport) -> ReadHalf {
+    transport
+}
+
+/// Hands the reader thread its half, wrapped in whatever this platform
+/// needs it to be.
+#[cfg(windows)]
+fn read_half(transport: Transport) -> ReadHalf {
+    PipeReader { pipe: transport }
+}
+
 /// Guards the inherited channel from being taken twice in one process.
 ///
 /// Consumed only by the branch that actually takes a channel. A refusal --
@@ -94,7 +243,7 @@ pub(crate) type Transport = std::fs::File;
 /// later, legitimate call would be refused for no reason.
 static CHANNEL_TAKEN: AtomicBool = AtomicBool::new(false);
 
-/// Opens the endpoint, returning the transport and a clone for the writer.
+/// Opens the endpoint, returning the reader's half and the writer's clone.
 ///
 /// # Errors
 ///
@@ -104,7 +253,7 @@ static CHANNEL_TAKEN: AtomicBool = AtomicBool::new(false);
 ///   cannot be cloned.
 /// - [`ChannelError::AlreadyTaken`] when this process already took its
 ///   channel.
-pub(crate) fn connect(endpoint: &Endpoint) -> Result<(Transport, Transport), ChannelError> {
+pub(crate) fn connect(endpoint: &Endpoint) -> Result<(ReadHalf, Transport), ChannelError> {
     let transport = match endpoint {
         #[cfg(unix)]
         Endpoint::Descriptor(fd) => {
@@ -198,7 +347,7 @@ pub(crate) fn connect(endpoint: &Endpoint) -> Result<(Transport, Transport), Cha
             return Err(ChannelError::Io(error));
         }
     };
-    Ok((transport, writer))
+    Ok((read_half(transport), writer))
 }
 
 #[cfg(test)]

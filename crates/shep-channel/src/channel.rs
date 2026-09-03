@@ -7,7 +7,7 @@ use crate::{ChannelError, ChildMessage, ShepherdMessage, endpoint, session};
 /// when your app already has an event loop and wants the channel inside it.
 #[derive(Debug)]
 pub struct Channel {
-    pub(crate) reader: std::io::BufReader<endpoint::Transport>,
+    pub(crate) reader: std::io::BufReader<endpoint::ReadHalf>,
     pub(crate) writer: endpoint::Transport,
     pub(crate) version: Option<String>,
 }
@@ -74,7 +74,7 @@ impl Channel {
     pub(crate) fn into_halves(
         self,
     ) -> (
-        std::io::BufReader<endpoint::Transport>,
+        std::io::BufReader<endpoint::ReadHalf>,
         endpoint::Transport,
         Option<String>,
     ) {

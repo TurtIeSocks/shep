@@ -20,7 +20,7 @@ all-features = true
 # `default-features = false` because it wants the wire types and nothing
 # else; an app wants the whole thing and says nothing.
 default = ["client"]
-client = ["dep:serde_json"]
+client = ["dep:serde_json", "dep:windows-sys"]
 
 [dependencies]
 # `features = ["std"]` is load-bearing, not tidiness. The workspace pins serde
@@ -34,14 +34,32 @@ client = ["dep:serde_json"]
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, optional = true }
 
+# `PeekNamedPipe`, and the two error codes that mean the shepherd has gone.
+# Windows only, and only with the client: `endpoint::PipeReader` explains why
+# the reader there cannot simply park in a `ReadFile` the way the unix one
+# does, and this is the one call it needs to avoid that.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+], optional = true }
+
 [dev-dependencies]
 serde_json.workspace = true
 
 # Maps a socketpair onto fd 3 in `tests/real_child.rs`, the same crate
-# `tokio_runner.rs` uses for the real thing. Unix-only: that test is
-# unix-only, and `command-fds` does unconditional unix fd work.
+# `tokio_runner.rs` uses for the real thing. Unix-only: that mapping is the
+# unix half of the contract, and `command-fds` does unconditional unix fd
+# work.
 [target.'cfg(unix)'.dev-dependencies]
 command-fds.workspace = true
+
+# Stands up a real named pipe server for `tests/real_child.rs`. The same
+# `ServerOptions` call the daemon's own `shep_core::transport::Listener`
+# makes, so that test's shepherd end is the production one rather than a
+# lookalike that could agree with a bug.
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 
 [lints]
 workspace = true

@@ -43,10 +43,11 @@
 //!   own judgement; only a handler you registered does.
 
 #![doc(test(attr(deny(warnings))))]
-// Not `forbid`: taking the inherited descriptor needs one `unsafe` block,
-// because the standard library has no safe constructor from a raw
-// descriptor. That single site carries its own `// SAFETY:` and the
-// workspace denies `undocumented_unsafe_blocks`, so it cannot lose it.
+// Not `forbid`: two calls in `endpoint` need an `unsafe` block, one per
+// platform. Taking the inherited descriptor on unix has no safe constructor
+// in the standard library, and asking a Windows pipe what it has buffered
+// has no safe wrapper at all. Each carries its own `// SAFETY:` and the
+// workspace denies `undocumented_unsafe_blocks`, so neither can lose it.
 #![deny(unsafe_code)]
 
 #[cfg(feature = "client")]

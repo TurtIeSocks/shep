@@ -1,23 +1,33 @@
-//! Drives the `answers` example's handlers as a real child with a real
-//! fd 3.
+//! Drives the `answers` example's handlers as a real child, on a real
+//! channel, on whichever platform this is.
 //!
-//! unix only: wiring an inherited descriptor is the unix half of the
-//! contract. The Windows half is a named pipe the app opens by name, and it
-//! is compiled by CI and executed by no test. This file is the only test in
-//! the crate that opens an endpoint at all, and it is `#![cfg(unix)]`;
-//! nothing outside the crate calls `shep_channel::serve` or `Channel::open`.
-//! So CI's Windows legs type-check `endpoint.rs`'s `Endpoint::Pipe` arm and
-//! run nothing through it.
+//! Both halves of the contract are here, because they are two different
+//! mechanisms and only the assertions are shared: unix wires an inherited
+//! descriptor onto the child's fd 3, and Windows hands it the name of a
+//! pipe it opens itself. [`ShepherdSide`] is defined twice, once per
+//! platform, and the test body below calls the same two methods on whichever
+//! one compiled.
 //!
-//! That is a gap, stated rather than papered over. The shepherd creates the
-//! pipe with a random name per spawn, so driving that arm needs a live
-//! daemon rather than a socketpair, which is why the coverage is not here.
-//! The daemon's own Windows tests do not supply it either: they predate this
-//! crate and drive `cmd.exe` children that never link it.
+//! # What the Windows half is for
 //!
-//! Everything above the door is covered on both platforms by the generic
-//! tests in `session.rs`, and the crate doc's doctest runs `serve()`
-//! everywhere, taking the no-channel branch.
+//! It ran nothing until 2026-09-02. CI's Windows legs type-checked
+//! `endpoint.rs`'s `Endpoint::Pipe` arm and executed no line of it, and the
+//! arm was broken: the shepherd hands an app **one** pipe instance, so
+//! `try_clone` gives the writer thread a second handle onto the same
+//! synchronous kernel file object, and the reader thread parked in
+//! `ReadFile` held that object against every write the app tried to make.
+//! `ready()` could not get out, so the shepherd never heard it and never
+//! sent anything, so the read never completed. Measured here, on real
+//! Windows: the write returned only when the pipe was torn down.
+//!
+//! That is why the first assertion below is worth reading twice. On Windows
+//! it is not checking that the app said the right thing -- it is checking
+//! that the app could say anything at all.
+//!
+//! The shepherd end is the production one rather than a lookalike. It is the
+//! same `ServerOptions` call `shep_core::transport::Listener::bind` makes,
+//! down to `first_pipe_instance` and `reject_remote_clients`, so a bug in
+//! how the daemon creates the pipe would show up here too.
 //!
 //! # Why this does not spawn `examples/answers.rs`
 //!
@@ -33,16 +43,11 @@
 //! Instead, this file's one test re-execs *itself*. [`CHILD_VAR`], checked
 //! at the very top of the test function, tells a re-exec of the same test
 //! binary to run [`run_as_child`] -- the same handlers `examples/answers.rs`
-//! registers -- instead of running the assertions below. The parent spawns
-//! `current_exe()` filtered to this one test's name via `--exact`, with the
-//! socketpair mapped onto its fd 3. The child is still a real separate
-//! process finding a real inherited descriptor, which is the property under
-//! test; `examples/answers.rs` stays as the copy an app author reads, and
-//! `clippy --all-targets` keeps it from rotting.
-#![cfg(unix)]
+//! registers -- instead of running the assertions below. The child is still
+//! a real separate process finding a real channel, which is the property
+//! under test; `examples/answers.rs` stays as the copy an app author reads,
+//! and `clippy --all-targets` keeps it from rotting.
 
-use std::io::{BufRead as _, BufReader, Write as _};
-use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -54,7 +59,7 @@ const CHILD_VAR: &str = "SHEP_CHANNEL_TEST_CHILD";
 /// This file's one test function's name, passed to the re-exec'd binary as
 /// an exact filter. Keep this in sync with the `#[test] fn` below by hand
 /// -- libtest names tests by plain string, so nothing else enforces it.
-const TEST_NAME: &str = "a_real_child_finds_fd_3_and_answers";
+const TEST_NAME: &str = "a_real_child_finds_its_channel_and_answers";
 
 /// How long the parent gives the child to answer before calling it hung. A
 /// working child answers in milliseconds; this is slack for a loaded
@@ -89,56 +94,39 @@ fn run_as_child() -> ! {
 }
 
 #[test]
-fn a_real_child_finds_fd_3_and_answers() {
+fn a_real_child_finds_its_channel_and_answers() {
     if std::env::var_os(CHILD_VAR).is_some() {
         run_as_child();
     }
 
-    let (ours, theirs) = UnixStream::pair().expect("socketpair");
-    // The child inherits a blocking descriptor, which is what the shepherd
-    // hands a real app: `tokio_runner.rs` clears O_NONBLOCK deliberately so
-    // a plain read parks rather than returning EAGAIN.
-    theirs.set_nonblocking(false).expect("blocking");
-    ours.set_read_timeout(Some(DEADLINE)).expect("deadline");
+    let (mut shepherd, child) = open_channel_and_spawn_child();
+    let child = ChildGuard(Some(child));
 
-    let child = ChildGuard(Some(spawn_child(theirs)));
-
-    let mut writer = ours.try_clone().expect("clone");
-    let mut reader = BufReader::new(ours);
-
-    let mut ready = String::new();
-    reader
-        .read_line(&mut ready)
-        .expect("child did not say ready within the deadline");
-    assert_eq!(ready.trim_end(), "{\"kind\":\"ready\"}");
-
-    let mut metric = String::new();
-    reader.read_line(&mut metric).expect("no metric");
+    // On Windows this is the deadlock check, not a formatting check: an app
+    // whose writer thread is stuck behind its own parked reader never gets
+    // this far, because the shepherd is waiting for exactly this line before
+    // it sends anything.
     assert_eq!(
-        metric.trim_end(),
+        shepherd.read_line(),
+        "{\"kind\":\"ready\"}",
+        "the child never said ready"
+    );
+
+    assert_eq!(
+        shepherd.read_line(),
         "{\"kind\":\"metric\",\"name\":\"rps\",\"value\":42.0}"
     );
 
-    writer
-        .write_all(b"{\"kind\":\"action\",\"name\":\"gc\",\"params\":\"now\",\"id\":7}\n")
-        .expect("write");
-    let mut reply = String::new();
-    reader.read_line(&mut reply).expect("no reply");
+    shepherd.write_line("{\"kind\":\"action\",\"name\":\"gc\",\"params\":\"now\",\"id\":7}");
     assert_eq!(
-        reply.trim_end(),
+        shepherd.read_line(),
         "{\"kind\":\"action-reply\",\"action\":\"gc\",\"body\":\"collected, params=Some(\\\"now\\\")\",\"id\":7}"
     );
 
     // The rule this crate exists for, against a real process.
-    writer
-        .write_all(b"{\"kind\":\"action\",\"name\":\"typo\",\"id\":8}\n")
-        .expect("write");
-    let mut unknown = String::new();
-    reader
-        .read_line(&mut unknown)
-        .expect("no reply to an unknown action");
+    shepherd.write_line("{\"kind\":\"action\",\"name\":\"typo\",\"id\":8}");
     assert_eq!(
-        unknown.trim_end(),
+        shepherd.read_line(),
         "{\"kind\":\"action-reply\",\"action\":\"typo\",\"body\":\"unknown action: typo\",\"id\":8}"
     );
 
@@ -155,6 +143,27 @@ fn a_real_child_finds_fd_3_and_answers() {
     );
 }
 
+/// The parts of the child's command that do not depend on how the channel
+/// reaches it.
+///
+/// `SHEP_NAME` is load-bearing rather than decoration: `serve()` gates its
+/// no-channel advice on that variable, so without it the child would stay
+/// silent for the wrong reason and the stderr assertion above would prove
+/// nothing. With it set, the child is a process running under shep that
+/// DOES have a channel, so the advice must not fire.
+fn base_command() -> Command {
+    let exe = std::env::current_exe().expect("path to this test binary");
+    let mut command = Command::new(exe);
+    command
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .env(CHILD_VAR, "1")
+        .env("SHEP_CHANNEL_VERSION", "1")
+        .env("SHEP_NAME", "answers")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 /// Kills and reaps the wrapped child on drop if [`ChildGuard::take`] was
 /// never called -- including on an unwind from a failed `assert_eq!` above.
 /// Every read in this test is bounded by [`DEADLINE`], so a hung child
@@ -163,8 +172,7 @@ fn a_real_child_finds_fd_3_and_answers() {
 /// child parks as an orphan (reparented to pid 1) for as long as the
 /// machine runs. Verified: deliberately breaking `endpoint::discover` to
 /// return `Absent` (task-7's non-vacuity check) panics the parent at the
-/// first `read_line` and, without this guard, leaves exactly that orphan
-/// behind.
+/// first read and, without this guard, leaves exactly that orphan behind.
 struct ChildGuard(Option<std::process::Child>);
 
 impl ChildGuard {
@@ -189,36 +197,192 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Spawns a re-exec of this same test binary, filtered by `--exact` to run
-/// only [`run_as_child`] (by way of [`CHILD_VAR`]), with `theirs` mapped
-/// onto its fd 3. `FdMapping` takes an `OwnedFd`, which a `UnixStream`
-/// converts into, so this needs no `unsafe` at all.
-fn spawn_child(theirs: UnixStream) -> std::process::Child {
+/// The shepherd's end of a socketpair, read and written a line at a time.
+#[cfg(unix)]
+struct ShepherdSide {
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    writer: std::os::unix::net::UnixStream,
+}
+
+#[cfg(unix)]
+impl ShepherdSide {
+    /// The next line the child sent, without its newline.
+    ///
+    /// # Panics
+    ///
+    /// If the child sends nothing within [`DEADLINE`], or closes its end.
+    #[track_caller]
+    fn read_line(&mut self) -> String {
+        use std::io::BufRead as _;
+
+        let mut line = String::new();
+        let read = self
+            .reader
+            .read_line(&mut line)
+            .expect("the child sent nothing within the deadline");
+        assert!(read > 0, "the child closed its end of the channel");
+        line.trim_end().to_string()
+    }
+
+    /// Sends one line to the child, newline appended.
+    ///
+    /// # Panics
+    ///
+    /// If the write fails.
+    #[track_caller]
+    fn write_line(&mut self, line: &str) {
+        use std::io::Write as _;
+
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("write to the socket");
+    }
+}
+
+/// Spawns the child with a socketpair mapped onto its fd 3, and keeps the
+/// shepherd's end.
+///
+/// `FdMapping` takes an `OwnedFd`, which a `UnixStream` converts into, so
+/// this needs no `unsafe` at all.
+#[cfg(unix)]
+fn open_channel_and_spawn_child() -> (ShepherdSide, std::process::Child) {
     use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
 
     use command_fds::{CommandFdExt as _, FdMapping};
 
-    let exe = std::env::current_exe().expect("path to this test binary");
-    let mut command = Command::new(exe);
+    let (ours, theirs) = UnixStream::pair().expect("socketpair");
+    // The child inherits a blocking descriptor, which is what the shepherd
+    // hands a real app: `tokio_runner.rs` clears O_NONBLOCK deliberately so
+    // a plain read parks rather than returning EAGAIN.
+    theirs.set_nonblocking(false).expect("blocking");
+    ours.set_read_timeout(Some(DEADLINE)).expect("deadline");
+
+    let mut command = base_command();
     command
-        .args(["--exact", TEST_NAME, "--nocapture"])
-        .env(CHILD_VAR, "1")
-        .env("SHEP_CHANNEL_FD", "3")
-        .env("SHEP_CHANNEL_VERSION", "1")
-        // The warning is gated on SHEP_NAME, so without this the child
-        // would stay silent for the wrong reason and the assertion below
-        // would prove nothing. With it set, the child is a process running
-        // under shep that DOES have a channel, so the advice must not fire.
-        .env("SHEP_NAME", "answers")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env_remove("SHEP_CHANNEL_PIPE")
+        .env("SHEP_CHANNEL_FD", "3");
     command
         .fd_mappings(vec![FdMapping {
             parent_fd: OwnedFd::from(theirs),
             child_fd: 3,
         }])
         .expect("map the socketpair to fd 3");
-    command
+    let child = command
         .spawn()
-        .expect("spawn the re-exec'd test binary as the channel child")
+        .expect("spawn the re-exec'd test binary as the channel child");
+
+    let writer = ours.try_clone().expect("clone");
+    let side = ShepherdSide {
+        reader: std::io::BufReader::new(ours),
+        writer,
+    };
+    (side, child)
+}
+
+/// The shepherd's end of a named pipe, read and written a line at a time.
+///
+/// Async underneath because the server end of a Windows named pipe is: the
+/// daemon's own is `tokio::net::windows::named_pipe::NamedPipeServer`, and
+/// using anything else here would test a pipe the daemon does not create.
+/// Every call blocks on the runtime, so the test body reads the same on both
+/// platforms.
+#[cfg(windows)]
+struct ShepherdSide {
+    runtime: tokio::runtime::Runtime,
+    pipe: tokio::io::BufReader<tokio::net::windows::named_pipe::NamedPipeServer>,
+}
+
+#[cfg(windows)]
+impl ShepherdSide {
+    /// The next line the child sent, without its newline.
+    ///
+    /// # Panics
+    ///
+    /// If the child sends nothing within [`DEADLINE`], or closes its end.
+    #[track_caller]
+    fn read_line(&mut self) -> String {
+        use tokio::io::AsyncBufReadExt as _;
+
+        // Split the borrow: `block_on` takes `&self` on the runtime while
+        // the read needs `&mut` on the pipe, and they are different fields.
+        let Self { runtime, pipe } = self;
+        let mut line = String::new();
+        let read = runtime
+            .block_on(async { tokio::time::timeout(DEADLINE, pipe.read_line(&mut line)).await })
+            .expect("the child sent nothing within the deadline")
+            .expect("read from the pipe");
+        assert!(read > 0, "the child closed its end of the channel");
+        line.trim_end().to_string()
+    }
+
+    /// Sends one line to the child, newline appended.
+    ///
+    /// # Panics
+    ///
+    /// If the write fails.
+    #[track_caller]
+    fn write_line(&mut self, line: &str) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let Self { runtime, pipe } = self;
+        let framed = format!("{line}\n");
+        runtime
+            .block_on(async {
+                pipe.write_all(framed.as_bytes()).await?;
+                pipe.flush().await
+            })
+            .expect("write to the pipe");
+    }
+}
+
+/// Creates the channel's pipe, spawns the child pointed at it by name, and
+/// waits for the child to open it.
+///
+/// The order matters and is the daemon's: the pipe exists before the child
+/// does, so the child's own open cannot lose a race with it. `connect`
+/// resolves once the child has opened its end -- which `serve()` does at
+/// startup, before it registers a single handler.
+#[cfg(windows)]
+fn open_channel_and_spawn_child() -> (ShepherdSide, std::process::Child) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    // Unique per process, as the daemon's is unique per spawn. This test is
+    // the only thing in its own process that opens one, so a pid is enough
+    // where the daemon needs a nonce.
+    let name = format!(r"\\.\pipe\shep-channel-test-{}", std::process::id());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime for the shepherd end");
+    // `ServerOptions::create` registers with the reactor, so it has to run
+    // inside the runtime's context even though it is not itself async.
+    let server = {
+        let _guard = runtime.enter();
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&name)
+            .expect("create the channel's pipe")
+    };
+
+    let mut command = base_command();
+    command
+        .env_remove("SHEP_CHANNEL_FD")
+        .env("SHEP_CHANNEL_PIPE", &name);
+    let child = command
+        .spawn()
+        .expect("spawn the re-exec'd test binary as the channel child");
+
+    runtime
+        .block_on(async { tokio::time::timeout(DEADLINE, server.connect()).await })
+        .expect("the child never opened the pipe within the deadline")
+        .expect("accept the child's connection");
+
+    let side = ShepherdSide {
+        pipe: tokio::io::BufReader::new(server),
+        runtime,
+    };
+    (side, child)
 }
