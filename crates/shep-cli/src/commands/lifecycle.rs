@@ -2854,10 +2854,20 @@ mod tests {
         use shep_core::status::ProcStatus;
         move |request| match request {
             Request::ListFlock => Response::Flock(flock.clone()),
-            // Accepted and reported as a no-op. A load that changed
-            // nothing is the ordinary case for these fixtures, which are
-            // about respawn selectors rather than about config.
-            Request::ApplyConfig { .. } => Response::Applied(Vec::new()),
+            // One entry per app named, which is what `Response::Applied`
+            // promises and what the daemon really does: an app missing from
+            // that answer is indistinguishable from an app the daemon
+            // dropped. Every entry is a no-op, since these fixtures are
+            // about respawn selectors rather than about config -- but a
+            // fake allowed to send a reply the daemon cannot is a fake that
+            // can hide a real defect.
+            Request::ApplyConfig { apps, .. } => Response::Applied(
+                apps.iter()
+                    .map(|app| {
+                        SheepApplied::new(app.config.name.clone(), Vec::new(), Vec::new(), None)
+                    })
+                    .collect(),
+            ),
             Request::Restart { selector } => {
                 let SelectorSpec::Id(id) = selector else {
                     // Never reached by a correct build, and asserted on
