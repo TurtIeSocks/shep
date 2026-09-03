@@ -1139,34 +1139,42 @@ async fn apply_declared(
     streams: &mut Streams<'_>,
     resumed: &[(DeclaredApp, Vec<shep_core::protocol::ProcessInfo>)],
     reset: ResetDepth,
-) {
+) -> ExitCode {
     let apps: Vec<DeclaredApp> = resumed
         .iter()
         .filter(|(app, _)| !app.declared.is_empty())
         .map(|(app, _)| app.clone())
         .collect();
     if apps.is_empty() {
-        return;
+        return ExitCode::Success;
     }
     let report = match client
         .request_with_deadline(Request::ApplyConfig { apps, reset }, Some(START_DEADLINE))
         .await
     {
         Ok(Response::Applied(report)) => report,
+        // `Response` is `#[non_exhaustive]`, so an answer this client does
+        // not recognise is a daemon-side fault rather than a bad file --
+        // `request_and_render` calls the same case `Internal` for the same
+        // reason.
         Ok(_other) => {
             let message = "the daemon answered the config load with a response this client does \
                  not understand; the Flockfile's edits are not in effect";
-            streams.aside("start", message);
-            return;
+            return streams.fail(ExitCode::Internal, message);
         }
+        // The code the class of failure already has: an unreachable daemon
+        // is `DaemonUnreachable`, an expired deadline is `DeadlineExceeded`,
+        // a daemon-side refusal is whatever its `RpcErrorCode` maps to.
+        // Inventing one here would answer a transport question with a
+        // configuration answer.
         Err(err) => {
             let message = format!(
                 "the Flockfile's edits could not be applied, so they are not in effect: {err}"
             );
-            streams.aside("start", &message);
-            return;
+            return streams.fail(ExitCode::from(&err), &message);
         }
     };
+    let mut failure: Option<ExitCode> = None;
     for sheep in report {
         // An app with nothing to say prints nothing. A deploy re-runs the
         // same unchanged Flockfile over and over, and eleven "nothing to
@@ -1175,7 +1183,58 @@ async fn apply_declared(
         let Some(message) = applied_line(&sheep) else {
             continue;
         };
-        streams.aside("start", &message);
+        if sheep.refused.is_some() {
+            // Reported as an ERROR and not as an aside, and the exit code
+            // follows it out. A refusal means some of the config the
+            // operator declared did not land, and a load that refused three
+            // apps and exited 0 tells `shep start F.toml && deploy` to carry
+            // on -- the silent-edit failure this verb exists to fix,
+            // arriving through the report instead of through the merge.
+            // `shep stock`'s partial scale-up is the same shape and has
+            // returned non-zero since it shipped.
+            //
+            // Every app is reported before the code is returned, matching
+            // `resume_all`: stopping at the first refusal would leave the
+            // operator guessing about the rest of the file.
+            failure = failure.or(Some(streams.fail(REFUSED_EXIT, &message)));
+        } else {
+            streams.aside("start", &message);
+        }
+    }
+    failure.unwrap_or(ExitCode::Success)
+}
+
+/// What a per-app refusal inside an otherwise successful load exits with.
+///
+/// ONE code for every refusal, and that is a limit of the wire rather than a
+/// judgement that they are all the same thing. [`SheepApplied::refused`]
+/// carries a SENTENCE, deliberately -- the daemon's refusals are prose an
+/// operator reads, and several of them name the remedy -- so a client cannot
+/// recover which class a refusal belongs to without matching on that prose,
+/// which would couple this file to the daemon's exact wording and break the
+/// moment anybody improved it.
+///
+/// `InvalidConfig` is the honest single answer: every refusal means the
+/// daemon would not put some part of the declared configuration into effect,
+/// and that is what code 4 says everywhere else in this CLI. It is not right
+/// for all of them -- a scale-up that ran out of room part-way is the same
+/// event `Request::Scale` answers with `SpawnFailed`, and a store that could
+/// not be read is a daemon-side fault -- and closing that gap needs a
+/// machine-readable class beside the sentence on the wire, which is a
+/// protocol addition rather than a client fix.
+const REFUSED_EXIT: ExitCode = ExitCode::InvalidConfig;
+
+/// The first of two codes to have failed, `Success` when neither did.
+///
+/// `start` does its work in order and reports the FIRST thing that went
+/// wrong, the discipline `request_each` states for the selector-taking
+/// verbs: a later failure overwriting an earlier one leaves the operator
+/// reading about the symptom instead of the cause.
+fn first_failure(earlier: ExitCode, later: ExitCode) -> ExitCode {
+    if earlier == ExitCode::Success {
+        later
+    } else {
+        earlier
     }
 }
 
@@ -1505,7 +1564,12 @@ async fn start_one(
     // top of the run rather than under it. It matters more now than it did
     // when this was only a warning -- a `NeedsRespawn` field parks for the
     // next spawn, and the resume immediately below is that spawn.
-    apply_declared(client, streams, &resumed, ResetDepth::None).await;
+    // The code is carried rather than returned on the spot. A refused field
+    // must not stop the flock coming back up: the resumes below are what
+    // `start` was asked to do, they are what an operator running this in a
+    // deploy needs to happen, and the refusal is reported the moment it
+    // arrives either way. What it changes is what the verb EXITS with.
+    let applied = apply_declared(client, streams, &resumed, ResetDepth::None).await;
     if !resumed.is_empty() {
         // `None`, not the operator's token: this arm reached the flock through
         // a Flockfile or a path, so there is no selector to quote back in the
@@ -1517,11 +1581,11 @@ async fn start_one(
             .collect();
         let code = resume_all(client, streams, None, &existing, started).await;
         if code != ExitCode::Success {
-            return code;
+            return first_failure(applied, code);
         }
     }
     if fresh.is_empty() {
-        return ExitCode::Success;
+        return applied;
     }
     let apps = fresh;
 
@@ -1540,7 +1604,7 @@ async fn start_one(
     )
     .await;
     started.extend(procs);
-    failure.unwrap_or(ExitCode::Success)
+    first_failure(applied, failure.unwrap_or(ExitCode::Success))
 }
 
 /// Stops the sheep matching `args.selector`.
@@ -2978,6 +3042,116 @@ mod tests {
         assert!(
             said.contains("shep reload zam"),
             "and what promotes the rest: {said}"
+        );
+    }
+
+    /// fails if a load that refused an app exits zero.
+    ///
+    /// The warning this replaced was advisory, so exiting zero was right for
+    /// it. A refusal is not advisory: it means some of the configuration the
+    /// operator declared did not land, and `shep start F.toml && deploy`
+    /// exiting zero on that tells CI to carry on. That is the silent-edit
+    /// failure this verb exists to fix, arriving through the report instead
+    /// of through the merge. `shep stock`'s partial scale-up is the same
+    /// shape and has returned non-zero since it shipped.
+    ///
+    /// Both apps are in one reply on purpose. A run where everything
+    /// refused could be made to pass by any rule that failed a load
+    /// wholesale; this asks the harder question, that one refusal among
+    /// successes still fails the verb, and that the app that DID apply is
+    /// still reported rather than swallowed by the failure.
+    #[tokio::test]
+    async fn a_load_that_refused_an_app_exits_non_zero_and_still_reports_the_rest() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"zam\"\nscript = \"./srv\"\nmax_restarts = 99\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let flock = a_clustered_flock(&[0, 1, 2]);
+        let (client, _envelopes) = fake_client_answering(&path, move |request| match request {
+            Request::ListFlock => Response::Flock(flock.clone()),
+            Request::ApplyConfig { .. } => Response::Applied(vec![
+                SheepApplied::new("zam", vec!["max_restarts".to_string()], Vec::new(), None),
+                SheepApplied::new(
+                    "api",
+                    Vec::new(),
+                    Vec::new(),
+                    Some("instances: a plain load never reshapes a flock".to_string()),
+                ),
+            ]),
+            _ => Response::Pong,
+        })
+        .await;
+
+        let (code, printed, said) = start_against(&client, flockfile.to_str().unwrap()).await;
+
+        assert_eq!(
+            code,
+            ExitCode::InvalidConfig,
+            "a refused load is a failed load: {said}"
+        );
+        assert!(
+            said.contains("never reshapes a flock"),
+            "the refusal reaches the operator: {said}"
+        );
+        assert!(
+            said.contains("applied max_restarts"),
+            "and so does what did land, beside it: {said}"
+        );
+        assert!(
+            printed.is_empty(),
+            "a failed verb leaves stdout empty, so `--format json` never \
+             carries a data envelope beside an error one: {printed}"
+        );
+    }
+
+    /// fails if a load that failed for a reason other than a refusal exits
+    /// zero, or exits with the refusal's configuration code.
+    ///
+    /// Two claims in one case, and the second is why it is not folded into
+    /// the one above. A load whose answer this client cannot read means the
+    /// whole file went nowhere, which is worse than one refused app, so it
+    /// cannot be the path that still exits zero. And it is a daemon-side
+    /// fault rather than a bad file, so it takes the code its own class
+    /// already has -- `request_and_render` calls the identical case
+    /// `Internal` -- instead of being flattened into the refusal code.
+    #[tokio::test]
+    async fn a_load_that_failed_for_another_reason_exits_with_its_own_class() {
+        use shep_client::testing::fake_client_answering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let flockfile = dir.path().join("Flockfile.toml");
+        std::fs::write(
+            &flockfile,
+            "[[app]]\nname = \"zam\"\nscript = \"./srv\"\nmax_restarts = 99\n",
+        )
+        .unwrap();
+        let path = shep_client::testing::control_address(dir.path());
+        let flock = a_clustered_flock(&[0, 1, 2]);
+        // `Pong` to an `ApplyConfig`: a daemon answering a verb with another
+        // verb's reply. `Response` is `#[non_exhaustive]`, so this is also
+        // the shape a daemon NEWER than this client produces.
+        let (client, _envelopes) = fake_client_answering(&path, move |request| match request {
+            Request::ListFlock => Response::Flock(flock.clone()),
+            _ => Response::Pong,
+        })
+        .await;
+
+        let (code, _printed, said) = start_against(&client, flockfile.to_str().unwrap()).await;
+
+        assert_eq!(
+            code,
+            ExitCode::Internal,
+            "its own class, not the refusal code: {said}"
+        );
+        assert!(
+            said.contains("not in effect"),
+            "and the operator is told the edits went nowhere: {said}"
         );
     }
 

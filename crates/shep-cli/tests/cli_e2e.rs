@@ -6897,6 +6897,85 @@ fn a_flockfile_edit_to_a_registered_sheep_is_reported_rather_than_swallowed() {
     graceful_kill(home);
 }
 
+/// A load that refused one app exits non-zero, and still reports the app it
+/// applied.
+///
+/// The warning this replaced was advisory, so exiting zero was right for it.
+/// A refusal is not: it means some of the configuration the operator
+/// declared did not land, and `shep start Flockfile.toml && deploy` exiting
+/// zero on that tells CI to carry on. That is the silent-edit failure this
+/// verb exists to fix, arriving through the report rather than through the
+/// merge. `shep stock`'s partial scale-up is the same shape and has returned
+/// non-zero since it shipped.
+///
+/// The refusal is a real one from the real daemon rather than a fake's
+/// script: a plain load never reshapes a flock, so a file that grows an
+/// `instances` line is refused that one field by name and told which flag
+/// would take it. Reaching it needs no fault injection and no timing.
+///
+/// What a broken implementation this catches: the exit code left at zero
+/// (`code` is 0); every refusal flattened into a wholesale failure that
+/// swallows the rest of the file (`applied` is missing from stderr); the
+/// report stopped at the first refusal, which for a two-app file would drop
+/// whichever app came second.
+#[test]
+fn a_load_that_refused_one_app_exits_non_zero_and_still_reports_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let script = write_test_script(&dir);
+    // `steady` carries the field that lands, `stocky` the one that cannot.
+    // `max_restarts` is read when a sheep exits, so it is in force the
+    // moment it reaches the stored spec and reports as APPLIED.
+    let body = |extra: &str| {
+        format!(
+            "[[app]]\nname = \"steady\"\nscript = '{}'\n{extra}\n\
+             [[app]]\nname = \"stocky\"\nscript = '{}'\n",
+            script.display(),
+            script.display(),
+        )
+    };
+    let flockfile = write_flockfile(&dir, &body(""));
+    let mut guard = DaemonGuard::default();
+
+    let boot = shep(home).arg("start").arg(&flockfile).output().unwrap();
+    guard.adopt_home(home);
+    assert_success(&boot);
+    poll_flock(home, |info| info["status"] == "online");
+
+    // One field each: one the daemon applies, one it refuses.
+    write_flockfile(
+        &dir,
+        &format!(
+            "[[app]]\nname = \"steady\"\nscript = '{}'\nmax_restarts = 9\n\
+             [[app]]\nname = \"stocky\"\nscript = '{}'\ninstances = 2\n",
+            script.display(),
+            script.display(),
+        ),
+    );
+    let again = shep(home).arg("start").arg(&flockfile).output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    // Pinned at 4 rather than merely non-zero. `InvalidConfig` is the code
+    // the rest of this CLI uses for a configuration the daemon would not
+    // accept, and pinning it is what makes a later change to the mapping a
+    // decision somebody takes rather than a drift nobody notices.
+    assert_eq!(
+        again.status.code(),
+        Some(4),
+        "a refused load is a failed load, and an invalid-config one: {stderr}"
+    );
+    assert!(
+        stderr.contains("stocky") && stderr.contains("reshapes a flock"),
+        "the refusal names the app and what was refused: {stderr}"
+    );
+    assert!(
+        stderr.contains("applied max_restarts"),
+        "and the app that DID apply is still reported beside it: {stderr}"
+    );
+
+    graceful_kill(home);
+}
+
 /// One app whose script does not exist refuses the whole Flockfile, before
 /// anything is registered, and names every app that failed.
 ///
