@@ -12,7 +12,9 @@ fn main() {
         format!("collected, params={params:?}")
     });
     shepherd.on_shutdown(|| std::process::exit(0));
-    shepherd.ready().expect("say ready");
+    shepherd
+        .ready()
+        .expect("failed to send the readiness message");
     shepherd.metric("rps", 42.0);
 
     // Park. The reader thread is doing the work; the test kills this process.

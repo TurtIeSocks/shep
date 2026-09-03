@@ -12,6 +12,20 @@
 
 **Base:** cut from `origin/main` after the spec commits (`d065f21`, `c33d044`).
 
+## What changed while this was executed
+
+This plan is what was planned. It is not a description of what shipped, and
+following it as written would reintroduce defects that were found and fixed
+during execution. The material differences:
+
+- Task 1 deletes `crates/shep-core/src/protocol/channel.rs` and removes `pub mod channel`. What shipped keeps that path as a `#[deprecated]` shim re-exporting from `shep-channel`, because it was a public module of a published crate.
+- The descriptor parser accepts any number that parses. What shipped refuses anything below 3, so a stray `SHEP_CHANNEL_FD` cannot adopt and later close stdin, stdout or stderr.
+- `Channel::open` has no ownership guard here. What shipped takes the descriptor at most once per process and returns `ChannelError::AlreadyTaken` on a second call. Without that, two calls double-close it, which aborts with an IO safety violation.
+- `is_active()` reads `outbox.is_some()` here. What shipped also checks whether the outbox is closed, so it answers whether the channel is live rather than whether one existed at startup.
+- `metric` takes `impl AsRef<str>` here. What shipped takes `impl Into<String>`.
+- `start()` discards both thread-spawn results with `.ok()` here. What shipped handles them, because a writer thread that never starts makes `ready()` report success for a message nothing will ever write.
+- The reader holds the dispatch read guard across the app's handler here. What shipped resolves under the guard and runs outside it, so a handler that registers a handler does not deadlock.
+
 ## Where this plan sits
 
 Five plans. This is the first, and every later one consumes what it produces.

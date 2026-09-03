@@ -205,9 +205,10 @@ fn spawn_child(theirs: UnixStream) -> std::process::Child {
         .env(CHILD_VAR, "1")
         .env("SHEP_CHANNEL_FD", "3")
         .env("SHEP_CHANNEL_VERSION", "1")
-        // Set so the child takes the no-channel warning path only if it has
-        // no channel, which it does. Without this the test would prove
-        // nothing about a process running under shep.
+        // The warning is gated on SHEP_NAME, so without this the child
+        // would stay silent for the wrong reason and the assertion below
+        // would prove nothing. With it set, the child is a process running
+        // under shep that DOES have a channel, so the advice must not fire.
         .env("SHEP_NAME", "answers")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

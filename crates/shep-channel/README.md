@@ -5,13 +5,19 @@ emit a metric, answer an action.
 
 ```rust
 let shepherd = shep_channel::serve();
+let (stop, wait_for_stop) = std::sync::mpsc::channel();
 
 shepherd.on_action("gc", |params, _name| {
     format!("collected, params={params:?}")
 });
-shepherd.on_shutdown(|| server.graceful_stop());
+shepherd.on_shutdown(move || {
+    let _ = stop.send(());
+});
 shepherd.ready()?;
 shepherd.metric("rps", 4200.0);
+
+// Serve until the shepherd asks this app to stop.
+wait_for_stop.recv().ok();
 ```
 
 Ask for a channel in the Flockfile with `channel = true`, or get one from

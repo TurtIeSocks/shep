@@ -30,7 +30,8 @@ An app author can forget that. A library cannot.
 ## What the wire actually is
 
 Pinned so the rest of this document can lean on it.
-`crates/shep-core/src/protocol/channel.rs:48` sets `CHANNEL_VERSION` to `"1"`.
+`crates/shep-channel/src/wire.rs` sets `CHANNEL_VERSION` to `"1"`. It lived
+in `shep-core` when this was written; D10 below is what moved it.
 Five message shapes total: `Ready`, `Metric`, `ActionReply` going up,
 `Shutdown` and `Action` coming down.
 

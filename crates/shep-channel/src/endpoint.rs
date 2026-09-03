@@ -131,14 +131,24 @@ pub(crate) fn connect(endpoint: &Endpoint) -> Result<(Transport, Transport), Cha
         }
         #[cfg(windows)]
         Endpoint::Pipe(path) => {
-            if CHANNEL_TAKEN.swap(true, Ordering::SeqCst) {
-                return Err(ChannelError::AlreadyTaken);
-            }
-            std::fs::OpenOptions::new()
+            // Opened BEFORE the claim, which is the opposite order to the
+            // unix arm above, because this step can fail and that one
+            // cannot. `from_raw_fd` always takes the descriptor, so
+            // claiming first is honest there. An `open` that fails after a
+            // claim would leave the channel marked taken by a process that
+            // never took it, and every later attempt would be refused.
+            let opened = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(path)
-                .map_err(ChannelError::Io)?
+                .map_err(ChannelError::Io)?;
+            if CHANNEL_TAKEN.swap(true, Ordering::SeqCst) {
+                // Another caller claimed it while this one was opening.
+                // Drop this handle rather than return a second owner.
+                drop(opened);
+                return Err(ChannelError::AlreadyTaken);
+            }
+            opened
         }
         #[cfg(unix)]
         Endpoint::Pipe(path) => {

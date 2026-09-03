@@ -122,6 +122,14 @@ impl Outbox {
     /// [`ChannelError::Closed`] when the outbox closes while waiting, which
     /// is the shepherd having gone away.
     pub(crate) fn push_blocking(&self, message: ChildMessage) -> Result<(), ChannelError> {
+        if self.capacity == 0 {
+            // Nothing is ever retained, so the wait below would never end:
+            // its condition is `len >= 0`, which no drain can falsify.
+            // `push_lossy` counts a drop in this case; a message that must
+            // not be dropped has no honest outcome here but a refusal, and
+            // `ready()` calls straight into this.
+            return Err(ChannelError::Closed);
+        }
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         while !inner.closed && inner.queue.len() >= self.capacity {
             inner = self
@@ -325,6 +333,28 @@ mod tests {
         outbox.close();
 
         let outcome = rx.recv_timeout(DEADLINE).expect("still parked after close");
+        assert!(matches!(outcome, Err(ChannelError::Closed)));
+        handle.join().expect("pusher panicked");
+    }
+
+    /// fails if a must-deliver push parks on an outbox that can never hold
+    /// anything. The wait condition is `len >= capacity`, which at capacity 0
+    /// is `0 >= 0` and no drain can falsify, so a regression here hangs
+    /// `ready()` rather than failing it. Bounded for that reason: a
+    /// regression fails at `DEADLINE` instead of parking the suite.
+    #[test]
+    fn a_must_deliver_push_refuses_a_zero_capacity_outbox_rather_than_parking() {
+        let outbox = Arc::new(Outbox::new(0));
+        let (tx, rx) = mpsc::channel();
+        let pusher = Arc::clone(&outbox);
+        let handle = std::thread::spawn(move || {
+            tx.send(pusher.push_blocking(ChildMessage::Ready))
+                .expect("report");
+        });
+
+        let outcome = rx
+            .recv_timeout(DEADLINE)
+            .expect("push_blocking parked on a zero-capacity outbox");
         assert!(matches!(outcome, Err(ChannelError::Closed)));
         handle.join().expect("pusher panicked");
     }
