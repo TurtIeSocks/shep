@@ -149,6 +149,29 @@ const READ_BUFFER: usize = 8 * 1024;
 /// that reads as it writes never catches up. Here the writer is normally
 /// already gone, so reading the pipe terminates on its own and the budget is
 /// a backstop rather than the mechanism.
+///
+/// # Where the number comes from
+///
+/// Not a measurement, and it should not be read as one. Nothing here is
+/// tuned against a rate, because the case that spends the budget is the case
+/// where no amount of budget is enough: a lamb that outlives its parent can
+/// hold the pipe open and talk for as long as it likes. The only question
+/// the number answers is how long ONE ending sheep may delay its own pump's
+/// teardown, and 100ms is chosen to be shorter than anything an operator
+/// perceives on a `shep stop` while still being many times what a drain of a
+/// pipe's worth of bytes needs.
+///
+/// What DOES have a measurement behind it is that the budget is unreachable
+/// on the path this exists for. A reaped child has no write ends left, so
+/// both streams answer EOF on the first read:
+/// `a_last_line_written_before_the_sheep_task_lets_go_reaches_the_file`
+/// closes both and runs 32 attempts in 0.14s, which is 4ms each including
+/// building a fresh pump and two files. Holding one write end open instead
+/// took the same test to 2.35s, or the full budget on most attempts, which
+/// is the lamb case behaving exactly as described.
+///
+/// Raise it if a real sheep is ever found losing a line to it. Lower it if a
+/// stop is ever measured waiting on it. Neither has happened.
 const FINAL_DRAIN: Duration = Duration::from_millis(100);
 
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
@@ -2180,13 +2203,7 @@ fn spawn_log_pump<O, E>(
                 // Documented cancel-safe, as a `select!` branch must be: a
                 // closed channel stays closed, so losing the race loses
                 // nothing.
-                () = logs_tx.closed() => {
-                    // Not a bare `break`: whatever the child wrote and this
-                    // pump has not read yet is still owed to the file. See
-                    // `FINAL_DRAIN`.
-                    final_drain(&mut files, &mut streams).await;
-                    break;
-                }
+                () = logs_tx.closed() => break,
 
                 // Cancel-safe: rebuilt against the same absolute deadline
                 // every iteration, so losing the race costs nothing.
@@ -2194,6 +2211,21 @@ fn spawn_log_pump<O, E>(
                     files.flush_idle().await;
                 }
             }
+        }
+        // Whatever the streams still hold, before the readers go with this
+        // task. Here rather than in the branch that prompted it, because
+        // FOUR exits reach this line and every one of them can leave a line
+        // unread: two `AfterLine::LogsClosed`, the control channel's own
+        // `None`, and `logs_tx.closed()`. Only the `while` running out is
+        // free of it, and that one costs nothing, since both streams are
+        // already retired and the drain has nothing to loop over.
+        //
+        // Not while parked. A parked pump has had its descriptors reported
+        // and is holding the pipe for a successor to adopt; reading it here
+        // would take bytes out of a pipe this image no longer owns the
+        // reading of. The `select!`'s own read arms carry the same guard.
+        if files.reading() {
+            final_drain(&mut files, &mut streams).await;
         }
         // A `BufWriter` cannot flush itself as it drops, and every way out of
         // the loop above drops both of them: without this, whatever a child
@@ -2933,6 +2965,50 @@ mod tests {
             assert!(
                 settled.is_ok(),
                 "attempt {attempt}: the pump dropped the line it had not read yet, \
+                 leaving {:?}",
+                fs::read_to_string(&pump.out_path)
+            );
+        }
+    }
+
+    /// The same line, lost the other way: through the control channel
+    /// rather than through `logs`.
+    ///
+    /// `logs` and `log_ctl` do not close together in the ordinary case. The
+    /// sheep task holds the `logs` receiver and returns when its child does,
+    /// while the slot holds a `log_ctl` sender that outlives it, so the
+    /// pump's `ctl_rx.recv()` answers `None` only once the slot goes too:
+    /// a delete, or the daemon shutting down. Those are the cases where both
+    /// close at once, and the control arm's own `None` is then a fourth way
+    /// out of the loop that can win the same random pick.
+    ///
+    /// Which is why the drain does not live in the branch that prompted it.
+    /// It runs on the way out, once, so it cannot matter which exit was
+    /// taken. This case fails if it is ever moved back into one of them.
+    #[tokio::test]
+    async fn a_last_line_survives_the_control_channel_closing_with_the_logs() {
+        for attempt in 0..RACE_ATTEMPTS {
+            let mut pump = PumpHarness::start();
+            pump.out_writer.write_all(b"last-words\n").await.unwrap();
+            drop(pump.out_writer);
+            drop(pump.err_writer);
+            // A delete: the slot's sender and the sheep task's receiver go
+            // in the same moment, so all four exits are live at once.
+            drop(pump.ctl);
+            drop(pump.logs);
+
+            let settled = timeout(PUMP_DEADLINE, async {
+                while !fs::read_to_string(&pump.out_path)
+                    .unwrap_or_default()
+                    .contains("last-words")
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(
+                settled.is_ok(),
+                "attempt {attempt}: the pump took an exit that skips the drain, \
                  leaving {:?}",
                 fs::read_to_string(&pump.out_path)
             );
