@@ -253,7 +253,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       # `--all-features` mirrors the task gate, as in `lint` above.
-      - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      - uses: taiki-e/install-action@nextest
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      - run: "cargo +${{ matrix.toolchain }} nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # nextest does not run doctests at all, so they need their own line
+      # or they stop running on this platform. 14 of them, 6.8s warm.
+      - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
   minimal-versions:
     needs: changes
@@ -267,7 +273,9 @@ jobs:
       - run: rustup toolchain install nightly stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo +nightly generate-lockfile -Z minimal-versions
-      - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      - uses: taiki-e/install-action@nextest
+      - run: "cargo +stable nextest run --profile ci --workspace -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+      - run: 'cargo +stable test --workspace --doc'
   musl:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -298,7 +306,9 @@ jobs:
       # serialising. The number is a judgement call and the headroom is
       # large, since this job has been running 132 to 185 seconds against a
       # twenty-minute timeout. If it flakes here again, one is affordable.
-      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --test-threads=2 --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      - uses: taiki-e/install-action@nextest
+      - run: "cargo nextest run --profile ci --workspace --locked --target x86_64-unknown-linux-musl --test-threads 2 -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl --doc'
   # CLAUDE.md's phase-gate cross-check
   # (`cargo check --workspace --all-targets --all-features --target
   # x86_64-pc-windows-gnu`) had no workflow behind it, so it only ran when a
@@ -360,7 +370,11 @@ jobs:
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      - uses: taiki-e/install-action@nextest
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      - run: "cargo nextest run --profile ci -p shep-daemon --locked --no-default-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      - run: 'cargo test -p shep-daemon --locked --no-default-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       # shep-client's `schema` feature is ON by default and a dog is
       # allowed to turn it off, so the opt-out needs a leg of its own: the
@@ -372,7 +386,9 @@ jobs:
       # way and only a doctest run reads it.
       - run: cargo test -p shep-client --locked --no-default-features
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
+      - run: "cargo nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      - run: 'cargo test --workspace --locked --all-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
   # Tests that need a quiet machine, run serially in a job of their own.
   #
@@ -443,7 +459,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots signal_ignored_then_kill_tree_reaps a_reload_costs_a'
+      - uses: taiki-e/install-action@nextest
+      - run: "cargo nextest run --profile ci-slow --workspace --locked --all-features -E 'test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a)'"
   # `cargo llvm-cov` on its own runs `cargo test --tests`, and `--tests` does
   # not build a package's examples. Four of `daemon_e2e`'s reload tests exec
   # `examples/reuse_port_sheep`, the SO_REUSEPORT fixture the whole reload
@@ -473,10 +490,11 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
       - run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          cargo test --workspace --locked -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a
+          cargo nextest run --profile ci --workspace --locked -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'
           cargo llvm-cov report --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with: { name: coverage, path: lcov.info }
