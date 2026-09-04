@@ -12,6 +12,9 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+use clap::ValueEnum as _;
+use shep_core::config::ResetDepth;
+
 /// The verb groups [`HELP_TEMPLATE`] renders, and the source of truth the
 /// drift test checks the real command tree against.
 ///
@@ -674,29 +677,84 @@ pub struct StartArgs {
     /// `server.js` as a script, which is what it has always meant.
     #[arg(long)]
     pub flockfile: bool,
-    /// Put process settings back to what the Flockfile says, keeping env.
+    /// Widen a Flockfile load past its additive default: append nothing,
+    /// overwrite instead. A mode touches only what its name says.
     ///
-    /// Every setting goes back, whether the file declares it or not: a key
-    /// the file is silent about goes to the value a fresh `shep start` off
-    /// that same file would give it. Without this flag a load is additive:
-    /// it appends keys nobody has set and overwrites nothing. `env` is
-    /// operator-supplied data and survives even this reset; everything else
-    /// is operator-tuned policy, and resetting policy is recoverable.
-    /// Refused when the target supplies no template to reset to: a sheep
-    /// name reads no file, and a bare script path is a command line rather
-    /// than a file.
-    #[arg(long, conflicts_with = "reset_all")]
-    pub reset: bool,
-    /// Put everything back to what the Flockfile says, including env, and
-    /// drop the override record.
-    ///
-    /// The wider of the two resets: `--reset` keeps `env` because it is
-    /// operator-supplied data, not policy, and losing it takes the app's
-    /// database away. This flag drops it too. Refused on the same targets
-    /// `--reset` is: a sheep name reads no file, and a bare script path is a
+    /// `file` puts back what the template declares, `env` kept. `policy`
+    /// puts back every setting but `env`, declared or not. `env` puts back
+    /// only `env`. `all` puts back everything, `env` included, and drops the
+    /// override record. Refused when the target supplies no template to
+    /// reset to: a sheep name reads no file, and a bare script path is a
     /// command line rather than a file.
-    #[arg(long = "reset-all")]
-    pub reset_all: bool,
+    ///
+    /// The value is required, with an equals sign: `--reset=file`, never
+    /// `--reset file`. `targets` is a greedy variadic positional, and a
+    /// space-separated value next to one of those is where argument parsing
+    /// gets ambiguous.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "",
+        value_parser = parse_reset_mode
+    )]
+    pub reset: Option<ResetMode>,
+}
+
+/// How far a `shep start`/`shep add` load widens past its additive default.
+///
+/// A CLI-local mirror of [`ResetDepth`], not `ResetDepth` itself: shep-core
+/// carries no `clap` dependency, and giving a wire protocol type a
+/// command-line-parser dependency to save this mapping would be the wrong
+/// trade. [`ResetDepth::None`] has no flag value of its own -- omitting
+/// `--reset` entirely is how an operator asks for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum ResetMode {
+    /// Put back what the template declares, `env` kept.
+    File,
+    /// Put back every setting but `env`, declared or not.
+    Policy,
+    /// Put back only `env`.
+    Env,
+    /// Put back everything, `env` included, and drop the override record.
+    All,
+}
+
+impl ResetMode {
+    /// Maps to the wire type `Request::ApplyConfig` actually carries.
+    #[must_use]
+    pub fn to_depth(self) -> ResetDepth {
+        match self {
+            Self::File => ResetDepth::File,
+            Self::Policy => ResetDepth::Policy,
+            Self::Env => ResetDepth::Env,
+            Self::All => ResetDepth::All,
+        }
+    }
+}
+
+/// The whole of `--reset`'s teaching surface, pinned as an exact string by
+/// `reset_with_no_value_is_a_usage_error_naming_every_mode`: a destructive
+/// verb should make the operator name the destruction, the way `git reset`
+/// makes them choose between `--soft`, `--mixed` and `--hard`.
+///
+/// Reached two ways: `--reset` with no value at all (clap's own message for
+/// that case names none of the four modes), and a value that names none of
+/// them. Both are refusals to guess, so both get the same table.
+const RESET_USAGE: &str = "--reset needs a mode: file, policy, env, or all\n  \
+    file    put back what the template declares, env kept\n  \
+    policy  put back every setting but env, declared or not\n  \
+    env     put back only env\n  \
+    all     put back everything, env included, and drop the override record";
+
+/// clap's own `ValueEnum` parser, wrapped so a missing or unknown value
+/// prints [`RESET_USAGE`] instead of clap's generic message. `require_equals`
+/// plus `default_missing_value = ""` route a bare `--reset` here with an
+/// empty string, which no mode name matches, so it lands on the same
+/// refusal as a typo.
+fn parse_reset_mode(raw: &str) -> Result<ResetMode, String> {
+    ResetMode::from_str(raw, true).map_err(|_| RESET_USAGE.to_string())
 }
 
 /// Arguments to `shep serve`.
@@ -1725,11 +1783,10 @@ mod tests {
         }
     }
 
-    /// fails if the two flags map to the same depth, or if either can be
-    /// combined with the other. They differ on two axes and a caller must
-    /// pick one.
+    /// fails if a mode value does not reach `StartArgs.reset`, or if a
+    /// target is silently absent from `--reset`.
     #[test]
-    fn the_reset_flags_are_mutually_exclusive_and_map_to_distinct_depths() {
+    fn every_reset_mode_parses_from_its_argv_spelling() {
         use clap::Parser;
 
         fn parse_start(argv: &[&str]) -> StartArgs {
@@ -1739,24 +1796,73 @@ mod tests {
             }
         }
 
-        fn depth_of(args: &StartArgs) -> (bool, bool) {
-            (args.reset, args.reset_all)
+        assert_eq!(parse_start(&["shep", "start", "F.toml"]).reset, None);
+        for (spelling, mode) in [
+            ("file", ResetMode::File),
+            ("policy", ResetMode::Policy),
+            ("env", ResetMode::Env),
+            ("all", ResetMode::All),
+        ] {
+            let flag = format!("--reset={spelling}");
+            assert_eq!(
+                parse_start(&["shep", "start", "F.toml", &flag]).reset,
+                Some(mode),
+                "argv spelling {spelling:?}"
+            );
+        }
+    }
+
+    /// fails if `--reset` with no value produces clap's own generic
+    /// message instead of naming the four modes. Exact string: an error
+    /// that lists three of four modes is worse than none.
+    #[test]
+    fn reset_with_no_value_is_a_usage_error_naming_every_mode() {
+        use clap::Parser;
+
+        let err = Cli::try_parse_from(["shep", "start", "F.toml", "--reset"]).unwrap_err();
+        assert!(
+            err.to_string().contains(RESET_USAGE),
+            "expected the reset table in: {err}"
+        );
+    }
+
+    /// fails if `StartArgs.targets`, a greedy variadic positional, ever
+    /// swallows a mode meant for `--reset`, or a mode swallows a target.
+    /// The equals form is required precisely to rule this out: the
+    /// space-separated form is refused outright rather than resolved either
+    /// way.
+    #[test]
+    fn a_reset_mode_does_not_swallow_the_target() {
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from(["shep", "start", "F.toml", "--reset=file"]).unwrap();
+        match parsed.command {
+            Commands::Start(args) => {
+                assert_eq!(args.targets, vec!["F.toml".to_string()]);
+                assert_eq!(args.reset, Some(ResetMode::File));
+            }
+            other => panic!("expected start, got {other:?}"),
         }
 
-        assert_eq!(
-            depth_of(&parse_start(&["shep", "start", "F.toml"])),
-            (false, false)
-        );
-        assert_eq!(
-            depth_of(&parse_start(&["shep", "start", "F.toml", "--reset"])),
-            (true, false)
-        );
-        assert_eq!(
-            depth_of(&parse_start(&["shep", "start", "F.toml", "--reset-all"])),
-            (false, true)
-        );
+        // Mutation check: drop `require_equals` from the field and this
+        // goes from `is_err()` to `is_ok()` -- clap resolves the
+        // space-separated form instead of refusing it, which is exactly
+        // the ambiguity this flag exists to rule out rather than resolve.
         assert!(
-            Cli::try_parse_from(["shep", "start", "F.toml", "--reset", "--reset-all"]).is_err()
+            Cli::try_parse_from(["shep", "start", "F.toml", "--reset", "file"]).is_err(),
+            "the space-separated form must be refused, not resolved"
+        );
+    }
+
+    /// fails if `--reset` is given a value none of the four modes claims.
+    #[test]
+    fn an_unknown_reset_mode_is_the_same_refusal_as_no_value() {
+        use clap::Parser;
+
+        let err = Cli::try_parse_from(["shep", "start", "F.toml", "--reset=banana"]).unwrap_err();
+        assert!(
+            err.to_string().contains(RESET_USAGE),
+            "expected the reset table in: {err}"
         );
     }
 

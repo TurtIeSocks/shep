@@ -22,7 +22,7 @@ use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec, SheepApp
 use shep_core::selector::ProcessSelector;
 
 use crate::cli::Format;
-use crate::cli::{SelectorArgs, StartArgs, StockArgs};
+use crate::cli::{ResetMode, SelectorArgs, StartArgs, StockArgs};
 use crate::commands::bounded::{Bounded, run_bounded};
 use crate::commands::dogs;
 use crate::commands::selector::parse_selector;
@@ -1355,33 +1355,18 @@ fn apply_interpreters(
     }
 }
 
-/// The depth of an `apply_declared` call chosen by `--reset`/`--reset-all`.
-///
-/// `clap`'s `conflicts_with` already refuses the two together, so at most one
-/// of `args.reset`/`args.reset_all` is ever set here.
 /// The reset flag the operator typed, `None` when they typed neither.
 ///
 /// Named so the two arms that REFUSE a reset can quote back the flag the
-/// operator actually wrote. `clap`'s `conflicts_with` refuses the two
-/// together, so `--reset-all` winning here is a tie that cannot happen.
+/// operator actually wrote. There is only one flag now, but the two refusal
+/// sites want the flag's own spelling rather than a literal, so this stays a
+/// function rather than a field read.
 fn reset_flag(args: &StartArgs) -> Option<&'static str> {
-    if args.reset_all {
-        Some("--reset-all")
-    } else if args.reset {
-        Some("--reset")
-    } else {
-        None
-    }
+    args.reset.map(|_| "--reset")
 }
 
 fn reset_depth(args: &StartArgs) -> ResetDepth {
-    if args.reset_all {
-        ResetDepth::All
-    } else if args.reset {
-        ResetDepth::Policy
-    } else {
-        ResetDepth::None
-    }
+    args.reset.map_or(ResetDepth::None, ResetMode::to_depth)
 }
 
 /// Which of the two verbs that read a Flockfile is running.
@@ -2120,8 +2105,7 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
-            reset: false,
-            reset_all: false,
+            reset: None,
         };
         {
             let mut streams = Streams {
@@ -2265,8 +2249,7 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
-            reset: false,
-            reset_all: false,
+            reset: None,
         }
     }
 
@@ -3239,14 +3222,14 @@ mod tests {
         );
     }
 
-    /// fails if `--reset`/`--reset-all` do not reach the wire as the depth
-    /// they name. `reset_depth` is the only place that mapping happens, and
+    /// fails if `--reset=<mode>` does not reach the wire as the depth it
+    /// names. `reset_depth` is the only place that mapping happens, and
     /// nothing else in this file would notice if it collapsed to `None`.
     #[tokio::test]
-    async fn reset_flags_choose_the_apply_config_depth_on_the_wire() {
+    async fn reset_modes_choose_the_apply_config_depth_on_the_wire() {
         use shep_client::testing::fake_client_answering;
 
-        async fn sent_depth(reset: bool, reset_all: bool) -> ResetDepth {
+        async fn sent_depth(reset: Option<ResetMode>) -> ResetDepth {
             let dir = tempfile::tempdir().unwrap();
             let flockfile = dir.path().join("Flockfile.toml");
             std::fs::write(
@@ -3260,7 +3243,6 @@ mod tests {
                     .await;
             let mut args = start_args(flockfile.to_str().unwrap());
             args.reset = reset;
-            args.reset_all = reset_all;
             let (code, _printed, _said) = start_against_with_args(&client, &args).await;
             assert_eq!(code, ExitCode::Success);
             let mut sent = Vec::new();
@@ -3273,9 +3255,14 @@ mod tests {
             sent[0]
         }
 
-        assert_eq!(sent_depth(false, false).await, ResetDepth::None);
-        assert_eq!(sent_depth(true, false).await, ResetDepth::Policy);
-        assert_eq!(sent_depth(false, true).await, ResetDepth::All);
+        assert_eq!(sent_depth(None).await, ResetDepth::None);
+        assert_eq!(sent_depth(Some(ResetMode::File)).await, ResetDepth::File);
+        assert_eq!(
+            sent_depth(Some(ResetMode::Policy)).await,
+            ResetDepth::Policy
+        );
+        assert_eq!(sent_depth(Some(ResetMode::Env)).await, ResetDepth::Env);
+        assert_eq!(sent_depth(Some(ResetMode::All)).await, ResetDepth::All);
     }
 
     /// fails if a reset flag is accepted when the target is a NAME. There is
@@ -3291,7 +3278,7 @@ mod tests {
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
 
         let mut args = start_args("zam");
-        args.reset = true;
+        args.reset = Some(ResetMode::Policy);
         let (code, printed, said) = start_against_with_args(&client, &args).await;
 
         assert_eq!(code, ExitCode::Usage);
@@ -3317,7 +3304,7 @@ mod tests {
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
 
         let mut args = start_args(script.to_str().unwrap());
-        args.reset = true;
+        args.reset = Some(ResetMode::Policy);
         let (code, printed, said) = start_against_with_args(&client, &args).await;
 
         assert_eq!(code, ExitCode::Usage);
@@ -3654,8 +3641,7 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
-            reset: false,
-            reset_all: false,
+            reset: None,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();

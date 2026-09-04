@@ -3179,8 +3179,7 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
-            reset: false,
-            reset_all: false,
+            reset: None,
         }
     }
 
