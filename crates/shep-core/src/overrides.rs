@@ -295,6 +295,10 @@ fn write_file(path: &Path, file: &OverridesFile) -> Result<(), OverridesError> {
     // replace does not leave one behind.
     tmp.persist(path)
         .map_err(|err| OverridesError::Io(err.error))?;
+
+    // The `sync_all` above made the CONTENTS durable; this makes the rename
+    // that published them durable. See `shep_core::atomic_file`.
+    crate::atomic_file::sync_dir(parent)?;
     Ok(())
 }
 

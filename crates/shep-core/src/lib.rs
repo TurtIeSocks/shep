@@ -20,8 +20,11 @@
 #![doc(test(attr(deny(warnings))))]
 #![forbid(unsafe_code)]
 
-// One create-at-`0600` staging file for every store under `$SHEP_HOME`,
-// declared before the four modules that were each carrying their own copy.
+// Declared above `barks`, `kv` and `overrides` because all three begin and
+// end a write through it, as do `shep.toml`, `dogs.toml` and the muster
+// roll in the crates above this one: one create-at-`0600` staging file and
+// one definition of what finishes an atomic replace, rather than six
+// writers each carrying their own copy and deciding how far to flush.
 pub mod atomic_file;
 pub mod barks;
 pub mod config;

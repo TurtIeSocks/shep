@@ -255,8 +255,19 @@ impl From<std::io::Error> for SnapshotError {
 }
 
 /// Writes `snapshot` to `path` atomically: a temp file in the same
-/// directory (so `rename(2)` is guaranteed atomic — it only is within one
-/// filesystem), `fsync`ed, then renamed over `path`.
+/// directory (so `rename(2)` is guaranteed atomic, which it only is within
+/// one filesystem), `fsync`ed, renamed over `path`, and on unix the
+/// directory `fsync`ed in turn so the rename itself survives a power cut.
+/// `shep_core::atomic_file::sync_dir` is a no-op on Windows, where that
+/// last guarantee is only as strong as NTFS makes it.
+///
+/// That last step matters more here than anywhere else this workspace
+/// writes. The roll exists to be read back by the restore that runs
+/// unattended after a reboot, and the graceful write at the end of `boot`
+/// is exactly the one a power cut skips, so what a restore finds is
+/// whatever the debounced `SnapshotWriter` last renamed into place. Making
+/// the contents durable without the rename that publishes them would leave
+/// the flock unrecoverable by the event the file exists to survive.
 ///
 /// The temp file is created owner-only (unix mode 0600) and `persist` keeps
 /// that mode across the rename. That mode is not cosmetic: the roll stores
@@ -280,6 +291,10 @@ pub(crate) fn write_atomic(path: &Path, snapshot: &FlockSnapshot) -> Result<(), 
     tmp.as_file().sync_all()?;
     tmp.persist(path)
         .map_err(|err| SnapshotError::Io(err.error))?;
+
+    // The `sync_all` above made the CONTENTS durable; this makes the rename
+    // that published them durable. See `shep_core::atomic_file`.
+    shep_core::atomic_file::sync_dir(parent)?;
     Ok(())
 }
 

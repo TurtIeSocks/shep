@@ -252,6 +252,10 @@ fn write_ring(path: &Path, lines: &[String]) -> Result<(), BarkError> {
     // inside the error and its `Drop` removes the staging file, so a
     // failed replace does not leave one behind.
     tmp.persist(path).map_err(|err| BarkError::Io(err.error))?;
+
+    // The `sync_all` above made the CONTENTS durable; this makes the rename
+    // that published them durable. See `shep_core::atomic_file`.
+    crate::atomic_file::sync_dir(parent)?;
     Ok(())
 }
 
