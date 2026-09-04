@@ -20,6 +20,9 @@
 #![doc(test(attr(deny(warnings))))]
 #![forbid(unsafe_code)]
 
+// One create-at-`0600` staging file for every store under `$SHEP_HOME`,
+// declared before the four modules that were each carrying their own copy.
+pub mod atomic_file;
 pub mod barks;
 pub mod config;
 pub mod kv;

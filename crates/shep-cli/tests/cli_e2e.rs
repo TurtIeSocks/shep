@@ -5097,7 +5097,7 @@ fn barks_reads_the_history_with_no_shepherd_running() {
 /// makes for `shep barks`.
 ///
 /// Folds in the file-mode claim `shep_core::kv`'s own module doc makes
-/// (`KV_FILE_MODE`, `0600`) rather than giving it a separate case: the file
+/// (`OWNER_ONLY_FILE_MODE`, `0600`) rather than giving it a separate case: the file
 /// this test's own first `set` creates is the one to check, and creating a
 /// second store just to stat it would prove nothing this one doesn't.
 ///

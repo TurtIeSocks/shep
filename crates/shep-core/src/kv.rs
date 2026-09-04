@@ -75,16 +75,6 @@ pub const MAX_KEY_BYTES: usize = 128;
 /// writable thing in `$SHEP_HOME` with no schema.
 pub const MAX_VALUE_BYTES: usize = 4096;
 
-/// Mode `kv.json` (and the temp file it is rewritten through) is created
-/// with: owner read/write, nobody else.
-///
-/// `$SHEP_HOME` itself is already `0700`, so this is belt-and-braces — and
-/// it is the mode a `tar`, a `cp -p` or a backup carries out of that
-/// directory with the file, where no directory mode follows it. Same
-/// argument `barks::BARK_FILE_MODE` records.
-#[cfg(unix)]
-const KV_FILE_MODE: u32 = 0o600;
-
 /// The file's shape: a version and a flat map.
 ///
 /// `BTreeMap`, not `HashMap`, so the file is written in key order and two
@@ -251,7 +241,7 @@ impl KvLock {
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(KV_FILE_MODE)
+            .mode(crate::atomic_file::OWNER_ONLY_FILE_MODE)
             .open(lock_path(path))?;
 
         Flock::lock(file, FlockArg::LockExclusive)
@@ -315,26 +305,6 @@ impl KvLock {
     }
 }
 
-/// Creates the staging file the store is rewritten through, in `parent` so
-/// the later `rename` stays within one filesystem.
-///
-/// Mode-at-creation rather than a separate `chmod` pass: there is no window
-/// where the file sits at whatever the process umask leaves it. The unique
-/// name (not a fixed `.tmp`) is what keeps two writers' renames from
-/// consuming each other's staging file — see this module's own doc.
-fn create_kv_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("kv").suffix(".tmp");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(KV_FILE_MODE));
-    }
-
-    builder.tempfile_in(parent)
-}
-
 /// Reads `path` under the lock the caller already holds.
 ///
 /// A missing file reads as an empty, current-version store — `shep get`
@@ -357,7 +327,7 @@ fn read_file(path: &Path) -> Result<KvFile, KvError> {
 /// own doc for the staged-temp-file-then-rename shape.
 fn write_file(path: &Path, file: &KvFile) -> Result<(), KvError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = create_kv_file(parent)?;
+    let mut tmp = crate::atomic_file::create_staging_file(parent, "kv", ".tmp")?;
 
     let json = serde_json::to_string_pretty(file)?;
     tmp.write_all(json.as_bytes())?;

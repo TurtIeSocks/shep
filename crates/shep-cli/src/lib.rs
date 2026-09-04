@@ -1195,7 +1195,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
                 // that refusal must never reach `ShepToml::save` -- `edit`
                 // always saves after its closure runs regardless of what
                 // the closure returned, which would rewrite (new inode,
-                // mode forced to `CONFIG_FILE_MODE`) a file this call is
+                // mode forced to `OWNER_ONLY_FILE_MODE`) a file this call is
                 // reporting as untouched.
                 // `result_large_err` on the closure, for the same reason and
                 // on the same platform as the module-wide allow in

@@ -44,26 +44,12 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 use crate::style::StyleLevel;
-
-/// Mode `shep.toml` (and the sibling lock file and staging file it is
-/// written through, and `dogs.toml`, which
-/// `commands::dog_migration` stages through the same helper) is created
-/// with: owner read/write, nobody else.
-///
-/// Unlike `barks.jsonl`'s own `0600`, this is not belt-and-braces. This
-/// file is where `docs/dogs.md` tells an operator to paste a Discord or
-/// Slack webhook URL, and both carry a bearer token in the path, so the
-/// mode here is the guard rather than a second one behind `$SHEP_HOME`'s.
-/// It is also what a `tar`, a `cp -p` or a backup of `$SHEP_HOME` carries
-/// out with the file, somewhere no directory mode follows it.
-#[cfg_attr(windows, allow(dead_code))]
-const CONFIG_FILE_MODE: u32 = 0o600;
 
 /// Extensions [`ShepToml::write_starter_interpreters`] maps, in the order
 /// they land in `shep.toml`.
@@ -184,7 +170,8 @@ impl ShepToml {
     /// a table, say) must be able to say so without the read-modify-
     /// write underneath it staging and renaming a byte-identical copy of
     /// the file back over itself anyway — that rename still lands a fresh
-    /// inode and forces [`CONFIG_FILE_MODE`] on a file that a refused edit
+    /// inode and forces [`shep_core::atomic_file::OWNER_ONLY_FILE_MODE`]
+    /// on a file that a refused edit
     /// never actually touched, and for a symlinked `path` it is what
     /// replaces the link with a plain file. [`Self::edit`]'s `f` cannot
     /// refuse at all, so that failure mode did not exist before this
@@ -547,7 +534,8 @@ impl ShepToml {
     }
 
     /// Writes the document back: staged in a sibling temp file at
-    /// [`CONFIG_FILE_MODE`], `fsync`ed, then `rename`d over `path`.
+    /// [`shep_core::atomic_file::OWNER_ONLY_FILE_MODE`], `fsync`ed, then
+    /// `rename`d over `path`.
     ///
     /// Private, and reached only from [`Self::edit`] with the lock held.
     ///
@@ -629,28 +617,14 @@ fn create_home_dir(dir: &Path) -> std::io::Result<()> {
 /// Creates the staging file a config is written through, in `parent` so
 /// the later `rename` stays within one filesystem.
 ///
-/// Mode-at-creation rather than a separate `chmod` pass (`tempfile` passes
-/// these permissions to the `open` call itself): there is no window in
-/// which the file holding a webhook token sits at whatever the process
-/// umask leaves it. Same shape, and same reasoning, as
-/// `barks::create_ring_file`.
-///
-/// `pub(super)` rather than private, and deliberately shared rather than
-/// copied: `commands::dog_migration` writes `dogs.toml`, which holds the
-/// webhook URLs that used to live in this file and needs the same
-/// [`CONFIG_FILE_MODE`] at the same `open`. A second implementation of
-/// create-at-mode plus `fsync` plus `rename` is how the two would drift,
-/// and the one that drifted would be the one nobody was reading.
+/// The create-at-mode reasoning lives with
+/// [`shep_core::atomic_file::create_staging_file`], which four stores now
+/// share. What is left here is the pair of names, and this wrapper is
+/// where they stay: `commands::dog_migration` writes `dogs.toml` through
+/// the same staging name as `shep.toml`, and two call sites spelling that
+/// pair out separately is how the two would drift.
 pub(super) fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("shep").suffix(".toml.tmp");
-    // `shep.toml` can hold a webhook token, so on unix it is created `0600`
-    // at the `open` itself rather than chmod'ed after. On Windows it
-    // inherits `$SHEP_HOME`'s ACL — the same gap `create_home_dir` above
-    // names, and the reason the operator docs say so out loud.
-    #[cfg(unix)]
-    builder.permissions(std::fs::Permissions::from_mode(CONFIG_FILE_MODE));
-    builder.tempfile_in(parent)
+    shep_core::atomic_file::create_staging_file(parent, "shep", ".toml.tmp")
 }
 
 /// An exclusive advisory lock over one config file, held for as long as
@@ -730,7 +704,7 @@ impl ConfigLock {
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(CONFIG_FILE_MODE)
+            .mode(shep_core::atomic_file::OWNER_ONLY_FILE_MODE)
             .open(lock_path(path))?;
 
         // `LockExclusive` blocks; the non-blocking variant would need a
@@ -865,6 +839,8 @@ impl core::error::Error for ShepTomlError {
 // this module's unix coverage is unchanged.
 #[cfg(all(test, unix))]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use shep_core::config::DaemonConfig;
 
     use super::*;
@@ -1196,7 +1172,8 @@ mod tests {
     /// the closure runs regardless of what the closure returned, would
     /// still stage a fresh file and rename it over the original on a
     /// refusal: identical bytes, but a new inode, and the mode forced to
-    /// [`CONFIG_FILE_MODE`] even though the original here is `0644`.
+    /// [`shep_core::atomic_file::OWNER_ONLY_FILE_MODE`] even though the
+    /// original here is `0644`.
     /// Content equality alone hides that, which is why this checks the
     /// file's metadata rather than only what is in it.
     /// [`ShepToml::try_edit`] is what actually prevents it: it never
