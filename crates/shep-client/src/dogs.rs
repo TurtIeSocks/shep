@@ -8,7 +8,8 @@
 //! author:
 //!
 //! ```no_run
-//! # #[derive(schemars::JsonSchema, shep_client::dogs::DogConfig)]
+//! # #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+//! # #[derive(shep_client::dogs::DogConfig)]
 //! # struct MyDogConfig {}
 //! fn main() {
 //!     shep_client::dogs::probe::<MyDogConfig>(
@@ -342,156 +343,6 @@ fn schema_answer<T: DogConfig + schemars::JsonSchema>() -> Result<String, Secret
 mod tests {
     use super::*;
 
-    #[derive(schemars::JsonSchema, DogConfig)]
-    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
-    struct Webhook {
-        #[shep(secret)]
-        url: String,
-        channel: String,
-    }
-
-    #[derive(schemars::JsonSchema, DogConfig)]
-    #[serde(tag = "kind", rename_all = "snake_case")]
-    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
-    enum Sink {
-        Discord {
-            #[shep(secret)]
-            url: String,
-            quiet: bool,
-        },
-        Slack {
-            #[shep(secret)]
-            url: String,
-        },
-    }
-
-    #[derive(schemars::JsonSchema, DogConfig)]
-    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
-    struct Renamed {
-        #[shep(secret)]
-        #[serde(rename = "webhook_url")]
-        url: String,
-    }
-
-    /// A type the root only mentions, so `schemars` hoists it into `$defs`.
-    /// Its `token` is an ordinary string, and it is named to collide with
-    /// the credential the two roots below mark.
-    #[derive(schemars::JsonSchema)]
-    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
-    struct Inner {
-        token: String,
-    }
-
-    #[derive(schemars::JsonSchema, DogConfig)]
-    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
-    struct Outer {
-        #[shep(secret)]
-        token: String,
-        inner: Inner,
-    }
-
-    #[derive(schemars::JsonSchema, DogConfig)]
-    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
-    struct RenamedOuter {
-        #[shep(secret)]
-        #[serde(rename = "api_token")]
-        token: String,
-        inner: Inner,
-    }
-
-    /// Both halves in one test on purpose: an implementation that marked
-    /// every property would pass a test that only checked the marked one.
-    #[test]
-    fn a_secret_field_carries_the_marker_and_a_plain_one_does_not() {
-        let schema = config_schema::<Webhook>().expect("`url` is a real property");
-        let props = schema
-            .as_value()
-            .get("properties")
-            .expect("a derived struct schema has properties");
-
-        assert_eq!(
-            props.get("url").and_then(|url| url.get(SECRET_KEY)),
-            Some(&serde_json::Value::Bool(true)),
-            "the marked field carries the marker"
-        );
-        assert_eq!(
-            props.get("channel").and_then(|it| it.get(SECRET_KEY)),
-            None,
-            "the unmarked field carries nothing"
-        );
-    }
-
-    /// A tagged enum has no top-level `properties` at all: it is a `oneOf` of
-    /// one object per variant. Marking code that reads only the top level
-    /// finds nothing, marks nothing, and says nothing.
-    #[test]
-    fn a_marker_reaches_every_variant_of_a_tagged_enum_and_no_plain_field() {
-        let schema = config_schema::<Sink>().expect("`url` is a real property in both variants");
-        let variants = schema
-            .as_value()
-            .get("oneOf")
-            .and_then(|it| it.as_array())
-            .expect("a tagged enum is a oneOf");
-        assert_eq!(variants.len(), 2);
-
-        for variant in variants {
-            let props = variant
-                .get("properties")
-                .expect("each variant carries its own properties");
-            assert_eq!(
-                props.get("url").and_then(|url| url.get(SECRET_KEY)),
-                Some(&serde_json::Value::Bool(true)),
-                "every occurrence of the marked name is marked"
-            );
-            assert_eq!(
-                props.get("quiet").and_then(|it| it.get(SECRET_KEY)),
-                None,
-                "a plain field in the same variant carries nothing"
-            );
-        }
-    }
-
-    #[test]
-    fn a_renamed_secret_field_is_an_error_rather_than_a_silent_pass() {
-        assert_eq!(
-            config_schema::<Renamed>(),
-            Err(SecretFieldMissing { field: "url" })
-        );
-    }
-
-    /// A mark names a field of the type shep asked about, so a like-named
-    /// property of some other type the root merely mentions is not that
-    /// field and must come out plain. `Rule::sinks` is the live case: it
-    /// lists sink NAMES, one level under a `BarkConfig::sinks` that really
-    /// does hold credentials.
-    #[test]
-    fn a_like_named_property_of_a_nested_type_is_left_plain() {
-        let schema = config_schema::<Outer>().expect("`token` is a real property of the root");
-        let schema = schema.as_value();
-
-        assert_eq!(
-            schema.pointer("/properties/token/x-shep-secret"),
-            Some(&serde_json::Value::Bool(true)),
-            "the root's own marked field carries the marker"
-        );
-        assert_eq!(
-            schema.pointer("/$defs/Inner/properties/token/x-shep-secret"),
-            None,
-            "a stranger that shares the name is not the marked field"
-        );
-    }
-
-    /// The same reach, pointing the other way: a `$defs` entry that happens
-    /// to carry the pre-rename name would satisfy the missing-field check on
-    /// behalf of a credential that shipped unmarked.
-    #[test]
-    fn a_renamed_secret_field_is_an_error_even_when_a_nested_type_has_the_old_name() {
-        assert_eq!(
-            config_schema::<RenamedOuter>(),
-            Err(SecretFieldMissing { field: "token" })
-        );
-    }
-
     /// The two ends of the grammar: what a dog prints and what shep reads.
     /// Pinned as a round trip rather than as a string, because the format is
     /// only ever interesting to the parser.
@@ -503,5 +354,169 @@ mod tests {
 
         assert_eq!(parsed.version, "0.1.3");
         assert_eq!(parsed.protocol, Some(crate::PROTOCOL_VERSION));
+    }
+
+    /// Everything the `schema` feature gates, gated the same way.
+    ///
+    /// A dog that turns the feature off gets a library with no
+    /// `config_schema` in it, which is the supported opt-out rather than a
+    /// broken build. The tests have to say so too: gated on `test` alone
+    /// they name `schemars`, `serde_json` and `config_schema` in a build
+    /// that has none of them, so the crate's own test target was the one
+    /// place the feature stopped being additive.
+    #[cfg(feature = "schema")]
+    mod schema {
+        use super::*;
+
+        #[derive(schemars::JsonSchema, DogConfig)]
+        #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+        struct Webhook {
+            #[shep(secret)]
+            url: String,
+            channel: String,
+        }
+
+        #[derive(schemars::JsonSchema, DogConfig)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+        enum Sink {
+            Discord {
+                #[shep(secret)]
+                url: String,
+                quiet: bool,
+            },
+            Slack {
+                #[shep(secret)]
+                url: String,
+            },
+        }
+
+        #[derive(schemars::JsonSchema, DogConfig)]
+        #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+        struct Renamed {
+            #[shep(secret)]
+            #[serde(rename = "webhook_url")]
+            url: String,
+        }
+
+        /// A type the root only mentions, so `schemars` hoists it into `$defs`.
+        /// Its `token` is an ordinary string, and it is named to collide with
+        /// the credential the two roots below mark.
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+        struct Inner {
+            token: String,
+        }
+
+        #[derive(schemars::JsonSchema, DogConfig)]
+        #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+        struct Outer {
+            #[shep(secret)]
+            token: String,
+            inner: Inner,
+        }
+
+        #[derive(schemars::JsonSchema, DogConfig)]
+        #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+        struct RenamedOuter {
+            #[shep(secret)]
+            #[serde(rename = "api_token")]
+            token: String,
+            inner: Inner,
+        }
+
+        /// Both halves in one test on purpose: an implementation that marked
+        /// every property would pass a test that only checked the marked one.
+        #[test]
+        fn a_secret_field_carries_the_marker_and_a_plain_one_does_not() {
+            let schema = config_schema::<Webhook>().expect("`url` is a real property");
+            let props = schema
+                .as_value()
+                .get("properties")
+                .expect("a derived struct schema has properties");
+
+            assert_eq!(
+                props.get("url").and_then(|url| url.get(SECRET_KEY)),
+                Some(&serde_json::Value::Bool(true)),
+                "the marked field carries the marker"
+            );
+            assert_eq!(
+                props.get("channel").and_then(|it| it.get(SECRET_KEY)),
+                None,
+                "the unmarked field carries nothing"
+            );
+        }
+
+        /// A tagged enum has no top-level `properties` at all: it is a `oneOf` of
+        /// one object per variant. Marking code that reads only the top level
+        /// finds nothing, marks nothing, and says nothing.
+        #[test]
+        fn a_marker_reaches_every_variant_of_a_tagged_enum_and_no_plain_field() {
+            let schema =
+                config_schema::<Sink>().expect("`url` is a real property in both variants");
+            let variants = schema
+                .as_value()
+                .get("oneOf")
+                .and_then(|it| it.as_array())
+                .expect("a tagged enum is a oneOf");
+            assert_eq!(variants.len(), 2);
+
+            for variant in variants {
+                let props = variant
+                    .get("properties")
+                    .expect("each variant carries its own properties");
+                assert_eq!(
+                    props.get("url").and_then(|url| url.get(SECRET_KEY)),
+                    Some(&serde_json::Value::Bool(true)),
+                    "every occurrence of the marked name is marked"
+                );
+                assert_eq!(
+                    props.get("quiet").and_then(|it| it.get(SECRET_KEY)),
+                    None,
+                    "a plain field in the same variant carries nothing"
+                );
+            }
+        }
+
+        #[test]
+        fn a_renamed_secret_field_is_an_error_rather_than_a_silent_pass() {
+            assert_eq!(
+                config_schema::<Renamed>(),
+                Err(SecretFieldMissing { field: "url" })
+            );
+        }
+
+        /// A mark names a field of the type shep asked about, so a like-named
+        /// property of some other type the root merely mentions is not that
+        /// field and must come out plain. `Rule::sinks` is the live case: it
+        /// lists sink NAMES, one level under a `BarkConfig::sinks` that really
+        /// does hold credentials.
+        #[test]
+        fn a_like_named_property_of_a_nested_type_is_left_plain() {
+            let schema = config_schema::<Outer>().expect("`token` is a real property of the root");
+            let schema = schema.as_value();
+
+            assert_eq!(
+                schema.pointer("/properties/token/x-shep-secret"),
+                Some(&serde_json::Value::Bool(true)),
+                "the root's own marked field carries the marker"
+            );
+            assert_eq!(
+                schema.pointer("/$defs/Inner/properties/token/x-shep-secret"),
+                None,
+                "a stranger that shares the name is not the marked field"
+            );
+        }
+
+        /// The same reach, pointing the other way: a `$defs` entry that happens
+        /// to carry the pre-rename name would satisfy the missing-field check on
+        /// behalf of a credential that shipped unmarked.
+        #[test]
+        fn a_renamed_secret_field_is_an_error_even_when_a_nested_type_has_the_old_name() {
+            assert_eq!(
+                config_schema::<RenamedOuter>(),
+                Err(SecretFieldMissing { field: "token" })
+            );
+        }
     }
 }
