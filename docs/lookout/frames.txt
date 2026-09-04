@@ -7,7 +7,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same twenty-five frames with colour; read it with `less -R`.
+frames.ansi is the same thirty frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -23,6 +23,12 @@ When the pane cannot show everything, the header says what went instead. Lines
 it read and dropped are counted exactly; bytes below its 64 KiB window were
 never read at all, so those are reported in bytes, because nothing counted the
 lines in them and guessing would be worse than saying so.
+
+The last five frames are the settings screen, `s` from the dashboard. It owns
+the whole body between the title and the status bar rather than sharing it
+with the flock table, so a fresh $SHEP_HOME, some scalars declared, an armed
+confirm, the socket editor mid-type and the dogs table's own drift each get a
+frame of their own.
 
 
 === healthy_wide  (120x30) ===
@@ -57,7 +63,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === errored  (120x30) ===
 One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row, and EXIT carries why each of the three stopped: a code for the two that crashed, a signal name for the one shep stopped itself.
@@ -91,7 +97,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === grouped  (120x30) ===
 Three instances of one app under a group header, with the cursor parked on the header. The header sums their restarts, CPU and memory and takes the SHORTEST of their uptimes, so a group reads as time since the app was last disturbed rather than as the age of its luckiest instance. The detail pane repeats that rollup and says lambs are per-instance; the feed will not guess which instance to tail.
@@ -125,7 +131,7 @@ bleats  web  follows one instance; select one to see its log
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === empty  (100x28) ===
 No sheep registered. Each of the three panes says why it is empty, and the three sentences are different because the three reasons are.
@@ -157,7 +163,7 @@ bleats  no sheep is selected
                                                                                                     
                                                                                                     
                                                                                                     
-q quit   j/k select   g/G first/last   r refresh   / filter                                read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                   read-only
 
 === narrow  (51x14) ===
 51 columns: FOLD, EXIT, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY a RUNNING sheep is behaving badly, a question EXIT cannot even ask. The host strip fits; the detail pane and the feed do not, at 14 rows.
@@ -221,7 +227,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === frozen  (120x30) ===
 The ladder ran out. Last known values stay, the uptime clock has stopped, and so has the host strip — one line ticking over on a frozen screen is a contradiction on the same frame.
@@ -255,7 +261,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === refused  (120x30) ===
 `x` with actions gated off. The refusal is literal, nothing about damage gets charming, and the panes below carry on.
@@ -367,7 +373,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === table_only  (120x12) ===
 12 rows: no optional panes at all. This is 12a's frame, and the only thing that changed is the two-column gutter the marker sits in.
@@ -383,7 +389,7 @@ shep lookout   /home/ada/.shep                                                  
   1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === feed_gap  (120x30) ===
 The feed under a burst: 3.8 megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first.
@@ -417,7 +423,7 @@ out  GET /v1/orders/26 200 34ms
 out  GET /v1/orders/27 200 35ms                                                                                         
 out  GET /v1/orders/28 200 36ms                                                                                         
 out  GET /v1/orders/29 200 37ms                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === feed_missing  (120x30) ===
 The selected sheep has never written a log in this $SHEP_HOME. The feed names that cause rather than sitting blank.
@@ -451,7 +457,7 @@ this sheep has not written a log in this $SHEP_HOME
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === cramped  (33x26) ===
 33 columns: the narrowest terminal that draws. 26 rows — a couple more than the 24-row floor for all three panes being up, so this frame has a little breathing room rather than sitting exactly on the edge. Everything truncates with an ellipsis; nothing overlaps.
@@ -515,7 +521,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === lambs  (120x30) ===
 The detail pane with a lamb list: how many descendants the shepherd's walk found, how old that reading is, and each lamb's pid and executable name. The stamp sits before the list so a narrow terminal truncates lambs rather than the caveat.
@@ -549,7 +555,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   / filter   x stop   R restart   L reload                                           control enabled
+q quit   j/k select   / filter   x stop   R restart   L reload   s settings                              control enabled
 
 === lambs_unknown  (120x30) ===
 The same pane on a stopped sheep. The shepherd had no pid to walk from and left the field unset rather than empty, and the line says which of the two it is looking at rather than reporting none found.
@@ -583,7 +589,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
 
 === confirm  (100x14) ===
 `R` pressed with the gate open. Nothing has been sent: the bar asks a question naming the verb and the exact sheep, and `api` is still online in the table behind it.
@@ -674,3 +680,173 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
                                                                                                     
                                                                                                     
 the shepherd stopped answering — reconnecting (attempt 3)                            control enabled
+
+=== settings_fresh  (120x30) ===
+The settings screen on a fresh $SHEP_HOME: shep.toml holds only [interpreters], so every scalar's SOURCE column reads `the default` and its VALUE is the compiled fallback. The state most operators open this screen in.
+
+shep lookout   /home/ada/.shep                                                                            6 in the flock
+  [daemon]                                                                                                              
+> log_level        warn                            the default  needs shep daemon reload                                
+  log_json         false                           the default  needs shep daemon reload                                
+  socket           /home/ada/.shep/run/shep.sock   the default  needs the shepherd stopped and started                  
+  max_cron_sleep   not set                         the default  needs shep daemon reload                                
+                                                                                                                        
+  [whistle]                                                                                                             
+  allow_control    false                           the default  needs shep whistle restarted                            
+                                                                                                                        
+  [style]                                                                                                               
+  level            full                            the default  the next command reads it                               
+                                                                                                                        
+  [dogs]                                                                                                                
+  space arms, Enter applies; a dog needs no reload                                                                      
+  NAME                                                                  IN FILE  SOURCE                    RUNNING      
+  bark                                                                  no       built-in                  not running  
+  metrics                                                               no       built-in                  not running  
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+esc close   j/k select   g/G first/last   space cycle                                                          read-only
+
+=== settings_set  (120x30) ===
+The settings screen with some scalars declared. `shep.toml` and `the default` sit side by side in the SOURCE column, so what the operator wrote and what shep assumes are both visible at once.
+
+shep lookout   /home/ada/.shep                                                                            6 in the flock
+  [daemon]                                                                                                              
+> log_level        warn                            shep.toml    needs shep daemon reload                                
+  log_json         false                           the default  needs shep daemon reload                                
+  socket           /home/ada/.shep/run/shep.sock   shep.toml    needs the shepherd stopped and started                  
+  max_cron_sleep   30s                             shep.toml    needs shep daemon reload                                
+                                                                                                                        
+  [whistle]                                                                                                             
+  allow_control    false                           the default  needs shep whistle restarted                            
+                                                                                                                        
+  [style]                                                                                                               
+  level            full                            shep.toml    the next command reads it                               
+                                                                                                                        
+  [dogs]                                                                                                                
+  space arms, Enter applies; a dog needs no reload                                                                      
+  NAME                                                                  IN FILE  SOURCE                    RUNNING      
+  bark                                                                  no       built-in                  not running  
+  metrics                                                               yes      built-in                  not running  
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+esc close   j/k select   g/G first/last   space cycle                                                          read-only
+
+=== settings_confirm  (180x30) ===
+A [daemon] confirm armed on log_level, naming the variable and the flag it cannot see: SHEP_LOG_LEVEL and --log-level, and the shep daemon reload the edit needs.
+
+shep lookout   /home/ada/.shep                                                                                                                                        6 in the flock
+  [daemon]                                                                                                                                                                          
+> log_level        warn                            shep.toml    needs shep daemon reload                                                                                            
+  log_json         false                           the default  needs shep daemon reload                                                                                            
+  socket           /home/ada/.shep/run/shep.sock   shep.toml    needs the shepherd stopped and started                                                                              
+  max_cron_sleep   30s                             shep.toml    needs shep daemon reload                                                                                            
+                                                                                                                                                                                    
+  [whistle]                                                                                                                                                                         
+  allow_control    false                           the default  needs shep whistle restarted                                                                                        
+                                                                                                                                                                                    
+  [style]                                                                                                                                                                           
+  level            full                            shep.toml    the next command reads it                                                                                           
+                                                                                                                                                                                    
+  [dogs]                                                                                                                                                                            
+  space arms, Enter applies; a dog needs no reload                                                                                                                                  
+  NAME                                                                                                                              IN FILE  SOURCE                    RUNNING      
+  bark                                                                                                                              no       built-in                  not running  
+  metrics                                                                                                                           yes      built-in                  not running  
+                                                                                                                                                                                    
+  set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key cancels          
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+esc close   j/k select   g/G first/last   space cycle                                                                                                                control enabled
+
+=== settings_typing  (120x30) ===
+The socket editor open mid-path. The status bar names the field being typed, not the dashboard's own filter box, which is what it showed here before the fix this frame now pins.
+
+shep lookout   /home/ada/.shep                                                                            6 in the flock
+  [daemon]                                                                                                              
+  log_level        warn                            shep.toml    needs shep daemon reload                                
+  log_json         false                           the default  needs shep daemon reload                                
+> socket           /home/ada/.shep/run/shep.sock   shep.toml    needs the shepherd stopped and started                  
+  max_cron_sleep   30s                             shep.toml    needs shep daemon reload                                
+                                                                                                                        
+  [whistle]                                                                                                             
+  allow_control    false                           the default  needs shep whistle restarted                            
+                                                                                                                        
+  [style]                                                                                                               
+  level            full                            shep.toml    the next command reads it                               
+                                                                                                                        
+  [dogs]                                                                                                                
+  space arms, Enter applies; a dog needs no reload                                                                      
+  NAME                                                                  IN FILE  SOURCE                    RUNNING      
+  bark                                                                  no       built-in                  not running  
+  metrics                                                               yes      built-in                  not running  
+                                                                                                                        
+  editing socket: /home/ada/.shep/run/s▏   enter applies   esc cancels                                                  
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+editing socket  /home/ada/.shep/run/s▏   enter applies   esc cancels                                     control enabled
+
+=== settings_dogs  (120x30) ===
+The dogs table showing the drift it exists to reveal: otel running while disabled in the file, ledger enabled and absent, and bark enabled, running, and silent.
+
+shep lookout   /home/ada/.shep                                                                            2 in the flock
+  [daemon]                                                                                                              
+> log_level        warn                            shep.toml    needs shep daemon reload                                
+  log_json         false                           the default  needs shep daemon reload                                
+  socket           /home/ada/.shep/run/shep.sock   shep.toml    needs the shepherd stopped and started                  
+  max_cron_sleep   30s                             shep.toml    needs shep daemon reload                                
+                                                                                                                        
+  [whistle]                                                                                                             
+  allow_control    false                           the default  needs shep whistle restarted                            
+                                                                                                                        
+  [style]                                                                                                               
+  level            full                            shep.toml    the next command reads it                               
+                                                                                                                        
+  [dogs]                                                                                                                
+  space arms, Enter applies; a dog needs no reload                                                                      
+  NAME                                                                  IN FILE  SOURCE                    RUNNING      
+  otel                                                                  no       built-in                  online       
+  ledger                                                                yes      built-in                  not running  
+  bark                                                                  yes      built-in                  silent       
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+esc close   j/k select   g/G first/last   space cycle                                                          read-only

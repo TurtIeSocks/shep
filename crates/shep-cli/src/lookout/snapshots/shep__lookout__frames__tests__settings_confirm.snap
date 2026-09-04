@@ -1,0 +1,34 @@
+---
+source: crates/shep-cli/src/lookout/frames.rs
+expression: render_text(&buffer)
+---
+shep lookout   /home/ada/.shep                                                                                                                                        6 in the flock
+  [daemon]                                                                                                                                                                          
+> log_level        warn                            shep.toml    needs shep daemon reload                                                                                            
+  log_json         false                           the default  needs shep daemon reload                                                                                            
+  socket           /home/ada/.shep/run/shep.sock   shep.toml    needs the shepherd stopped and started                                                                              
+  max_cron_sleep   30s                             shep.toml    needs shep daemon reload                                                                                            
+                                                                                                                                                                                    
+  [whistle]                                                                                                                                                                         
+  allow_control    false                           the default  needs shep whistle restarted                                                                                        
+                                                                                                                                                                                    
+  [style]                                                                                                                                                                           
+  level            full                            shep.toml    the next command reads it                                                                                           
+                                                                                                                                                                                    
+  [dogs]                                                                                                                                                                            
+  space arms, Enter applies; a dog needs no reload                                                                                                                                  
+  NAME                                                                                                                              IN FILE  SOURCE                    RUNNING      
+  bark                                                                                                                              no       built-in                  not running  
+  metrics                                                                                                                           yes      built-in                  not running  
+                                                                                                                                                                                    
+  set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key cancels          
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+                                                                                                                                                                                    
+esc close   j/k select   g/G first/last   space cycle                                                                                                                control enabled
