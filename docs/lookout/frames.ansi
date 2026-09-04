@@ -738,7 +738,7 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mesc/s close   j/k select   g/G first/last   r refresh                                                          read-only[0m
+[0m[38;5;245mesc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only[0m
 
 
 === settings_set  (120x30) ===
@@ -773,7 +773,7 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mesc/s close   j/k select   g/G first/last   r refresh                                                          read-only[0m
+[0m[38;5;245mesc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only[0m
 
 
 === settings_confirm  (180x30) ===
@@ -798,7 +798,7 @@ shep lookout   /home/ada/.shep                                                  
   bark                                                                                                                            no       built-in                  not running    [0m
   metrics                                                                                                                         yes      built-in                  not running    [0m
                                                                                                                                                                                     [0m
-[0m[38;5;221m  set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key cancels[0m          [0m
+[0m[38;5;221m  set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key cancels          [0m
                                                                                                                                                                                     [0m
                                                                                                                                                                                     [0m
                                                                                                                                                                                     [0m
@@ -833,7 +833,7 @@ shep lookout   /home/ada/.shep                                                  
   bark                                                                no       built-in                  not running    [0m
   metrics                                                             yes      built-in                  not running    [0m
                                                                                                                         [0m
-[0m[38;5;221m  editing socket: /home/ada/.shep/run/s▏   enter applies   esc cancels[0m                                                  [0m
+[0m[38;5;221m  editing socket: /home/ada/.shep/run/s▏   enter applies   esc cancels                                                  [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -878,7 +878,7 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mesc/s close   j/k select   g/G first/last   r refresh                                                          read-only[0m
+[0m[38;5;245mesc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only[0m
 
 
 === settings_narrow  (45x24) ===

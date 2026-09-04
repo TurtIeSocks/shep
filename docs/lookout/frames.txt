@@ -713,7 +713,7 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         
                                                                                                                         
                                                                                                                         
-esc/s close   j/k select   g/G first/last   r refresh                                                          read-only
+esc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only
 
 === settings_set  (120x30) ===
 The settings screen with some scalars declared. `shep.toml` and `the default` sit side by side in the SOURCE column, so what the operator wrote and what shep assumes are both visible at once.
@@ -747,7 +747,7 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         
                                                                                                                         
                                                                                                                         
-esc/s close   j/k select   g/G first/last   r refresh                                                          read-only
+esc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only
 
 === settings_confirm  (180x30) ===
 A [daemon] confirm armed on log_level, naming the variable and the flag it cannot see: SHEP_LOG_LEVEL and --log-level, and the shep daemon reload the edit needs.
@@ -849,7 +849,7 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         
                                                                                                                         
                                                                                                                         
-esc/s close   j/k select   g/G first/last   r refresh                                                          read-only
+esc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only
 
 === settings_narrow  (45x24) ===
 The same screen at 45 columns. Both of its tables have dropped a column rather than clipping: the scalar rows have lost the apply cost and kept SOURCE, and the dogs table has lost SOURCE and kept RUNNING. Each keeps whichever half is not said anywhere else.

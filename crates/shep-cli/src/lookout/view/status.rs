@@ -294,9 +294,9 @@ fn hint_for(control: Control, settings_open: bool) -> String {
         // `s` gets said here at all -- on this screen `s` is the close key,
         // not the open one. `r` and `Enter` were missing outright.
         return match control {
-            Control::ReadOnly => "esc/s close   j/k select   g/G first/last   r refresh",
+            Control::ReadOnly => "esc/s close   j/k select   g/G first/last   r refresh   q quit",
             Control::Allowed => {
-                "esc/s close   j/k select   g/G first/last   r refresh   space cycle   enter apply"
+                "esc/s close   j/k select   g/G first/last   r refresh   space cycle   enter apply   q quit"
             }
         }
         .to_string();
@@ -685,6 +685,18 @@ mod tests {
         for both in [&closed, &open] {
             assert!(both.contains("esc/s close"), "got {both:?}");
             assert!(both.contains("r refresh"), "got {both:?}");
+        }
+    }
+
+    /// fails if `q` stops being named on the settings screen's own status
+    /// bar -- `App` handles it there (`app.rs`'s settings key dispatch),
+    /// same as on the dashboard, but neither settings hint form said so.
+    #[test]
+    fn q_quit_is_named_on_the_settings_screen_in_both_control_states() {
+        let closed = rendered(&status_line(&app_in_settings(), 200));
+        let open = rendered(&status_line(&app_in_settings_with_control(), 200));
+        for hint in [&closed, &open] {
+            assert!(hint.contains("q quit"), "got {hint:?}");
         }
     }
 }
