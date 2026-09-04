@@ -1012,6 +1012,24 @@ pub(crate) const VERSION_BUDGET: Duration = Duration::from_secs(1);
 /// than inventing a second one.
 const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
+/// The most a probe will read from a candidate, per spawn.
+///
+/// One mebibyte, against a version answer of two lines and a JSON Schema
+/// that runs to single-digit kilobytes for a config with a lot of fields.
+/// Three orders of magnitude of headroom, and still a bound: without one,
+/// the read is limited only by the budget and by how fast the candidate can
+/// write, which measured at roughly 290MB of resident memory for a second
+/// of spew and is a stranger's binary deciding how much of this machine's
+/// memory to take. `adopt` runs that binary twice, so it is asked twice.
+///
+/// Truncation is not a new outcome and never a refusal. A cut-off version
+/// answer is output shep cannot read, which is the unknown protocol it
+/// already was; a cut-off schema is not valid JSON, so it is
+/// [`DogSchema::Unreadable`] and earns the warning decision 4 already
+/// defines. Both need a dog to print a megabyte before answering, which no
+/// dog following the contract does.
+const PROBE_OUTPUT_LIMIT: u64 = 1024 * 1024;
+
 /// Drains `stdout` to end on a thread, handing the text back through the
 /// returned channel.
 ///
@@ -1023,14 +1041,23 @@ const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// could do forever. On the timeout path the thread is left to end on its
 /// own when the pipe closes: it holds nothing but a `String` and a sender,
 /// and `adopt` is a one-shot command.
-fn read_in_background(mut stdout: std::process::ChildStdout) -> Receiver<String> {
+fn read_in_background(stdout: std::process::ChildStdout) -> Receiver<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::Read as _;
         let mut text = String::new();
+        // Bounded by [`PROBE_OUTPUT_LIMIT`], and the drop that follows is
+        // half of what the bound buys: the read end closes, so a candidate
+        // still writing takes an EPIPE instead of being left blocked on a
+        // full pipe until the budget kills it.
+        //
         // A candidate answering in bytes that are not UTF-8 is answering
-        // nothing shep can read, which is the same unknown as silence.
-        let _ = stdout.read_to_string(&mut text);
+        // nothing shep can read, which is the same unknown as silence. That
+        // now includes a multi-byte character the cap cut in half, since
+        // `read_to_string` leaves `text` empty when it fails: a candidate
+        // that reached the cap mid-character was already answering
+        // something no reader here was going to use.
+        let _ = stdout.take(PROBE_OUTPUT_LIMIT).read_to_string(&mut text);
         let _ = tx.send(text);
     });
     rx
@@ -2660,6 +2687,45 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(10),
             "the vet is bounded by its own budget, not by the candidate: {elapsed:?}"
+        );
+    }
+
+    /// fails if a candidate decides how much of this machine's memory a
+    /// probe takes. The read is on a thread with no bound but the budget
+    /// and the writer's speed, so a binary that spews reached roughly 290MB
+    /// resident for a second of it, and `adopt` spawns that binary twice.
+    ///
+    /// Twice the cap is written, so a read that stopped anywhere else shows
+    /// up in the length rather than only in the memory it took. `trap ''
+    /// PIPE` is what lets the script reach its own `exit 0` after shep
+    /// closes the pipe underneath it, since a candidate killed by SIGPIPE
+    /// would answer `None` for its exit status and say nothing about where
+    /// the read stopped.
+    ///
+    /// Mutation check: dropping the `take` reddens this on the length.
+    #[test]
+    fn a_candidate_that_will_not_stop_talking_is_read_no_further_than_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk = "a".repeat(1024);
+        let chunks = PROBE_OUTPUT_LIMIT / 1024 * 2;
+        let bin = probe_script(
+            dir.path(),
+            "shep-otel",
+            &format!(
+                "trap '' PIPE\ni=0\nwhile [ $i -lt {chunks} ]; do \
+                 printf '%s' '{chunk}'; i=$((i+1)); done\nexit 0"
+            ),
+            "exit 0",
+        );
+
+        let answer = ask(&bin, VERSION_FLAG, dir.path(), "otel", TEST_BUDGET)
+            .expect("what a candidate prints is never a refusal")
+            .expect("it exited 0, so it answered");
+
+        assert_eq!(
+            answer.len() as u64,
+            PROBE_OUTPUT_LIMIT,
+            "the read stops at the cap, whatever the candidate does after it"
         );
     }
 
