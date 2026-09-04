@@ -145,8 +145,27 @@ would leave a running dog reading stale config with nothing to tell it. That
 would leave #122's re-read mechanism with a single boot-time producer and no
 way for an operator to trigger it.
 
-A sheep edit needs no new request. `Request::ApplyConfig` already exists and
-already carries the four-way classification.
+### 6b. A sheep edit needs one new request too, for the read
+
+`Request::ApplyConfig` already exists and already carries the four-way
+classification, so the write side is done. The read side is not, and this was
+missed when decision 6 was first written.
+
+Nothing on the wire returns a sheep's config values. `Response::Described`
+carries `Vec<ProcessInfo>`, whose only config fields are `pending` and
+`overridden`, and both are documented as names only, never values, under
+IR-41 because `env` can hold a secret. So a pane can learn which fields an
+operator has changed and can write a change, and cannot show what
+`max_restarts` is currently set to.
+
+A second request answers with the sheep's effective `AppConfig`, `env`
+replaced by its key names alone. Every other field is operator-supplied
+policy that the pane is about to let them edit, so withholding a value would
+make the pane unusable while protecting nothing.
+
+Decision 12 is untouched by this: env VALUES still never cross the wire, and
+the pane still writes env without reading it back. Both new requests ride the
+one `PROTOCOL_VERSION` bump decision 7 already asks for.
 
 ### 7. `PROTOCOL_VERSION` moves 3 to 4
 
@@ -191,7 +210,9 @@ for every dog that has not adopted the contract.
 
 ## Wire
 
-One new `Request` variant carrying the dog's name and the edit. The daemon
+Two new `Request` variants: one carrying a sheep's name and answering with
+its effective `AppConfig` with `env` reduced to key names (decision 6b), and
+one carrying a dog's name and the edit. The daemon
 writes, publishes `config.dog.<name>`, and answers with the same shape its
 other config writes use.
 
