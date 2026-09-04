@@ -132,9 +132,12 @@ pub fn is_classified(field: &str) -> bool {
 /// **Not a two-by-two grid**, and an earlier version of this comment said it
 /// was. There are two independent choices, but the settings one has three
 /// settings rather than two -- untouched, declared only, or everything --
-/// which makes six combinations. These four are the ones worth having; the
-/// two dropped both reset undeclared keys while sparing declared ones, which
-/// is an operation nobody wants.
+/// which makes six combinations. These four are the ones worth having. One
+/// discarded combination resets nothing at all, so it is the additive
+/// default with extra typing. The other is `File` plus `Env`: reset `env`,
+/// and reset only what the template declares, sparing everything it does
+/// not. That one is coherent, not useless, and is left out only because
+/// nobody has asked for it.
 ///
 /// `#[non_exhaustive]`: no fifth depth is anticipated, but this type travels
 /// inside `Request::ApplyConfig` on the wire, so the attribute stays as
