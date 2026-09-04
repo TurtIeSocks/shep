@@ -663,42 +663,6 @@ mod tests {
         addr
     }
 
-    /// Awaits `fut` against `timeout`, under a genuinely real clock rather
-    /// than the paused one `#[tokio::test(start_paused = true)]` installs.
-    ///
-    /// Bridges through [`tokio::task::spawn_blocking`] — the technique
-    /// `tokio::time::pause`'s own doc names under "Preventing auto-advance"
-    /// — because a plain `tokio::time::timeout(..).await` races real
-    /// socket I/O against the paused clock's auto-advance and reliably
-    /// LOSES: with nothing else runnable, tokio jumps straight from "now"
-    /// to the next pending timer's deadline in one step (confirmed against
-    /// `tokio` 1.53's own `time::park_thread_timeout`, which does exactly
-    /// one non-blocking, zero-duration I/O poll before deciding to jump —
-    /// not a bounded real wait), and a loopback TCP round trip does not
-    /// finish inside that single zero-duration poll. `spawn_blocking`
-    /// inhibits auto-advance for as long as it runs (tokio tracks this
-    /// with a plain counter — see `Clock::inhibit_auto_advance`), so the
-    /// nested `Handle::block_on` below waits out `timeout` on the ACTUAL
-    /// wall clock while this test's spawned server and this dog's own
-    /// delivery task keep running normally on the runtime's own worker
-    /// thread, freed by the calling test task moving off it.
-    ///
-    /// A bare `tokio::time::timeout` loses this race 100% of the time under
-    /// a paused clock, never intermittently: a minimal reproduction (two
-    /// tasks, a real `TcpListener`, nothing else) confirmed it. The
-    /// property each test asserts — a real delivery over a real socket
-    /// happened — is unchanged; only the mechanism used to wait for it
-    /// without fighting the paused clock is different.
-    async fn await_real_io<T: Send + 'static>(
-        timeout: Duration,
-        fut: impl Future<Output = T> + Send + 'static,
-    ) -> Result<T, tokio::time::error::Elapsed> {
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || handle.block_on(tokio::time::timeout(timeout, fut)))
-            .await
-            .expect("the spawn_blocking bridge task must not itself panic")
-    }
-
     fn base_info(name: &str, status: ProcStatus, restarts: u32) -> ProcessInfo {
         ProcessInfo::builder(1, name, status)
             .pid(Some(4242))
@@ -796,9 +760,19 @@ mod tests {
     /// THE test this dog exists for. fails if the poll is only ever driven
     /// by its interval: `web`'s `errored` frame is genuinely dropped by a
     /// real broadcast channel, so a loop that reconciles on a timer alone
-    /// stays silent for the whole poll interval — and under a paused clock,
-    /// forever.
-    #[tokio::test(start_paused = true)]
+    /// stays silent for the whole poll interval, which this fixture sets to
+    /// 60s.
+    ///
+    /// A real clock, and the 60s is what replaces the paused one. This test
+    /// used to pause the clock and wait through a `spawn_blocking` bridge,
+    /// a combination in which the deadline could never elapse: the bridge
+    /// inhibits auto-advance, so nothing moved the virtual clock to the
+    /// timeout and a regression hung the suite instead of failing it.
+    /// Measured, by making `spawn_firings` a no-op: over a minute, then
+    /// killed by hand. Nothing here needs the clock stopped. No interval can
+    /// fire inside a test that finishes in milliseconds, so the poll below
+    /// is still attributable to the lag and to nothing else.
+    #[tokio::test]
     async fn a_dropped_frame_makes_bark_poll_and_catch_up() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
         for i in 0..64 {
@@ -835,7 +809,7 @@ mod tests {
             ScriptedConfig::answering(String::new()),
         ));
 
-        let req = await_real_io(Duration::from_secs(5), captured)
+        let req = tokio::time::timeout(Duration::from_secs(5), captured)
             .await
             .expect("a dropped frame must produce a delivered bark")
             .unwrap();
@@ -847,16 +821,13 @@ mod tests {
         // building the outcome, appending to `barks.jsonl`). A short,
         // bounded poll — not a sleep the test just hopes is long enough —
         // covers that ordinary scheduling gap.
-        let recorded = await_real_io(Duration::from_secs(5), {
-            let barks_path = barks_path.clone();
-            async move {
-                loop {
-                    let records = shep_core::barks::read(&barks_path).unwrap();
-                    if !records.is_empty() {
-                        break records;
-                    }
-                    tokio::task::yield_now().await;
+        let recorded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let records = shep_core::barks::read(&barks_path).unwrap();
+                if !records.is_empty() {
+                    break records;
                 }
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -868,8 +839,8 @@ mod tests {
         assert_eq!(
             flock.calls(),
             1,
-            "the poll ran because of the lag, not because an interval elapsed \
-             — the clock is paused, so no interval has"
+            "the poll ran because of the lag, not because an interval elapsed: \
+             the interval is 60s and this test is milliseconds old"
         );
 
         loop_handle.abort();
@@ -943,9 +914,19 @@ mod tests {
     /// before the loop is given a chance to run either delivery to
     /// completion. If firings were awaited inline rather than spawned, the
     /// fast sink could only be reached after the slow one's own
-    /// `sink_timeout` (10s of virtual time) elapsed; this asserts it is
-    /// reached in well under that, with no timer needing to fire at all.
-    #[tokio::test(start_paused = true)]
+    /// `sink_timeout` elapsed; this asserts it is reached in well under
+    /// that.
+    ///
+    /// A real clock, for the reason
+    /// `a_dropped_frame_makes_bark_poll_and_catch_up` gives above: the
+    /// paused one it used to run under could not elapse the deadline it was
+    /// given, so an inline-awaiting loop would have hung here rather than
+    /// failed. The budget is 2s against a 10s `sink_timeout`. It was 50ms of
+    /// nominal virtual time, which no clock ever enforced; a real 50ms is a
+    /// claim about how fast a contended runner schedules two tasks, and this
+    /// project has lost CI runs to exactly that. Five times under the
+    /// timeout is still the whole of what this test means.
+    #[tokio::test]
     async fn a_slow_sink_never_stalls_the_loop() {
         let slow_addr = slow_sink().await;
         let (fast_addr, fast_captured) = one_shot_sink(200, "").await;
@@ -1008,7 +989,7 @@ mod tests {
             ScriptedConfig::answering(String::new()),
         ));
 
-        let req = await_real_io(Duration::from_millis(50), fast_captured)
+        let req = tokio::time::timeout(Duration::from_secs(2), fast_captured)
             .await
             .expect(
                 "the fast sink must be reached promptly; a slow sink in flight \
@@ -1100,16 +1081,14 @@ sinks = ["oncall"]
     /// a bark that restarted itself instead would add a restart to the
     /// column an operator reads as instability.
     ///
-    /// The one test in this module that does NOT pause the clock, and it
-    /// is about how this fails rather than how it passes. Under
-    /// `start_paused` the deadline inside [`await_real_io`] cannot elapse:
-    /// `spawn_blocking` inhibits auto-advance for as long as it runs, so
-    /// nothing moves the virtual clock to the timeout and a broken swap
-    /// hangs the suite instead of failing it. Measured, by mutating the
-    /// swap into a no-op. On a real clock the same wait is bounded, and
-    /// nothing here needs a paused one: the only timer in the loop is a
-    /// 60s poll interval that must not fire either way, and there is no
-    /// sleep anywhere below.
+    /// A real clock, and it is about how this fails rather than how it
+    /// passes. This test found the trap the other two in this module then
+    /// had to be taken out of: under `start_paused`, a deadline awaited
+    /// through a `spawn_blocking` bridge cannot elapse, because the bridge
+    /// inhibits auto-advance and nothing else moves the virtual clock to
+    /// it. A broken swap hung the suite rather than failing it. Measured,
+    /// by mutating the swap into a no-op. On a real clock the same wait is
+    /// bounded and the same mutation fails in 5.01s.
     #[tokio::test]
     async fn a_config_change_swaps_barks_sinks_in_place() {
         let (old_addr, mut old_captured) = one_shot_sink(200, "").await;
