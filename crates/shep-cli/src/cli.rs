@@ -12,7 +12,6 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use clap::ValueEnum as _;
 use shep_core::config::ResetDepth;
 
 /// The verb groups [`HELP_TEMPLATE`] renders, and the source of truth the
@@ -678,14 +677,10 @@ pub struct StartArgs {
     #[arg(long)]
     pub flockfile: bool,
     /// Widen a Flockfile load past its additive default: append nothing,
-    /// overwrite instead. A mode touches only what its name says.
-    ///
-    /// `file` puts back what the template declares, `env` kept. `policy`
-    /// puts back every setting but `env`, declared or not. `env` puts back
-    /// only `env`. `all` puts back everything, `env` included, and drops the
-    /// override record. Refused when the target supplies no template to
-    /// reset to: a sheep name reads no file, and a bare script path is a
-    /// command line rather than a file.
+    /// overwrite instead. A mode touches only what its name says; see the
+    /// four below. Refused when the target supplies no template to reset
+    /// to: a sheep name reads no file, and a bare script path is a command
+    /// line rather than a file.
     ///
     /// The value is required, with an equals sign: `--reset=file`, never
     /// `--reset file`. `targets` is a greedy variadic positional, and a
@@ -693,10 +688,10 @@ pub struct StartArgs {
     /// gets ambiguous.
     #[arg(
         long,
+        value_enum,
         num_args = 0..=1,
         require_equals = true,
-        default_missing_value = "",
-        value_parser = parse_reset_mode
+        default_missing_value = ""
     )]
     pub reset: Option<ResetMode>,
 }
@@ -732,29 +727,6 @@ impl ResetMode {
             Self::All => ResetDepth::All,
         }
     }
-}
-
-/// The whole of `--reset`'s teaching surface, pinned as an exact string by
-/// `reset_with_no_value_is_a_usage_error_naming_every_mode`: a destructive
-/// verb should make the operator name the destruction, the way `git reset`
-/// makes them choose between `--soft`, `--mixed` and `--hard`.
-///
-/// Reached two ways: `--reset` with no value at all (clap's own message for
-/// that case names none of the four modes), and a value that names none of
-/// them. Both are refusals to guess, so both get the same table.
-const RESET_USAGE: &str = "--reset needs a mode: file, policy, env, or all\n  \
-    file    put back what the template declares, env kept\n  \
-    policy  put back every setting but env, declared or not\n  \
-    env     put back only env\n  \
-    all     put back everything, env included, and drop the override record";
-
-/// clap's own `ValueEnum` parser, wrapped so a missing or unknown value
-/// prints [`RESET_USAGE`] instead of clap's generic message. `require_equals`
-/// plus `default_missing_value = ""` route a bare `--reset` here with an
-/// empty string, which no mode name matches, so it lands on the same
-/// refusal as a typo.
-fn parse_reset_mode(raw: &str) -> Result<ResetMode, String> {
-    ResetMode::from_str(raw, true).map_err(|_| RESET_USAGE.to_string())
 }
 
 /// Arguments to `shep serve`.
@@ -1812,17 +1784,23 @@ mod tests {
         }
     }
 
-    /// fails if `--reset` with no value produces clap's own generic
-    /// message instead of naming the four modes. Exact string: an error
-    /// that lists three of four modes is worse than none.
+    /// fails if `--reset` with no value stops naming the four modes.
+    /// Exact string: an error that lists three of four modes is worse than
+    /// none. `value_enum` supplies this for free once `num_args = 0..=1`
+    /// plus `default_missing_value` route a bare `--reset` through the
+    /// same possible-values machinery as a typo, rather than through
+    /// clap's unrelated "an equal sign is needed" message for a flag that
+    /// takes no value at all.
     #[test]
     fn reset_with_no_value_is_a_usage_error_naming_every_mode() {
         use clap::Parser;
 
         let err = Cli::try_parse_from(["shep", "start", "F.toml", "--reset"]).unwrap_err();
-        assert!(
-            err.to_string().contains(RESET_USAGE),
-            "expected the reset table in: {err}"
+        assert_eq!(
+            err.to_string(),
+            "error: a value is required for '--reset[=<RESET>]' but none was supplied\n  \
+             [possible values: file, policy, env, all]\n\n\
+             For more information, try '--help'.\n"
         );
     }
 
@@ -1860,9 +1838,11 @@ mod tests {
         use clap::Parser;
 
         let err = Cli::try_parse_from(["shep", "start", "F.toml", "--reset=banana"]).unwrap_err();
-        assert!(
-            err.to_string().contains(RESET_USAGE),
-            "expected the reset table in: {err}"
+        assert_eq!(
+            err.to_string(),
+            "error: invalid value 'banana' for '--reset[=<RESET>]'\n  \
+             [possible values: file, policy, env, all]\n\n\
+             For more information, try '--help'.\n"
         );
     }
 
