@@ -5735,10 +5735,13 @@ impl<R: ProcessRunner> Actor<R> {
     /// reload-in-flight refusal, the still-departing refusal and the
     /// partial-scale write-back are all that function's, and a second
     /// spelling of them here is a second thing to keep in step. Two depths
-    /// never reach it at all: [`ResetDepth::None`], which never reshapes a
-    /// flock, and any depth while `shutting_down`, because a scale-up spawns
-    /// and CRITICAL-1 forbids a child the shutdown aggregation cannot know
-    /// about.
+    /// never reach it at all, matching the three that do named above:
+    /// [`ResetDepth::None`], which never reshapes a flock, and
+    /// [`ResetDepth::Env`], which resets `env` and no setting at all, so
+    /// `merge_declared` holds `instances` out of its scope on the
+    /// same terms and a stocked count survives. Nor does any depth while
+    /// `shutting_down`, because a scale-up spawns and CRITICAL-1 forbids a
+    /// child the shutdown aggregation cannot know about.
     fn handle_apply_config(&mut self, apps: Vec<DeclaredApp>, reset: ResetDepth) -> Vec<Applied> {
         // One locked read for the whole file and one locked write at the end,
         // never a pair per app. The store is rewritten whole on every write,
