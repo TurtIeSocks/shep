@@ -560,6 +560,30 @@ where
                 let _ = app.update(Msg::Settings { result });
                 dirty = true;
             }
+            // The one arm that writes `shep.toml`, and off this task on
+            // purpose: `commands::settings::apply_setting` takes
+            // `ShepToml::try_edit`'s own lock, which blocks with no
+            // deadline. A concurrent `shep adopt` holding it would freeze
+            // this task's redraw, its tick and its bus drain right along
+            // with the write if this ran inline.
+            Effect::WriteSetting(edit) => {
+                let path = daemon_config.clone();
+                let for_msg = edit.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::commands::settings::apply_setting(&path, &edit)
+                })
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|inner| inner.map_err(|err| err.to_string()));
+                // `let _`: `Msg::SettingWritten` returns `Effect::None`
+                // unconditionally, the same reason `Msg::Settings`'s own
+                // call site above gives.
+                let _ = app.update(Msg::SettingWritten {
+                    edit: for_msg,
+                    result,
+                });
+                dirty = true;
+            }
             Effect::None => dirty = true,
         }
     }

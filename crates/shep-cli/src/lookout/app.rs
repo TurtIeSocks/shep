@@ -31,13 +31,14 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use shep_client::RequestError;
+use shep_core::config::LogLevel;
 use shep_core::protocol::{
     BusEvent, Lamb, ProcessEventKind, ProcessInfo, Request, Response, SelectorSpec,
 };
 use shep_core::status::ProcStatus;
 
 use super::theme::Palette;
-use crate::commands::settings::{SettingField, SettingsSnapshot};
+use crate::commands::settings::{ScalarView, SettingEdit, SettingField, SettingsSnapshot};
 use crate::style::{StyleLevel, StyleSource};
 use crate::vocabulary::Reported;
 
@@ -218,6 +219,21 @@ pub enum Msg {
         /// The rendered snapshot, or why it could not be read.
         result: Result<SettingsSnapshot, String>,
     },
+    /// An [`Effect::WriteSetting`] this reducer asked for has landed.
+    ///
+    /// `Result<(), String>` for the same reason [`Self::Settings`]'s own doc
+    /// gives: this reducer holds no error types from `commands`, and
+    /// `super::run_ui` is what calls `to_string()` on a
+    /// `commands::settings::SettingError` on the way in.
+    SettingWritten {
+        /// The edit that was sent, echoed back so the reducer can update the
+        /// right row without re-deriving it from whatever is armed now: the
+        /// cursor, and what is armed, can both have moved on while the write
+        /// was in flight.
+        edit: SettingEdit,
+        /// Whether the write landed, or why it did not.
+        result: Result<(), String>,
+    },
 }
 
 /// What the caller has to do after an update.
@@ -260,6 +276,17 @@ pub enum Effect {
     /// Raised by the dashboard's own `s`, never by the settings screen's:
     /// once the screen is open, `s` closes it instead. See [`App::on_key`].
     LoadSettings,
+    /// Apply one edit to `shep.toml`; the result lands as
+    /// [`Msg::SettingWritten`].
+    ///
+    /// Raised by [`App::confirm_setting`] once an armed scalar's Enter
+    /// lands. `super::run_ui` runs it on `spawn_blocking`, and that is
+    /// load-bearing rather than a convention: `commands::settings`'s
+    /// `ConfigLock::acquire` blocks with no deadline
+    /// (`FlockArg::LockExclusive`), so a concurrent `shep adopt` on the same
+    /// file would freeze the UI task's redraw, its tick and its bus drain
+    /// right along with the write.
+    WriteSetting(SettingEdit),
 }
 
 /// The connection's state, as the dashboard reports it.
@@ -487,6 +514,68 @@ pub struct Settings {
     /// pre-clamped: a later task's refresh can shrink the dog list out from
     /// under a cursor already sitting past its new end.
     cursor: usize,
+    /// The screen's one in-flight edit, or `None`. One field rather than
+    /// several `Option`s, so typing, armed and sent cannot overlap -- the
+    /// same claim [`Action`]'s own doc makes for the sheep confirm, made in
+    /// the type instead of in a guard.
+    pending: Option<Pending>,
+}
+
+/// The settings screen's own in-flight edit.
+///
+/// `Debug` is derived rather than redacted (IR-41): a field name, a
+/// candidate value and the rendered prompt sentence built from it -- none of
+/// the four scalars this task reaches carries a secret.
+#[derive(Debug, Clone)]
+enum Pending {
+    /// A free-text edit under construction. Only [`SettingField::Socket`]
+    /// and [`SettingField::MaxCronSleep`] ever reach this -- task 8's own
+    /// territory. Nothing in this task constructs it; the variant exists now
+    /// so [`Settings::pending`] and [`App::confirm_setting`] have a shape to
+    /// pass a non-`Armed`, non-`Sent` state through rather than gaining a
+    /// second `Option` the day it lands.
+    #[allow(dead_code)]
+    Typing {
+        /// Which scalar.
+        field: SettingField,
+        /// What the operator has typed so far.
+        buffer: String,
+    },
+    /// Armed: waiting for the operator's `Enter`. Nothing has gone out yet.
+    Armed {
+        /// The candidate, ready to send.
+        edit: SettingEdit,
+        /// The question this candidate reads as, rendered once at arm time
+        /// so [`Settings::pending`] can hand back a borrowed `&str` without
+        /// re-rendering it on every read.
+        text: String,
+        /// When it was armed. Only an armed edit expires -- see the
+        /// `Msg::Tick` arm.
+        at: Instant,
+    },
+    /// Sent: [`Effect::WriteSetting`] is in flight, waiting on
+    /// [`Msg::SettingWritten`].
+    Sent {
+        /// The edit that was sent.
+        #[allow(dead_code)]
+        edit: SettingEdit,
+        /// The same rendered question, so the prompt line does not change
+        /// wording between the question and its own answer.
+        text: String,
+    },
+}
+
+/// What the settings screen's status line shows for its one in-flight edit.
+///
+/// `Debug` is derived rather than redacted (IR-41): a rendered sentence and
+/// a bool, nothing a `{:?}` could leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsPrompt<'a> {
+    /// The confirm sentence: what will change, and what applying it does
+    /// and does not do.
+    pub text: &'a str,
+    /// False while it is a question, true once it has gone out.
+    pub sent: bool,
 }
 
 impl Settings {
@@ -495,19 +584,96 @@ impl Settings {
         Self {
             snapshot,
             cursor: 0,
+            pending: None,
         }
     }
 
-    /// What the screen reads off disk.
+    /// The armed candidate and its prompt, or `None`.
+    #[must_use]
+    pub fn pending(&self) -> Option<SettingsPrompt<'_>> {
+        match &self.pending {
+            Some(Pending::Armed { text, .. }) => Some(SettingsPrompt { text, sent: false }),
+            Some(Pending::Sent { text, .. }) => Some(SettingsPrompt { text, sent: true }),
+            Some(Pending::Typing { .. }) | None => None,
+        }
+    }
+
+    /// The next candidate for `field`, or `None` for a field this task does
+    /// not cycle ([`SettingField::Socket`], [`SettingField::MaxCronSleep`]
+    /// -- free text, task 8's own `Pending::Typing`) and for a
+    /// [`SettingsRow::Dog`] row, which is never a [`SettingField`] at all.
     ///
-    /// Not called outside this module's own tests yet: `view::settings`'s
-    /// `draw_settings` (a later task) is the real caller, reading it to
-    /// render every row's value and source. Same precedent this crate
-    /// already carries (`style::Presentation::BARE`,
-    /// `output::OutputEnvelope`, `commands::settings::load_settings`):
-    /// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-    /// site nothing needs yet.
-    #[allow(dead_code)]
+    /// Advances from whatever is already armed for THIS field, so a second
+    /// `space` walks one step further along the cycle rather than
+    /// re-deriving the same next value the file itself would produce --
+    /// without that, six log levels behind one cycle key would leave the
+    /// fourth unreachable without a cancel in between. An armed candidate
+    /// for a DIFFERENT field (the cursor moved after arming) is not a base:
+    /// this starts fresh from the snapshot instead.
+    fn next_candidate(&self, field: SettingField) -> Option<String> {
+        let armed_here = match &self.pending {
+            Some(Pending::Armed {
+                edit:
+                    SettingEdit::Set {
+                        field: armed_field,
+                        value,
+                    },
+                ..
+            }) if *armed_field == field => Some(value.as_str()),
+            _ => None,
+        };
+        let base = match armed_here {
+            Some(value) => value,
+            None => self.current_value(field)?,
+        };
+        Some(match field {
+            SettingField::LogLevel => next_log_level(base),
+            SettingField::LogJson | SettingField::AllowControl => next_bool(base),
+            SettingField::StyleLevel => next_style_level(base),
+            SettingField::Socket | SettingField::MaxCronSleep => return None,
+        })
+    }
+
+    /// The snapshot's own rendered value for one of the four scalars this
+    /// task cycles. `None` for the two this task does not.
+    fn current_value(&self, field: SettingField) -> Option<&str> {
+        Some(match field {
+            SettingField::LogLevel => self.snapshot.log_level.value.as_str(),
+            SettingField::LogJson => self.snapshot.log_json.value.as_str(),
+            SettingField::AllowControl => self.snapshot.allow_control.value.as_str(),
+            SettingField::StyleLevel => self.snapshot.style_level.value.as_str(),
+            SettingField::Socket | SettingField::MaxCronSleep => return None,
+        })
+    }
+
+    /// Folds a landed write back into the row it changed: the snapshot's
+    /// own [`ScalarView`] for `field` becomes `value`, sourced
+    /// [`StyleSource::Config`] -- the write just put it in the file.
+    /// [`SettingEdit::Unset`] never reaches here (this task only ever
+    /// arms `Set`), and the two fields this task never cycles are matched
+    /// out for exhaustiveness rather than reached.
+    fn record_written(&mut self, edit: &SettingEdit) {
+        let SettingEdit::Set { field, value } = edit else {
+            return;
+        };
+        let view = ScalarView {
+            value: value.clone(),
+            source: StyleSource::Config,
+        };
+        match field {
+            SettingField::LogLevel => self.snapshot.log_level = view,
+            SettingField::LogJson => self.snapshot.log_json = view,
+            SettingField::AllowControl => self.snapshot.allow_control = view,
+            SettingField::StyleLevel => self.snapshot.style_level = view,
+            SettingField::Socket | SettingField::MaxCronSleep => {}
+        }
+    }
+
+    /// What the screen reads off disk. `view::settings::content_lines` is
+    /// the real caller, reading it to render every row's value and source
+    /// -- `Settings::record_written` is what keeps it current once a write
+    /// lands, so a read here after a landed edit shows the new value, not
+    /// the one `Effect::LoadSettings` last found on disk.
     #[must_use]
     pub fn snapshot(&self) -> &SettingsSnapshot {
         &self.snapshot
@@ -533,11 +699,10 @@ impl Settings {
     /// empty, which cannot happen today (the six scalars are unconditional),
     /// but the type stays honest about it rather than asserting.
     ///
-    /// Not called outside this module's own tests yet: `view::settings`'s
-    /// `draw_settings` (a later task) is the real caller, reading it to
-    /// highlight the selected row. `#[allow(dead_code)]` for the same
-    /// reason [`Self::snapshot`] carries it.
-    #[allow(dead_code)]
+    /// `view::settings::content_lines` is the real caller, reading it to
+    /// highlight the selected row -- and [`App::cycle_setting`] reads it
+    /// through this same accessor to decide which field, if any, `space`
+    /// arms.
     #[must_use]
     pub fn cursor(&self) -> Option<SettingsRow> {
         let rows = self.rows();
@@ -565,6 +730,88 @@ impl Settings {
     /// Moves the cursor to the last row.
     fn move_to_last(&mut self) {
         self.cursor = self.rows().len().saturating_sub(1);
+    }
+}
+
+/// `Off, Error, Warn, Info, Debug, Trace`, [`LogLevel`]'s own declared
+/// order, wrapping from `Trace` back to `Off`.
+const LOG_LEVEL_ORDER: [LogLevel; 6] = [
+    LogLevel::Off,
+    LogLevel::Error,
+    LogLevel::Warn,
+    LogLevel::Info,
+    LogLevel::Debug,
+    LogLevel::Trace,
+];
+
+/// One step along [`LOG_LEVEL_ORDER`] from `current`. A string this crate
+/// did not itself render (should not happen -- every candidate and every
+/// snapshot value comes from [`LogLevel::as_str`]) reads as
+/// [`LogLevel::default`]'s own place in the ladder (`Warn`), so a corrupt
+/// value still produces a legal next one rather than panicking.
+fn next_log_level(current: &str) -> String {
+    let index = LogLevel::from_name(current)
+        .and_then(|level| {
+            LOG_LEVEL_ORDER
+                .iter()
+                .position(|candidate| *candidate == level)
+        })
+        .unwrap_or(2);
+    LOG_LEVEL_ORDER[(index + 1) % LOG_LEVEL_ORDER.len()]
+        .as_str()
+        .to_string()
+}
+
+/// Flips `"true"`/`"false"`. Anything else (should not happen, the same
+/// reason [`next_log_level`] states) reads as `false` and flips to `true`.
+fn next_bool(current: &str) -> String {
+    (current != "true").to_string()
+}
+
+/// `Full, Plain, Bare`, [`StyleLevel`]'s own declared order, wrapping from
+/// `Bare` back to `Full`.
+const STYLE_LEVEL_ORDER: [StyleLevel; 3] = [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare];
+
+/// One step along [`STYLE_LEVEL_ORDER`] from `current`, the same fallback
+/// [`next_log_level`] takes for an unparseable value.
+fn next_style_level(current: &str) -> String {
+    let index = StyleLevel::parse(current)
+        .and_then(|level| {
+            STYLE_LEVEL_ORDER
+                .iter()
+                .position(|candidate| *candidate == level)
+        })
+        .unwrap_or(0);
+    STYLE_LEVEL_ORDER[(index + 1) % STYLE_LEVEL_ORDER.len()].to_string()
+}
+
+/// The confirm sentence for `field`'s candidate `value` -- verbatim, per the
+/// task 7 spec's own table. `value` is always the candidate a
+/// `next_*` function above just produced, never re-derived here: this
+/// function only ever renders it into the sentence.
+///
+/// Called only with a field [`Settings::next_candidate`] returned `Some`
+/// for, so [`SettingField::Socket`] and [`SettingField::MaxCronSleep`]
+/// never reach the two arms below -- named rather than wildcarded so a
+/// future field added to the match cannot fall through unnoticed.
+fn confirm_text(field: SettingField, value: &str) -> String {
+    match field {
+        SettingField::LogLevel => format!(
+            "set log_level to {value}? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level"
+        ),
+        SettingField::LogJson => format!(
+            "set log_json to {value}? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_JSON or --log-json"
+        ),
+        SettingField::AllowControl => {
+            let word = if value == "true" { "on" } else { "off" };
+            format!("turn whistle control tools {word}? needs shep whistle restarted")
+        }
+        SettingField::StyleLevel => {
+            format!("set style level to {value}? the next command reads it")
+        }
+        SettingField::Socket | SettingField::MaxCronSleep => unreachable!(
+            "Settings::next_candidate never arms these two -- they are task 8's Pending::Typing"
+        ),
     }
 }
 
@@ -829,6 +1076,25 @@ impl App {
                         self.action = None;
                     }
                 }
+                // The settings screen's own expiry sits OUTSIDE the guard
+                // above, and compares against `now` -- the tick's own
+                // instant -- rather than `self.now`, which that guard stops
+                // advancing once the link is lost. The sheep confirm freezes
+                // with everything else on a dead link because every word of
+                // it describes the shepherd, which the dashboard can no
+                // longer see; a settings edit describes a local file that is
+                // not stale just because the shepherd stopped answering, so
+                // it keeps its own clock running.
+                if let Some(settings) = self.settings.as_mut() {
+                    let expired = matches!(
+                        settings.pending,
+                        Some(Pending::Armed { at, .. })
+                            if now.saturating_duration_since(at) >= CONFIRM_EXPIRY
+                    );
+                    if expired {
+                        settings.pending = None;
+                    }
+                }
                 Effect::None
             }
             Msg::Resize => Effect::None,
@@ -941,6 +1207,37 @@ impl App {
                         self.settings = Some(Settings::new(snapshot));
                     }
                     Err(message) => {
+                        self.notice = Some(Notice {
+                            text: message,
+                            grave: true,
+                        });
+                    }
+                }
+                Effect::None
+            }
+            // An [`Effect::WriteSetting`] landed. `Ok` folds the value into
+            // the row it changed and clears the prompt; `Err` leaves the row
+            // exactly as it read before the write, and raises a grave
+            // notice with the refusal's own words rather than a generic
+            // one -- the same "say why" rule `arm`'s refusal ladder follows.
+            //
+            // Both arms clear `pending` on the settings screen alone, in two
+            // separate blocks rather than one shared borrow of `self`: this
+            // arm needs to set `self.notice` on the `Err` path, and Rust
+            // will not let a `&mut self.settings` borrow stay live across
+            // that assignment to a different field of the same `self`.
+            Msg::SettingWritten { edit, result } => {
+                match result {
+                    Ok(()) => {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings.pending = None;
+                            settings.record_written(&edit);
+                        }
+                    }
+                    Err(message) => {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings.pending = None;
+                        }
                         self.notice = Some(Notice {
                             text: message,
                             grave: true,
@@ -1242,12 +1539,29 @@ impl App {
         self.notice = None;
         match key {
             KeyPress::Quit => return Effect::Quit,
-            // Both close. `s` toggling shut is the dashboard's own `s`
-            // meaning something different once the screen is open, the same
-            // division `Escape`'s doc argues for; `Escape` closing rather
-            // than quitting is the one place this screen swaps the
-            // dashboard's own cascade.
-            KeyPress::Settings | KeyPress::Escape => self.settings = None,
+            // Both close -- but an armed confirm eats the FIRST one instead,
+            // the same cancel-before-act rule `on_key`'s own dashboard
+            // branch already follows for `x`/`R`/`L`. Without this, `space`
+            // then a reflexive `Escape` would close the whole screen on top
+            // of a question the operator only meant to back out of.
+            //
+            // `s` toggling shut is the dashboard's own `s` meaning something
+            // different once the screen is open, the same division
+            // `Escape`'s doc argues for; `Escape` closing rather than
+            // quitting is the one place this screen swaps the dashboard's
+            // own cascade.
+            KeyPress::Settings | KeyPress::Escape => {
+                let armed = self.settings.as_ref().is_some_and(|settings| {
+                    matches!(settings.pending, Some(Pending::Armed { .. }))
+                });
+                if armed {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.pending = None;
+                    }
+                } else {
+                    self.settings = None;
+                }
+            }
             KeyPress::SelectUp => {
                 if let Some(settings) = self.settings.as_mut() {
                     settings.move_by(-1);
@@ -1268,19 +1582,9 @@ impl App {
                     settings.move_to_last();
                 }
             }
-            // Nothing to cycle yet: writing lands in a later task. The
-            // refusal is the one thing that has to exist today: an operator
-            // running a read-only lookout must be told why `space` did
-            // nothing, exactly as an action key already is.
-            KeyPress::Cycle => {
-                if self.control == Control::ReadOnly {
-                    self.notice = Some(Notice {
-                        text: "read-only: actions need --allow-control".to_string(),
-                        grave: true,
-                    });
-                }
-            }
-            KeyPress::Confirm | KeyPress::Refresh => {}
+            KeyPress::Cycle => return self.cycle_setting(),
+            KeyPress::Confirm => return self.confirm_setting(),
+            KeyPress::Refresh => {}
             // Unreachable from here, and named rather than wildcarded so a
             // future variant does not fall silently into an arm that
             // ignores it: an action key in particular must never be
@@ -1293,6 +1597,68 @@ impl App {
             | KeyPress::TextAbandon => {}
         }
         Effect::None
+    }
+
+    /// `space` on the settings screen. Arms a candidate for the cursor's
+    /// row, or refuses and says why the same way an action key does; the
+    /// gate is the same read-only check `arm` makes for a sheep action,
+    /// because a keystroke that mutates `shep.toml` needs the same fat-finger
+    /// catch a keystroke that stops a sheep does. Re-arms rather than
+    /// no-opping when a candidate is already armed for this row, so a
+    /// second `space` walks one step further along the cycle -- see
+    /// [`Settings::next_candidate`]'s own doc.
+    ///
+    /// Silently does nothing on [`SettingField::Socket`],
+    /// [`SettingField::MaxCronSleep`] and a [`SettingsRow::Dog`] row: none
+    /// of the three is this task's job, and a screen the operator can
+    /// already read gives no sign that `space` was ever going to do
+    /// anything there.
+    fn cycle_setting(&mut self) -> Effect {
+        if self.control == Control::ReadOnly {
+            self.notice = Some(Notice {
+                text: "read-only: actions need --allow-control".to_string(),
+                grave: true,
+            });
+            return Effect::None;
+        }
+        let Some(settings) = self.settings.as_mut() else {
+            return Effect::None;
+        };
+        let Some(SettingsRow::Scalar(field)) = settings.cursor() else {
+            return Effect::None;
+        };
+        let Some(value) = settings.next_candidate(field) else {
+            return Effect::None;
+        };
+        let text = confirm_text(field, &value);
+        settings.pending = Some(Pending::Armed {
+            edit: SettingEdit::Set { field, value },
+            text,
+            at: self.now,
+        });
+        Effect::None
+    }
+
+    /// The operator's `Enter` on the settings screen. Sends an armed
+    /// candidate and moves it to [`Pending::Sent`]; leaves anything else
+    /// (nothing armed, or a `Typing` edit task 8 owns) untouched.
+    fn confirm_setting(&mut self) -> Effect {
+        let Some(settings) = self.settings.as_mut() else {
+            return Effect::None;
+        };
+        match settings.pending.take() {
+            Some(Pending::Armed { edit, text, .. }) => {
+                settings.pending = Some(Pending::Sent {
+                    edit: edit.clone(),
+                    text,
+                });
+                Effect::WriteSetting(edit)
+            }
+            other => {
+                settings.pending = other;
+                Effect::None
+            }
+        }
     }
 
     /// Arms a confirm, or refuses and says why.
@@ -3916,6 +4282,161 @@ mod tests {
         let _ = app.update(Msg::Key(KeyPress::Cycle));
         let notice = app.notice().expect("the refusal has to say why");
         assert!(notice.is_grave());
+    }
+
+    #[test]
+    fn space_arms_a_candidate_without_changing_the_row() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let before = app.settings().unwrap().snapshot().log_level.value.clone();
+
+        assert_eq!(app.update(Msg::Key(KeyPress::Cycle)), Effect::None);
+
+        assert_eq!(
+            app.settings().unwrap().snapshot().log_level.value,
+            before,
+            "arming is a question, so the row still shows what the file says"
+        );
+        assert!(app.settings().unwrap().pending().is_some());
+    }
+
+    /// Six log levels and one cycle key. Without re-arming, the fourth is
+    /// unreachable without cancelling in between.
+    #[test]
+    fn space_advances_the_candidate_rather_than_needing_a_cancel() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let first = app.settings().unwrap().pending().unwrap().text.to_string();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let second = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_daemon_confirm_names_both_layers_lookout_cannot_see() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("shep daemon reload"), "got: {text}");
+        assert!(text.contains("SHEP_LOG_LEVEL"), "got: {text}");
+        assert!(text.contains("--log-level"), "got: {text}");
+    }
+
+    #[test]
+    fn the_whistle_confirm_names_a_whistle_restart_and_not_a_reload() {
+        let mut app = fixtures::app_in_settings_on(SettingField::AllowControl);
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("shep whistle restarted"), "got: {text}");
+        assert!(
+            !text.contains("daemon reload"),
+            "a whistle key needs no reload: {text}"
+        );
+    }
+
+    #[test]
+    fn the_style_confirm_promises_nothing_beyond_the_next_command() {
+        let mut app = fixtures::app_in_settings_on(SettingField::StyleLevel);
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("the next command reads it"), "got: {text}");
+    }
+
+    #[test]
+    fn enter_sends_the_armed_edit() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let effect = app.update(Msg::Key(KeyPress::Confirm));
+        assert!(matches!(
+            effect,
+            Effect::WriteSetting(SettingEdit::Set {
+                field: SettingField::LogLevel,
+                ..
+            })
+        ));
+        assert!(app.settings().unwrap().pending().unwrap().sent);
+    }
+
+    #[test]
+    fn a_written_edit_updates_the_row_and_its_source() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        let _ = app.update(Msg::SettingWritten {
+            edit,
+            result: Ok(()),
+        });
+
+        assert_eq!(
+            app.settings().unwrap().snapshot().log_level.source,
+            StyleSource::Config
+        );
+        assert!(app.settings().unwrap().pending().is_none());
+    }
+
+    #[test]
+    fn a_refused_write_says_why_and_leaves_the_row_alone() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let before = app.settings().unwrap().snapshot().log_level.clone();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        let _ = app.update(Msg::SettingWritten {
+            edit,
+            result: Err("max_cron_sleep is 500ms, below the 1s floor".into()),
+        });
+
+        assert_eq!(app.settings().unwrap().snapshot().log_level, before);
+        let notice = app.notice().unwrap();
+        assert!(notice.is_grave());
+        assert!(notice.to_string().contains("below the 1s floor"));
+    }
+
+    /// The divergence from the sheep confirm, which `disarm_on_link_change`
+    /// clears. A settings edit is local file I/O over a file that is not
+    /// stale.
+    #[test]
+    fn a_lost_link_leaves_a_scalar_confirm_armed() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let _ = app.update(Msg::Frozen {
+            at_local: "12:00:00".into(),
+        });
+        assert!(
+            app.settings().unwrap().pending().is_some(),
+            "a scalar never leaves the machine, so a dead shepherd is irrelevant to it"
+        );
+    }
+
+    /// And it still expires, off the raw tick rather than `self.now`, which
+    /// stops advancing once the link is lost.
+    #[test]
+    fn a_settings_confirm_expires_on_a_frozen_dashboard() {
+        let (mut app, start) = fixtures::app_in_settings_at();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let _ = app.update(Msg::Frozen {
+            at_local: "12:00:00".into(),
+        });
+        let _ = app.update(Msg::Tick {
+            now: start + CONFIRM_EXPIRY,
+        });
+        assert!(app.settings().unwrap().pending().is_none());
+    }
+
+    #[test]
+    fn escape_cancels_the_confirm_before_it_closes_the_screen() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let _ = app.update(Msg::Key(KeyPress::Escape));
+        assert!(app.settings().unwrap().pending().is_none());
+        assert!(
+            app.settings().is_some(),
+            "the first Esc cancels, it does not close"
+        );
+        let _ = app.update(Msg::Key(KeyPress::Escape));
+        assert!(app.settings().is_none());
     }
 
     /// fails if an action armed while the read is still in flight survives

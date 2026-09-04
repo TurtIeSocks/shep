@@ -1,16 +1,19 @@
 //! The settings screen: `[daemon]`, `[whistle]`, `[style]` then `[dogs]`,
 //! drawn straight into the buffer rather than composed as a `Vec<Line>` the
-//! way the dashboard's own panes are — this screen owns the whole body
+//! way the dashboard's own panes are (this screen owns the whole body
 //! between the title and the status bar, so there is no outer `draw` left to
-//! hand lines to.
+//! hand lines to).
 //!
 //! Every row goes through [`fit`], the same truncation `view::flock` uses:
 //! a value cut short says so with the same trailing `…`, rather than
 //! spilling into the column beside it.
 //!
-//! Reading is unconditional. Editing lands in later tasks (7 and 8), so
-//! every row here shows what `shep.toml` says today, never what an operator
-//! is mid-typing.
+//! Four of the six scalars (`log_level`, `log_json`, `allow_control`,
+//! `style level`) are editable, and their armed candidate is what one extra
+//! line under the dogs table shows, when there is one. `socket` and
+//! `max_cron_sleep` still only ever show what `shep.toml` says today: task
+//! 8's own free-text editor is what makes those two, and the dogs table's
+//! own enable/disable, editable as well.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -280,47 +283,56 @@ fn scalar_line(
     Line::from(Span::raw(text))
 }
 
+/// Which `[section]` a scalar field's row lives under.
+const fn section_for(field: SettingField) -> &'static str {
+    match field {
+        SettingField::LogLevel
+        | SettingField::LogJson
+        | SettingField::Socket
+        | SettingField::MaxCronSleep => "[daemon]",
+        SettingField::AllowControl => "[whistle]",
+        SettingField::StyleLevel => "[style]",
+    }
+}
+
 /// Every line of the screen's body, top to bottom: `[daemon]`'s four rows,
 /// `[whistle]`'s one, `[style]`'s one, then `[dogs]`'s caption and table.
+///
+/// Walks [`Settings::rows`] itself rather than hand-listing the six scalars
+/// a second time in this function's own order: two lists that happen to
+/// agree today would silently desync the moment either one reordered, and
+/// the cursor -- which [`Settings::rows`] alone defines -- would then land
+/// on a row this function drew somewhere else.
 fn content_lines(settings: &Settings, palette: Palette, width: u16) -> Vec<Line<'static>> {
     let snapshot = settings.snapshot();
     let cursor = settings.cursor();
-    let is_selected = |field: SettingField| cursor == Some(SettingsRow::Scalar(field));
 
     let mut lines = Vec::new();
+    let mut current_section: Option<&'static str> = None;
 
-    lines.push(section_header("[daemon]", palette));
-    for field in [
-        SettingField::LogLevel,
-        SettingField::LogJson,
-        SettingField::Socket,
-        SettingField::MaxCronSleep,
-    ] {
+    // The six scalar rows always sort first in `Settings::rows`, ahead of
+    // every `SettingsRow::Dog` -- see its own doc -- so this loop's `break`
+    // on the first non-scalar row is exactly "stop once the scalars end",
+    // never "stop at the first dog that happens to come early".
+    for row in settings.rows() {
+        let SettingsRow::Scalar(field) = row else {
+            break;
+        };
+        let section = section_for(field);
+        if current_section != Some(section) {
+            if current_section.is_some() {
+                lines.push(Line::default());
+            }
+            lines.push(section_header(section, palette));
+            current_section = Some(section);
+        }
         lines.push(scalar_line(
             field,
             scalar_view(snapshot, field),
-            is_selected(field),
+            cursor == Some(row),
             width,
         ));
     }
-    lines.push(Line::default());
-
-    lines.push(section_header("[whistle]", palette));
-    lines.push(scalar_line(
-        SettingField::AllowControl,
-        &snapshot.allow_control,
-        is_selected(SettingField::AllowControl),
-        width,
-    ));
-    lines.push(Line::default());
-
-    lines.push(section_header("[style]", palette));
-    lines.push(scalar_line(
-        SettingField::StyleLevel,
-        &snapshot.style_level,
-        is_selected(SettingField::StyleLevel),
-        width,
-    ));
     lines.push(Line::default());
 
     lines.push(section_header("[dogs]", palette));
@@ -342,14 +354,33 @@ fn content_lines(settings: &Settings, palette: Palette, width: u16) -> Vec<Line<
         lines.push(dog_line(dog, &rendered_columns, width, selected));
     }
 
+    // One prompt line under the table, in the shape the status bar's own
+    // `confirm_prompt`/`in_flight_text` use for a sheep confirm: a question
+    // styled `attention` while it waits on `Enter`, an in-flight sentence
+    // once it has gone out. Drawn here rather than in the status bar itself
+    // -- the settings screen owns its own body between the title and that
+    // bar, and this prompt is about one row in the table above it, not
+    // about the whole dashboard.
+    if let Some(prompt) = settings.pending() {
+        lines.push(Line::default());
+        let text = if prompt.sent {
+            format!("{}  sent, waiting for the shepherd", prompt.text)
+        } else {
+            format!("{}  enter confirms, any other key cancels", prompt.text)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {text}"),
+            palette.attention(),
+        )));
+    }
+
     lines
 }
 
 /// Draws the settings screen into `area`, straight into `buffer`.
 ///
-/// `app` supplies the palette; every other fact this screen shows comes off
-/// `settings` -- see this module's own doc for why reading is the whole of
-/// this task.
+/// `app` supplies the palette; every other fact this screen shows, including
+/// its one armed or in-flight prompt line, comes off `settings`.
 pub fn draw_settings(app: &App, settings: &Settings, area: Rect, buffer: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -373,6 +404,7 @@ mod tests {
     use super::super::fixtures;
     use super::*;
     use crate::lookout::frames::render_text;
+    use crate::style::StyleSource;
 
     /// The whole screen at a comfortable width. The snapshot is the
     /// assertion: it pins the section order, every row's four columns and
@@ -445,6 +477,27 @@ mod tests {
         assert!(
             marked[0].contains("log_level"),
             "the cursor opens on the first row: {rendered:?}"
+        );
+    }
+
+    /// fails if `SCALAR_SOURCE_W` stops fitting the widest word this column
+    /// ever prints. `"the default"` is what a fresh `$SHEP_HOME` shows for
+    /// every scalar -- the state most operators open this screen in -- and
+    /// no fixture anywhere in this tree renders it: `settings_snapshot`
+    /// gives every scalar `StyleSource::Config`, which is one column
+    /// shorter (`"shep.toml"`) and would not catch the column shrinking out
+    /// from under the longer word.
+    #[test]
+    fn the_default_source_label_fits_the_column_it_was_sized_for() {
+        let rendered = fit(&StyleSource::Default.to_string(), SCALAR_SOURCE_W);
+        assert_eq!(
+            rendered.chars().count(),
+            usize::from(SCALAR_SOURCE_W),
+            "fit always pads or truncates to the exact column width"
+        );
+        assert!(
+            !rendered.contains('…'),
+            "SCALAR_SOURCE_W must fit \"the default\" whole: got {rendered:?}"
         );
     }
 }

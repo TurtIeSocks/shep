@@ -9,11 +9,13 @@ use shep_client::RequestError;
 use shep_core::protocol::{BusEvent, Lamb, ProcessInfo, Response};
 use shep_core::status::ProcStatus;
 
-use super::super::app::{ActionVerb, App, Control, KeyPress, LambWalk, Msg, RowKey, Sent};
+use super::super::app::{
+    ActionVerb, App, Control, KeyPress, LambWalk, Msg, RowKey, Sent, SettingsRow,
+};
 use super::super::source::HostSample;
 use super::super::tail::{Stream, Tail, TailLine};
 use super::super::theme::Palette;
-use crate::commands::settings::{DogView, ScalarView, SettingsSnapshot};
+use crate::commands::settings::{DogView, ScalarView, SettingField, SettingsSnapshot};
 use crate::style::StyleSource;
 
 /// No colour at all: the palette every fixture uses unless the test is about
@@ -446,6 +448,38 @@ pub fn app_in_settings() -> App {
 /// [`app_in_settings`] with the control gate open, for the one test that
 /// proves an action key stays unreachable even when actions would otherwise
 /// be permitted.
+/// [`app_in_settings_with_control`] with the cursor already moved onto
+/// `field`'s row, by real `SelectDown` keypresses -- not by poking the
+/// cursor index directly, so a test using this fixture is exercising the
+/// same path an operator would.
+pub fn app_in_settings_on(field: SettingField) -> App {
+    let mut app = app_in_settings_with_control();
+    let target = app
+        .settings()
+        .unwrap()
+        .rows()
+        .iter()
+        .position(|row| *row == SettingsRow::Scalar(field))
+        .expect("field is one of the six scalar rows Settings::rows always carries");
+    for _ in 0..target {
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+    app
+}
+
+/// [`app_in_settings_with_control`], but built from a caller-visible `t0`
+/// rather than [`Instant::now`] read inside this function: an expiry test
+/// needs to hand `Msg::Tick` an instant it can do arithmetic against.
+pub fn app_in_settings_at() -> (App, Instant) {
+    let t0 = Instant::now();
+    let mut app = App::new(plain(), Control::Allowed, "/home/ada/.shep".to_string(), t0);
+    app.update(Msg::Key(KeyPress::Settings));
+    app.update(Msg::Settings {
+        result: Ok(settings_snapshot()),
+    });
+    (app, t0)
+}
+
 pub fn app_in_settings_with_control() -> App {
     let mut app = app_in_settings();
     app.set_control_for_tests(Control::Allowed);
