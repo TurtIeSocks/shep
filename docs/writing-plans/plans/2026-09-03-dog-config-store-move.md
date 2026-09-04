@@ -506,8 +506,9 @@ Expected: FAIL, `cannot find function 'migrate_dog_sections'`.
 ///   TOML, and [`DogMigrationError::Render`] when the merged map will not
 ///   serialize.
 /// - [`DogMigrationError::Read`] and [`DogMigrationError::Write`] for the
-///   underlying I/O, and [`DogMigrationError::Toml`] for whatever
-///   `ShepToml` failed at.
+///   underlying I/O, [`DogMigrationError::Lock`] when `dogs.toml`'s
+///   sibling lock could not be taken, and [`DogMigrationError::Toml`] for
+///   whatever `ShepToml` failed at.
 pub fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrationError> {
     let existing_source = match std::fs::read_to_string(&paths.daemon_config) {
         Ok(source) => source,
@@ -536,6 +537,8 @@ pub fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrati
     // neither file. `try_edit`'s own `Err` skips `save` entirely and
     // leaves `path` exactly as it was found.
     ShepToml::try_edit(&paths.daemon_config, |doc| {
+        let _dogs_lock =
+            ConfigLock::acquire(&paths.dogs_config).map_err(DogMigrationError::Lock)?;
         let incoming = doc.take_dog_sections();
         if let Some(name) = incoming.keys().find(|name| already.dog.contains_key(*name)) {
             return Err(DogMigrationError::WouldOverwrite { name: name.clone() });
@@ -550,7 +553,16 @@ pub fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrati
         // sections only once the new file already holds them. A crash
         // between the two leaves them readable from `shep.toml`, which is
         // the direction that loses nothing.
-        std::fs::write(&paths.dogs_config, rendered).map_err(DogMigrationError::Write)?;
+        //
+        // Through `write_dogs_config`, never `std::fs::write`. That file
+        // holds webhook URLs, which are bearer tokens in a path, so it is
+        // staged in a sibling temp at `CONFIG_FILE_MODE`, `fsync`ed and
+        // `rename`d: a bare write would create it at the ambient umask and
+        // leave a half-written file behind on a crash. The lock above is
+        // the other half, serialising this against `shep rehome`'s write
+        // to the same file. `shep.toml`'s lock is the outer one and this
+        // is the only place either is nested in the other.
+        write_dogs_config(&paths.dogs_config, &rendered).map_err(DogMigrationError::Write)?;
         Ok(moved)
     })
 }
