@@ -57,6 +57,17 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# One run per ref at a time. On a pull request a newer push cancels the run
+# it supersedes, because the old head's verdict is no longer the question:
+# measured over every run to 2026-09-04, 565 of them, 17 were cancelled by
+# hand for exactly that reason and the rest of the superseded ones ran to
+# the end for nothing. A push to main cancels nothing, and never queues behind a
+# pull request, since the group carries the ref: main's runs are the record
+# the release workflows and the ruleset read, and a cancelled one there is
+# a gap in it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   # Decides which of the jobs below a change actually needs, so a docs-only
   # pull request stops paying for the full Rust matrix. Everything below
