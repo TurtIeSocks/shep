@@ -36,7 +36,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only`;
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only`;
 
 const narrow = `shep lookout   /home/ada/.shep       6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12…
@@ -76,7 +76,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only`;
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only`;
 
 const refused = `shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h
@@ -131,7 +131,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   / filter   x stop   R restart   L reload                                           control enabled`;
+q quit   j/k select   / filter   x stop   R restart   L reload   s settings                              control enabled`;
 
 const filterActive = `shep lookout   /home/ada/.shep                                                   2 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
@@ -164,6 +164,71 @@ host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7% 
   0     web                online           48211    0         -          3.4%    182.0M    1h 25m
   1     web                online           48212    0         -          2.9%    178.0M    1h 26m
 restart api (id 2): the shepherd restarted it                                        control enabled`;
+
+const settingsFresh = `shep lookout   /home/ada/.shep                                                                            6 in the flock
+  [daemon]
+> log_level        warn                            the default  needs shep daemon reload
+  log_json         false                           the default  needs shep daemon reload
+  socket           /home/ada/.shep/run/shep.sock   the default  needs the shepherd stopped and started
+  max_cron_sleep   not set                         the default  needs shep daemon reload
+
+  [whistle]
+  allow_control    false                           the default  needs shep whistle restarted
+
+  [style]
+  level            full                            the default  the next command reads it
+
+  [dogs]
+  space arms, Enter applies; a dog needs no reload
+  NAME                                                                  IN FILE  SOURCE                    RUNNING
+  bark                                                                  no       built-in                  not running
+  metrics                                                               no       built-in                  not running
+
+esc close   j/k select   g/G first/last   space cycle                                                          read-only`;
+
+const settingsConfirm = `shep lookout   /home/ada/.shep                                                                                                                                        6 in the flock
+  [daemon]
+> log_level        warn                            shep.toml    needs shep daemon reload
+  log_json         false                           the default  needs shep daemon reload
+  socket           /home/ada/.shep/run/shep.sock   shep.toml    needs the shepherd stopped and started
+  max_cron_sleep   30s                             shep.toml    needs shep daemon reload
+
+  [whistle]
+  allow_control    false                           the default  needs shep whistle restarted
+
+  [style]
+  level            full                            shep.toml    the next command reads it
+
+  [dogs]
+  space arms, Enter applies; a dog needs no reload
+  NAME                                                                                                                              IN FILE  SOURCE                    RUNNING
+  bark                                                                                                                              no       built-in                  not running
+  metrics                                                                                                                           yes      built-in                  not running
+
+  set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key cancels
+set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key ca… control enabled`;
+
+const settingsDogs = `shep lookout   /home/ada/.shep                                                                            2 in the flock
+  [daemon]
+> log_level        warn                            shep.toml    needs shep daemon reload
+  log_json         false                           the default  needs shep daemon reload
+  socket           /home/ada/.shep/run/shep.sock   shep.toml    needs the shepherd stopped and started
+  max_cron_sleep   30s                             shep.toml    needs shep daemon reload
+
+  [whistle]
+  allow_control    false                           the default  needs shep whistle restarted
+
+  [style]
+  level            full                            shep.toml    the next command reads it
+
+  [dogs]
+  space arms, Enter applies; a dog needs no reload
+  NAME                                                                  IN FILE  SOURCE                    RUNNING
+  otel                                                                  no       built-in                  online
+  ledger                                                                yes      built-in                  not running
+  bark                                                                  yes      built-in                  silent
+
+esc close   j/k select   g/G first/last   space cycle                                                          read-only`;
 ---
 
 <DocsLayout
@@ -362,6 +427,107 @@ restart api (id 2): the shepherd restarted it                                   
       <code>shep stop</code> yourself. Every color on screen is also
       redundant with text, so <code>NO_COLOR</code> and a 16-color terminal
       lose decoration, never information.
+    </p>
+    <h2>Settings</h2>
+    <p>
+      <code>s</code> opens a full-screen settings view over
+      <code>shep.toml</code>: the four daemon fields, the whistle gate, the
+      style level, and the dogs table's own enable/disable, each with a
+      SOURCE column and a note on what it takes to apply. <code>s</code>
+      or <code>Esc</code> closes it again, back to the flock table.
+    </p>
+    <p>
+      Reading this screen needs nothing. It opens under a plain
+      <code>shep lookout</code>, with no <code>--allow-control</code>, the
+      same as everything else on the dashboard. Changing a value is a
+      different story: every edit and the dog toggle need the same gate the
+      action keys do, and refuse the same way if it's closed.
+    </p>
+    <CodeBlock label="120×30, a fresh $SHEP_HOME">{settingsFresh}</CodeBlock>
+    <p>
+      SOURCE reads <code>the default</code> when <code>shep.toml</code>
+      doesn't mention the field at all, and the VALUE column shows the
+      compiled fallback instead of anything from disk. A fresh
+      <code>$SHEP_HOME</code> ships a <code>shep.toml</code> holding only
+      <code>[interpreters]</code>, so this is the state you land in the
+      first time you open the screen: every field on it is a guess about
+      what the daemon assumes, not a record of what anyone wrote. Once a
+      field is set, SOURCE switches to <code>shep.toml</code> and VALUE
+      shows what's actually there.
+    </p>
+    <CodeBlock label="120×30, some fields set">{settingsDogs}</CodeBlock>
+    <p>
+      The <code>[dogs]</code> table is the one place SOURCE isn't the whole
+      story: IN FILE says whether <code>[daemon] enabled_dogs</code> names
+      the dog, SOURCE says whether it's built in or adopted from a path, and
+      RUNNING joins both against the live flock. The three can disagree, and
+      when they do that's the point of showing all three: <code>otel</code>
+      above is running with nothing enabling it, <code>ledger</code> is
+      enabled and not running, and <code>bark</code> is enabled, running,
+      and still <code>silent</code> because it never finished a handshake.
+      <code>space</code> arms a toggle on the selected dog and <code>Enter</code>
+      sends it; unlike a scalar edit, this reaches the shepherd directly and
+      needs no reload.
+    </p>
+    <Callout variant="careful">
+      A <code>[daemon]</code> edit only ever changes <code>shep.toml</code>.
+      The shepherd itself can be started with <code>SHEP_LOG_LEVEL</code>,
+      <code>SHEP_SOCKET</code>, or the matching <code>--log-level</code> /
+      <code>--socket</code> flags, and shep's own precedence puts those above
+      the file. Lookout has no way to see what the shepherd was booted with,
+      so setting <code>log_level</code> here and running
+      <code>shep daemon reload</code> can do nothing at all if the process
+      was started with <code>SHEP_LOG_LEVEL</code> set, and nothing on
+      screen will say so. <code>[style]</code> is the one exception: those
+      layers belong to lookout's own process, not the shepherd's, so a style
+      edit always takes.
+    </Callout>
+    <p>
+      The confirm names exactly this risk when it's <code>[daemon]</code>
+      that's armed:
+    </p>
+    <CodeBlock label="180×30, armed">{settingsConfirm}</CodeBlock>
+    <p>
+      <code>log_level</code>, <code>log_json</code>, and
+      <code>allow_control</code> cycle through a fixed set of values, and the
+      cycle only ever moves a field from <code>the default</code> to
+      <code>shep.toml</code>, never back: <code>space</code> proposes the
+      next value, it's never "unset". <code>socket</code> and
+      <code>max_cron_sleep</code> are the only two fields this screen can put
+      back to the default, because they're free text, and clearing the
+      editor back to an empty line is what unsets them. <code>style level</code>
+      is optional too, but <code>shep style</code> is what owns it and can't
+      clear it either, so this screen doesn't offer to.
+    </p>
+    <p>
+      Keys, all of them local to this screen while it's open:
+    </p>
+    <ul>
+      <li><code>s</code> opens the screen, and closes it again</li>
+      <li><code>j</code>/<code>k</code>, arrows move the cursor one row</li>
+      <li><code>g</code>/<code>G</code> jump to the first or last row</li>
+      <li>
+        <code>space</code> arms the cursor's row; pressing it again on the
+        same field re-arms with the next candidate
+      </li>
+      <li>
+        <code>Enter</code> opens the text editor on <code>socket</code>/
+        <code>max_cron_sleep</code>, or sends an armed confirm
+      </li>
+      <li>
+        <code>Esc</code> cancels an armed confirm, else abandons the text
+        editor, else closes the screen; it never quits lookout
+      </li>
+      <li><code>r</code> re-reads <code>shep.toml</code> from disk</li>
+    </ul>
+    <p class="fine">
+      An armed candidate is cancelled, not acted on, by any movement key, by
+      <code>r</code>, or by <code>s</code>: the same rule the dashboard's own
+      action keys follow, where a stray keystroke right after arming backs
+      out of the question instead of both dismissing it and doing something
+      else. The confirm itself renders in the status bar, the same fixed row
+      the dashboard's <code>x</code>/<code>R</code>/<code>L</code> confirm
+      uses.
     </p>
     <h2>Where to go next</h2>
 
