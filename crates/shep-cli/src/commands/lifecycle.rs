@@ -3423,7 +3423,7 @@ mod tests {
                     "api",
                     Vec::new(),
                     Vec::new(),
-                    Some("instances: a plain load never reshapes a flock".to_string()),
+                    Some("instances: this load never reshapes a flock".to_string()),
                 ),
             ]),
             _ => Response::Pong,
