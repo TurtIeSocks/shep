@@ -26,12 +26,17 @@ subject=$(sed -n '1p' "$msg_file")
 # as nothing and release-plz drops it, so a reverted breaking change would go
 # unrecorded. Retitle it `revert: ...` and see the note below about giving
 # `revert` a parser.
-# Only the forms git writes itself. A plain `Merge ` prefix would exempt a
-# hand-written `Merge release branch`, which is an ordinary commit release-plz
-# would drop like any other unreadable subject.
+# Only the forms git writes itself, from fmt-merge-msg.c. A plain `Merge `
+# prefix would exempt a hand-written `Merge release branch`, which is an
+# ordinary commit release-plz would drop like any other unreadable subject.
+#
+# The plurals are not padding. An octopus merge writes
+# `Merge branches 'a' and 'b'`, and the singular-only patterns an earlier
+# revision of this file used would have rejected it.
+if printf '%s' "$subject" | grep -qE "^Merge (branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits) |^Merge pull request #"; then
+    exit 0
+fi
 case "$subject" in
-    "Merge branch "*|"Merge pull request #"*|"Merge remote-tracking branch "*) exit 0 ;;
-    "Merge tag "*|"Merge commit "*) exit 0 ;;
     "fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
 esac
 
@@ -47,12 +52,17 @@ esac
 #   revert build              match NO parser, so `filter_commits = true`
 #                             discards them with no entry and no warning
 #
-# `protect_breaking_commits = true` outranks every skip above. A subject
-# carrying `!` is kept whatever its type, so `docs!:` and `chore!:` both
-# produce an entry marked BREAKING. That is the single most important thing
-# on this page: the `!` matters more than the type. shep-core 0.2.1 shipped a
-# source break as a patch, and a `!` anywhere on that commit would have saved
-# it even under a type that otherwise drops.
+# `protect_breaking_commits = true` outranks a skip, but only for a subject
+# that PARSED. `!` goes after the type or the scope, and it rescues
+# `docs!:` and `chore!:` from their `skip = true`, both arriving marked
+# BREAKING. It rescues nothing that matched no parser: `revert!:` and
+# `build!:` still vanish, and so does a sentence with a `!` stuck on it.
+#
+# So the type comes first and the `!` second, and an earlier revision of this
+# file had that backwards. It said a `!` anywhere would have rescued
+# shep-core 0.2.1. Measured: `Tell a running dog its config changed!`
+# produces nothing at all, because there is no type for the `!` to attach to.
+# The commit needed to be `refactor(core)!:` and no shorter fix existed.
 #
 # `revert` and `build` are the trap. They are real conventional types, they
 # look correct, and they contribute nothing. Rejected here rather than

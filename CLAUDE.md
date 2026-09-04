@@ -247,12 +247,15 @@ re-running that suite in isolation with the mutation still applied.
   parser and `filter_commits = true` discards them as silently as it discards
   a sentence.
 
-  **The `!` matters more than the type.** `protect_breaking_commits = true`
-  outranks a skip, so `docs!:` and `chore!:` are kept and marked BREAKING. It
-  does not outrank a miss, so `revert!:` and `build!:` still vanish. A `!`
-  anywhere on the commit that changed `BusEvent::topic` would have saved
-  0.2.1 even under a type that otherwise drops. All measured with git-cliff
-  2.14.1 against the real config.
+  **A `!` is the second half of the rule, never a shortcut past the first.**
+  `protect_breaking_commits = true` outranks a `skip = true`, so `docs!:` and
+  `chore!:` are kept and arrive marked BREAKING. It does not outrank a miss,
+  so `revert!:` and `build!:` vanish, and neither does it rescue a subject
+  that never parsed: `Tell a running dog its config changed!` produces
+  nothing, measured. The commit that changed `BusEvent::topic` needed to be
+  `refactor(core)!:`, and no shorter fix would have saved 0.2.1. A conventional
+  type gets the commit seen; the `!` then decides the bump. All measured with
+  git-cliff 2.14.1 against the real config.
 
   `.github/workflows/commits.yml` gates it now and `.githooks/commit-msg`
   catches it earlier, so this bullet is the explanation rather than the
