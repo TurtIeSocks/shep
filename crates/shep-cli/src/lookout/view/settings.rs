@@ -553,9 +553,28 @@ fn content_lines(
 ) -> Vec<Line<'static>> {
     let snapshot = settings.snapshot();
     let cursor = settings.cursor();
+    let view = settings.view();
+    let offset = view.offset();
+    // Zero means "unlimited" ([`Viewport`]'s own doc): the settings screen
+    // built in every test below has no terminal behind it, so this stays
+    // zero and every row this function ever produced still comes out, in
+    // the same order -- the seven snapshots this task must not move.
+    let visible_rows = view.rows();
+    let total_rows = settings.rows().len();
 
     let mut lines = Vec::new();
     let mut current_section: Option<&'static str> = None;
+    // A section's header (and the blank line ahead of it, for every
+    // section after the first) held here rather than pushed straight away.
+    // It is only pushed alongside the first row of its section that
+    // survives the offset skip below -- which is what rule 3 means by "the
+    // header labels a scrolled view": a section can start well above the
+    // offset and still need its name on screen the moment the view enters
+    // it.
+    let mut pending_header: Vec<Line<'static>> = Vec::new();
+    let mut emitted = 0usize;
+    let mut row_index = 0usize;
+    let mut full = false;
 
     // The six scalar rows always sort first in `Settings::rows`, ahead of
     // every `SettingsRow::Dog` -- see its own doc -- so this loop's `break`
@@ -565,42 +584,94 @@ fn content_lines(
         let SettingsRow::Scalar(field) = row else {
             break;
         };
+        let index = row_index;
+        row_index += 1;
         let section = section_for(field);
         if current_section != Some(section) {
+            let mut header = Vec::new();
             if current_section.is_some() {
-                lines.push(Line::default());
+                header.push(Line::default());
             }
-            lines.push(section_header(section, palette));
+            header.push(section_header(section, palette));
+            pending_header = header;
             current_section = Some(section);
         }
+        if index < offset {
+            continue;
+        }
+        if visible_rows > 0 && emitted >= visible_rows {
+            full = true;
+            break;
+        }
+        lines.extend(pending_header.drain(..));
         lines.push(scalar_line(
             field,
             scalar_view(snapshot, field),
             cursor == Some(row),
             body_width(width),
         ));
+        emitted += 1;
     }
-    lines.push(Line::default());
 
-    lines.push(section_header("[dogs]", palette));
     // `body_width`, not `width`: every line below draws `mark`'s own two
     // columns before its first cell, so the table is laid out in what is
     // left after them. `view::mod`'s own `draw` does the same for the flock
     // table, and this pane had not.
     let table_width = body_width(width);
-    // Fitted rather than printed raw: the caption is 48 columns and the
-    // screen draws from `view::MIN_TERM_WIDTH` (33) up, so on a narrow
-    // terminal it was cut mid-word by `Buffer::set_line` with nothing
-    // saying it had been cut.
-    lines.push(Line::from(Span::styled(
-        format!("  {}", fit(DOGS_CAPTION, table_width)),
-        palette.muted(),
-    )));
-    let rendered_columns = columns_for(table_width);
-    lines.push(dog_header_line(rendered_columns, table_width, palette));
-    for (index, dog) in dog_rows(app, table_width).iter().enumerate() {
-        let selected = cursor == Some(SettingsRow::Dog(index));
-        lines.push(dog_line(dog, rendered_columns, table_width, selected));
+    if !full {
+        let mut dogs_header = vec![Line::default(), section_header("[dogs]", palette)];
+        // Fitted rather than printed raw: the caption is 48 columns and the
+        // screen draws from `view::MIN_TERM_WIDTH` (33) up, so on a narrow
+        // terminal it was cut mid-word by `Buffer::set_line` with nothing
+        // saying it had been cut.
+        dogs_header.push(Line::from(Span::styled(
+            format!("  {}", fit(DOGS_CAPTION, table_width)),
+            palette.muted(),
+        )));
+        let rendered_columns = columns_for(table_width);
+        dogs_header.push(dog_header_line(rendered_columns, table_width, palette));
+
+        let dogs = dog_rows(app, table_width);
+        if dogs.is_empty() {
+            // Nothing to gate a header this function will never draw
+            // otherwise -- the empty flock still gets to say "[dogs]",
+            // the same reason `flock::render_table` prints its header row
+            // for an empty payload.
+            lines.extend(dogs_header);
+        } else {
+            let mut pending_header = dogs_header;
+            for (index, dog) in dogs.iter().enumerate() {
+                let global_index = row_index + index;
+                if global_index < offset {
+                    continue;
+                }
+                if visible_rows > 0 && emitted >= visible_rows {
+                    break;
+                }
+                lines.extend(pending_header.drain(..));
+                let selected = cursor == Some(SettingsRow::Dog(index));
+                lines.push(dog_line(dog, rendered_columns, table_width, selected));
+                emitted += 1;
+            }
+        }
+    }
+
+    let hidden_above = view.hidden_above();
+    let hidden_below = view.hidden_below(total_rows);
+    if hidden_below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ... {hidden_below} below"),
+            palette.muted(),
+        )));
+    }
+    if hidden_above > 0 {
+        lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!("  ... {hidden_above} above"),
+                palette.muted(),
+            )),
+        );
     }
 
     // One prompt line under the table, echoing the status bar's own Slot 1
@@ -828,6 +899,31 @@ mod tests {
             marked[0].contains("log_level"),
             "the cursor opens on the first row: {rendered:?}"
         );
+    }
+
+    /// fails if a terminal shorter than the settings screen either loses
+    /// the cursor off the bottom of the drawn window, or draws past
+    /// `note_body_rows`' own count without saying anything was cut.
+    #[test]
+    fn a_short_terminal_scrolls_and_says_what_it_hid() {
+        let mut app = fixtures::app_in_settings();
+        app.note_body_rows(4);
+        // Walk to the last row. Six scalars plus however many dogs the
+        // fixture carries; `SelectLast` lands on the last one whatever the
+        // count.
+        app.update(Msg::Key(KeyPress::SelectLast));
+        let settings = app.settings().unwrap();
+        let palette = app.palette();
+        let lines = content_lines(&app, settings, palette, 120);
+        let text: Vec<String> = lines.iter().map(std::string::ToString::to_string).collect();
+        assert!(text[0].contains("above"), "{text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("[dogs]")),
+            "the visible section is labelled"
+        );
+        let last_row = settings.rows().len() - 1;
+        assert_eq!(settings.view().cursor(), last_row);
+        assert!(settings.view().offset() > 0);
     }
 
     /// fails if `SCALAR_SOURCE_W` stops fitting the widest word this column

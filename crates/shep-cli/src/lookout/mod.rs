@@ -48,6 +48,7 @@ pub mod tail;
 pub mod term;
 pub mod theme;
 pub mod view;
+pub mod viewport;
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -58,6 +59,7 @@ use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::Rect;
 use shep_core::paths::ShepPaths;
 use tokio::sync::mpsc;
 
@@ -452,6 +454,13 @@ where
             lambs_dirty = false;
         }
         if dirty && may_draw {
+            // Told before the draw it is about to feed, not after: a
+            // scrolled screen's cursor must never land on a row the
+            // terminal that size implies could not have shown.
+            if let Ok(size) = terminal.size() {
+                let area = Rect::new(0, 0, size.width, size.height);
+                app.note_body_rows(view::body_rows(area));
+            }
             let _ = terminal.draw(|frame| view::draw(&app, frame));
             dirty = false;
             last_draw = Some(Instant::now());

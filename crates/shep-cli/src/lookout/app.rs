@@ -38,6 +38,7 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 
 use super::theme::Palette;
+use super::viewport::Viewport;
 use crate::commands::settings::{SettingEdit, SettingField, SettingsSnapshot};
 use crate::style::{StyleLevel, StyleSource};
 use crate::vocabulary::Reported;
@@ -641,10 +642,11 @@ pub enum SettingsRow {
 #[derive(Debug, Clone)]
 pub struct Settings {
     snapshot: SettingsSnapshot,
-    /// An index into [`Self::rows`], clamped on every read rather than kept
-    /// pre-clamped: a later task's refresh can shrink the dog list out from
-    /// under a cursor already sitting past its new end.
-    cursor: usize,
+    /// The cursor and, once a terminal has said how tall the body is, the
+    /// scroll offset. Clamped on every read rather than kept pre-clamped: a
+    /// refresh can shrink the dog list out from under a cursor already
+    /// sitting past its new end.
+    view: Viewport,
     /// The screen's one in-flight edit, or `None`. One field rather than
     /// several `Option`s, so typing, armed and sent cannot overlap -- the
     /// same claim [`Action`]'s own doc makes for the sheep confirm, made in
@@ -729,7 +731,7 @@ impl Settings {
     fn new(snapshot: SettingsSnapshot) -> Self {
         Self {
             snapshot,
-            cursor: 0,
+            view: Viewport::new(),
             pending: None,
         }
     }
@@ -910,7 +912,7 @@ impl Settings {
     #[must_use]
     pub fn cursor(&self) -> Option<SettingsRow> {
         let rows = self.rows();
-        rows.get(self.cursor.min(rows.len().saturating_sub(1)))
+        rows.get(self.view.cursor().min(rows.len().saturating_sub(1)))
             .copied()
     }
 
@@ -918,22 +920,30 @@ impl Settings {
     /// than wrapping, the same rule the flock table's own cursor follows.
     fn move_by(&mut self, delta: isize) {
         let len = self.rows().len();
-        if len == 0 {
-            self.cursor = 0;
-            return;
-        }
-        let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, len as isize - 1) as usize;
+        self.view.move_by(delta, len);
     }
 
     /// Moves the cursor to the first row.
     fn move_to_first(&mut self) {
-        self.cursor = 0;
+        let len = self.rows().len();
+        self.view.move_to(0, len);
     }
 
     /// Moves the cursor to the last row.
     fn move_to_last(&mut self) {
-        self.cursor = self.rows().len().saturating_sub(1);
+        let len = self.rows().len();
+        self.view.move_to(len.saturating_sub(1), len);
+    }
+
+    /// The viewport, for the renderer.
+    #[must_use]
+    pub fn view(&self) -> &Viewport {
+        &self.view
+    }
+
+    /// Records the terminal's height.
+    pub fn set_rows(&mut self, rows: usize) {
+        self.view.set_rows(rows);
     }
 }
 
@@ -1531,15 +1541,21 @@ impl App {
                         // out would be the one filter edit in this whole
                         // screen that vanishes without an Esc.
                         self.mode = InputMode::Normal;
-                        // The cursor: reset to the first row only while
+                        // The viewport: reset to the top only while
                         // `opening`. `Settings::cursor` clamps on every
                         // read, so a preserved cursor sitting past a
                         // shorter dogs list still lands somewhere real
-                        // rather than out of bounds.
-                        let cursor = self.settings.as_ref().map_or(0, |settings| settings.cursor);
+                        // rather than out of bounds -- and the same clamp
+                        // now covers the offset a preserved `Viewport`
+                        // carries.
+                        let view = self.settings.as_ref().map(|settings| settings.view.clone());
                         let mut settings = Settings::new(snapshot);
                         if !opening {
-                            settings.cursor = cursor;
+                            if let Some(view) = view {
+                                settings.view = view;
+                            }
+                            let len = settings.rows().len();
+                            settings.view.clamp(len);
                         }
                         self.settings = Some(settings);
                     }
@@ -2987,6 +3003,15 @@ impl App {
     #[must_use]
     pub fn settings(&self) -> Option<&Settings> {
         self.settings.as_ref()
+    }
+
+    /// Tells every scrollable screen how tall the body is. Called by the
+    /// event loop before each draw, so a screen's cursor never lands on a
+    /// row that was not rendered.
+    pub fn note_body_rows(&mut self, rows: u16) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.set_rows(usize::from(rows));
+        }
     }
 
     /// The resolved style level and which layer chose it. What

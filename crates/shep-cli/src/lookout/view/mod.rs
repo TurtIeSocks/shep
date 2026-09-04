@@ -154,6 +154,24 @@ pub fn panes_for(height: u16) -> Panes {
 /// dashboard is broken — the same reason `output::table::render_table`
 /// prints its header row for an empty payload.
 ///
+/// How tall the settings screen's body is for a terminal of `area`: between
+/// the title line and the status bar, the same arithmetic `draw` itself
+/// applies. Zero for a terminal too small to draw at all, so a caller that
+/// asks before checking size gets a viewport that never scrolls rather than
+/// an underflowed height.
+///
+/// `lookout::mod`'s event loop calls this before each draw, so
+/// [`App::note_body_rows`] always reflects the terminal that is about to be
+/// drawn to rather than the previous frame's.
+#[must_use]
+pub fn body_rows(area: Rect) -> u16 {
+    if area.width < MIN_TERM_WIDTH || area.height < MIN_HEIGHT {
+        return 0;
+    }
+    // One row for the title, one for the status bar.
+    area.height - 2
+}
+
 /// `draw`'s real caller is `super::mod`'s `run_ui`, once per frame.
 pub fn draw(app: &App, frame: &mut Frame<'_>) {
     let area = frame.area();
@@ -209,10 +227,7 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
             x: area.x,
             y,
             width,
-            // `bottom - y` never underflows: `y` is `area.y + 1` here and
-            // `bottom` is `area.y + height - 1`, and `height >= MIN_HEIGHT`
-            // (6) is already checked above, so `bottom > y` always holds.
-            height: bottom - y,
+            height: body_rows(area),
         };
         settings::draw_settings(app, settings, body, buffer);
         buffer.set_line(area.x, bottom, &status::status_line(app, width), width);
