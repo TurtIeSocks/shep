@@ -38,7 +38,10 @@ use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 /// Empty when there was nothing to move, which is every boot after the
 /// first. Writes `dogs.toml` before striking `shep.toml`, so a crash
 /// between the two leaves the sections readable from the old file rather
-/// than from neither.
+/// than from neither. On unix both writes flush the directory holding
+/// them, which is what makes that an order at all rather than two renames
+/// a power cut can lose independently; on Windows `sync_dir` does nothing
+/// and the order holds only against an ordinary crash.
 ///
 /// # Errors
 ///
@@ -220,6 +223,21 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         // sections only once the new file already holds them. A crash
         // between the two leaves them readable from `shep.toml`, which is
         // the direction that loses nothing.
+        //
+        // "Before" is a claim about durability, not about statement order,
+        // and on unix it holds only because `write_dogs_config` flushes the
+        // directory it renamed into. Without that the two renames are
+        // independent under a power cut, and the interleaving that loses
+        // this one while landing the strike leaves the sections in NEITHER
+        // file: an operator's webhook URLs gone, from a path whose whole
+        // argument was that it could not happen.
+        //
+        // What the surviving interleaving costs is a refusal, not data.
+        // Landing here and losing the strike leaves values under both
+        // `[dog.<name>]` and `[<name>]`, which is what `collides` above
+        // answers `WouldOverwrite` to, so the next boot stops and says so
+        // rather than guessing between two values. Recoverable by hand and
+        // loud, which is the trade this order is choosing.
         write_dogs_config(&paths.dogs_config, &merged.to_string())
             .map_err(DogMigrationError::Write)?;
         Ok(moved)
@@ -241,6 +259,13 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
 /// the name is out of `enabled_dogs` and `adopted_dogs` by then. The other
 /// order loses an operator's webhook URLs while the dog is still enabled
 /// and still running, and says nothing about it.
+///
+/// Which of the two lands is only decided by the order once each rename is
+/// durable by itself. On unix both writers flush the directory they
+/// renamed into for that reason: a power cut between them can otherwise
+/// lose the `shep.toml` rewrite while keeping this removal, which is the
+/// bad order reached by accident. `sync_dir` does nothing on Windows, so
+/// there the order survives a crash but not a power cut.
 ///
 /// # Errors
 ///
@@ -459,6 +484,13 @@ fn renumber_tables(item: &mut Item, next: &mut usize) {
 /// mode follows. **Atomicity**: `std::fs::write` opens `O_TRUNC`, so a
 /// crash between the truncate and the write leaves a half-written
 /// `dogs.toml` behind; the rename installs the whole file or none of it.
+/// **Durability**: on unix the rename is then published by flushing the
+/// directory that holds it, without which a power cut can lose the rename
+/// while keeping the bytes it pointed at. Both callers order this write
+/// against a `shep.toml` write and argue from that order, and an order
+/// between two renames means nothing until each one is durable on its own.
+/// That flush is a no-op on Windows, which is why those two arguments name
+/// the platform rather than claiming the order outright.
 fn write_dogs_config(path: &Path, rendered: &str) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = create_config_file(parent)?;
@@ -468,6 +500,10 @@ fn write_dogs_config(path: &Path, rendered: &str) -> std::io::Result<()> {
     // inside the error and its `Drop` removes the staging file, so a failed
     // replace leaves nothing behind in `$SHEP_HOME`.
     tmp.persist(path).map_err(|err| err.error)?;
+
+    // The `sync_all` above made the CONTENTS durable; this makes the rename
+    // that published them durable. See `shep_core::atomic_file`.
+    shep_core::atomic_file::sync_dir(parent)?;
     Ok(())
 }
 
