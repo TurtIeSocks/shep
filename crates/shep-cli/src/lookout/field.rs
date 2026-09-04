@@ -1,3 +1,7 @@
+// Nothing in the crate calls this yet: the settings screen reads it from
+// task 3 and the config panes from task 5. The allow leaves with task 5.
+#![allow(dead_code)]
+
 //! A form's shape, read off a JSON Schema.
 //!
 //! Every config pane in lookout renders one of these. A JSON Schema is
