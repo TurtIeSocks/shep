@@ -26,27 +26,58 @@ subject=$(sed -n '1p' "$msg_file")
 # as nothing and release-plz drops it, so a reverted breaking change would go
 # unrecorded. Retitle it `revert: ...` and see the note below about giving
 # `revert` a parser.
+# Only the forms git writes itself, from fmt-merge-msg.c. A plain `Merge `
+# prefix would exempt a hand-written `Merge release branch`, which is an
+# ordinary commit release-plz would drop like any other unreadable subject.
+#
+# The plurals are not padding. An octopus merge writes
+# `Merge branches 'a' and 'b'`, and the singular-only patterns an earlier
+# revision of this file used would have rejected it.
+if printf '%s' "$subject" | grep -qE "^Merge (branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits) |^Merge pull request #"; then
+    exit 0
+fi
 case "$subject" in
-    "Merge "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+    "fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
 esac
 
-# The nine types below are not the conventional-commits list, they are what
-# release-plz-changelog.toml actually handles. Measured with git-cliff 2.14.1
-# against that exact config:
+# What release-plz-changelog.toml actually does with a subject, measured with
+# git-cliff 2.14.1 against that config rather than read off it:
 #
-#   feat fix perf refactor   produce a changelog entry
-#   docs test ci chore style  match `skip = true`, dropped on purpose
+#   feat fix perf refactor    an entry in Added/Fixed/Performance/Changed
+#   chore: update Cargo.toml dependencies
+#   chore: update Cargo.lock dependencies
+#                             an entry under Internal, because that exact
+#                             parser is listed BEFORE the generic chore skip
+#   docs test ci chore style  skipped, deliberately, when not breaking
 #   revert build              match NO parser, so `filter_commits = true`
-#                             drops them with no entry and no warning
+#                             discards them with no entry and no warning
+#
+# `protect_breaking_commits = true` outranks a skip, but only for a subject
+# that PARSED. `!` goes after the type or the scope, and it rescues
+# `docs!:` and `chore!:` from their `skip = true`, both arriving marked
+# BREAKING. It rescues nothing that matched no parser: `revert!:` and
+# `build!:` still vanish, and so does a sentence with a `!` stuck on it.
+#
+# So the type comes first and the `!` second, and an earlier revision of this
+# file had that backwards. It said a `!` anywhere would have rescued
+# shep-core 0.2.1. Measured: `Tell a running dog its config changed!`
+# produces nothing at all, because there is no type for the `!` to attach to.
+# The commit needed to be `refactor(core)!:` and no shorter fix existed.
 #
 # `revert` and `build` are the trap. They are real conventional types, they
-# look correct, and they contribute nothing. They are rejected here rather
-# than accepted, because a gate that passes a commit release-plz discards is
-# the bug this file exists to prevent. To use one, give it a parser in
+# look correct, and they contribute nothing. Rejected here rather than
+# accepted, because a gate that passes a commit release-plz discards is the
+# bug this file exists to prevent. To use one, give it a parser in
 # release-plz-changelog.toml first, then add it here.
 
-# type(optional scope)optional !: space, then something.
-if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+# The scope is `[^()]` and not `[a-z...]`. git-conventional, which git-cliff
+# parses with, permits any character in a scope except a newline and a
+# parenthesis, so `feat(API): ...` is valid and produces an entry. An earlier
+# revision of this file spelled the class `[a-z0-9 ._/-]` and would have
+# rejected it, which is the worse failure for a gate: a false pass lets one
+# bad commit through, a false rejection blocks correct work.
+
+if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
     exit 0
 fi
 
