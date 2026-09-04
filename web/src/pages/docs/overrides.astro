@@ -22,7 +22,10 @@
  * The `--reset`/`--reset-all` commands were re-typed for `--reset=<mode>`
  * on 2026-09-04, when that flag replaced the two booleans, and re-run to
  * confirm the outputs did not move: they did not, since only the CLI
- * syntax changed, not the wire behavior each mode maps to.
+ * syntax changed, not the wire behavior each mode maps to. A review the
+ * same day added one more check not in any const above: `--reset=file`
+ * against a Flockfile declaring `instances = 2` on an app stocked to
+ * four settles at two, the same as `policy` or `all` would.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
@@ -189,7 +192,7 @@ const store = `$ cat $SHEP_HOME/overrides.json
       the one with no flag on it, and that is the bound worth knowing: an
       unreviewed template cannot cost you a process. <code>--reset</code> is a
       person asking for the template's shape, and a shape includes a count.
-      <a href="#the-reset-flags-reshape-the-flock">Two of the four modes can
+      <a href="#the-reset-flags-reshape-the-flock">Three of the four modes can
       kill</a>, and it has a section of its own below.
     </p>
     <p class="fine">
@@ -297,34 +300,46 @@ const store = `$ cat $SHEP_HOME/overrides.json
       either case, and doing nothing quietly would be worse.
     </p>
 
-    <h2 id="the-reset-flags-reshape-the-flock">Two of the four modes reshape the flock, and that can kill</h2>
+    <h2 id="the-reset-flags-reshape-the-flock">Three of the four modes reshape the flock, and that can kill</h2>
     <p>
       <code>instances</code> is the one setting that changes the shape of a
       flock rather than the value of a field, which is why a plain load holds
-      it out of scope however unestablished it is. <code>policy</code> and
-      <code>all</code> do not. They put the count back to what a fresh start
-      off the template would give it, and putting a count back down deletes
-      the instances above it, through the same path <code>shep delete</code>
-      takes.
+      it out of scope however unestablished it is. <code>file</code>,
+      <code>policy</code> and <code>all</code> do not. Each puts the count
+      back to what it resolves to under that mode, and putting a count back
+      down deletes the instances above it, through the same path
+      <code>shep delete</code> takes. Only <code>env</code> leaves it alone,
+      the same as a plain load.
+    </p>
+    <p>
+      <code>file</code> and the other two resolve an undeclared count
+      differently, and that difference is the whole reason <code>file</code>
+      exists. A Flockfile that declares <code>instances</code> gets it applied
+      under any of the three, the same as any other declared key.
     </p>
     <Callout variant="careful">
       A Flockfile that never mentions <code>instances</code> still says
       something about it under <code>policy</code> or <code>all</code>: it
       says 1, because that is what a fresh start off that file would run. So
       an app you scaled to four with <code>shep stock</code> goes to one
-      against a file that has no opinion about instances at all. This is the
-      exact footgun <code>--reset=file</code> exists to avoid: it only puts
-      back what the template declares, so an undeclared <code>instances</code>
-      is left running at whatever count it already had.
+      against a file that has no opinion about instances at all.
+      <code>--reset=file</code> is the mode that survives exactly this case:
+      it only puts back what the template declares, so an undeclared
+      <code>instances</code> is left running at whatever count it already
+      had. Write the count you want into the template and
+      <code>--reset=file</code> applies it like any other declared field.
     </Callout>
     <CodeBlock>{resetScales}</CodeBlock>
     <p>
       Four instances, a <code>policy</code> reset against a two-line
-      Flockfile, one instance left. Nothing there is a bug and nothing was
-      silent: the report names <code>instances</code> among what it applied.
+      Flockfile that does not mention <code>instances</code>, one instance
+      left. Nothing there is a bug and nothing was silent: the report names
+      <code>instances</code> among what it applied.
       <code>--reset=file</code> against the same file would have left all
-      four running, and is the reset an operator reaching for "the file
-      wins" almost always means.
+      four running, because the file says nothing to put back. Against a
+      file that declares <code>instances = 2</code>, <code>file</code> would
+      have settled at two, the same as <code>policy</code> or <code>all</code>
+      would have.
     </p>
     <p class="fine">
       The table <code>start</code> prints is a snapshot taken while the
