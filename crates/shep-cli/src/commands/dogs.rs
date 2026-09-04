@@ -2370,15 +2370,37 @@ mod tests {
         chmod(dir.path(), 0o700);
     }
 
-    /// Writes an executable `/bin/sh` script at `dir/name` whose body is
-    /// `body`, for the `--version` cases below: a dog's answer is text on
-    /// stdout and an exit status, and a shell script is the shortest thing
-    /// that can produce any pair of those on demand.
-    fn dog_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    /// Writes an executable `/bin/sh` script at `dir/name` that dispatches
+    /// on `$1` the way a real dog does: `version_body` for the version
+    /// flag, `schema_body` for the schema flag, and nothing at all for any
+    /// other argument. A dog's answer is text on stdout and an exit status,
+    /// and a shell script is the shortest thing that can produce any pair of
+    /// those on demand.
+    ///
+    /// The dispatch is not decoration. A fixture that answers every flag the
+    /// same way answers the schema flag with its version text, which is
+    /// unreadable JSON and earns a warning, so nine tests about something
+    /// else would each carry a notice nobody asserts on and a real
+    /// regression in that warning could hide among them.
+    fn probe_script(dir: &Path, name: &str, version_body: &str, schema_body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version)\n{version_body}\n;;\n\
+             --schema)\n{schema_body}\n;;\nesac\n"
+        );
+        std::fs::write(&path, body).unwrap();
         chmod(&path, 0o755);
         path
+    }
+
+    /// A dog that answers the version flag with `body`, and the schema flag
+    /// the way every dog written before this contract does: with nothing.
+    /// A binary built on clap exits non-zero on a flag it has never heard
+    /// of, and one that ignores its arguments prints its version; both are
+    /// [`DogSchema::Silent`], and silence is the shorter of the two to
+    /// write.
+    fn dog_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        probe_script(dir, name, body, "exit 0")
     }
 
     /// fails if a dog built against a protocol this shep cannot speak is
@@ -2719,20 +2741,15 @@ mod tests {
         );
     }
 
-    /// Writes a dog that answers the two flags differently, which is the
-    /// shape every real dog has: one binary, one dispatch on `$1`. The
-    /// version half always names this shep's own protocol, so a schema test
-    /// never fails for a reason that has nothing to do with the schema.
+    /// A dog whose schema half is what the test is about. The version half
+    /// always names this shep's own protocol, so a schema test never fails
+    /// for a reason that has nothing to do with the schema.
     fn two_flag_dog(dir: &Path, schema_body: &str) -> PathBuf {
-        dog_script(
+        probe_script(
             dir,
             "shep-otel",
-            &format!(
-                "case \"$1\" in\n\
-                 --version) echo 'shep-otel 0.1.3'; echo 'shep-protocol: {PROTOCOL_VERSION}' ;;\n\
-                 --schema) {schema_body} ;;\n\
-                 esac"
-            ),
+            &format!("echo 'shep-otel 0.1.3'\necho 'shep-protocol: {PROTOCOL_VERSION}'"),
+            schema_body,
         )
     }
 
