@@ -3019,6 +3019,12 @@ mod tests {
     /// stay in it and are not counted, so the answer is a count of WHOLE
     /// lines and the caller's assertion stays exact. Any other error is a
     /// real failure and says so rather than passing for saturation.
+    ///
+    /// `#[cfg(unix)]` because the type it takes is: `tokio::net::unix` does
+    /// not exist on Windows, and its only caller is a `cfg(unix)` case. The
+    /// gate this needed is `cargo check --target x86_64-pc-windows-gnu`,
+    /// which is a phase gate rather than a task one, so CI found it.
+    #[cfg(unix)]
     async fn fill_pipe(writer: &tokio::net::unix::pipe::Sender, line: &str) -> usize {
         // Once, before the loop, and this is what makes the `WouldBlock`
         // below the kernel's own answer. `try_write` reports `WouldBlock`
