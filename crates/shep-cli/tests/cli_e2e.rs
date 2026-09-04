@@ -2491,7 +2491,8 @@ fn reopen_puts_a_rotated_log_back_where_bleats_can_read_it() {
 fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
-    let script = write_logging_script(&dir, "blocked-out-marker", None);
+    const MARKER: &str = "blocked-out-marker";
+    let script = write_logging_script(&dir, MARKER, None);
     let mut guard = DaemonGuard::default();
 
     let boot = shep(home)
@@ -2503,6 +2504,22 @@ fn a_reopen_that_cannot_open_a_path_again_exits_internal() {
         .unwrap();
     guard.adopt_home(home);
     assert_success(&boot);
+
+    // The precondition the rename below needs, waited for through the same
+    // reading verb `reopen_puts_a_rotated_log_back_where_bleats_can_read_it`
+    // uses. `online` says the daemon spawned the child; it does not say the
+    // log pump has opened the file, and `bleats_no_follow_until_written`'s
+    // own doc names that gap. Without this the rename meets a path that is
+    // not there yet and fails ENOENT, which is a test racing its fixture
+    // rather than a product defect -- seen on two CI jobs of one run on
+    // 2026-09-04, and never once on a developer machine.
+    let written = bleats_no_follow_until_written(home, &["all"]);
+    let printed = String::from_utf8_lossy(&written.stdout);
+    assert!(
+        printed.contains(MARKER),
+        "precondition: the pump must have opened the log before the rotation \
+         renames it: stdout={printed}"
+    );
 
     // Read off the daemon's own snapshot rather than derived here, so the
     // test cannot disagree with it about which file it is blocking.
@@ -9003,10 +9020,18 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
     // direction working on the stop path four assertions after the exec.
     let stopped = shep(dir.path()).arg("stop").arg("bye").output().unwrap();
     assert_success(&stopped);
+    // The row rides along in the message, because the two ways this can
+    // fail are indistinguishable from the log file alone and both leave it
+    // empty. A `bye` that was killed by the stop ladder never got the
+    // message; a `bye` that exited 0 got it, wrote its line, and had the
+    // line dropped on the way to the file. The second is what CI saw on
+    // 2026-09-04, and `tokio_runner`'s `FINAL_DRAIN` is the fix.
     assert!(
         await_log_line(&bye_log, "told {\"kind\":\"shutdown\"}"),
-        "the stop message must reach the child down the carried channel: {}",
-        std::fs::read_to_string(&bye_log).unwrap_or_default()
+        "the stop message must reach the child down the carried channel. \
+         The log holds {:?}; the flock reads {}",
+        std::fs::read_to_string(&bye_log).unwrap_or_default(),
+        poll_flock_data(dir.path(), Duration::ZERO, |_| true),
     );
 
     graceful_kill(dir.path());
