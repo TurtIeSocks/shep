@@ -49,12 +49,12 @@ Every task's requirements implicitly include all of these.
 
 ## Dependency graph
 
-Tasks 1, 2 and 4 are independent and can be dispatched together. Everything else is a chain.
+Tasks 1 and 2 are independent and dispatch together. Task 4 reads back through task 2's `read_only` and `enabled_dog_names`, so it is not independent of it, and 3 and 4 form the second parallel leg.
 
 ```
-1 (rename) ─┐
-2 (ShepToml)─┼─> 3 (settings module) ─> 5 (open/close) ─> 6 (render) ─┬─> 7 (scalars) ─> 8 (text editor) ─┬─> 10 (frames) ─> 11 (docs)
-4 (dogs)  ───┘                                                        └─> 9 (dogs section) ──────────────┘
+1 (rename) ──────────────────────┐
+2 (ShepToml) ─┬─> 3 (settings) ──┴─> 5 (open/close) ─> 6 (render) ─┬─> 7 (scalars) ─> 8 (editor) ─┬─> 10 (frames) ─> 11 (docs)
+              └─> 4 (dogs) ──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -737,14 +737,16 @@ fn the_flock_cursor_and_the_filter_survive_the_swap() {
         let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
     }
     let _ = app.update(Msg::Key(KeyPress::TextApply));
-    let selected = app.selected().cloned();
+    // `selected()` hands back an owned `Option<RowKey>` (app.rs:1434), so
+    // there is nothing to clone.
+    let selected = app.selected();
     let filter = app.filter().to_string();
 
     let _ = app.update(Msg::Key(KeyPress::Settings));
     let _ = app.update(Msg::Settings { result: Ok(fixtures::settings_snapshot()) });
     let _ = app.update(Msg::Key(KeyPress::Settings));
 
-    assert_eq!(app.selected().cloned(), selected);
+    assert_eq!(app.selected(), selected);
     assert_eq!(app.filter(), filter);
 }
 
@@ -779,7 +781,8 @@ fn an_action_key_from_the_dashboard_is_unreachable_while_the_screen_is_up() {
     let mut app = fixtures::app_in_settings_with_control();
     // `x` is the stop key on the dashboard. In here it is not an action at all.
     let _ = app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
-    assert!(app.action_state().is_none(), "no sheep confirm can arm from here");
+    // The accessor is `App::action()` (app.rs:1662).
+    assert!(app.action().is_none(), "no sheep confirm can arm from here");
 }
 
 #[test]
@@ -904,6 +907,8 @@ Expected: FAIL, module not found. The snapshot test will want `cargo insta accep
 `settings.rs` renders, in order: `[daemon]` with its four rows, `[whistle]` with one, `[style]` with one, then `[dogs]` with its caption and table. Each scalar row is name, value, source, and the apply cost. Section headers use the palette's muted style; the cursor row is marked `>` exactly as the flock table marks its selection.
 
 The dogs caption is `space arms, Enter applies; a dog needs no reload`. Do not write a caption that says space applies: this screen arms and confirms like every other action in lookout.
+
+This task renders the dogs table from `SettingsSnapshot` alone: NAME, IN FILE and SOURCE. The RUNNING column is the join against the live flock and belongs to task 9, which declares `dog_rows` for it. Leave the column out here rather than rendering an empty one.
 
 Model the drop tiers on `view/flock.rs`'s `TIERS` and `columns_for`, including the doc explaining the drop order. SOURCE goes first because it is the widest and an adopted path can be long; then IN FILE, because RUNNING is the half that answers "is it up".
 
@@ -1323,6 +1328,24 @@ The file half and the daemon half are two acts. File first, then the request, wh
   }
   ```
   `Sent::request()` gains its two arms: `EnableDog { name, source }` and `DisableDog { name }`. `PROTOCOL_VERSION` does not move; both requests already exist.
+
+  Also produced, in `view/settings.rs`:
+  ```rust
+  /// One row of the dogs table, with the file and the live flock joined by
+  /// name. Declared here rather than in task 6 because the join is this
+  /// task's whole subject: task 6 renders IN FILE and SOURCE from the
+  /// snapshot alone, and RUNNING is what this adds.
+  pub struct DogRow {
+      pub name: String,
+      pub enabled: bool,
+      /// The word the flock table would show, or `None` when no dog of this
+      /// name is running.
+      pub running: Option<String>,
+      pub adopted_path: Option<PathBuf>,
+  }
+
+  pub fn dog_rows(app: &App, width: u16) -> Vec<DogRow>;
+  ```
 
 **Confirm strings, verbatim:**
 
