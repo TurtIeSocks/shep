@@ -253,7 +253,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       # `--all-features` mirrors the task gate, as in `lint` above.
-      - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+      - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
   minimal-versions:
     needs: changes
@@ -267,7 +267,7 @@ jobs:
       - run: rustup toolchain install nightly stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo +nightly generate-lockfile -Z minimal-versions
-      - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+      - run: 'cargo +stable test --workspace -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
   musl:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -298,7 +298,7 @@ jobs:
       # serialising. The number is a judgement call and the headroom is
       # large, since this job has been running 132 to 185 seconds against a
       # twenty-minute timeout. If it flakes here again, one is affordable.
-      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --test-threads=2 --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+      - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl -- --test-threads=2 --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
   # CLAUDE.md's phase-gate cross-check
   # (`cargo check --workspace --all-targets --all-features --target
   # x86_64-pc-windows-gnu`) had no workflow behind it, so it only ran when a
@@ -360,9 +360,9 @@ jobs:
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+      - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps'
+      - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
   # Tests that need a quiet machine, run serially in a job of their own.
   #
@@ -381,6 +381,22 @@ jobs:
   # names the race. Seen failing once on macos/1.88 while passing five of
   # five locally at 0.41s each.
   #
+  # `a_reload_costs_a` is a prefix, and it matches exactly the two halves of
+  # the reload measurement: the draining app and the defiant one. Each reloads
+  # a `reuse_port_sheep` while a caller opens a connection every 4ms, and each
+  # asserts a COUNT rather than a duration -- the drainer must lose nothing,
+  # the defier must be seen to lose something. No millisecond budget appears
+  # in either, which is why they did not look like timing tests, and both are.
+  # The fixture closes its listener only once `accept` has returned
+  # `WouldBlock` with the stop flag set, so a connection the kernel queues
+  # between those two instructions is reset when the fd closes. That window is
+  # microseconds wide on a quiet machine and as wide as a descheduled thread
+  # on a busy one, and no socket API makes the two steps atomic. Three
+  # failures in the eighteen days to 2026-09-03, all on Linux, all the same
+  # cause pointing opposite ways: the drainer lost 1 of 109 and 1 of 111 to
+  # `Connection reset by peer`, and the defier lost 0 of 297 when it needs to
+  # lose at least one.
+  #
   # Every other job skips these groups so the matrix stays fast and honest.
   # This job runs them with `--test-threads=1` so the only load is their own.
   # They are NOT `#[ignore]`d: the tier's own doc says it exists so the full
@@ -388,15 +404,20 @@ jobs:
   # branch that went five phases without a compiler reading it.
   #
   # One leg per watcher backend -- FSEvents, inotify, ReadDirectoryChangesW --
-  # since the backend is the thing under test. No second Linux leg: the arm
-  # runner would exercise the same inotify. Stable only, for the same reason;
-  # the compiler is not what varies here. `--workspace`, matching the skip the
+  # since for the `::slow::` tier the backend is the thing under test. No
+  # second Linux leg: the arm runner would exercise the same inotify, and for
+  # the reload pair the same kernel's SO_REUSEPORT balancing. That does cost
+  # the reload pair the leg two of its three failures came from, which was the
+  # slowest Linux runner rather than a different Linux, and running serially
+  # is what those failures needed. Stable only, for the same reason; the
+  # compiler is not what varies here. `--workspace`, matching the skip the
   # other jobs apply, so a `mod slow` added outside shep-daemon later cannot
   # end up skipped everywhere and run nowhere.
   #
-  # libtest takes both filters positionally, so this is one command. On
-  # Windows the boot half matches nothing, because `boot.rs`'s tests are
-  # `cfg(unix)` -- that is the platform split, not a filter typo.
+  # libtest takes these filters positionally, so this is one command. On
+  # Windows the boot and reload halves both match nothing, because `boot.rs`'s
+  # tests and `daemon_e2e`'s reload pair are `cfg(unix)` -- that is the
+  # platform split, not a filter typo.
   slow:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -412,11 +433,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots signal_ignored_then_kill_tree_reaps'
+      - run: 'cargo test --workspace --locked --all-features -- --test-threads=1 ::slow:: two_concurrent_boots signal_ignored_then_kill_tree_reaps a_reload_costs_a'
   # `cargo llvm-cov` on its own runs `cargo test --tests`, and `--tests` does
-  # not build a package's examples. `daemon_e2e`'s two reload tests exec
+  # not build a package's examples. Four of `daemon_e2e`'s reload tests exec
   # `examples/reuse_port_sheep`, the SO_REUSEPORT fixture the whole reload
-  # measurement rests on, and fail without it. `--all-targets` does not help:
+  # measurement rests on, and fail without it. The two counting ones moved to
+  # `slow` above and this job skips them now, so the reason this job still
+  # needs the example is the other two: a probed reload of a release that
+  # serves, and of one that does not. `--all-targets` does not help:
   # it compiles examples in test mode into `deps/` rather than uplifting a
   # plain binary into `examples/`, which is the path the test looks in.
   #
@@ -442,7 +466,7 @@ jobs:
       - run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          cargo test --workspace --locked -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps
+          cargo test --workspace --locked -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a
           cargo llvm-cov report --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with: { name: coverage, path: lcov.info }
