@@ -379,12 +379,12 @@ fn a_fresh_home_reads_every_scalar_as_the_default() {
     let path = dir.path().join("shep.toml");
     ShepToml::edit(&path, ShepToml::write_starter_interpreters).unwrap();
 
-    let snap = load_settings(&path, &style_fixture()).unwrap();
-    assert_eq!(snap.log_level.source, SettingSource::Default);
+    let snap = load_settings(&path, &socket_fixture(), style_fixture()).unwrap();
+    assert_eq!(snap.log_level.source, StyleSource::Default);
     assert_eq!(snap.log_level.value, "warn");
-    assert_eq!(snap.log_json.source, SettingSource::Default);
-    assert_eq!(snap.allow_control.source, SettingSource::Default);
-    assert_eq!(snap.max_cron_sleep.source, SettingSource::Default);
+    assert_eq!(snap.log_json.source, StyleSource::Default);
+    assert_eq!(snap.allow_control.source, StyleSource::Default);
+    assert_eq!(snap.max_cron_sleep.source, StyleSource::Default);
 }
 
 #[test]
@@ -393,11 +393,11 @@ fn a_declared_scalar_reads_as_config_even_at_its_default_value() {
     let path = dir.path().join("shep.toml");
     std::fs::write(&path, "[daemon]\nlog_level = \"warn\"\n").unwrap();
 
-    let snap = load_settings(&path, &style_fixture()).unwrap();
+    let snap = load_settings(&path, &socket_fixture(), style_fixture()).unwrap();
     assert_eq!(snap.log_level.value, "warn");
     assert_eq!(
         snap.log_level.source,
-        SettingSource::Config,
+        StyleSource::Config,
         "a key written to its own default is still a key someone wrote"
     );
 }
@@ -456,8 +456,8 @@ fn unsetting_an_optional_field_returns_it_to_the_default() {
 
     apply_setting(&path, &SettingEdit::Unset { field: SettingField::MaxCronSleep }).unwrap();
 
-    let snap = load_settings(&path, &style_fixture()).unwrap();
-    assert_eq!(snap.max_cron_sleep.source, SettingSource::Default);
+    let snap = load_settings(&path, &socket_fixture(), style_fixture()).unwrap();
+    assert_eq!(snap.max_cron_sleep.source, StyleSource::Default);
 }
 
 #[test]
@@ -466,7 +466,7 @@ fn every_built_in_dog_is_a_candidate_even_when_nothing_is_enabled() {
     let path = dir.path().join("shep.toml");
     std::fs::write(&path, "").unwrap();
 
-    let snap = load_settings(&path, &style_fixture()).unwrap();
+    let snap = load_settings(&path, &socket_fixture(), style_fixture()).unwrap();
     let names: Vec<&str> = snap.dogs.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(names, vec!["bark", "metrics"]);
     assert!(snap.dogs.iter().all(|d| !d.enabled));
@@ -482,7 +482,7 @@ fn an_adopted_dog_joins_the_candidates_and_carries_its_path() {
     )
     .unwrap();
 
-    let snap = load_settings(&path, &style_fixture()).unwrap();
+    let snap = load_settings(&path, &socket_fixture(), style_fixture()).unwrap();
     let otel = snap.dogs.iter().find(|d| d.name == "otel").unwrap();
     assert!(otel.enabled);
     assert_eq!(otel.adopted_path.as_deref(), Some(Path::new("/usr/local/bin/shep-otel")));
@@ -491,7 +491,7 @@ fn an_adopted_dog_joins_the_candidates_and_carries_its_path() {
 }
 ```
 
-`style_fixture()` is a local helper returning whatever `load_settings`'s second parameter turns out to be, with the level resolved from the config layer. Write it once at the top of the test module.
+`style_fixture()` returns a `(StyleLevel, StyleSource)` pair with the level resolved from the config layer; `socket_fixture()` returns a `&Path` standing in for `paths.socket`. Write both once at the top of the test module.
 
 - [ ] **Step 2: Run them and watch them fail**
 
@@ -503,7 +503,7 @@ Expected: FAIL, module not found.
 
 - [ ] **Step 3: Implement**
 
-`load_settings` opens through `ShepToml::read_only`, asks each task-2 reader for its `Option`, and pairs `Some` with `SettingSource::Config` and `None` with `SettingSource::Default` plus the compiled default rendered as a string. Take the defaults from `DaemonSection::default()` and `WhistleSection::default()` rather than typing literals, so a changed default cannot leave this module lying.
+`load_settings` opens through `ShepToml::read_only`, asks each task-2 reader for its `Option`, and pairs `Some` with `StyleSource::Config` and `None` with `StyleSource::Default` plus the compiled default rendered as a string. Take the defaults from `DaemonSection::default()` and `WhistleSection::default()` rather than typing literals, so a changed default cannot leave this module lying.
 
 `socket`'s default is the resolved socket path, not an empty cell: pass it in from `ShepPaths` and render that. It is the socket this lookout is connected over, so it is the live answer by construction.
 
@@ -1049,7 +1049,7 @@ fn a_written_edit_updates_the_row_and_its_source() {
     };
     let _ = app.update(Msg::SettingWritten { edit, result: Ok(()) });
 
-    assert_eq!(app.settings().unwrap().snapshot().log_level.source, SettingSource::Config);
+    assert_eq!(app.settings().unwrap().snapshot().log_level.source, StyleSource::Config);
     assert!(app.settings().unwrap().pending().is_none());
 }
 
@@ -1123,7 +1123,7 @@ enum Pending {
 }
 ```
 
-`Cycle` on a scalar row builds the next candidate and stores `Armed`, resetting `at` each press. `Confirm` on `Armed` moves to `Sent` and returns `Effect::WriteSetting`. `Msg::SettingWritten` clears `Pending` and, on `Ok`, updates that field's `ScalarView` in place to the written value with `SettingSource::Config`; on `Err` it leaves the view alone and raises a grave `Notice`.
+`Cycle` on a scalar row builds the next candidate and stores `Armed`, resetting `at` each press. `Confirm` on `Armed` moves to `Sent` and returns `Effect::WriteSetting`. `Msg::SettingWritten` clears `Pending` and, on `Ok`, updates that field's `ScalarView` in place to the written value with `StyleSource::Config`; on `Err` it leaves the view alone and raises a grave `Notice`.
 
 Expiry: extend the `Msg::Tick` arm. The existing sheep-action expiry sits inside `if !matches!(self.link, Link::Lost { .. })`. The settings expiry goes **outside** that guard and compares against the tick's own `now`, not `self.now`. Comment why: the sheep confirm freezes because everything it describes is stale, and a settings edit describes a file that is not.
 
@@ -1605,6 +1605,6 @@ git commit -m "docs(web): the lookout settings screen, and what a change there c
 Run against the spec before dispatching task 1.
 
 - **Spec coverage.** Decision 1 is task 6 (`draw` branches rather than adding a pane tier). Decision 2 is task 7. Decision 3 is tasks 3 and 8. Decision 4 is tasks 2, 3 and 6. Decision 5 is tasks 2, 3 and 8. Decision 6 is tasks 7, 8 and 9's confirm strings. Decision 7 is task 11's docs, since lookout only names the command. Decision 8 is task 5's read-only test. Decision 9 is tasks 6 and 9. Decision 10 is task 4. Decision 11 is a note at the call sites, checked in review rather than by a test, because there is nothing to redact.
-- **Types.** `SettingField`, `SettingEdit`, `SettingsSnapshot`, `ScalarView`, `SettingSource`, `DogView` and `SettingError` are defined in task 3 and used unchanged in 5 through 9. `SettingsRow` and `Settings` are task 5's. `Pending` is task 7's, extended by task 8. `Effect::WriteDog`, `Msg::DogWritten` and `Sent::Dog` are task 9's.
-- **Loose ends, all closed before dispatch.** `resolve_style` returns `(StyleLevel, StyleSource)` at `lib.rs:533`; `SettingSource` collapses into `StyleSource`, which already has the four variants; `DogSource` is `BuiltIn | Adopted { path: String }` at `request.rs:587`; the read-only refusal is `"read-only: actions need --allow-control"` at `app.rs:1033`; and `silent` comes from `Reported::of(..).word()` at `vocabulary.rs:117`. Nothing in this plan is left for an implementer to guess at.
+- **Types.** `SettingField`, `SettingEdit`, `SettingsSnapshot`, `ScalarView`, `DogView` and `SettingError` are defined in task 3 and used unchanged in 5 through 9. `SettingsRow` and `Settings` are task 5's. `Pending` is task 7's, extended by task 8. `Effect::WriteDog`, `Msg::DogWritten` and `Sent::Dog` are task 9's.
+- **Loose ends, all closed before dispatch.** `resolve_style` returns `(StyleLevel, StyleSource)` at `lib.rs:533`; `SettingSource` is not declared at all; `StyleSource` already has the four variants; `DogSource` is `BuiltIn | Adopted { path: String }` at `request.rs:587`; the read-only refusal is `"read-only: actions need --allow-control"` at `app.rs:1033`; and `silent` comes from `Reported::of(..).word()` at `vocabulary.rs:117`. Nothing in this plan is left for an implementer to guess at.
 - **`ino()` needs `std::os::unix::fs::MetadataExt`** in task 3's test module. `commands` is already `cfg(unix)` wholesale, so no gate is needed around it.
