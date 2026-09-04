@@ -2993,7 +2993,9 @@ mod tests {
     /// fails if the new field breaks an older peer, on the same terms as
     /// `last_exit` and `lambs` before it. A daemon that predates smits sends
     /// no `smit` key, and this decoding to `None` rather than erroring is
-    /// what keeps `PROTOCOL_VERSION` at 2 rather than needing another bump.
+    /// why the field cost `PROTOCOL_VERSION` no bump of its own. The
+    /// constant has moved since, for a reason unrelated to this field, so
+    /// this says what the field did rather than what the constant is.
     #[test]
     fn a_process_info_without_a_smit_key_still_deserializes() {
         let fixture = r#"{"id":1,"name":"web","status":"online","pid":42,"restarts":0,"uptime_ms":10,"fold":null,"out_file":null,"err_file":null,"cpu_percent":null,"memory_bytes":null,"dog":null,"lambs":null,"last_exit":null}"#;
@@ -3003,12 +3005,12 @@ mod tests {
 
     /// fails if `handshook` breaks an older peer, on the same terms as
     /// `smit` and `instance` before it. A daemon that predates the field
-    /// sends no `handshook` key and still announces protocol 2, so this
-    /// decoding to `None` rather than erroring is what keeps
-    /// `PROTOCOL_VERSION` at 2: the evolution rule in this module's parent
-    /// says an additive optional field keeps the version, and a required
-    /// one would make a current client unable to list against that daemon
-    /// at all.
+    /// sends no `handshook` key, so this decoding to `None` rather than
+    /// erroring is why the field cost `PROTOCOL_VERSION` no bump of its
+    /// own: the evolution rule in this module's parent says an additive
+    /// optional field keeps the version, and a required one would make a
+    /// current client unable to list against that daemon at all. The
+    /// constant has moved since, for a reason unrelated to this field.
     ///
     /// The fixture is a DOG's row, deliberately — that is the one row where
     /// the missing key changes what a renderer prints, and `None` there has
