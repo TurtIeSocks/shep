@@ -2104,7 +2104,10 @@ version = "0.2.0"
 dependencies = [
  "futures-util",
  "nix 0.29.0",
+ "schemars",
+ "serde_json",
  "shep-core",
+ "shep-macros",
  "tempfile",
  "tokio",
  "tokio-stream",
