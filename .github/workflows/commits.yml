@@ -1,0 +1,95 @@
+name: commits
+# Rejects a pull request carrying a commit subject release-plz cannot read.
+#
+# This is a release-correctness gate wearing a lint's clothes. release-plz
+# walks the INDIVIDUAL commits on a branch and `filter_unconventional = true`
+# in release-plz-changelog.toml drops anything that does not parse, so an
+# unreadable subject contributes nothing to its crate's changelog and nothing
+# to the version bump. A breaking change in such a commit ships inside a
+# semver-compatible version, with an empty changelog section, and no step
+# anywhere fails.
+#
+# Measured before this existed: of the 31 commits on the branch that became
+# shep-core 0.2.1, 19 were unreadable. One of those 19 changed a public
+# signature. 0.2.1 went to crates.io as a patch, with an empty changelog
+# section for that crate. `semver_check = true` did not catch it either; run
+# by hand against origin/main it reported 196 passing checks and no update
+# required, because it has no lint for a changed inherent-method return type.
+#
+# `.githooks/commit-msg` runs the same rule locally, but core.hooksPath is
+# per-clone and a fresh clone or worktree has it unset, so that hook is a
+# convenience and this job is the gate.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  conventional:
+    name: conventional subjects
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The full range, because a subject is only checkable if it is fetched.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check every commit subject on this branch
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          # --no-merges: a merge subject is git's own wording, and release-plz
+          # ignores merge commits anyway, which is the whole reason a `!` in a
+          # pull request title buys nothing.
+          #
+          # Nothing is exempt here, unlike the local hook. `fixup!`, `squash!`
+          # and `amend!` are fine to create locally and are consumed by
+          # `git rebase --autosquash`; one reaching a pull request head was
+          # never squashed and would be dropped like any other unreadable
+          # subject. `Revert "..."`, which `git revert` writes, parses as
+          # nothing and is dropped too.
+          #
+          # The nine accepted types are what release-plz-changelog.toml
+          # actually handles, not the conventional-commits list. Measured with
+          # git-cliff 2.14.1 against that config: feat, fix, perf and refactor
+          # produce entries; docs, test, ci, chore and style are `skip = true`
+          # and dropped on purpose; revert and build match NO parser, so
+          # `filter_commits = true` discards them silently. Those last two are
+          # the trap, since they are real conventional types that look correct
+          # and contribute nothing. Give one a parser in that config before
+          # adding it here.
+          bad=0
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+              printf '  ok      %s\n' "$subject"
+            else
+              printf '  DROPPED %s\n' "$subject"
+              bad=$((bad + 1))
+            fi
+          done <<EOF
+          $(git log --no-merges --format='%s' "$BASE..$HEAD")
+          EOF
+
+          if [ "$bad" -gt 0 ]; then
+            cat >&2 <<MSG
+
+          $bad commit subject(s) above will be dropped by release-plz.
+
+          Each one contributes nothing to its crate's changelog and nothing to
+          the version bump. If any of them changes a public API, that change
+          ships inside a semver-compatible version and nothing reports it.
+
+          Rewrite them as: type(optional-scope): lowercase summary
+
+          Put a ! after the type or scope on the commit that actually breaks
+          something, in the crate that breaks. A ! on this pull request's
+          title does nothing, because release-plz never reads the merge commit.
+          MSG
+            exit 1
+          fi
+          echo "All $(git log --no-merges --oneline "$BASE..$HEAD" | wc -l | tr -d ' ') commit subject(s) are readable."
