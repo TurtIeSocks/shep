@@ -1,0 +1,74 @@
+# Keeps the commit pins in .github/workflows current, and the two lockfiles.
+#
+# Every action in the workflows is pinned by commit rather than by tag, so a
+# moved tag cannot change what runs in a job that holds a token. A pin that
+# nobody moves is a pin that rots, and this is what moves it: one pull
+# request a week, every action in it, with the version comment beside each
+# pin rewritten to match.
+#
+# The commit-message prefixes are not decoration. `.github/workflows/commits.yml`
+# rejects a subject release-plz cannot read, and Dependabot's default subject
+# ("Bump X from A to B") is one of those. `ci(deps):` and `chore(deps):` both
+# parse and are both skipped by release-plz-changelog.toml, so a dependency
+# bump makes no changelog entry and, on its own, no release: release-plz still
+# bumps a version for it, and release-plz-pr.yml's no-op guard then holds that
+# release pull request open rather than merging an empty one. That is the
+# guard doing its job; merge it by hand when a real change lands.
+#
+# Cargo and npm are monthly and grouped, because a version bump is not a
+# security fix. Security advisories reach this repository through
+# Dependabot's security updates, which are enabled separately in the
+# repository settings and open a pull request the day the advisory lands,
+# whatever the schedule here says.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+      include: scope
+    labels: [dependencies]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+      include: scope
+    labels: [dependencies]
+
+  # benches/ is its own workspace with its own lockfile, excluded from the
+  # root one so a bench-only dependency can never reach a shipped binary,
+  # which also means the entry above never sees it.
+  - package-ecosystem: cargo
+    directory: /benches
+    schedule:
+      interval: monthly
+    groups:
+      cargo-benches:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+      include: scope
+    labels: [dependencies]
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: monthly
+    groups:
+      npm:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+      include: scope
+    labels: [dependencies]
