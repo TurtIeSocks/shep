@@ -135,8 +135,21 @@ them. This is not a safety measure the pane invents; it is what
 
 ### 6. The daemon writes a dog's section, not lookout
 
-A new request. lookout sends the edit, the daemon writes `dogs.toml` under
-the lock it already holds, and publishes `config.dog.<name>`.
+A new request. lookout sends the edit, the daemon writes `dogs.toml` and
+publishes `config.dog.<name>`.
+
+**The daemon has no lock for that file and this decision has to buy one.** An
+earlier revision said "under the lock it already holds", which was wrong.
+`ConfigLock` and `create_config_file` are `shep-cli`-private, all three of
+today's writers are in the CLI, and `DogsConfig`'s own doc calls the file
+"deliberately not a locked shep-owned store like `overrides.json`". The
+daemon reads it and nothing more. `shep-core`'s `overrides.rs` already has a
+sibling-lockfile scheme that both sides can use, so the work is moving to
+that rather than writing a third one.
+
+It needs no actor. `RpcContext` already carries `events: Bus` and
+`dogs_config: PathBuf`, both in scope where the dispatch match runs, and
+`dogs.toml` is not supervisor state the way `overrides.json` is.
 
 This breaks #124's precedent deliberately. lookout writes `shep.toml` itself
 and that is fine, because nothing subscribes to `shep.toml`. A dog's section
@@ -191,6 +204,23 @@ selection, which is what `x`, `R` and `L` already are.
 
 Taken keys at the time of writing: `/ G L R W c g j k q r s x z`.
 
+### 8b. The panes need scrolling, which lookout does not have
+
+`draw_settings` renders `content_lines()` and takes `area.height` off the
+front. There is no `skip`, no scroll offset on `Settings`, and no
+scroll-into-view when the cursor moves: the cursor clamps to `rows().len()`
+and has no notion of which rows were drawn.
+
+That has never bitten because the settings screen is six scalars and a few
+dogs, which fits any terminal. A sheep pane is 39 fields under four headers,
+so a 30-line terminal shows about a quarter of it and the cursor walks off
+the bottom onto rows that were never rendered.
+
+So slice 1 builds a viewport: an offset on the screen state, scroll-into-view
+on every cursor move, and a way to see there is more. The settings screen
+inherits it and its snapshots must not move, which is the same gate decision
+1 already leans on.
+
 ### 9. Env is write-only, and it is one row that opens a sub-screen
 
 Decision 12 governs the behaviour and this decision only places it. `env` is
@@ -212,7 +242,21 @@ for every dog that has not adopted the contract.
 
 Two new `Request` variants: one carrying a sheep's name and answering with
 its effective `AppConfig` with `env` reduced to key names (decision 6b), and
-one carrying a dog's name and the edit. The daemon
+one carrying a dog's name and the edit.
+
+**Adding a variant produces no compile error for a missing handler.**
+`Request` and `Response` are both `#[non_exhaustive]` and `rpc.rs`'s dispatch
+ends in a wildcard answering "this daemon does not implement that request",
+so a variant with no arm silently answers an internal error at runtime. The
+two wire snapshots (`request_wire_v3`, `reply_wire_v3`) are hand-written
+literal fixtures with no completeness check, so they do not catch it either.
+Both plans list the handler as its own step for that reason.
+
+The bump moves two tests that pin the numeral rather than reading the
+constant: `hello_handshake_shape` and
+`a_dogs_hello_names_the_dog_and_nothing_elses_does`, both in `request.rs`.
+Several other files hardcode "protocol 1" and "protocol 2" on purpose,
+simulating an older daemon, and must not be touched. The daemon
 writes, publishes `config.dog.<name>`, and answers with the same shape its
 other config writes use.
 
