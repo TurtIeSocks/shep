@@ -194,7 +194,7 @@ within = "2m"
 sinks = ["oncall"]
 ```
 
-Leave `[bark.rules]` out entirely and the bark dog does not stay
+Leave `[[bark.rules]]` out entirely and the bark dog does not stay
 silent — one rule is built in by default, firing on every configured sink
 whenever a sheep reaches `Errored`. That is deliberate: it is the alert
 that must not be missed, keyed to the shepherd's own decision that it has

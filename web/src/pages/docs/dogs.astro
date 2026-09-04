@@ -250,7 +250,7 @@ restarts = 5
 within = "2m"
 sinks = ["oncall"]`}</CodeBlock>
     <p>
-      Leave <code>[bark.rules]</code> out and bark doesn't go quiet:
+      Leave <code>[[bark.rules]]</code> out and bark doesn't go quiet:
       one rule is built in by default, firing on every configured sink
       whenever a sheep reaches <code>Errored</code>. That's the alert that
       must not be missed, so it needs no opt-in. <code>restart_rate</code>{" "}
