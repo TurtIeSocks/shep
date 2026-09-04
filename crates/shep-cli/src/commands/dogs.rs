@@ -824,8 +824,17 @@ fn ask(
     // than to the terminal. A candidate that writes on its way up would
     // otherwise scribble over the operator's terminal mid-vet, and a hostile
     // one could imitate shep's own output at the exact moment somebody is
-    // deciding whether to trust it. The pipe is read by [`answer_text`] and
-    // never rendered.
+    // deciding whether to trust it.
+    //
+    // The pipe is read by [`answer_text`], and part of what comes back IS
+    // rendered: [`report_dog_version`] puts the parsed version string in a
+    // notice. What makes that safe is `emit_notice`, which runs every message
+    // through `terminal_safe::sanitise` before it reaches the stream, not the
+    // pipe. An earlier revision of this comment said the answer was "never
+    // rendered", which was false and pointed at the wrong protection, so
+    // anyone removing that `sanitise` call would have read this and believed
+    // there was nothing downstream to break.
+    //
     // `env_clear` and then the allowlist, never the operator's environment.
     // Argued at the top of this function; `probe_env` builds the list.
     match Command::new(path)
