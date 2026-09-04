@@ -18,6 +18,11 @@
  * third command and that is the real output, not a paste error. `shep start
  * <name>` resumes a stopped sheep through `Request::Restart`, which counts
  * a restart, and has since long before this verb.
+ *
+ * The `--reset`/`--reset-all` commands were re-typed for `--reset=<mode>`
+ * on 2026-09-04, when that flag replaced the two booleans, and re-run to
+ * confirm the outputs did not move: they did not, since only the CLI
+ * syntax changed, not the wire behavior each mode maps to.
  */
 import DocsLayout from "../../layouts/DocsLayout.astro";
 import ReferencePills from "../../components/docs/ReferencePills.astro";
@@ -63,7 +68,7 @@ notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
 1   web   online  96368  0         -     -    -    1.2M  3s      -     -
 
-$ shep start Flockfile.toml --reset
+$ shep start Flockfile.toml --reset=policy
 notice[start]: web: applied max_memory
 notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
@@ -74,7 +79,7 @@ notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
 1   web   online  96368  0         -     -    -    1.2M  3s      -     -
 
-$ shep start Flockfile.toml --reset-all
+$ shep start Flockfile.toml --reset=all
 notice[start]: web: env waiting on the next spawn (\`shep reload web\` promotes them)
 notice[start]: web is already online; \`shep restart web\` replaces it.
 ID  NAME  STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
@@ -99,7 +104,7 @@ ID  NAME   STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
 2   web:2  online  96579  0         -     -    -    1.2M  2s      -     -
 3   web:3  online  96580  0         -     -    -    1.2M  2s      -     -
 
-$ shep start Flockfile.toml --reset
+$ shep start Flockfile.toml --reset=policy
 notice[start]: web: applied instances
 notice[start]: web are already running; \`shep restart web\` replaces them.
 ID  NAME   STATUS  PID    RESTARTS  EXIT  CFG  CPU  MEM   UPTIME  FOLD  SMIT
@@ -161,8 +166,8 @@ const store = `$ cat $SHEP_HOME/overrides.json
       So a load appends. It writes the settings nobody has established yet
       and leaves everything else exactly as it is, which means the worst a
       merged change can do to a running flock is nothing.
-      <code>--reset</code> is how you say the file wins, and it is something
-      a person types.
+      <code>--reset=&lt;mode&gt;</code> is how you say the file wins, and it is
+      something a person types.
     </p>
     <Callout variant="note">
       A Flockfile is read when you name a file, or when
@@ -182,10 +187,10 @@ const store = `$ cat $SHEP_HOME/overrides.json
     <p>
       All three are about the load a merged pull request can cause, which is
       the one with no flag on it, and that is the bound worth knowing: an
-      unreviewed template cannot cost you a process. The reset flags are a
+      unreviewed template cannot cost you a process. <code>--reset</code> is a
       person asking for the template's shape, and a shape includes a count.
-      <a href="#the-reset-flags-reshape-the-flock">One of them can kill</a>,
-      and it has a section of its own below.
+      <a href="#the-reset-flags-reshape-the-flock">Two of the four modes can
+      kill</a>, and it has a section of its own below.
     </p>
     <p class="fine">
       A dog is refused outright, at every depth. A Flockfile that names
@@ -258,30 +263,33 @@ const store = `$ cat $SHEP_HOME/overrides.json
     </p>
     <CodeBlock>{established}</CodeBlock>
     <p>
-      <code>--reset</code> is what puts the file back in charge. It resets
-      every setting, declared or not, and keeps <code>env</code>. Only
-      <code>env</code> survives it: a setting an operator had set is put back
-      like any other, and its entry in the override record is spent on the way
-      through, so what the record still holds after a <code>--reset</code> is
-      <code>env</code> and nothing else. <code>--reset-all</code> is the wider
-      one: it resets <code>env</code> too and drops the record entirely, so
-      the next plain load starts from a clean sheet.
+      <code>--reset=&lt;mode&gt;</code> is what puts the file back in charge,
+      and the mode is required: shep asks you to name the destruction rather
+      than guess it. There are two axes rather than one. <code>env</code> is
+      either kept or put back; everything else is either left alone, put back
+      to what the template declares, or put back to what a fresh start off
+      that template would give even the keys it never mentions. Four
+      combinations are worth having:
     </p>
     <div class="rows">
       <div class="row"><span>no flag</span><span>Append what nobody has established. Overwrite nothing. <code>instances</code> is held out of even this: a plain load never reshapes a flock.</span></div>
-      <div class="row"><span><code>--reset</code></span><span>Every setting but <code>env</code> goes back to what the file says, the instance count included, which is the one that can delete a process. A setting the file never mentions goes back too, to whatever a fresh start off that file would give it. <code>env</code> is kept.</span></div>
-      <div class="row"><span><code>--reset-all</code></span><span>Everything goes back to the file, <code>env</code> and the instance count included, and the sheep's override record is dropped.</span></div>
+      <div class="row"><span><code>--reset=file</code></span><span>Puts back what the template declares, <code>env</code> kept, and leaves every key the template is silent on alone. Nothing to put back for an undeclared key means nothing changes for it.</span></div>
+      <div class="row"><span><code>--reset=policy</code></span><span>Puts back every setting but <code>env</code>, declared or not, the instance count included, which is the one that can delete a process. A setting the file never mentions goes back too, to whatever a fresh start off that file would give it.</span></div>
+      <div class="row"><span><code>--reset=env</code></span><span>Puts back only <code>env</code> and touches nothing else, so a policy tuning survives it.</span></div>
+      <div class="row"><span><code>--reset=all</code></span><span>Everything goes back to the file, <code>env</code> and the instance count included, and the sheep's override record is dropped.</span></div>
     </div>
     <p>
-      The line between the two resets is data against policy.
+      <code>env</code> is the axis that splits data from policy.
       <code>env</code> is the one field holding something an operator
-      supplied rather than tuned, and a <code>--reset</code> that took an
-      app's database credentials away would be a different kind of event
-      from one that put its restart budget back. Resetting policy is
-      recoverable; resetting data is not.
+      supplied rather than tuned, and a reset that took an app's database
+      credentials away as a side effect of putting its restart budget back
+      would be a different kind of event. Resetting policy is recoverable;
+      resetting data is not. <code>policy</code> and <code>env</code> exist
+      for the operator who wants exactly one of them; <code>all</code> is for
+      the operator who means both.
     </p>
     <p class="fine">
-      Both flags are refused outright when the target supplies no template.
+      Every mode is refused outright when the target supplies no template.
       Naming a sheep is one: <code>--reset needs a Flockfile to reset to; web
       names a sheep, not a file</code>, exit 2. A bare script path is the
       other, for the same reason and with the same exit code, since the
@@ -289,29 +297,34 @@ const store = `$ cat $SHEP_HOME/overrides.json
       either case, and doing nothing quietly would be worse.
     </p>
 
-    <h2 id="the-reset-flags-reshape-the-flock">The reset flags reshape the flock, and that can kill</h2>
+    <h2 id="the-reset-flags-reshape-the-flock">Two of the four modes reshape the flock, and that can kill</h2>
     <p>
       <code>instances</code> is the one setting that changes the shape of a
       flock rather than the value of a field, which is why a plain load holds
-      it out of scope however unestablished it is. A reset does not. It puts
-      the count back to what the template says, and putting a count back down
-      deletes the instances above it, through the same path
-      <code>shep delete</code> takes.
+      it out of scope however unestablished it is. <code>policy</code> and
+      <code>all</code> do not. They put the count back to what a fresh start
+      off the template would give it, and putting a count back down deletes
+      the instances above it, through the same path <code>shep delete</code>
+      takes.
     </p>
     <Callout variant="careful">
       A Flockfile that never mentions <code>instances</code> still says
-      something about it under a reset flag: it says 1, because that is what
-      a fresh start off that file would run. So an app you scaled to four
-      with <code>shep stock</code> goes to one on a <code>--reset</code>
-      against a file that has no opinion about instances at all. Write the
-      count you want into the template before you reset against it.
+      something about it under <code>policy</code> or <code>all</code>: it
+      says 1, because that is what a fresh start off that file would run. So
+      an app you scaled to four with <code>shep stock</code> goes to one
+      against a file that has no opinion about instances at all. This is the
+      exact footgun <code>--reset=file</code> exists to avoid: it only puts
+      back what the template declares, so an undeclared <code>instances</code>
+      is left running at whatever count it already had.
     </Callout>
     <CodeBlock>{resetScales}</CodeBlock>
     <p>
-      Four instances, a reset against a two-line Flockfile, one instance
-      left. Nothing there is a bug and nothing was silent: the report names
-      <code>instances</code> among what it applied. It is still the sharpest
-      edge on this page, because the file that caused it never said the word.
+      Four instances, a <code>policy</code> reset against a two-line
+      Flockfile, one instance left. Nothing there is a bug and nothing was
+      silent: the report names <code>instances</code> among what it applied.
+      <code>--reset=file</code> against the same file would have left all
+      four running, and is the reset an operator reaching for "the file
+      wins" almost always means.
     </p>
     <p class="fine">
       The table <code>start</code> prints is a snapshot taken while the
@@ -334,8 +347,10 @@ const store = `$ cat $SHEP_HOME/overrides.json
       The first command there set <code>DB_HOST</code> to a real hostname in
       the Flockfile and loaded it. Nothing happened, and nothing was
       supposed to: the key was established, so the template no longer speaks
-      for it. <code>--reset-all</code> is the only thing that hands
-      <code>env</code> back to the file.
+      for it. <code>--reset=env</code> or <code>--reset=all</code> are what
+      hand <code>env</code> back to the file; <code>env</code> is the one
+      thing <code>--reset=file</code> and <code>--reset=policy</code> never
+      touch.
     </p>
 
     <h2>Registering before starting</h2>
@@ -363,10 +378,8 @@ const store = `$ cat $SHEP_HOME/overrides.json
     <Callout variant="careful">
       The middle step is the one shep has no verb for yet. Filling in an
       established key today means editing the Flockfile and loading it with
-      <code>--reset-all</code>, which hands <code>env</code> back to the file
-      and drops the override record with it. Read
-      <a href="#the-reset-flags-reshape-the-flock">the reset warning</a>
-      first if the app has been scaled.
+      <code>--reset=env</code>, which hands <code>env</code> back to the file
+      and touches nothing else, not even <code>instances</code>.
     </Callout>
     <p>
       Running <code>shep add</code> again changes nothing and prints nothing,
@@ -388,9 +401,10 @@ const store = `$ cat $SHEP_HOME/overrides.json
       The awkward consequence is deletion. Removing a line from a Flockfile
       does not remove the setting, once the setting is established: the file
       has stopped mentioning it, and a load that acted on an absence would
-      be overwriting by omission. <code>--reset</code> puts a deleted
-      setting back to shep's own default, and <code>--reset-all</code> does
-      the same for a deleted <code>env</code> key.
+      be overwriting by omission. <code>--reset=policy</code> or
+      <code>--reset=all</code> puts a deleted setting back to shep's own
+      default, since it is now a key the file is silent on; <code>all</code>
+      does the same for a deleted <code>env</code> key.
     </p>
 
     <h2>Where it is kept</h2>
