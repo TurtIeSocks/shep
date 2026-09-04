@@ -1701,7 +1701,7 @@ on_first_run fires as a side effect on whichever command created the home, writi
 
 ## Config overrides
 
-### A Flockfile load is additive by default: the file may add, and may never overwrite - **superseded**
+### A Flockfile load is additive by default: the file may add, and may never overwrite
 
 `shep start <Flockfile>` merges the file into the sheep of the same name rather than replacing it. A key the file declares that nobody has established yet takes the file's value; every other key keeps exactly what it has, defaults included. `--reset` widens that to every setting but `env`, and `--reset-all` to everything.
 
