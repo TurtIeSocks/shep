@@ -568,6 +568,12 @@ mod tests {
     /// belongs to a type one level down. See [`BarkConfig::sinks`]. The key
     /// is spelled out rather than read from `shep_core::dogs::SECRET_KEY`
     /// for the reason `sinks.rs`'s own marker test gives.
+    ///
+    /// `Rule` is checked where it lives, under `$defs`, and not only as the
+    /// `rules` array at the top level. The array was never going to be
+    /// marked and pinning it said nothing: `Rule::sinks` shares a name with
+    /// the credential above it, so the definition is the one place a marker
+    /// could land on a list of sink names.
     #[test]
     fn the_bark_schema_marks_the_sinks_map_and_leaves_the_rules_plain() {
         let schema = shep_client::dogs::config_schema::<BarkConfig>()
@@ -583,6 +589,16 @@ mod tests {
             schema.pointer("/properties/rules/x-shep-secret"),
             None,
             "a rule names sinks and holds no credential of its own"
+        );
+        assert!(
+            schema.pointer("/$defs/Rule/properties/sinks").is_some(),
+            "the pointer below is only a check while `Rule` still has this \
+             shape, so a rename that moved it must fail here first"
+        );
+        assert_eq!(
+            schema.pointer("/$defs/Rule/properties/sinks/x-shep-secret"),
+            None,
+            "a rule's sinks are names, and a name is not a credential"
         );
     }
 
