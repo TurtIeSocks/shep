@@ -282,10 +282,13 @@ re-running that suite in isolation with the mutation still applied.
 
 ## Architecture
 
-Six published workspace members, one distributed binary (`shep`):
-shep-core, shep-daemon, shep-client, shep-cli (published as `shep`),
-shep-channel (the client an app links to speak the shepherd channel), and
-shep-cli-redirect, a placeholder holding the `shep-cli` name on crates.io.
+Seven published workspace members, one distributed binary (`shep`):
+shep-core, shep-daemon, shep-client, shep-macros (the `DogConfig` derive),
+shep-cli (published as `shep`), shep-channel (the client an app links to
+speak the shepherd channel), and shep-cli-redirect, a placeholder holding
+the `shep-cli` name on crates.io. This line said "five" on main and "six"
+on the branch that added shep-channel, and both were wrong once the two
+met: neither counted the other's crate.
 Each crate's Cargo.toml `description` states its role.
 
 **The docs site is `web/`** -- an Astro site, published, and part of the
