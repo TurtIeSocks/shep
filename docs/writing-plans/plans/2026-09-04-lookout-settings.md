@@ -17,7 +17,7 @@ Every task's requirements implicitly include all of these.
 - **Clean-room rule, non-negotiable.** Never open, read, or port source from `~/GitHub/pm2`. Nothing in this feature has a pm2 ancestor.
 - **Invoke the `shep-idiomatic-rust` skill before writing or reviewing any Rust in this repository.** Cite rules as `IR-<n>` in review.
 - **No em dashes and no en dashes anywhere.** Not in code, comments, docs, commit messages, operator-facing strings or the PR body. Existing strings that carry one are out of scope and stay as they are.
-- **Operator-facing prose goes through `humanizer` then `rin-voice` before it lands.** That covers every string this feature prints, the docs page, and the PR body. Not commit messages, which stay long and detailed.
+- **Operator-facing prose goes through the project's voice review before it lands.** That covers every string this feature prints, the docs page, and the PR body. Not commit messages, which stay long and detailed.
 - **Never write the maintainer's real name, personal email, or any absolute home-directory path** into a committed file, a commit message, or a PR body. Repo-relative paths only.
 - **Any snippet in this plan that quotes existing code is a guess.** Grep the real file and follow what is there, not what is written here. Signatures for code this plan introduces are binding; quotations of code that already exists are not.
 - **Every new test must be proved non-vacuous.** Mutate the thing it protects, watch that test go red, and **verify the mutation actually applied** before trusting the red. `cargo fmt` has rewrapped a line a patch was matching, leaving the patch a silent no-op and three green runs looking like evidence.
@@ -963,7 +963,7 @@ git commit -m "feat(lookout): the settings screen renders, with a source per sca
   }
   ```
 
-**Confirm strings, verbatim.** These have already been through `humanizer` and `rin-voice`; use them as written and do not paraphrase.
+**Confirm strings, verbatim.** These have already been through the project's voice review; use them as written and do not paraphrase.
 
 | Field | Prompt |
 | --- | --- |
@@ -1550,7 +1550,7 @@ git commit -m "docs(lookout): gallery frames for the settings screen"
 3. That a `[daemon]` edit can be shadowed by the shepherd's own `SHEP_*` env or boot flags, which lookout cannot see, and that `[style]` is the exception because those layers are lookout's own.
 4. That `log_level`, `log_json` and `allow_control` can move from `the default` to `shep.toml` and not back from this screen, because `socket` and `max_cron_sleep` are the only optional ones (spec decision 5).
 
-Run `humanizer` then `rin-voice` over the prose before committing it. Match the page's existing register rather than inventing one.
+Run the project's voice review over the prose before committing it. Match the page's existing register rather than inventing one.
 
 - [ ] **Step 2: Regenerate the CLI reference and check the diff**
 
