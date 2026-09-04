@@ -270,8 +270,17 @@ pub enum Msg {
 /// later walked straight around it: a read-only lookout could type a new
 /// `socket` and apply it. A fourth door added tomorrow cannot repeat that,
 /// because it cannot construct the effect it would have to return.
+///
+/// [`WriteAuthority::granted`] takes `&App` rather than a bare [`Control`]
+/// on purpose: a bare `Control` can be built anywhere (`Control::Allowed`
+/// is a unit variant, not a secret), so a call site free to hand in a
+/// literal `Control::Allowed` instead of the app's own field would grant
+/// itself the token by construction, which is exactly the shape the first
+/// review mutation of this gate took, and it compiled. Reading the field
+/// off `App` closes that: the only `Control` `granted` ever sees is the one
+/// the app was actually built with.
 mod authority {
-    use super::Control;
+    use super::App;
 
     /// Proof that `--allow-control` was on when a settings write was built.
     ///
@@ -281,16 +290,20 @@ mod authority {
     pub struct WriteAuthority(());
 
     impl WriteAuthority {
-        /// A token when `control` permits writing, [`None`] otherwise.
+        /// A token when `app`'s own [`Control`](super::Control) permits
+        /// writing, [`None`] otherwise.
         ///
         /// The sole constructor. The unit field above is private to this
         /// module, so every other module in this crate reaches a
-        /// [`WriteAuthority`] through here or not at all.
+        /// [`WriteAuthority`] through here or not at all. Takes `&App`
+        /// rather than a `Control` so the only reachable answer is the
+        /// app's own gate -- see this module's own doc for what a bare
+        /// `Control` parameter let slip past review once already.
         #[must_use]
-        pub const fn granted(control: Control) -> Option<Self> {
-            match control {
-                Control::ReadOnly => None,
-                Control::Allowed => Some(Self(())),
+        pub fn granted(app: &App) -> Option<Self> {
+            match app.control {
+                super::Control::ReadOnly => None,
+                super::Control::Allowed => Some(Self(())),
             }
         }
     }
@@ -2079,7 +2092,7 @@ impl App {
     /// See [`WriteAuthority`]'s own doc for why the gate is shaped this way
     /// rather than as a check per key.
     fn authorize_write(&mut self) -> Option<WriteAuthority> {
-        let authority = WriteAuthority::granted(self.control);
+        let authority = WriteAuthority::granted(self);
         if authority.is_none() {
             self.notice = Some(Notice {
                 text: READ_ONLY_REFUSAL.to_string(),
