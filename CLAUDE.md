@@ -213,6 +213,29 @@ filtersets in the workflow partition the suite with nothing dropped: 2511 in
 the ordinary legs plus 30 in `slow` is 2541, which is every non-doctest test.
 Nothing here changes the local gate: keep running bare `cargo test`.
 
+**A test that passed only on retry is a warning on the run, not a green
+leg.** Every CI profile in `.config/nextest.toml` writes junit, and
+`.github/actions/nextest-report` runs after every nextest leg: each test
+carrying a `flakyFailure` becomes a `::warning` annotation and a row in the
+job summary, and the file is kept as an artifact for 14 days. Read the
+annotation before merging. The retry exists so a contended runner does not
+block a merge, not so a defect can hide behind one; `nextest.toml`'s own
+comment records two 2026-09-04 failures a retry would have hidden.
+
+### cargo-deny runs in CI; run it when a dependency changes
+
+```bash
+cargo deny check
+```
+
+The `deny` job runs it against `deny.toml` on every pull request that
+touches Rust, either lockfile or the file itself: RustSec advisories, the
+licence allowlist, duplicate versions (warned, not refused) and sources
+(crates.io only). A licence not on the list fails the job until somebody
+reads it and adds it, which is the point. `brew install cargo-deny` on the
+host; it is not in the task gate because the advisory half needs the
+network, and the gate is meant to run offline.
+
 ### The phase gate — run at a merge, not per task
 
 The four above, plus `cargo test --workspace --all-features -- --test-threads=1`
@@ -282,9 +305,11 @@ re-running that suite in isolation with the mutation still applied.
 
 ## Architecture
 
-Five workspace members, one distributed binary (`shep`): shep-core,
-shep-daemon, shep-client, shep-cli (published as `shep`), and
-shep-cli-redirect, a placeholder holding the `shep-cli` name on crates.io.
+Six crates plus `examples` in the workspace, one distributed binary
+(`shep`): shep-core, shep-daemon, shep-client, shep-macros (the `DogConfig`
+derive, reached through shep-client's re-export), shep-cli (published as
+`shep`), and shep-cli-redirect, a placeholder holding the `shep-cli` name on
+crates.io. This line said "five" for the whole time shep-macros existed.
 Each crate's Cargo.toml `description` states its role.
 
 **The docs site is `web/`** -- an Astro site, published, and part of the
@@ -383,6 +408,21 @@ never costs clarity.
 - Open design decisions live at the bottom of map.md and in goals.md's open
   questions — check them before making architectural calls; if a decision is
   listed there, it is the maintainer's, not yours.
+- **A dev-dependency on another workspace crate names only a path**, never
+  `workspace = true` and never a version. `cargo publish` strips a path-only
+  dev-dependency and keeps a versioned one, and a versioned one has to
+  resolve on crates.io while the crate is being packaged. shep-macros'
+  dev-dependency on shep-client carried the workspace version, shep-client
+  depends on shep-macros so shep-macros publishes first, and every release
+  from 2026-09-04 18:24 stopped there with `failed to select a version for
+  the requirement shep-client = "^0.2.1"`: shep-core and shep-daemon reached
+  crates.io at 0.2.1 and 0.2.2 while shep-macros, shep-client and shep
+  stayed at 0.2.0 until #131 broke the cycle on 2026-09-05.
+  `scripts/check-dev-deps.py` now refuses a versioned one on every pull
+  request (`.github/workflows/manifests.yml`, no toolchain needed);
+  `cargo publish --dry-run -p <crate>` reproduces the failure in a second;
+  and `deny.toml` allows a path-only wildcard for exactly this shape. See
+  `docs/decisions.md`, "CI and releases".
 
 ## Status / workflow
 
