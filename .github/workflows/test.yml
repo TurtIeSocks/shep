@@ -139,8 +139,10 @@ jobs:
               - 'docs/whistle/tools.md'
               - 'docs/lookout/frames.txt'
               - 'docs/lookout/frames.ansi'
-              # The report that runs after every nextest leg. A change to it
-              # is a change to what the Rust jobs do.
+              # cargo-deny's config, and the report that runs after every
+              # nextest leg. A change to either is a change to what the
+              # Rust jobs do.
+              - 'deny.toml'
               - '.github/actions/**'
             # benches/ is its own workspace, excluded from the root one, so
             # the main matrix never compiles it and only the bench job below
@@ -562,6 +564,28 @@ jobs:
           name: junit-coverage
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: coverage, path: lcov.info }
+  # cargo-deny against deny.toml: RustSec advisories, licences, duplicate
+  # versions and sources. The advisory half is the one nothing else here
+  # does; `cargo audit` was installed on one machine and run by nobody. It
+  # runs on the `rust` filter, which includes Cargo.lock and deny.toml, so a
+  # lockfile-only pull request (a Dependabot bump, say) gets it too.
+  #
+  # Ten minutes is a ceiling: the whole check is under a minute, and most
+  # of that is fetching the advisory database.
+  deny:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          # `[graph] all-features = true` in deny.toml already covers the
+          # feature set; this is the action's own default, stated so it
+          # cannot drift from the file.
+          arguments: --all-features
   bench:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.bench == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}

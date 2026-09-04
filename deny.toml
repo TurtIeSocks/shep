@@ -1,0 +1,64 @@
+# cargo-deny: RustSec advisories, licences, duplicate versions and sources.
+# Run by the `deny` job in .github/workflows/test.yml on every pull request
+# that touches Rust or a lockfile, and by hand with `cargo deny check`.
+#
+# Why this exists. Until 2026-09-04 nothing in any gate read the RustSec
+# database, and nothing checked which licence a new transitive dependency
+# arrived under. `cargo audit` was installed on one machine and run by
+# nobody, which is the shape a check takes right before it matters. A job
+# that runs on every pull request is the version that fires.
+
+[graph]
+# The task gate's feature set, so the tree checked here is the tree that is
+# built and tested. Without it, everything behind shep-daemon's `test-fakes`
+# feature is invisible to this file.
+all-features = true
+
+[advisories]
+version = 2
+# A yanked version is one its author pulled, and Cargo.lock keeps resolving
+# it without a word. Refuse rather than warn.
+yanked = "deny"
+# An advisory goes in here only with its reason beside it and, where there
+# is one, the fix that lets it come out again.
+ignore = []
+
+[licenses]
+version = 2
+# Every licence in the tree as of 2026-09-04, each read once before it was
+# added. The workspace is MIT OR Apache-2.0; the rest are what the
+# dependencies arrive under. A licence not on this list fails the job, and
+# that is the point: it should be read before it is allowed, not after.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",        # subtle; encoding_rs alongside MIT OR Apache-2.0
+    "ISC",                 # inotify, json5, rustls-webpki, untrusted; ring alongside Apache-2.0
+    "Zlib",                # foldhash
+    "CC0-1.0",             # notify
+    "Unicode-3.0",         # unicode-ident alongside MIT OR Apache-2.0
+    "CDLA-Permissive-2.0", # webpki-roots: Mozilla's CA bundle, data rather than code
+]
+
+[bans]
+# Two versions of one crate in the tree cost build time and can mean a
+# stale requirement somewhere, but they are not a defect on their own, and
+# the `windows-*` family moves on its own schedule and is the usual
+# offender. Reported, not refused.
+multiple-versions = "warn"
+# A `*` requirement resolves to whatever is newest on the day, which is the
+# opposite of a reproducible build. A path dependency with no version is
+# also a `*` to Cargo, and one of those is deliberate: shep-macros'
+# dev-dependency on shep-client names only a path so that `cargo publish`
+# drops it, which is what broke the release deadlock of 2026-09-04 (the
+# comment on that dependency has the measurement). Path-only is allowed
+# here for exactly that shape and nothing else.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only. A git dependency or a second registry is a decision, and
+# it should be made here rather than in whichever Cargo.toml first reached
+# for one.
+unknown-registry = "deny"
+unknown-git = "deny"
