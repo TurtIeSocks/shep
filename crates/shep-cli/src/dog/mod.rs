@@ -337,14 +337,20 @@ async fn run_bark(runtime: DogRuntime) -> ExitCode {
             return ExitCode::InvalidConfig;
         }
     };
-    // `config.dog.bark` alongside the lifecycle topics: the shepherd
+    // `config.dog.<name>` alongside the lifecycle topics: the shepherd
     // publishes it when this dog's section changes and says nothing about
-    // what changed, so the frame is a prompt to re-ask. Bark's own name,
+    // what changed, so the frame is a prompt to re-ask. This dog's own name,
     // not `config.*` -- a glob would hand this dog every other dog's
     // prompts to filter for itself.
+    //
+    // Taken from the runtime rather than written out, because the same name
+    // has to reach `ClientShepherd`'s re-read request. Two literals would be
+    // free to drift, and drift here is silent: bark would keep answering a
+    // topic it still subscribes to by re-reading somebody else's section.
+    let dog = runtime.name.clone();
     let events = match runtime
         .client
-        .subscribe(vec!["process.*".to_owned(), "config.dog.bark".to_owned()])
+        .subscribe(vec!["process.*".to_owned(), format!("config.dog.{dog}")])
         .await
     {
         Ok(events) => events,
@@ -356,6 +362,7 @@ async fn run_bark(runtime: DogRuntime) -> ExitCode {
     let barks_path = runtime.paths.barks.clone();
     let shepherd = Arc::new(ClientShepherd {
         client: runtime.client,
+        dog,
     });
     bark::run_loop(
         events,
@@ -389,12 +396,17 @@ impl bark::EventSource for EventStream {
 /// Wraps [`ReconnectingClient`] as both of the things [`bark::run_loop`]
 /// asks the shepherd for: `Request::ListFlock` for the reconciliation poll
 /// ([`bark::FlockSource`]) and `Request::DogConfig` for a re-read after a
-/// `config.dog.bark` frame ([`bark::ConfigSource`]). One connection answers
+/// `config.dog.<name>` frame ([`bark::ConfigSource`]). One connection answers
 /// both, and [`ReconnectingClient`] is not `Clone`, so the two roles reach
 /// it through one [`Arc`] rather than through two clients that would
 /// reconnect independently.
 struct ClientShepherd {
     client: ReconnectingClient,
+    /// The dog whose section [`bark::ConfigSource`] re-asks for. Held rather
+    /// than spelled in the impl, so the name this dog subscribes on and the
+    /// name its re-read request carries come from one value and cannot
+    /// disagree.
+    dog: String,
 }
 
 impl bark::FlockSource for ClientShepherd {
@@ -421,7 +433,7 @@ impl bark::ConfigSource for ClientShepherd {
         let response = self
             .client
             .request(Request::DogConfig {
-                name: "bark".to_owned(),
+                name: self.dog.clone(),
             })
             .await?;
         match response {
