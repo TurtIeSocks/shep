@@ -375,9 +375,11 @@ sinks = ["oncall"]`}</CodeBlock>
         anything that exists, isn't a file, has no execute bit, or is
         world-writable, and refusing a name that already belongs to a
         built-in verb or alias, since such a dog could never be reached.
-        Passing all of that, it actually spawns the binary with no
-        arguments and kills it immediately, because the only honest way to
-        know whether this kernel can exec a file is to ask this kernel.
+        Passing all of that, it actually spawns the binary and kills it
+        immediately, because the only honest way to know whether this kernel
+        can exec a file is to ask this kernel. The <code>--version</code>
+        probe below is that spawn, so the exec proof and the version answer
+        cost one child rather than two.
       </p>
     </VerbSignature>
     <VerbSignature verb="rehome" usage="shep rehome <name>">
