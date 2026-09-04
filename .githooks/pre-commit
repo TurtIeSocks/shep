@@ -1,0 +1,25 @@
+#!/bin/sh
+# Runs `typos` over what is about to be committed, when it is installed.
+#
+# The `typos` job in .github/workflows/test.yml is the gate; this is the
+# same check a few minutes earlier. Measured over the 19 days to 2026-09-04,
+# 12 of 99 red CI runs were that job, every one a real misspelling in prose
+# or a comment that a local run would have caught before the push.
+#
+# Same install as the commit-msg hook beside this file:
+#     git config core.hooksPath .githooks
+# `typos` itself: `brew install typos-cli` or `cargo install typos-cli`.
+# Missing, it is skipped rather than failed, so a clone without it commits
+# as before and CI still has the last word.
+
+command -v typos >/dev/null 2>&1 || exit 0
+
+# NUL-delimited end to end. A plain `xargs` splits on every kind of
+# whitespace, and this repository tracks three files with spaces in their
+# names under docs/shep-design/: fed through `printf '%s\n' | xargs`, each
+# one arrived at typos as several fragments, every fragment was "not
+# found", and the commit was refused for a typo that did not exist.
+if git diff --cached -z --name-only --diff-filter=ACMR | grep -qcz .; then
+    git diff --cached -z --name-only --diff-filter=ACMR \
+        | xargs -0 typos --config _typos.toml --
+fi
