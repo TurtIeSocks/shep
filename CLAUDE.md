@@ -200,6 +200,30 @@ re-running that suite in isolation with the mutation still applied.
   plan spends its cost later, in review loops.
 - **Implementing a written plan:** Sonnet, high thinking. The design decisions
   are already made.
+- **Every brief says to use conventional commit subjects, and says it in the
+  brief rather than trusting it to be known.** `type(scope): summary`, with a
+  `!` on the commit that actually breaks something, in the crate that breaks.
+
+  This is a release-correctness rule, not a style one. release-plz walks the
+  INDIVIDUAL commits and `filter_unconventional = true` drops whatever does
+  not parse, so an unreadable subject contributes nothing to its crate's
+  changelog and nothing to the version bump. The `!` on a pull request title
+  is read by nobody: release-plz ignores merge commits, which is the opposite
+  of what a `merge_commit_title = PR_TITLE` setting suggests.
+
+  Measured 2026-09-04, and it is the reason this bullet exists. Of the 31
+  commits behind `shep-core` 0.2.1, 19 were unreadable, and the split was
+  exact: every readable one was written in the main thread, every unreadable
+  one by an implementer subagent. One of the 19 changed `BusEvent::topic`'s
+  signature, so a source break went to crates.io as a patch with an empty
+  changelog section. Nothing failed. `semver_check = true` did not catch it
+  either, having no lint for a changed inherent-method return type.
+
+  `.github/workflows/commits.yml` gates it now and `.githooks/commit-msg`
+  catches it earlier, so this bullet is the explanation rather than the
+  enforcement. It still belongs here, because a brief that omits the rule
+  produces a branch that fails CI at the end instead of a subagent that gets
+  it right at the start.
 
 ## Architecture
 

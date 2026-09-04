@@ -1,0 +1,56 @@
+#!/bin/sh
+# Rejects a commit subject release-plz cannot read.
+#
+# release-plz walks the INDIVIDUAL commits on a branch, not the merge
+# commit's subject, and `filter_unconventional = true` in
+# release-plz-changelog.toml silently drops anything that does not parse.
+# A dropped commit contributes nothing to the changelog and nothing to the
+# version bump, so a breaking change in one ships inside a compatible
+# version with an empty changelog entry and no error anywhere.
+#
+# That is not hypothetical. shep-core 0.2.1 went to crates.io carrying a
+# changed public signature because the commit that made it was called
+# "Tell a running dog its config changed".
+#
+# Install once per clone: git config core.hooksPath .githooks
+
+msg_file="$1"
+subject=$(sed -n '1p' "$msg_file")
+
+# A merge, revert, fixup or squash subject is git's own wording, not ours.
+case "$subject" in
+    "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+esac
+
+# type(optional scope)optional !: space, then something.
+if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style|build|revert)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+    exit 0
+fi
+
+cat >&2 <<MSG
+This commit subject is not a conventional commit, so release-plz will drop it:
+
+  $subject
+
+Nothing will fail. The commit merges, the changelog section for its crate
+comes out empty, and if the change was breaking it ships inside a
+semver-compatible version. That is how shep-core 0.2.1 was published with a
+changed public signature.
+
+Write it as: type(optional-scope): lowercase summary
+
+  feat: a new surface        fix: a bug            perf: faster
+  refactor: no behaviour change                    revert: undo
+  docs / style / test / ci / chore / build: no release
+
+Add ! after the type or scope for a BREAKING change, and put it on the
+commit that actually breaks something, in the crate that breaks:
+
+  feat(core)!: BusEvent::topic returns Cow rather than a static str
+
+The ! on a pull request title does nothing. release-plz never reads it.
+
+To bypass once, and only for a commit nobody needs in a changelog:
+  git commit --no-verify
+MSG
+exit 1
