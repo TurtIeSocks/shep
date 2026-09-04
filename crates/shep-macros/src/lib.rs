@@ -40,7 +40,7 @@ const SECRET: &str = "secret";
 /// `#[shep(secret)]`. A struct and an enum both work, and the enum matters:
 /// a bark sink is one, tagged by kind, with a webhook URL in every variant.
 ///
-/// ```rust,ignore
+/// ```rust
 /// use shep_client::dogs::DogConfig;
 ///
 /// #[derive(serde::Deserialize, schemars::JsonSchema, DogConfig)]
@@ -55,15 +55,15 @@ const SECRET: &str = "secret";
 ///         url: String,
 ///     },
 /// }
+///
+/// // One name, not two: see below.
+/// assert_eq!(Sink::SECRET_FIELDS, ["url"]);
 /// ```
 ///
-/// The example is `ignore`d because `shep_client::dogs::DogConfig` does not
-/// exist yet, so there is nothing for a doctest to import. That is a fact
-/// about today rather than a property of the crate: a dev-dependency cycle is
-/// allowed, since dev-dependencies sit outside the library build graph, so
-/// once the trait lands this should become a running doctest with
-/// `shep-client` as a dev-dependency. The derive's behaviour is tested in
-/// `shep-client`, where it is used.
+/// That example runs, which needs `shep-client` as a dev-dependency of this
+/// crate: a cycle on paper, allowed because dev-dependencies sit outside the
+/// library build graph. The derive's behaviour is tested in `shep-client`,
+/// where the marking happens and where a real schema can be looked at.
 ///
 /// # What it expands to
 ///

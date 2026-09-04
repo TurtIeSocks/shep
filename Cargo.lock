@@ -2186,6 +2186,9 @@ version = "0.1.34"
 dependencies = [
  "proc-macro2",
  "quote 1.0.47",
+ "schemars",
+ "serde",
+ "shep-client",
  "syn 2.0.119",
 ]
 
