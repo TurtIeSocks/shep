@@ -620,7 +620,7 @@ every field holding a credential:
 ```rust
 use shep_client::dogs::DogConfig;
 
-#[derive(serde::Deserialize, schemars::JsonSchema, DogConfig)]
+#[derive(Default, serde::Deserialize, schemars::JsonSchema, DogConfig)]
 #[serde(deny_unknown_fields, default)]
 struct MyDogConfig {
     /// Where to POST. Doc comments become the schema's descriptions.

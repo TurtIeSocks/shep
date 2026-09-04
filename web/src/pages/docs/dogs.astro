@@ -15,6 +15,31 @@ const barksDemo = `$ shep barks
 WHEN                 RULE    SUBJECT  MESSAGE                                                                     SINKS
 2026-08-29 21:06:35  daemon  flaky    dog flaky exhausted its restart budget: 15 restarts against a budget of 16  -`;
 
+const probeSnippet = `fn main() {
+    shep_client::dogs::probe::<MyDogConfig>(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    );
+    // ...normal startup, reached only when this run is not a probe.
+}`;
+
+const configSnippet = `use shep_client::dogs::DogConfig;
+
+#[derive(Default, serde::Deserialize, schemars::JsonSchema, DogConfig)]
+#[serde(deny_unknown_fields, default)]
+struct MyDogConfig {
+    /// Where to POST. Doc comments become the schema's descriptions.
+    #[shep(secret)]
+    webhook: String,
+    /// What to watch.
+    path: String,
+}`;
+
+const schemaNotice = `notice[dog_schema_unreadable]: pydog answered \`--schema\` with something that
+is not JSON, so shep has no description of its settings and they stay a
+hand-edited section. The dog is adopted and runs normally; this is a bug to
+report to whoever wrote it`;
+
 const dogLogDemo = `2026-09-02T14:22:31.412+02:00 [shep] shep started this dog; its process is pid 5512
 2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as \`log-rotate\`, on protocol 3
 2026-09-02T14:22:31.492+02:00 rotating web-0-out.log (12.4 MiB)`;
@@ -170,6 +195,23 @@ $ shep disable metrics`}</CodeBlock>
       startup, and nothing pushes it a new one. <code>shep disable
       &lt;name&gt; &amp;&amp; shep enable &lt;name&gt;</code> is what
       re-reads it: a fresh process asking a fresh question.
+    </Callout>
+    <p>
+      A dog can subscribe instead of waiting to be bounced. Shep publishes
+      on <code>config.dog.&lt;name&gt;</code> when it changes a dog's
+      section itself, and a dog holding a subscription re-asks for its
+      section and decides what the change means: swap the values, rebind a
+      listener, or ask for its own restart. The frame says that the section
+      changed and nothing about what is in it. Bark subscribes and swaps in
+      place, since sinks and rules are pure data with no OS resource
+      attached. One thing publishes today, the boot that moves a section out
+      of <code>shep.toml</code>, so a hand edit still needs the stop and
+      start above.
+    </p>
+    <Callout variant="careful">
+      A dog that restarts itself on a config change has to say so in its own
+      log. Nothing else can tell that apart from a crash loop, and the
+      restart count is the column an operator reads as instability.
     </Callout>
     <Callout variant="careful">
       A section that used to live in <code>shep.toml</code> migrates to{" "}
@@ -516,12 +558,23 @@ shep-protocol: 3`}</CodeBlock>
       right on the first try. Hand written JSON is where the quoting and the
       trailing comma go wrong, and nothing here nests.
     </p>
-    <p>Emitting it needs no dependency a dog doesn't already have:</p>
-    <CodeBlock label="main.rs">{`if std::env::args().nth(1).as_deref() == Some("--version") {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    println!("shep-protocol: {}", shep_client::PROTOCOL_VERSION);
-    return;
-}`}</CodeBlock>
+    <p>
+      A dog written against <code>shep-client</code> answers this probe and
+      the schema one below with a single call, as the first line of{" "}
+      <code>main</code>:
+    </p>
+    <CodeBlock label="main.rs">{probeSnippet}</CodeBlock>
+    <p>
+      It prints the answer and exits when shep asked a question, and returns
+      when it didn't, so nothing after it runs on a probe: put it before
+      anything has been opened. The name and the version are arguments
+      because <code>env!</code> expands where it's written, and they're the
+      two facts only the dog knows. The flag names, the{" "}
+      <code>shep-protocol</code> key and the number it carries all come from
+      shep. That's the point of the call: they were hand-typed from this
+      page until it existed, and a typo in any of them read as "protocol
+      unknown" with nothing saying so.
+    </p>
     <Callout variant="note">
       Answering is optional and stays optional. Dogs predating the
       convention are still adoptable, and a dog that doesn't answer is never
@@ -727,6 +780,68 @@ shep-dog 0.1.24`}</CodeBlock>
       fine. What catches it is the dog's own CI building against a current{" "}
       <code>shep-core</code>, which is where both published dogs' breakage
       was already visible and unread.
+    </p>
+
+    <h2>Answering <code>--schema</code></h2>
+    <p>
+      <code>shep adopt</code> asks a second question straight after the
+      first: <code>--schema</code>, answered on stdout with a JSON Schema
+      for the dog's own <code>[&lt;name&gt;]</code> section. Same shape as{" "}
+      <code>--version</code> and the same budget: spawn, read, kill.
+    </p>
+    <p>
+      Asked of the binary rather than over the socket, because the dog most
+      in need of configuring is the one that's disabled or has never
+      started, and it has no connection to answer on. Configure then enable
+      is the order an operator wants.
+    </p>
+    <p>
+      <code>probe</code> answers this flag too, from its type parameter.
+      Derive <code>JsonSchema</code> and <code>DogConfig</code> on the type
+      the dog deserializes its config into, and mark every field holding a
+      credential:
+    </p>
+    <CodeBlock label="config.rs">{configSnippet}</CodeBlock>
+    <p>
+      <code>#[shep(secret)]</code> says the field is a bearer credential,
+      and shep renders one as <code>&lt;set&gt;</code>: replaceable, never
+      read back. The attribute exists rather than the schemars extension it
+      expands to because that extension key is a string the author types,
+      and a transposed letter in it compiles, validates, marks nothing, and
+      paints the credential on screen. Marking a field the schema doesn't
+      have, which is what a <code>#[serde(rename)]</code> on it produces, is
+      a refusal rather than a silent pass.
+    </p>
+    <Callout variant="careful">
+      A mark names a field of the type shep asked about. A credential one
+      type down, in a nested struct or in a map's values, isn't covered by a
+      mark down there: mark the field that holds them. Bark's own{" "}
+      <code>sinks</code> map is marked whole for this reason, and every sink
+      in it carries a webhook URL.
+    </Callout>
+    <Callout variant="note">
+      Answering is optional, exactly as <code>--version</code> is. A dog
+      that says nothing is adopted, recorded as having no schema, and
+      refused nothing, which is every dog written before this contract. What
+      it gives up is a description of itself: a settings pane needs a schema
+      to render, so its section stays a file an operator hand-edits.
+    </Callout>
+    <p>
+      A dog that answers something that isn't JSON gets one line, and is
+      adopted anyway:
+    </p>
+    <CodeBlock>{schemaNotice}</CodeBlock>
+    <p>
+      Silence earns no such line, for the reason an unstated protocol earns
+      none: it's the ordinary case, and a notice for every dog is how an
+      operator learns to skip the one that matters.
+    </p>
+    <p>
+      The answer isn't written down, on the same rule the protocol number
+      follows. <code>cargo install</code> replaces a binary with nothing
+      watching, and a stale schema is worse than a stale version number,
+      because it mislabels which field is a credential. Shep asks the binary
+      again when it needs one.
     </p>
 
     <h2>What shep writes into a dog's own log</h2>
