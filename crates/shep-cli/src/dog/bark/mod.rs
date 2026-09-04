@@ -137,6 +137,49 @@ pub trait FlockSource: Send + Sync {
     fn flock(&self) -> impl Future<Output = Result<Vec<ProcessInfo>, RequestError>> + Send;
 }
 
+/// What bark re-asks its own `[bark]` section through, so a config change
+/// is drivable without a socket.
+///
+/// The shepherd publishes `config.dog.bark` and says nothing about what
+/// changed (`BusEvent::DogConfigChanged`), so the frame is a prompt and
+/// this trait is the answer to it: one `Request::DogConfig` for bark's own
+/// section, which is the only section that request ever answers with.
+///
+/// `Sync` for the same reason [`FlockSource`] is: [`run_loop`]'s own future
+/// holds a `&C` across the `.await` in [`reloaded_config`].
+pub trait ConfigSource: Send + Sync {
+    /// This dog's `[bark]` section as it stands now, empty when the file
+    /// has no such section.
+    ///
+    /// # Errors
+    /// Whatever the underlying source could not answer with -- for the
+    /// production implementation, whatever `Request::DogConfig` failed
+    /// with.
+    fn section(&self) -> impl Future<Output = Result<String, RequestError>> + Send;
+}
+
+/// The rule set a `[bark]` section means: its own rules, or
+/// [`rules::Rules::default_rules`] when it configured none.
+///
+/// One function rather than two copies, because it is asked twice now: at
+/// startup by `dog::run_bark`, and again on every `config.dog.bark` frame
+/// by [`run_loop`]. A change that gave a reloading bark different defaults
+/// from a starting one would be invisible until the alert it silently
+/// stopped sending.
+///
+/// # Errors
+/// - [`rules::RulesError`] -- as [`rules::Rules::new`]: a rule routing to a
+///   sink the section does not define, an unknown event kind, or an
+///   insecure webhook scheme.
+pub fn rules_for(config: &BarkConfig) -> Result<Rules, rules::RulesError> {
+    let rule_list = if config.rules.is_empty() {
+        Rules::default_rules(&config.sinks)
+    } else {
+        config.rules.clone()
+    };
+    Rules::new(rule_list, &config.sinks)
+}
+
 /// Bark's loop: subscribe for speed, poll for correctness.
 ///
 /// **A dropped frame polls immediately** rather than waiting for the next
@@ -180,16 +223,17 @@ pub trait FlockSource: Send + Sync {
 /// the caller's `config`/`barks_path` outlive. Callers still `.await` or
 /// `tokio::spawn` the result exactly as they would an `async fn` — the
 /// sugar difference is invisible at every call site in this module.
-pub fn run_loop<E: EventSource, F: FlockSource>(
+pub fn run_loop<E: EventSource, F: FlockSource, C: ConfigSource>(
     events: E,
     flock: F,
     rules: Rules,
     config: &BarkConfig,
     barks_path: &Path,
-) -> impl Future<Output = ExitCode> + Send + use<E, F> {
-    let sinks = Arc::new(config.sinks.clone());
-    let sink_timeout = config.sink_timeout.as_duration();
-    let max_bytes = config.history_bytes;
+    config_source: C,
+) -> impl Future<Output = ExitCode> + Send + use<E, F, C> {
+    let mut sinks = Arc::new(config.sinks.clone());
+    let mut sink_timeout = config.sink_timeout.as_duration();
+    let mut max_bytes = config.history_bytes;
     // `interval_at`, not `interval`: a plain `tokio::time::interval` fires
     // its first tick immediately, which would make every dog poll once at
     // startup for no reason attributable to either a drop or the interval
@@ -197,7 +241,7 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
     // by one of those two, never by the timer's own startup quirk —
     // `a_dropped_frame_makes_bark_poll_and_catch_up` is built entirely on
     // being able to say "the poll ran because of the lag."
-    let poll_period = config.poll.as_duration();
+    let mut poll_period = config.poll.as_duration();
     let barks_path = Arc::new(barks_path.to_path_buf());
 
     async move {
@@ -246,6 +290,47 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
                         // carries it, under "The bark dog still restarts
                         // once per reload".
                         None => break,
+                        // Ahead of the ordinary event arm, and matched on
+                        // the variant rather than on the dog's name: the
+                        // subscription is what narrows this to bark's own
+                        // topic (`config.dog.bark`), so a name check here
+                        // would be a second place for the name to be
+                        // wrong rather than a second line of defence.
+                        Some(Ok(BusEvent::DogConfigChanged { .. })) => {
+                            if let Some((next, next_rules)) = reloaded_config(&config_source).await {
+                                // In place, never a restart. Sinks and
+                                // rules are pure data with no OS resource
+                                // attached, so nothing here has to be
+                                // rebound or reopened -- the metrics dog's
+                                // `bind` is the case that would. A bark
+                                // that answered a config change by exiting
+                                // would add a restart to the column an
+                                // operator reads as instability, and would
+                                // have to say so in this log to be told
+                                // apart from a crash loop.
+                                sinks = Arc::new(next.sinks.clone());
+                                sink_timeout = next.sink_timeout.as_duration();
+                                max_bytes = next.history_bytes;
+                                // Rebuilt, which resets each rule's
+                                // per-subject debounce: a subject already
+                                // alerted on can alert once more straight
+                                // after a change. The alternative is
+                                // carrying state across a rule set the
+                                // operator may have renumbered, where
+                                // index 0 no longer means the rule it did
+                                // when the debounce was recorded.
+                                rules = next_rules;
+                                if next.poll.as_duration() != poll_period {
+                                    poll_period = next.poll.as_duration();
+                                    poll_interval = tokio::time::interval_at(
+                                        tokio::time::Instant::now() + poll_period,
+                                        poll_period,
+                                    );
+                                    poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                                }
+                                eprintln!("shep dog bark: reloaded [bark] from dogs.toml");
+                            }
+                        }
                         Some(Ok(event)) => {
                             let firings = rules.on_event(&event, now_ms());
                             spawn_firings(firings, &sinks, &append_lock, &barks_path, sink_timeout, max_bytes);
@@ -265,6 +350,46 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
         }
 
         ExitCode::Success
+    }
+}
+
+/// Re-asks `source` for `[bark]` and rebuilds what a config change can
+/// swap, or `None` when the answer cannot be used.
+///
+/// Every failure is reported and dropped rather than propagated: a dog
+/// that exited on a bad edit would stop alerting at exactly the moment an
+/// operator is editing config, and the section it was already running on
+/// is still a working one. What reaches stderr is the FACT and the
+/// parser's own position, never the section: `[bark]` carries webhook URLs
+/// that are themselves bearer credentials.
+async fn reloaded_config<C: ConfigSource>(source: &C) -> Option<(BarkConfig, Rules)> {
+    let section = match source.section().await {
+        Ok(section) => section,
+        Err(err) => {
+            eprintln!("shep dog bark: could not re-read [bark] from the shepherd: {err}");
+            return None;
+        }
+    };
+    // Empty means the section is gone, which is a legitimate edit and not
+    // a failure -- the same reading `DogRuntime::config` gives it at
+    // startup. bark keeps running with no sinks and no rules.
+    let config = if section.is_empty() {
+        BarkConfig::default()
+    } else {
+        match toml::from_str::<BarkConfig>(&section) {
+            Ok(config) => config,
+            Err(_err) => {
+                eprintln!("shep dog bark: [bark] in dogs.toml does not parse; see `shep dogs`");
+                return None;
+            }
+        }
+    };
+    match rules_for(&config) {
+        Ok(rules) => Some((config, rules)),
+        Err(err) => {
+            eprintln!("shep dog bark: keeping the running rules; the new ones are refused: {err}");
+            None
+        }
     }
 }
 
@@ -466,6 +591,37 @@ mod tests {
         async fn flock(&self) -> Result<Vec<ProcessInfo>, RequestError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok((*self.answer).clone())
+        }
+    }
+
+    /// A [`ConfigSource`] answering one fixed `[bark]` section, counting
+    /// how many times it was asked. The count is what proves the loop
+    /// RE-ASKS on a `config.dog.bark` frame rather than acting on the frame
+    /// itself: shep publishes that a section changed and nothing about what
+    /// changed, so a loop that did not ask learned nothing.
+    #[derive(Clone)]
+    struct ScriptedConfig {
+        section: Arc<String>,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl ScriptedConfig {
+        fn answering(section: String) -> Self {
+            Self {
+                section: Arc::new(section),
+                calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ConfigSource for ScriptedConfig {
+        async fn section(&self) -> Result<String, RequestError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((*self.section).clone())
         }
     }
 
@@ -673,6 +829,10 @@ mod tests {
             gave_up_rules(),
             &config_with_sink(addr, &barks_path),
             &barks_path,
+            // Never asked: no `config.dog.bark` frame is sent here, and
+            // `calls()` in the config test is what proves the loop only
+            // asks when one is.
+            ScriptedConfig::answering(String::new()),
         ));
 
         let req = await_real_io(Duration::from_secs(5), captured)
@@ -839,7 +999,14 @@ mod tests {
             .unwrap();
 
         let flock = ScriptedFlock::answering(Vec::new());
-        let loop_handle = tokio::spawn(run_loop(rx, flock, rules, &config, &barks_path));
+        let loop_handle = tokio::spawn(run_loop(
+            rx,
+            flock,
+            rules,
+            &config,
+            &barks_path,
+            ScriptedConfig::answering(String::new()),
+        ));
 
         let req = await_real_io(Duration::from_millis(50), fast_captured)
             .await
@@ -921,4 +1088,69 @@ sinks = ["oncall"]
         // is necessary but not sufficient for the dog to actually start.
         Rules::new(config.rules, &config.sinks).expect("both documented rules route to real sinks");
     }
+
+    /// fails if a `config.dog.bark` frame does not reach bark's sinks. The
+    /// swap is observable at the only place it matters: the next firing is
+    /// delivered to the sink the NEW section names, over a real socket,
+    /// while the old sink's server is still up and receives nothing.
+    ///
+    /// The loop is the same loop throughout, which is the other half of
+    /// what this pins. bark answers a config change in place because its
+    /// config is sinks and rules, pure data with no OS resource attached;
+    /// a bark that restarted itself instead would add a restart to the
+    /// column an operator reads as instability.
+    #[tokio::test(start_paused = true)]
+    async fn a_config_change_swaps_barks_sinks_in_place() {
+        let (old_addr, mut old_captured) = one_shot_sink(200, "").await;
+        let (new_addr, new_captured) = one_shot_sink(200, "").await;
+        let dir = tempfile::tempdir().unwrap();
+        let barks_path = dir.path().join("barks.jsonl");
+        let source = ScriptedConfig::answering(format!(
+            "[sinks.ops]\nkind = \"json\"\nurl = \"http://{new_addr}/hook\"\n"
+        ));
+
+        let (tx, rx) = broadcast::channel(16);
+        let loop_handle = tokio::spawn(run_loop(
+            rx,
+            ScriptedFlock::answering(Vec::new()),
+            gave_up_rules(),
+            &config_with_sink(old_addr, &barks_path),
+            &barks_path,
+            source.clone(),
+        ));
+
+        // One receiver, one queue: the loop reads these in the order they
+        // were sent and awaits the re-ask before it takes the second, so
+        // the delivery below is attributable to the new section and never
+        // to a race this test would have to sleep through.
+        tx.send(BusEvent::DogConfigChanged {
+            dog: "bark".to_owned(),
+        })
+        .unwrap();
+        tx.send(errored_event("web")).unwrap();
+
+        let req = await_real_io(Duration::from_secs(5), new_captured)
+            .await
+            .expect("the bark must reach the sink the new section names")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&req.body).contains("web"));
+
+        assert_eq!(source.calls(), 1, "one frame, one re-ask");
+        assert!(
+            !loop_handle.is_finished(),
+            "bark swaps its config in place; it does not exit to pick one up"
+        );
+        // `try_recv`, never an await: the old sink's server is still
+        // parked in `accept`, so it holds its own sender alive and an
+        // await here would wait for a connection that must never come.
+        // The delivery above has already happened, so a bark that went to
+        // the old address would be sitting in this channel now.
+        assert!(
+            old_captured.try_recv().is_err(),
+            "the sink the old section named must be left alone"
+        );
+
+        loop_handle.abort();
+    }
+
 }

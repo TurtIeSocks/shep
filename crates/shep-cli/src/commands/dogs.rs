@@ -1771,6 +1771,15 @@ pub async fn rehome(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) ->
     // `shep.toml` by now, so the daemon half below would stop it and the
     // operator would be told it was forgotten while its configuration, and
     // the webhook URLs in it, were still on disk.
+    //
+    // The third writer of `dogs.toml`, and the one that needs no
+    // `config.dog.<name>` frame at all. The other two are in
+    // `commands::daemon`, where `boot_supervisor` publishes and the reload
+    // pre-flight explains why it cannot. This one removes the dog: the
+    // daemon half below stops it, so by the time anything could be told
+    // its section changed there is no subscriber left to tell. A frame
+    // here would reach a process on its way out and ask it to re-read a
+    // section that is gone.
     if let Err(err) = dog_migration::forget_dog_section(&paths.dogs_config, name) {
         return fail_dogs_config(streams, &err);
     }

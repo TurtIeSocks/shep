@@ -127,6 +127,22 @@ impl RpcContext {
         let _ = self.shutdown.send(true);
     }
 
+    /// Announces that these dogs' `dogs.toml` sections changed.
+    ///
+    /// The daemon's own half of the dog-config contract, and the ONE place
+    /// a `config.dog.<name>` frame comes from. The publisher has to be
+    /// inside the daemon process, because that is where the bus is: the
+    /// CLI's other two writers of `dogs.toml` run in an operator's
+    /// short-lived process and say nothing (see their own call sites for
+    /// which and why).
+    ///
+    /// Public because the caller is `shep`'s own boot, which runs the
+    /// migration before this daemon exists and hands the names over once
+    /// it does.
+    pub fn announce_dog_config(&self, dogs: &[String]) {
+        crate::bus::publish_dog_config_changed(&self.events, dogs);
+    }
+
     /// Writes the muster roll now, reporting what it recorded.
     ///
     /// `None` means the supervisor engine has already stopped: there is

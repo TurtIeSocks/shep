@@ -29,6 +29,7 @@ pub mod bark;
 pub mod metrics;
 
 use core::fmt;
+use std::sync::Arc;
 
 use shep_client::{ConnectError, EventStream, ReconnectingClient, RequestError};
 use shep_core::paths::ShepPaths;
@@ -329,19 +330,23 @@ async fn run_bark(runtime: DogRuntime) -> ExitCode {
             return ExitCode::InvalidConfig;
         }
     };
-    let rule_list = if config.rules.is_empty() {
-        bark::rules::Rules::default_rules(&config.sinks)
-    } else {
-        config.rules.clone()
-    };
-    let rules = match bark::rules::Rules::new(rule_list, &config.sinks) {
+    let rules = match bark::rules_for(&config) {
         Ok(rules) => rules,
         Err(err) => {
             eprintln!("shep dog bark: {err}");
             return ExitCode::InvalidConfig;
         }
     };
-    let events = match runtime.client.subscribe(vec!["process.*".to_owned()]).await {
+    // `config.dog.bark` alongside the lifecycle topics: the shepherd
+    // publishes it when this dog's section changes and says nothing about
+    // what changed, so the frame is a prompt to re-ask. Bark's own name,
+    // not `config.*` -- a glob would hand this dog every other dog's
+    // prompts to filter for itself.
+    let events = match runtime
+        .client
+        .subscribe(vec!["process.*".to_owned(), "config.dog.bark".to_owned()])
+        .await
+    {
         Ok(events) => events,
         Err(err) => {
             eprintln!("shep dog bark: could not subscribe to the shepherd's bus: {err}");
@@ -349,10 +354,18 @@ async fn run_bark(runtime: DogRuntime) -> ExitCode {
         }
     };
     let barks_path = runtime.paths.barks.clone();
-    let flock = ClientFlockSource {
+    let shepherd = Arc::new(ClientShepherd {
         client: runtime.client,
-    };
-    bark::run_loop(events, flock, rules, &config, &barks_path).await
+    });
+    bark::run_loop(
+        events,
+        Arc::clone(&shepherd),
+        rules,
+        &config,
+        &barks_path,
+        shepherd,
+    )
+    .await
 }
 
 /// Adapts [`EventStream`] to [`bark::EventSource`]: its own `next` already
@@ -373,14 +386,18 @@ impl bark::EventSource for EventStream {
     }
 }
 
-/// Wraps [`ReconnectingClient`] as [`bark::FlockSource`]: `Request::ListFlock`, mapped
-/// into the shape [`bark::run_loop`] can poll without a socket of its own —
-/// the same reason [`bark::EventSource`] exists for the subscription side.
-struct ClientFlockSource {
+/// Wraps [`ReconnectingClient`] as both of the things [`bark::run_loop`]
+/// asks the shepherd for: `Request::ListFlock` for the reconciliation poll
+/// ([`bark::FlockSource`]) and `Request::DogConfig` for a re-read after a
+/// `config.dog.bark` frame ([`bark::ConfigSource`]). One connection answers
+/// both, and [`ReconnectingClient`] is not `Clone`, so the two roles reach
+/// it through one [`Arc`] rather than through two clients that would
+/// reconnect independently.
+struct ClientShepherd {
     client: ReconnectingClient,
 }
 
-impl bark::FlockSource for ClientFlockSource {
+impl bark::FlockSource for ClientShepherd {
     async fn flock(&self) -> Result<Vec<ProcessInfo>, RequestError> {
         match self.client.request(Request::ListFlock).await? {
             Response::Flock(flock) => Ok(flock),
@@ -396,6 +413,46 @@ impl bark::FlockSource for ClientFlockSource {
                 daemon_version: None,
             })),
         }
+    }
+}
+
+impl bark::ConfigSource for ClientShepherd {
+    async fn section(&self) -> Result<String, RequestError> {
+        let response = self
+            .client
+            .request(Request::DogConfig {
+                name: "bark".to_owned(),
+            })
+            .await?;
+        match response {
+            Response::DogSection { toml } => Ok(toml.as_str().to_string()),
+            // Never returned by a daemon on the same protocol version, and
+            // reportable rather than `unreachable!()` for the reason
+            // `DogRunError::UnexpectedReply`'s own doc gives.
+            _ => Err(RequestError::Rpc(RpcError {
+                code: RpcErrorCode::Internal,
+                message: "the shepherd answered DogConfig with something other than \
+                          Response::DogSection"
+                    .to_owned(),
+                daemon_version: None,
+            })),
+        }
+    }
+}
+
+/// Both traits reach the client through one [`Arc`] -- see
+/// [`ClientShepherd`]'s own doc. The forwarding impls live here rather than
+/// beside the traits in `bark::mod`, so nothing in bark has to know that
+/// the production shepherd is shared.
+impl bark::FlockSource for Arc<ClientShepherd> {
+    async fn flock(&self) -> Result<Vec<ProcessInfo>, RequestError> {
+        bark::FlockSource::flock(&**self).await
+    }
+}
+
+impl bark::ConfigSource for Arc<ClientShepherd> {
+    async fn section(&self) -> Result<String, RequestError> {
+        bark::ConfigSource::section(&**self).await
     }
 }
 
