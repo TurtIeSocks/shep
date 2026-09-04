@@ -82,9 +82,10 @@ pub fn create_staging_file(
 // DIRECTORY, which sits in the page cache until that directory is flushed
 // too. Lose power in between and the data survives with nothing pointing
 // at it. A crash is not that case: a completed `rename(2)` is visible to
-// every later process whether or not anything was flushed, so only a power
-// cut or a kernel panic can lose a landed rename. The muster roll needs
-// the difference most, its whole job being read back after a reboot.
+// every later process whether or not anything was flushed, so it takes an
+// unclean shutdown (power cut, kernel panic, hypervisor reset) to undo one,
+// and the old file is what comes back. The muster roll needs the
+// difference most, its whole job being read back after a reboot.
 //
 // Why the two arms differ, which is not a caller's question (IR-31).
 //
