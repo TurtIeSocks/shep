@@ -188,6 +188,26 @@ That is the same bug class decision 5 removes for `--version`, and the marker
 is the one field where getting it wrong has a security consequence rather than
 a cosmetic one.
 
+### 6b. Two calls decision 6 left open, settled 2026-09-04
+
+**The derive ships as `shep-macros`, re-exported by `shep-client`.** A proc
+macro cannot live in `shep-client`, so it needs a crate of its own. Keeping it
+minimal and re-exporting means a dog author still takes one dependency and
+writes `use shep_client::dogs::DogConfig`, which is how `shep_core` already
+reaches them. A larger `shep-dog` SDK crate was considered and refused: it
+would be a second published name and would split the dog contract across two
+crates rather than one.
+
+**`shep-client` gains schemars behind a `schema` feature, on by default.** The
+name matches the feature `shep-core` already uses for the same dependency.
+Enabled by default so following the docs works, and opt-out for a dog that does
+not want roughly fourteen crates of build it will never use.
+
+Turning it off is not a broken state, and that falls out of decision 4 rather
+than being a special case: a dog without the feature does not answer `--schema`,
+and a dog that answers nothing is recorded as having no schema and refused
+nothing. The design already had a hole this shape.
+
 ### 7. The schema is asked fresh, never stored
 
 `docs/dogs.md` already refuses to store a dog's protocol version, on the
