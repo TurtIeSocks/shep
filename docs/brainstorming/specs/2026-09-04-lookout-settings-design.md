@@ -75,8 +75,8 @@ every dog's config to `$SHEP_HOME/dogs.toml`, migrated once at boot.
 There is nothing left to exclude.
 
 A dogs config pane is separate later work with its own spec
-([the dog config design](2026-09-03-dog-config-design.md), decision 9), and it
-depends on dogs publishing a schema, which is not built.
+([the dog config design](2026-09-03-dog-config-design.md), decision 9). Dogs
+now publish a config schema, but the pane itself is not built.
 
 ### Decision 13 does not apply to this screen
 
