@@ -818,9 +818,10 @@ Cursor movement clamps rather than wrapping, matching the flock table. Store the
 ```rust
 Effect::LoadSettings => {
     let path = paths.daemon_config.clone();
+    let socket_default = paths.socket.clone();
     let style = /* the resolved style this lookout already holds */;
     let result = tokio::task::spawn_blocking(move || {
-        commands::settings::load_settings(&path, &style)
+        commands::settings::load_settings(&path, &socket_default, style)
     })
     .await
     .map_err(|err| err.to_string())
@@ -830,7 +831,11 @@ Effect::LoadSettings => {
 }
 ```
 
+`load_settings` takes three arguments, not two: the config path, the socket path a document that declares none falls back to, and the already-resolved style. The style goes by value, since it is a `(StyleLevel, StyleSource)` pair of two `Copy` fields.
+
 `spawn_blocking` even though the read takes no lock: the rule is "no file I/O on the redraw task", which is cheaper to hold than a judgement per call site. Say so in a comment.
+
+What shipped does not `.await` the handle in the arm, as the sample above does. Awaiting it there parks the UI task until the I/O lands, which is the freeze `spawn_blocking` was reached for in the first place; the handle goes into a `FuturesUnordered` the `select!` drains instead. See the commit that fixed it for the full argument.
 
 Add the fixtures `settings_snapshot()`, `app_in_settings()` and `app_in_settings_with_control()` to `view/fixtures.rs`, in the shape the ones already there use.
 
@@ -1607,4 +1612,4 @@ Run against the spec before dispatching task 1.
 - **Spec coverage.** Decision 1 is task 6 (`draw` branches rather than adding a pane tier). Decision 2 is task 7. Decision 3 is tasks 3 and 8. Decision 4 is tasks 2, 3 and 6. Decision 5 is tasks 2, 3 and 8. Decision 6 is tasks 7, 8 and 9's confirm strings. Decision 7 is task 11's docs, since lookout only names the command. Decision 8 is task 5's read-only test. Decision 9 is tasks 6 and 9. Decision 10 is task 4. Decision 11 is a note at the call sites, checked in review rather than by a test, because there is nothing to redact.
 - **Types.** `SettingField`, `SettingEdit`, `SettingsSnapshot`, `ScalarView`, `DogView` and `SettingError` are defined in task 3 and used unchanged in 5 through 9. `SettingsRow` and `Settings` are task 5's. `Pending` is task 7's, extended by task 8. `Effect::WriteDog`, `Msg::DogWritten` and `Sent::Dog` are task 9's.
 - **Loose ends, all closed before dispatch.** `resolve_style` returns `(StyleLevel, StyleSource)` at `lib.rs:533`; `SettingSource` is not declared at all; `StyleSource` already has the four variants; `DogSource` is `BuiltIn | Adopted { path: String }` at `request.rs:587`; the read-only refusal is `"read-only: actions need --allow-control"` at `app.rs:1033`; and `silent` comes from `Reported::of(..).word()` at `vocabulary.rs:117`. Nothing in this plan is left for an implementer to guess at.
-- **`ino()` needs `std::os::unix::fs::MetadataExt`** in task 3's test module. `commands` is already `cfg(unix)` wholesale, so no gate is needed around it.
+- **`ino()` needs `std::os::unix::fs::MetadataExt`** in task 3's test module, and the import needs its own `#[cfg(unix)]`. `mod commands;` carries no gate at all: each site that reaches for a unix API gates itself. Assuming otherwise is what broke the Windows leg of CI on this branch.
