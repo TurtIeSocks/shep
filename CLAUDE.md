@@ -241,10 +241,18 @@ re-running that suite in isolation with the mutation still applied.
   Nine types are accepted, and they are what `release-plz-changelog.toml`
   handles rather than the conventional-commits list. `feat`, `fix`, `perf`
   and `refactor` produce entries; `docs`, `test`, `ci`, `chore` and `style`
-  are `skip = true` and drop on purpose. `revert` and `build` are refused,
-  because they match no parser there and `filter_commits = true` discards
-  them as silently as it discards a sentence. Measured with git-cliff 2.14.1
-  against the real config.
+  are `skip = true` and drop when not breaking, except
+  `chore: update Cargo.{toml,lock} dependencies`, which has its own parser
+  ahead of that skip. `revert` and `build` are refused, because they match no
+  parser and `filter_commits = true` discards them as silently as it discards
+  a sentence.
+
+  **The `!` matters more than the type.** `protect_breaking_commits = true`
+  outranks a skip, so `docs!:` and `chore!:` are kept and marked BREAKING. It
+  does not outrank a miss, so `revert!:` and `build!:` still vanish. A `!`
+  anywhere on the commit that changed `BusEvent::topic` would have saved
+  0.2.1 even under a type that otherwise drops. All measured with git-cliff
+  2.14.1 against the real config.
 
   `.github/workflows/commits.yml` gates it now and `.githooks/commit-msg`
   catches it earlier, so this bullet is the explanation rather than the

@@ -53,19 +53,33 @@ jobs:
           # subject. `Revert "..."`, which `git revert` writes, parses as
           # nothing and is dropped too.
           #
-          # The nine accepted types are what release-plz-changelog.toml
-          # actually handles, not the conventional-commits list. Measured with
-          # git-cliff 2.14.1 against that config: feat, fix, perf and refactor
-          # produce entries; docs, test, ci, chore and style are `skip = true`
-          # and dropped on purpose; revert and build match NO parser, so
-          # `filter_commits = true` discards them silently. Those last two are
-          # the trap, since they are real conventional types that look correct
-          # and contribute nothing. Give one a parser in that config before
-          # adding it here.
+          # What release-plz-changelog.toml does with a subject, measured with
+          # git-cliff 2.14.1 against that config rather than read off it:
+          #
+          #   feat fix perf refactor   an entry
+          #   chore: update Cargo.{toml,lock} dependencies
+          #                            an entry under Internal, since that exact
+          #                            parser precedes the generic chore skip
+          #   docs test ci chore style skipped deliberately, when not breaking
+          #   revert build             match NO parser, so `filter_commits = true`
+          #                            discards them silently
+          #
+          # `protect_breaking_commits = true` outranks a skip but NOT a miss.
+          # A `!` rescues `docs!:` and `chore!:`, which produce BREAKING
+          # entries, and rescues nothing for `revert!:` or `build!:`, which
+          # match no parser and vanish. So a breaking revert would be lost
+          # entirely, which is why those two are refused rather than accepted.
+          #
+          # The scope class is `[^()]` and not `[a-z...]`: git-conventional,
+          # which git-cliff parses with, allows any scope character except a
+          # newline and a parenthesis, so `feat(API): ...` is valid. An earlier
+          # revision rejected it, which is the worse failure for a gate. A
+          # false pass lets one bad commit through; a false rejection blocks
+          # correct work.
           bad=0
           while IFS= read -r subject; do
             [ -z "$subject" ] && continue
-            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
               printf '  ok      %s\n' "$subject"
             else
               printf '  DROPPED %s\n' "$subject"

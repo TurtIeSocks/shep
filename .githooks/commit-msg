@@ -26,27 +26,48 @@ subject=$(sed -n '1p' "$msg_file")
 # as nothing and release-plz drops it, so a reverted breaking change would go
 # unrecorded. Retitle it `revert: ...` and see the note below about giving
 # `revert` a parser.
+# Only the forms git writes itself. A plain `Merge ` prefix would exempt a
+# hand-written `Merge release branch`, which is an ordinary commit release-plz
+# would drop like any other unreadable subject.
 case "$subject" in
-    "Merge "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+    "Merge branch "*|"Merge pull request #"*|"Merge remote-tracking branch "*) exit 0 ;;
+    "Merge tag "*|"Merge commit "*) exit 0 ;;
+    "fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
 esac
 
-# The nine types below are not the conventional-commits list, they are what
-# release-plz-changelog.toml actually handles. Measured with git-cliff 2.14.1
-# against that exact config:
+# What release-plz-changelog.toml actually does with a subject, measured with
+# git-cliff 2.14.1 against that config rather than read off it:
 #
-#   feat fix perf refactor   produce a changelog entry
-#   docs test ci chore style  match `skip = true`, dropped on purpose
+#   feat fix perf refactor    an entry in Added/Fixed/Performance/Changed
+#   chore: update Cargo.toml dependencies
+#   chore: update Cargo.lock dependencies
+#                             an entry under Internal, because that exact
+#                             parser is listed BEFORE the generic chore skip
+#   docs test ci chore style  skipped, deliberately, when not breaking
 #   revert build              match NO parser, so `filter_commits = true`
-#                             drops them with no entry and no warning
+#                             discards them with no entry and no warning
+#
+# `protect_breaking_commits = true` outranks every skip above. A subject
+# carrying `!` is kept whatever its type, so `docs!:` and `chore!:` both
+# produce an entry marked BREAKING. That is the single most important thing
+# on this page: the `!` matters more than the type. shep-core 0.2.1 shipped a
+# source break as a patch, and a `!` anywhere on that commit would have saved
+# it even under a type that otherwise drops.
 #
 # `revert` and `build` are the trap. They are real conventional types, they
-# look correct, and they contribute nothing. They are rejected here rather
-# than accepted, because a gate that passes a commit release-plz discards is
-# the bug this file exists to prevent. To use one, give it a parser in
+# look correct, and they contribute nothing. Rejected here rather than
+# accepted, because a gate that passes a commit release-plz discards is the
+# bug this file exists to prevent. To use one, give it a parser in
 # release-plz-changelog.toml first, then add it here.
 
-# type(optional scope)optional !: space, then something.
-if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+# The scope is `[^()]` and not `[a-z...]`. git-conventional, which git-cliff
+# parses with, permits any character in a scope except a newline and a
+# parenthesis, so `feat(API): ...` is valid and produces an entry. An earlier
+# revision of this file spelled the class `[a-z0-9 ._/-]` and would have
+# rejected it, which is the worse failure for a gate: a false pass lets one
+# bad commit through, a false rejection blocks correct work.
+
+if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
     exit 0
 fi
 
