@@ -368,6 +368,10 @@ fn write_file(path: &Path, file: &KvFile) -> Result<(), KvError> {
     // inside the error and its `Drop` removes the staging file, so a failed
     // replace does not leave one behind.
     tmp.persist(path).map_err(|err| KvError::Io(err.error))?;
+
+    // The `sync_all` above made the CONTENTS durable; this makes the rename
+    // that published them durable. See `shep_core::atomic_file`.
+    crate::atomic_file::sync_dir(parent)?;
     Ok(())
 }
 

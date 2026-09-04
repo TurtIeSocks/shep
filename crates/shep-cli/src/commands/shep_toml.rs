@@ -547,7 +547,9 @@ impl ShepToml {
     }
 
     /// Writes the document back: staged in a sibling temp file at
-    /// [`CONFIG_FILE_MODE`], `fsync`ed, then `rename`d over `path`.
+    /// [`CONFIG_FILE_MODE`], `fsync`ed, `rename`d over `path`, and the
+    /// directory `fsync`ed in turn so the rename itself survives a power
+    /// cut (see `shep_core::atomic_file`).
     ///
     /// Private, and reached only from [`Self::edit`] with the lock held.
     ///
@@ -563,7 +565,8 @@ impl ShepToml {
     ///
     /// # Errors
     /// - [`ShepTomlError::Io`] — the staging file could not be created or
-    ///   written, or the rename over `path` failed.
+    ///   written, the rename over `path` failed, or the directory holding
+    ///   it could not be flushed.
     fn save(&self) -> Result<(), ShepTomlError> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let mut tmp = create_config_file(parent).map_err(|source| self.io_error(source))?;
@@ -577,6 +580,10 @@ impl ShepToml {
         // so a failed replace leaves nothing behind in `$SHEP_HOME`.
         tmp.persist(&self.path)
             .map_err(|err| self.io_error(err.error))?;
+
+        // The `sync_all` above made the CONTENTS durable; this makes the
+        // rename that published them durable. See `shep_core::atomic_file`.
+        shep_core::atomic_file::sync_dir(parent).map_err(|source| self.io_error(source))?;
         Ok(())
     }
 
