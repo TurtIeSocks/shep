@@ -1701,7 +1701,7 @@ on_first_run fires as a side effect on whichever command created the home, writi
 
 ## Config overrides
 
-### A Flockfile load is additive by default: the file may add, and may never overwrite
+### A Flockfile load is additive by default: the file may add, and may never overwrite - **superseded**
 
 `shep start <Flockfile>` merges the file into the sheep of the same name rather than replacing it. A key the file declares that nobody has established yet takes the file's value; every other key keeps exactly what it has, defaults included. `--reset` widens that to every setting but `env`, and `--reset-all` to everything.
 
@@ -1709,15 +1709,15 @@ on_first_run fires as a side effect on whichever command created the home, writi
 
 An unrecognised `ResetDepth` from a newer client falls back to additive for the same reason: append-only is the depth that cannot destroy something an operator set.
 
-`verified crates/shep-daemon/src/supervisor.rs (merge_declared) and crates/shep-core/src/config/apply.rs (ResetDepth)`
+`verified crates/shep-daemon/src/supervisor.rs (merge_declared) and crates/shep-core/src/config/apply.rs (ResetDepth)`. Replaced by: the half naming the flags. Additive-by-default still holds and is still the whole default, and so does the unrecognised-depth fallback. What moved is the sentence about `--reset` and `--reset-all`, which are gone: see "--reset and --reset-all become one flag" below for the four modes that replaced them.
 
-### env is data and everything else is policy, which is where --reset stops
+### env is data and everything else is policy, which is where --reset stops - **superseded**
 
 `--reset` puts every setting but `env` back to the template. `--reset-all` is a second flag rather than an argument to the first.
 
 **Why:** Resetting policy is recoverable and resetting data is not. A `--reset` that also cleared `env` would take an app's database credentials away as a side effect of putting its restart budget back, and the operator asking for the second thing is almost never asking for the first. Two flags, because a single flag with a modifier reads as one act with a switch rather than as two different sizes of act.
 
-`verified crates/shep-core/src/config/apply.rs (ResetDepth::Settings vs ResetDepth::All)`
+`verified crates/shep-core/src/config/apply.rs (ResetDepth::Settings vs ResetDepth::All)`. Replaced by: "--reset and --reset-all become one flag" below. The data-versus-policy split held and is what the mode names are drawn from, but `--reset` is no longer where it stops: `env` is now a mode of its own, so an operator can reset data without policy as well as policy without data. `ResetDepth::Settings` is gone, renamed to `ResetDepth::Policy`, and the two flags are one flag taking a required mode.
 
 ### rearm_name is a force-replacing sibling to ExtrasRegistry::arm, not a flag on it
 
@@ -1735,13 +1735,13 @@ A config change to a lifecycle extra rebuilds the whole name-group's tasks throu
 
 `verified crates/shep-daemon/src/extras.rs (ExtrasRegistry::liveness_epochs)`
 
-### PROTOCOL_VERSION stayed 2 for Request::ApplyConfig, and the skew is louder than the six precedents
+### PROTOCOL_VERSION stayed 2 for Request::ApplyConfig, and the skew is louder than the six precedents - **superseded**
 
 `Request` gained an `ApplyConfig` variant and `Response` an `Applied`, additively, with no version bump. Six prior additions in shep-core's changelog set that precedent.
 
 **Why:** The rule the constant answers is whether an older peer can still be understood, and an added variant that an older client never sends does not break one. Bumping would refuse every older client for every verb to improve the error message for one. What is sharper here than in the six precedents: a NEW CLI against an OLDER daemon passes the handshake, sends `ApplyConfig`, and the daemon ends the connection on an envelope it cannot decode, so `shep start <Flockfile>` fails on a dead client rather than on a named version refusal. The remedy is `shep daemon reload` after upgrading, which is why it is now said in the docs rather than left to be discovered.
 
-`verified crates/shep-core/src/protocol/mod.rs (PROTOCOL_VERSION = 2) and crates/shep-core/CHANGELOG.md`
+`verified crates/shep-core/src/protocol/mod.rs (PROTOCOL_VERSION = 2) and crates/shep-core/CHANGELOG.md`. Replaced by: the entry directly below, which says which half stood. The constant is 3 now, and it moved for the `ResetDepth` rename inside the payload rather than for the variant itself.
 
 ### PROTOCOL_VERSION moved to 3 anyway, once the payload inside ApplyConfig stopped being purely additive
 
