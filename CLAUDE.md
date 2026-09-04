@@ -568,5 +568,21 @@ on it reaches every instance behind a confirm naming the count. `shep
 bleats` now reads a log file shared by several instances once instead of
 once per instance, and labels a multi-instance app's lines with their slot.
 
+**A dog's config moved out of `shep.toml` on 2026-09-03.** A dog's section
+used to live under `[dog.<name>]` in `shep.toml`; it now lives under
+`[<name>]` in a new, hand-editable `$SHEP_HOME/dogs.toml`. The daemon
+migrates any old sections once, at boot, and refuses to boot rather than
+guess when a name holds VALUES in both files. **Not when a name merely
+exists in both**, which is what this line said and is the rule the branch
+removed: an empty section is a header, not a second value, so an empty
+`[dog.<name>]` in the source is skipped and an empty `[<name>]` in
+`dogs.toml` is written over. Every `shep enable` older than this branch
+scaffolds the first shape, and refusing on it took a mixed-version host to
+a shepherd that would not boot. `RawDaemonConfig::dog` is kept on
+purpose: removing it would turn an un-migrated `shep.toml` into a refused
+boot under `deny_unknown_fields`, so it stays as the thing the migration
+reads from. The migration itself lives in
+`crates/shep-cli/src/commands/dog_migration.rs`.
+
 Project memory (cross-session state) tracks decisions; docs above are the
 source of truth.

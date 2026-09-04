@@ -58,8 +58,9 @@
 //! - `bus`: the daemon-wide event bus — topic-glob filtering, per-subscriber forwarder tasks
 //! - [`rpc`]: request dispatch — verb routing onto [`SupervisorHandle`](supervisor::SupervisorHandle), typed errors, per-call deadlines
 //! - [`dogs`]: the dog contract — what a dog is spawned as
-//!   ([`dog_app`](dogs::dog_app)) and the `[dog.<name>]` section served back
-//!   to it over the socket ([`dog_section`](dogs::dog_section))
+//!   ([`dog_app`](dogs::dog_app)) and the `[<name>]` section, read from
+//!   `dogs.toml`, served back to it over the socket
+//!   ([`dog_section`](dogs::dog_section))
 //! - `server`: the unix-socket connection layer — peer-cred auth, handshake, subscriptions (unix-only)
 //! - [`snapshot`]: the muster roll — debounced atomic `flock.json` writes, restart-survival restore
 //! - [`boot`]: daemon boot — `0700` layout dirs, pidfile, socket bind with stale-socket

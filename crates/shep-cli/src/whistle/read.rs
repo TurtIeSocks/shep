@@ -253,6 +253,7 @@ mod tests {
         ShepPaths {
             home: std::path::PathBuf::new(),
             daemon_config: std::path::PathBuf::new(),
+            dogs_config: std::path::PathBuf::new(),
             snapshot: std::path::PathBuf::new(),
             logs: std::path::PathBuf::new(),
             pids: std::path::PathBuf::new(),

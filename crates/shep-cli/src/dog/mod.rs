@@ -320,12 +320,12 @@ async fn run_bark(runtime: DogRuntime) -> ExitCode {
     let config = match runtime.config::<bark::BarkConfig>() {
         Ok(config) => config,
         Err(_err) => {
-            // The fact, not the value: a `[dog.bark]` section routinely
+            // The fact, not the value: a `[bark]` section routinely
             // carries a webhook URL with a bearer token in its path, and
             // `DogRunError::Section`'s own message can quote it — see that
             // type's redacted `Debug`. `metrics::run`'s own diagnostic
             // takes the same posture for the same reason.
-            eprintln!("shep dog bark: [dog.bark] does not parse; see `shep dogs`");
+            eprintln!("shep dog bark: [bark] in dogs.toml does not parse; see `shep dogs`");
             return ExitCode::InvalidConfig;
         }
     };
@@ -416,6 +416,7 @@ mod tests {
         let home = dir.to_path_buf();
         ShepPaths {
             daemon_config: home.join("shep.toml"),
+            dogs_config: home.join("dogs.toml"),
             snapshot: home.join("flock.json"),
             logs: home.join("logs"),
             pids: home.join("pids"),

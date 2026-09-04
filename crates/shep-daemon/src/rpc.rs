@@ -66,12 +66,14 @@ pub struct RpcContext {
     pub(crate) registry: FlockRegistry,
     /// Where [`Self::snapshot_now`] writes the muster roll.
     pub(crate) snapshot_path: PathBuf,
-    /// Where `DogConfig` reads a dog's `[dog.<name>]` section from.
+    /// Where `DogConfig` reads a dog's `[<name>]` section from: this home's
+    /// `dogs.toml`, not `shep.toml`. The key carries no prefix, and the
+    /// boot-time migration is what put it there.
     ///
     /// Re-read per request rather than held as parsed config: that is what
     /// makes `shep disable X && shep enable X` pick up an edited section
     /// (`crate::dogs::dog_section`).
-    pub(crate) daemon_config: PathBuf,
+    pub(crate) dogs_config: PathBuf,
     /// This daemon's `$SHEP_HOME` layout, for assembling a dog's app config.
     pub(crate) paths: ShepPaths,
     /// This daemon's crate version, echoed in the handshake.
@@ -504,7 +506,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         // Re-read per request, never cached: `shep disable X && shep enable X`
         // is the supported way to reload a dog's configuration, and a copy
         // taken at boot would answer that with the section as it was.
-        Request::DogConfig { name } => match crate::dogs::dog_section(&ctx.daemon_config, &name) {
+        Request::DogConfig { name } => match crate::dogs::dog_section(&ctx.dogs_config, &name) {
             Ok(toml) => reply(Ok(Response::DogSection { toml: toml.into() })),
             Err(err) => reply(Err(RpcError {
                 code: RpcErrorCode::InvalidConfig,
@@ -2600,7 +2602,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dog_config_request_reads_the_file_as_it_stands_now() {
         let h = harness(vec![]);
-        std::fs::write(&h.ctx.daemon_config, "[dog.bark]\ndebounce = \"30s\"\n").unwrap();
+        std::fs::write(&h.ctx.dogs_config, "[bark]\ndebounce = \"30s\"\n").unwrap();
         let reply = reply_of(
             dispatch(
                 envelope(

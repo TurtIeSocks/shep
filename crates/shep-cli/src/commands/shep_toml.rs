@@ -41,6 +41,7 @@
 // a genuinely large variant, which is a different fact from the one here.
 #![allow(clippy::result_large_err)]
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -50,8 +51,10 @@ use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 use crate::style::StyleLevel;
 
-/// Mode `shep.toml` — and the sibling lock file and staging file it is
-/// written through — is created with: owner read/write, nobody else.
+/// Mode `shep.toml` (and the sibling lock file and staging file it is
+/// written through, and `dogs.toml`, which
+/// `commands::dog_migration` stages through the same helper) is created
+/// with: owner read/write, nobody else.
 ///
 /// Unlike `barks.jsonl`'s own `0600`, this is not belt-and-braces. This
 /// file is where `docs/dogs.md` tells an operator to paste a Discord or
@@ -270,12 +273,29 @@ impl ShepToml {
         })
     }
 
-    /// Adds `name` to `[daemon] enabled_dogs` (idempotently) and ensures a
-    /// `[dog.<name>]` table exists for the dog to be configured through.
+    /// Adds `name` to `[daemon] enabled_dogs` (idempotently), and writes
+    /// nothing else anywhere.
     ///
-    /// Never truncates a `[dog.<name>]` table that already exists — a
-    /// dog's own configuration is not this writer's to touch, only its
-    /// existence.
+    /// **It used to scaffold an empty `[dog.<name>]` here, and that is now
+    /// a boot-breaking bug rather than a nicety.** A dog's configuration
+    /// lives in `dogs.toml`, so an operator who enabled a dog and then
+    /// configured it where `docs/dogs.md` says to had that name in both
+    /// files, and `commands::dog_migration` refuses on exactly that: two
+    /// values for one key is a question shep cannot answer. The daemon
+    /// exits 4 and the flock is left unsupervised, over a table nobody
+    /// asked for.
+    ///
+    /// Scaffolding into `dogs.toml` instead would keep the nicety, and is
+    /// the wrong trade. It puts this type, which owns `shep.toml` and only
+    /// that, in the business of writing a second file behind a second lock,
+    /// and every write of that file has to hold the staged-temp, `fsync`
+    /// and `rename` discipline `dog_migration::write_dogs_config` carries
+    /// because webhook credentials live there at `0600`. The nicety it
+    /// buys is thin: `shep-daemon`'s `dog_section` already documents an
+    /// absent section as legitimate and answers an empty string, so a dog
+    /// enabled with no section runs on its defaults, and an empty table
+    /// tells an operator nothing a documented example does not tell them
+    /// better. Writing nothing cannot collide with anything.
     pub fn enable_dog(&mut self, name: &str) {
         let daemon = self.daemon_table_mut();
         let enabled_dogs = daemon
@@ -286,12 +306,18 @@ impl ShepToml {
         if !enabled_dogs.iter().any(|v| v.as_str() == Some(name)) {
             enabled_dogs.push(name);
         }
-        self.dog_table_mut(name);
     }
 
-    /// Removes `name` from `[daemon] enabled_dogs`, leaving `[dog.<name>]`
-    /// in place: an operator who disables a dog to restart it must not lose
-    /// the configuration they wrote for it.
+    /// Removes `name` from `[daemon] enabled_dogs` and touches nothing
+    /// else: an operator who disables a dog to restart it must not lose the
+    /// configuration they wrote for it.
+    ///
+    /// That configuration lives in `dogs.toml` now, so keeping it is
+    /// something this method achieves by doing nothing at all rather than
+    /// by leaving a `[dog.<name>]` table alone. The behaviour is unchanged;
+    /// only the file the promise is about moved. [`Self::rehome_dog`] is
+    /// the half that forgets a dog for real, and `commands::dogs::rehome`
+    /// is where the other file is reached.
     pub fn disable_dog(&mut self, name: &str) {
         if let Some(enabled_dogs) = self
             .doc
@@ -321,6 +347,47 @@ impl ShepToml {
             Item::Value(exec.to_string_lossy().into_owned().into()),
         );
         self.enable_dog(name);
+    }
+
+    /// Removes the whole `[dog]` table and hands back what was under it.
+    ///
+    /// Keyed by dog name with the `dog.` prefix dropped, which is the shape
+    /// `dogs.toml` wants, and handed back as live [`Item`]s rather than
+    /// `toml::Table` values. That is what lets the migration write the
+    /// destination through `toml_edit` as well: an `Item` carries its own
+    /// decor, so a comment an operator wrote above or inside
+    /// `[dog.metrics]` travels with the section instead of being dropped at
+    /// this boundary, and the header re-renders under whatever key the
+    /// section is inserted at, with nothing here rewriting it. Going
+    /// through `toml::Table` used to lose both.
+    ///
+    /// Only table-like entries come back, which covers `[dog.metrics]`, a
+    /// dotted `metrics.bind = ...` under `[dog]`, and an inline
+    /// `metrics = { .. }` alike. `[dog] stray = 5` and `[[dog.x]]` are
+    /// neither, and are dropped here rather than moved. That is not a
+    /// silent loss: the migration's own guard compares these keys against
+    /// what the source declared under `[dog]` and refuses the whole move
+    /// when one does not come back.
+    ///
+    /// A document with no `[dog]` table yields an empty map and is left
+    /// byte-identical, so a second call after a migration writes nothing.
+    ///
+    /// The one caller is the boot migration. This is not a general editing
+    /// primitive: it takes everything, because a partial move would leave
+    /// the same key readable from two files.
+    pub fn take_dog_sections(&mut self) -> BTreeMap<String, Item> {
+        let Some(item) = self.doc.remove("dog") else {
+            return BTreeMap::new();
+        };
+        // `[[dog]]` itself, the one shape with nothing table-like under it
+        // to iterate.
+        let Some(dog) = item.as_table_like() else {
+            return BTreeMap::new();
+        };
+        dog.iter()
+            .filter(|(_, value)| value.as_table_like().is_some())
+            .map(|(name, value)| (name.to_owned(), value.clone()))
+            .collect()
     }
 
     /// The binary path recorded for `name` in `[daemon] adopted_dogs`, if
@@ -381,11 +448,16 @@ impl ShepToml {
         Ok(Self::open(path)?.adopted_dog_path(name))
     }
 
-    /// Forgets `name` entirely: out of `enabled_dogs`, out of
-    /// `adopted_dogs`, and `[dog.<name>]` removed. The difference between
-    /// `rehome` and `disable`, and the reason they are two verbs.
+    /// Forgets `name` in this file: out of `enabled_dogs`, out of
+    /// `adopted_dogs`, and `[dog.<name>]` removed if an un-migrated
+    /// `shep.toml` still carries one. The difference between `rehome` and
+    /// `disable`, and the reason they are two verbs.
     ///
-    /// Called by `commands::dogs::rehome`.
+    /// **This is half of a rehome.** A dog's configuration lives in
+    /// `dogs.toml` now, and striking it there is
+    /// `commands::dog_migration::forget_dog_section`, called by
+    /// `commands::dogs::rehome` immediately after this: one file per
+    /// writer, since this type owns `shep.toml` and only that.
     pub fn rehome_dog(&mut self, name: &str) {
         self.disable_dog(name);
         if let Some(adopted_dogs) = self
@@ -525,21 +597,6 @@ impl ShepToml {
             .as_table_mut()
             .expect("daemon is only ever written as a table")
     }
-
-    /// `[dog.<name>]`, creating it (empty) if it does not exist yet — never
-    /// touched again once it does, per [`Self::enable_dog`]'s own doc.
-    fn dog_table_mut(&mut self, name: &str) -> &mut Table {
-        let dog = self
-            .doc
-            .entry("dog")
-            .or_insert_with(|| Item::Table(Table::new()))
-            .as_table_mut()
-            .expect("dog is only ever written as a table");
-        dog.entry(name)
-            .or_insert_with(|| Item::Table(Table::new()))
-            .as_table_mut()
-            .expect("a dog's own section is only ever written as a table")
-    }
 }
 
 /// Creates `dir` (and any missing parent) at `boot::DIR_MODE` directly,
@@ -569,7 +626,7 @@ fn create_home_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// Creates the staging file the config is written through, in `parent` so
+/// Creates the staging file a config is written through, in `parent` so
 /// the later `rename` stays within one filesystem.
 ///
 /// Mode-at-creation rather than a separate `chmod` pass (`tempfile` passes
@@ -577,7 +634,14 @@ fn create_home_dir(dir: &Path) -> std::io::Result<()> {
 /// which the file holding a webhook token sits at whatever the process
 /// umask leaves it. Same shape, and same reasoning, as
 /// `barks::create_ring_file`.
-fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+///
+/// `pub(super)` rather than private, and deliberately shared rather than
+/// copied: `commands::dog_migration` writes `dogs.toml`, which holds the
+/// webhook URLs that used to live in this file and needs the same
+/// [`CONFIG_FILE_MODE`] at the same `open`. A second implementation of
+/// create-at-mode plus `fsync` plus `rename` is how the two would drift,
+/// and the one that drifted would be the one nobody was reading.
+pub(super) fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("shep").suffix(".toml.tmp");
     // `shep.toml` can hold a webhook token, so on unix it is created `0600`
@@ -589,11 +653,19 @@ fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile>
     builder.tempfile_in(parent)
 }
 
-/// An exclusive advisory lock over one `shep.toml`, held for as long as
+/// An exclusive advisory lock over one config file, held for as long as
 /// the value lives and released when it drops (including on an early `?`,
 /// and by the kernel if the process dies holding it).
 ///
-/// The lock is on a sibling `shep.toml.lock`, never on the config itself,
+/// Keyed on the path it is given rather than on `shep.toml` specifically:
+/// [`ShepToml::edit`] takes one over `shep.toml`, and
+/// `commands::dog_migration` takes one over `dogs.toml`, which has two
+/// writers of its own. **Whenever both are held at once, `shep.toml`'s is
+/// taken first**, which is the whole of what keeps the two orderings from
+/// deadlocking; `migrate_dog_sections` is the one caller that holds both,
+/// and it says so at the point it nests them.
+///
+/// The lock is on a sibling `<name>.lock`, never on the config itself,
 /// and that is the whole design decision — the same one `barks::RingLock`
 /// records: [`ShepToml::save`] finishes by `rename`ing a new file over the
 /// config, which replaces the inode. A lock taken on the config would be a
@@ -603,7 +675,7 @@ fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile>
 /// never read; it exists only to be an inode with a stable identity, and
 /// it is left on disk between edits on purpose so both writers keep
 /// agreeing on which one it is.
-struct ConfigLock {
+pub(super) struct ConfigLock {
     /// `flock(2)` is released by this handle's `Drop`. Named with a
     /// leading underscore because it is held, never read.
     #[cfg(unix)]
@@ -623,7 +695,7 @@ impl ConfigLock {
     /// for a reason other than contention (contention blocks rather than
     /// failing).
     #[cfg(windows)]
-    fn acquire(path: &Path) -> std::io::Result<Self> {
+    pub(super) fn acquire(path: &Path) -> std::io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt as _;
 
         /// Another handle already holds share access this open denies.
@@ -651,7 +723,7 @@ impl ConfigLock {
     }
 
     #[cfg(unix)]
-    fn acquire(path: &Path) -> std::io::Result<Self> {
+    pub(super) fn acquire(path: &Path) -> std::io::Result<Self> {
         use nix::fcntl::{Flock, FlockArg};
 
         let file = std::fs::OpenOptions::new()
@@ -826,8 +898,9 @@ mod tests {
         let cfg = DaemonConfig::load(Some(&written), &|_| None).unwrap();
         assert_eq!(cfg.daemon.enabled_dogs, vec!["metrics"]);
         assert!(
-            cfg.dog.contains_key("metrics"),
-            "a table to configure it through"
+            cfg.dog.is_empty(),
+            "enable writes no dog section at all; the next boot refuses a \
+             name held in both files: {written}"
         );
     }
 
@@ -885,6 +958,10 @@ mod tests {
     fn rehoming_a_dog_forgets_it_entirely() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
+        // Seeded by hand, since no writer here creates one any more: a
+        // `[dog.<name>]` in `shep.toml` is what an un-migrated file carries,
+        // and striking it is still this method's job.
+        std::fs::write(&path, "[dog.otel]\ndebounce = \"30s\"\n").unwrap();
         ShepToml::edit(&path, |doc| {
             doc.adopt_dog("otel", Path::new("/usr/local/bin/shep-otel"));
         })
@@ -1362,6 +1439,112 @@ mod tests {
             cfg.daemon.enabled_dogs.len(),
             2 * EDITS_PER_WRITER,
             "the config enables dogs nobody asked for"
+        );
+    }
+
+    #[test]
+    fn taking_dog_sections_returns_them_keyed_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "[daemon]\nenabled_dogs = [\"metrics\"]\n\n[dog.metrics]\nbind = \"127.0.0.1:9615\"\n\n[dog.bark.sinks]\noncall = { kind = \"discord\" }\n",
+        )
+        .expect("write");
+
+        let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        assert_eq!(taken.keys().collect::<Vec<_>>(), vec!["bark", "metrics"]);
+        assert_eq!(taken["metrics"]["bind"].as_str(), Some("127.0.0.1:9615"));
+    }
+
+    #[test]
+    fn taking_dog_sections_leaves_every_other_section_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "# keep me\n[daemon]\nenabled_dogs = [\"metrics\"]\n\n[dog.metrics]\nbind = \"127.0.0.1:9615\"\n\n[style]\nlevel = \"full\"\n",
+        )
+        .expect("write");
+
+        ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        // Exact string: the whole reason this goes through `toml_edit` rather
+        // than a `toml::Table` round-trip is that a comment or a reordered key
+        // would be a reason not to run the upgrade.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "# keep me\n[daemon]\nenabled_dogs = [\"metrics\"]\n\n[style]\nlevel = \"full\"\n"
+        );
+    }
+
+    #[test]
+    fn taking_from_a_file_with_no_dog_sections_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        let before = "[daemon]\nlog_level = \"info\"\n";
+        std::fs::write(&path, before).expect("write");
+
+        let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        assert!(taken.is_empty());
+        // Content identity, not proof that nothing was written: `edit` always
+        // stages and renames, so the file has a new inode either way. Not
+        // writing at all is the migration's job, and its own early return is
+        // where that is tested.
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+    }
+
+    #[test]
+    fn taking_dog_sections_keeps_nested_tables_and_arrays_of_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "[dog.bark.sinks]\noncall = { kind = \"discord\", url = \"https://discord.com/api/webhooks/x\" }\n\n[[dog.bark.rules]]\non = \"gave_up\"\nsinks = [\"oncall\"]\n",
+        )
+        .expect("write");
+
+        let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        let bark = &taken["bark"];
+        assert_eq!(
+            bark["sinks"]["oncall"]["url"].as_str(),
+            Some("https://discord.com/api/webhooks/x"),
+            "a nested sub-table's own values must survive the take"
+        );
+        // `as_array_of_tables`, not `as_array`: `[[dog.bark.rules]]` is a
+        // `toml_edit::ArrayOfTables`, a document construct, where `sinks =
+        // ["oncall"]` below is a `Value::Array`.
+        let rules = bark["rules"]
+            .as_array_of_tables()
+            .expect("rules is an array of tables");
+        assert_eq!(rules.len(), 1);
+        let rule = rules.get(0).expect("one rule");
+        assert_eq!(rule["on"].as_str(), Some("gave_up"));
+        assert_eq!(
+            rule["sinks"]
+                .as_array()
+                .and_then(|sinks| sinks.get(0))
+                .and_then(toml_edit::Value::as_str),
+            Some("oncall"),
+            "the array-of-tables entry keeps its own array field"
+        );
+    }
+
+    #[test]
+    fn taking_dog_sections_keeps_an_inline_table_dog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[dog]\nmetrics = { bind = \"127.0.0.1:9615\" }\n").expect("write");
+
+        let taken = ShepToml::edit(&path, ShepToml::take_dog_sections).expect("edit");
+
+        assert_eq!(
+            taken["metrics"]["bind"].as_str(),
+            Some("127.0.0.1:9615"),
+            "an inline-table dog under [dog] must not be dropped"
         );
     }
 }

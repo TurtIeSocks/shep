@@ -898,6 +898,7 @@ async fn a_bare_interpreter_resolves_via_the_seeded_path() {
     let paths = ShepPaths {
         home: dir.path().to_path_buf(),
         daemon_config: dir.path().join("shep.toml"),
+        dogs_config: dir.path().join("dogs.toml"),
         snapshot: dir.path().join("flock.json"),
         logs: dir.path().join("logs"),
         pids: dir.path().join("pids"),

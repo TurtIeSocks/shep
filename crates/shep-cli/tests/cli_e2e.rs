@@ -6238,6 +6238,97 @@ fn runtime_exits_when_the_flock_empties_with_a_code_that_says_why() {
     );
 }
 
+#[cfg(unix)]
+/// Fails if `shep runtime` serves a dog the compiled default instead of the
+/// bind an operator wrote.
+///
+/// `runtime` reaches `boot_supervisor` directly, never `run_daemon`, and
+/// the dog-config migration used to live in the latter -- so `runtime`
+/// started dogs out of a `dogs.toml` that would never exist. Measured
+/// before the fix, with exactly this shep.toml: nothing listened on the
+/// configured port and the compiled default 9615 served instead, with no
+/// warning and no file written. Permanent, since a container that only ever
+/// runs `shep runtime` never migrates; for bark it would mean every sink
+/// disappearing and alerting stopping silently.
+///
+/// The port is the assertion rather than the file, because the file is the
+/// mechanism and the port is what an operator loses. `dogs.toml` is
+/// asserted too, as the cheap direct evidence of which of the two ran.
+///
+/// `#[cfg(unix)]`, like the other cases that scrape a real dog process:
+/// they share [`wait_for_dog_pid`]'s `nix::unistd::Pid` and
+/// [`DaemonGuard`]'s dog sweep.
+#[test]
+fn runtime_migrates_dog_config_and_serves_the_bind_an_operator_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let port = free_port();
+    write_shep_toml(
+        &dir,
+        &format!(
+            "[daemon]\nenabled_dogs = [\"metrics\"]\n\n[dog.metrics]\nbind = \"127.0.0.1:{port}\"\n"
+        ),
+    );
+    let script = write_test_script(&dir);
+    let flockfile = write_flockfile(
+        &dir,
+        &format!("[[app]]\nname = \"web\"\nscript = '{}'\n", script.display()),
+    );
+    let mut guard = DaemonGuard::default();
+    // Before the spawn, not after: `runtime` boots its shepherd in its own
+    // process, so there is a supervisor to reap from the moment it starts.
+    guard.adopt_home(home);
+
+    let mut child = std::process::Command::cargo_bin("shep")
+        .expect("locate the built shep binary")
+        .arg("--home")
+        .arg(home)
+        .arg("runtime")
+        .arg(&flockfile)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn shep runtime");
+    // `runtime` streams the flock's bleats to its own stdout for as long as
+    // it runs; nothing draining those pipes wedges the child once they fill.
+    discard_in_background(child.stdout.take().expect("piped stdout"));
+    discard_in_background(child.stderr.take().expect("piped stderr"));
+
+    // `wait_for_dog_pid` shells out to `shep flock` and asserts success on
+    // the first try, so it cannot be the first thing aimed at a shepherd
+    // booting inside a process this test only just spawned. Every other
+    // case in this file reaches its daemon through a `shep start` that has
+    // already returned; `runtime` gives no such moment.
+    let start = Instant::now();
+    while !shep(home).arg("flock").output().unwrap().status.success() {
+        assert!(
+            start.elapsed() < FLOCK_DEADLINE,
+            "`shep runtime` never brought a shepherd up at {}",
+            home.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let dog_pid = wait_for_dog_pid(home, "metrics");
+    guard.adopt_dog_pid(dog_pid);
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let body = poll_metrics(addr);
+    assert!(
+        body.contains("HTTP/1.1 200"),
+        "the metrics dog must answer at the bind shep.toml asked for, not at \
+         the compiled default: {body}"
+    );
+    assert!(
+        home.join("dogs.toml").is_file(),
+        "`shep runtime` must migrate `[dog.metrics]` out of shep.toml"
+    );
+
+    graceful_kill(home);
+    let _ = child.wait();
+}
+
 // --- `shep dev` -------------------------------------------------------
 
 /// A `shep dev` invocation with `$SHEP_DEV_HOME` set to `dev_home`, timeout
@@ -7623,6 +7714,84 @@ fn a_bad_shep_toml_refuses_the_reload_and_leaves_the_flock_supervised() {
         .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
 
     write_shep_toml(&dir, "[daemon]\nmax_cron_sleep = \"soon\"\n");
+
+    let reloaded = shep(dir.path())
+        .arg("daemon")
+        .arg("reload")
+        .output()
+        .unwrap();
+    assert_eq!(
+        reloaded.status.code(),
+        Some(4),
+        "InvalidConfig; stderr={}",
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+
+    let after = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("flock")
+        .output()
+        .unwrap();
+    assert_success(&after);
+    let envelope: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    let sheep = &envelope["data"][0];
+    assert_eq!(sheep["status"], "online", "still supervised: {sheep}");
+    assert_eq!(
+        sheep["pid"].as_u64(),
+        Some(pid_before),
+        "the refusal must happen before anything is signalled: {sheep}"
+    );
+
+    graceful_kill(dir.path());
+}
+
+/// Fails if a dog section shep cannot move can orphan a running flock.
+///
+/// The dog-config migration runs at the top of every boot, so on the
+/// handover arm it runs in a successor whose predecessor is already gone: a
+/// refusal there used to exit the successor with the flock still running
+/// and nothing supervising it. Measured before the fix, with exactly this
+/// setup: the reload failed, the sheep survived reparented to init, `shep
+/// flock` reported it stopped, and a recovering `shep muster` started a
+/// second copy alongside the orphan.
+///
+/// `metrics` configured in both `shep.toml` and `dogs.toml` is the refusal
+/// with the fewest moving parts (`DogMigrationError::WouldOverwrite`), and
+/// it is one an operator reaches by hand-writing `dogs.toml` before
+/// upgrading. No `#[cfg(unix)]`, for the same reason the bad-`shep.toml`
+/// case above carries none: the pre-flight runs before the arm is chosen.
+#[test]
+fn a_refused_dog_migration_refuses_the_reload_and_leaves_the_flock_supervised() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_test_script(&dir);
+    let mut guard = DaemonGuard::default();
+
+    let started = shep(dir.path())
+        .arg("--format")
+        .arg("json")
+        .arg("start")
+        .arg(&script)
+        .arg("--name")
+        .arg("sheep")
+        .output()
+        .unwrap();
+    guard.adopt_home(dir.path());
+    assert_success(&started);
+
+    let before = poll_flock(dir.path(), |info| {
+        info["status"] == "online" && !info["pid"].is_null()
+    });
+    let pid_before = before["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("an online sheep reports a pid: {before}"));
+
+    write_shep_toml(&dir, "[dog.metrics]\nbind = \"127.0.0.1:19616\"\n");
+    std::fs::write(
+        dir.path().join("dogs.toml"),
+        "[metrics]\nbind = \"127.0.0.1:19617\"\n",
+    )
+    .unwrap();
 
     let reloaded = shep(dir.path())
         .arg("daemon")

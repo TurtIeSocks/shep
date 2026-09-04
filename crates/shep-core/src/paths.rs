@@ -72,6 +72,12 @@ pub struct ShepPaths {
     pub home: PathBuf,
     /// Daemon config: `shep.toml`
     pub daemon_config: PathBuf,
+    /// A dog's own settings: `dogs.toml`
+    ///
+    /// Separate from [`Self::daemon_config`] rather than a section inside
+    /// it, so lookout can write a dog's config without writing into the
+    /// daemon's own hand-authored file.
+    pub dogs_config: PathBuf,
     /// Flock snapshot (muster roll): `flock.json`
     pub snapshot: PathBuf,
     /// Log directory
@@ -173,6 +179,7 @@ impl ShepPaths {
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut paths = Self {
             daemon_config: home.join("shep.toml"),
+            dogs_config: home.join("dogs.toml"),
             snapshot: home.join("flock.json"),
             logs: home.join("logs"),
             pids: home.join("pids"),
@@ -272,6 +279,7 @@ mod tests {
         let p = ShepPaths::resolve(&no_env, Path::new("/home/ada"));
         assert_eq!(p.home, Path::new("/home/ada/.shep"));
         assert_eq!(p.daemon_config, Path::new("/home/ada/.shep/shep.toml"));
+        assert_eq!(p.dogs_config, Path::new("/home/ada/.shep/dogs.toml"));
         assert_eq!(p.snapshot, Path::new("/home/ada/.shep/flock.json"));
         assert_eq!(p.logs, Path::new("/home/ada/.shep/logs"));
         assert_eq!(p.pids, Path::new("/home/ada/.shep/pids"));

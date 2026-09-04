@@ -169,7 +169,7 @@ pub async fn run(runtime: DogRuntime) -> ExitCode {
             // fact, never the value, and that rule does not carve out an
             // exception for a config shape (like this one) that happens not
             // to carry a secret today.
-            eprintln!("shep dog metrics: [dog.metrics] does not parse; see `shep dogs`");
+            eprintln!("shep dog metrics: [metrics] in dogs.toml does not parse; see `shep dogs`");
             return ExitCode::InvalidConfig;
         }
     };

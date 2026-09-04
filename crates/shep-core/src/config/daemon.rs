@@ -188,12 +188,15 @@ pub struct StyleSection {
 /// `ResolvedApp` protects a property of travel — the supervisor is handed one
 /// and must trust normalization it cannot see. Every production site loads a
 /// `DaemonConfig` and consumes it within a few lines (`run_daemon` renders it
-/// straight into `BootOptions`; shep-daemon's `dogs` reads one
-/// `[dog.<name>]` table; shep-cli's `whistle::gate` reads one boolean), and
-/// the daemon holds a `BootOptions`, not this. Guarding the one
-/// `max_cron_sleep` floor against a caller who is already out of contract
-/// would cost accessors for every field of every section, including a
-/// `BTreeMap<String, toml::Table>` two crates legitimately read. If an
+/// straight into `BootOptions`; shep-cli's `whistle::gate` reads one
+/// boolean), and the daemon holds a `BootOptions`, not this. A dog's own
+/// table is no longer among them: it lives in `dogs.toml` now, and
+/// shep-daemon's `dog_section` reads it out of a
+/// [`DogsConfig`](crate::config::DogsConfig), so
+/// [`Self::dog`] is what an un-migrated file parses into and nothing in
+/// production reads. Guarding the one `max_cron_sleep` floor against a
+/// caller who is already out of contract would cost accessors for every
+/// field of every section, that `BTreeMap<String, toml::Table>` included. If an
 /// out-of-tree caller ever does need to mutate and re-check, the answer is to
 /// make `validate` public — one line, non-breaking — not to privatise the
 /// fields. `docs/specs/deferred.md` records this as resolved.

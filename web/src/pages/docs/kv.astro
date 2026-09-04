@@ -50,18 +50,19 @@ KEY  VALUE`;
     <h1>The KV store</h1>
     <ReferencePills slug="kv" />
     <p class="lede">
-      Two files already configure everything shep runs: a Flockfile
-      configures a sheep, <code>shep.toml</code> configures the shepherd and
-      its dogs. Neither has a field for "the port the last on-call engineer
-      picked" or a feature flag a provisioning script wants to leave a note
-      about. The KV store is what's left over: a flat, file-locked junk
-      drawer, explicitly not the primary config path.
+      Three files already configure everything shep runs: a Flockfile
+      configures a sheep, <code>shep.toml</code> configures the shepherd,
+      and <code>dogs.toml</code> configures its dogs. None has a field for
+      "the port the last on-call engineer picked" or a feature flag a
+      provisioning script wants to leave a note about. The KV store is
+      what's left over: a flat, file-locked junk drawer, explicitly not the
+      primary config path.
     </p>
 
     <Callout variant="note">
       Reaching for this to configure a <em>sheep</em>? Put it in the
       Flockfile. Configuring a <em>dog</em>? Put it under
-      <code>[dog.&lt;name&gt;]</code> in <code>shep.toml</code>. This store is
+      <code>[&lt;name&gt;]</code> in <code>dogs.toml</code>. This store is
       only for what's left after those two.
     </Callout>
 
@@ -144,8 +145,8 @@ KEY  VALUE`;
       <a href="/docs/dogs" class="next-card">
         <div class="next-title">Dogs →</div>
         <div class="next-body">
-          Per-dog settings live under <code>[dog.&lt;name&gt;]</code> in
-          <code>shep.toml</code>, not here. This page explains where the
+          Per-dog settings live under <code>[&lt;name&gt;]</code> in
+          <code>dogs.toml</code>, not here. This page explains where the
           line falls.
         </div>
       </a>
