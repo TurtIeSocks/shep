@@ -2322,11 +2322,12 @@ mod tests {
     #[test]
     fn the_alias_vector_parses_to_the_expected_command() {
         use clap::Parser;
-        // `Commands` is imported here and not via `super::*`: the top-level
-        // `use cli::Commands` is `#[cfg(unix)]`-gated alongside every verb
-        // module, and this test — like every other one in this file — must
-        // still compile under the Windows cross-check. Matches
-        // `save_parses_to_its_own_command`'s existing shape.
+        // Named explicitly rather than leaned on through `use super::*`,
+        // matching `save_parses_to_its_own_command` and every other
+        // dispatch test in this file. The reason given here used to be a
+        // `#[cfg(unix)]` gate on a top-level `use cli::Commands` in
+        // `main.rs`; there is no such gate, and no such file since Phase 15
+        // extracted the library.
         use cli::Commands;
         let argv = alias_argv(
             "dog",
@@ -2367,11 +2368,13 @@ mod tests {
     /// dispatch arms carried no unit coverage at all until recently, and a
     /// verb pointed at the wrong handler was invisible workspace-wide.
     ///
-    /// `Commands` is imported locally rather than via `super::*`: the
-    /// top-level `use cli::Commands` (main.rs:31) is `#[cfg(unix)]`-gated
-    /// alongside every verb module, but this test — like every other one in
-    /// this file — must still compile on the Windows target, where that
-    /// import does not exist.
+    /// `Commands` is named explicitly rather than leaned on through
+    /// `use super::*`, matching every other dispatch test in this file.
+    /// This said it was working around a `#[cfg(unix)]` gate on a
+    /// `use cli::Commands` at `main.rs:31`. That gate does not exist, the
+    /// import at the top of this file is unconditional, and `main.rs` has
+    /// not existed since Phase 15 turned this crate into a library with
+    /// three thin `[[bin]]` targets over it.
     #[test]
     fn save_parses_to_its_own_command() {
         use clap::Parser;
@@ -2950,18 +2953,20 @@ mod tests {
     /// daemon dispatch arm for real belongs in the e2e tier
     /// (`tests/cli_e2e.rs`), against an isolated `--home`, not here.
     ///
-    /// `#[cfg(unix)]`: what this proves is specific to the unix arm's
-    /// early-dispatch shape — that `Completions` is one of the handful of
-    /// verbs routed around `resolve_paths` rather than through it. The
-    /// windows arm has no such split to prove anything about: it refuses
-    /// every verb unconditionally, `completions` included, before it can
-    /// even become a question of whether paths were resolved. Windows is
-    /// shep's 0% tier by deliberate, standing decision (`CLAUDE.md`: "every
-    /// verb prints \"not yet supported\" and exits") — carving out
-    /// `completions` as the one working verb there is a real product
-    /// decision, not one this test should make unilaterally by asserting
-    /// `Success` against an arm that was never built to return it.
-    #[cfg(unix)]
+    /// Runs on every platform, deliberately. This carried a
+    /// `#[cfg(unix)]` whose stated reason was that "the windows arm
+    /// refuses every verb unconditionally, `completions` included" and
+    /// that Windows is shep's 0% tier. Both halves are stale: there is one
+    /// `run`, not a unix arm and a windows arm, `Commands::Completions` is
+    /// not gated in it, and the Windows tier is built and runs against a
+    /// live flock. Correcting the prose and keeping the gate would have
+    /// left a gate with no reason, so the gate goes.
+    ///
+    /// What it proves is portable: that `Completions` is one of the handful
+    /// of verbs routed around `resolve_paths` rather than through it, so it
+    /// answers with no `$SHEP_HOME` at all. Everything on that path is
+    /// platform-neutral -- `resolve_paths`, `ShepherdStatus::probe` (which
+    /// fails to connect and reports no shepherd), and `completions` itself.
     #[tokio::test]
     async fn completions_never_resolves_paths() {
         use clap::Parser;
