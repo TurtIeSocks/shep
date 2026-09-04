@@ -437,23 +437,29 @@ shep-owned store at `$SHEP_HOME/overrides.json` (locked and `0600`, like the
 KV store). `shep start <Flockfile>` now sends `Request::ApplyConfig` and
 merges the file into the sheep of the same name: additive by default, so it
 appends keys nobody has established and overwrites nothing, because a
-Flockfile arrives through a pull request. `--reset` puts non-`env` settings
-back to the template and `--reset-all` puts everything back and drops the
-record; both are refused when the target names a sheep, since a name reads
-no file. Both are refused on a bare script path too, for the same reason. A
-load with NO FLAG never prunes and never kills, and the merge itself registers
-nothing, though the `shep start` carrying it still registers and starts an app
-the flock does not have, by its own fresh path --
+Flockfile arrives through a pull request. Widening it takes
+`--reset=<mode>`, one flag with four required values rather than two
+booleans: `file` puts back what the template declares and leaves `env` and
+every undeclared key alone; `policy` does the same but for every key,
+declared or not; `env` puts back only `env`; `all` does both. `--reset`
+with no value is a usage error naming the four. Every mode is refused when
+the target names a sheep, since a name reads no file, and on a bare script
+path too, for the same reason. A load with NO FLAG never prunes and never
+kills, and the merge itself registers nothing, though the `shep start`
+carrying it still registers and starts an app the flock does not have, by
+its own fresh path --
 a field the running child holds parks as pending and `shep reload`/`shep
 restart` promote it, re-resolving identity only when `user` or `group` moved.
 **A reset can kill, and that is deliberate.** `instances` is Structural, held
-out of a plain load entirely and routed through `handle_scale` under either
-reset flag, whose `Ordering::Less` arm deletes the instances above the new
-count on the same path `shep delete` takes (`a_plain_load_never_scales_and_a_reset_does`
-pins it). The sharp edge: a Flockfile that never mentions `instances` still
-means 1 under a reset, because that is the compiled default the reset falls
-back to, so an app stocked to four goes to one against a file that has no
-opinion about the count. The overrides page carries the warning. A `CFG`
+out of a plain load entirely and routed through `handle_scale` under any
+mode but `file`, whose `Ordering::Less` arm deletes the instances above the
+new count on the same path `shep delete` takes
+(`a_plain_load_never_scales_and_a_reset_does` pins it). The sharp edge: a
+Flockfile that never mentions `instances` still means 1 under `policy` or
+`all`, because that is the compiled default the reset falls back to, so an
+app stocked to four goes to one against a file that has no opinion about
+the count. `file` is the mode that survives this, because there is nothing
+declared to put back. The overrides page carries the warning. A `CFG`
 column in `shep flock` and in `shep lookout` marks a sheep with pending
 (`!N`) or overridden (`*N`) fields, and `shep describe` lists the names. A
 per-app refusal exits non-zero. The four-way field classification lives in
@@ -478,8 +484,9 @@ registered sheep does, and the notice code. `Request::Add` /
 `Response::Added` are additive, so `PROTOCOL_VERSION` stays at 2 and the
 paragraph below applies to `shep add` too. **The fill-in half of
 "register, fill in, start" does not exist yet**: an established `env` key
-today moves only through the file plus `--reset-all`, and editing one in
-place is a later slice (spec decisions 10 and 11).
+today moves only through the file plus `--reset=env` (or `--reset=all`,
+which also drops the override record), and editing one in place is a later
+slice (spec decisions 10 and 11).
 
 **Restart the shepherd after upgrading to it.** `PROTOCOL_VERSION` did NOT
 move for `ApplyConfig` itself or for `Add` (both variants are additive, and
