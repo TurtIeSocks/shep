@@ -124,10 +124,17 @@ pub fn is_classified(field: &str) -> bool {
 
 /// How much of a Flockfile load overwrites what the operator has set since.
 ///
-/// Two axes, and the design spec (`2026-09-02-config-overrides-design.md`
-/// §3) says there are no more: whether `env` is reset, and whether a key the
-/// template does not declare is left alone. Four combinations, four
-/// variants.
+/// A mode touches what its name says, and the design spec
+/// (`2026-09-02-config-overrides-design.md` §3) states each variant against
+/// three columns rather than two: whether `env` is reset, whether a key the
+/// template declares is reset, and whether a key it does not declare is.
+///
+/// **Not a two-by-two grid**, and an earlier version of this comment said it
+/// was. There are two independent choices, but the settings one has three
+/// settings rather than two -- untouched, declared only, or everything --
+/// which makes six combinations. These four are the ones worth having; the
+/// two dropped both reset undeclared keys while sparing declared ones, which
+/// is an operation nobody wants.
 ///
 /// `#[non_exhaustive]`: no fifth depth is anticipated, but this type travels
 /// inside `Request::ApplyConfig` on the wire, so the attribute stays as
@@ -141,16 +148,18 @@ pub enum ResetDepth {
     /// Append keys nobody established. Overwrite nothing. The default,
     /// because a Flockfile arrives from the app's own repository.
     ///
-    /// `env`: kept. A key the template does not declare: kept, since there
-    /// is nothing established to append it against.
+    /// `env`: kept. A key the template declares: kept, unless nobody has
+    /// established it yet, which is the append. A key it does not declare:
+    /// kept, since there is nothing to append it against.
     #[default]
     None,
     /// Put back what the template declares, and nothing else.
     ///
-    /// `env`: kept. A key the template does not declare: kept -- an app
-    /// stocked to four instances against a file with no `instances` line
-    /// keeps its count, because the file never entered that argument. This
-    /// is the mode that fixes the footgun `Policy` below reintroduces.
+    /// `env`: kept. A key the template declares: reset. A key it does not
+    /// declare: kept -- an app stocked to four instances against a file with
+    /// no `instances` line keeps its count, because the file never entered
+    /// that argument. This is the mode that fixes the footgun `Policy` below
+    /// reintroduces.
     File,
     /// Put non-`env` settings back to the template, `env` kept. Every
     /// setting goes back, declared or not: a key the template is silent
@@ -159,20 +168,25 @@ pub enum ResetDepth {
     /// policy: resetting policy is recoverable, resetting data takes the
     /// app's database away.
     ///
-    /// `env`: kept. A key the template does not declare: dropped back to
-    /// the template's own default.
+    /// `env`: kept. A key the template declares: reset. A key it does not
+    /// declare: reset too, to the template's own default.
     Policy,
     /// Reset `env` back to the template and leave everything else alone.
     ///
-    /// `env`: reset. A key the template does not declare: kept, on the same
-    /// reasoning as `File` -- this mode touches data, not policy, so it has
-    /// no opinion about a key the template is silent on.
+    /// This mode touches data, not policy, so it has no opinion about any
+    /// setting: a restart budget the template happens to mention is not the
+    /// operator's to lose to a flag that says `env`. On the settings axis it
+    /// is therefore `None`, append included, because the flag widens a load
+    /// rather than narrowing one.
+    ///
+    /// `env`: reset. A key the template declares: kept, save for the same
+    /// append `None` does. A key it does not declare: kept.
     Env,
     /// Put everything back to the template, `env` included, and drop the
     /// override record.
     ///
-    /// `env`: reset. A key the template does not declare: dropped back to
-    /// the template's own default.
+    /// `env`: reset. A key the template declares: reset. A key it does not
+    /// declare: reset too, to the template's own default.
     All,
 }
 

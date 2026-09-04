@@ -2814,15 +2814,22 @@ fn establish_env(next: &mut AppOverrides, incoming: &DeclaredApp) {
 ///   exists to fix.
 /// - [`ResetDepth::Policy`] puts every key but `env` in scope, declared or
 ///   not.
-/// - [`ResetDepth::Env`] is `File` on this axis, and differs from it only
-///   over `env` below.
+/// - [`ResetDepth::Env`] puts no key in scope at all. It resets `env` and
+///   nothing else, so on this axis it is `None`: a declared key nobody has
+///   established is still appended, because the flag widens a load rather
+///   than narrowing one, and nothing else moves.
 /// - [`ResetDepth::All`] puts every key in scope, `env` included, and is the
 ///   one depth whose whole override record is dropped afterwards (in
 ///   [`Actor::apply_one`], not here).
 ///
-/// The four are a two-by-two grid rather than a ladder, and the two axes are
-/// exactly the two paragraphs above: whether a key the file does not declare
-/// is in scope, and whether `env` is reset.
+/// **The four are not a two-by-two grid**, and an earlier version of this
+/// comment said they were. There are two independent choices, but the
+/// settings one has three settings rather than two -- untouched, or back to
+/// what the template declares, or back for every key including the ones the
+/// template never named -- which makes six combinations of which these four
+/// are the ones worth having. A mode touches what its name says: reading it
+/// as a grid is what made `--reset=env` put back a restart budget the
+/// template happened to mention.
 ///
 /// `env` merges one level deeper than the rest, because it is a table rather
 /// than a value: under `None` an env key the file declares and nobody
@@ -2870,27 +2877,41 @@ fn merge_declared(
             continue;
         }
         let in_scope = match reset {
-            // The two depths that drop a key the template does not declare:
-            // every key goes back, and one the file is silent about goes
-            // back to the value a fresh start off that file would give it.
+            // The two depths that reset a key the template does not
+            // declare: every key goes back, and one the file is silent
+            // about goes back to the value a fresh start off that file
+            // would give it.
             ResetDepth::Policy | ResetDepth::All => true,
-            // The two that keep it. A reset puts back what the template
-            // SAYS, so a key the template never named has nothing to be put
-            // back to and the operator's value stands. `instances` needs no
-            // exception here and must not have one: a template declaring it
-            // is an operator asking for that count, and a template silent
-            // about it leaves the count alone by this same rule, which is
-            // the footgun `File` exists to fix.
-            ResetDepth::File | ResetDepth::Env => incoming.declared.contains(key),
-            // `ResetDepth::None`, and any depth a newer client knows that
-            // this build does not: append-only is the rule that cannot
-            // overwrite something an operator set, so it is the one an
-            // unrecognised depth falls back to. `instances` is held out of
-            // it entirely, because appending that field is not a value
-            // change but a reshaping of the flock -- a scale-down through a
-            // plain load would DELETE instances, and `shep stock` is an
-            // operator setting the count that the store cannot yet tell
-            // apart from a count nobody has touched.
+            // The one depth that resets what the template declares and
+            // nothing else. A key the template never named has no template
+            // value to be put back to, so the operator's stands.
+            // `instances` needs no exception here and must not have one: a
+            // template declaring it is an operator asking for that count,
+            // and a template silent about it leaves the count alone by this
+            // same rule, which is the footgun `File` exists to fix.
+            ResetDepth::File => incoming.declared.contains(key),
+            // `ResetDepth::Env` and `ResetDepth::None`, plus any depth a
+            // newer client knows that this build does not.
+            //
+            // `Env` shares this arm WHOLE, and it is worth saying which
+            // parts of the rule it is sharing rather than leaving it to
+            // read as a coincidence. A mode touches what its name says, so
+            // on the settings axis `Env` resets nothing, declared or not.
+            // But `--reset=env` is a WIDENING of a load, never a narrowing:
+            // the load underneath it still happens, so a key the template
+            // declares that nobody has established is still appended, and
+            // the alternative would make `--reset=env` apply LESS to
+            // settings than the same command without the flag. `instances`
+            // stays held out for `Env` too, and the reason carries over
+            // untouched: the store cannot tell a stocked count from a count
+            // nobody has touched, so appending one is not a value change
+            // but a reshaping of the flock that would DELETE instances. A
+            // flag naming `env` is the last flag that should be allowed to
+            // do that.
+            //
+            // For `None` itself: append-only is the rule that cannot
+            // overwrite something an operator set, so it is also the one an
+            // unrecognised depth falls back to.
             _ => {
                 key != "instances" && incoming.declared.contains(key) && !established.contains(key)
             }
@@ -2932,12 +2953,12 @@ fn merge_declared(
         // would be a different kind of event from one that put its restart
         // budget back.
         //
-        // The two depths that keep `env`, which is the other axis of the
-        // grid: they part company above, over a key the template does not
-        // declare, and agree here.
+        // The two depths that keep `env`. They part company above, over a
+        // key the template does not declare, and agree here.
         ResetDepth::Policy | ResetDepth::File => {}
-        // The two that reset it, for the operator who means it. They part
-        // company above on the same axis `Policy` and `File` do.
+        // The two that reset it, for the operator who means it. These two
+        // agree about nothing else: `All` resets every setting and `Env`
+        // resets none, which is the whole point of having both.
         ResetDepth::All | ResetDepth::Env => {
             next.fields.remove("env");
             merged.insert(
@@ -5902,20 +5923,26 @@ impl<R: ProcessRunner> Actor<R> {
         // change what an operator set; the store cannot yet tell a stocked
         // count from an untouched one, so no plain load may act on the field.
         //
-        // All four reset depths may act on it, and `File` is the interesting
-        // one: it takes a count the template DECLARES, on the same terms as
-        // every other key it declares, and leaves the count alone when the
+        // `Env` is on the same side of that as a plain load, because it
+        // resets `env` and no setting at all, so it gets the same note
+        // rather than silence: a template whose count differs is something
+        // an operator is told about under every depth that will not act on
+        // it.
+        //
+        // Three depths may act on it, and `File` is the interesting one: it
+        // takes a count the template DECLARES, on the same terms as every
+        // other key it declares, and leaves the count alone when the
         // template is silent. That second half is not a refusal and needs no
         // arm here -- `merge_declared` simply never puts the field in scope,
         // so nothing drifts and nothing scales.
         if !matches!(
             reset,
-            ResetDepth::Policy | ResetDepth::All | ResetDepth::File | ResetDepth::Env
+            ResetDepth::Policy | ResetDepth::All | ResetDepth::File
         ) && incoming.declared.contains("instances")
             && incoming.config.instances != running.instances
         {
             refusals.push(format!(
-                "instances: a plain load never reshapes a flock; `shep start --reset` to take \
+                "instances: this load never reshapes a flock; `shep start --reset` to take \
                  the file's count of {}",
                 incoming.config.instances
             ));
@@ -6123,11 +6150,12 @@ impl<R: ProcessRunner> Actor<R> {
         // above did, while dropping the record forgets that anybody ever
         // spoke for the key at all. Only a depth that reset EVERYTHING can
         // do the second, because the record is what holds a later plain load
-        // off a key an operator set. Under `Env` the operator's `max_memory`
-        // survived the merge, so its record entry has to survive with it or
-        // the next merged pull request appends the template's value over it;
-        // under `File` and `Policy` the same is true of `env`. `All` leaves
-        // nothing behind to protect, so there is nothing left to record.
+        // off a key an operator set. Under `Env` every setting override
+        // survived the merge untouched, so every one of their record entries
+        // has to survive with them or the next merged pull request appends
+        // the template's value over them; under `File` and `Policy` the same
+        // is true of `env`. `All` leaves nothing behind to protect, so there
+        // is nothing left to record.
         let overridden_names: Vec<String> = if matches!(reset, ResetDepth::All) {
             Vec::new()
         } else {
@@ -22605,18 +22633,23 @@ mod tests {
         );
     }
 
-    /// fails if `--reset=env` takes an operator's undeclared setting with it,
-    /// or stops resetting env. It is `file` on the settings axis and `all` on
-    /// the env one, which is the whole of what makes the set a grid rather
-    /// than a ladder.
+    /// fails if `--reset=env` reaches any setting at all. This is the
+    /// property the whole naming rule turns on: an operator typing
+    /// `--reset=env` does not expect their restart budget put back because
+    /// the template happens to mention it, and an earlier reading of the
+    /// spec had exactly that. `max_restarts` is declared by the template and
+    /// still must not move.
     #[test]
-    fn env_resets_env_and_still_leaves_an_undeclared_setting_alone() {
+    fn env_resets_env_and_touches_no_setting_at_all() {
         let merged = merged_over_grid(ResetDepth::Env);
-        assert_eq!(merged.max_restarts, 10, "a declared key goes back");
+        assert_eq!(
+            merged.max_restarts, 3,
+            "a declared policy field is not `env`'s to reset"
+        );
         assert_eq!(
             merged.max_memory,
             Some(MemSize::from_bytes(2 << 30)),
-            "`env` has no opinion about a key the template is silent on"
+            "and neither is one the template is silent on"
         );
         assert_eq!(
             merged.env.get("DB").map(String::as_str),
@@ -22677,12 +22710,14 @@ mod tests {
         );
     }
 
-    /// fails if `--reset=env` spends the override over a key the template
-    /// never declared. That record entry is what keeps a later plain load
-    /// from appending the template's value over it, so dropping it here would
-    /// lose the operator's ceiling one load later rather than now.
+    /// fails if `--reset=env` spends a setting override. An override is
+    /// spent exactly where the merge overwrote it, and this mode overwrites
+    /// no setting, so both survive. Those record entries are what keep a
+    /// later plain load from appending the template's values over them, so
+    /// dropping one here would lose the operator's tuning a load later
+    /// rather than now.
     #[test]
-    fn env_spends_the_env_override_and_keeps_the_undeclared_setting() {
+    fn env_spends_only_the_env_override() {
         let record = record_over_grid(ResetDepth::Env);
         let mut held: Vec<&String> = record.fields.keys().collect();
         // Sorted, because `serde_json::Map` is insertion-ordered under
@@ -22690,8 +22725,8 @@ mod tests {
         held.sort();
         assert_eq!(
             held,
-            vec!["max_memory"],
-            "`env` spends env and the declared setting, and keeps the rest"
+            vec!["max_memory", "max_restarts"],
+            "`env` spends env and keeps every setting override"
         );
     }
 
@@ -22713,7 +22748,7 @@ mod tests {
     /// holds `max_memory`, which is the only thing standing between the
     /// operator's ceiling and the next plain load.
     #[tokio::test(start_paused = true)]
-    async fn an_env_reset_keeps_the_record_that_holds_an_undeclared_override() {
+    async fn an_env_reset_keeps_the_override_record() {
         let dir = tempfile::tempdir().unwrap();
         let (mut actor, _enforcer) = actor_over(
             &dir,
@@ -22748,6 +22783,69 @@ mod tests {
             actor.sheep[&0].entry.overridden,
             vec!["max_memory".to_string()],
             "and `shep flock`'s CFG column must still say so"
+        );
+    }
+
+    /// fails if `--reset=env` stops appending. The flag WIDENS a load, it
+    /// never narrows one, so the additive default underneath it still runs:
+    /// a key the template declares that nobody has established is appended
+    /// exactly as a plain load would append it. The alternative would make
+    /// `--reset=env` apply less to settings than the same command without
+    /// the flag.
+    ///
+    /// The second assertion is what keeps that from reading as an overwrite:
+    /// `max_restarts` IS established, and does not move.
+    #[test]
+    fn an_env_reset_still_appends_a_key_nobody_established() {
+        let (stored, _, record) = reset_grid();
+        let mut template = AppConfig::minimal("web", "./srv");
+        template.max_restarts = 10;
+        template.min_uptime = UpDuration::from_millis(9000);
+        template.env = BTreeMap::from([("DB".to_string(), "template".to_string())]);
+        let incoming = declared_app(
+            template,
+            &["name", "script", "max_restarts", "min_uptime", "env"],
+        );
+
+        let (merged, _) = merge_declared(&stored, &incoming, &record, ResetDepth::Env)
+            .expect("the grid fixture travels through serde");
+        assert_eq!(
+            merged.min_uptime,
+            UpDuration::from_millis(9000),
+            "a declared key nobody established is appended under `env` too"
+        );
+        assert_eq!(
+            merged.max_restarts, 3,
+            "and an established one is still not overwritten"
+        );
+    }
+
+    /// fails if `--reset=env` reshapes a flock. `instances` is held out of
+    /// this depth for the reason it is held out of a plain load -- the store
+    /// cannot tell a stocked count from a count nobody has touched, so
+    /// taking the file's would DELETE instances -- and a flag naming `env`
+    /// is the last one that should be allowed to. The operator is told
+    /// rather than left with silence, on the same terms a plain load tells
+    /// them.
+    #[tokio::test(start_paused = true)]
+    async fn an_env_reset_never_reshapes_a_flock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut actor, _enforcer) = actor_over(&dir, &[app_with("web", |app| app.instances = 4)]);
+        let mut file = AppConfig::minimal("web", "./srv");
+        file.instances = 2;
+        let file = declared_app(file, &["name", "script", "instances"]);
+        let reply = apply_config(&mut actor, vec![file], ResetDepth::Env).await;
+        assert_eq!(
+            actor.ids_of_name("web").len(),
+            4,
+            "`env` scaled a flock: {reply:?}"
+        );
+        assert!(
+            reply[0]
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("instances")),
+            "an operator whose count did not move must be told why: {reply:?}"
         );
     }
 
