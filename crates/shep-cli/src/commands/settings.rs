@@ -59,11 +59,9 @@ pub struct ScalarView {
 /// `Debug` is derived rather than redacted (IR-41): a bare field name, no
 /// secret, nothing a `{:?}` could leak.
 ///
-/// Only [`Self::MaxCronSleep`] is constructed today, by this module's own
-/// tests. The other five are the lookout settings screen's own vocabulary
-/// for its other five fields, not yet wired to a keypress.
-/// `#[allow(dead_code)]` for the same reason [`load_settings`] carries it.
-#[allow(dead_code)]
+/// All six variants are constructed by the lookout settings screen's own
+/// `Settings::rows`, one per scalar row, in the fixed order they appear
+/// below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingField {
     /// `[daemon] log_level`.
@@ -221,13 +219,8 @@ impl From<ShepTomlError> for SettingError {
 /// [`ShepTomlError::Io`] if `path` exists and could not be read.
 /// [`ShepTomlError::Parse`] if `path` exists and is not valid TOML.
 ///
-/// Not called outside this module's own tests yet: the lookout settings
-/// screen (later tasks in this feature, wiring this module into `App` and
-/// its reducer) is the caller. Same precedent this crate already carries
-/// twice (`style::Presentation::BARE`, `output::OutputEnvelope`):
-/// `#[allow(dead_code)]` says so explicitly rather than inventing a call
-/// site nothing needs yet.
-#[allow(dead_code)]
+/// Called by `lookout::mod::run_ui`'s `Effect::LoadSettings` arm, inside the
+/// `spawn_blocking` closure that arm runs the whole read through.
 pub fn load_settings(
     path: &Path,
     socket_default: &Path,

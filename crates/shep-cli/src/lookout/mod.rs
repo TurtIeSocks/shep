@@ -218,6 +218,8 @@ pub async fn lookout(streams: &mut Streams<'_>, paths: &ShepPaths, args: &Lookou
         msg_rx,
         poll_tx,
         request_tx,
+        paths.daemon_config.clone(),
+        paths.socket.clone(),
         source::LocalReader::new(),
     )
     .await;
@@ -294,6 +296,14 @@ pub fn resolve_control(flag: bool, kv: &Path) -> Control {
 /// selections into one read and one `Describe` per [`MIN_REDRAW`] window
 /// rather than one per keypress. See the phase plan's design decisions 3
 /// and 11.
+///
+/// `#[allow(clippy::too_many_arguments)]`: this crosses eight with
+/// `daemon_config`/`socket_default`, the settings screen's own read target.
+/// Bundling every existing test call site's positional args into a struct
+/// to duck the lint would touch all seven of them for a cosmetic reason;
+/// `frames::sheep` already carries the same attribute for the same kind of
+/// tradeoff, at eight.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ui<B: Backend, S, L>(
     mut app: App,
     mut terminal: Terminal<B>,
@@ -301,6 +311,13 @@ pub async fn run_ui<B: Backend, S, L>(
     mut msgs: mpsc::Receiver<Msg>,
     polls: mpsc::Sender<()>,
     requests: mpsc::Sender<self::app::Sent>,
+    // The settings screen's own read target. Carried as two owned `PathBuf`s
+    // rather than `&ShepPaths`, so a test can hand this loop an arbitrary
+    // pair without constructing a real `ShepPaths` -- and cloned into
+    // `Effect::LoadSettings`'s `spawn_blocking` closure each time the screen
+    // opens, since that closure outlives this function's own stack frame.
+    daemon_config: std::path::PathBuf,
+    socket_default: std::path::PathBuf,
     mut local: L,
 ) -> Terminal<B>
 where
@@ -501,6 +518,41 @@ where
                 }
                 dirty = true;
             }
+            // The one arm that does file I/O off this task on purpose,
+            // rather than as an oversight: `spawn_blocking` even though the
+            // read takes no lock, because "no file I/O on the redraw task"
+            // is cheaper to hold as a rule than to re-judge at every call
+            // site. The style resolution the settings screen's own STYLE
+            // LEVEL row needs lives inside the same closure for the same
+            // reason -- reading `shep.toml` a second time out here, just to
+            // decide the layer, would be exactly the I/O this arm exists to
+            // avoid.
+            //
+            // The flag layer is not resolved here: `shep lookout` carries no
+            // `--style` of its own today (`LookoutArgs` has no such field),
+            // so `crate::style::resolve`'s `flag` argument is `None` rather
+            // than a shortcut -- there is genuinely nothing to read.
+            Effect::LoadSettings => {
+                let path = daemon_config.clone();
+                let socket_default = socket_default.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let config_text = std::fs::read_to_string(&path).ok();
+                    let style = crate::style::resolve(
+                        None,
+                        std::env::var("SHEP_STYLE").ok().as_deref(),
+                        crate::style_from_config(config_text.as_deref()),
+                    );
+                    crate::commands::settings::load_settings(&path, &socket_default, style)
+                })
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|inner| inner.map_err(|err| err.to_string()));
+                // `let _`: `Msg::Settings` returns `Effect::None`
+                // unconditionally, the same reason `Msg::Bleats`'s call site
+                // above gives.
+                let _ = app.update(Msg::Settings { result });
+                dirty = true;
+            }
             Effect::None => dirty = true,
         }
     }
@@ -510,7 +562,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -583,6 +635,8 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
+                PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 FakeLocal::default(),
             ),
         )
@@ -633,6 +687,8 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
+                PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 FakeLocal::default(),
             ),
         )
@@ -710,6 +766,8 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
+                PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
             ),
         )
@@ -786,6 +844,8 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
+                PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
             ),
         )
@@ -891,6 +951,8 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
+                PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
             ),
         )
@@ -960,6 +1022,8 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
+                PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
             ),
         )
@@ -1026,6 +1090,8 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
+                PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
             ),
         )

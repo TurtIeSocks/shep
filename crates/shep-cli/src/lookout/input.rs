@@ -63,6 +63,8 @@ pub fn map_key(event: &Event, mode: InputMode) -> Option<KeyPress> {
         KeyCode::Char('x') => Some(KeyPress::Action(ActionVerb::Stop)),
         KeyCode::Char('R') => Some(KeyPress::Action(ActionVerb::Restart)),
         KeyCode::Char('L') => Some(KeyPress::Action(ActionVerb::Reload)),
+        KeyCode::Char('s') => Some(KeyPress::Settings),
+        KeyCode::Char(' ') => Some(KeyPress::Cycle),
         KeyCode::Enter => Some(KeyPress::Confirm),
         _ => None,
     }
@@ -134,6 +136,14 @@ mod tests {
         assert_eq!(
             map_key(&key(KeyCode::Char('L')), InputMode::Normal),
             Some(KeyPress::Action(ActionVerb::Reload))
+        );
+        assert_eq!(
+            map_key(&key(KeyCode::Char('s')), InputMode::Normal),
+            Some(KeyPress::Settings)
+        );
+        assert_eq!(
+            map_key(&key(KeyCode::Char(' ')), InputMode::Normal),
+            Some(KeyPress::Cycle)
         );
         assert_eq!(map_key(&key(KeyCode::Char('z')), InputMode::Normal), None);
     }

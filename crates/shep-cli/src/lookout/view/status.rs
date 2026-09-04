@@ -127,13 +127,20 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // overlay anywhere in this module, and one rule under the header
         // beats a full border for a pane somebody reads at 3am.
         (text, palette.attention())
-    } else if !app.filter().is_empty() {
+    } else if app.settings().is_none() && !app.filter().is_empty() {
+        // Gated on the screen being closed: the filter survives the swap
+        // into settings (`App::on_settings_key` never touches it), but `/`
+        // and `esc` mean something else entirely while the screen owns the
+        // keyboard, so this line would be false the moment it stayed up.
         (
             format!("filter \"{}\"   / edit   esc clear", app.filter()),
             palette.muted(),
         )
     } else {
-        (hint_for(app.control()), palette.muted())
+        (
+            hint_for(app.control(), app.settings().is_some()),
+            palette.muted(),
+        )
     };
     // Always rendered, in both states. An operator who does not know whether
     // their dashboard can act is one keystroke from finding out the wrong
@@ -201,23 +208,33 @@ fn in_flight_text(action: &ActionState<'_>) -> String {
 
 /// The key hint.
 ///
-/// Two forms now that the three action keys exist. This file's standing
-/// rule: a hint that needs a footnote to be true is an asterisk, not a hint,
-/// so `Control::Allowed`'s form is only ever handed to a dashboard where `x`,
-/// `R` and `L` really do arm a confirm.
+/// Three forms now: the settings screen's own, and the dashboard's two.
+/// `settings_open` picks between them, and wins outright, because the
+/// dashboard's `x`/`R`/`L`/`r`/`/` mean nothing while the screen owns the
+/// keyboard. This file's standing rule: a hint that needs a footnote to be
+/// true is an asterisk, not a hint, so `Control::Allowed`'s dashboard form
+/// is only ever handed to a dashboard where `x`, `R` and `L` really do arm a
+/// confirm, and the settings form is only ever handed to a dashboard where
+/// they do nothing at all.
 ///
-/// The read-only text is 59 characters, up from the 48 that shipped before
-/// this phase. It still truncates at the 39 columns the 49-column gap test
-/// leaves for it, and the first 40 characters are byte-identical to the old
-/// hint, so `a_truncated_hint_still_leaves_a_gap_before_the_control_label`
-/// measures exactly what it was written to measure and the `narrow` and
-/// `cramped` frames do not move.
-fn hint_for(control: Control) -> String {
+/// `s settings` is APPENDED to both dashboard forms, never inserted: the
+/// read-only text's first 40 characters have to stay byte-identical for
+/// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` and the
+/// `narrow`/`cramped` gallery frames to keep measuring what they were
+/// written to measure, and appending is the one edit that cannot move them.
+fn hint_for(control: Control, settings_open: bool) -> String {
+    if settings_open {
+        return "esc close   j/k select   g/G first/last   space cycle".to_string();
+    }
     match control {
-        Control::ReadOnly => "q quit   j/k select   g/G first/last   r refresh   / filter",
+        Control::ReadOnly => {
+            "q quit   j/k select   g/G first/last   r refresh   / filter   s settings"
+        }
         // `g/G` and `r` drop out to make room. They are the two an operator
         // rediscovers by pressing them; an action key is not.
-        Control::Allowed => "q quit   j/k select   / filter   x stop   R restart   L reload",
+        Control::Allowed => {
+            "q quit   j/k select   / filter   x stop   R restart   L reload   s settings"
+        }
     }
     .to_string()
 }

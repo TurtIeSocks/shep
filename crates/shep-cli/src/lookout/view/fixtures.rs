@@ -13,6 +13,8 @@ use super::super::app::{ActionVerb, App, Control, KeyPress, LambWalk, Msg, RowKe
 use super::super::source::HostSample;
 use super::super::tail::{Stream, Tail, TailLine};
 use super::super::theme::Palette;
+use crate::commands::settings::{DogView, ScalarView, SettingsSnapshot};
+use crate::style::StyleSource;
 
 /// No colour at all: the palette every fixture uses unless the test is about
 /// colour.
@@ -397,5 +399,55 @@ pub fn armed_app_with_a_filter_and_a_notice() -> App {
     app.set_control_for_tests(Control::Allowed);
     app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
     app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
+    app
+}
+
+/// A plausible settings snapshot: every scalar rendered as if `shep.toml`
+/// declared it, and two candidate dogs, one enabled, for the tests that
+/// need a screen with real rows rather than a fresh home's all-default one.
+pub fn settings_snapshot() -> SettingsSnapshot {
+    let config = |value: &str| ScalarView {
+        value: value.to_string(),
+        source: StyleSource::Config,
+    };
+    SettingsSnapshot {
+        log_level: config("warn"),
+        log_json: config("false"),
+        socket: config("/home/ada/.shep/run/shep.sock"),
+        max_cron_sleep: config("30s"),
+        allow_control: config("false"),
+        style_level: config("full"),
+        dogs: vec![
+            DogView {
+                name: "bark".to_string(),
+                enabled: false,
+                adopted_path: None,
+            },
+            DogView {
+                name: "metrics".to_string(),
+                enabled: true,
+                adopted_path: None,
+            },
+        ],
+    }
+}
+
+/// A dashboard with the settings screen already open on
+/// [`settings_snapshot`], the gate closed ([`Control::ReadOnly`]).
+pub fn app_in_settings() -> App {
+    let mut app = app_with(flock_of(3, 0), plain());
+    app.update(Msg::Key(KeyPress::Settings));
+    app.update(Msg::Settings {
+        result: Ok(settings_snapshot()),
+    });
+    app
+}
+
+/// [`app_in_settings`] with the control gate open, for the one test that
+/// proves an action key stays unreachable even when actions would otherwise
+/// be permitted.
+pub fn app_in_settings_with_control() -> App {
+    let mut app = app_in_settings();
+    app.set_control_for_tests(Control::Allowed);
     app
 }

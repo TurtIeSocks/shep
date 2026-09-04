@@ -37,6 +37,7 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 
 use super::theme::Palette;
+use crate::commands::settings::{SettingField, SettingsSnapshot};
 use crate::vocabulary::Reported;
 
 /// Whether this lookout may act on a sheep.
@@ -115,6 +116,14 @@ pub enum KeyPress {
     TextApply,
     /// `Esc` in whichever text field is open: abandon the edit and leave.
     TextAbandon,
+    /// `s`: open the settings screen from the dashboard, or close it again
+    /// from inside the screen. The reducer decides which, the same division
+    /// [`Self::Escape`]'s own doc argues for.
+    Settings,
+    /// `space`: cycle the value under the settings screen's own cursor.
+    /// Meaningless from the dashboard; refuses the same way an action key
+    /// does when the control gate is closed.
+    Cycle,
 }
 
 /// Everything that can change the dashboard.
@@ -197,6 +206,17 @@ pub enum Msg {
         /// What could not be sent.
         sent: Sent,
     },
+    /// The settings screen's read of `shep.toml` landed, in answer to an
+    /// [`Effect::LoadSettings`] this reducer asked for.
+    ///
+    /// `Result<_, String>` rather than `commands::settings::SettingError`,
+    /// because this reducer holds no error types from `commands` and a
+    /// notice needs a rendered sentence anyway: `super::run_ui` is what
+    /// calls `to_string()` on the way in.
+    Settings {
+        /// The rendered snapshot, or why it could not be read.
+        result: Result<SettingsSnapshot, String>,
+    },
 }
 
 /// What the caller has to do after an update.
@@ -233,6 +253,12 @@ pub enum Effect {
     Send(Sent),
     /// Leave.
     Quit,
+    /// Read `shep.toml`'s settings snapshot; the result lands as
+    /// [`Msg::Settings`].
+    ///
+    /// Raised by the dashboard's own `s`, never by the settings screen's:
+    /// once the screen is open, `s` closes it instead. See [`App::on_key`].
+    LoadSettings,
 }
 
 /// The connection's state, as the dashboard reports it.
@@ -436,6 +462,111 @@ impl fmt::Display for Notice {
     }
 }
 
+/// One row the settings screen's cursor can sit on.
+///
+/// `Debug` is derived rather than redacted (IR-41): a bare field name or a
+/// bare index, nothing a `{:?}` could leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRow {
+    /// One of the six scalar fields, in [`Settings::rows`]'s fixed order.
+    Scalar(SettingField),
+    /// Index into [`SettingsSnapshot::dogs`].
+    Dog(usize),
+}
+
+/// The settings screen's own state. `None` on [`App`] is the dashboard.
+///
+/// `Debug` is derived rather than redacted (IR-41): the snapshot underneath
+/// carries no secret ([`SettingsSnapshot`]'s own note says why) and the
+/// cursor is a bare index.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    snapshot: SettingsSnapshot,
+    /// An index into [`Self::rows`], clamped on every read rather than kept
+    /// pre-clamped: a later task's refresh can shrink the dog list out from
+    /// under a cursor already sitting past its new end.
+    cursor: usize,
+}
+
+impl Settings {
+    /// A freshly opened screen, cursor on the first row.
+    fn new(snapshot: SettingsSnapshot) -> Self {
+        Self {
+            snapshot,
+            cursor: 0,
+        }
+    }
+
+    /// What the screen reads off disk.
+    ///
+    /// Not called outside this module's own tests yet: `view::settings`'s
+    /// `draw_settings` (a later task) is the real caller, reading it to
+    /// render every row's value and source. Same precedent this crate
+    /// already carries (`style::Presentation::BARE`,
+    /// `output::OutputEnvelope`, `commands::settings::load_settings`):
+    /// `#[allow(dead_code)]` says so explicitly rather than inventing a call
+    /// site nothing needs yet.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn snapshot(&self) -> &SettingsSnapshot {
+        &self.snapshot
+    }
+
+    /// Every row the cursor can sit on: the six scalars in their fixed
+    /// order, then one row per candidate dog.
+    #[must_use]
+    pub fn rows(&self) -> Vec<SettingsRow> {
+        let mut rows = vec![
+            SettingsRow::Scalar(SettingField::LogLevel),
+            SettingsRow::Scalar(SettingField::LogJson),
+            SettingsRow::Scalar(SettingField::Socket),
+            SettingsRow::Scalar(SettingField::MaxCronSleep),
+            SettingsRow::Scalar(SettingField::AllowControl),
+            SettingsRow::Scalar(SettingField::StyleLevel),
+        ];
+        rows.extend((0..self.snapshot.dogs.len()).map(SettingsRow::Dog));
+        rows
+    }
+
+    /// The row the cursor sits on. `None` only if [`Self::rows`] is somehow
+    /// empty, which cannot happen today (the six scalars are unconditional),
+    /// but the type stays honest about it rather than asserting.
+    ///
+    /// Not called outside this module's own tests yet: `view::settings`'s
+    /// `draw_settings` (a later task) is the real caller, reading it to
+    /// highlight the selected row. `#[allow(dead_code)]` for the same
+    /// reason [`Self::snapshot`] carries it.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn cursor(&self) -> Option<SettingsRow> {
+        let rows = self.rows();
+        rows.get(self.cursor.min(rows.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// Moves the cursor by `delta` rows, clamped to [`Self::rows`] rather
+    /// than wrapping, the same rule the flock table's own cursor follows.
+    fn move_by(&mut self, delta: isize) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
+    }
+
+    /// Moves the cursor to the first row.
+    fn move_to_first(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Moves the cursor to the last row.
+    fn move_to_last(&mut self) {
+        self.cursor = self.rows().len().saturating_sub(1);
+    }
+}
+
 /// What an action key does.
 ///
 /// Three verbs, and deliberately not four: `start` is whistle's and the CLI's,
@@ -594,6 +725,9 @@ pub struct App {
     lambs: Option<LambReading>,
     /// The one action this dashboard is in the middle of, or `None`.
     action: Option<Action>,
+    /// The settings screen's own state. `None` is the dashboard; `Some` is
+    /// the screen, open over it.
+    settings: Option<Settings>,
 }
 
 impl App {
@@ -616,6 +750,7 @@ impl App {
             feed: super::tail::Tail::default(),
             lambs: None,
             action: None,
+            settings: None,
         }
     }
 
@@ -748,6 +883,24 @@ impl App {
                 // clear.
                 Sent::Lambs { .. } => Effect::None,
             },
+            // The file can have changed since `s` asked for it, and the
+            // screen opens on whatever this read found -- never on stale or
+            // empty state, which is exactly why `s` asks first rather than
+            // opening immediately. A failed read leaves the dashboard up: an
+            // empty settings screen would say nothing about why it has
+            // nothing to show.
+            Msg::Settings { result } => {
+                match result {
+                    Ok(snapshot) => self.settings = Some(Settings::new(snapshot)),
+                    Err(message) => {
+                        self.notice = Some(Notice {
+                            text: message,
+                            grave: true,
+                        });
+                    }
+                }
+                Effect::None
+            }
         }
     }
 
@@ -928,6 +1081,13 @@ impl App {
         if self.mode == InputMode::Text {
             return self.on_text_key(key);
         }
+        // The settings screen owns its own keymap while it is open, ahead of
+        // the armed-confirm check below: no sheep action can be armed from
+        // in here (`s` reaches the dashboard only after the screen closes),
+        // so the ordering is a documentation choice, not a correctness one.
+        if self.settings.is_some() {
+            return self.on_settings_key(key);
+        }
         // Checked BEFORE the ordinary dispatch, and a cancelling keypress is
         // CONSUMED. A stray `j` during a pending confirm cancels it and does
         // not also move the selection: if it did both, the operator would see
@@ -1016,7 +1176,75 @@ impl App {
             | KeyPress::TextBackspace
             | KeyPress::TextApply
             | KeyPress::TextAbandon => Effect::None,
+            // The read, not the open: the screen opens only once
+            // `Msg::Settings` lands. See that arm's own doc for why.
+            KeyPress::Settings => Effect::LoadSettings,
+            // Meaningless from the dashboard; the settings screen is the
+            // only thing `space` does anything for, and this branch is only
+            // reached when that screen is not open.
+            KeyPress::Cycle => Effect::None,
         }
+    }
+
+    /// The settings screen's own keymap, in force for as long as
+    /// [`Self::settings`] is `Some`. Everything not named here is ignored,
+    /// in particular an action key: no sheep action can arm while this
+    /// screen owns the keyboard.
+    fn on_settings_key(&mut self, key: KeyPress) -> Effect {
+        self.notice = None;
+        match key {
+            KeyPress::Quit => return Effect::Quit,
+            // Both close. `s` toggling shut is the dashboard's own `s`
+            // meaning something different once the screen is open, the same
+            // division `Escape`'s doc argues for; `Escape` closing rather
+            // than quitting is the one place this screen swaps the
+            // dashboard's own cascade.
+            KeyPress::Settings | KeyPress::Escape => self.settings = None,
+            KeyPress::SelectUp => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.move_by(-1);
+                }
+            }
+            KeyPress::SelectDown => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.move_by(1);
+                }
+            }
+            KeyPress::SelectFirst => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.move_to_first();
+                }
+            }
+            KeyPress::SelectLast => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.move_to_last();
+                }
+            }
+            // Nothing to cycle yet: writing lands in a later task. The
+            // refusal is the one thing that has to exist today: an operator
+            // running a read-only lookout must be told why `space` did
+            // nothing, exactly as an action key already is.
+            KeyPress::Cycle => {
+                if self.control == Control::ReadOnly {
+                    self.notice = Some(Notice {
+                        text: "read-only: actions need --allow-control".to_string(),
+                        grave: true,
+                    });
+                }
+            }
+            KeyPress::Confirm | KeyPress::Refresh => {}
+            // Unreachable from here, and named rather than wildcarded so a
+            // future variant does not fall silently into an arm that
+            // ignores it: an action key in particular must never be
+            // mistaken for one this screen answers.
+            KeyPress::Action(_)
+            | KeyPress::FilterStart
+            | KeyPress::TextChar(_)
+            | KeyPress::TextBackspace
+            | KeyPress::TextApply
+            | KeyPress::TextAbandon => {}
+        }
+        Effect::None
     }
 
     /// Arms a confirm, or refuses and says why.
@@ -1672,6 +1900,13 @@ impl App {
         })
     }
 
+    /// The settings screen's own state, or `None` while the dashboard is
+    /// showing.
+    #[must_use]
+    pub fn settings(&self) -> Option<&Settings> {
+        self.settings.as_ref()
+    }
+
     /// Overrides the control gate a fixture built with. `App::new` takes
     /// [`Control`] and every shipped fixture hard-codes [`Control::ReadOnly`];
     /// this is the one line that lets the action-key tests build a dashboard
@@ -1738,6 +1973,8 @@ const fn outcome(verb: ActionVerb) -> &'static str {
 mod tests {
     use super::*;
     use shep_core::protocol::{ProcessEventKind, RpcError, RpcErrorCode};
+
+    use super::super::view::fixtures;
 
     fn sheep(id: u32, name: &str, status: ProcStatus) -> ProcessInfo {
         ProcessInfo::builder(id, name, status)
@@ -3483,5 +3720,135 @@ mod tests {
             );
             assert!(app.notice().is_some_and(Notice::is_grave));
         }
+    }
+
+    /// `s` asks for the read rather than opening on stale or empty state: the
+    /// file can have changed since the last look, and an empty screen while the
+    /// read is in flight is a screen that lies for one frame.
+    #[test]
+    fn s_asks_for_the_file_before_the_screen_opens() {
+        let mut app = fixtures::full_app();
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Settings)),
+            Effect::LoadSettings
+        );
+        assert!(
+            app.settings().is_none(),
+            "nothing opens until the read lands"
+        );
+    }
+
+    #[test]
+    fn the_screen_opens_when_the_read_lands() {
+        let mut app = fixtures::full_app();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert!(app.settings().is_some());
+    }
+
+    #[test]
+    fn a_read_that_failed_says_so_and_leaves_the_dashboard_up() {
+        let mut app = fixtures::full_app();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Settings {
+            result: Err("no such file".into()),
+        });
+        assert!(app.settings().is_none());
+        let notice = app.notice().expect("a failed read has to say so");
+        assert!(notice.is_grave());
+        assert!(notice.to_string().contains("no such file"));
+    }
+
+    #[test]
+    fn s_closes_the_screen_again() {
+        let mut app = fixtures::app_in_settings();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        assert!(app.settings().is_none());
+    }
+
+    /// The one arm of the `Escape` cascade this screen swaps. From the dashboard
+    /// with no filter, `Esc` quits; from here it must not.
+    #[test]
+    fn escape_closes_the_screen_and_never_quits() {
+        let mut app = fixtures::app_in_settings();
+        assert_eq!(app.update(Msg::Key(KeyPress::Escape)), Effect::None);
+        assert!(app.settings().is_none());
+    }
+
+    #[test]
+    fn the_flock_cursor_and_the_filter_survive_the_swap() {
+        let mut app = fixtures::full_app();
+        let _ = app.update(Msg::Key(KeyPress::FilterStart));
+        for c in "web".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        // `selected()` hands back an owned `Option<RowKey>` (app.rs:1436), so
+        // there is nothing to clone.
+        let selected = app.selected();
+        let filter = app.filter().to_string();
+
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+
+        assert_eq!(app.selected(), selected);
+        assert_eq!(app.filter(), filter);
+    }
+
+    #[test]
+    fn the_settings_cursor_starts_at_the_first_row_on_every_open() {
+        let mut app = fixtures::app_in_settings();
+        let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+
+        let first = app.settings().unwrap().rows()[0];
+        assert_eq!(app.settings().unwrap().cursor(), Some(first));
+    }
+
+    #[test]
+    fn the_cursor_moves_through_the_scalars_and_into_the_dogs() {
+        let mut app = fixtures::app_in_settings();
+        let rows = app.settings().unwrap().rows();
+        for _ in 0..rows.len() - 1 {
+            let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        }
+        assert_eq!(
+            app.settings().unwrap().cursor(),
+            Some(*rows.last().unwrap())
+        );
+        // and it stops rather than wrapping, the way the flock table does
+        let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        assert_eq!(
+            app.settings().unwrap().cursor(),
+            Some(*rows.last().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_action_key_from_the_dashboard_is_unreachable_while_the_screen_is_up() {
+        let mut app = fixtures::app_in_settings_with_control();
+        // `x` is the stop key on the dashboard. In here it is not an action at all.
+        let _ = app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        // The accessor is `App::action()` (app.rs:1662).
+        assert!(app.action().is_none(), "no sheep confirm can arm from here");
+    }
+
+    #[test]
+    fn a_read_only_lookout_opens_the_screen_and_refuses_the_edit_key() {
+        let mut app = fixtures::app_in_settings(); // Control::ReadOnly
+        assert!(app.settings().is_some(), "reading shep.toml is not gated");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let notice = app.notice().expect("the refusal has to say why");
+        assert!(notice.is_grave());
     }
 }
