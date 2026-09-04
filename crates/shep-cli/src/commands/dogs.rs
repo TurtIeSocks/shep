@@ -2957,6 +2957,76 @@ mod tests {
         );
     }
 
+    /// Every file under `dir`, recursively, as text. A file shep wrote that
+    /// is not UTF-8 is skipped rather than failing the walk; none of them
+    /// are today, and a binary one could not carry the marker anyway.
+    fn every_file_under(dir: &Path) -> Vec<(PathBuf, String)> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(every_file_under(&path));
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                found.push((path, text));
+            }
+        }
+        found
+    }
+
+    /// fails if a schema reaches anything shep writes. Decision 7: asked
+    /// fresh, stored nowhere, because `cargo install` replaces a dog's
+    /// binary with nothing watching and a stale schema is worse than a
+    /// stale version number, since it mislabels which field is a
+    /// credential.
+    ///
+    /// Nothing stores it today, and it is guaranteed structurally: the
+    /// function that records an adopted dog has no schema to take. A
+    /// structural guarantee is exactly the kind a later signature change
+    /// removes with nothing going red, so this asserts on the files rather
+    /// than on the shape of a call. The whole home is walked, not just
+    /// `shep.toml`, so a schema parked in `dogs.toml` or a cache beside it
+    /// would be caught too. The dog's binary lives in its own directory
+    /// because the fixture script contains the schema text it prints.
+    ///
+    /// Mutation check: appending the schema to `shep.toml` after the edit
+    /// reddens this.
+    #[tokio::test]
+    async fn a_published_schema_reaches_no_file_shep_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let binaries = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, home.path());
+        let marker = "only-ever-in-the-schema";
+        let bin = two_flag_dog(
+            binaries.path(),
+            &format!("echo '{{\"title\":\"{marker}\",\"properties\":{{}}}}'"),
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+        assert_eq!(code, ExitCode::Success);
+
+        let written = every_file_under(home.path());
+        assert!(
+            written.iter().any(|(_, text)| text.contains("otel")),
+            "the adopt has to have written the dog somewhere for this to mean anything: {written:?}"
+        );
+        for (path, text) in &written {
+            assert!(
+                !text.contains(marker),
+                "the schema was stored in {}: {text}",
+                path.display()
+            );
+        }
+    }
+
     /// fails if a schema's own text can reach a log through `Debug`. A dog
     /// author's `Default` is what a `default` in the schema carries, and it
     /// is the same field the secret marker exists to keep off a screen, so
