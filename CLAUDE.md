@@ -196,6 +196,23 @@ on a project where doctests dominated. It does not transfer: this workspace's
 cost is the integration tier (`cli_e2e` ~47s, `daemon_e2e` ~22s), which
 `--lib --bins` would skip entirely rather than speed up. Keep the bare form.
 
+**This holds for the LOCAL gate. CI splits them, because nextest cannot run
+them at all.** As of 2026-09-04 every CI leg that used to run `cargo test`
+runs `cargo nextest run` plus a separate `cargo test --doc`, so a flaky
+integration test can be retried without retrying anything else. That split is
+forced by the tool rather than chosen, and it is cheap: measured the same day
+on this machine, warm, doctests alone are **6.8s**, not the 30.9s above, which
+was a colder tree. `cargo nextest run` over the same skip set is **26.1s**
+against `cargo test`'s **45.2s**, so a leg is faster even paying for the
+second command.
+
+Two numbers to keep straight when a count looks wrong. `cargo test --workspace
+--all-features` over the skip set reports **2525**; nextest reports **2511**,
+and the missing **14** are exactly the doctests it does not run. The two
+filtersets in the workflow partition the suite with nothing dropped: 2511 in
+the ordinary legs plus 30 in `slow` is 2541, which is every non-doctest test.
+Nothing here changes the local gate: keep running bare `cargo test`.
+
 ### The phase gate — run at a merge, not per task
 
 The four above, plus `cargo test --workspace --all-features -- --test-threads=1`
