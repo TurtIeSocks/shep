@@ -10,6 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-04
+
+### Added
+
+- The four reset modes get their own arms
+
+### Changed
+
+- ResetDepth gains File and Env, Settings becomes Policy **(BREAKING)**
+
+### Fixed
+
+- --reset=env touches env and no setting at all
+- The instances refusal advises a mode, not a bare flag
+- Env never reaches handle_scale either, so name it
+- The instances refusal named a purpose, not a scope
+
+
 ## [0.1.34] - 2026-09-04
 
 

@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-04
+
+### Changed
+
+- ResetDepth gains File and Env, Settings becomes Policy **(BREAKING)**
+
+### Fixed
+
+- Drop three em dashes from the PROTOCOL_VERSION bump prose
+- --reset=env touches env and no setting at all
+- ResetDepth's own rustdoc still described the wrong two discards
+- Two test docs asserted PROTOCOL_VERSION is 2, which it is not
+
+
 ## [0.1.34] - 2026-09-04
 
 ### Changed
