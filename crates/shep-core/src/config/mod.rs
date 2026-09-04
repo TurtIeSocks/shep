@@ -28,4 +28,4 @@ pub use normalize::{
 };
 pub use probe::{ProbeTarget, ProbeTargetError};
 #[cfg(feature = "schema")]
-pub use scaffold::{CURATED, Depth, Scaffold, ScaffoldError};
+pub use scaffold::{CURATED, Depth, GROUP_ORDER, Scaffold, ScaffoldError};

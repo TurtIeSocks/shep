@@ -117,11 +117,11 @@ pub const CURATED: &[&str] = &["name", "script", "autorestart", "cwd"];
 /// Group order for [`Depth::All`], coarsest concern first: what it is and
 /// what runs, then what it receives, then how it is kept alive, then when.
 ///
-/// Fields carrying no `group` sort after all of these. That is deliberate
-/// rather than tidy: half of `AppConfig` is currently ungrouped, so half the
-/// full scaffold is still alphabetical, and leaving those at the end makes
-/// the gap visible instead of hiding it in the middle.
-const GROUP_ORDER: &[&str] = &["process", "inputs", "control", "cron"];
+/// Fields carrying no `group` sort after all of these. Measured against the
+/// exported schema on 2026-09-04, every field of `AppConfig` carries a group
+/// (39 of 39), so the fallback exists for a future ungrouped field rather
+/// than a current gap.
+pub const GROUP_ORDER: &[&str] = &["process", "inputs", "control", "cron"];
 
 /// One line of a scaffold, before any comment marker is applied.
 ///
