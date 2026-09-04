@@ -478,9 +478,13 @@ esc close   j/k select   g/G first/last   space cycle                           
       so setting <code>log_level</code> here and running
       <code>shep daemon reload</code> can do nothing at all if the process
       was started with <code>SHEP_LOG_LEVEL</code> set, and nothing on
-      screen will say so. <code>[style]</code> is the one exception: those
-      layers belong to lookout's own process, not the shepherd's, so a style
-      edit always takes.
+      screen will say so. <code>[style]</code> is not an exception:
+      <code>--style</code> and <code>$SHEP_STYLE</code> outrank the file
+      there too. The difference is that those layers belong to lookout's own
+      process, so lookout can see them. SOURCE names the one in force, the
+      last column reads <code>written, but outranked</code> instead of
+      promising anything, and the confirm names the layer that will keep
+      winning.
     </Callout>
     <p>
       The confirm names exactly this risk when it's <code>[daemon]</code>

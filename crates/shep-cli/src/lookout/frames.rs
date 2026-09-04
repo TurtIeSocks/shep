@@ -1264,6 +1264,9 @@ fn settings_snapshot_for_gallery() -> SettingsSnapshot {
         max_cron_sleep: config("30s"),
         allow_control: default("false"),
         style_level: config("full"),
+        // The document declares it, so the file and the resolved value
+        // agree -- see `SettingsSnapshot::style_level_in_file`.
+        style_level_in_file: Some("full".to_string()),
         dogs: vec![
             DogView {
                 name: "bark".to_string(),

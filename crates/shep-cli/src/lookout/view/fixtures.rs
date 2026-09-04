@@ -419,6 +419,9 @@ pub fn settings_snapshot() -> SettingsSnapshot {
         max_cron_sleep: config("30s"),
         allow_control: config("false"),
         style_level: config("full"),
+        // The document declares it, so the file and the resolved value
+        // agree -- see `SettingsSnapshot::style_level_in_file`.
+        style_level_in_file: Some("full".to_string()),
         dogs: vec![
             DogView {
                 name: "bark".to_string(),
@@ -475,6 +478,29 @@ pub fn app_in_settings_at() -> (App, Instant) {
         result: Ok(settings_snapshot()),
     });
     (app, t0)
+}
+
+/// The settings screen with `[style] level` SHADOWED: the document says
+/// `full`, `source` is the layer that outranked it, and the level in force
+/// is `bare`. The cursor sits on the style row, moved there by real
+/// keypresses the same way [`app_in_settings_on`] moves it.
+///
+/// The one state where a scalar's value in force and its value on disk
+/// disagree, which is the whole reason `[style]` carries two of them --
+/// every other field's layers belong to the shepherd's process, where
+/// lookout can see neither.
+pub fn app_in_settings_with_shadowed_style(source: StyleSource) -> App {
+    let mut app = app_in_settings_on(SettingField::StyleLevel);
+    let mut snapshot = settings_snapshot();
+    snapshot.style_level = ScalarView {
+        value: "bare".to_string(),
+        source,
+    };
+    snapshot.style_level_in_file = Some("full".to_string());
+    app.update(Msg::Settings {
+        result: Ok(snapshot),
+    });
+    app
 }
 
 /// [`app_in_settings`] with the control gate open, for the one test that

@@ -28,6 +28,7 @@ use super::super::app::{App, Settings, SettingsRow};
 use super::super::theme::Palette;
 use super::flock::{fit, mark};
 use crate::commands::settings::{ScalarView, SettingField, SettingsSnapshot};
+use crate::style::StyleSource;
 use crate::vocabulary::Reported;
 
 /// The dogs caption, verbatim. Not "space applies": this screen arms and
@@ -308,16 +309,26 @@ pub(super) const fn field_label(field: SettingField) -> &'static str {
 /// reload; `socket` needs a full stop and start, since a reload never moves
 /// the listening socket; `allow_control` needs whistle restarted rather
 /// than the daemon, because a dog toggle and a whistle setting are both
-/// read by a process the daemon itself never touches; `style level` costs
-/// nothing because lookout re-resolves it on its own next command.
-const fn apply_cost(field: SettingField) -> &'static str {
+/// read by a process the daemon itself never touches.
+///
+/// `style level` is the one cell that reads `source` as well as the field.
+/// It costs nothing when the file is what decides -- lookout re-resolves it
+/// on its own next command -- but `--style` and `$SHEP_STYLE` outrank the
+/// file, and under either of those "the next command reads it" is simply
+/// untrue. The SOURCE cell two columns left already names the layer, so
+/// this cell says what that layer does rather than repeating its name. The
+/// confirm says it at length; see `app::style_confirm_text`.
+const fn apply_cost(field: SettingField, source: StyleSource) -> &'static str {
     match field {
         SettingField::LogLevel | SettingField::LogJson | SettingField::MaxCronSleep => {
             "needs shep daemon reload"
         }
         SettingField::Socket => "needs the shepherd stopped and started",
         SettingField::AllowControl => "needs shep whistle restarted",
-        SettingField::StyleLevel => "the next command reads it",
+        SettingField::StyleLevel => match source {
+            StyleSource::Config | StyleSource::Default => "the next command reads it",
+            StyleSource::Env | StyleSource::Flag => "written, but outranked",
+        },
     }
 }
 
@@ -350,7 +361,7 @@ fn scalar_line(
         fit(field_label(field), SCALAR_NAME_W),
         fit(&view.value, SCALAR_VALUE_W),
         fit(&view.source.to_string(), SCALAR_SOURCE_W),
-        fit(apply_cost(field), cost_width),
+        fit(apply_cost(field, view.source), cost_width),
     );
     Line::from(Span::raw(text))
 }
@@ -595,6 +606,33 @@ mod tests {
             !rendered.contains('…'),
             "SCALAR_SOURCE_W must fit \"the default\" whole: got {rendered:?}"
         );
+    }
+
+    /// fails if the style row keeps claiming the next command reads it
+    /// while a layer above the file is set.
+    ///
+    /// The row's own SOURCE cell already says `$SHEP_STYLE`, so the cost
+    /// cell beside it saying "the next command reads it" is the same frame
+    /// contradicting itself: the next command reads `$SHEP_STYLE`.
+    #[test]
+    fn the_style_cost_cell_stops_promising_the_next_command_when_it_is_outranked() {
+        let app = fixtures::app_in_settings_with_shadowed_style(StyleSource::Env);
+        let settings = app.settings().unwrap();
+        let lines = content_lines(&app, settings, app.palette(), 120);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let row = rendered
+            .iter()
+            .find(|line| {
+                line.get(2..)
+                    .is_some_and(|cells| cells.starts_with("level "))
+            })
+            .unwrap_or_else(|| panic!("the style row is drawn: {rendered:?}"));
+        assert!(row.contains("$SHEP_STYLE"), "got: {row:?}");
+        assert!(row.contains("written, but outranked"), "got: {row:?}");
+        assert!(!row.contains("the next command reads it"), "got: {row:?}");
     }
 
     /// fails if the free-text editor stops showing what is being typed, or

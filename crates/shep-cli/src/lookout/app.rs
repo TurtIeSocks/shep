@@ -774,6 +774,14 @@ impl Settings {
     /// fourth unreachable without a cancel in between. An armed candidate
     /// for a DIFFERENT field (the cursor moved after arming) is not a base:
     /// this starts fresh from the snapshot instead.
+    ///
+    /// From nothing armed, the base is what the FILE says, which is
+    /// [`Self::current_value`] for five of the six fields and
+    /// [`SettingsSnapshot::style_level_in_file`] for `[style] level`. That
+    /// one field's [`ScalarView::value`] is the level in force rather than
+    /// the level on disk, so with `$SHEP_STYLE=bare` over a file saying
+    /// `full` a cycle from the resolved value proposes `full` -- a write
+    /// that changes nothing, reported to the operator as a change.
     fn next_candidate(&self, field: SettingField) -> Option<String> {
         let armed_here = match &self.pending {
             Some(Pending::Armed {
@@ -786,14 +794,21 @@ impl Settings {
             }) if *armed_field == field => Some(value.as_str()),
             _ => None,
         };
-        let base = match armed_here {
-            Some(value) => value,
-            None => self.current_value(field)?,
+        let in_file = (field == SettingField::StyleLevel)
+            .then(|| self.snapshot.style_level_in_file.as_deref())
+            .flatten();
+        let base: String = match (armed_here, in_file) {
+            (Some(value), _) | (None, Some(value)) => value.to_string(),
+            // A `[style]` document that declares nothing falls back to
+            // `StyleLevel`'s own compiled default, which is what
+            // `style::resolve` returns for the same absence.
+            (None, None) if field == SettingField::StyleLevel => STYLE_LEVEL_ORDER[0].to_string(),
+            (None, None) => self.current_value(field)?.to_string(),
         };
         Some(match field {
-            SettingField::LogLevel => next_log_level(base),
-            SettingField::LogJson | SettingField::AllowControl => next_bool(base),
-            SettingField::StyleLevel => next_style_level(base),
+            SettingField::LogLevel => next_log_level(&base),
+            SettingField::LogJson | SettingField::AllowControl => next_bool(&base),
+            SettingField::StyleLevel => next_style_level(&base),
             SettingField::Socket | SettingField::MaxCronSleep => return None,
         })
     }
@@ -808,6 +823,20 @@ impl Settings {
             SettingField::StyleLevel => self.snapshot.style_level.value.as_str(),
             SettingField::Socket | SettingField::MaxCronSleep => return None,
         })
+    }
+
+    /// Which layer `field`'s value came from, off the snapshot. Only
+    /// [`confirm_text`] reads it, and only its `[style]` arm does anything
+    /// with it -- see [`style_confirm_text`].
+    fn source_of(&self, field: SettingField) -> StyleSource {
+        match field {
+            SettingField::LogLevel => self.snapshot.log_level.source,
+            SettingField::LogJson => self.snapshot.log_json.source,
+            SettingField::Socket => self.snapshot.socket.source,
+            SettingField::MaxCronSleep => self.snapshot.max_cron_sleep.source,
+            SettingField::AllowControl => self.snapshot.allow_control.source,
+            SettingField::StyleLevel => self.snapshot.style_level.source,
+        }
     }
 
     /// The snapshot's own rendered value for one of the two free-text
@@ -956,7 +985,16 @@ fn next_style_level(current: &str) -> String {
 /// for, so [`SettingField::Socket`] and [`SettingField::MaxCronSleep`]
 /// never reach the two arms below -- named rather than wildcarded so a
 /// future field added to the match cannot fall through unnoticed.
-fn confirm_text(field: SettingField, value: &str) -> String {
+///
+/// `source` is the field's own [`ScalarView::source`], and only
+/// [`SettingField::StyleLevel`] reads it. The other three carry a caveat
+/// about a layer lookout CANNOT see (the shepherd's env and flags), and a
+/// caveat is all they can carry. `[style]`'s layers are lookout's own
+/// process, so this is the one field where the screen knows -- and it was
+/// the one field promising "the next command reads it" unconditionally,
+/// which is false the moment `$SHEP_STYLE` or `--style` is set. See
+/// [`style_confirm_text`].
+fn confirm_text(field: SettingField, value: &str, source: StyleSource) -> String {
     match field {
         SettingField::LogLevel => format!(
             "set log_level to {value}? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level"
@@ -968,11 +1006,38 @@ fn confirm_text(field: SettingField, value: &str) -> String {
             let word = if value == "true" { "on" } else { "off" };
             format!("turn whistle control tools {word}? needs shep whistle restarted")
         }
-        SettingField::StyleLevel => {
-            format!("set style level to {value}? the next command reads it")
-        }
+        SettingField::StyleLevel => style_confirm_text(value, source),
         SettingField::Socket | SettingField::MaxCronSleep => unreachable!(
             "Settings::next_candidate never arms these two -- they are task 8's Pending::Typing"
+        ),
+    }
+}
+
+/// The `[style] level` half of [`confirm_text`], split out because it is
+/// the only arm that reads a second fact.
+///
+/// `StyleSource` is what `shep style` already reports and what the row's
+/// own SOURCE cell already shows, so this sentence never tells an operator
+/// something the screen contradicts two lines above it. The split is by
+/// what the layer above the file DOES, not by which layer it is:
+///
+/// - `Config`, `Default` -- nothing outranks the file, so the write is the
+///   whole story and the sentence says so, as it always did.
+/// - `Env`, `Flag` -- the write lands and the level in force does not
+///   move. Naming the layer is the point: the failure this avoids is the
+///   one `StyleSource`'s own doc exists for, an operator editing
+///   `shep.toml`, seeing nothing change, and never thinking of the
+///   `$SHEP_STYLE` in a shell profile they have forgotten about.
+fn style_confirm_text(value: &str, source: StyleSource) -> String {
+    match source {
+        StyleSource::Config | StyleSource::Default => {
+            format!("set style level to {value}? the next command reads it")
+        }
+        StyleSource::Env => format!(
+            "set style level to {value}? it goes in the file, but $SHEP_STYLE is set and keeps winning until it is unset"
+        ),
+        StyleSource::Flag => format!(
+            "set style level to {value}? it goes in the file, but --style was passed to this lookout and keeps winning for as long as it runs"
         ),
     }
 }
@@ -2060,7 +2125,8 @@ impl App {
         let Some(value) = settings.next_candidate(field) else {
             return Effect::None;
         };
-        let text = confirm_text(field, &value);
+        let source = settings.source_of(field);
+        let text = confirm_text(field, &value, source);
         settings.pending = Some(Pending::Armed {
             edit: SettingEdit::Set { field, value },
             text,
@@ -5063,6 +5129,54 @@ mod tests {
         let _ = app.update(Msg::Key(KeyPress::Cycle));
         let text = app.settings().unwrap().pending().unwrap().text.to_string();
         assert!(text.contains("the next command reads it"), "got: {text}");
+    }
+
+    /// fails if the style confirm keeps promising "the next command reads
+    /// it" while a layer above the file is set.
+    ///
+    /// `style::resolve` is flag over env over config, so with `$SHEP_STYLE`
+    /// or `--style` in play the write lands and nothing changes. This is
+    /// the one field where lookout KNOWS -- the SOURCE cell on the same row
+    /// already reads `$SHEP_STYLE` or `--style` -- and it was the one field
+    /// whose confirm said nothing about it, while the other three carry a
+    /// caveat about layers lookout cannot see at all.
+    #[test]
+    fn a_shadowed_style_confirm_names_the_layer_that_keeps_winning() {
+        for (source, layer) in [
+            (StyleSource::Env, "$SHEP_STYLE"),
+            (StyleSource::Flag, "--style"),
+        ] {
+            let mut app = fixtures::app_in_settings_with_shadowed_style(source);
+            let _ = app.update(Msg::Key(KeyPress::Cycle));
+            let text = app.settings().unwrap().pending().unwrap().text.to_string();
+            assert!(text.contains(layer), "{source} must name itself: {text}");
+            assert!(
+                text.contains("keeps winning"),
+                "{source} must say what it does: {text}"
+            );
+            assert!(
+                !text.contains("the next command reads it"),
+                "{source}: the next command reads {source}, not the file: {text}"
+            );
+        }
+    }
+
+    /// fails if `space` on the style row cycles from the level in FORCE
+    /// rather than the level on DISK.
+    ///
+    /// With `$SHEP_STYLE=bare` over a file saying `full`, cycling the
+    /// resolved value walks `bare -> full` and proposes `full`, which is
+    /// what the file already holds: a no-op write, reported to the operator
+    /// as a change. From the file it walks `full -> plain`.
+    #[test]
+    fn the_style_cycle_starts_from_the_file_and_not_the_level_in_force() {
+        let mut app = fixtures::app_in_settings_with_shadowed_style(StyleSource::Env);
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(
+            text.contains("set style level to plain"),
+            "the file says full, so one step is plain: {text}"
+        );
     }
 
     #[test]

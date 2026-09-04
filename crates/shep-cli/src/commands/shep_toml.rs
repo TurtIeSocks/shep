@@ -566,6 +566,23 @@ impl ShepToml {
         Ok(())
     }
 
+    /// `[style] level`, or `None` when the document never wrote it, as the
+    /// raw string on disk.
+    ///
+    /// The twin of [`Self::daemon_log_level`], and it exists for a sharper
+    /// reason than symmetry: `[style]` is the one field on the settings
+    /// screen whose value in force can come from a layer ABOVE the file
+    /// (`--style`, `$SHEP_STYLE`), so the resolved level and the level the
+    /// document declares are two different facts. Cycling a candidate from
+    /// the resolved one proposes a no-op write whenever they disagree.
+    #[must_use]
+    pub fn style_level(&self) -> Option<String> {
+        self.table("style")?
+            .get("level")?
+            .as_str()
+            .map(String::from)
+    }
+
     /// `[daemon] log_json`, or `None` when the document never wrote it --
     /// the distinction the whole settings screen rests on. A key written
     /// to its own default is still `Some`, because [`DaemonConfig::load`]'s

@@ -130,6 +130,20 @@ pub struct SettingsSnapshot {
     pub allow_control: ScalarView,
     /// `[style] level`, resolved.
     pub style_level: ScalarView,
+    /// What `[style] level` says in the DOCUMENT, or `None` when the
+    /// document never wrote it.
+    ///
+    /// The only field on this screen that needs both halves. Every
+    /// `[daemon]`/`[whistle]` field's [`ScalarView::value`] is already the
+    /// document's own value, because the layers that could outrank it
+    /// belong to the shepherd's process and this one cannot see them.
+    /// `[style]`'s can be `--style` or `$SHEP_STYLE`, which are lookout's
+    /// own, so `style_level.value` is the level in FORCE and this is the
+    /// level on DISK. `Settings::next_candidate` cycles from this one: with
+    /// `$SHEP_STYLE=bare` over a file saying `full`, cycling the resolved
+    /// value proposes `full` again, which is a no-op write reported as a
+    /// change.
+    pub style_level_in_file: Option<String>,
     /// Every candidate dog: [`BUILT_IN_DOGS`] plus every `adopted_dogs`
     /// key, sorted, deduplicated.
     pub dogs: Vec<DogView>,
@@ -286,6 +300,7 @@ pub fn load_settings(
         value: level.to_string(),
         source,
     };
+    let style_level_in_file = doc.style_level();
 
     Ok(SettingsSnapshot {
         log_level,
@@ -294,6 +309,7 @@ pub fn load_settings(
         max_cron_sleep,
         allow_control,
         style_level,
+        style_level_in_file,
         dogs: dog_candidates(&doc),
     })
 }
