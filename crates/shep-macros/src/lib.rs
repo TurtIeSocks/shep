@@ -2,8 +2,8 @@
 //!
 //! A dog (a plugin process the shepherd supervises) publishes a JSON Schema
 //! for its own config so shep can render a settings pane for it. One kind of
-//! field needs marking: a credential, such as a webhook URL, which a pane
-//! shows as `<set>` rather than as its value.
+//! field needs marking: a credential, such as the webhook URL in a bark sink,
+//! which a pane shows as `<set>` rather than as its value.
 //!
 //! `schemars` can express that by hand, with
 //! `#[schemars(extend("x-shep-secret" = true))]`. This crate exists because
@@ -23,7 +23,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{Attribute, Data, DeriveInput, Field, Fields, Meta, Token, parse_macro_input};
+use syn::{Attribute, Data, DeriveInput, Field, Meta, Token, parse_macro_input};
 
 /// The attribute this derive claims. Only `#[shep(secret)]` is spelled with
 /// it today.
@@ -35,18 +35,25 @@ const SECRET: &str = "secret";
 /// Marks which of a dog's config fields are credentials, so shep can redact
 /// them without the dog author ever typing the extension key that says so.
 ///
-/// Derive it on the struct a dog deserializes its config into, alongside
+/// Derive it on the type a dog deserializes its config into, alongside
 /// `schemars::JsonSchema`, and mark each credential field with
-/// `#[shep(secret)]`:
+/// `#[shep(secret)]`. A struct and an enum both work, and the enum matters:
+/// a bark sink is one, tagged by kind, with a webhook URL in every variant.
 ///
 /// ```rust,ignore
 /// use shep_client::dogs::DogConfig;
 ///
 /// #[derive(serde::Deserialize, schemars::JsonSchema, DogConfig)]
-/// struct Sink {
-///     kind: String,
-///     #[shep(secret)]
-///     url: String,
+/// #[serde(tag = "kind", rename_all = "snake_case")]
+/// enum Sink {
+///     Discord {
+///         #[shep(secret)]
+///         url: String,
+///     },
+///     Slack {
+///         #[shep(secret)]
+///         url: String,
+///     },
 /// }
 /// ```
 ///
@@ -68,26 +75,38 @@ const SECRET: &str = "secret";
 /// }
 /// ```
 ///
-/// # Limitations
+/// One `"url"`, not two, for the two variants above: the list is names, and a
+/// name repeated across variants is one name. The schema `schemars` builds
+/// for a tagged enum is a `oneOf` of one object per variant, each with its own
+/// `properties`, so whatever marks a field has to reach every occurrence of
+/// the name rather than a single top-level property.
 ///
-/// A field is named by its Rust identifier. A `#[serde(rename)]` or
-/// `#[serde(rename_all)]` that changes what the field is called in the schema
-/// is not followed, and the marker would then miss it silently, which is the
-/// failure this derive exists to remove. Do not rename a field marked
-/// `#[shep(secret)]`.
+/// # Renames
+///
+/// A field is named here by its Rust identifier. A `#[serde(rename)]` on a
+/// marked field changes what the schema calls it, and the marker would then
+/// have no property to land on. That is caught where the marking happens, in
+/// `shep_client`, which refuses a name it cannot find rather than passing an
+/// unmarked credential on.
+///
+/// A `#[serde(rename_all)]` on a tagged enum renames the VARIANTS, not their
+/// fields, so a `url` inside one stays `url`. Measured against `schemars`
+/// 1.2.2 rather than assumed.
 ///
 /// # Compile errors
 ///
 /// Deliberate refusals, each with its own message:
 ///
-/// - an enum, a union, or a tuple struct, none of which has a named field for
-///   the schema to carry a property for;
-/// - `#[shep(...)]` on the struct itself, which marks nothing;
+/// - `#[shep(secret)]` on a field with no name, in a tuple struct or a tuple
+///   variant, where a schema has no named property for it to mark;
+/// - `#[shep(...)]` on the type or on a variant, neither of which is a field;
+/// - a union, which has no serde representation to build a schema from;
 /// - any option other than `secret`, which is the misspelling this crate is
 ///   here to catch.
 ///
-/// A struct with no fields, or with no field marked, is accepted: a dog whose
-/// config holds no credential still wants the impl.
+/// Everything else is accepted and simply carries no marks: a struct or a
+/// variant with no fields, an unmarked tuple, an enum of plain unit variants.
+/// A dog whose config holds no credential still wants the impl.
 #[proc_macro_derive(DogConfig, attributes(shep))]
 pub fn derive_dog_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -107,12 +126,25 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         ));
     }
 
-    let mut secrets = Vec::new();
+    let mut secrets: Vec<String> = Vec::new();
     for field in fields_of(input)? {
-        if is_secret(field)?
-            && let Some(ident) = &field.ident
-        {
-            secrets.push(ident.to_string());
+        if !is_secret(field)? {
+            continue;
+        }
+        let Some(ident) = &field.ident else {
+            return Err(syn::Error::new_spanned(
+                field,
+                "`#[shep(secret)]` cannot mark an unnamed field: a JSON Schema \
+                 property has a name and this field has none, so the mark would \
+                 have nothing to land on. Name the field.",
+            ));
+        };
+        let name = ident.to_string();
+        // Deduped rather than pushed blind: an internally tagged enum repeats
+        // a field name across its variants, the way a bark sink repeats
+        // `url`, and the list is names to look for rather than places to look.
+        if !secrets.contains(&name) {
+            secrets.push(name);
         }
     }
 
@@ -126,32 +158,36 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-/// The named fields of a struct, or the refusal that shape earns.
+/// Every field the type has, a struct's directly and an enum's gathered from
+/// its variants.
 ///
-/// A unit struct has no fields and gets an empty list rather than an error: a
-/// dog with nothing to configure is a real dog. A tuple struct is refused
-/// instead of being treated the same way, because it does have fields and an
-/// author marking one would reasonably expect the mark to land.
+/// Shapes that cannot hold a named field are not refused here, only left
+/// empty. A unit variant has nothing to mark, and an unmarked tuple is a
+/// config type someone wrote for other reasons. What is refused is a mark
+/// that cannot land, and [`expand`] does that once it knows which fields
+/// carry one, so the rule stays the same wherever the field came from.
 fn fields_of(input: &DeriveInput) -> syn::Result<Vec<&Field>> {
-    let refusal = |what: &str| {
-        Err(syn::Error::new_spanned(
-            &input.ident,
-            format!(
-                "`DogConfig` cannot be derived for {what}: a dog's config is a \
-                 struct with named fields, since `#[shep(secret)]` marks one of \
-                 them by the name it carries in the schema",
-            ),
-        ))
-    };
-
     match &input.data {
-        Data::Struct(data) => match &data.fields {
-            Fields::Named(named) => Ok(named.named.iter().collect()),
-            Fields::Unit => Ok(Vec::new()),
-            Fields::Unnamed(_) => refusal("a tuple struct"),
-        },
-        Data::Enum(_) => refusal("an enum"),
-        Data::Union(_) => refusal("a union"),
+        Data::Struct(data) => Ok(data.fields.iter().collect()),
+        Data::Enum(data) => {
+            let mut fields = Vec::new();
+            for variant in &data.variants {
+                if let Some(attr) = find_shep_attribute(&variant.attrs) {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "`#[shep(secret)]` marks a field, not a variant: move \
+                         it onto the field inside that holds the credential",
+                    ));
+                }
+                fields.extend(variant.fields.iter());
+            }
+            Ok(fields)
+        }
+        Data::Union(_) => Err(syn::Error::new_spanned(
+            &input.ident,
+            "`DogConfig` cannot be derived for a union: a union has no serde \
+             representation, so there is no schema for a mark to go into",
+        )),
     }
 }
 

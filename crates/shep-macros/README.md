@@ -9,15 +9,23 @@ fields is a credential.
 use shep_client::dogs::DogConfig;
 
 #[derive(serde::Deserialize, schemars::JsonSchema, DogConfig)]
-struct Sink {
-    kind: SinkKind,
-    #[shep(secret)]
-    url: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Sink {
+    Discord {
+        #[shep(secret)]
+        url: String,
+    },
+    Slack {
+        #[shep(secret)]
+        url: String,
+    },
 }
 ```
 
 A field marked `#[shep(secret)]` reaches shep carrying the `x-shep-secret`
-schema extension, and shep shows `<set>` in place of the value.
+schema extension, and shep shows `<set>` in place of the value. A struct works
+the same way; the enum is here because a bark sink is one, tagged by kind,
+with a webhook URL in every variant.
 
 Depend on `shep-client` rather than on this crate: it re-exports the derive
 next to the trait the derive implements, so a dog takes one dependency.
