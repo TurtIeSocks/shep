@@ -766,12 +766,12 @@ Expected: FAIL, the enable leaves a `[dog.<name>]` table behind.
 
 - [ ] **Step 3: Decide where a scaffold belongs, and say why in the code**
 
-`enable_dog` must stop writing into `shep.toml`'s `[dog]` table. Two defensible destinations and the choice is yours to argue at the call site:
+`enable_dog` must stop writing into `shep.toml`'s `[dog]` table, and it scaffolds nothing in its place. Two destinations were defensible when this was written and the implementation picked the first:
 
-- Scaffold nothing. `dog_section` already documents an absent section as legitimate and answers an empty string, so a dog enables and runs on its defaults until someone configures it.
-- Scaffold `[<name>]` into `dogs.toml` instead, keeping the original intent that enabling a dog gives an operator somewhere to write.
+- **Scaffold nothing, which is what shipped.** `dog_section` already documents an absent section as legitimate and answers an empty string, so a dog enables and runs on its defaults until someone configures it. Smaller, and it cannot collide.
+- Scaffold `[<name>]` into `dogs.toml` instead. Rejected: it preserves a nicety at the cost of putting `ShepToml`, which owns one file, in the position of writing another.
 
-The first is smaller and cannot collide. The second preserves a nicety and puts `ShepToml`, which owns one file, in the position of writing another. Whichever you pick, the doc comment says which and why.
+The doc comment on `enable_dog` says which and why. The empty tables an older `shep enable` already scaffolded are a separate matter and the migration handles them: skipped on the source side, written over on the destination side, never a refusal.
 
 - [ ] **Step 4: Make `rehome` forget both files**
 

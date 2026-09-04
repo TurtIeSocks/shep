@@ -84,10 +84,19 @@ parse. This is not optional politeness: delete that field and every existing
 file with a `[dog.bark]` section stops parsing, the daemon refuses to boot, and
 the flock goes unsupervised at upgrade time.
 
-On boot, any `[dog.*]` section present is moved into `dogs.toml` and struck
-from `shep.toml` in one `ShepToml::edit`, and shep reports what moved. One
-transition, one source of truth after it, no window where both files hold a
-value for the same key.
+On boot, any `[dog.*]` section carrying values is moved into `dogs.toml` and
+struck from `shep.toml` in one `ShepToml::edit`, and shep reports what moved.
+One transition, one source of truth after it, no window where both files hold
+a value for the same key.
+
+An EMPTY `[dog.<name>]` is skipped rather than moved, and an empty `[<name>]`
+already in `dogs.toml` is written over rather than refused. Every `shep enable`
+older than this change scaffolds the first shape, so a mixed-version host keeps
+producing it; counting a header as a value made the new binary refuse the whole
+migration and the daemon exited 4. The refusal is for two VALUES under one
+name, which is the only case shep would have to guess between. A header holds
+nothing to guess about, and it goes with the rest of the `[dog]` table when the
+migration strikes it.
 
 After that boot the `dog` field is a recognized key that is always empty.
 Removing it from the struct is a later breaking change with its own
