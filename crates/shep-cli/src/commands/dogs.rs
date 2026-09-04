@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use shep_client::{Client, ConnectError, PROTOCOL_VERSION};
 use shep_core::barks;
+use shep_core::dogs::{DogVersion, VERSION_FLAG, parse_version_answer};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{DogSource, Request, Response, SelectorSpec};
 
@@ -863,16 +864,6 @@ pub struct VettedBinary {
     pub answer: Option<DogVersion>,
 }
 
-/// The flag [`vet_binary`] asks a candidate with, and the one
-/// `docs/dogs.md` publishes as the contract.
-const VERSION_FLAG: &str = "--version";
-
-/// The one key [`parse_version_answer`] reads. Every other `shep-` key is
-/// reserved for a number this shep has not heard of, and is ignored rather
-/// than refused, so a dog written against a later contract stays adoptable
-/// by this one.
-const SHEP_PROTOCOL_KEY: &str = "shep-protocol";
-
 /// How long [`ask_version`] gives a binary to answer, and separately how
 /// long it then waits for that answer to reach the reader thread.
 ///
@@ -900,54 +891,6 @@ pub(crate) const VERSION_BUDGET: Duration = Duration::from_secs(1);
 /// [`macos_deferred_exec_failure`]'s own polled-with-a-budget shape rather
 /// than inventing a second one.
 const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(2);
-
-/// What a candidate answered to `--version`, parsed by
-/// [`parse_version_answer`] from the format `docs/dogs.md` publishes.
-///
-/// The two fields answer different questions and only one of them can
-/// refuse an adopt: see [`AdoptRefusal::ProtocolMismatch`].
-#[derive(Debug, PartialEq, Eq)]
-/// What a dog answered `--version` with.
-///
-/// Two numbers rather than one, because they answer different questions:
-/// `protocol` decides whether the dog can handshake at all, and `version`
-/// only says which build it is. A dog may give the second and not the
-/// first, which is why `protocol` is optional and an absent one is unknown
-/// rather than incompatible.
-pub struct DogVersion {
-    /// The last whitespace-separated field of line 1 -- the version. The
-    /// name before it is ignored, so a crate whose name differs from the
-    /// dog's registered name answers correctly without knowing it.
-    pub version: String,
-    /// The `shep-protocol` line's value, and `None` when the answer carried
-    /// no such line or carried one that is not a decimal number. Answering
-    /// is optional, so `None` is an unknown protocol rather than a fault.
-    pub protocol: Option<u32>,
-}
-
-/// Parses the format `docs/dogs.md` publishes: `<name> <version>` on line
-/// 1, then `<key>: <value>` lines.
-///
-/// `None` when there is no line 1 to read a version from. Everything past
-/// that is tolerated rather than refused -- unknown keys, blank lines, key
-/// order, and a `shep-protocol` that is not a number -- because a shep that
-/// refuses a dog over the shape of text the dog never promised to print is
-/// refusing on its own guess. The strictness is all in the other direction:
-/// only an exact [`SHEP_PROTOCOL_KEY`] carrying a decimal is believed, and
-/// only a believed protocol can refuse.
-fn parse_version_answer(text: &str) -> Option<DogVersion> {
-    let mut lines = text.lines();
-    let version = lines.next()?.split_whitespace().next_back()?.to_string();
-    let mut protocol = None;
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':')
-            && key.trim() == SHEP_PROTOCOL_KEY
-        {
-            protocol = value.trim().parse().ok();
-        }
-    }
-    Some(DogVersion { version, protocol })
-}
 
 /// Drains `stdout` to end on a thread, handing the text back through the
 /// returned channel.
