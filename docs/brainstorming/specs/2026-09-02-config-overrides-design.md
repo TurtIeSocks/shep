@@ -157,8 +157,11 @@ section claimed it was.** There are two independent choices, but the second
 one has three settings rather than two: policy can go untouched, or back to
 what the template declares, or back for every key including the ones the
 template never named. Six combinations exist. These four are the ones worth
-having, and the discarded two are both modes that reset undeclared keys while
-sparing declared ones, which is an operation nobody wants.
+having. One discarded combination resets nothing at all, so it is the
+additive default with extra typing. The other is `file` plus `env`: reset
+env, and reset only what the template declares, sparing everything it does
+not. That one is coherent, not useless: it is simply left out because
+nobody has asked for it.
 
 The grid framing produced a real defect before it was caught. Under it, `env`
 was the baseline reset plus env, so `--reset=env` also put back every field
