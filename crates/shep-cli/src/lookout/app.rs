@@ -943,7 +943,8 @@ impl Settings {
 
     /// Records the terminal's height.
     pub fn set_rows(&mut self, rows: usize) {
-        self.view.set_rows(rows);
+        let len = self.rows().len();
+        self.view.set_rows(rows, len);
     }
 }
 

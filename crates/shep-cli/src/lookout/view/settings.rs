@@ -639,7 +639,7 @@ fn content_lines(
             // for an empty payload.
             lines.extend(dogs_header);
         } else {
-            let mut pending_header = dogs_header;
+            let mut pending_dogs_header = dogs_header;
             for (index, dog) in dogs.iter().enumerate() {
                 let global_index = row_index + index;
                 if global_index < offset {
@@ -648,7 +648,7 @@ fn content_lines(
                 if visible_rows > 0 && emitted >= visible_rows {
                     break;
                 }
-                lines.extend(pending_header.drain(..));
+                lines.extend(pending_dogs_header.drain(..));
                 let selected = cursor == Some(SettingsRow::Dog(index));
                 lines.push(dog_line(dog, rendered_columns, table_width, selected));
                 emitted += 1;

@@ -49,9 +49,9 @@ impl Viewport {
 
     /// Records the terminal's height, and pulls the cursor back into view
     /// if the terminal shrank under it.
-    pub fn set_rows(&mut self, rows: usize) {
+    pub fn set_rows(&mut self, rows: usize, len: usize) {
         self.rows = rows;
-        self.ensure_visible();
+        self.ensure_visible(len);
     }
 
     /// Moves by `delta`, clamped to `0..len` rather than wrapping, the same
@@ -64,7 +64,7 @@ impl Viewport {
         }
         let next = self.cursor as isize + delta;
         self.cursor = next.clamp(0, len as isize - 1) as usize;
-        self.ensure_visible();
+        self.ensure_visible(len);
     }
 
     /// Jumps to `index`, clamped.
@@ -75,24 +75,12 @@ impl Viewport {
             return;
         }
         self.cursor = index.min(len - 1);
-        self.ensure_visible();
+        self.ensure_visible(len);
     }
 
     /// Clamps to a list that may have shrunk since the last move.
-    ///
-    /// `move_by`'s own `ensure_visible` only pulls the offset toward a
-    /// cursor that moved; it never shrinks an offset that was already valid
-    /// for the old, longer list but now overshoots the new one (an offset
-    /// near the old bottom, with the new list too short to fill the
-    /// screen from there). Capping it to `len - rows` here is what keeps
-    /// the cursor's last known screen position -- last visible row -- true
-    /// after the list under it shrinks, rather than leaving blank rows
-    /// below a cursor that is still, technically, in view.
     pub fn clamp(&mut self, len: usize) {
         self.move_by(0, len);
-        if self.rows > 0 {
-            self.offset = self.offset.min(len.saturating_sub(self.rows));
-        }
     }
 
     /// Rows above the first drawn one.
@@ -110,7 +98,14 @@ impl Viewport {
         len.saturating_sub(self.offset + self.rows)
     }
 
-    fn ensure_visible(&mut self) {
+    /// Pulls the offset back to whatever keeps the cursor visible, and caps
+    /// it to `len - rows` -- every entry point above routes through here
+    /// with its own `len`, so a list that shrank between two calls (a
+    /// `move_by` after keys were removed from underneath, with no `clamp`
+    /// in between) cannot leave a stale offset past the end of the new,
+    /// shorter list, the same way `move_by` and `move_to`'s own cursor
+    /// clamp already cannot leave a stale cursor.
+    fn ensure_visible(&mut self, len: usize) {
         if self.rows == 0 {
             return;
         }
@@ -119,6 +114,7 @@ impl Viewport {
         } else if self.cursor >= self.offset + self.rows {
             self.offset = self.cursor + 1 - self.rows;
         }
+        self.offset = self.offset.min(len.saturating_sub(self.rows));
     }
 }
 
@@ -137,7 +133,7 @@ mod tests {
     #[test]
     fn moving_past_the_bottom_pulls_the_offset_so_the_cursor_is_the_last_visible_row() {
         let mut v = Viewport::new();
-        v.set_rows(10);
+        v.set_rows(10, 100);
         v.move_by(15, 100);
         assert_eq!(v.cursor(), 15);
         assert_eq!(v.offset(), 6, "rows 6..=15 are visible");
@@ -146,7 +142,7 @@ mod tests {
     #[test]
     fn moving_back_above_the_top_pulls_the_offset_to_the_cursor() {
         let mut v = Viewport::new();
-        v.set_rows(10);
+        v.set_rows(10, 100);
         v.move_by(30, 100);
         v.move_by(-28, 100);
         assert_eq!(v.cursor(), 2);
@@ -156,7 +152,7 @@ mod tests {
     #[test]
     fn the_cursor_clamps_to_the_list_rather_than_wrapping() {
         let mut v = Viewport::new();
-        v.set_rows(10);
+        v.set_rows(10, 100);
         v.move_by(-5, 100);
         assert_eq!(v.cursor(), 0);
         v.move_by(500, 100);
@@ -167,7 +163,7 @@ mod tests {
     #[test]
     fn an_empty_list_leaves_the_cursor_and_offset_at_zero() {
         let mut v = Viewport::new();
-        v.set_rows(10);
+        v.set_rows(10, 100);
         v.move_by(3, 0);
         assert_eq!((v.cursor(), v.offset()), (0, 0));
     }
@@ -175,7 +171,7 @@ mod tests {
     #[test]
     fn hidden_counts_say_how_much_is_off_screen_either_side() {
         let mut v = Viewport::new();
-        v.set_rows(10);
+        v.set_rows(10, 100);
         v.move_to(45, 100);
         assert_eq!(v.hidden_above(), v.offset());
         assert_eq!(v.hidden_below(100), 100 - v.offset() - 10);
@@ -185,7 +181,7 @@ mod tests {
     #[test]
     fn shrinking_the_list_under_the_cursor_clamps_it_back() {
         let mut v = Viewport::new();
-        v.set_rows(10);
+        v.set_rows(10, 100);
         v.move_to(45, 100);
         v.clamp(20);
         assert_eq!(v.cursor(), 19);
@@ -195,10 +191,24 @@ mod tests {
     #[test]
     fn a_shorter_terminal_brings_the_cursor_back_into_view() {
         let mut v = Viewport::new();
-        v.set_rows(30);
+        v.set_rows(30, 100);
         v.move_to(25, 100);
         assert_eq!(v.offset(), 0);
-        v.set_rows(10);
+        v.set_rows(10, 100);
         assert_eq!(v.offset(), 16, "the cursor is still the last visible row");
+    }
+
+    /// A list that shrinks between two `move_by` calls with no `clamp` in
+    /// between -- the shape `content_lines`' env sub-screen exercises once
+    /// it can remove a key out from under the cursor. `move_by` must catch
+    /// the stale offset on its own; nothing here ever calls `clamp`.
+    #[test]
+    fn a_move_after_the_list_shrinks_catches_the_stale_offset_without_a_clamp() {
+        let mut v = Viewport::new();
+        v.set_rows(10, 100);
+        v.move_to(90, 100);
+        v.move_by(0, 20);
+        assert_eq!(v.offset(), 10);
+        assert_eq!(v.cursor(), 19);
     }
 }
