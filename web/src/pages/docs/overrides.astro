@@ -265,6 +265,11 @@ const store = `$ cat $SHEP_HOME/overrides.json
       nothing at all, because the key is one somebody has already set:
     </p>
     <CodeBlock>{established}</CodeBlock>
+    <Callout variant="careful">
+      <code>--reset</code> and <code>--reset-all</code> are gone, with no
+      alias for either: <code>--reset=&lt;mode&gt;</code> replaces both, and
+      the mode is required.
+    </Callout>
     <p>
       <code>--reset=&lt;mode&gt;</code> is what puts the file back in charge,
       and the mode is required: shep asks you to name the destruction rather
