@@ -505,6 +505,10 @@ Expected: FAIL, `cannot find function 'migrate_dog_sections'`.
 /// - [`DogMigrationError::Parse`] when `dogs.toml` exists and is not valid
 ///   TOML, and [`DogMigrationError::Render`] when the merged map will not
 ///   serialize.
+/// - [`DogMigrationError::SectionsUnreadable`] when the source declared a
+///   dog under `[dog]` that `take_dog_sections` did not hand back. The
+///   sections are struck by then, so refusing is the only answer that
+///   does not lose them. It reaches an operator as a refused boot.
 /// - [`DogMigrationError::Read`] and [`DogMigrationError::Write`] for the
 ///   underlying I/O, [`DogMigrationError::Lock`] when `dogs.toml`'s
 ///   sibling lock could not be taken, and [`DogMigrationError::Toml`] for
