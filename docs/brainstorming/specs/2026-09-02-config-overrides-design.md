@@ -133,14 +133,39 @@ the template now said, a merged pull request would be a path into a running
 flock: `user = "root"`, a changed `script`, a swapped `NODE_ENV`. Splitting on
 the argument type closes that without a flag anyone can alias on by default.
 
-### 3. A file load is additive, and two flags widen it
+### 3. A file load is additive, and one flag widens it four ways
 
-- No flag: append keys that are **not in the established set**. Never
-  overwrite.
-- `--reset`: put non-env process settings back to the template. Keep env and
-  keep operator-added keys.
-- `--reset-all`: put everything back to the template and delete operator-added
-  keys.
+No flag appends keys that are **not in the established set** and overwrites
+nothing. That is the whole default, and it stays the default because a
+Flockfile arrives from the app's own repository through a pull request:
+somebody merges, a deploy runs `shep start Flockfile.toml`, and nobody typed
+anything. An operator who set `max_memory = "2G"` on a box that was OOMing must
+not lose it to a merge that touched an unrelated line.
+
+Widening it takes `--reset=<mode>`, and the mode is required. Four values,
+because there are exactly two axes and no more:
+
+| mode | `env` | keys the template does not declare |
+| --- | --- | --- |
+| `file` | kept | kept |
+| `policy` | kept | dropped |
+| `env` | reset | kept |
+| `all` | reset | dropped |
+
+`policy` and `env` are the two halves this design already splits config into,
+one paragraph down, so the flag values and the prose use one vocabulary rather
+than two. `file` is named for the thing the operator is looking at: it puts
+back what the file actually says and leaves everything the file has no opinion
+about alone. `all` is the only mode that is strictly the most, and the set is
+deliberately not a ladder, because `env` and `policy` are different axes rather
+than different sizes.
+
+**`--reset` with no value is an error that prints the table.** A destructive
+verb should make an operator name the destruction, the way `git reset` makes
+them choose between `--soft`, `--mixed` and `--hard`. The value is required
+with an equals sign, `--reset=file`, because `StartArgs.targets` is a greedy
+variadic positional and a space-separated value next to one of those is where
+argument parsing gets ambiguous.
 
 **"Not in the established set" is the definition that matters**, and it must
 not be implemented as "equals the default". Every `AppConfig` field always has
@@ -159,14 +184,22 @@ an app where nobody set one, which is inside the trust already extended to a
 file whose `script` you execute, and is written down here rather than left to
 be discovered.
 
-`--reset` skipping env is a special case and the right one. Env is
-operator-supplied data; the rest is operator-tuned policy. Resetting policy is
-recoverable, resetting data takes the app's database away.
+**`file` is the mode that fixes a footgun rather than adding a feature.** A
+reset that also resets what the template is silent about is how an app stocked
+to four instances drops to one against a file with no `instances` line: the
+compiled default wins an argument the file never entered. Under `file` there is
+nothing to put back, so the count survives. `policy` keeps the old behaviour for
+an operator who genuinely wants the box returned to a clean template.
 
-The original complaint is fixed by `--reset`, not by the default:
+Env skipping is a special case and the right one for `file` and `policy`. Env is
+operator-supplied data; the rest is operator-tuned policy. Resetting policy is
+recoverable, resetting data takes the app's database away. `env` and `all` exist
+for the operator who means it.
+
+The original complaint is fixed by a reset, not by the default:
 `instances = 5` edited into a template reaches a running app through
-`shep start Flockfile.toml --reset`, which routes to the existing scale path
-and leaves the running instances alone.
+`shep start Flockfile.toml --reset=file`, which routes to the existing scale
+path and leaves the running instances alone.
 
 ### 4. A load never kills a process and never prunes
 
@@ -249,7 +282,7 @@ the muster restore of a sheep saved while stopped.
 means deciding there, not here."* So the work is a request variant, an rpc arm
 and a verb, not new supervisor machinery.
 
-`--reset` and `--reset-all` apply, since the load path is shared. On an app
+Every `--reset=<mode>` applies, since the load path is shared. On an app
 that is already running it appends config and leaves it running: refusing would
 break re-running it after a template edit, and stopping it would break decision
 4. An added app has `instances_running = 0`, so `restorable()` will not bring
@@ -507,8 +540,12 @@ sheep.
 
 - an established key is not overwritten by a later file load
 - a key absent from the established set is appended by a later file load
-- `--reset` restores process settings and leaves env alone
-- `--reset-all` deletes operator-added keys
+- `--reset=file` restores what the template declares and leaves everything
+  it is silent about alone, including an instance count the file never mentions
+- `--reset=policy` restores process settings, declared or not, and leaves env
+- `--reset=env` restores env and leaves policy
+- `--reset=all` restores both and deletes operator-added keys
+- `--reset` with no value is a usage error that prints the four modes
 - a G3 override lands as pending and does not touch the running child
 - `shep reload` promotes pending, and promoting a `user` change resets
   `credentials` to `Unresolved`
@@ -563,5 +600,5 @@ that catches a wrong prop; a build stays green on one.
   set is what that file declared. No override store exists yet, and additive
   append is a no-op on the first run.
 - **`shep stock` behaves identically** from the outside. It now writes an
-  override rather than the spec directly, and `--reset-all` is the way to
+  override rather than the spec directly, and `--reset=all` is the way to
   discard one.
