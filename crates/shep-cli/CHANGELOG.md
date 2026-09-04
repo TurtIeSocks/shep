@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-04
+
+### Added
+
+- Replace --reset/--reset-all with --reset=<mode>
+
+### Changed
+
+- ResetDepth gains File and Env, Settings becomes Policy **(BREAKING)**
+
+### Fixed
+
+- Drive --reset through value_enum instead of a bespoke parser
+- A reset refusal echoes the mode the operator typed
+
+
 ## [0.1.34] - 2026-09-04
 
 ### Changed
