@@ -4,12 +4,13 @@
 //! # Why this lives here and not in the crate that asks or the crate that answers
 //!
 //! `shep-cli`'s `adopt` spawns a candidate binary with [`VERSION_FLAG`] and
-//! parses what it prints; `shep-client` (the dog side) will answer that same
-//! flag from `shep_client::dogs::probe`. Both sides read a string a dog
-//! author currently hand-types from a snippet in `docs/dogs.md`, so a typo
-//! reads as "protocol unknown" and nothing says so. One definition, owned by
-//! the crate both already depend on, is what lets the asker and the answerer
-//! agree by construction instead of by copying a doc snippet correctly.
+//! [`SCHEMA_FLAG`] and parses what it prints; `shep-client` (the dog side)
+//! answers both from `shep_client::dogs::probe`. Before that call existed,
+//! both sides read a string a dog author hand-typed from a snippet in
+//! `docs/dogs.md`, so a typo read as "protocol unknown" and nothing said so.
+//! One definition, owned by the crate both already depend on, is what lets
+//! the asker and the answerer agree by construction instead of by copying a
+//! doc snippet correctly.
 //!
 //! The asker itself (spawning the binary, applying the timeout, deciding
 //! whether an unknown protocol refuses an adopt) stays in `shep-cli`,
@@ -30,8 +31,9 @@
 pub const VERSION_FLAG: &str = "--version";
 
 /// The flag a candidate is spawned with when shep asks for its config
-/// schema. Unused today: `shep_client::dogs::probe` starts answering it in
-/// a later task, and the reader that acts on the answer arrives with it.
+/// schema. Asked by `shep-cli`'s `adopt`, beside the version and on the
+/// same terms: a dog that answers nothing is refused nothing. Answered by
+/// `shep_client::dogs::probe`.
 pub const SCHEMA_FLAG: &str = "--schema";
 
 /// The one key [`parse_version_answer`] reads in a `--version` answer.
@@ -41,12 +43,12 @@ pub const SCHEMA_FLAG: &str = "--schema";
 pub const SHEP_PROTOCOL_KEY: &str = "shep-protocol";
 
 /// The schemars extension key that marks a config field as a credential.
-/// Unused today: the `DogConfig` derive that expands to it, and the reader
-/// in `shep lookout` that redacts a field carrying it, both arrive in a
-/// later task. Getting this string right matters more than the other three
-/// here, because a typo in it does not fail loudly: the schema still
-/// validates, the field is simply not marked, and a credential can end up
-/// rendered on screen.
+/// Written by the `DogConfig` derive, which exists so that no dog author
+/// ever types it; the reader in `shep lookout` that redacts a field
+/// carrying it arrives in a later task. Getting this string right matters
+/// more than the other three here, because a typo in it does not fail
+/// loudly: the schema still validates, the field is simply not marked, and
+/// a credential can end up rendered on screen.
 pub const SECRET_KEY: &str = "x-shep-secret";
 
 /// What a dog answered [`VERSION_FLAG`] with, parsed by
