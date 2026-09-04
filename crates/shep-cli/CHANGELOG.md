@@ -13,6 +13,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-04
+
+### Added
+
+- ShepToml can read and write shep.toml's six scalars
+- A settings snapshot that keeps absent apart from defaulted
+- S opens a settings screen, read-only for now
+- The settings screen renders, with a source per scalar
+- The four closed scalars arm, confirm and write
+- Socket and max_cron_sleep get an editor, and can be unset
+- Per-dog toggles, applying live through the shepherd
+
+### Changed
+
+- One name reaches both the topic and the re-read request
+- The text keymap is named for text, not for the filter
+- A dog toggle's config decision, apart from its reporting
+
+### Fixed
+
+- Silence ShepToml's dead-code lint and close two test gaps
+- Unix-only settings test, closed boolean grammar, dead reader
+- Close the settings/action race, thread the resolved style
+- Close the settings/filter race the same way as the confirm one
+- Reload the row after a landed write, and un-contradict the status bar
+- Name what the shepherd did on a landed dog reply, cover on_dog_reply
+- Move the settings confirm to the status bar
+- Make the control gate a property of every settings write
+- Re-read the file after a landed dog toggle
+- The style row says what the layer above the file will do
+- Pay the selection gutter in the dogs table's own budget
+- The scalar rows adapt to width instead of clipping
+- The settings key hint answers to the control gate
+- An adopted dog carries a path in the fixtures and the gallery
+- Fit the settings confirm and editor lines like every other row
+- WriteAuthority::granted reads the app's own gate, not a bare Control
+- Name q quit on the settings screen's status bar
+- A settings write no longer parks the loop it was moved off
+
+
 ## [0.2.1] - 2026-09-04
 
 ### Changed
