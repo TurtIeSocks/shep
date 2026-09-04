@@ -461,7 +461,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use shep_client::testing::{fake_reconnecting_client_on, sample_ack, serve_one_request};
+    use shep_client::testing::{
+        Handshake, fake_daemon_across_handovers, fake_reconnecting_client_on, sample_ack,
+        serve_one_request,
+    };
 
     use super::*;
 
@@ -730,5 +733,70 @@ mod tests {
             debug.contains(&format!("section: \"<{byte_len} bytes>\"")),
             "{debug}"
         );
+    }
+
+    /// fails if bark stops asking for its own config topic. Everything
+    /// else about a config change is covered one layer down, against
+    /// `run_loop` directly, and all of it is unreachable if this
+    /// subscription is not made: a dog that never asked for
+    /// `config.dog.bark` is never sent one, and goes on running on a
+    /// section an operator has already edited with nothing to say so.
+    ///
+    /// Deleting the topic from the vec below leaves the whole suite green
+    /// without this test, which is how it came to be written.
+    ///
+    /// A handover fixture rather than `serve_one_request`: that one closes
+    /// after its single reply, so the `Subscribe` that follows a dog's
+    /// `DogConfig` is never read off the wire. This one keeps the
+    /// connection open and records every envelope, which is the only place
+    /// the topics a dog asked for are visible.
+    #[tokio::test]
+    async fn bark_subscribes_to_its_own_config_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = shep_client::testing::control_address(dir.path());
+        let daemon = fake_daemon_across_handovers(&socket, vec![Handshake::Accept(sample_ack())]);
+        // A section with a real sink, because bark refuses to run without
+        // one: the default rule set routes to every configured sink, and a
+        // rule routing nowhere is refused at `Rules::new`. Port 1 is never
+        // dialled -- no bark fires in this test.
+        daemon.reply_to_dog_config(
+            "[sinks.ops]\nkind = \"json\"\nurl = \"http://127.0.0.1:1/hook\"\n",
+        );
+        let paths = test_paths(dir.path(), socket);
+
+        let task = tokio::spawn(run_dog("bark", paths));
+
+        // Polled rather than slept on, and bounded: the fixture records
+        // envelopes as it reads them, so the test yields until the
+        // subscribe arrives and fails with its own message if it never
+        // does.
+        let topics =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let subscribed = daemon.envelopes().into_iter().find_map(|(_, envelope)| {
+                        match envelope.body {
+                            Request::Subscribe { topics } => Some(topics),
+                            _ => None,
+                        }
+                    });
+                    if let Some(topics) = subscribed {
+                        break topics;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bark must subscribe once its config parses");
+
+        assert!(
+            topics.iter().any(|topic| topic == "config.dog.bark"),
+            "bark must ask for its own config topic: {topics:?}"
+        );
+        assert!(
+            topics.iter().any(|topic| topic == "process.*"),
+            "the lifecycle topics every rule reads must survive: {topics:?}"
+        );
+
+        task.abort();
     }
 }
