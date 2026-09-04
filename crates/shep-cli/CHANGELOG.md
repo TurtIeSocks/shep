@@ -13,6 +13,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-09-04
+
+### Added
+
+- Dogs.toml gets a type and a path
+- ShepToml can take the dog sections out
+- Dog config moves to dogs.toml, migrated on boot
+
+### Fixed
+
+- Take_dog_sections keeps nested tables, arrays and inline tables
+- Dogs.toml is written at 0600 through the same staged rename shep.toml uses
+- The migration refuses on a dog entry that would be dropped, by name
+- Dog help text stops naming shep.toml for a key that moved
+- Shep enable stops scaffolding a section the next boot refuses
+- Shep rehome forgets a dog in dogs.toml too, not just shep.toml
+- Dogs.toml gets the lock shep.toml has, across both its writers
+- The dog migration runs before a reload signals the predecessor
+- Shep runtime migrates dog config, like every other boot
+- DogsConfigError's Debug no longer prints dogs.toml
+- Both writers of dogs.toml keep an operator's comments
+- An empty [dog.<name>] is not a second value to refuse
+- The last string sending an operator to [dog.bark.sinks]
+- A header spelled with spaces stranded its dog section forever
+- A bare header in dogs.toml refused a section carrying values
+- The moved section was not appended, though the comment said it was
+
+
 ## [0.1.31] - 2026-09-03
 
 ### Added

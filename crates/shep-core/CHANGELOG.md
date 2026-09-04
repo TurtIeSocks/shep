@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-09-04
+
+### Added
+
+- Dogs.toml gets a type and a path
+
+### Fixed
+
+- DogsConfigError's Debug no longer prints dogs.toml
+
+
 ## [0.1.31] - 2026-09-03
 
 ### Added
