@@ -917,6 +917,27 @@ impl App {
                         // `self.settings` becomes `Some`, so clearing here
                         // covers both the keypress and the race.
                         self.action = None;
+                        // The sibling race: `s`, then `/`, then a snapshot
+                        // landing while the box is still open. `on_key`
+                        // checks `self.mode == InputMode::Text` ahead of the
+                        // settings check, and `on_text_key` never consults
+                        // `self.settings`, so an open box would survive the
+                        // screen opening and keep eating every keystroke the
+                        // settings keymap was meant to own. Leaving text
+                        // mode here makes that state unrepresentable, the
+                        // same way clearing `self.action` above does for a
+                        // confirm.
+                        //
+                        // The query itself is kept, not cleared: this is
+                        // `TextApply`'s reading (Enter), not
+                        // `TextAbandon`'s (Esc). The operator was watching
+                        // the dashboard filter live while `/` was open --
+                        // the read had not landed yet -- so the characters
+                        // they typed are a real query they chose to build,
+                        // not a stray keystroke. Discarding it on the way
+                        // out would be the one filter edit in this whole
+                        // screen that vanishes without an Esc.
+                        self.mode = InputMode::Normal;
                         self.settings = Some(Settings::new(snapshot));
                     }
                     Err(message) => {
@@ -3920,6 +3941,39 @@ mod tests {
         assert!(
             app.action().is_none(),
             "no armed action may survive the screen opening"
+        );
+    }
+
+    /// fails if the filter box survives the screen opening the same way an
+    /// armed action almost did. `s` raises `Effect::LoadSettings` while
+    /// `self.settings` is still `None`, so `/` reaches `on_key`'s ordinary
+    /// dispatch and opens the box; once the read lands, `on_key`'s
+    /// `self.mode == InputMode::Text` check runs ahead of the settings
+    /// branch, so every key after this would keep landing in
+    /// `on_text_key` and never reach `on_settings_key` at all. The query
+    /// is kept rather than cleared -- `TextApply`'s reading, argued at the
+    /// fix's own call site.
+    #[test]
+    fn opening_the_screen_closes_a_filter_box_left_open_while_the_read_was_in_flight() {
+        let mut app = fixtures::allowed_app();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Key(KeyPress::FilterStart));
+        let _ = app.update(Msg::Key(KeyPress::TextChar('w')));
+        let _ = app.update(Msg::Key(KeyPress::TextChar('e')));
+        assert_eq!(app.mode(), InputMode::Text, "the box is open before the read lands");
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert!(app.settings().is_some(), "the screen opened");
+        assert_eq!(
+            app.mode(),
+            InputMode::Normal,
+            "the box must not survive the screen opening"
+        );
+        assert_eq!(
+            app.filter(),
+            "we",
+            "the typed query is kept, not discarded"
         );
     }
 
