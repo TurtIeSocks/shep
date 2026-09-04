@@ -38,25 +38,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// Mode `barks.jsonl` (and the temp file it is rewritten through) is
-/// created with: owner read/write, nobody else.
-///
-/// `$SHEP_HOME` itself is already `0700` (`boot::DIR_MODE` in
-/// `shep-daemon`), so this is belt-and-braces, not the only guard between
-/// this file and another local user — and it is belt-and-braces for a
-/// different reason than `snapshot::write_atomic`'s own `0600`. That file
-/// holds `AppConfig::env` verbatim, a real secret. This one does not: a
-/// [`Bark`] carries a rule name, a subject and a message, and
-/// [`SinkOutcome`] names a sink by its `[dog.bark.sinks]` config key,
-/// never by the webhook URL or token behind it. The mode stays tight
-/// anyway, matching the rest of `$SHEP_HOME`'s posture (spec §10: no
-/// other user, at all) and because this is still a record of what the
-/// shepherd told an outside service — and so that a future field that DID
-/// carry a URL would arrive into a file that was already narrow, not one
-/// that has to widen for it.
-#[cfg(unix)]
-const BARK_FILE_MODE: u32 = 0o600;
-
 /// Cap the ring keeps itself under when nobody configured one.
 pub const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -259,7 +240,7 @@ fn ring_bytes(lines: &[String]) -> u64 {
 /// reaches `write_ring` by another route.
 fn write_ring(path: &Path, lines: &[String]) -> Result<(), BarkError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = create_ring_file(parent)?;
+    let mut tmp = crate::atomic_file::create_staging_file(parent, "barks", ".tmp")?;
 
     for line in lines {
         tmp.write_all(line.as_bytes())?;
@@ -276,32 +257,6 @@ fn write_ring(path: &Path, lines: &[String]) -> Result<(), BarkError> {
     // that published them durable. See `shep_core::atomic_file`.
     crate::atomic_file::sync_dir(parent)?;
     Ok(())
-}
-
-/// Creates the staging file the ring is rewritten through, in `parent` so
-/// the later `rename` stays within one filesystem.
-///
-/// Mode-at-creation rather than a separate `chmod` pass ([`tempfile`]
-/// passes these permissions to the `open` call itself): there is no window
-/// where the file sits at whatever the process umask leaves it, the same
-/// TOCTOU `boot::create_dir_at_dir_mode`'s own doc explains for
-/// directories. On Windows the permissions are left alone — there is no
-/// unix permission-bit equivalent (the same split
-/// `snapshot::write_atomic`'s own `write_atomic_is_owner_only_on_unix`
-/// test uses) — and `tempfile`'s own default is already owner-only on
-/// unix, so this call only makes that choice explicit rather than
-/// inherited.
-fn create_ring_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("barks").suffix(".tmp");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(BARK_FILE_MODE));
-    }
-
-    builder.tempfile_in(parent)
 }
 
 /// An exclusive advisory lock over one bark ring, held for as long as the
@@ -347,7 +302,7 @@ impl RingLock {
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(BARK_FILE_MODE)
+            .mode(crate::atomic_file::OWNER_ONLY_FILE_MODE)
             .open(lock_path(path))?;
 
         // `LockExclusive` blocks; the non-blocking variant would need a
@@ -645,11 +600,14 @@ mod tests {
         );
     }
 
-    /// fails if the ring lands wider than owner-only. `Bark` carries no
-    /// credential today (see [`BARK_FILE_MODE`]'s own doc), but this file
-    /// is still a record of what the shepherd told an outside service, and
-    /// the mode is the one guarantee a reader of this test can check
-    /// without a live process.
+    /// fails if the ring lands wider than owner-only. A `Bark` carries no
+    /// credential today: it holds a rule name, a subject and a message,
+    /// and a [`SinkOutcome`] names a sink by its config key rather than by
+    /// the webhook URL behind it. The mode stays tight anyway, because
+    /// this file is still a record of what the shepherd told an outside
+    /// service, and because a future field that did carry a URL should
+    /// arrive into a file that is already narrow. See
+    /// [`crate::atomic_file::OWNER_ONLY_FILE_MODE`] for the shared value.
     #[cfg(unix)]
     #[test]
     fn append_creates_the_ring_owner_only_on_unix() {

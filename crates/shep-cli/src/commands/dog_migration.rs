@@ -84,7 +84,7 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
     // rather than an optimisation. `ShepToml::edit` and `try_edit` both
     // stage a temp file and rename it over the original whenever `save`
     // runs, so opening the document at all would give an untouched
-    // `shep.toml` a fresh inode, force `CONFIG_FILE_MODE` on it, and
+    // `shep.toml` a fresh inode, force `OWNER_ONLY_FILE_MODE` on it, and
     // replace a symlinked path with a plain file. Every boot after the
     // first reaches this line, so that cost would land on everyone.
     //
@@ -470,7 +470,7 @@ fn renumber_tables(item: &mut Item, next: &mut usize) {
 }
 
 /// Writes `rendered` to `path`: staged in a sibling temp file at
-/// `CONFIG_FILE_MODE`, `fsync`ed, then `rename`d over `path`.
+/// `OWNER_ONLY_FILE_MODE`, `fsync`ed, then `rename`d over `path`.
 ///
 /// The same three steps, through the same helper, that
 /// [`ShepToml::save`] writes `shep.toml` with, and for the same two
@@ -1189,7 +1189,7 @@ mod tests {
     /// identical either way. `ShepToml::edit` and `try_edit` stage a temp
     /// file and rename it over the original whenever `save` runs, so
     /// opening the document on an idle boot would hand an untouched
-    /// `shep.toml` a fresh inode, force `CONFIG_FILE_MODE` onto it, and
+    /// `shep.toml` a fresh inode, force `OWNER_ONLY_FILE_MODE` onto it, and
     /// turn a symlinked path into a plain file. Every boot after the first
     /// takes this path, so the cost lands on every operator.
     #[cfg(unix)]

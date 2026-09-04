@@ -42,16 +42,6 @@ use serde::{Deserialize, Serialize};
 /// downgrade that overwrites it. `kv.rs`'s `KV_VERSION` is the precedent.
 pub const OVERRIDES_VERSION: u32 = 1;
 
-/// Mode `overrides.json` (and the temp file it is rewritten through) is
-/// created with: owner read/write, nobody else.
-///
-/// `$SHEP_HOME` itself is already `0700`, so this is belt-and-braces, and
-/// it is the mode a `tar`, a `cp -p` or a backup carries out of that
-/// directory with the file, where no directory mode follows it. Same
-/// argument `kv::KV_FILE_MODE` records; this store holds `env` values too.
-#[cfg(unix)]
-const OVERRIDES_FILE_MODE: u32 = 0o600;
-
 /// One sheep's overrides: the fields an operator has set that its current
 /// Flockfile does not declare.
 ///
@@ -216,7 +206,7 @@ impl OverridesLock {
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(OVERRIDES_FILE_MODE)
+            .mode(crate::atomic_file::OWNER_ONLY_FILE_MODE)
             .open(lock_path(path))?;
 
         Flock::lock(file, FlockArg::LockExclusive)
@@ -269,26 +259,6 @@ impl OverridesLock {
     }
 }
 
-/// Creates the staging file the store is rewritten through, in `parent` so
-/// the later `rename` stays within one filesystem.
-///
-/// Mode-at-creation rather than a separate `chmod` pass: there is no window
-/// where the file sits at whatever the process umask leaves it. The unique
-/// name (not a fixed `.tmp`) is what keeps two writers' renames from
-/// consuming each other's staging file: see this module's own doc.
-fn create_overrides_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("overrides").suffix(".tmp");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(OVERRIDES_FILE_MODE));
-    }
-
-    builder.tempfile_in(parent)
-}
-
 /// Reads `path` under the lock the caller already holds.
 ///
 /// A missing file reads as an empty, current-version store: a fresh
@@ -313,7 +283,7 @@ fn read_file(path: &Path) -> Result<OverridesFile, OverridesError> {
 /// own doc for the staged-temp-file-then-rename shape.
 fn write_file(path: &Path, file: &OverridesFile) -> Result<(), OverridesError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = create_overrides_file(parent)?;
+    let mut tmp = crate::atomic_file::create_staging_file(parent, "overrides", ".tmp")?;
 
     let json = serde_json::to_string_pretty(file)?;
     tmp.write_all(json.as_bytes())?;
