@@ -1650,12 +1650,24 @@ impl App {
     }
 
     /// One dog toggle's answer: the settings screen's `Pending::Sent` line
-    /// clears, and one sentence lands in the status bar.
+    /// clears, one sentence lands in the status bar, and the screen
+    /// re-reads `shep.toml`.
     ///
     /// No row is upserted here from `Response::DogStarted`'s own
     /// `ProcessInfo`, unlike [`Self::on_action_reply`]: the RUNNING column
     /// this reply would feed repairs itself off the next `ListFlock`, two
     /// seconds later, the same as every other flock fact this screen shows.
+    ///
+    /// [`Effect::LoadSettings`] on every arm, `Err` included, for the same
+    /// reason `Msg::SettingWritten`'s own `Ok` arm raises it: the FILE half
+    /// has already landed by the time this reply arrives (that is what
+    /// `Msg::DogWritten`'s `Ok` sent the request on), so `DogView.enabled`
+    /// is stale here whatever the shepherd went on to say. Without the
+    /// re-read the IN FILE cell kept its pre-write value while RUNNING
+    /// updated off the two-second poll, so a landed `enable metrics` read
+    /// `metrics | no | online` -- the dogs table manufacturing the exact
+    /// drift it exists to reveal, and reading as the one row the docs page
+    /// teaches an operator to treat as "running with nothing enabling it".
     fn on_dog_reply(
         &mut self,
         name: String,
@@ -1712,7 +1724,7 @@ impl App {
                 });
             }
         }
-        Effect::None
+        Effect::LoadSettings
     }
 
     fn on_event(&mut self, event: BusEvent) -> Effect {
@@ -5665,6 +5677,91 @@ mod tests {
             Some("disable otel: the shepherd stopped and deregistered it")
         );
         assert!(!app.notice().unwrap().is_grave());
+    }
+
+    /// Whether the settings screen's own dogs list still says `name` is
+    /// enabled. Reads the snapshot the screen is rendering from, not the
+    /// file, which is the whole point: the two can disagree.
+    #[track_caller]
+    fn dog_enabled_in_view(app: &App, name: &str) -> bool {
+        app.settings()
+            .expect("the settings screen is open")
+            .snapshot()
+            .dogs
+            .iter()
+            .find(|dog| dog.name == name)
+            .expect("the fixture carries this dog")
+            .enabled
+    }
+
+    /// fails if a landed dog toggle leaves the dogs table showing what the
+    /// file said BEFORE the write.
+    ///
+    /// The file half lands first and the daemon half second, so by the time
+    /// this reply arrives `DogView.enabled` is already stale while RUNNING
+    /// keeps updating off the two-second poll. Nothing raised a re-read, so
+    /// a landed `enable metrics` sat there reading `metrics | no | online`
+    /// -- the dogs table manufacturing the one drift row the docs page
+    /// teaches an operator to read as "running with nothing enabling it".
+    /// The scalar path already solved this: `Msg::SettingWritten`'s `Ok`
+    /// arm raises `Effect::LoadSettings` rather than folding the write into
+    /// the row by hand, and this inherits it.
+    ///
+    /// Both directions, because an enable and a disable answer with
+    /// different replies (`DogStarted` and `Deleted`) down two different
+    /// arms of `on_dog_reply`'s own match.
+    #[test]
+    fn a_landed_toggle_re_reads_the_file_in_both_directions() {
+        for (name, enable) in [("metrics", true), ("otel", false)] {
+            let (mut app, sent) = armed_and_sent_dog(name);
+            assert_eq!(
+                dog_enabled_in_view(&app, name),
+                !enable,
+                "{name}: the fixture starts on the other bit"
+            );
+            let reply = if enable {
+                Response::DogStarted(
+                    ProcessInfo::builder(50, name, ProcStatus::Online)
+                        .pid(Some(50_000))
+                        .dog(Some(DogSource::BuiltIn))
+                        .build(),
+                )
+            } else {
+                Response::Deleted(vec![50])
+            };
+
+            let effect = app.update(Msg::Replied {
+                sent,
+                result: Ok(reply),
+            });
+
+            assert_eq!(
+                effect,
+                Effect::LoadSettings,
+                "{name}: a landed toggle has to re-read the file it changed"
+            );
+            assert_eq!(
+                dog_enabled_in_view(&app, name),
+                !enable,
+                "{name}: nothing is folded into the row by hand -- the re-read is the repair"
+            );
+
+            // The re-read landing, with the bit the write actually put in
+            // the file.
+            let mut fresh = app.settings().unwrap().snapshot().clone();
+            for dog in &mut fresh.dogs {
+                if dog.name == name {
+                    dog.enabled = enable;
+                }
+            }
+            app.update(Msg::Settings { result: Ok(fresh) });
+
+            assert_eq!(
+                dog_enabled_in_view(&app, name),
+                enable,
+                "{name}: and the row agrees with the file once it lands"
+            );
+        }
     }
 
     /// fails if a reply this binary does not understand -- or the RIGHT
