@@ -1801,6 +1801,26 @@ It was briefly 500ms, and the reason it is not is worth keeping. The argument fo
 
 `verified crates/shep-daemon/src/tokio_runner.rs (FINAL_DRAIN, final_drain, a_last_line_written_before_the_sheep_task_lets_go_reaches_the_file, a_last_line_survives_the_control_channel_closing_with_the_logs, both_pipes_filled_to_capacity_drain_inside_the_budget) and crates/shep-cli/tests/cli_e2e.rs`
 
+
+
+### A handover case read every ping failure as an unbound address, because ping cannot say which failure it had
+
+`the_control_socket_accepts_throughout_a_handover` failed on three macOS CI jobs on 2026-09-04 and passed on every Linux leg and every rerun, always on `the control address must stay bound across the handover: ["exit Some(5): "]`. The address never became unbound. The case stays in the ordinary tier and its tolerance was not widened; the instrument changed. A second thread now dials the address with `connect(2)` every 5ms and every refusal it collects is fatal, and the `shep ping` loop counts its failures instead of reading them.
+
+**Why:** `shep ping` renders "shepherd offline" on stdout and exits 5 with an empty stderr for every reason it can have, which is deliberate. `render_ping`'s own doc says a verb whose whole job is reporting liveness must not fail with an error line, and `ShepherdStatus::probe` above it folds every `ConnectError` from `Client::connect` and every non-`Pong` from `client.request` into one `None`. So nothing is left to classify on, and the case classified anyway: it partitioned its failures on the text of `RequestError::Closed`, a `shep-client` `Display` string that `shep ping` never prints. The half it kept for the one exchange in flight at the exec was unreachable, every failure landed in the fatal half, and the comment above the partition described a tolerance the code did not have.
+
+Measured against the mechanism rather than against the flake, because a 2.5% event needs more than one red run to understand. 200 real `shep daemon reload` handovers against a single shepherd on a loaded box, with a `shep ping` loop and a `connect(2)` loop running throughout: no reload fell back to stopping and starting, 5 of 603 pings failed, and 0 of 854 dials were refused. All five failures were exit 5, `shepherd offline` on stdout, nothing at all on stderr, which is the CI payload byte for byte. The same dial loop against a shepherd genuinely killed and started again refused 16 of 45, so it measures what it claims to. The case itself, which is one handover per run, failed once in 95 runs before the rewrite with that message exactly, and passed 60 of 60 after it, both under the same load.
+
+That the loss is the accepted connection rather than the address is not an inference from those counts alone. `handover::hand_over` carries the listening descriptor across `execve` and nothing else, the socket file is never unlinked on that path because the exec never returns to `RunningDaemon::run`'s teardown, and `commands::daemon`'s handover arm leans on the same fact from the other side: it holds a witness connection across the signal precisely because a predecessor's accepted connections do not survive its exec.
+
+The case now reads which arm it got, too. A reload that falls back to stopping and starting really does unbind the address, legitimately, and the new dialer would report that as the defect, which is the same misclassification in different clothes. Both fallback arms say so on stderr before they take it, so the premise is checked rather than assumed.
+
+The `slow` tier was wrong here for the reason it was wrong twice above: this case asserts that a socket keeps answering, not a duration, a batch or a count, and the tier's criterion is what a contended runner cannot hold still. A retry would have been worse, since nextest already retries this tier and a retry hides a misclassification exactly as well as it hides a flake.
+
+Teaching `shep ping` to say why it is offline was the other way out, and it was turned down. It puts a field in the output envelope and breaks ping's committed fixture, for a distinction the case stops needing the moment it asks `connect(2)` itself. A dial is the property; a verb that has to survive a handshake and a round trip before it can answer is answering a broader question than the one being asked.
+
+`verified crates/shep-cli/tests/cli_e2e.rs (the_control_socket_accepts_throughout_a_handover, DIAL_INTERVAL)`
+
 ## CI and releases
 
 ### An intra-workspace dev-dependency names only a path, never a version

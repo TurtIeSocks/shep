@@ -9037,6 +9037,18 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
     graceful_kill(dir.path());
 }
 
+/// Gap between the dials [`the_control_socket_accepts_throughout_a_handover`]
+/// makes at the control address.
+///
+/// A dial is a `connect(2)` and an immediate close, microseconds of work on
+/// each side, so this interval decides how narrow an outage the case can see
+/// rather than what the case costs. 5ms resolves one far shorter than the
+/// shortest real one: every way this address can actually go away spans a
+/// daemon teardown or a fresh bind, hundreds of milliseconds in the
+/// stop-and-start fallback that is the closest thing to a near miss.
+#[cfg(unix)]
+const DIAL_INTERVAL: Duration = Duration::from_millis(5);
+
 /// The control socket answers throughout a handover.
 ///
 /// The successor inherits the listening descriptor rather than binding the
@@ -9045,6 +9057,33 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
 /// gets to it. Nothing may be refused, and the socket file may never
 /// disappear, since a rebind would race the predecessor's socket file and
 /// lose whatever connection a client had already made.
+///
+/// Two probers, because that is two questions and no one instrument answers
+/// both. The dialer asks the property itself: `connect(2)` on the address is
+/// what "still bound" MEANS, it cannot be confused with anything happening
+/// after the connection is up, and every refusal it collects is fatal. The
+/// pinger asks the other half, that a request still gets served, and its
+/// failures are counted rather than read.
+///
+/// Counted because they cannot be read. `shep ping` renders "shepherd
+/// offline" on stdout and exits 5 with an EMPTY stderr for every reason it
+/// can have: `ShepherdStatus::probe` (`shep-cli/src/status.rs`) folds every
+/// `ConnectError` and every `RequestError` into one `None`, and `render_ping`
+/// under it is documented not to fail with an error line. So the partition
+/// this case used to run, on the text of `RequestError::Closed`, could never
+/// match a thing: every ping failure landed in the fatal half, and the
+/// tolerance for the one exchange in flight at the exec was dead code. Three
+/// macOS CI jobs on 2026-09-04 failed on `["exit Some(5): "]`, which is that
+/// tolerated drop being read as an unbound address.
+///
+/// Measured against the mechanism rather than against the flake, since one
+/// handover per run is a slow way to see a 2.5% event: 200 real handovers
+/// under load dropped 5 of 603 pings and refused 0 of 854 dials, and all
+/// five were exit 5, "shepherd offline" on stdout, nothing at all on stderr.
+/// Against a shepherd genuinely stopped and started, the same dial loop
+/// refused 16 of 45, so it is measuring something. The case itself failed
+/// once in 95 runs before this rewrite, on the message above, and passed 60
+/// of 60 after it, both under the same load.
 #[cfg(unix)]
 #[test]
 fn the_control_socket_accepts_throughout_a_handover() {
@@ -9063,6 +9102,30 @@ fn the_control_socket_accepts_throughout_a_handover() {
     assert_success(&started);
     let _ = poll_flock(dir.path(), |info| info["status"] == "online");
 
+    // One deadline for both threads, so the two answers describe the same
+    // window.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let socket = dir.path().join("run").join("shep.sock");
+    let dialer = std::thread::spawn(move || {
+        let mut refused = Vec::new();
+        let mut dials = 0_usize;
+        while Instant::now() < deadline {
+            dials += 1;
+            // The stream this opens is dropped where the `if let` ends, so
+            // the daemon's accept loop meets an EOF rather than a handshake
+            // it has to wait out, and reports it at `debug!` and nothing
+            // else (`shep-daemon/src/server.rs`, "connection ended"). The
+            // answer wanted here is the syscall's: asking for more of the
+            // exchange would put it back in the same bucket as everything
+            // else that can go wrong, which is the whole bug being fixed.
+            if let Err(err) = std::os::unix::net::UnixStream::connect(&socket) {
+                refused.push(format!("dial {dials}: {:?}: {err}", err.kind()));
+            }
+            std::thread::sleep(DIAL_INTERVAL);
+        }
+        (refused, dials)
+    });
+
     let home = dir.path().to_path_buf();
     // The prober says when it is really probing, and the reload waits for
     // that. Without the handshake the reload could finish before the first
@@ -9071,24 +9134,20 @@ fn the_control_socket_accepts_throughout_a_handover() {
     // across the exec.
     let (probing, started_probing) = std::sync::mpsc::channel();
     let prober = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        let mut refused = Vec::new();
+        let mut dropped = Vec::new();
+        let mut pings = 0_usize;
         let mut announced = false;
         while Instant::now() < deadline {
-            let out = shep(&home).arg("ping").output().unwrap();
-            if !out.status.success() {
-                refused.push(format!(
-                    "exit {:?}: {}",
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stderr)
-                ));
+            pings += 1;
+            if !shep(&home).arg("ping").output().unwrap().status.success() {
+                dropped.push(pings);
             }
             if !announced {
                 announced = true;
                 let _ = probing.send(());
             }
         }
-        refused
+        (dropped, pings)
     });
     started_probing
         .recv_timeout(FLOCK_DEADLINE)
@@ -9100,6 +9159,19 @@ fn the_control_socket_accepts_throughout_a_handover() {
         .output()
         .unwrap();
     assert_success(&reloaded);
+    // The premise, checked rather than assumed. A reload that fell back to
+    // stopping and starting really did unbind the address, legitimately, and
+    // the dialer below would report that as the defect: one misclassified
+    // failure traded for another. Both fallback arms say so on stderr before
+    // they take it (`commands/daemon.rs`'s two `aside("reload", ...)` calls),
+    // so the case can name what happened instead of blaming the daemon for
+    // doing what it said it would.
+    let reload_aside = String::from_utf8_lossy(&reloaded.stderr);
+    assert!(
+        !reload_aside.contains("starting one instead")
+            && !reload_aside.contains("stopping and starting instead"),
+        "this case is about the handover arm and the reload took the other one: {reload_aside}"
+    );
 
     // What the listener crossing the exec actually buys, and what it does
     // not. The listener's descriptor is carried, so no client ever finds the
@@ -9109,23 +9181,30 @@ fn the_control_socket_accepts_throughout_a_handover() {
     // seeing its connection drop and retrying.
     //
     // So a ping whose reply was in flight at the instant of the exec fails,
-    // and must be tolerated. A ping that could not connect at all means the
+    // and must be tolerated. A dial that could not connect at all means the
     // address went away, which is the property this test exists to defend.
     //
     // Asserting the stronger thing was wrong rather than merely strict, and
     // it passed on macOS purely because the window is narrow: the four Linux
     // jobs on the first CI run of this test all caught it.
-    let refused = prober.join().unwrap();
-    let (dropped, unreachable): (Vec<_>, Vec<_>) = refused
-        .into_iter()
-        .partition(|line| line.contains("the connection closed before a reply arrived"));
+    //
+    // One, still, and not a looser bound: the prober is sequential, so
+    // exactly one ping can be mid-exchange at the instant of the exec. The
+    // next one dials an address the successor has inherited and waits in the
+    // backlog until it accepts, which is a boot away rather than a
+    // `HANDSHAKE_TIMEOUT` away.
+    let (refused, dials) = dialer.join().unwrap();
+    let (dropped, pings) = prober.join().unwrap();
     assert!(
-        unreachable.is_empty(),
-        "the control address must stay bound across the handover: {unreachable:?}"
+        refused.is_empty(),
+        "the control address must stay bound across the handover, \
+         {} of {dials} dials refused: {refused:?}",
+        refused.len()
     );
     assert!(
         dropped.len() <= 1,
-        "at most the one request in flight at the exec may drop, got {}: {dropped:?}",
+        "at most the one request in flight at the exec may drop, got {} of {pings} \
+         pings, at {dropped:?}",
         dropped.len()
     );
 
