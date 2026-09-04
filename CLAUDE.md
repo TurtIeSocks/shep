@@ -485,8 +485,9 @@ on which verb read it is one nobody could reason about. Four places consult
 it: which request a fresh app goes out as, whether an app the flock already
 has is resumed after the merge, what a name target that resolves to a
 registered sheep does, and the notice code. `Request::Add` /
-`Response::Added` are additive, so `PROTOCOL_VERSION` stays at 2 and the
-paragraph below applies to `shep add` too. **The fill-in half of
+`Response::Added` are additive and did not move `PROTOCOL_VERSION` on
+their own; it later moved to 3 for an unrelated reason, recorded below, and
+the paragraph below applies to `shep add` too. **The fill-in half of
 "register, fill in, start" does not exist yet**: an established `env` key
 today moves only through the file plus `--reset=env` (or `--reset=all`,
 which also drops the override record), and editing one in place is a later
