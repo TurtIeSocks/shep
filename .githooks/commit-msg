@@ -17,13 +17,36 @@
 msg_file="$1"
 subject=$(sed -n '1p' "$msg_file")
 
-# A merge, revert, fixup or squash subject is git's own wording, not ours.
+# A merge subject is git's own wording. So are the autosquash markers, and
+# those are legitimate HERE because they are created locally and consumed by
+# `git rebase --autosquash` before the branch is pushed. The CI gate rejects
+# them, since one surviving to a pull request head was never squashed.
+#
+# `Revert "..."`, which `git revert` writes for you, is NOT exempt. It parses
+# as nothing and release-plz drops it, so a reverted breaking change would go
+# unrecorded. Retitle it `revert: ...` and see the note below about giving
+# `revert` a parser.
 case "$subject" in
-    "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+    "Merge "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
 esac
 
+# The nine types below are not the conventional-commits list, they are what
+# release-plz-changelog.toml actually handles. Measured with git-cliff 2.14.1
+# against that exact config:
+#
+#   feat fix perf refactor   produce a changelog entry
+#   docs test ci chore style  match `skip = true`, dropped on purpose
+#   revert build              match NO parser, so `filter_commits = true`
+#                             drops them with no entry and no warning
+#
+# `revert` and `build` are the trap. They are real conventional types, they
+# look correct, and they contribute nothing. They are rejected here rather
+# than accepted, because a gate that passes a commit release-plz discards is
+# the bug this file exists to prevent. To use one, give it a parser in
+# release-plz-changelog.toml first, then add it here.
+
 # type(optional scope)optional !: space, then something.
-if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style|build|revert)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([a-z0-9 ._/-]+\))?!?: .+'; then
     exit 0
 fi
 
@@ -40,8 +63,13 @@ changed public signature.
 Write it as: type(optional-scope): lowercase summary
 
   feat: a new surface        fix: a bug            perf: faster
-  refactor: no behaviour change                    revert: undo
-  docs / style / test / ci / chore / build: no release
+  refactor: no behaviour change
+  docs / style / test / ci / chore: no changelog entry, which is fine
+
+Not accepted: revert and build. Both are real conventional types and both
+match no parser in release-plz-changelog.toml, so release-plz drops them
+exactly as it drops an unreadable subject. Give one a parser there before
+using it here.
 
 Add ! after the type or scope for a BREAKING change, and put it on the
 commit that actually breaks something, in the crate that breaks:

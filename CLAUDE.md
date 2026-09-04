@@ -219,6 +219,14 @@ re-running that suite in isolation with the mutation still applied.
   changelog section. Nothing failed. `semver_check = true` did not catch it
   either, having no lint for a changed inherent-method return type.
 
+  Nine types are accepted, and they are what `release-plz-changelog.toml`
+  handles rather than the conventional-commits list. `feat`, `fix`, `perf`
+  and `refactor` produce entries; `docs`, `test`, `ci`, `chore` and `style`
+  are `skip = true` and drop on purpose. `revert` and `build` are refused,
+  because they match no parser there and `filter_commits = true` discards
+  them as silently as it discards a sentence. Measured with git-cliff 2.14.1
+  against the real config.
+
   `.github/workflows/commits.yml` gates it now and `.githooks/commit-msg`
   catches it earlier, so this bullet is the explanation rather than the
   enforcement. It still belongs here, because a brief that omits the rule

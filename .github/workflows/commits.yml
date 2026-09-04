@@ -45,13 +45,27 @@ jobs:
           # --no-merges: a merge subject is git's own wording, and release-plz
           # ignores merge commits anyway, which is the whole reason a `!` in a
           # pull request title buys nothing.
+          #
+          # Nothing is exempt here, unlike the local hook. `fixup!`, `squash!`
+          # and `amend!` are fine to create locally and are consumed by
+          # `git rebase --autosquash`; one reaching a pull request head was
+          # never squashed and would be dropped like any other unreadable
+          # subject. `Revert "..."`, which `git revert` writes, parses as
+          # nothing and is dropped too.
+          #
+          # The nine accepted types are what release-plz-changelog.toml
+          # actually handles, not the conventional-commits list. Measured with
+          # git-cliff 2.14.1 against that config: feat, fix, perf and refactor
+          # produce entries; docs, test, ci, chore and style are `skip = true`
+          # and dropped on purpose; revert and build match NO parser, so
+          # `filter_commits = true` discards them silently. Those last two are
+          # the trap, since they are real conventional types that look correct
+          # and contribute nothing. Give one a parser in that config before
+          # adding it here.
           bad=0
           while IFS= read -r subject; do
             [ -z "$subject" ] && continue
-            case "$subject" in
-              "Revert "*|"fixup!"*|"squash!"*|"amend!"*) continue ;;
-            esac
-            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style|build|revert)(\([a-z0-9 ._/-]+\))?!?: .+'; then
+            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([a-z0-9 ._/-]+\))?!?: .+'; then
               printf '  ok      %s\n' "$subject"
             else
               printf '  DROPPED %s\n' "$subject"
