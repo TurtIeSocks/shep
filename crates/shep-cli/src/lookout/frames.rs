@@ -33,6 +33,7 @@
 //! build, and cost nothing when they run under `cargo test`.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -41,14 +42,21 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 
 use shep_client::RequestError;
-use shep_core::protocol::{ExitInfo, Lamb, ProcessInfo, Response, RpcError, RpcErrorCode};
+use shep_core::protocol::{
+    DogSource, ExitInfo, Lamb, ProcessInfo, Response, RpcError, RpcErrorCode,
+};
 use shep_core::status::ProcStatus;
 
-use super::app::{ActionVerb, App, Control, KeyPress, Msg, RowKey, Sent};
+use super::app::{ActionVerb, App, Control, KeyPress, Msg, RowKey, Sent, SettingsRow};
 use super::source::HostSample;
 use super::tail::{Stream, Tail, TailLine};
 use super::theme::Palette;
 use super::view::draw;
+use crate::commands::settings::{
+    DogView, ScalarView, SettingField, SettingsSnapshot, load_settings,
+};
+use crate::commands::shep_toml::ShepToml;
+use crate::style::{StyleLevel, StyleSource};
 
 /// One rendered buffer as plain text: one line per row, trailing spaces
 /// kept, no escapes.
@@ -181,6 +189,24 @@ pub enum Scene {
     ActionAccepted,
     /// An action key pressed while the link is coming back.
     ActionRefusedOffline,
+    /// The settings screen on a fresh `$SHEP_HOME`: only `[interpreters]` on
+    /// disk, so every scalar reads its compiled default. The state most
+    /// operators open the screen in.
+    SettingsFresh,
+    /// The settings screen with some scalars declared, so `shep.toml` and
+    /// the default sit side by side.
+    SettingsSet,
+    /// The settings screen with a `[daemon]` confirm armed, naming the
+    /// variable and the flag it cannot see.
+    SettingsConfirm,
+    /// The settings screen with the `socket` editor open mid-path.
+    SettingsTyping,
+    /// The settings screen's dogs table, showing the drift it exists to
+    /// make visible.
+    SettingsDogs,
+    /// The settings screen on a narrow terminal, where both of its tables
+    /// have dropped a column.
+    SettingsNarrow,
 }
 
 impl Scene {
@@ -211,6 +237,12 @@ impl Scene {
         Self::ActionRefused,
         Self::ActionAccepted,
         Self::ActionRefusedOffline,
+        Self::SettingsFresh,
+        Self::SettingsSet,
+        Self::SettingsConfirm,
+        Self::SettingsTyping,
+        Self::SettingsDogs,
+        Self::SettingsNarrow,
     ];
 
     /// The snapshot name and the gallery heading.
@@ -242,11 +274,17 @@ impl Scene {
             Self::ActionRefused => "action_refused",
             Self::ActionAccepted => "action_accepted",
             Self::ActionRefusedOffline => "action_refused_offline",
+            Self::SettingsFresh => "settings_fresh",
+            Self::SettingsSet => "settings_set",
+            Self::SettingsConfirm => "settings_confirm",
+            Self::SettingsTyping => "settings_typing",
+            Self::SettingsDogs => "settings_dogs",
+            Self::SettingsNarrow => "settings_narrow",
         }
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so the maintainer does not have to hold twenty-five of them in her head.
+    /// gallery so the maintainer does not have to hold thirty-one of them in her head.
     ///
     /// Every clause here is pinned by an assertion in
     /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
@@ -329,6 +367,24 @@ impl Scene {
             Self::ActionRefusedOffline => {
                 "An action key pressed while the link is coming back. The refusal names the same reconnect attempt the banner above it does, rather than the exhausted-ladder sentence — Phase 16 review Minor #8 caught the two disagreeing on one frame."
             }
+            Self::SettingsFresh => {
+                "The settings screen on a fresh $SHEP_HOME: shep.toml holds only [interpreters], so every scalar's SOURCE column reads `the default` and its VALUE is the compiled fallback. The state most operators open this screen in."
+            }
+            Self::SettingsSet => {
+                "The settings screen with some scalars declared. `shep.toml` and `the default` sit side by side in the SOURCE column, so what the operator wrote and what shep assumes are both visible at once."
+            }
+            Self::SettingsConfirm => {
+                "A [daemon] confirm armed on log_level, naming the variable and the flag it cannot see: SHEP_LOG_LEVEL and --log-level, and the shep daemon reload the edit needs."
+            }
+            Self::SettingsTyping => {
+                "The socket editor open mid-path. The status bar names the field being typed, not the dashboard's own filter box, which is what it showed here before the fix this frame now pins."
+            }
+            Self::SettingsDogs => {
+                "The dogs table showing the drift it exists to reveal: otel running while disabled in the file, ledger enabled and absent, and bark enabled, running, and silent."
+            }
+            Self::SettingsNarrow => {
+                "The same screen at 45 columns. Both of its tables have dropped a column rather than clipping: the scalar rows have lost the apply cost and kept SOURCE, and the dogs table has lost SOURCE and kept RUNNING. Each keeps whichever half is not said anywhere else."
+            }
         }
     }
 
@@ -345,7 +401,9 @@ impl Scene {
             | Self::ActionRefused
             | Self::ActionAccepted
             | Self::ActionRefusedOffline
-            | Self::Lambs => Control::Allowed,
+            | Self::Lambs
+            | Self::SettingsConfirm
+            | Self::SettingsTyping => Control::Allowed,
             _ => Control::ReadOnly,
         }
     }
@@ -374,6 +432,18 @@ impl Scene {
             | Self::ActionRefused
             | Self::ActionAccepted
             | Self::ActionRefusedOffline => (100, 14),
+            // 180: the `log_level` confirm's own sentence -- naming both
+            // `SHEP_LOG_LEVEL` and `--log-level` plus "enter confirms, any
+            // other key cancels" -- runs to 170 columns, past every other
+            // scene's width. A narrower frame would truncate the very flag
+            // this scene exists to show.
+            Self::SettingsConfirm => (180, 30),
+            // 45: `SCALAR_TIERS`'s middle tier, and `DOG_TIERS`'s. Wide
+            // enough that both tables still draw a real row, narrow enough
+            // that both have given a column up -- which is the one thing
+            // this frame is here to show, and the axis every other settings
+            // frame (120 and 180) misses.
+            Self::SettingsNarrow => (45, 24),
             // HealthyWide, Errored, Grouped, Retrying, Frozen, Refused, FeedGap,
             // FeedMissing, HostUnknown, Lambs, LambsUnknown: every scene that
             // carries all three optional panes at their ordinary rows.
@@ -543,6 +613,15 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 None,
             ),
         ],
+        // Two dog processes only -- the dashboard flock is invisible behind
+        // the settings screen this scene draws, so what matters is what
+        // `dog_rows`'s own join sees: `otel` up and healthy, `bark` up but
+        // never handshook. `ledger` (armed enabled in the snapshot below)
+        // has no row here at all, which is what "enabled and absent" means.
+        Scene::SettingsDogs | Scene::SettingsNarrow => vec![
+            dog_sheep(90, "otel", None),
+            dog_sheep(91, "bark", Some(false)),
+        ],
         _ => vec![
             sheep(
                 0,
@@ -629,9 +708,19 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     // moving the cursor in them would change a snapshot for no reason.
     // `Grouped` is excluded for a fifth reason: its cursor belongs on the
     // group header, which is the whole scene, and it goes there below.
+    // `SettingsDogs` and `SettingsNarrow` are excluded for a sixth: their
+    // flock has no id 2 at all -- the dashboard behind them is invisible
+    // once the settings screen draws over the whole body, so there is
+    // nothing for a cursor there to do.
     if !matches!(
         which,
-        Scene::Empty | Scene::Narrow | Scene::TooNarrow | Scene::TableOnly | Scene::Grouped
+        Scene::Empty
+            | Scene::Narrow
+            | Scene::TooNarrow
+            | Scene::TableOnly
+            | Scene::Grouped
+            | Scene::SettingsDogs
+            | Scene::SettingsNarrow
     ) {
         select_id(&mut app, 2);
     }
@@ -658,10 +747,10 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 "web"
             };
             for typed in query.chars() {
-                app.update(Msg::Key(KeyPress::FilterChar(typed)));
+                app.update(Msg::Key(KeyPress::TextChar(typed)));
             }
             if which == Scene::FilterActive {
-                app.update(Msg::Key(KeyPress::FilterApply));
+                app.update(Msg::Key(KeyPress::TextApply));
             }
         }
         _ => {}
@@ -833,6 +922,71 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                     })),
                 });
             }
+        }
+        _ => {}
+    }
+
+    // The five settings scenes, applied last for the same reason the five
+    // action scenes above are: `SettingsConfirm` arms a candidate, and
+    // `Settings::pending` expires on the same `CONFIRM_EXPIRY` the
+    // dashboard's own action confirm does, so arming it before the tick at
+    // `age` (600s in `scene()`) would already show it expired by the time
+    // this function draws.
+    match which {
+        Scene::SettingsFresh => {
+            // A genuinely fresh document, not a hand-edited snapshot: the
+            // scaffold every first run leaves is `[interpreters]` alone, and
+            // `load_settings` is the same reader `run_ui` calls, so this is
+            // what an operator's very first `s` actually shows.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("shep.toml");
+            ShepToml::edit(&path, ShepToml::write_starter_interpreters).unwrap();
+            let snapshot = load_settings(
+                &path,
+                std::path::Path::new("/home/ada/.shep/run/shep.sock"),
+                (StyleLevel::Full, StyleSource::Default),
+            )
+            .unwrap();
+            app.update(Msg::Key(KeyPress::Settings));
+            app.update(Msg::Settings {
+                result: Ok(snapshot),
+            });
+        }
+        Scene::SettingsSet => {
+            app.update(Msg::Key(KeyPress::Settings));
+            app.update(Msg::Settings {
+                result: Ok(settings_snapshot_for_gallery()),
+            });
+        }
+        Scene::SettingsConfirm => {
+            app.update(Msg::Key(KeyPress::Settings));
+            app.update(Msg::Settings {
+                result: Ok(settings_snapshot_for_gallery()),
+            });
+            // The cursor already sits on `log_level`, `Settings::rows`'s
+            // first row, so arming it needs no `SelectDown` at all.
+            app.update(Msg::Key(KeyPress::Cycle));
+        }
+        Scene::SettingsTyping => {
+            app.update(Msg::Key(KeyPress::Settings));
+            app.update(Msg::Settings {
+                result: Ok(settings_snapshot_for_gallery()),
+            });
+            move_settings_cursor_to(&mut app, SettingField::Socket);
+            // Opens the editor, seeded with the on-disk value.
+            app.update(Msg::Key(KeyPress::Confirm));
+            // Trims the seeded value back to a partial path, so the frame
+            // shows the editor genuinely mid-type rather than holding the
+            // whole, untouched value it opened with.
+            for _ in 0..8 {
+                app.update(Msg::Key(KeyPress::TextBackspace));
+            }
+        }
+        Scene::SettingsDogs | Scene::SettingsNarrow => {
+            app.update(Msg::Key(KeyPress::Settings));
+            app.update(Msg::Settings {
+                result: Ok(settings_snapshot_with_dog_drift()),
+            });
         }
         _ => {}
     }
@@ -1070,6 +1224,118 @@ fn flock_without_api() -> Vec<ProcessInfo> {
     ]
 }
 
+/// One dog process: `id` and `name` as `dog_rows`'s join key, `handshook`
+/// carrying the same three-state signal a real listing does -- `None` reads
+/// `online`, `Some(false)` reads `silent`, per [`crate::vocabulary::Reported::of`].
+/// [`Scene::SettingsDogs`] is the only scene that calls this.
+fn dog_sheep(id: u32, name: &str, handshook: Option<bool>) -> ProcessInfo {
+    ProcessInfo::builder(id, name, ProcStatus::Online)
+        .pid(Some(90_000 + id))
+        .dog(Some(DogSource::BuiltIn))
+        .handshook(handshook)
+        .build()
+}
+
+/// Walks the settings screen's cursor onto `field`'s row by real
+/// `SelectDown` keypresses, the same real-path rule
+/// `view::fixtures::app_in_settings_on` follows for its own tests.
+///
+/// # Panics
+///
+/// If the settings screen is not open. Gallery scaffolding: a scene that
+/// called this before `Msg::Settings` landed is a defect in the scene, not
+/// in the screen.
+#[track_caller]
+fn move_settings_cursor_to(app: &mut App, field: SettingField) {
+    let target = app
+        .settings()
+        .expect("the settings screen must already be open")
+        .rows()
+        .iter()
+        .position(|row| *row == SettingsRow::Scalar(field))
+        .expect("field is one of the six scalar rows Settings::rows always carries");
+    for _ in 0..target {
+        app.update(Msg::Key(KeyPress::SelectDown));
+    }
+}
+
+/// A settings snapshot with `log_level`, `socket`, `max_cron_sleep` and
+/// `style_level` declared in `shep.toml`, and `log_json`/`allow_control`
+/// left at their compiled defaults -- the mixed state
+/// [`Scene::SettingsSet`]'s own caption shows, and the fixture
+/// [`Scene::SettingsConfirm`] and [`Scene::SettingsTyping`] both build on.
+fn settings_snapshot_for_gallery() -> SettingsSnapshot {
+    let config = |value: &str| ScalarView {
+        value: value.to_string(),
+        source: StyleSource::Config,
+    };
+    let default = |value: &str| ScalarView {
+        value: value.to_string(),
+        source: StyleSource::Default,
+    };
+    SettingsSnapshot {
+        log_level: config("warn"),
+        log_json: default("false"),
+        socket: config("/home/ada/.shep/run/shep.sock"),
+        max_cron_sleep: config("30s"),
+        allow_control: default("false"),
+        style_level: config("full"),
+        // The document declares it, so the file and the resolved value
+        // agree -- see `SettingsSnapshot::style_level_in_file`.
+        style_level_in_file: Some("full".to_string()),
+        dogs: vec![
+            DogView {
+                name: "bark".to_string(),
+                enabled: false,
+                adopted_path: None,
+            },
+            DogView {
+                name: "metrics".to_string(),
+                enabled: true,
+                adopted_path: None,
+            },
+        ],
+    }
+}
+
+/// [`settings_snapshot_for_gallery`]'s own scalars, with `dogs` replaced by
+/// the three-way drift [`Scene::SettingsDogs`] shows: `otel` running while
+/// the file disables it, `ledger` enabled and absent from
+/// [`Scene::SettingsDogs`]'s own flock, and `bark` enabled and running --
+/// [`dog_sheep`] gives it `handshook: Some(false)`, so the join reads it
+/// `silent` rather than `online`.
+fn settings_snapshot_with_dog_drift() -> SettingsSnapshot {
+    SettingsSnapshot {
+        dogs: vec![
+            // Both carry a real path, and they have to: `BUILT_IN_DOGS` is
+            // `["metrics", "bark"]`, and `dog_candidates` builds every
+            // other name out of `[daemon] adopted_dogs`, whose values ARE
+            // the paths. So a non-built-in dog with `adopted_path: None`
+            // is a row `load_settings` cannot produce from a document
+            // shep wrote (only a hand-edited non-string value could), and
+            // it rendered
+            // `built-in` for two dogs that are not. The spec's own decision
+            // 9 mockup gives these two paths.
+            DogView {
+                name: "otel".to_string(),
+                enabled: false,
+                adopted_path: Some(PathBuf::from("/usr/local/bin/shep-otel")),
+            },
+            DogView {
+                name: "ledger".to_string(),
+                enabled: true,
+                adopted_path: Some(PathBuf::from("/opt/ledger/bin/dog")),
+            },
+            DogView {
+                name: "bark".to_string(),
+                enabled: true,
+                adopted_path: None,
+            },
+        ],
+        ..settings_snapshot_for_gallery()
+    }
+}
+
 /// The header both gallery files open with.
 ///
 /// Not a doc comment on the test: this text is read by a person opening
@@ -1084,7 +1350,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same twenty-five frames with colour; read it with `less -R`.
+frames.ansi is the same thirty-one frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -1100,6 +1366,12 @@ When the pane cannot show everything, the header says what went instead. Lines
 it read and dropped are counted exactly; bytes below its 64 KiB window were
 never read at all, so those are reported in bytes, because nothing counted the
 lines in them and guessing would be worse than saying so.
+
+The last six frames are the settings screen, `s` from the dashboard. It owns
+the whole body between the title and the status bar rather than sharing it
+with the flock table, so a fresh $SHEP_HOME, some scalars declared, an armed
+confirm, the socket editor mid-type, the dogs table's own drift and the same
+screen at 45 columns each get a frame of their own.
 ";
 
 #[cfg(test)]
@@ -1163,6 +1435,15 @@ mod tests {
         })
     }
 
+    /// The dogs table's own row lookup: unlike [`row_for`], a dog row opens
+    /// with `mark` and a name, never a numeric id, so the same "first two
+    /// tokens" shape does not apply.
+    fn dog_row_for<'a>(frame: &'a str, name: &str) -> Option<&'a str> {
+        frame
+            .lines()
+            .find(|line| line.trim_start_matches('>').split_whitespace().next() == Some(name))
+    }
+
     /// Whether the MARKED row's name starts with `prefix`. For a name the
     /// NAME column has truncated, the exact truncated string depends on
     /// terminal width, so a literal expected value would be wrong at any
@@ -1210,7 +1491,7 @@ mod tests {
     /// in this module runs on both platforms, and the dashboard itself was
     /// exercised against a live Windows flock.
     #[cfg(unix)]
-    #[allow(clippy::too_many_lines)] // twenty-five captions, each pinned clause by clause
+    #[allow(clippy::too_many_lines)] // thirty-one captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
         // "All three panes at 120x30: the host strip under the title, the
         //  detail pane and the bleats feed under the table. `>` marks the
@@ -1677,6 +1958,89 @@ mod tests {
         for key in ["x stop", "R restart", "L reload"] {
             assert!(lambs_bar.contains(key), "the control hint names {key}");
         }
+
+        // "The settings screen on a fresh $SHEP_HOME: shep.toml holds only
+        //  [interpreters], so every scalar's SOURCE column reads `the
+        //  default` and its VALUE is the compiled fallback. The state most
+        //  operators open this screen in."
+        let fresh = render_text(&scene(Scene::SettingsFresh).1);
+        assert_eq!(
+            fresh.matches("the default").count(),
+            6,
+            "all six scalars read the default: {fresh:?}"
+        );
+        assert!(
+            !fresh.contains("shep.toml  "),
+            "a fresh home has declared nothing: {fresh:?}"
+        );
+
+        // "The settings screen with some scalars declared. `shep.toml` and
+        //  `the default` sit side by side in the SOURCE column, so what the
+        //  operator wrote and what shep assumes are both visible at once."
+        let set = render_text(&scene(Scene::SettingsSet).1);
+        assert!(set.contains("shep.toml"), "some scalars are declared");
+        assert!(set.contains("the default"), "and some are not: {set:?}");
+
+        // "A [daemon] confirm armed on log_level, naming the variable and
+        //  the flag it cannot see: SHEP_LOG_LEVEL and --log-level, and the
+        //  shep daemon reload the edit needs."
+        let confirm = render_text(&scene(Scene::SettingsConfirm).1);
+        assert!(confirm.contains("shep daemon reload"), "got: {confirm:?}");
+        assert!(confirm.contains("SHEP_LOG_LEVEL"), "got: {confirm:?}");
+        assert!(confirm.contains("--log-level"), "got: {confirm:?}");
+
+        // "The socket editor open mid-path. The status bar names the field
+        //  being typed, not the dashboard's own filter box, which is what
+        //  it showed here before the fix this frame now pins."
+        let typing = render_text(&scene(Scene::SettingsTyping).1);
+        assert!(
+            typing.contains("editing socket"),
+            "names the field being typed: {typing:?}"
+        );
+        assert!(
+            !typing.contains("filter "),
+            "must not read as the dashboard's own filter box: {typing:?}"
+        );
+
+        // "The dogs table showing the drift it exists to reveal: otel
+        //  running while disabled in the file, ledger enabled and absent,
+        //  and bark enabled, running, and silent."
+        let dogs = render_text(&scene(Scene::SettingsDogs).1);
+        assert!(
+            dog_row_for(&dogs, "otel")
+                .is_some_and(|row| row.contains("no") && row.contains("online")),
+            "otel: disabled in the file, running: {dogs:?}"
+        );
+        assert!(
+            dog_row_for(&dogs, "ledger")
+                .is_some_and(|row| row.contains("yes") && row.contains("not running")),
+            "ledger: enabled, absent from the flock: {dogs:?}"
+        );
+        assert!(
+            dog_row_for(&dogs, "bark")
+                .is_some_and(|row| row.contains("yes") && row.contains("silent")),
+            "bark: enabled, running, never handshook: {dogs:?}"
+        );
+
+        // "The same screen at 45 columns. Both of its tables have dropped a
+        //  column rather than clipping: the scalar rows have lost the apply
+        //  cost and kept SOURCE, and the dogs table has lost SOURCE and
+        //  kept RUNNING. Each keeps whichever half is not said anywhere
+        //  else."
+        let narrow = render_text(&scene(Scene::SettingsNarrow).1);
+        assert!(
+            narrow.contains("shep.toml"),
+            "the scalar rows keep SOURCE: {narrow:?}"
+        );
+        assert!(
+            !narrow.contains("needs shep daemon reload"),
+            "and lose the apply cost: {narrow:?}"
+        );
+        assert!(
+            dog_row_for(&narrow, "otel").is_some_and(|row| row.contains("online")),
+            "the dogs table keeps RUNNING: {narrow:?}"
+        );
+        assert!(!narrow.contains("built-in"), "and loses SOURCE: {narrow:?}");
     }
 
     /// fails if the gallery's cursor walk budgets by SHEEP rather than by
@@ -1745,7 +2109,7 @@ mod tests {
         // above already guarantees it, so it would be a line that cannot
         // fail. The literal can — it is what catches a scene added to the
         // enum and not to `ALL`, or the reverse.
-        assert_eq!(Scene::ALL.len(), 25);
+        assert_eq!(Scene::ALL.len(), 31);
     }
 
     /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders

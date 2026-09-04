@@ -1,5 +1,6 @@
 ---
 source: crates/shep-cli/src/lookout/frames.rs
+assertion_line: 1836
 expression: render_text(&buffer)
 ---
 shep lookout   /home/ada/.shep                                                                            6 in the flock
@@ -31,4 +32,4 @@ out  GET /v1/orders/26 200 34ms
 out  GET /v1/orders/27 200 35ms                                                                                         
 out  GET /v1/orders/28 200 36ms                                                                                         
 out  GET /v1/orders/29 200 37ms                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter                                                    read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only

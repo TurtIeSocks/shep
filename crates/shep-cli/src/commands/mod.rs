@@ -1,8 +1,13 @@
-//! Per-verb command implementations, `daemon` first. OS tier: gated
-//! `#[cfg(unix)]` at this module's own declaration in `lib.rs`, so nothing
-//! declared beneath it needs a `cfg` of its own -- and nothing under it is
-//! compiled on Windows at all, which is why the tests here reach for `sh`
-//! and `sleep` without a portability dance.
+//! Per-verb command implementations, `daemon` first.
+//!
+//! `mod commands;` at `lib.rs` carries no platform gate -- commit
+//! `6c2f44e` (2026-08-26) removed the blanket `#[cfg(unix)]` this doc used
+//! to claim, along with the Windows arm that refused every verb before
+//! reaching any of them, once the Windows tier became real. Every module
+//! under this one compiles on every platform; a Unix API call site gates
+//! itself individually instead (ten files in this crate hold one), the
+//! same way `commands::shep_toml`'s own module doc now describes for
+//! itself.
 
 pub mod admin;
 pub mod bleats;
@@ -34,6 +39,7 @@ pub mod runtime;
 pub mod schema;
 pub(crate) mod selector;
 pub mod serve;
+pub(crate) mod settings;
 pub(crate) mod shep_toml;
 pub mod signal;
 // Unix only, and this is the Windows tier's largest deliberate omission

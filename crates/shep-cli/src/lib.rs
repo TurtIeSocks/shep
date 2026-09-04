@@ -194,12 +194,18 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
             err.exit();
         }
     };
-    // Resolved once, here, and passed down rather than re-derived at each of
-    // the two `run` arms (`cfg(unix)`/`cfg(windows)`) or at every `Streams`
-    // construction inside them — see `resolve_style` and `must_render_bare`
+    // Resolved once, here, and passed down rather than re-derived inside
+    // `run` itself (there is one `run`, unconditional on platform, not a
+    // `cfg(unix)`/`cfg(windows)` pair) or at every `Streams` construction
+    // inside it — see `resolve_style` and `must_render_bare`
     // for why the two steps (what is configured, and whether the hard rule
-    // overrides it) are kept separate.
-    let (configured, _source) = resolve_style(&cli.global);
+    // overrides it) are kept separate. `style_source` rides all the way
+    // down to `lookout::lookout`, which is the one caller that reports it
+    // rather than only consuming the level: the settings screen's own
+    // STYLE LEVEL row needs to say which layer won, and it has to be this
+    // same resolution rather than a second one, so the screen and the rest
+    // of the CLI can never disagree.
+    let (configured, style_source) = resolve_style(&cli.global);
     let level = if must_render_bare(std::io::stdout().is_terminal(), cli.global.format) {
         style::StyleLevel::Bare
     } else {
@@ -220,7 +226,9 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
         std::env::var_os("COLORTERM").as_deref(),
         output::terminal_width(),
     );
-    std::process::ExitCode::from(runtime.block_on(run(cli, style)) as u8)
+    std::process::ExitCode::from(
+        runtime.block_on(run(cli, style, (configured, style_source))) as u8,
+    )
 }
 
 /// Before clap's own "unrecognized subcommand" error (suggestions and
@@ -438,11 +446,11 @@ async fn print_shepherd_status(argv: &[OsString]) {
 /// `--home` invocation still works in an environment with no `$HOME` at all.
 ///
 /// Pure tier on purpose (no `#[cfg(unix)]`): its own test runs on every
-/// target, and [`resolve_style`] below calls it from `run_argv` — shared,
-/// unconditional code — to find `shep.toml` for the style level's config
-/// layer. That is the one Windows call site today; the Windows build's `run`
-/// itself still does not call it, since refusing outright is the whole
-/// Windows deliverable for now.
+/// target, and `run` calls it on every target too, since it has no
+/// platform split of its own. [`resolve_style`] reaches it through
+/// `run_argv` to find `shep.toml` for the style level's config layer, and
+/// `ensure_home` and every dispatch arm that needs `$SHEP_HOME` before
+/// doing its own work reach it the same way.
 fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
     let env = |key: &str| match key {
         "SHEP_HOME" => global
@@ -834,7 +842,19 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
 /// the same way, so it can tell the operator whether the value it just
 /// wrote is what will actually run or whether `--style`/`$SHEP_STYLE`
 /// still outranks it.
-async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
+///
+/// `resolved_style` is [`run_argv`]'s own `resolve_style(&cli.global)`
+/// call, the unforced pair `style` above is partly built from. The one
+/// caller that needs the pair itself rather than only the level is the
+/// lookout dispatch: the settings screen's own STYLE LEVEL row reports
+/// which layer won, and reading that back from the same resolution this
+/// function already holds is what keeps the screen and the rest of the
+/// CLI from ever disagreeing about it.
+async fn run(
+    cli: Cli,
+    style: style::Presentation,
+    resolved_style: (style::StyleLevel, style::StyleSource),
+) -> ExitCode {
     let fmt = cli.global.format;
     // Resolved once, here, rather than at each of the seventeen call sites
     // that reach a shepherd: `cli.command` is partially moved by the
@@ -1096,7 +1116,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             style,
             fmt,
         };
-        return lookout::lookout(&mut streams, &paths, args).await;
+        return lookout::lookout(&mut streams, &paths, args, resolved_style).await;
     }
 
     // Not in the locked block below, for the reason `lookout`'s own comment
@@ -2303,11 +2323,12 @@ mod tests {
     #[test]
     fn the_alias_vector_parses_to_the_expected_command() {
         use clap::Parser;
-        // `Commands` is imported here and not via `super::*`: the top-level
-        // `use cli::Commands` is `#[cfg(unix)]`-gated alongside every verb
-        // module, and this test — like every other one in this file — must
-        // still compile under the Windows cross-check. Matches
-        // `save_parses_to_its_own_command`'s existing shape.
+        // Named explicitly rather than leaned on through `use super::*`,
+        // matching `save_parses_to_its_own_command` and every other
+        // dispatch test in this file. The reason given here used to be a
+        // `#[cfg(unix)]` gate on a top-level `use cli::Commands` in
+        // `main.rs`; there is no such gate, and no such file since Phase 15
+        // extracted the library.
         use cli::Commands;
         let argv = alias_argv(
             "dog",
@@ -2348,11 +2369,13 @@ mod tests {
     /// dispatch arms carried no unit coverage at all until recently, and a
     /// verb pointed at the wrong handler was invisible workspace-wide.
     ///
-    /// `Commands` is imported locally rather than via `super::*`: the
-    /// top-level `use cli::Commands` (main.rs:31) is `#[cfg(unix)]`-gated
-    /// alongside every verb module, but this test — like every other one in
-    /// this file — must still compile on the Windows target, where that
-    /// import does not exist.
+    /// `Commands` is named explicitly rather than leaned on through
+    /// `use super::*`, matching every other dispatch test in this file.
+    /// This said it was working around a `#[cfg(unix)]` gate on a
+    /// `use cli::Commands` at `main.rs:31`. That gate does not exist, the
+    /// import at the top of this file is unconditional, and `main.rs` has
+    /// not existed since Phase 15 turned this crate into a library with
+    /// three thin `[[bin]]` targets over it.
     #[test]
     fn save_parses_to_its_own_command() {
         use clap::Parser;
@@ -2623,14 +2646,24 @@ mod tests {
 
         let cli = Cli::try_parse_from(["shep", "--home", missing, "startup"]).unwrap();
         assert_eq!(
-            run(cli, style::Presentation::BARE).await,
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
             ExitCode::Usage,
             "startup must refuse a $SHEP_HOME that is not there"
         );
 
         let cli = Cli::try_parse_from(["shep", "--home", missing, "unstartup"]).unwrap();
         assert_ne!(
-            run(cli, style::Presentation::BARE).await,
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
             ExitCode::Usage,
             "unstartup removes a unit and never reads the home a --home names"
         );
@@ -2814,12 +2847,14 @@ mod tests {
     /// or if what it writes is not what `style_from_config` (the same
     /// reader `resolve_style` uses) reads back.
     ///
-    /// `#[cfg(unix)]` because every verb refuses on Windows with "shep does
-    /// not yet support Windows", so there is no write to observe there. This
-    /// gate was missing when the test landed and turned CI's two Windows legs
-    /// red; the local gate could not see it, because a macOS `cargo test`
-    /// never compiles a Windows arm and the windows-gnu cross-check is
-    /// `cargo check`, which does not run anything.
+    /// `#[cfg(unix)]`: `shep style <level>` genuinely runs on Windows now
+    /// (only `startup`/`unstartup` refuse there), but this test drives that
+    /// write through `commands::shep_toml`'s `ConfigLock`, and nothing in
+    /// this crate has ever compiled or run that lock's `cfg(windows)` arm --
+    /// a macOS `cargo test` never reaches it and the windows-gnu cross-check
+    /// is `cargo check`, which does not run anything. Gating this test
+    /// unix-only says so plainly rather than asserting a Windows write this
+    /// worktree cannot actually observe.
     #[cfg(unix)]
     #[tokio::test]
     async fn style_with_a_level_writes_shep_toml_and_the_config_reads_it_back() {
@@ -2834,7 +2869,12 @@ mod tests {
             let home = dir.path().to_str().unwrap();
             let cli = Cli::try_parse_from(["shep", "--home", home, "style", raw]).unwrap();
             assert_eq!(
-                run(cli, style::Presentation::BARE).await,
+                run(
+                    cli,
+                    style::Presentation::BARE,
+                    (style::StyleLevel::Full, style::StyleSource::Default),
+                )
+                .await,
                 ExitCode::Success,
                 "style {raw}"
             );
@@ -2852,8 +2892,11 @@ mod tests {
     /// no-arg form is a report, and only a report, the same guarantee
     /// `resolve_style_reads_the_flag_and_the_real_shep_toml_it_names`
     /// above pins for what it *reads*.
-    /// `#[cfg(unix)]` for the same reason as the test above: the verb
-    /// refuses on Windows before it can report anything.
+    /// `#[cfg(unix)]` to stay paired with the test above rather than for a
+    /// reason of its own: it drives the same `run` dispatch through the
+    /// same real `$SHEP_HOME`, and keeping both gated the same way keeps
+    /// the pair's Windows coverage (or the lack of it) legible in one
+    /// place instead of one gated and one not for no visible reason.
     #[cfg(unix)]
     #[tokio::test]
     async fn style_with_no_level_reports_and_writes_nothing() {
@@ -2862,7 +2905,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_str().unwrap();
         let cli = Cli::try_parse_from(["shep", "--home", home, "style"]).unwrap();
-        assert_eq!(run(cli, style::Presentation::BARE).await, ExitCode::Success);
+        assert_eq!(
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
+            ExitCode::Success
+        );
 
         assert!(
             !dir.path().join("shep.toml").exists(),
@@ -2908,24 +2959,34 @@ mod tests {
     /// daemon dispatch arm for real belongs in the e2e tier
     /// (`tests/cli_e2e.rs`), against an isolated `--home`, not here.
     ///
-    /// `#[cfg(unix)]`: what this proves is specific to the unix arm's
-    /// early-dispatch shape — that `Completions` is one of the handful of
-    /// verbs routed around `resolve_paths` rather than through it. The
-    /// windows arm has no such split to prove anything about: it refuses
-    /// every verb unconditionally, `completions` included, before it can
-    /// even become a question of whether paths were resolved. Windows is
-    /// shep's 0% tier by deliberate, standing decision (`CLAUDE.md`: "every
-    /// verb prints \"not yet supported\" and exits") — carving out
-    /// `completions` as the one working verb there is a real product
-    /// decision, not one this test should make unilaterally by asserting
-    /// `Success` against an arm that was never built to return it.
-    #[cfg(unix)]
+    /// Runs on every platform, deliberately. This carried a
+    /// `#[cfg(unix)]` whose stated reason was that "the windows arm
+    /// refuses every verb unconditionally, `completions` included" and
+    /// that Windows is shep's 0% tier. Both halves are stale: there is one
+    /// `run`, not a unix arm and a windows arm, `Commands::Completions` is
+    /// not gated in it, and the Windows tier is built and runs against a
+    /// live flock. Correcting the prose and keeping the gate would have
+    /// left a gate with no reason, so the gate goes.
+    ///
+    /// What it proves is portable: that `Completions` is one of the handful
+    /// of verbs routed around `resolve_paths` rather than through it, so it
+    /// answers with no `$SHEP_HOME` at all. Everything on that path is
+    /// platform-neutral -- `resolve_paths`, `ShepherdStatus::probe` (which
+    /// fails to connect and reports no shepherd), and `completions` itself.
     #[tokio::test]
     async fn completions_never_resolves_paths() {
         use clap::Parser;
         let argv = ["shep", "completions", "bash"];
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
-        assert_eq!(run(cli, style::Presentation::BARE).await, ExitCode::Success);
+        assert_eq!(
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
+            ExitCode::Success
+        );
     }
 
     /// fails if the absent-socket case stops naming the next command, or if a
@@ -3271,7 +3332,12 @@ mod tests {
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
 
         assert_eq!(
-            run(cli, style::Presentation::BARE).await,
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
             ExitCode::DaemonUnreachable,
             "`kill` against an unowned home must reach its own socket-free path"
         );

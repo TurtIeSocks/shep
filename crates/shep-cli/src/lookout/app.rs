@@ -31,12 +31,15 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use shep_client::RequestError;
+use shep_core::config::LogLevel;
 use shep_core::protocol::{
-    BusEvent, Lamb, ProcessEventKind, ProcessInfo, Request, Response, SelectorSpec,
+    BusEvent, DogSource, Lamb, ProcessEventKind, ProcessInfo, Request, Response, SelectorSpec,
 };
 use shep_core::status::ProcStatus;
 
 use super::theme::Palette;
+use crate::commands::settings::{SettingEdit, SettingField, SettingsSnapshot};
+use crate::style::{StyleLevel, StyleSource};
 use crate::vocabulary::Reported;
 
 /// Whether this lookout may act on a sheep.
@@ -105,14 +108,24 @@ pub enum KeyPress {
     Confirm,
     /// `/` — open the filter box, carrying whatever query is already set.
     FilterStart,
-    /// One printable character typed into the box.
-    FilterChar(char),
-    /// `Backspace` in the box.
-    FilterBackspace,
-    /// `Enter` in the box: apply and leave.
-    FilterApply,
-    /// `Esc` in the box: clear the filter and leave.
-    FilterAbandon,
+    /// One printable character typed into whichever text field is open.
+    /// The reducer decides which that is, the same division `Escape`'s own
+    /// doc argues for, because the keymap cannot see it.
+    TextChar(char),
+    /// `Backspace` in whichever text field is open.
+    TextBackspace,
+    /// `Enter` in whichever text field is open: apply and leave.
+    TextApply,
+    /// `Esc` in whichever text field is open: abandon the edit and leave.
+    TextAbandon,
+    /// `s`: open the settings screen from the dashboard, or close it again
+    /// from inside the screen. The reducer decides which, the same division
+    /// [`Self::Escape`]'s own doc argues for.
+    Settings,
+    /// `space`: cycle the value under the settings screen's own cursor.
+    /// Meaningless from the dashboard; refuses the same way an action key
+    /// does when the control gate is closed.
+    Cycle,
 }
 
 /// Everything that can change the dashboard.
@@ -195,7 +208,108 @@ pub enum Msg {
         /// What could not be sent.
         sent: Sent,
     },
+    /// The settings screen's read of `shep.toml` landed, in answer to an
+    /// [`Effect::LoadSettings`] this reducer asked for.
+    ///
+    /// `Result<_, String>` rather than `commands::settings::SettingError`,
+    /// because this reducer holds no error types from `commands` and a
+    /// notice needs a rendered sentence anyway: `super::run_ui` is what
+    /// calls `to_string()` on the way in.
+    Settings {
+        /// The rendered snapshot, or why it could not be read.
+        result: Result<SettingsSnapshot, String>,
+    },
+    /// An [`Effect::WriteSetting`] this reducer asked for has landed.
+    ///
+    /// `Result<(), String>` for the same reason [`Self::Settings`]'s own doc
+    /// gives: this reducer holds no error types from `commands`, and
+    /// `super::run_ui` is what calls `to_string()` on a
+    /// `commands::settings::SettingError` on the way in.
+    SettingWritten {
+        /// The edit that was sent, echoed back so the reducer can update the
+        /// right row without re-deriving it from whatever is armed now: the
+        /// cursor, and what is armed, can both have moved on while the write
+        /// was in flight.
+        edit: SettingEdit,
+        /// Whether the write landed, or why it did not.
+        result: Result<(), String>,
+    },
+    /// An [`Effect::WriteDog`] this reducer asked for has landed.
+    ///
+    /// `Result<DogSource, String>` rather than the config commands' own
+    /// error types, for the same reason [`Self::SettingWritten`]'s own doc
+    /// gives: `super::run_ui` is what calls `to_string()` on the way in.
+    /// `Ok` carries the [`DogSource`] the write resolved, which is what
+    /// [`Sent::Dog`] rides to the shepherd -- the request cannot disagree
+    /// with the file this way.
+    DogWritten {
+        /// The toggle that was sent, echoed back the same reason
+        /// [`Self::SettingWritten`]'s own `edit` is: the cursor, and what
+        /// is armed, can both have moved on while the write was in flight.
+        edit: DogEdit,
+        /// Whether the write landed and what it resolved to, or why it did
+        /// not.
+        result: Result<DogSource, String>,
+    },
 }
+
+/// The one gate on writing `shep.toml` from the settings screen.
+///
+/// Lives in its own module with a private field so that [`Control`] is
+/// checked ONCE, structurally, rather than remembered key by key. Nothing
+/// outside this module can build a [`WriteAuthority`] -- not `App`, not the
+/// key handlers, not the tests -- so the only way to reach it is
+/// [`WriteAuthority::granted`], which hands back [`None`] for
+/// [`Control::ReadOnly`]. [`Effect::WriteSetting`] and [`Effect::WriteDog`]
+/// each carry one, so a settings write is not something a handler is
+/// trusted to check before performing: it is something the handler cannot
+/// name without having passed the check.
+///
+/// That matters because the first version of this gate was a check on one
+/// key (`space`, [`App::cycle_setting`]), and the editor `Enter` added
+/// later walked straight around it: a read-only lookout could type a new
+/// `socket` and apply it. A fourth door added tomorrow cannot repeat that,
+/// because it cannot construct the effect it would have to return.
+///
+/// [`WriteAuthority::granted`] takes `&App` rather than a bare [`Control`]
+/// on purpose: a bare `Control` can be built anywhere (`Control::Allowed`
+/// is a unit variant, not a secret), so a call site free to hand in a
+/// literal `Control::Allowed` instead of the app's own field would grant
+/// itself the token by construction, which is exactly the shape the first
+/// review mutation of this gate took, and it compiled. Reading the field
+/// off `App` closes that: the only `Control` `granted` ever sees is the one
+/// the app was actually built with.
+mod authority {
+    use super::App;
+
+    /// Proof that `--allow-control` was on when a settings write was built.
+    ///
+    /// `Debug` is derived rather than redacted (IR-41): a zero-sized token
+    /// with no field a `{:?}` could print.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WriteAuthority(());
+
+    impl WriteAuthority {
+        /// A token when `app`'s own [`Control`](super::Control) permits
+        /// writing, [`None`] otherwise.
+        ///
+        /// The sole constructor. The unit field above is private to this
+        /// module, so every other module in this crate reaches a
+        /// [`WriteAuthority`] through here or not at all. Takes `&App`
+        /// rather than a `Control` so the only reachable answer is the
+        /// app's own gate -- see this module's own doc for what a bare
+        /// `Control` parameter let slip past review once already.
+        #[must_use]
+        pub fn granted(app: &App) -> Option<Self> {
+            match app.control {
+                super::Control::ReadOnly => None,
+                super::Control::Allowed => Some(Self(())),
+            }
+        }
+    }
+}
+
+pub use authority::WriteAuthority;
 
 /// What the caller has to do after an update.
 ///
@@ -231,6 +345,40 @@ pub enum Effect {
     Send(Sent),
     /// Leave.
     Quit,
+    /// Read `shep.toml`'s settings snapshot; the result lands as
+    /// [`Msg::Settings`].
+    ///
+    /// Raised by the dashboard's own `s`, never by the settings screen's:
+    /// once the screen is open, `s` closes it instead. See [`App::on_key`].
+    LoadSettings,
+    /// Apply one edit to `shep.toml`; the result lands as
+    /// [`Msg::SettingWritten`].
+    ///
+    /// Raised by [`App::confirm_setting`] once an armed scalar's Enter
+    /// lands. `super::run_ui` runs it on `spawn_blocking`, and that is
+    /// load-bearing rather than a convention: `commands::settings`'s
+    /// `ConfigLock::acquire` blocks with no deadline
+    /// (`FlockArg::LockExclusive`), so a concurrent `shep adopt` on the same
+    /// file would freeze the UI task's redraw, its tick and its bus drain
+    /// right along with the write.
+    ///
+    /// The [`WriteAuthority`] is not decoration: it is the only thing that
+    /// makes `--allow-control` a property of this effect rather than a
+    /// check each key handler has to remember. See its own doc.
+    WriteSetting(SettingEdit, WriteAuthority),
+    /// Apply one dog's file half; the result lands as [`Msg::DogWritten`].
+    ///
+    /// Raised by [`App::confirm_setting`] once an armed dog row's Enter
+    /// lands. Its own [`Effect`], not [`Self::WriteSetting`] again: the two
+    /// carry different payloads (a [`DogEdit`] rather than a
+    /// [`SettingEdit`]) and end differently -- a scalar write ends in a
+    /// notice, a dog write ends in a request to the shepherd
+    /// ([`Sent::Dog`]). `super::run_ui` runs this on `spawn_blocking`, the
+    /// same reason [`Self::WriteSetting`]'s own doc gives.
+    ///
+    /// Carries a [`WriteAuthority`] for the same reason
+    /// [`Self::WriteSetting`] does.
+    WriteDog(DogEdit, WriteAuthority),
 }
 
 /// The connection's state, as the dashboard reports it.
@@ -341,6 +489,18 @@ pub enum Sent {
         /// Its name at arm time.
         name: String,
     },
+    /// One dog's daemon half, after its file half landed. `source` is what
+    /// the write returned, so the request cannot disagree with the file --
+    /// see [`DogEdit`]'s own doc for the file half this follows.
+    Dog {
+        /// The dog's name.
+        name: String,
+        /// `true` to start it, `false` to stop and deregister it.
+        enable: bool,
+        /// Where the binary comes from, exactly as the config write
+        /// answered.
+        source: DogSource,
+    },
 }
 
 impl Sent {
@@ -362,8 +522,35 @@ impl Sent {
                     ActionVerb::Reload => Request::Reload { selector },
                 }
             }
+            Self::Dog {
+                name,
+                enable: true,
+                source,
+            } => Request::EnableDog {
+                name: name.clone(),
+                source: source.clone(),
+            },
+            Self::Dog {
+                name,
+                enable: false,
+                ..
+            } => Request::DisableDog { name: name.clone() },
         }
     }
+}
+
+/// One dog toggle, ready for the file half: [`Effect::WriteDog`] carries
+/// one, and [`Msg::DogWritten`] echoes it back once
+/// `dogs::enable_in_config`/`dogs::disable_in_config` has answered.
+///
+/// `Debug` is derived rather than redacted (IR-41): a bare name and a bool,
+/// nothing a `{:?}` could leak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DogEdit {
+    /// The dog's name.
+    pub name: String,
+    /// `true` to enable, `false` to disable.
+    pub enable: bool,
 }
 
 /// What the cursor can sit on: one sheep, or the header above an app's
@@ -431,6 +618,497 @@ impl Notice {
 impl fmt::Display for Notice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.text)
+    }
+}
+
+/// One row the settings screen's cursor can sit on.
+///
+/// `Debug` is derived rather than redacted (IR-41): a bare field name or a
+/// bare index, nothing a `{:?}` could leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsRow {
+    /// One of the six scalar fields, in [`Settings::rows`]'s fixed order.
+    Scalar(SettingField),
+    /// Index into [`SettingsSnapshot::dogs`].
+    Dog(usize),
+}
+
+/// The settings screen's own state. `None` on [`App`] is the dashboard.
+///
+/// `Debug` is derived rather than redacted (IR-41): the snapshot underneath
+/// carries no secret ([`SettingsSnapshot`]'s own note says why) and the
+/// cursor is a bare index.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    snapshot: SettingsSnapshot,
+    /// An index into [`Self::rows`], clamped on every read rather than kept
+    /// pre-clamped: a later task's refresh can shrink the dog list out from
+    /// under a cursor already sitting past its new end.
+    cursor: usize,
+    /// The screen's one in-flight edit, or `None`. One field rather than
+    /// several `Option`s, so typing, armed and sent cannot overlap -- the
+    /// same claim [`Action`]'s own doc makes for the sheep confirm, made in
+    /// the type instead of in a guard.
+    pending: Option<Pending>,
+}
+
+/// The settings screen's own in-flight edit.
+///
+/// `Debug` is derived rather than redacted (IR-41): a field name, a
+/// candidate value and the rendered prompt sentence built from it -- none of
+/// the four scalars this task reaches carries a secret.
+#[derive(Debug, Clone)]
+enum Pending {
+    /// A free-text edit under construction. Only [`SettingField::Socket`]
+    /// and [`SettingField::MaxCronSleep`] ever reach this: `Enter` on
+    /// either row opens it, seeded with that field's own on-disk value
+    /// ([`App::confirm_setting`]), and [`App::on_settings_text_key`] is
+    /// the only place a [`KeyPress::TextChar`] or [`KeyPress::TextBackspace`]
+    /// ever reaches it while [`Settings`] owns the keyboard.
+    Typing {
+        /// Which scalar.
+        field: SettingField,
+        /// What the operator has typed so far.
+        buffer: String,
+    },
+    /// Armed: waiting for the operator's `Enter`. Nothing has gone out yet.
+    Armed {
+        /// The candidate, ready to send.
+        edit: SettingEdit,
+        /// The question this candidate reads as, rendered once at arm time
+        /// so [`Settings::pending`] can hand back a borrowed `&str` without
+        /// re-rendering it on every read.
+        text: String,
+        /// When it was armed. Only an armed edit expires -- see the
+        /// `Msg::Tick` arm.
+        at: Instant,
+    },
+    /// Armed on a [`SettingsRow::Dog`] row instead: waiting for the
+    /// operator's `Enter`, same as [`Self::Armed`], but for a [`DogEdit`]
+    /// rather than a [`SettingEdit`] -- the two carry different payloads and
+    /// [`App::confirm_setting`] sends them through different effects
+    /// ([`Effect::WriteDog`] rather than [`Effect::WriteSetting`]).
+    DogArmed {
+        /// The candidate toggle, ready to send.
+        edit: DogEdit,
+        /// The question this candidate reads as, rendered once at arm time,
+        /// same as [`Self::Armed`]'s own `text`.
+        text: String,
+        /// When it was armed. Only an armed edit expires -- see the
+        /// `Msg::Tick` arm.
+        at: Instant,
+    },
+    /// Sent: [`Effect::WriteSetting`] or [`Effect::WriteDog`] is in flight,
+    /// waiting on [`Msg::SettingWritten`] or [`Msg::DogWritten`]. Carries no
+    /// `edit`: nothing reads the sent candidate back off `Pending` -- the
+    /// landing message's own `edit` (the one the effect round-trips) is what
+    /// every match site actually uses, so this variant only ever needs the
+    /// rendered question, and one variant covers both origins.
+    Sent {
+        /// The same rendered question, so the prompt line does not change
+        /// wording between the question and its own answer.
+        text: String,
+    },
+}
+
+/// What the settings screen's status line shows for its one in-flight edit.
+///
+/// `Debug` is derived rather than redacted (IR-41): a rendered sentence and
+/// a bool, nothing a `{:?}` could leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsPrompt<'a> {
+    /// The confirm sentence: what will change, and what applying it does
+    /// and does not do.
+    pub text: &'a str,
+    /// False while it is a question, true once it has gone out.
+    pub sent: bool,
+}
+
+impl Settings {
+    /// A freshly opened screen, cursor on the first row.
+    fn new(snapshot: SettingsSnapshot) -> Self {
+        Self {
+            snapshot,
+            cursor: 0,
+            pending: None,
+        }
+    }
+
+    /// The armed candidate and its prompt, or `None`.
+    #[must_use]
+    pub fn pending(&self) -> Option<SettingsPrompt<'_>> {
+        match &self.pending {
+            Some(Pending::Armed { text, .. } | Pending::DogArmed { text, .. }) => {
+                Some(SettingsPrompt { text, sent: false })
+            }
+            Some(Pending::Sent { text, .. }) => Some(SettingsPrompt { text, sent: true }),
+            Some(Pending::Typing { .. }) | None => None,
+        }
+    }
+
+    /// Whether an [`Pending::Armed`] or [`Pending::DogArmed`] candidate is
+    /// waiting on `Enter` -- the one state a stray key on this screen
+    /// (movement, `Escape`, `Settings`, `Refresh`) has to eat rather than
+    /// also doing its ordinary job. `Pending::Typing` and `Pending::Sent`
+    /// are both left out on purpose: a free-text edit has its own keymap
+    /// ([`App::on_settings_text_key`]), and a request already sent is not
+    /// cancellable by a keypress, the same rule the sheep confirm's own
+    /// `Stage::Sent` follows.
+    fn is_armed(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(Pending::Armed { .. } | Pending::DogArmed { .. })
+        )
+    }
+
+    /// The field and buffer of an in-flight free-text edit, or `None` --
+    /// including while nothing is armed, while a cycled candidate is
+    /// `Armed` or `Sent`, and once the screen is closed. The view's own
+    /// window into [`Pending::Typing`], the same way [`Self::pending`] is
+    /// its window into `Armed`/`Sent`; the two never overlap; see
+    /// [`Self::pending`]'s own `Typing` arm.
+    #[must_use]
+    pub fn typing(&self) -> Option<(&SettingField, &str)> {
+        match &self.pending {
+            Some(Pending::Typing { field, buffer }) => Some((field, buffer.as_str())),
+            _ => None,
+        }
+    }
+
+    /// The next candidate for `field`, or `None` for a field this task does
+    /// not cycle ([`SettingField::Socket`], [`SettingField::MaxCronSleep`]
+    /// -- free text, task 8's own `Pending::Typing`) and for a
+    /// [`SettingsRow::Dog`] row, which is never a [`SettingField`] at all.
+    ///
+    /// Advances from whatever is already armed for THIS field, so a second
+    /// `space` walks one step further along the cycle rather than
+    /// re-deriving the same next value the file itself would produce --
+    /// without that, six log levels behind one cycle key would leave the
+    /// fourth unreachable without a cancel in between. An armed candidate
+    /// for a DIFFERENT field (the cursor moved after arming) is not a base:
+    /// this starts fresh from the snapshot instead.
+    ///
+    /// From nothing armed, the base is what the FILE says, which is
+    /// [`Self::current_value`] for five of the six fields and
+    /// [`SettingsSnapshot::style_level_in_file`] for `[style] level`. That
+    /// one field's [`ScalarView::value`] is the level in force rather than
+    /// the level on disk, so with `$SHEP_STYLE=bare` over a file saying
+    /// `full` a cycle from the resolved value proposes `full` -- a write
+    /// that changes nothing, reported to the operator as a change.
+    fn next_candidate(&self, field: SettingField) -> Option<String> {
+        let armed_here = match &self.pending {
+            Some(Pending::Armed {
+                edit:
+                    SettingEdit::Set {
+                        field: armed_field,
+                        value,
+                    },
+                ..
+            }) if *armed_field == field => Some(value.as_str()),
+            _ => None,
+        };
+        let in_file = (field == SettingField::StyleLevel)
+            .then_some(self.snapshot.style_level_in_file.as_deref())
+            .flatten();
+        let base: String = match (armed_here, in_file) {
+            (Some(value), _) | (None, Some(value)) => value.to_string(),
+            // A `[style]` document that declares nothing falls back to
+            // `StyleLevel`'s own compiled default, which is what
+            // `style::resolve` returns for the same absence.
+            (None, None) if field == SettingField::StyleLevel => STYLE_LEVEL_ORDER[0].to_string(),
+            (None, None) => self.current_value(field)?.to_string(),
+        };
+        Some(match field {
+            SettingField::LogLevel => next_log_level(&base),
+            SettingField::LogJson | SettingField::AllowControl => next_bool(&base),
+            SettingField::StyleLevel => next_style_level(&base),
+            SettingField::Socket | SettingField::MaxCronSleep => return None,
+        })
+    }
+
+    /// The snapshot's own rendered value for one of the four scalars this
+    /// task cycles. `None` for the two this task does not.
+    fn current_value(&self, field: SettingField) -> Option<&str> {
+        Some(match field {
+            SettingField::LogLevel => self.snapshot.log_level.value.as_str(),
+            SettingField::LogJson => self.snapshot.log_json.value.as_str(),
+            SettingField::AllowControl => self.snapshot.allow_control.value.as_str(),
+            SettingField::StyleLevel => self.snapshot.style_level.value.as_str(),
+            SettingField::Socket | SettingField::MaxCronSleep => return None,
+        })
+    }
+
+    /// Which layer `field`'s value came from, off the snapshot. Only
+    /// [`confirm_text`] reads it, and only its `[style]` arm does anything
+    /// with it -- see [`style_confirm_text`].
+    fn source_of(&self, field: SettingField) -> StyleSource {
+        match field {
+            SettingField::LogLevel => self.snapshot.log_level.source,
+            SettingField::LogJson => self.snapshot.log_json.source,
+            SettingField::Socket => self.snapshot.socket.source,
+            SettingField::MaxCronSleep => self.snapshot.max_cron_sleep.source,
+            SettingField::AllowControl => self.snapshot.allow_control.source,
+            SettingField::StyleLevel => self.snapshot.style_level.source,
+        }
+    }
+
+    /// The snapshot's own rendered value for one of the two free-text
+    /// fields [`Self::current_value`] does not cover -- what
+    /// [`App::confirm_setting`] seeds [`Pending::Typing`]'s buffer with.
+    /// Only ever called with [`SettingField::Socket`] or
+    /// [`SettingField::MaxCronSleep`]: the other four are cycled, not
+    /// typed, and never open an editor.
+    fn text_seed(&self, field: SettingField) -> &str {
+        match field {
+            SettingField::Socket => self.snapshot.socket.value.as_str(),
+            SettingField::MaxCronSleep => self.snapshot.max_cron_sleep.value.as_str(),
+            SettingField::LogLevel
+            | SettingField::LogJson
+            | SettingField::AllowControl
+            | SettingField::StyleLevel => {
+                unreachable!("text_seed only ever reaches the two free-text fields")
+            }
+        }
+    }
+
+    /// What the screen reads off disk. `view::settings::content_lines` is
+    /// the real caller, reading it to render every row's value and source.
+    /// A landed write does not update this in place any more: `App`'s own
+    /// `Msg::SettingWritten` `Ok` arm raises a fresh [`Effect::LoadSettings`]
+    /// instead, the same read `r` and the initial `s` both already go
+    /// through, so `Set` and `Unset` land the same way and neither can
+    /// drift from whatever else changed in the document meanwhile.
+    #[must_use]
+    pub fn snapshot(&self) -> &SettingsSnapshot {
+        &self.snapshot
+    }
+
+    /// Every row the cursor can sit on: the six scalars in their fixed
+    /// order, then one row per candidate dog.
+    #[must_use]
+    pub fn rows(&self) -> Vec<SettingsRow> {
+        let mut rows = vec![
+            SettingsRow::Scalar(SettingField::LogLevel),
+            SettingsRow::Scalar(SettingField::LogJson),
+            SettingsRow::Scalar(SettingField::Socket),
+            SettingsRow::Scalar(SettingField::MaxCronSleep),
+            SettingsRow::Scalar(SettingField::AllowControl),
+            SettingsRow::Scalar(SettingField::StyleLevel),
+        ];
+        rows.extend((0..self.snapshot.dogs.len()).map(SettingsRow::Dog));
+        rows
+    }
+
+    /// The row the cursor sits on. `None` only if [`Self::rows`] is somehow
+    /// empty, which cannot happen today (the six scalars are unconditional),
+    /// but the type stays honest about it rather than asserting.
+    ///
+    /// `view::settings::content_lines` is the real caller, reading it to
+    /// highlight the selected row -- and [`App::cycle_setting`] reads it
+    /// through this same accessor to decide which field, if any, `space`
+    /// arms.
+    #[must_use]
+    pub fn cursor(&self) -> Option<SettingsRow> {
+        let rows = self.rows();
+        rows.get(self.cursor.min(rows.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// Moves the cursor by `delta` rows, clamped to [`Self::rows`] rather
+    /// than wrapping, the same rule the flock table's own cursor follows.
+    fn move_by(&mut self, delta: isize) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
+    }
+
+    /// Moves the cursor to the first row.
+    fn move_to_first(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Moves the cursor to the last row.
+    fn move_to_last(&mut self) {
+        self.cursor = self.rows().len().saturating_sub(1);
+    }
+}
+
+/// `Off, Error, Warn, Info, Debug, Trace`, [`LogLevel`]'s own declared
+/// order, wrapping from `Trace` back to `Off`.
+const LOG_LEVEL_ORDER: [LogLevel; 6] = [
+    LogLevel::Off,
+    LogLevel::Error,
+    LogLevel::Warn,
+    LogLevel::Info,
+    LogLevel::Debug,
+    LogLevel::Trace,
+];
+
+/// One step along [`LOG_LEVEL_ORDER`] from `current`. A string this crate
+/// did not itself render (should not happen -- every candidate and every
+/// snapshot value comes from [`LogLevel::as_str`]) reads as
+/// [`LogLevel::default`]'s own place in the ladder (`Warn`), so a corrupt
+/// value still produces a legal next one rather than panicking.
+fn next_log_level(current: &str) -> String {
+    let index = LogLevel::from_name(current)
+        .and_then(|level| {
+            LOG_LEVEL_ORDER
+                .iter()
+                .position(|candidate| *candidate == level)
+        })
+        .unwrap_or(2);
+    LOG_LEVEL_ORDER[(index + 1) % LOG_LEVEL_ORDER.len()]
+        .as_str()
+        .to_string()
+}
+
+/// Flips `"true"`/`"false"`. Anything else (should not happen, the same
+/// reason [`next_log_level`] states) reads as `false` and flips to `true`.
+fn next_bool(current: &str) -> String {
+    (current != "true").to_string()
+}
+
+/// `Full, Plain, Bare`, [`StyleLevel`]'s own declared order, wrapping from
+/// `Bare` back to `Full`.
+const STYLE_LEVEL_ORDER: [StyleLevel; 3] = [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare];
+
+/// One step along [`STYLE_LEVEL_ORDER`] from `current`, the same fallback
+/// [`next_log_level`] takes for an unparseable value.
+fn next_style_level(current: &str) -> String {
+    let index = StyleLevel::parse(current)
+        .and_then(|level| {
+            STYLE_LEVEL_ORDER
+                .iter()
+                .position(|candidate| *candidate == level)
+        })
+        .unwrap_or(0);
+    STYLE_LEVEL_ORDER[(index + 1) % STYLE_LEVEL_ORDER.len()].to_string()
+}
+
+/// The confirm sentence for `field`'s candidate `value` -- verbatim, per the
+/// task 7 spec's own table. `value` is always the candidate a
+/// `next_*` function above just produced, never re-derived here: this
+/// function only ever renders it into the sentence.
+///
+/// Called only with a field [`Settings::next_candidate`] returned `Some`
+/// for, so [`SettingField::Socket`] and [`SettingField::MaxCronSleep`]
+/// never reach the two arms below -- named rather than wildcarded so a
+/// future field added to the match cannot fall through unnoticed.
+///
+/// `source` is the field's own [`ScalarView::source`], and only
+/// [`SettingField::StyleLevel`] reads it. The other three carry a caveat
+/// about a layer lookout CANNOT see (the shepherd's env and flags), and a
+/// caveat is all they can carry. `[style]`'s layers are lookout's own
+/// process, so this is the one field where the screen knows -- and it was
+/// the one field promising "the next command reads it" unconditionally,
+/// which is false the moment `$SHEP_STYLE` or `--style` is set. See
+/// [`style_confirm_text`].
+fn confirm_text(field: SettingField, value: &str, source: StyleSource) -> String {
+    match field {
+        SettingField::LogLevel => format!(
+            "set log_level to {value}? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level"
+        ),
+        SettingField::LogJson => format!(
+            "set log_json to {value}? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_JSON or --log-json"
+        ),
+        SettingField::AllowControl => {
+            let word = if value == "true" { "on" } else { "off" };
+            format!("turn whistle control tools {word}? needs shep whistle restarted")
+        }
+        SettingField::StyleLevel => style_confirm_text(value, source),
+        SettingField::Socket | SettingField::MaxCronSleep => unreachable!(
+            "Settings::next_candidate never arms these two -- they are task 8's Pending::Typing"
+        ),
+    }
+}
+
+/// The `[style] level` half of [`confirm_text`], split out because it is
+/// the only arm that reads a second fact.
+///
+/// `StyleSource` is what `shep style` already reports and what the row's
+/// own SOURCE cell already shows, so this sentence never tells an operator
+/// something the screen contradicts two lines above it. The split is by
+/// what the layer above the file DOES, not by which layer it is:
+///
+/// - `Config`, `Default` -- nothing outranks the file, so the write is the
+///   whole story and the sentence says so, as it always did.
+/// - `Env`, `Flag` -- the write lands and the level in force does not
+///   move. Naming the layer is the point: the failure this avoids is the
+///   one `StyleSource`'s own doc exists for, an operator editing
+///   `shep.toml`, seeing nothing change, and never thinking of the
+///   `$SHEP_STYLE` in a shell profile they have forgotten about.
+fn style_confirm_text(value: &str, source: StyleSource) -> String {
+    match source {
+        StyleSource::Config | StyleSource::Default => {
+            format!("set style level to {value}? the next command reads it")
+        }
+        StyleSource::Env => format!(
+            "set style level to {value}? it goes in the file, but $SHEP_STYLE is set and keeps winning until it is unset"
+        ),
+        StyleSource::Flag => format!(
+            "set style level to {value}? it goes in the file, but --style was passed to this lookout and keeps winning for as long as it runs"
+        ),
+    }
+}
+
+/// The confirm sentence for a free-text edit -- verbatim, per the design
+/// spec's own table, and the pair this repository's voice review already
+/// signed off on. Only ever built from [`App::on_settings_text_key`]'s
+/// `TextApply` arm, and only ever with an edit naming
+/// [`SettingField::Socket`] or [`SettingField::MaxCronSleep`]: the other
+/// four fields build their sentence through [`confirm_text`] instead,
+/// which never sees an [`SettingEdit::Unset`] because none of the four is
+/// optional. The `Socket` sentence says both halves on purpose: that a
+/// reload will not move it, and that an env var or a boot flag may shadow
+/// it anyway even after this edit lands.
+fn confirm_text_for_edit(edit: &SettingEdit) -> String {
+    match edit {
+        SettingEdit::Set {
+            field: SettingField::Socket,
+            value,
+        } => format!(
+            "set socket to {value}? needs the shepherd stopped and started; a reload will not move it, and it will not apply if the shepherd was booted with SHEP_SOCKET or --socket"
+        ),
+        SettingEdit::Set {
+            field: SettingField::MaxCronSleep,
+            value,
+        } => format!(
+            "set max_cron_sleep to {value}? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_MAX_CRON_SLEEP or --max-cron-sleep"
+        ),
+        SettingEdit::Unset {
+            field: SettingField::Socket,
+        } => "unset socket? it goes back to the default under $SHEP_HOME, and needs the shepherd stopped and started"
+            .to_string(),
+        SettingEdit::Unset {
+            field: SettingField::MaxCronSleep,
+        } => "unset max_cron_sleep? it goes back to the daemon's own default, and needs shep daemon reload"
+            .to_string(),
+        SettingEdit::Set { .. } | SettingEdit::Unset { .. } => unreachable!(
+            "on_settings_text_key only ever builds an edit for socket or max_cron_sleep"
+        ),
+    }
+}
+
+/// What [`App`]'s `Msg::SettingWritten` `Err` arm reopens
+/// [`Pending::Typing`] with, for the two free-text fields: the field and
+/// the text the operator typed, recovered from the edit
+/// [`Effect::WriteSetting`] carried. `None` for the four cycled fields,
+/// which reopen nothing -- a refusal there clears the row's pending state
+/// and raises the notice on its own, same as before this task.
+fn typed_text_of(edit: &SettingEdit) -> Option<(SettingField, String)> {
+    match edit {
+        SettingEdit::Set {
+            field: field @ (SettingField::Socket | SettingField::MaxCronSleep),
+            value,
+        } => Some((*field, value.clone())),
+        SettingEdit::Unset {
+            field: field @ (SettingField::Socket | SettingField::MaxCronSleep),
+        } => Some((*field, String::new())),
+        _ => None,
     }
 }
 
@@ -525,6 +1203,12 @@ pub const CONFIRM_EXPIRY: Duration = Duration::from_secs(10);
 /// the same one, so the two cannot drift apart.
 const LINK_GONE: &str = "the shepherd is gone — nothing left to ask";
 
+/// The sentence every closed-gate refusal gives, on the dashboard and on
+/// the settings screen alike. One string, so an operator who has met it
+/// once on `x` recognises it on `space` -- and so the two cannot drift
+/// apart the way the checks behind them once did.
+const READ_ONLY_REFUSAL: &str = "read-only: actions need --allow-control";
+
 /// The whole dashboard's state.
 #[derive(Debug)]
 pub struct App {
@@ -592,6 +1276,17 @@ pub struct App {
     lambs: Option<LambReading>,
     /// The one action this dashboard is in the middle of, or `None`.
     action: Option<Action>,
+    /// The settings screen's own state. `None` is the dashboard; `Some` is
+    /// the screen, open over it.
+    settings: Option<Settings>,
+    /// The resolved style level and which layer chose it, from
+    /// `run_argv`'s own `resolve_style`. `App::new` defaults it to
+    /// `(StyleLevel::Full, StyleSource::Default)`; `run_argv`'s `lookout`
+    /// dispatch immediately overrides it with the real resolution through
+    /// `Self::set_style`, so the settings screen's own STYLE LEVEL row
+    /// reads the same answer the rest of the CLI does rather than a second,
+    /// independently derived one.
+    style: (StyleLevel, StyleSource),
 }
 
 impl App {
@@ -614,6 +1309,8 @@ impl App {
             feed: super::tail::Tail::default(),
             lambs: None,
             action: None,
+            settings: None,
+            style: (StyleLevel::Full, StyleSource::Default),
         }
     }
 
@@ -682,6 +1379,25 @@ impl App {
                         self.action = None;
                     }
                 }
+                // The settings screen's own expiry sits OUTSIDE the guard
+                // above, and compares against `now` -- the tick's own
+                // instant -- rather than `self.now`, which that guard stops
+                // advancing once the link is lost. The sheep confirm freezes
+                // with everything else on a dead link because every word of
+                // it describes the shepherd, which the dashboard can no
+                // longer see; a settings edit describes a local file that is
+                // not stale just because the shepherd stopped answering, so
+                // it keeps its own clock running.
+                if let Some(settings) = self.settings.as_mut() {
+                    let expired = matches!(
+                        settings.pending,
+                        Some(Pending::Armed { at, .. } | Pending::DogArmed { at, .. })
+                            if now.saturating_duration_since(at) >= CONFIRM_EXPIRY
+                    );
+                    if expired {
+                        settings.pending = None;
+                    }
+                }
                 Effect::None
             }
             Msg::Resize => Effect::None,
@@ -724,6 +1440,7 @@ impl App {
                 Sent::Action { verb, target, name } => {
                     self.on_action_reply(verb, target, &name, result)
                 }
+                Sent::Dog { name, enable, .. } => self.on_dog_reply(name, enable, result),
             },
             Msg::Unsent { sent } => match sent {
                 Sent::Action { verb, target, name } => {
@@ -745,6 +1462,168 @@ impl App {
                 // is what the pane says. Nothing to report and nothing to
                 // clear.
                 Sent::Lambs { .. } => Effect::None,
+                // Same shape as `Sent::Action`'s own arm above, aimed at the
+                // settings screen's own pending line instead of the sheep
+                // confirm.
+                Sent::Dog { name, enable, .. } => {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.pending = None;
+                    }
+                    let verb = if enable { "enable" } else { "disable" };
+                    self.notice = Some(Notice {
+                        text: format!("{verb} {name}: it was not sent"),
+                        grave: true,
+                    });
+                    Effect::None
+                }
+            },
+            // The file can have changed since `s` asked for it, and the
+            // screen opens on whatever this read found -- never on stale or
+            // empty state, which is exactly why `s` asks first rather than
+            // opening immediately. A failed read leaves the dashboard up: an
+            // empty settings screen would say nothing about why it has
+            // nothing to show.
+            //
+            // This is also where a landed write's own re-read lands
+            // (`Msg::SettingWritten`'s `Ok` arm raises `Effect::LoadSettings`
+            // rather than hand-updating one row) and where `r` lands. Both
+            // arrive with `self.settings` already `Some`, and the cursor is
+            // preserved across them rather than reset: `opening` below is
+            // true only the first time, when `s` itself is what raised the
+            // read.
+            Msg::Settings { result } => {
+                let opening = self.settings.is_none();
+                match result {
+                    Ok(snapshot) => {
+                        // Clears an action that armed while the read was in
+                        // flight (`s`, then `x`, then this landing): once
+                        // this branch runs, `on_key`'s settings short
+                        // circuit intercepts every key ahead of the
+                        // armed-confirm cancel block, and `on_settings_key`
+                        // no-ops `Confirm`. Without this, the prompt would
+                        // sit on screen, unreachable by Enter or by any
+                        // other key, until `CONFIRM_EXPIRY`. This is the
+                        // same closing-by-construction `on_key`'s own
+                        // comment already argues for `/` and the filter
+                        // box: a sheep confirm and the settings screen can
+                        // never coexist, and this is the one place
+                        // `self.settings` becomes `Some`, so clearing here
+                        // covers both the keypress and the race.
+                        self.action = None;
+                        // The sibling race: `s`, then `/`, then a snapshot
+                        // landing while the box is still open. `on_key`
+                        // checks `self.mode == InputMode::Text` ahead of the
+                        // settings check, and `on_text_key` never consults
+                        // `self.settings`, so an open box would survive the
+                        // screen opening and keep eating every keystroke the
+                        // settings keymap was meant to own. Leaving text
+                        // mode here makes that state unrepresentable, the
+                        // same way clearing `self.action` above does for a
+                        // confirm.
+                        //
+                        // The query itself is kept, not cleared: this is
+                        // `TextApply`'s reading (Enter), not
+                        // `TextAbandon`'s (Esc). The operator was watching
+                        // the dashboard filter live while `/` was open --
+                        // the read had not landed yet -- so the characters
+                        // they typed are a real query they chose to build,
+                        // not a stray keystroke. Discarding it on the way
+                        // out would be the one filter edit in this whole
+                        // screen that vanishes without an Esc.
+                        self.mode = InputMode::Normal;
+                        // The cursor: reset to the first row only while
+                        // `opening`. `Settings::cursor` clamps on every
+                        // read, so a preserved cursor sitting past a
+                        // shorter dogs list still lands somewhere real
+                        // rather than out of bounds.
+                        let cursor = self.settings.as_ref().map_or(0, |settings| settings.cursor);
+                        let mut settings = Settings::new(snapshot);
+                        if !opening {
+                            settings.cursor = cursor;
+                        }
+                        self.settings = Some(settings);
+                    }
+                    Err(message) => {
+                        self.notice = Some(Notice {
+                            text: message,
+                            grave: true,
+                        });
+                    }
+                }
+                Effect::None
+            }
+            // An [`Effect::WriteSetting`] landed. `Ok` clears the prompt and
+            // raises a fresh [`Effect::LoadSettings`] rather than folding
+            // the write into the row by hand: that covers `Set` and
+            // `Unset` uniformly (an `Unset` has no local value to fold in,
+            // only the document does), picks up anything else that changed
+            // on disk in the meantime, and is the same read `r` and the
+            // initial `s` already go through -- see [`Msg::Settings`]'s own
+            // doc for how the cursor survives it. `Err` leaves the row
+            // exactly as it read before the write, and raises a grave
+            // notice with the refusal's own words rather than a generic
+            // one -- the same "say why" rule `arm`'s refusal ladder follows.
+            //
+            // For the two free-text fields, `Err` also reopens
+            // [`Pending::Typing`] with the text the operator typed
+            // ([`typed_text_of`]) and switches [`InputMode::Text`] back on:
+            // the refusal is discovered under `apply_setting`'s own lock,
+            // after the confirm, so it has to land as a re-opened editor
+            // rather than a blank row -- an operator who typed a long path
+            // must not have to retype it to fix one character. The four
+            // cycled fields have nothing to reopen; their `Err` matches the
+            // behaviour this arm already had.
+            Msg::SettingWritten { edit, result } => match result {
+                Ok(()) => {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.pending = None;
+                    }
+                    Effect::LoadSettings
+                }
+                Err(message) => {
+                    // `typed_text_of` names the field, so the two branches
+                    // below never share a borrow of `self.settings` that
+                    // would fight the `self.notice` assignment beneath
+                    // them.
+                    if let Some((field, buffer)) = typed_text_of(&edit) {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings.pending = Some(Pending::Typing { field, buffer });
+                        }
+                        self.mode = InputMode::Text;
+                    } else if let Some(settings) = self.settings.as_mut() {
+                        settings.pending = None;
+                    }
+                    self.notice = Some(Notice {
+                        text: message,
+                        grave: true,
+                    });
+                    Effect::None
+                }
+            },
+            // An [`Effect::WriteDog`] landed. `Ok` clears the prompt and
+            // raises the daemon half -- one message still yields one
+            // effect, so the chain is `Cycle` arms, `Confirm` writes the
+            // file, this arm asks the shepherd. `Err` raises a grave notice
+            // with the refusal's own words, the same "say why" rule
+            // `Msg::SettingWritten`'s own `Err` arm follows, and never
+            // reaches the shepherd: the file half failed, so there is
+            // nothing yet for the daemon half to agree or disagree with.
+            Msg::DogWritten { edit, result } => match result {
+                Ok(source) => Effect::Send(Sent::Dog {
+                    name: edit.name,
+                    enable: edit.enable,
+                    source,
+                }),
+                Err(message) => {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.pending = None;
+                    }
+                    self.notice = Some(Notice {
+                        text: message,
+                        grave: true,
+                    });
+                    Effect::None
+                }
             },
         }
     }
@@ -848,6 +1727,84 @@ impl App {
         Effect::None
     }
 
+    /// One dog toggle's answer: the settings screen's `Pending::Sent` line
+    /// clears, one sentence lands in the status bar, and the screen
+    /// re-reads `shep.toml`.
+    ///
+    /// No row is upserted here from `Response::DogStarted`'s own
+    /// `ProcessInfo`, unlike [`Self::on_action_reply`]: the RUNNING column
+    /// this reply would feed repairs itself off the next `ListFlock`, two
+    /// seconds later, the same as every other flock fact this screen shows.
+    ///
+    /// [`Effect::LoadSettings`] on every arm, `Err` included, for the same
+    /// reason `Msg::SettingWritten`'s own `Ok` arm raises it: the FILE half
+    /// has already landed by the time this reply arrives (that is what
+    /// `Msg::DogWritten`'s `Ok` sent the request on), so `DogView.enabled`
+    /// is stale here whatever the shepherd went on to say. Without the
+    /// re-read the IN FILE cell kept its pre-write value while RUNNING
+    /// updated off the two-second poll, so a landed `enable metrics` read
+    /// `metrics | no | online` -- the dogs table manufacturing the exact
+    /// drift it exists to reveal, and reading as the one row the docs page
+    /// teaches an operator to treat as "running with nothing enabling it".
+    fn on_dog_reply(
+        &mut self,
+        name: String,
+        enable: bool,
+        result: Result<Response, RequestError>,
+    ) -> Effect {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.pending = None;
+        }
+        let verb = if enable { "enable" } else { "disable" };
+        let prefix = format!("{verb} {name}");
+        // `EnableDog` answers `Response::DogStarted`; `DisableDog` answers
+        // `Response::Deleted`, the same reply `Delete` gives -- see that
+        // variant's own doc in shep-core for why it carries no dedicated
+        // shape.
+        match result {
+            Ok(Response::DogStarted(_)) if enable => {
+                self.notice = Some(Notice {
+                    text: format!("{prefix}: the shepherd started it"),
+                    grave: false,
+                });
+            }
+            Ok(Response::Deleted(_)) if !enable => {
+                self.notice = Some(Notice {
+                    text: format!("{prefix}: the shepherd stopped and deregistered it"),
+                    grave: false,
+                });
+            }
+            // Also reached by a mismatched guard above -- an `EnableDog`
+            // that somehow answered `Response::Deleted`, or a `DisableDog`
+            // that somehow answered `Response::DogStarted`. Neither reply
+            // agrees with the request this reducer sent, so this is the
+            // right arm for both: "something this lookout does not
+            // understand" is true of an answer to the wrong verb too, not
+            // only of a variant this binary has never heard of.
+            Ok(_unrecognised) => {
+                self.notice = Some(Notice {
+                    text: format!(
+                        "{prefix}: the shepherd answered something this lookout does not understand"
+                    ),
+                    grave: true,
+                });
+            }
+            Err(RequestError::Rpc(err)) => {
+                self.notice = Some(Notice {
+                    text: format!("{prefix}: {}", err.message),
+                    grave: true,
+                });
+            }
+            Err(other) => {
+                self.notice = Some(Notice {
+                    text: format!("{prefix}: {other}"),
+                    grave: true,
+                });
+            }
+        }
+        Effect::LoadSettings
+    }
+
     fn on_event(&mut self, event: BusEvent) -> Effect {
         match event {
             BusEvent::Process { event, info, .. } => {
@@ -925,6 +1882,13 @@ impl App {
         // this branch is what keeps them off the query. See `on_text_key`.
         if self.mode == InputMode::Text {
             return self.on_text_key(key);
+        }
+        // The settings screen owns its own keymap while it is open, ahead of
+        // the armed-confirm check below: no sheep action can be armed from
+        // in here (`s` reaches the dashboard only after the screen closes),
+        // so the ordering is a documentation choice, not a correctness one.
+        if self.settings.is_some() {
+            return self.on_settings_key(key);
         }
         // Checked BEFORE the ordinary dispatch, and a cancelling keypress is
         // CONSUMED. A stray `j` during a pending confirm cancels it and does
@@ -1010,10 +1974,282 @@ impl App {
             // the top of this function has already taken. Named rather than
             // wildcarded so a future variant does not fall silently into an
             // arm that ignores it.
-            KeyPress::FilterChar(_)
-            | KeyPress::FilterBackspace
-            | KeyPress::FilterApply
-            | KeyPress::FilterAbandon => Effect::None,
+            KeyPress::TextChar(_)
+            | KeyPress::TextBackspace
+            | KeyPress::TextApply
+            | KeyPress::TextAbandon => Effect::None,
+            // The read, not the open: the screen opens only once
+            // `Msg::Settings` lands. See that arm's own doc for why.
+            KeyPress::Settings => Effect::LoadSettings,
+            // Meaningless from the dashboard; the settings screen is the
+            // only thing `space` does anything for, and this branch is only
+            // reached when that screen is not open.
+            KeyPress::Cycle => Effect::None,
+        }
+    }
+
+    /// The settings screen's own keymap, in force for as long as
+    /// [`Self::settings`] is `Some`. Everything not named here is ignored,
+    /// in particular an action key: no sheep action can arm while this
+    /// screen owns the keyboard.
+    fn on_settings_key(&mut self, key: KeyPress) -> Effect {
+        self.notice = None;
+        match key {
+            KeyPress::Quit => return Effect::Quit,
+            // Both close -- but an armed confirm eats the FIRST one instead,
+            // the same cancel-before-act rule `on_key`'s own dashboard
+            // branch already follows for `x`/`R`/`L`. Without this, `space`
+            // then a reflexive `Escape` would close the whole screen on top
+            // of a question the operator only meant to back out of.
+            //
+            // `s` toggling shut is the dashboard's own `s` meaning something
+            // different once the screen is open, the same division
+            // `Escape`'s doc argues for; `Escape` closing rather than
+            // quitting is the one place this screen swaps the dashboard's
+            // own cascade.
+            KeyPress::Settings | KeyPress::Escape => {
+                let armed = self.settings.as_ref().is_some_and(Settings::is_armed);
+                if armed {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.pending = None;
+                    }
+                } else {
+                    self.settings = None;
+                }
+            }
+            // An armed candidate eats the FIRST movement key rather than
+            // also moving the cursor -- the same cancel-before-act rule
+            // `on_key`'s own dashboard branch already follows for
+            // `x`/`R`/`L` (see its "A stray `j` during a pending confirm"
+            // comment): without it, the operator would see the prompt
+            // vanish and the cursor move on the same keypress, and the
+            // next reflexive Enter would apply an edit to a row they had
+            // already lost track of. `Sent` is untouched, same as the
+            // dashboard's own guard, which only fires on `Stage::Armed`:
+            // a request already in flight is not cancellable by a keypress.
+            KeyPress::SelectUp
+            | KeyPress::SelectDown
+            | KeyPress::SelectFirst
+            | KeyPress::SelectLast => {
+                if let Some(settings) = self.settings.as_mut() {
+                    if settings.is_armed() {
+                        settings.pending = None;
+                    } else {
+                        match key {
+                            KeyPress::SelectUp => settings.move_by(-1),
+                            KeyPress::SelectDown => settings.move_by(1),
+                            KeyPress::SelectFirst => settings.move_to_first(),
+                            KeyPress::SelectLast => settings.move_to_last(),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            KeyPress::Cycle => return self.cycle_setting(),
+            KeyPress::Confirm => return self.confirm_setting(),
+            // Re-reads `shep.toml`, so another process's write shows up --
+            // the design spec's own table entry for `r`. `Msg::Settings`'s
+            // own doc is what keeps the cursor from resetting to the first
+            // row on the way back, the same as a landed write's reload.
+            //
+            // An armed candidate eats this one too, the same cancel-before-act
+            // rule the movement keys and `Escape`/`Settings` already follow
+            // above: without the guard, `space` then a reflexive `r` would
+            // silently drop the question and never send the edit, with
+            // nothing on screen to say so.
+            KeyPress::Refresh => {
+                if let Some(settings) = self.settings.as_mut()
+                    && settings.is_armed()
+                {
+                    settings.pending = None;
+                    return Effect::None;
+                }
+                return Effect::LoadSettings;
+            }
+            // Unreachable from here, and named rather than wildcarded so a
+            // future variant does not fall silently into an arm that
+            // ignores it: an action key in particular must never be
+            // mistaken for one this screen answers.
+            KeyPress::Action(_)
+            | KeyPress::FilterStart
+            | KeyPress::TextChar(_)
+            | KeyPress::TextBackspace
+            | KeyPress::TextApply
+            | KeyPress::TextAbandon => {}
+        }
+        Effect::None
+    }
+
+    /// The [`WriteAuthority`] every settings write path has to hold, or
+    /// [`None`] with the refusal already raised.
+    ///
+    /// The one place [`Control`] is read on this screen. Every door that
+    /// can end in a changed `shep.toml` -- `space` on a scalar, `space` on
+    /// a dog, `Enter` opening the free-text editor, `Enter` applying an
+    /// armed candidate -- comes through here, and it is not a convention
+    /// they are trusted to follow: [`Effect::WriteSetting`] and
+    /// [`Effect::WriteDog`] cannot be built without the token this returns.
+    /// See [`WriteAuthority`]'s own doc for why the gate is shaped this way
+    /// rather than as a check per key.
+    fn authorize_write(&mut self) -> Option<WriteAuthority> {
+        let authority = WriteAuthority::granted(self);
+        if authority.is_none() {
+            self.notice = Some(Notice {
+                text: READ_ONLY_REFUSAL.to_string(),
+                grave: true,
+            });
+        }
+        authority
+    }
+
+    /// `space` on the settings screen. Arms a candidate for the cursor's
+    /// row, or refuses and says why the same way an action key does; the
+    /// gate is [`Self::authorize_write`], the same one every other door on
+    /// this screen passes, because a keystroke that mutates `shep.toml`
+    /// needs the same fat-finger catch a keystroke that stops a sheep does.
+    /// Dispatches by row kind: [`Self::cycle_scalar`] for one of the six
+    /// fields, [`Self::cycle_dog`] for a [`SettingsRow::Dog`] row.
+    fn cycle_setting(&mut self) -> Effect {
+        if self.authorize_write().is_none() {
+            return Effect::None;
+        }
+        let Some(cursor) = self.settings.as_ref().and_then(Settings::cursor) else {
+            return Effect::None;
+        };
+        match cursor {
+            SettingsRow::Scalar(field) => self.cycle_scalar(field),
+            SettingsRow::Dog(index) => self.cycle_dog(index),
+        }
+    }
+
+    /// `space` on one of the six scalar rows. Re-arms rather than no-opping
+    /// when a candidate is already armed for this field, so a second
+    /// `space` walks one step further along the cycle -- see
+    /// [`Settings::next_candidate`]'s own doc.
+    ///
+    /// Silently does nothing on [`SettingField::Socket`] and
+    /// [`SettingField::MaxCronSleep`]: free text is not this function's job,
+    /// and a screen the operator can already read gives no sign that
+    /// `space` was ever going to do anything there.
+    fn cycle_scalar(&mut self, field: SettingField) -> Effect {
+        let Some(settings) = self.settings.as_mut() else {
+            return Effect::None;
+        };
+        let Some(value) = settings.next_candidate(field) else {
+            return Effect::None;
+        };
+        let source = settings.source_of(field);
+        let text = confirm_text(field, &value, source);
+        settings.pending = Some(Pending::Armed {
+            edit: SettingEdit::Set { field, value },
+            text,
+            at: self.now,
+        });
+        Effect::None
+    }
+
+    /// `space` on a [`SettingsRow::Dog`] row: refuses while the link is
+    /// gone, with [`LINK_GONE`]'s own sentence rather than a second one for
+    /// the same fact, then arms the opposite of the file's own `enabled`
+    /// bit -- one `space` always proposes a toggle, never a cycle, because
+    /// there are only two states.
+    ///
+    /// The link check is this row's own, unlike [`Self::cycle_scalar`]: an
+    /// enable/disable is a request to the shepherd once confirmed, and a
+    /// scalar edit is local file I/O the shepherd never sees, so only the
+    /// dog row needs the shepherd reachable to be worth arming at all.
+    fn cycle_dog(&mut self, index: usize) -> Effect {
+        if matches!(self.link, Link::Lost { .. }) {
+            self.notice = Some(Notice {
+                text: LINK_GONE.to_string(),
+                grave: true,
+            });
+            return Effect::None;
+        }
+        let Some(settings) = self.settings.as_mut() else {
+            return Effect::None;
+        };
+        let Some(dog) = settings.snapshot.dogs.get(index) else {
+            return Effect::None;
+        };
+        let name = dog.name.clone();
+        let enable = !dog.enabled;
+        let text = if enable {
+            format!("enable {name}? it starts now, no reload")
+        } else {
+            format!("disable {name}? it stops now and is deregistered")
+        };
+        settings.pending = Some(Pending::DogArmed {
+            edit: DogEdit { name, enable },
+            text,
+            at: self.now,
+        });
+        Effect::None
+    }
+
+    /// The operator's `Enter` on the settings screen. Three meanings,
+    /// picked in this order:
+    ///
+    /// - Nothing is pending and the cursor sits on [`SettingField::Socket`]
+    ///   or [`SettingField::MaxCronSleep`]: opens [`Pending::Typing`],
+    ///   seeded with that field's own on-disk value, and switches
+    ///   [`InputMode::Text`] on -- [`Self::on_settings_text_key`] is what
+    ///   answers every key from here on, not this function again.
+    /// - Something is [`Pending::Armed`] or [`Pending::DogArmed`]: sends it
+    ///   and moves it to [`Pending::Sent`] -- [`Effect::WriteSetting`] for
+    ///   the former, [`Effect::WriteDog`] for the latter, per each one's own
+    ///   doc for why they are not the same effect.
+    /// - Anything else (nothing pending on a cycled row, or already
+    ///   `Sent`): untouched.
+    ///
+    /// The first two both go through [`Self::authorize_write`] and refuse
+    /// under [`Control::ReadOnly`]; the third does nothing, so it raises no
+    /// refusal for a key that was never going to act. Opening the editor is
+    /// gated as well as applying it, because an editor a read-only operator
+    /// can type a whole socket path into before being told no is a worse
+    /// refusal than one that arrives on the keypress that asked.
+    fn confirm_setting(&mut self) -> Effect {
+        let Some(settings) = self.settings.as_ref() else {
+            return Effect::None;
+        };
+        let opens_editor = settings.pending.is_none()
+            && matches!(
+                settings.cursor(),
+                Some(SettingsRow::Scalar(
+                    SettingField::Socket | SettingField::MaxCronSleep
+                ))
+            );
+        if !opens_editor && !settings.is_armed() {
+            return Effect::None;
+        }
+        let Some(authority) = self.authorize_write() else {
+            return Effect::None;
+        };
+        let Some(settings) = self.settings.as_mut() else {
+            return Effect::None;
+        };
+        if opens_editor {
+            let Some(SettingsRow::Scalar(field)) = settings.cursor() else {
+                return Effect::None;
+            };
+            let buffer = settings.text_seed(field).to_string();
+            settings.pending = Some(Pending::Typing { field, buffer });
+            self.mode = InputMode::Text;
+            return Effect::None;
+        }
+        match settings.pending.take() {
+            Some(Pending::Armed { edit, text, .. }) => {
+                settings.pending = Some(Pending::Sent { text });
+                Effect::WriteSetting(edit, authority)
+            }
+            Some(Pending::DogArmed { edit, text, .. }) => {
+                settings.pending = Some(Pending::Sent { text });
+                Effect::WriteDog(edit, authority)
+            }
+            other => {
+                settings.pending = other;
+                Effect::None
+            }
         }
     }
 
@@ -1030,7 +2266,7 @@ impl App {
     /// approved table.
     fn arm(&mut self, verb: ActionVerb) -> Effect {
         let refusal = if self.control == Control::ReadOnly {
-            Some("read-only: actions need --allow-control".to_string())
+            Some(READ_ONLY_REFUSAL.to_string())
         } else if let Link::Retrying { attempt } = self.link {
             // NOT `LINK_GONE` here: that sentence says the shepherd is gone,
             // which is false while it is still being redialled, and a
@@ -1161,6 +2397,19 @@ impl App {
         }
     }
 
+    /// The one text keymap's own router: the filter box while the
+    /// settings screen is closed, [`Self::on_settings_text_key`]'s editor
+    /// while it is open. A previous task closed the window where the two
+    /// could both own [`InputMode::Text`] at once -- see `Msg::Settings`'s
+    /// own arm -- so this split is total: exactly one of the two ever
+    /// answers a given keypress.
+    fn on_text_key(&mut self, key: KeyPress) -> Effect {
+        if self.settings.is_some() {
+            return self.on_settings_text_key(key);
+        }
+        self.on_filter_text_key(key)
+    }
+
     /// The filter box's keymap.
     ///
     /// Ctrl-C still quits: in raw mode it is a key event and not a signal,
@@ -1175,29 +2424,92 @@ impl App {
     /// somebody was mid-word. The status bar hides it under the box instead
     /// and shows it when the box closes. See the phase plan's "Shapes the
     /// design named" #2.
-    fn on_text_key(&mut self, key: KeyPress) -> Effect {
+    fn on_filter_text_key(&mut self, key: KeyPress) -> Effect {
         match key {
             KeyPress::Quit => Effect::Quit,
-            KeyPress::FilterChar(typed) => {
+            KeyPress::TextChar(typed) => {
                 let mut query = self.filter.clone();
                 query.push(typed);
                 self.set_filter(query)
             }
-            KeyPress::FilterBackspace => {
+            KeyPress::TextBackspace => {
                 let mut query = self.filter.clone();
                 query.pop();
                 self.set_filter(query)
             }
-            KeyPress::FilterApply => {
+            KeyPress::TextApply => {
                 self.mode = InputMode::Normal;
                 Effect::None
             }
-            KeyPress::FilterAbandon => {
+            KeyPress::TextAbandon => {
                 self.mode = InputMode::Normal;
                 self.set_filter(String::new())
             }
             _ => Effect::None,
         }
+    }
+
+    /// The settings editor's own text keymap, in force for as long as a
+    /// [`Pending::Typing`] owns [`InputMode::Text`].
+    ///
+    /// Does not trim the buffer, on `TextChar` or on `TextBackspace`
+    /// alike: this repository does not widen an accepted input grammar
+    /// without a basis in the spec, the same rule
+    /// [`Self::on_filter_text_key`]'s own filter buffer carries.
+    ///
+    /// `TextApply` arms rather than writes: an empty buffer becomes
+    /// [`SettingEdit::Unset`], anything else becomes [`SettingEdit::Set`],
+    /// and either way the edit moves to [`Pending::Armed`] rather than
+    /// going out -- the operator's next `Enter`, on the now-closed editor,
+    /// is what sends it, the same second-`Enter` shape every other confirm
+    /// on this screen already uses.
+    ///
+    /// `TextAbandon` drops [`Pending::Typing`] back to `None` and leaves
+    /// the screen open, matching [`KeyPress::Escape`]'s own doc: the
+    /// cascade backs out of the innermost thing first.
+    fn on_settings_text_key(&mut self, key: KeyPress) -> Effect {
+        let now = self.now;
+        let Some(settings) = self.settings.as_mut() else {
+            return Effect::None;
+        };
+        match key {
+            KeyPress::Quit => return Effect::Quit,
+            KeyPress::TextChar(typed) => {
+                if let Some(Pending::Typing { buffer, .. }) = settings.pending.as_mut() {
+                    buffer.push(typed);
+                }
+            }
+            KeyPress::TextBackspace => {
+                if let Some(Pending::Typing { buffer, .. }) = settings.pending.as_mut() {
+                    buffer.pop();
+                }
+            }
+            KeyPress::TextApply => {
+                if let Some(Pending::Typing { field, buffer }) = settings.pending.take() {
+                    let edit = if buffer.is_empty() {
+                        SettingEdit::Unset { field }
+                    } else {
+                        SettingEdit::Set {
+                            field,
+                            value: buffer,
+                        }
+                    };
+                    let text = confirm_text_for_edit(&edit);
+                    settings.pending = Some(Pending::Armed {
+                        edit,
+                        text,
+                        at: now,
+                    });
+                }
+                self.mode = InputMode::Normal;
+            }
+            KeyPress::TextAbandon => {
+                settings.pending = None;
+                self.mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+        Effect::None
     }
 
     /// The rows the table draws, in `(name, instance, id)` order: the whole
@@ -1670,6 +2982,31 @@ impl App {
         })
     }
 
+    /// The settings screen's own state, or `None` while the dashboard is
+    /// showing.
+    #[must_use]
+    pub fn settings(&self) -> Option<&Settings> {
+        self.settings.as_ref()
+    }
+
+    /// The resolved style level and which layer chose it. What
+    /// `Effect::LoadSettings` hands `commands::settings::load_settings`
+    /// for the STYLE LEVEL row, so the screen never re-resolves on its own.
+    #[must_use]
+    pub fn style(&self) -> (StyleLevel, StyleSource) {
+        self.style
+    }
+
+    /// Sets the resolved style level and its source. Called exactly once,
+    /// by `run_argv`'s `lookout` dispatch, right after construction: `App`
+    /// has no way to resolve this itself (it holds no `GlobalArgs` and
+    /// reads no files), so the caller that already computed it hands it
+    /// over rather than this type inventing a second, divergent way to get
+    /// one.
+    pub(crate) fn set_style(&mut self, style: (StyleLevel, StyleSource)) {
+        self.style = style;
+    }
+
     /// Overrides the control gate a fixture built with. `App::new` takes
     /// [`Control`] and every shipped fixture hard-codes [`Control::ReadOnly`];
     /// this is the one line that lets the action-key tests build a dashboard
@@ -1736,6 +3073,9 @@ const fn outcome(verb: ActionVerb) -> &'static str {
 mod tests {
     use super::*;
     use shep_core::protocol::{ProcessEventKind, RpcError, RpcErrorCode};
+
+    use super::super::view::fixtures;
+    use crate::commands::settings::ScalarView;
 
     fn sheep(id: u32, name: &str, status: ProcStatus) -> ProcessInfo {
         ProcessInfo::builder(id, name, status)
@@ -2697,10 +4037,10 @@ mod tests {
         app.update(Msg::Key(KeyPress::FilterStart));
         assert_eq!(app.mode(), InputMode::Text);
         for letter in ['w', 'e', 'b'] {
-            app.update(Msg::Key(KeyPress::FilterChar(letter)));
+            app.update(Msg::Key(KeyPress::TextChar(letter)));
         }
         assert_eq!(app.rows().len(), 1, "narrowed before Enter");
-        app.update(Msg::Key(KeyPress::FilterApply));
+        app.update(Msg::Key(KeyPress::TextApply));
         assert_eq!(app.mode(), InputMode::Normal);
         assert_eq!(
             app.rows().len(),
@@ -2714,10 +4054,10 @@ mod tests {
     fn backspace_widens_the_table_back_out() {
         let (mut app, _t0) = started();
         app.update(Msg::Key(KeyPress::FilterStart));
-        app.update(Msg::Key(KeyPress::FilterChar('w')));
-        app.update(Msg::Key(KeyPress::FilterChar('z')));
+        app.update(Msg::Key(KeyPress::TextChar('w')));
+        app.update(Msg::Key(KeyPress::TextChar('z')));
         assert_eq!(app.rows().len(), 0);
-        app.update(Msg::Key(KeyPress::FilterBackspace));
+        app.update(Msg::Key(KeyPress::TextBackspace));
         assert_eq!(
             app.rows().len(),
             2,
@@ -2731,8 +4071,8 @@ mod tests {
     fn esc_while_editing_clears_the_filter_and_leaves_the_box() {
         let (mut app, _t0) = started();
         app.update(Msg::Key(KeyPress::FilterStart));
-        app.update(Msg::Key(KeyPress::FilterChar('w')));
-        app.update(Msg::Key(KeyPress::FilterAbandon));
+        app.update(Msg::Key(KeyPress::TextChar('w')));
+        app.update(Msg::Key(KeyPress::TextAbandon));
         assert_eq!(app.mode(), InputMode::Normal);
         assert_eq!(app.filter(), "");
         assert_eq!(app.rows().len(), 3);
@@ -2768,9 +4108,9 @@ mod tests {
     fn a_notice_raised_while_typing_is_deferred_and_not_destroyed() {
         let (mut app, _t0) = started();
         app.update(Msg::Key(KeyPress::FilterStart));
-        app.update(Msg::Key(KeyPress::FilterChar('w')));
+        app.update(Msg::Key(KeyPress::TextChar('w')));
         app.update(Msg::Event(BusEvent::DaemonShutdown));
-        app.update(Msg::Key(KeyPress::FilterChar('e')));
+        app.update(Msg::Key(KeyPress::TextChar('e')));
         assert!(
             app.notice().is_some(),
             "typing did not wipe the shepherd's announcement"
@@ -3481,5 +4821,1115 @@ mod tests {
             );
             assert!(app.notice().is_some_and(Notice::is_grave));
         }
+    }
+
+    /// `s` asks for the read rather than opening on stale or empty state: the
+    /// file can have changed since the last look, and an empty screen while the
+    /// read is in flight is a screen that lies for one frame.
+    #[test]
+    fn s_asks_for_the_file_before_the_screen_opens() {
+        let mut app = fixtures::full_app();
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Settings)),
+            Effect::LoadSettings
+        );
+        assert!(
+            app.settings().is_none(),
+            "nothing opens until the read lands"
+        );
+    }
+
+    #[test]
+    fn the_screen_opens_when_the_read_lands() {
+        let mut app = fixtures::full_app();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert!(app.settings().is_some());
+    }
+
+    #[test]
+    fn a_read_that_failed_says_so_and_leaves_the_dashboard_up() {
+        let mut app = fixtures::full_app();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Settings {
+            result: Err("no such file".into()),
+        });
+        assert!(app.settings().is_none());
+        let notice = app.notice().expect("a failed read has to say so");
+        assert!(notice.is_grave());
+        assert!(notice.to_string().contains("no such file"));
+    }
+
+    #[test]
+    fn s_closes_the_screen_again() {
+        let mut app = fixtures::app_in_settings();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        assert!(app.settings().is_none());
+    }
+
+    /// The one arm of the `Escape` cascade this screen swaps. From the dashboard
+    /// with no filter, `Esc` quits; from here it must not.
+    #[test]
+    fn escape_closes_the_screen_and_never_quits() {
+        let mut app = fixtures::app_in_settings();
+        assert_eq!(app.update(Msg::Key(KeyPress::Escape)), Effect::None);
+        assert!(app.settings().is_none());
+    }
+
+    #[test]
+    fn the_flock_cursor_and_the_filter_survive_the_swap() {
+        let mut app = fixtures::full_app();
+        let _ = app.update(Msg::Key(KeyPress::FilterStart));
+        for c in "web".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        // `selected()` hands back an owned `Option<RowKey>` (app.rs:1436), so
+        // there is nothing to clone.
+        let selected = app.selected();
+        let filter = app.filter().to_string();
+
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+
+        assert_eq!(app.selected(), selected);
+        assert_eq!(app.filter(), filter);
+    }
+
+    #[test]
+    fn the_settings_cursor_starts_at_the_first_row_on_every_open() {
+        let mut app = fixtures::app_in_settings();
+        let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+
+        let first = app.settings().unwrap().rows()[0];
+        assert_eq!(app.settings().unwrap().cursor(), Some(first));
+    }
+
+    #[test]
+    fn the_cursor_moves_through_the_scalars_and_into_the_dogs() {
+        let mut app = fixtures::app_in_settings();
+        let rows = app.settings().unwrap().rows();
+        for _ in 0..rows.len() - 1 {
+            let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        }
+        assert_eq!(
+            app.settings().unwrap().cursor(),
+            Some(*rows.last().unwrap())
+        );
+        // and it stops rather than wrapping, the way the flock table does
+        let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        assert_eq!(
+            app.settings().unwrap().cursor(),
+            Some(*rows.last().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_action_key_from_the_dashboard_is_unreachable_while_the_screen_is_up() {
+        let mut app = fixtures::app_in_settings_with_control();
+        // `x` is the stop key on the dashboard. In here it is not an action at all.
+        let _ = app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        // The accessor is `App::action()` (app.rs:1662).
+        assert!(app.action().is_none(), "no sheep confirm can arm from here");
+    }
+
+    /// fails if ANY key route on the settings screen reaches a write while
+    /// the gate is closed.
+    ///
+    /// Not "the cycle key refuses", which is all
+    /// `a_read_only_lookout_opens_the_screen_and_refuses_the_edit_key`
+    /// below ever checked. `space` was the only door the first version of
+    /// this gate guarded, and the free-text editor added a task later
+    /// walked straight around it: `SelectDown, SelectDown, Confirm,
+    /// TextChar, TextChar, TextApply, Confirm` on a `Control::ReadOnly`
+    /// lookout came back `WriteSetting(Set { field: Socket, .. })`. So this
+    /// walks every sequence that ends in a write instead of naming one key,
+    /// and asserts the two write effects never come back.
+    ///
+    /// The refusal is checked per keypress rather than at the end because
+    /// `on_settings_key` clears `self.notice` on every key: a route whose
+    /// last press is a no-op `Enter` has already had the sentence wiped by
+    /// the time the walk finishes.
+    #[test]
+    fn no_key_route_writes_the_config_while_the_gate_is_closed() {
+        use KeyPress::{Confirm, Cycle, SelectDown, TextApply, TextChar};
+
+        // The six scalars come first in `Settings::rows`, in the order
+        // `log_level, log_json, socket, max_cron_sleep, allow_control,
+        // level`, and `fixtures::settings_snapshot` carries two dogs after
+        // them -- so two `SelectDown`s reach `socket` and six reach the
+        // first dog row.
+        let routes: &[(&str, &[KeyPress])] = &[
+            ("space on a cycled scalar", &[Cycle, Confirm]),
+            (
+                "the socket editor",
+                &[
+                    SelectDown,
+                    SelectDown,
+                    Confirm,
+                    TextChar('/'),
+                    TextChar('x'),
+                    TextApply,
+                    Confirm,
+                ],
+            ),
+            (
+                "the max_cron_sleep editor",
+                &[
+                    SelectDown,
+                    SelectDown,
+                    SelectDown,
+                    Confirm,
+                    TextChar('9'),
+                    TextChar('s'),
+                    TextApply,
+                    Confirm,
+                ],
+            ),
+            (
+                "the whistle gate",
+                &[
+                    SelectDown, SelectDown, SelectDown, SelectDown, Cycle, Confirm,
+                ],
+            ),
+            (
+                "space on a dog row",
+                &[
+                    SelectDown, SelectDown, SelectDown, SelectDown, SelectDown, SelectDown, Cycle,
+                    Confirm,
+                ],
+            ),
+        ];
+
+        for (what, keys) in routes {
+            let mut app = fixtures::app_in_settings(); // Control::ReadOnly
+            let mut refused = false;
+            for key in *keys {
+                let effect = app.update(Msg::Key(*key));
+                assert!(
+                    !matches!(effect, Effect::WriteSetting(..) | Effect::WriteDog(..)),
+                    "{what}: a read-only lookout reached {effect:?}"
+                );
+                refused |= app.notice().is_some_and(Notice::is_grave);
+            }
+            assert!(refused, "{what}: the refusal has to say why");
+            assert!(
+                app.settings().unwrap().pending().is_none(),
+                "{what}: nothing is left armed"
+            );
+            assert!(
+                app.settings().unwrap().typing().is_none(),
+                "{what}: no editor is left open"
+            );
+        }
+    }
+
+    /// fails if the same five routes stop reaching a write once the gate is
+    /// open. The twin of
+    /// `no_key_route_writes_the_config_while_the_gate_is_closed`, and the
+    /// half that keeps it honest: a gate that refused everything would pass
+    /// that test and be useless.
+    #[test]
+    fn every_one_of_those_routes_writes_once_the_gate_is_open() {
+        use KeyPress::{Confirm, Cycle, SelectDown, TextApply, TextChar};
+
+        let routes: &[(&str, &[KeyPress])] = &[
+            ("space on a cycled scalar", &[Cycle, Confirm]),
+            (
+                "the socket editor",
+                &[
+                    SelectDown,
+                    SelectDown,
+                    Confirm,
+                    TextChar('/'),
+                    TextChar('x'),
+                    TextApply,
+                    Confirm,
+                ],
+            ),
+            (
+                "space on a dog row",
+                &[
+                    SelectDown, SelectDown, SelectDown, SelectDown, SelectDown, SelectDown, Cycle,
+                    Confirm,
+                ],
+            ),
+        ];
+
+        for (what, keys) in routes {
+            let mut app = fixtures::app_in_settings_with_control();
+            let mut wrote = false;
+            for key in *keys {
+                let effect = app.update(Msg::Key(*key));
+                wrote |= matches!(effect, Effect::WriteSetting(..) | Effect::WriteDog(..));
+            }
+            assert!(wrote, "{what}: an open gate has to reach the write");
+        }
+    }
+
+    #[test]
+    fn a_read_only_lookout_opens_the_screen_and_refuses_the_edit_key() {
+        let mut app = fixtures::app_in_settings(); // Control::ReadOnly
+        assert!(app.settings().is_some(), "reading shep.toml is not gated");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let notice = app.notice().expect("the refusal has to say why");
+        assert!(notice.is_grave());
+    }
+
+    #[test]
+    fn space_arms_a_candidate_without_changing_the_row() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let before = app.settings().unwrap().snapshot().log_level.value.clone();
+
+        assert_eq!(app.update(Msg::Key(KeyPress::Cycle)), Effect::None);
+
+        assert_eq!(
+            app.settings().unwrap().snapshot().log_level.value,
+            before,
+            "arming is a question, so the row still shows what the file says"
+        );
+        assert!(app.settings().unwrap().pending().is_some());
+    }
+
+    /// Six log levels and one cycle key. Without re-arming, the fourth is
+    /// unreachable without cancelling in between.
+    #[test]
+    fn space_advances_the_candidate_rather_than_needing_a_cancel() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let first = app.settings().unwrap().pending().unwrap().text.to_string();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let second = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_daemon_confirm_names_both_layers_lookout_cannot_see() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("shep daemon reload"), "got: {text}");
+        assert!(text.contains("SHEP_LOG_LEVEL"), "got: {text}");
+        assert!(text.contains("--log-level"), "got: {text}");
+    }
+
+    #[test]
+    fn the_whistle_confirm_names_a_whistle_restart_and_not_a_reload() {
+        let mut app = fixtures::app_in_settings_on(SettingField::AllowControl);
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("shep whistle restarted"), "got: {text}");
+        assert!(
+            !text.contains("daemon reload"),
+            "a whistle key needs no reload: {text}"
+        );
+    }
+
+    #[test]
+    fn the_style_confirm_promises_nothing_beyond_the_next_command() {
+        let mut app = fixtures::app_in_settings_on(SettingField::StyleLevel);
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("the next command reads it"), "got: {text}");
+    }
+
+    /// fails if the style confirm keeps promising "the next command reads
+    /// it" while a layer above the file is set.
+    ///
+    /// `style::resolve` is flag over env over config, so with `$SHEP_STYLE`
+    /// or `--style` in play the write lands and nothing changes. This is
+    /// the one field where lookout KNOWS -- the SOURCE cell on the same row
+    /// already reads `$SHEP_STYLE` or `--style` -- and it was the one field
+    /// whose confirm said nothing about it, while the other three carry a
+    /// caveat about layers lookout cannot see at all.
+    #[test]
+    fn a_shadowed_style_confirm_names_the_layer_that_keeps_winning() {
+        for (source, layer) in [
+            (StyleSource::Env, "$SHEP_STYLE"),
+            (StyleSource::Flag, "--style"),
+        ] {
+            let mut app = fixtures::app_in_settings_with_shadowed_style(source);
+            let _ = app.update(Msg::Key(KeyPress::Cycle));
+            let text = app.settings().unwrap().pending().unwrap().text.to_string();
+            assert!(text.contains(layer), "{source} must name itself: {text}");
+            assert!(
+                text.contains("keeps winning"),
+                "{source} must say what it does: {text}"
+            );
+            assert!(
+                !text.contains("the next command reads it"),
+                "{source}: the next command reads {source}, not the file: {text}"
+            );
+        }
+    }
+
+    /// fails if `space` on the style row cycles from the level in FORCE
+    /// rather than the level on DISK.
+    ///
+    /// With `$SHEP_STYLE=bare` over a file saying `full`, cycling the
+    /// resolved value walks `bare -> full` and proposes `full`, which is
+    /// what the file already holds: a no-op write, reported to the operator
+    /// as a change. From the file it walks `full -> plain`.
+    #[test]
+    fn the_style_cycle_starts_from_the_file_and_not_the_level_in_force() {
+        let mut app = fixtures::app_in_settings_with_shadowed_style(StyleSource::Env);
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(
+            text.contains("set style level to plain"),
+            "the file says full, so one step is plain: {text}"
+        );
+    }
+
+    #[test]
+    fn enter_sends_the_armed_edit() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let effect = app.update(Msg::Key(KeyPress::Confirm));
+        assert!(matches!(
+            effect,
+            Effect::WriteSetting(
+                SettingEdit::Set {
+                    field: SettingField::LogLevel,
+                    ..
+                },
+                _
+            )
+        ));
+        assert!(app.settings().unwrap().pending().unwrap().sent);
+    }
+
+    #[test]
+    fn a_written_edit_updates_the_row_and_its_source() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        let SettingEdit::Set {
+            value: candidate, ..
+        } = edit.clone()
+        else {
+            panic!("cycling only ever arms Set");
+        };
+
+        let effect = app.update(Msg::SettingWritten {
+            edit,
+            result: Ok(()),
+        });
+        assert_eq!(
+            effect,
+            Effect::LoadSettings,
+            "a landed write re-reads rather than hand-folding the row"
+        );
+        assert!(app.settings().unwrap().pending().is_none());
+
+        // The re-read itself: `run_ui` drives this through `spawn_blocking`
+        // and `load_settings`; this test drives the landing message
+        // directly, the same way the fixtures that open the screen already
+        // do for the initial `s`.
+        let mut updated = fixtures::settings_snapshot();
+        updated.log_level = ScalarView {
+            value: candidate,
+            source: StyleSource::Config,
+        };
+        let _ = app.update(Msg::Settings {
+            result: Ok(updated.clone()),
+        });
+
+        assert_eq!(app.settings().unwrap().snapshot(), &updated);
+    }
+
+    /// The other half of the row-update story: an `Unset` has no local
+    /// value to fold in (only the document does), which is exactly why the
+    /// fix routes both through the same re-read rather than growing a
+    /// second, `Unset`-shaped folding path.
+    #[test]
+    fn an_unset_write_returns_the_row_to_the_default() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..8 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        assert!(matches!(
+            edit,
+            SettingEdit::Unset {
+                field: SettingField::MaxCronSleep
+            }
+        ));
+
+        let effect = app.update(Msg::SettingWritten {
+            edit,
+            result: Ok(()),
+        });
+        assert_eq!(effect, Effect::LoadSettings);
+
+        let mut updated = fixtures::settings_snapshot();
+        updated.max_cron_sleep = ScalarView {
+            value: "30s".to_string(),
+            source: StyleSource::Default,
+        };
+        let _ = app.update(Msg::Settings {
+            result: Ok(updated.clone()),
+        });
+
+        assert_eq!(app.settings().unwrap().snapshot(), &updated);
+    }
+
+    /// fails if a landed write's own reload throws the cursor back to the
+    /// first row -- `Msg::Settings`'s `opening` check is what this pins.
+    #[test]
+    fn the_cursor_survives_a_landed_writes_reload() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let before = app.settings().unwrap().cursor();
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        let _ = app.update(Msg::SettingWritten {
+            edit,
+            result: Ok(()),
+        });
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert_eq!(app.settings().unwrap().cursor(), before);
+    }
+
+    /// fails if `r` throws the cursor back to the first row the same way a
+    /// landed write's own reload almost did.
+    #[test]
+    fn the_cursor_survives_a_refresh() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let before = app.settings().unwrap().cursor();
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Refresh)),
+            Effect::LoadSettings
+        );
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert_eq!(app.settings().unwrap().cursor(), before);
+    }
+
+    #[test]
+    fn a_refused_write_says_why_and_leaves_the_row_alone() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let before = app.settings().unwrap().snapshot().log_level.clone();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        let _ = app.update(Msg::SettingWritten {
+            edit,
+            result: Err("max_cron_sleep is 500ms, below the 1s floor".into()),
+        });
+
+        assert_eq!(app.settings().unwrap().snapshot().log_level, before);
+        let notice = app.notice().unwrap();
+        assert!(notice.is_grave());
+        assert!(notice.to_string().contains("below the 1s floor"));
+    }
+
+    /// The divergence from the sheep confirm, which `disarm_on_link_change`
+    /// clears. A settings edit is local file I/O over a file that is not
+    /// stale.
+    #[test]
+    fn a_lost_link_leaves_a_scalar_confirm_armed() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let _ = app.update(Msg::Frozen {
+            at_local: "12:00:00".into(),
+        });
+        assert!(
+            app.settings().unwrap().pending().is_some(),
+            "a scalar never leaves the machine, so a dead shepherd is irrelevant to it"
+        );
+    }
+
+    /// And it still expires, off the raw tick rather than `self.now`, which
+    /// stops advancing once the link is lost.
+    #[test]
+    fn a_settings_confirm_expires_on_a_frozen_dashboard() {
+        let (mut app, start) = fixtures::app_in_settings_at();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let _ = app.update(Msg::Frozen {
+            at_local: "12:00:00".into(),
+        });
+        let _ = app.update(Msg::Tick {
+            now: start + CONFIRM_EXPIRY,
+        });
+        assert!(app.settings().unwrap().pending().is_none());
+    }
+
+    #[test]
+    fn escape_cancels_the_confirm_before_it_closes_the_screen() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let _ = app.update(Msg::Key(KeyPress::Escape));
+        assert!(app.settings().unwrap().pending().is_none());
+        assert!(
+            app.settings().is_some(),
+            "the first Esc cancels, it does not close"
+        );
+        let _ = app.update(Msg::Key(KeyPress::Escape));
+        assert!(app.settings().is_none());
+    }
+
+    /// fails if an action armed while the read is still in flight survives
+    /// the screen opening. `s` raises `Effect::LoadSettings` while
+    /// `self.settings` is still `None`, so `x` reaches `arm()` normally and
+    /// succeeds; once the read lands, `on_key`'s settings branch runs ahead
+    /// of the armed-confirm cancel block and `on_settings_key` no-ops
+    /// `Confirm`, so nothing would ever reach the code that resolves an
+    /// armed action. The fix is the same closing-by-construction `on_key`'s
+    /// own comment already argues for `/` and the filter box.
+    #[test]
+    fn opening_the_screen_clears_an_action_armed_while_the_read_was_in_flight() {
+        let mut app = fixtures::allowed_app();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        assert!(
+            app.action().is_some(),
+            "the arm must still succeed before the read lands"
+        );
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert!(
+            app.action().is_none(),
+            "no armed action may survive the screen opening"
+        );
+    }
+
+    /// fails if the filter box survives the screen opening the same way an
+    /// armed action almost did. `s` raises `Effect::LoadSettings` while
+    /// `self.settings` is still `None`, so `/` reaches `on_key`'s ordinary
+    /// dispatch and opens the box; once the read lands, `on_key`'s
+    /// `self.mode == InputMode::Text` check runs ahead of the settings
+    /// branch, so every key after this would keep landing in
+    /// `on_text_key` and never reach `on_settings_key` at all. The query
+    /// is kept rather than cleared -- `TextApply`'s reading, argued at the
+    /// fix's own call site.
+    #[test]
+    fn opening_the_screen_closes_a_filter_box_left_open_while_the_read_was_in_flight() {
+        let mut app = fixtures::allowed_app();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Key(KeyPress::FilterStart));
+        let _ = app.update(Msg::Key(KeyPress::TextChar('w')));
+        let _ = app.update(Msg::Key(KeyPress::TextChar('e')));
+        assert_eq!(
+            app.mode(),
+            InputMode::Text,
+            "the box is open before the read lands"
+        );
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert!(app.settings().is_some(), "the screen opened");
+        assert_eq!(
+            app.mode(),
+            InputMode::Normal,
+            "the box must not survive the screen opening"
+        );
+        assert_eq!(app.filter(), "we", "the typed query is kept, not discarded");
+    }
+
+    /// fails if `App::set_style` does not round trip exactly: the flag
+    /// source in particular, since that is the layer the settings screen's
+    /// own STYLE LEVEL row was silently dropping before this was wired
+    /// through `App` at all.
+    #[test]
+    fn set_style_round_trips_exactly() {
+        let mut app = fixtures::full_app();
+        assert_eq!(
+            app.style(),
+            (StyleLevel::Full, StyleSource::Default),
+            "the default before anyone calls set_style"
+        );
+        app.set_style((StyleLevel::Bare, StyleSource::Flag));
+        assert_eq!(app.style(), (StyleLevel::Bare, StyleSource::Flag));
+    }
+
+    /// fails if the settings screen's own STYLE LEVEL row can disagree with
+    /// the style `App` was told to carry. Drives the exact call
+    /// `Effect::LoadSettings` makes (`load_settings(path, socket_default,
+    /// app.style())`) against a real file on disk whose own `[style]
+    /// level` names a THIRD, different level -- proving the row reports
+    /// the value threaded onto `App`, not one re-derived from the file,
+    /// which is what a flag "reaching the row" rather than being dropped
+    /// actually means.
+    #[test]
+    fn the_style_set_on_the_app_reaches_the_settings_row_undropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[style]\nlevel = \"bare\"\n").unwrap();
+        let socket_default = dir.path().join("run").join("shep.sock");
+
+        let mut app = fixtures::full_app();
+        app.set_style((StyleLevel::Plain, StyleSource::Flag));
+
+        let result = crate::commands::settings::load_settings(&path, &socket_default, app.style())
+            .map_err(|err| err.to_string());
+        let _ = app.update(Msg::Settings { result });
+
+        let row = &app.settings().unwrap().snapshot().style_level;
+        assert_eq!(
+            row.source,
+            StyleSource::Flag,
+            "the flag beats the file rather than being dropped by it"
+        );
+        assert_eq!(row.value, "plain");
+    }
+
+    #[test]
+    fn enter_on_a_text_row_opens_the_editor_seeded_with_the_current_value() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let (field, buffer) = app.settings().unwrap().typing().expect("the editor opens");
+        assert_eq!(*field, SettingField::MaxCronSleep);
+        assert_eq!(buffer, "30s");
+    }
+
+    #[test]
+    fn typing_then_enter_arms_rather_than_writing() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..3 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        for c in "45s".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
+        }
+        assert_eq!(app.update(Msg::Key(KeyPress::TextApply)), Effect::None);
+        let prompt = app.settings().unwrap().pending().unwrap();
+        assert!(
+            !prompt.sent,
+            "the editor arms; a second Enter is what sends"
+        );
+        assert!(prompt.text.contains("45s"), "got: {}", prompt.text);
+        assert!(
+            prompt.text.contains("SHEP_MAX_CRON_SLEEP"),
+            "got: {}",
+            prompt.text
+        );
+    }
+
+    #[test]
+    fn an_empty_editor_arms_an_unset() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..8 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.starts_with("unset max_cron_sleep?"), "got: {text}");
+    }
+
+    #[test]
+    fn the_socket_confirm_rules_out_the_reload_it_would_otherwise_imply() {
+        let mut app = fixtures::app_in_settings_on(SettingField::Socket);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("stopped and started"), "got: {text}");
+        assert!(text.contains("a reload will not move it"), "got: {text}");
+    }
+
+    /// A refusal is discovered under the lock, so it lands after the confirm.
+    /// The typed text has to survive it, or the operator retypes a path to fix
+    /// one character.
+    #[test]
+    fn a_refused_write_reopens_the_editor_with_the_text_intact() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..3 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        for c in "500ms".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        let _ = app.update(Msg::SettingWritten {
+            edit,
+            result: Err("max_cron_sleep is 500ms, below the 1s floor".into()),
+        });
+
+        let (_, buffer) = app
+            .settings()
+            .unwrap()
+            .typing()
+            .expect("the editor reopens");
+        assert_eq!(buffer, "500ms");
+        assert!(
+            app.notice()
+                .unwrap()
+                .to_string()
+                .contains("below the 1s floor")
+        );
+    }
+
+    #[test]
+    fn escape_abandons_the_editor_and_keeps_the_screen_open() {
+        let mut app = fixtures::app_in_settings_on(SettingField::Socket);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let _ = app.update(Msg::Key(KeyPress::TextAbandon));
+        assert!(app.settings().unwrap().typing().is_none());
+        assert!(app.settings().is_some());
+    }
+
+    #[test]
+    fn a_closed_scalar_has_no_editor() {
+        let mut app = fixtures::app_in_settings_with_control(); // on log_level
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        assert!(
+            app.settings().unwrap().typing().is_none(),
+            "log_level is a cycle, not a text field"
+        );
+    }
+
+    /// fails if an armed candidate survives a movement key. `space` on
+    /// `log_level` arms it; `j` must cancel that arm instead of also
+    /// moving the cursor to `log_json` -- the same cancel-before-act rule
+    /// the dashboard's `x`/`R`/`L` already follow (task 7 review finding
+    /// A).
+    #[test]
+    fn movement_cancels_an_armed_candidate_rather_than_also_moving() {
+        let mut app = fixtures::app_in_settings_with_control(); // cursor on log_level
+        let before = app.settings().unwrap().cursor();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        assert!(
+            app.settings().unwrap().pending().is_some(),
+            "space must arm before this test means anything"
+        );
+        let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        assert!(
+            app.settings().unwrap().pending().is_none(),
+            "the armed candidate must not survive the movement key"
+        );
+        assert_eq!(
+            app.settings().unwrap().cursor(),
+            before,
+            "the cursor must not also move on the same keypress"
+        );
+    }
+
+    /// fails if an armed candidate survives `r`. `space` arms; `r` must
+    /// cancel that arm instead of silently dropping it while reloading the
+    /// screen underneath it -- the same cancel-before-act rule every other
+    /// key on this screen already follows.
+    #[test]
+    fn refresh_cancels_an_armed_candidate_rather_than_silently_dropping_it() {
+        let mut app = fixtures::app_in_settings_with_control(); // cursor on log_level
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        assert!(
+            app.settings().unwrap().pending().is_some(),
+            "space must arm before this test means anything"
+        );
+        let effect = app.update(Msg::Key(KeyPress::Refresh));
+        assert_eq!(
+            effect,
+            Effect::None,
+            "a cancel must not also raise a reload"
+        );
+        assert!(
+            app.settings().unwrap().pending().is_none(),
+            "the armed candidate must not survive `r`"
+        );
+    }
+
+    #[test]
+    fn arming_a_dog_names_the_live_apply_and_not_a_reload() {
+        let mut app = fixtures::app_in_settings_on_dog("metrics");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("it starts now, no reload"), "got: {text}");
+    }
+
+    #[test]
+    fn disabling_says_it_deregisters() {
+        let mut app = fixtures::app_in_settings_on_enabled_dog("otel");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("deregistered"), "got: {text}");
+    }
+
+    /// The chain: the write lands, and the reducer raises the daemon half.
+    /// One message still yields one effect.
+    #[test]
+    fn a_written_dog_toggle_raises_the_daemon_half() {
+        let mut app = fixtures::app_in_settings_on_dog("metrics");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::WriteDog(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send the file half first");
+        };
+        let effect = app.update(Msg::DogWritten {
+            edit,
+            result: Ok(DogSource::BuiltIn),
+        });
+        assert!(matches!(
+            effect,
+            Effect::Send(Sent::Dog { enable: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_refused_file_half_never_reaches_the_shepherd() {
+        let mut app = fixtures::app_in_settings_on_dog("metrics");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::WriteDog(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send the file half first");
+        };
+        let effect = app.update(Msg::DogWritten {
+            edit,
+            result: Err("permission denied".into()),
+        });
+        assert_eq!(
+            effect,
+            Effect::None,
+            "a failed write must not ask the shepherd"
+        );
+        assert!(app.notice().unwrap().is_grave());
+    }
+
+    /// The scalars never leave the machine; a dog's second half does.
+    #[test]
+    fn a_dog_toggle_refuses_while_the_link_is_gone() {
+        let mut app = fixtures::app_in_settings_on_dog("metrics");
+        let _ = app.update(Msg::Frozen {
+            at_local: "12:00:00".into(),
+        });
+        let effect = app.update(Msg::Key(KeyPress::Cycle));
+        assert_eq!(effect, Effect::None);
+        assert!(app.settings().unwrap().pending().is_none(), "nothing arms");
+        assert!(app.notice().unwrap().is_grave());
+    }
+
+    #[test]
+    fn a_scalar_still_edits_while_the_link_is_gone() {
+        let mut app = fixtures::app_in_settings_with_control(); // on log_level
+        let _ = app.update(Msg::Frozen {
+            at_local: "12:00:00".into(),
+        });
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        assert!(
+            app.settings().unwrap().pending().is_some(),
+            "a scalar is local file I/O and needs no shepherd"
+        );
+    }
+
+    /// Drives a dog toggle all the way to `Effect::Send`, the setup every
+    /// `on_dog_reply` test below shares: arm, confirm (the file half),
+    /// `Msg::DogWritten` landing `Ok` (the daemon half goes out). Panics
+    /// with a message naming which step failed, rather than an unwrap,
+    /// since every caller is a test asserting on what happens next.
+    fn armed_and_sent_dog(name: &str) -> (App, Sent) {
+        let mut app = fixtures::app_in_settings_on_dog(name);
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::WriteDog(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send the file half first");
+        };
+        let Effect::Send(sent) = app.update(Msg::DogWritten {
+            edit,
+            result: Ok(DogSource::BuiltIn),
+        }) else {
+            panic!("a landed write must raise the daemon half");
+        };
+        (app, sent)
+    }
+
+    /// `EnableDog` answers `Response::DogStarted`, and the reply's own
+    /// sentence names what the shepherd did rather than a bare "done" --
+    /// the same convention `on_action_reply`'s own `outcome()` sets for a
+    /// sheep action.
+    #[test]
+    fn a_landed_enable_names_what_the_shepherd_did() {
+        let (mut app, sent) = armed_and_sent_dog("metrics");
+        assert!(
+            app.settings().unwrap().pending().is_some(),
+            "the sent line stays up until the reply lands"
+        );
+        let info = ProcessInfo::builder(50, "metrics", ProcStatus::Online)
+            .pid(Some(50_000))
+            .dog(Some(DogSource::BuiltIn))
+            .build();
+        app.update(Msg::Replied {
+            sent,
+            result: Ok(Response::DogStarted(info)),
+        });
+        assert_eq!(
+            app.notice().map(ToString::to_string).as_deref(),
+            Some("enable metrics: the shepherd started it")
+        );
+        assert!(!app.notice().unwrap().is_grave());
+        assert!(
+            app.settings().unwrap().pending().is_none(),
+            "the sent line clears once the reply lands"
+        );
+    }
+
+    /// `DisableDog` answers `Response::Deleted`, the same reply `Delete`
+    /// gives -- and disable's own reply names the deregistration, the
+    /// sharpest fact on this screen, since the confirm that said so is
+    /// gone by the time this lands.
+    #[test]
+    fn a_landed_disable_names_the_deregistration() {
+        let (mut app, sent) = armed_and_sent_dog("otel");
+        app.update(Msg::Replied {
+            sent,
+            result: Ok(Response::Deleted(vec![50])),
+        });
+        assert_eq!(
+            app.notice().map(ToString::to_string).as_deref(),
+            Some("disable otel: the shepherd stopped and deregistered it")
+        );
+        assert!(!app.notice().unwrap().is_grave());
+    }
+
+    /// Whether the settings screen's own dogs list still says `name` is
+    /// enabled. Reads the snapshot the screen is rendering from, not the
+    /// file, which is the whole point: the two can disagree.
+    #[track_caller]
+    fn dog_enabled_in_view(app: &App, name: &str) -> bool {
+        app.settings()
+            .expect("the settings screen is open")
+            .snapshot()
+            .dogs
+            .iter()
+            .find(|dog| dog.name == name)
+            .expect("the fixture carries this dog")
+            .enabled
+    }
+
+    /// fails if a landed dog toggle leaves the dogs table showing what the
+    /// file said BEFORE the write.
+    ///
+    /// The file half lands first and the daemon half second, so by the time
+    /// this reply arrives `DogView.enabled` is already stale while RUNNING
+    /// keeps updating off the two-second poll. Nothing raised a re-read, so
+    /// a landed `enable metrics` sat there reading `metrics | no | online`
+    /// -- the dogs table manufacturing the one drift row the docs page
+    /// teaches an operator to read as "running with nothing enabling it".
+    /// The scalar path already solved this: `Msg::SettingWritten`'s `Ok`
+    /// arm raises `Effect::LoadSettings` rather than folding the write into
+    /// the row by hand, and this inherits it.
+    ///
+    /// Both directions, because an enable and a disable answer with
+    /// different replies (`DogStarted` and `Deleted`) down two different
+    /// arms of `on_dog_reply`'s own match.
+    #[test]
+    fn a_landed_toggle_re_reads_the_file_in_both_directions() {
+        for (name, enable) in [("metrics", true), ("otel", false)] {
+            let (mut app, sent) = armed_and_sent_dog(name);
+            assert_eq!(
+                dog_enabled_in_view(&app, name),
+                !enable,
+                "{name}: the fixture starts on the other bit"
+            );
+            let reply = if enable {
+                Response::DogStarted(
+                    ProcessInfo::builder(50, name, ProcStatus::Online)
+                        .pid(Some(50_000))
+                        .dog(Some(DogSource::BuiltIn))
+                        .build(),
+                )
+            } else {
+                Response::Deleted(vec![50])
+            };
+
+            let effect = app.update(Msg::Replied {
+                sent,
+                result: Ok(reply),
+            });
+
+            assert_eq!(
+                effect,
+                Effect::LoadSettings,
+                "{name}: a landed toggle has to re-read the file it changed"
+            );
+            assert_eq!(
+                dog_enabled_in_view(&app, name),
+                !enable,
+                "{name}: nothing is folded into the row by hand -- the re-read is the repair"
+            );
+
+            // The re-read landing, with the bit the write actually put in
+            // the file.
+            let mut fresh = app.settings().unwrap().snapshot().clone();
+            for dog in &mut fresh.dogs {
+                if dog.name == name {
+                    dog.enabled = enable;
+                }
+            }
+            app.update(Msg::Settings { result: Ok(fresh) });
+
+            assert_eq!(
+                dog_enabled_in_view(&app, name),
+                enable,
+                "{name}: and the row agrees with the file once it lands"
+            );
+        }
+    }
+
+    /// fails if a reply this binary does not understand -- or the RIGHT
+    /// SHAPE for the WRONG verb -- reads as success. `metrics` is armed as
+    /// an `enable`, so `Response::Deleted` (the shape a `DisableDog` gets)
+    /// is a mismatched guard rather than a recognised reply, and
+    /// `Response::Pong` is a reply this binary has genuinely never heard of
+    /// -- both must land in the same refusal, the same pairing
+    /// `an_unrecognised_reply_says_so_rather_than_reading_as_success` makes
+    /// for a sheep action.
+    #[test]
+    fn an_unrecognised_dog_reply_says_so_rather_than_reading_as_success() {
+        for reply in [Response::Pong, Response::Deleted(vec![1])] {
+            let (mut app, sent) = armed_and_sent_dog("metrics");
+            app.update(Msg::Replied {
+                sent,
+                result: Ok(reply),
+            });
+            assert_eq!(
+                app.notice().map(ToString::to_string).as_deref(),
+                Some(
+                    "enable metrics: the shepherd answered something this lookout does not understand"
+                )
+            );
+            assert!(app.notice().unwrap().is_grave());
+        }
+    }
+
+    /// fails if a connection that died mid-request reports as anything
+    /// else, the same claim
+    /// `a_connection_that_died_mid_request_says_so_under_the_same_prefix`
+    /// makes for a sheep action.
+    #[test]
+    fn a_dog_reply_that_failed_to_send_says_so_under_the_same_prefix() {
+        let (mut app, sent) = armed_and_sent_dog("metrics");
+        app.update(Msg::Replied {
+            sent,
+            result: Err(RequestError::Closed),
+        });
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert!(said.starts_with("enable metrics: "), "got {said:?}");
+        assert!(said.contains(&RequestError::Closed.to_string()));
     }
 }

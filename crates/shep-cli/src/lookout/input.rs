@@ -43,11 +43,11 @@ pub fn map_key(event: &Event, mode: InputMode) -> Option<KeyPress> {
             // type half the sheep names in a flock. ALT is, because an
             // `Alt-w` is a command somewhere and never a letter here.
             KeyCode::Char(typed) if !key.modifiers.contains(KeyModifiers::ALT) => {
-                Some(KeyPress::FilterChar(typed))
+                Some(KeyPress::TextChar(typed))
             }
-            KeyCode::Backspace => Some(KeyPress::FilterBackspace),
-            KeyCode::Enter => Some(KeyPress::FilterApply),
-            KeyCode::Esc => Some(KeyPress::FilterAbandon),
+            KeyCode::Backspace => Some(KeyPress::TextBackspace),
+            KeyCode::Enter => Some(KeyPress::TextApply),
+            KeyCode::Esc => Some(KeyPress::TextAbandon),
             _ => None,
         };
     }
@@ -63,6 +63,8 @@ pub fn map_key(event: &Event, mode: InputMode) -> Option<KeyPress> {
         KeyCode::Char('x') => Some(KeyPress::Action(ActionVerb::Stop)),
         KeyCode::Char('R') => Some(KeyPress::Action(ActionVerb::Restart)),
         KeyCode::Char('L') => Some(KeyPress::Action(ActionVerb::Reload)),
+        KeyCode::Char('s') => Some(KeyPress::Settings),
+        KeyCode::Char(' ') => Some(KeyPress::Cycle),
         KeyCode::Enter => Some(KeyPress::Confirm),
         _ => None,
     }
@@ -134,6 +136,14 @@ mod tests {
         assert_eq!(
             map_key(&key(KeyCode::Char('L')), InputMode::Normal),
             Some(KeyPress::Action(ActionVerb::Reload))
+        );
+        assert_eq!(
+            map_key(&key(KeyCode::Char('s')), InputMode::Normal),
+            Some(KeyPress::Settings)
+        );
+        assert_eq!(
+            map_key(&key(KeyCode::Char(' ')), InputMode::Normal),
+            Some(KeyPress::Cycle)
         );
         assert_eq!(map_key(&key(KeyCode::Char('z')), InputMode::Normal), None);
     }
@@ -217,7 +227,7 @@ mod tests {
     fn typing_q_while_editing_types_a_letter() {
         assert_eq!(
             map_key(&key(KeyCode::Char('q')), InputMode::Text),
-            Some(KeyPress::FilterChar('q'))
+            Some(KeyPress::TextChar('q'))
         );
         assert_eq!(
             map_key(&key(KeyCode::Char('q')), InputMode::Normal),
@@ -233,15 +243,15 @@ mod tests {
     fn the_text_mode_binds_exactly_the_box_s_keys() {
         assert_eq!(
             map_key(&key(KeyCode::Backspace), InputMode::Text),
-            Some(KeyPress::FilterBackspace)
+            Some(KeyPress::TextBackspace)
         );
         assert_eq!(
             map_key(&key(KeyCode::Enter), InputMode::Text),
-            Some(KeyPress::FilterApply)
+            Some(KeyPress::TextApply)
         );
         assert_eq!(
             map_key(&key(KeyCode::Esc), InputMode::Text),
-            Some(KeyPress::FilterAbandon)
+            Some(KeyPress::TextAbandon)
         );
         let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(map_key(&ctrl_c, InputMode::Text), Some(KeyPress::Quit));
@@ -256,7 +266,7 @@ mod tests {
         let shifted = Event::Key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT));
         assert_eq!(
             map_key(&shifted, InputMode::Text),
-            Some(KeyPress::FilterChar('W'))
+            Some(KeyPress::TextChar('W'))
         );
     }
 
