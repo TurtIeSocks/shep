@@ -13,6 +13,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use clap::ValueEnum as _;
 use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{
     AppConfig, DeclaredApp, FlockFormat, Flockfile, FlockfileError, ResetDepth,
@@ -1355,14 +1356,22 @@ fn apply_interpreters(
     }
 }
 
-/// The reset flag the operator typed, `None` when they typed neither.
+/// The `--reset=<mode>` the operator typed, `None` when they typed nothing.
 ///
-/// Named so the two arms that REFUSE a reset can quote back the flag the
-/// operator actually wrote. There is only one flag now, but the two refusal
-/// sites want the flag's own spelling rather than a literal, so this stays a
-/// function rather than a field read.
-fn reset_flag(args: &StartArgs) -> Option<&'static str> {
-    args.reset.map(|_| "--reset")
+/// Named so the two arms that REFUSE a reset can quote back the flag AND the
+/// mode the operator actually wrote, rather than a bare `--reset` that does
+/// not by itself parse: an operator who typed `--reset=file` should see
+/// `--reset=file` in the refusal, not a flag spelling that would now be a
+/// usage error on its own.
+fn reset_flag(args: &StartArgs) -> Option<String> {
+    args.reset.map(|mode| {
+        let name = mode
+            .to_possible_value()
+            .expect("every ResetMode variant has a possible value")
+            .get_name()
+            .to_string();
+        format!("--reset={name}")
+    })
 }
 
 fn reset_depth(args: &StartArgs) -> ResetDepth {
@@ -3278,14 +3287,15 @@ mod tests {
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
 
         let mut args = start_args("zam");
-        args.reset = Some(ResetMode::Policy);
+        args.reset = Some(ResetMode::Env);
         let (code, printed, said) = start_against_with_args(&client, &args).await;
 
         assert_eq!(code, ExitCode::Usage);
         assert!(printed.is_empty(), "a refusal prints no data envelope");
         assert!(
-            said.contains("--reset") && said.contains("zam"),
-            "the refusal names the flag and the token it was refused for: {said}"
+            said.contains("--reset=env") && said.contains("zam"),
+            "the refusal must echo the mode the operator actually typed, \
+             not a bare --reset that is now its own usage error: {said}"
         );
     }
 
@@ -3304,14 +3314,15 @@ mod tests {
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
 
         let mut args = start_args(script.to_str().unwrap());
-        args.reset = Some(ResetMode::Policy);
+        args.reset = Some(ResetMode::All);
         let (code, printed, said) = start_against_with_args(&client, &args).await;
 
         assert_eq!(code, ExitCode::Usage);
         assert!(printed.is_empty(), "a refusal prints no data envelope");
         assert!(
-            said.contains("--reset") && said.contains("zam"),
-            "the refusal names the flag and the token it was refused for: {said}"
+            said.contains("--reset=all") && said.contains("zam"),
+            "the refusal must echo the mode the operator actually typed, \
+             not a bare --reset that is now its own usage error: {said}"
         );
         assert!(
             applies(&mut envelopes).is_empty(),
