@@ -34,6 +34,7 @@ pub mod runtime;
 pub mod schema;
 pub(crate) mod selector;
 pub mod serve;
+pub(crate) mod settings;
 pub(crate) mod shep_toml;
 pub mod signal;
 // Unix only, and this is the Windows tier's largest deliberate omission
