@@ -5942,8 +5942,8 @@ impl<R: ProcessRunner> Actor<R> {
             && incoming.config.instances != running.instances
         {
             refusals.push(format!(
-                "instances: this load never reshapes a flock; `shep start --reset` to take \
-                 the file's count of {}",
+                "instances: this load never reshapes a flock; `shep start --reset=file` to \
+                 take the file's count of {}",
                 incoming.config.instances
             ));
         }
@@ -23226,12 +23226,15 @@ mod tests {
             "a plain load deleted an instance"
         );
         assert!(!reply[0].applied.contains(&"instances".to_string()));
-        assert!(
-            reply[0]
-                .refused
-                .as_deref()
-                .is_some_and(|why| why.contains("instances")),
-            "an operator whose count did not move must be told why: {reply:?}"
+        assert_eq!(
+            reply[0].refused.as_deref(),
+            Some(
+                "instances: this load never reshapes a flock; `shep start --reset=file` to \
+                 take the file's count of 1"
+            ),
+            "the refusal must name a mode an operator can actually type, \
+             not the bare flag `shep start --reset` now refuses on its \
+             own: {reply:?}"
         );
         assert_eq!(
             reply[0]
