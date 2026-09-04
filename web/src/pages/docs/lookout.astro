@@ -229,6 +229,28 @@ const settingsDogs = `shep lookout   /home/ada/.shep                            
   bark                                                                yes      built-in                  silent
 
 esc/s close   j/k select   g/G first/last   r refresh                                                          read-only`;
+
+const settingsNarrow = `shep lookout   /home/ada/.shep 2 in the flock
+  [daemon]
+> log_level        warn           shep.toml
+  log_json         false          the default
+  socket           /home/ada/.s…  shep.toml
+  max_cron_sleep   30s            shep.toml
+
+  [whistle]
+  allow_control    false          the default
+
+  [style]
+  level            full           shep.toml
+
+  [dogs]
+  space arms, Enter applies; a dog needs no …
+  NAME               IN FILE  RUNNING
+  otel               no       online
+  ledger             yes      not running
+  bark               yes      silent
+
+esc/s close   j/k select   g/G fir… read-only`;
 ---
 
 <DocsLayout
@@ -369,6 +391,20 @@ esc/s close   j/k select   g/G first/last   r refresh                           
       existed; you see <code>CFG</code> past 122.
     </p>
     <CodeBlock label="51×14">{narrow}</CodeBlock>
+    <p>
+      The settings screen has its own drop order, and its two tables
+      disagree about which column goes first. The scalar rows drop the
+      apply cost and keep SOURCE; the dogs table drops SOURCE and keeps
+      RUNNING. Each keeps whichever fact is not said anywhere else on the
+      screen. The apply cost already appears twice more, in the confirm and
+      in the status bar the moment a candidate arms, so it can go first.
+      SOURCE on a scalar row is the only place that says whether an
+      operator wrote the value or shep assumed it, so it stays until the
+      last column falls. The dogs table has no such backup for SOURCE, so
+      it goes, and RUNNING, the one fact nothing else on the pane answers,
+      stays.
+    </p>
+    <CodeBlock label="45×24">{settingsNarrow}</CodeBlock>
     <p>
       Below 33 columns or 6 rows, lookout refuses to draw rather than risk
       overlapping garbage. The refusal message is short enough to survive
