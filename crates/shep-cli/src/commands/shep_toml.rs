@@ -260,6 +260,24 @@ impl ShepToml {
         })
     }
 
+    /// Reads `path` for a caller that only wants the answer -- the settings
+    /// screen's own door into this type, and the shape every reader below
+    /// is reached through.
+    ///
+    /// Takes no lock, unlike [`Self::edit`]/[`Self::try_edit`]:
+    /// [`Self::save`]'s rename onto `path` is atomic, so a concurrent
+    /// writer can only ever make this read observe the document just
+    /// before or just after that write, never a torn one. The same
+    /// argument [`Self::adopted_dog_path_readonly`] already makes for
+    /// itself.
+    ///
+    /// # Errors
+    /// [`ShepTomlError::Io`] if `path` exists and could not be read.
+    /// [`ShepTomlError::Parse`] if `path` exists and is not valid TOML.
+    pub fn read_only(path: &Path) -> Result<Self, ShepTomlError> {
+        Self::open(path)
+    }
+
     /// Adds `name` to `[daemon] enabled_dogs` (idempotently), and writes
     /// nothing else anywhere.
     ///
@@ -412,6 +430,25 @@ impl ShepToml {
             .unwrap_or_default()
     }
 
+    /// The names in `[daemon] enabled_dogs`, in file order -- the flock a
+    /// dog's silence or a boot-time skip can be checked against, and
+    /// distinct from [`Self::adopted_dog_names`]: a dog can be adopted and
+    /// not enabled, or (for one of the six built into the daemon) enabled
+    /// without ever being adopted.
+    #[must_use]
+    pub fn enabled_dog_names(&self) -> Vec<String> {
+        self.table("daemon")
+            .and_then(|daemon| daemon.get("enabled_dogs"))
+            .and_then(Item::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// [`Self::adopted_dog_path`] without [`Self::edit`]'s write side --
     /// for a caller that only wants the answer, such as `lib.rs`'s
     /// `dispatch_adopted_dog`, which runs on every unrecognized verb, most
@@ -504,6 +541,158 @@ impl ShepToml {
         Ok(())
     }
 
+    /// `[style] level`, or `None` when the document never wrote it -- the
+    /// distinction the whole settings screen rests on. A key written to
+    /// its own default is still `Some`, because [`DaemonConfig::load`]'s
+    /// `#[serde(default)]` on every section makes that fact unrecoverable
+    /// once the file is parsed into a config: only reading the document
+    /// directly, the way this reader and the five below it do, can still
+    /// tell "the operator wrote this" from "nobody ever did".
+    ///
+    /// The raw string as written -- `full`, `plain`, `bare`, or whatever
+    /// else an operator typed. Whether it names a real [`StyleLevel`] is
+    /// [`DaemonConfig::load`]'s question, not this reader's.
+    #[must_use]
+    pub fn style_level(&self) -> Option<String> {
+        self.table("style")?
+            .get("level")?
+            .as_str()
+            .map(String::from)
+    }
+
+    /// `[daemon] log_json`, or `None` when the document never wrote it.
+    /// See [`Self::style_level`] for why absence and a written default are
+    /// two different facts, not one.
+    #[must_use]
+    pub fn daemon_log_json(&self) -> Option<bool> {
+        self.table("daemon")?.get("log_json")?.as_bool()
+    }
+
+    /// `[daemon] log_level`, or `None` when the document never wrote it,
+    /// as the raw string on disk. Whether it names a real `LogLevel` is
+    /// [`DaemonConfig::load`]'s question, not this reader's.
+    #[must_use]
+    pub fn daemon_log_level(&self) -> Option<String> {
+        self.table("daemon")?
+            .get("log_level")?
+            .as_str()
+            .map(String::from)
+    }
+
+    /// `[daemon] socket`, or `None` when the document never wrote it.
+    #[must_use]
+    pub fn daemon_socket(&self) -> Option<PathBuf> {
+        self.table("daemon")?
+            .get("socket")?
+            .as_str()
+            .map(PathBuf::from)
+    }
+
+    /// `[daemon] max_cron_sleep`, or `None` when the document never wrote
+    /// it, as the raw string on disk -- not the parsed `UpDuration`. The
+    /// settings screen shows what the file says; parsing it here would
+    /// put a second opinion about the grammar next to `DaemonConfig`'s.
+    #[must_use]
+    pub fn daemon_max_cron_sleep(&self) -> Option<String> {
+        self.table("daemon")?
+            .get("max_cron_sleep")?
+            .as_str()
+            .map(String::from)
+    }
+
+    /// `[whistle] allow_control`, or `None` when the document never wrote
+    /// it.
+    #[must_use]
+    pub fn whistle_allow_control(&self) -> Option<bool> {
+        self.table("whistle")?.get("allow_control")?.as_bool()
+    }
+
+    /// Writes `[daemon] log_json = <value>`, creating `[daemon]` when this
+    /// document has none yet.
+    ///
+    /// # Errors
+    /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
+    /// something other than a table. See [`Self::set_style_level`], the
+    /// setter this one and its four siblings below are modelled on.
+    pub fn set_daemon_log_json(&mut self, value: bool) -> Result<(), ShepTomlError> {
+        self.section_table_mut("daemon")?
+            .insert("log_json", Item::Value(value.into()));
+        Ok(())
+    }
+
+    /// Writes `[daemon] log_level = "<value>"`, creating `[daemon]` when
+    /// this document has none yet. `value` is written as given, unchecked
+    /// -- [`DaemonConfig::load`] is what refuses a name that is not a real
+    /// `LogLevel`.
+    ///
+    /// # Errors
+    /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
+    /// something other than a table.
+    pub fn set_daemon_log_level(&mut self, value: &str) -> Result<(), ShepTomlError> {
+        self.section_table_mut("daemon")?
+            .insert("log_level", Item::Value(value.into()));
+        Ok(())
+    }
+
+    /// Writes `[daemon] socket = "<value>"`, creating `[daemon]` when this
+    /// document has none yet.
+    ///
+    /// # Errors
+    /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
+    /// something other than a table.
+    pub fn set_daemon_socket(&mut self, value: &Path) -> Result<(), ShepTomlError> {
+        self.section_table_mut("daemon")?.insert(
+            "socket",
+            Item::Value(value.to_string_lossy().into_owned().into()),
+        );
+        Ok(())
+    }
+
+    /// Writes `[daemon] max_cron_sleep = "<value>"`, creating `[daemon]`
+    /// when this document has none yet. `value` is written as given,
+    /// unchecked -- [`DaemonConfig::load`] is what refuses a duration
+    /// below the floor or one that does not parse at all.
+    ///
+    /// # Errors
+    /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
+    /// something other than a table.
+    pub fn set_daemon_max_cron_sleep(&mut self, value: &str) -> Result<(), ShepTomlError> {
+        self.section_table_mut("daemon")?
+            .insert("max_cron_sleep", Item::Value(value.into()));
+        Ok(())
+    }
+
+    /// Writes `[whistle] allow_control = <value>`, creating `[whistle]`
+    /// when this document has none yet.
+    ///
+    /// # Errors
+    /// [`ShepTomlError::WrongShape`] -- `whistle` is already there as
+    /// something other than a table.
+    pub fn set_whistle_allow_control(&mut self, value: bool) -> Result<(), ShepTomlError> {
+        self.section_table_mut("whistle")?
+            .insert("allow_control", Item::Value(value.into()));
+        Ok(())
+    }
+
+    /// Removes `[daemon] socket` if it is set, and does nothing --
+    /// neither error nor write -- if `[daemon]` is absent or is not a
+    /// table. Unlike the setters above, there is no shape for this to
+    /// refuse: removing a key from a table that is not a table is already
+    /// a no-op.
+    pub fn unset_daemon_socket(&mut self) {
+        if let Some(daemon) = self.doc.get_mut("daemon").and_then(Item::as_table_mut) {
+            daemon.remove("socket");
+        }
+    }
+
+    /// Removes `[daemon] max_cron_sleep` if it is set. See
+    /// [`Self::unset_daemon_socket`] for why this has no `Result`.
+    pub fn unset_daemon_max_cron_sleep(&mut self) {
+        if let Some(daemon) = self.doc.get_mut("daemon").and_then(Item::as_table_mut) {
+            daemon.remove("max_cron_sleep");
+        }
+    }
+
     /// Writes the starter `[interpreters]` mapping (task 47) -- a script
     /// extension to the interpreter shep runs it with, active from the
     /// moment it lands rather than commented into inertness, with an
@@ -581,6 +770,35 @@ impl ShepToml {
             path: self.path.clone(),
             source,
         }
+    }
+
+    /// `section` as a table, or `None` if this document never wrote it, or
+    /// wrote it as something else. The read side every scalar reader above
+    /// shares -- `Item::as_table` already answers `None` for the wrong-
+    /// shape case, which is fine for a reader (there is nothing to refuse,
+    /// only nothing to report) even though a setter cannot let that same
+    /// silence stand.
+    fn table(&self, section: &str) -> Option<&Table> {
+        self.doc.get(section).and_then(Item::as_table)
+    }
+
+    /// `section` as a table, creating it (empty) if this document has none
+    /// yet, and refusing with [`ShepTomlError::WrongShape`] if `section`
+    /// is already occupied by something else -- the write side every
+    /// scalar setter above shares, factored out rather than repeated five
+    /// times. [`Self::set_style_level`] carries this same shape inline,
+    /// for one key rather than five.
+    fn section_table_mut(&mut self, section: &'static str) -> Result<&mut Table, ShepTomlError> {
+        let item = self
+            .doc
+            .entry(section)
+            .or_insert_with(|| Item::Table(Table::new()));
+        let found = item.type_name();
+        item.as_table_mut().ok_or(ShepTomlError::WrongShape {
+            path: self.path.clone(),
+            key: section,
+            found,
+        })
     }
 
     /// `[daemon]`, creating it (empty) if this document has none yet.
@@ -771,7 +989,8 @@ pub enum ShepTomlError {
         /// The file that holds the wrongly-shaped value.
         path: PathBuf,
         /// The table key that was expected -- `"style"` for
-        /// [`ShepToml::set_style_level`], the only caller today.
+        /// [`ShepToml::set_style_level`], `"daemon"` or `"whistle"` for
+        /// the settings-screen setters that share [`ShepToml::section_table_mut`].
         key: &'static str,
         /// What TOML actually found there ([`Item::type_name`]) --
         /// `"string"`, `"array"`, and so on; never `"table"`, since that
@@ -1228,6 +1447,105 @@ mod tests {
             before.mode() & 0o777,
             after.mode() & 0o777,
             "a refused write must not touch the file's mode"
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_daemon_section_reads_every_scalar_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[interpreters]\njs = \"node\"\n").unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.daemon_log_json(), None);
+        assert_eq!(cfg.daemon_log_level(), None);
+        assert_eq!(cfg.daemon_socket(), None);
+        assert_eq!(cfg.daemon_max_cron_sleep(), None);
+        assert_eq!(cfg.whistle_allow_control(), None);
+        assert_eq!(cfg.style_level(), None);
+    }
+
+    /// The distinction the screen rests on: a key written to its own default is
+    /// not the same fact as a key nobody wrote, and `DaemonConfig::load` cannot
+    /// tell them apart because every section is `serde(default)`.
+    #[test]
+    fn a_scalar_written_to_its_default_still_reads_as_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[daemon]\nlog_level = \"warn\"\nlog_json = false\n").unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.daemon_log_level().as_deref(), Some("warn"));
+        assert_eq!(cfg.daemon_log_json(), Some(false));
+    }
+
+    #[test]
+    fn a_missing_file_reads_as_an_empty_document_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.daemon_log_level(), None);
+        assert!(!path.exists(), "a read must never create the file");
+    }
+
+    #[test]
+    fn setting_a_scalar_keeps_the_comments_and_the_keys_around_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "# keep me\n[daemon]\nenabled_dogs = [\"metrics\"]\n\n[style]\nlevel = \"full\"\n",
+        )
+        .unwrap();
+
+        ShepToml::try_edit(&path, |cfg| cfg.set_daemon_log_level("debug")).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# keep me\n"), "got: {text}");
+        assert!(text.contains("enabled_dogs = [\"metrics\"]"), "got: {text}");
+        assert!(text.contains("level = \"full\""), "got: {text}");
+        assert!(text.contains("log_level = \"debug\""), "got: {text}");
+    }
+
+    #[test]
+    fn unsetting_removes_the_key_and_leaves_its_neighbours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "[daemon]\nlog_level = \"debug\"\nmax_cron_sleep = \"30s\"\n",
+        )
+        .unwrap();
+
+        ShepToml::edit(&path, ShepToml::unset_daemon_max_cron_sleep).unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.daemon_max_cron_sleep(), None);
+        assert_eq!(cfg.daemon_log_level().as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn a_daemon_key_of_the_wrong_shape_is_refused_rather_than_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "daemon = \"loud\"\n").unwrap();
+
+        // `try_edit`, not `edit`. `edit` runs `save` whatever the closure
+        // returned, so a refusal through it would still stage and rename a
+        // byte-identical copy, landing a fresh inode on a file the refusal never
+        // touched. That is the failure `try_edit` exists for, and it is why
+        // every setter on this screen goes through it.
+        let refusal: Result<(), ShepTomlError> =
+            ShepToml::try_edit(&path, |cfg| cfg.set_daemon_log_json(true));
+
+        assert!(matches!(
+            refusal,
+            Err(ShepTomlError::WrongShape { key: "daemon", .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "daemon = \"loud\"\n"
         );
     }
 
