@@ -5,15 +5,12 @@
 //! the target, then `fsync` the directory the rename landed in. A reader
 //! sees the whole old file or the whole new one, never a fragment.
 //!
-//! [`create_staging_file`] is the first step. `kv.json`, `barks.jsonl`,
-//! `overrides.json` and `shep.toml` (with `dogs.toml` riding on the last
-//! one) each carried their own copy of it, six lines apiece and identical
-//! but for a name. This module is the one copy they share.
+//! [`create_staging_file`] is the first step and [`sync_dir`] is the last.
 //!
-//! [`sync_dir`] is the last step: it makes the *rename* durable, which the
-//! temp file's own `fsync` does not. On unix. It is a no-op on Windows, so
-//! every durability claim below, and in the six writers that call it, is a
-//! unix one.
+//! [`sync_dir`] makes the *rename* durable, which the temp file's own
+//! `fsync` does not. On unix. It is a no-op on Windows, so every
+//! durability claim below, and in the six writers that call it, is a unix
+//! one.
 //!
 //! Those two flushes answer different questions, and it is easy to buy one
 //! and believe you bought both. `File::sync_all` on the staging file
@@ -35,56 +32,69 @@
 //! and the `persist` stay with each store, because each maps a failure of
 //! them onto its own error type.
 
+// Where the create step came from, which is a maintainer's question rather
+// than a caller's (IR-31). `kv.json`, `barks.jsonl`, `overrides.json` and
+// `shep.toml` (with `dogs.toml` riding on the last one) each carried their
+// own copy of it, six lines apiece and identical but for a prefix, a
+// suffix and a mode constant that held `0o600` in all four. A fifth copy
+// was one `pub(super)` away when this became one function instead.
+
 use std::path::Path;
 
+// Why `0600` and not something a caller could widen (IR-31). Four files
+// reached it by different arguments, and the strictest is the one that
+// governs a shared value. `$SHEP_HOME` is itself `0700`, so for `kv.json`,
+// `barks.jsonl` and `overrides.json` this is a second lock on the same
+// door. For `shep.toml` and `dogs.toml` it is the only lock that counts:
+// `docs/dogs.md` tells an operator to paste a Discord or Slack webhook URL
+// there, and both of those carry a bearer token in the path. It is also
+// the mode a `tar`, a `cp -p` or a backup of `$SHEP_HOME` carries out with
+// the file, somewhere no directory mode follows it.
 /// Mode a file under `$SHEP_HOME` is created with: owner read/write,
 /// nobody else.
 ///
-/// `$SHEP_HOME` is itself `0700`, so for `kv.json`, `barks.jsonl` and
-/// `overrides.json` this is a second lock on the same door. For
-/// `shep.toml` and `dogs.toml` it is the only lock that counts:
-/// `docs/dogs.md` tells an operator to paste a Discord or Slack webhook
-/// URL there, and both of those carry a bearer token in the path. Four
-/// files reached `0600` by different arguments and the strictest of them
-/// is the one that governs the shared value.
+/// # Platforms
 ///
-/// It is also the mode a `tar`, a `cp -p` or a backup of `$SHEP_HOME`
-/// carries out with the file, somewhere no directory mode follows it.
-///
-/// Windows has no equivalent bit, so nothing there applies it and a file
-/// inherits the ACL of the directory it lands in. That is the same gap
-/// `shep.toml`'s own home-directory creation names in the operator docs.
+/// Unix only. Windows has no equivalent bit, so nothing there applies this
+/// and a file inherits the ACL of the directory it lands in. That is the
+/// same gap `shep.toml`'s own home-directory creation names in the
+/// operator docs.
 pub const OWNER_ONLY_FILE_MODE: u32 = 0o600;
 
+// The three choices a caller might otherwise ask about (IR-31).
+//
+// NO MODE PARAMETER. Every caller writes a file under `$SHEP_HOME` that
+// holds a credential, an `env` value, or a record of what the shepherd
+// told an outside service, so none of them wants anything but
+// `OWNER_ONLY_FILE_MODE`. A parameter would buy nothing today and would be
+// the door a later caller walks a `0644` through.
+//
+// A UNIQUE MIDDLE, not a fixed `<path>.tmp`. Two writers sharing one had
+// a process's `rename` consume the other's staging file, and the loser
+// died with `ENOENT` renaming a path that no longer existed.
+//
+// NO SEPARATOR IN EITHER PART. `tempfile`'s own docs call one legal and
+// inadvisable, and `tempfile_in` joins the result onto `parent`, so a `..`
+// in front of a separator stages the file outside the directory this
+// function's whole contract is that it stays inside. Nothing in the tree
+// passes anything but a literal; the check is what keeps that true now
+// four private helpers have become one public one.
+//
+// `tempfile`'s OWN TYPE back, rather than a newtype. The caller does the
+// writing, the `sync_all` and the `persist`, so a wrapper's whole body
+// would forward those three calls. The cost is a dependency's type in this
+// crate's public API, taken deliberately.
 /// Creates the staging file a store is rewritten through, in `parent` so
 /// the later `rename` stays within one filesystem.
 ///
-/// `prefix` and `suffix` bracket a unique middle `tempfile` picks. The
-/// uniqueness is not tidiness: two writers sharing a fixed `<path>.tmp`
-/// had one process's `rename` consume the other's staging file, and the
-/// loser died with `ENOENT` renaming a path that no longer existed.
+/// `prefix` and `suffix` bracket a unique middle `tempfile` picks, and
+/// neither may contain a path separator. The file is created
+/// [`OWNER_ONLY_FILE_MODE`] on unix, at the `open` itself rather than by a
+/// later `chmod`, so there is no window in which it sits at whatever the
+/// process umask leaves it. It carries no mode on Windows.
 ///
-/// Neither may contain a path separator. `tempfile` allows one and joins
-/// the result onto `parent`, so a `..` in front of a separator would stage
-/// the file outside the directory this function's whole contract is that
-/// it stays inside. No caller passes anything but a literal, and this is
-/// what keeps that true now the helper is public.
-///
-/// On unix the mode goes to the `open` itself rather than a later `chmod`
-/// pass, so there is no window in which a file holding a webhook token
-/// sits at whatever the process umask leaves it.
-///
-/// There is no mode parameter, and that is the function rather than an
-/// omission. Every caller writes a file under `$SHEP_HOME` that holds a
-/// credential, an `env` value, or a record of what the shepherd told an
-/// outside service, so none of them wants anything but
-/// [`OWNER_ONLY_FILE_MODE`]. A parameter would buy nothing today and
-/// would be the door a later caller walks a `0644` through.
-///
-/// Returns `tempfile`'s own type, because the caller does the writing, the
-/// `sync_all` and the `persist`. That puts a dependency's type in this
-/// crate's public API on purpose: the alternative is a newtype whose whole
-/// body forwards those three calls.
+/// The caller writes it, `sync_all`s it, and `persist`s it over the real
+/// file.
 ///
 /// # Errors
 /// - [`std::io::ErrorKind::InvalidInput`] when `prefix` or `suffix`
