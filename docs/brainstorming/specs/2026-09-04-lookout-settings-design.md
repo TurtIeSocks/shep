@@ -1,6 +1,6 @@
 # Design: the lookout settings screen
 
-Status: designed 2026-09-04, not yet implemented. This builds decision 11 of
+Status: designed 2026-09-04, implemented. This builds decision 11 of
 [the config overrides design](2026-09-02-config-overrides-design.md), and only
 the `shep.toml` half of it. That decision's other half, the overrides store,
 and decision 12's write-only env are a later slice.
