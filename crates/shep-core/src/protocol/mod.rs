@@ -20,7 +20,7 @@
 //! already shipping, and a rename removes a string an older daemon already
 //! decoded rather than adding one it never saw. Without the bump, a CLI
 //! built after this change sends `"policy"` for what used to be `--reset`,
-//! and a daemon that has not restarted since the upgrade cannot decode it —
+//! and a daemon that has not restarted since the upgrade cannot decode it:
 //! the connection ends on an envelope it cannot read instead of a named
 //! refusal at the handshake. Restart the shepherd after upgrading to this
 //! version, the same as the last bump asked.

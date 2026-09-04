@@ -511,7 +511,7 @@ rather than for `ApplyConfig` itself.** The two-case analysis above still
 holds for `Add` and for `ApplyConfig`'s own addition. It stopped holding for
 `ResetDepth::Settings`, renamed to `ResetDepth::Policy` (with `File`/`Env`
 added) in the same commit: a rename changes the wire spelling of an
-operation — `--reset` — that already ships, so the "versions match, same
+operation (`--reset`) that already ships, so the "versions match, same
 commit lineage" case above is no longer the only hazard. A daemon at
 protocol 2 that has simply not restarted since the upgrade now fails to
 decode `"policy"` for what it already understood as `"settings"`, which is a
