@@ -61,6 +61,25 @@ races two threads and needs the machine quiet. Add a timing- or
 contention-sensitive test and it needs the same treatment; the workflow's
 skip list names both groups explicitly.
 
+**The skip list is not the first answer to a CI-only failure, and twice on
+2026-09-04 it was the wrong one.**
+`a_reopen_that_cannot_open_a_path_again_exits_internal` renamed a log file
+after `poll_flock` said `online`, which means the daemon spawned the child
+and NOT that the pump has opened the file, so the rename failed `ENOENT`;
+the sibling ninety lines above it
+already waits for the first line through `bleats` and calls that wait a
+precondition. `a_flock_of_every_carried_kind_survives_a_daemon_reload` was
+not a test problem at all: the log pump dropped a line the child wrote just
+before its sheep task let go, 39 times in 64 at the seam, and quarantining
+it would have hidden that. Both stay in the ordinary tier. Before reaching
+for the skip list, check the failure against the `slow` tier's own
+criterion, which the workflow states: a test belongs there when it asserts a
+duration, a batch or a count that a contended runner cannot hold still.
+"Waits twenty seconds for something that should take milliseconds" is not
+that, and an EMPTY artifact where a partial one was expected is a defect
+rather than a slow machine. See `docs/decisions.md`, "CI flakes, and the log
+line a stop could lose".
+
 From Phase 15 on, `shep` is a library with three thin `[[bin]]` targets
 over it (`shep`, `shep-runtime`, `shep-dev`) rather than one bare binary — the
 two container-entrypoint aliases spec §3 asks for cannot share a module tree

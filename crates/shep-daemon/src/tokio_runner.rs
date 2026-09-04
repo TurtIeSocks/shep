@@ -56,7 +56,7 @@ use tokio::io::{
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep_until, timeout};
 
 #[cfg(unix)]
 use crate::boot::DIR_MODE;
@@ -121,6 +121,86 @@ use shep_core::logstamp::stamp_into;
 /// descriptor report answerable while a chatty sheep runs.
 #[cfg(unix)]
 const READ_BUFFER: usize = 8 * 1024;
+
+/// How long the pump keeps reading after its sheep task has let go.
+///
+/// The `logs_tx.closed()` branch of [`spawn_log_pump`]'s `select!` exists
+/// for a lamb that holds the pipe open past the child's own exit, and until
+/// 2026-09-04 it went straight to `break`. That lost the child's LAST line
+/// whenever the pump had not been polled since the child wrote it: both
+/// branches are ready in the same poll, `tokio::select!` picks between ready
+/// branches at random, and the losing half drops the reader with the bytes
+/// still in the pipe. Measured at the seam, 39 losses in 64 attempts.
+///
+/// A stop is where that hurts most. `shutdown_with_message` tells a child to
+/// wind up, and what it writes on the way out is the last thing an operator
+/// has to read; `shep stop` then reaps it, the sheep task returns, and the
+/// line races the drop that follows.
+///
+/// The common case pays nothing. A reaped child's write ends are closed, so
+/// both streams answer EOF on the first read and the drain returns without
+/// waiting. The budget is only ever spent when something OTHER than the
+/// child still holds a write end, which is the case this branch was written
+/// for, and 100ms of one lamb's output is a cheap way to stop discarding
+/// every other sheep's parting words.
+///
+/// A time bound rather than [`drain_ready`]'s: that one may not touch the
+/// pipe at all, because it runs while the sheep is still writing and a drain
+/// that reads as it writes never catches up. Here the writer is normally
+/// already gone, so reading the pipe terminates on its own and the budget is
+/// a backstop rather than the mechanism.
+///
+/// # Where the number comes from
+///
+/// 100ms, against a measured worst case of 7 to 12ms.
+///
+/// A child that has been reaped cannot have left more than its pipes'
+/// capacity behind, because its pipes are the only thing it had to write
+/// into. Two full pipes are therefore the whole of what this drain can face
+/// on the path it exists for, and that is a bound rather than an estimate.
+/// Measured on macOS, filling each pipe until the kernel answers `EAGAIN`:
+/// they take 1024 lines and 65536 bytes each, and draining all 131072 bytes
+/// into the two log files took 7.3, 9.4, 9.5 and 11.6ms across four runs.
+/// [`both_pipes_filled_to_capacity_drain_inside_the_budget`] is that
+/// measurement kept as a case, so a later cut to this number fails a test
+/// rather than silently truncating a dying sheep's last words.
+///
+/// # Why it is not wider
+///
+/// A draining pump is deaf, and a handover asks pumps questions.
+///
+/// `final_drain` runs inside a `select!` handler, so for as long as it lasts
+/// the pump is not polling `ctl_rx`. `supervisor::report_fds` says what that
+/// costs in as many words: a pump that has stopped serving its mailbox fills
+/// it and blocks the send, and the sweep gives every pump one
+/// `REPORT_DEADLINE` (2s) between them. So this budget is not free after
+/// all, and is spent out of that one.
+///
+/// It looked free at first, and the reasoning that made it look free was
+/// wrong in an instructive way: nothing joins this task, `spawn_log_pump`
+/// returns `()`, and `Msg::Exited` has already gone by the time the pump
+/// ends, so no operator waits on the drain. All true, and all beside the
+/// point, because the party that waits is not an operator but the next
+/// handover. This was briefly 500ms on the strength of that argument, and
+/// CI went red on a handover case two commits later. The failure was never
+/// pinned on it, but 500ms was a quarter of `REPORT_DEADLINE` bought with an
+/// argument that had a hole in it, and 100ms is 9x the measured worst case
+/// without the hole.
+///
+/// Serving `ctl_rx` from inside the drain would remove the tradeoff, the way
+/// [`reserve_slot`] does for its own wait. It is not done here because a
+/// `ReportFds` answered mid-drain would name descriptors this pump is about
+/// to close, and getting that right is a bigger change than the budget is
+/// worth.
+///
+/// # What the number is NOT
+///
+/// It does not bound the lamb. A process that inherited a write end and
+/// outlived its parent can hold the pipe open and talk for as long as it
+/// likes, so no budget is sufficient there and this one is a cap on how long
+/// ONE ending sheep may delay its own pump's teardown. That case is why a
+/// budget exists at all; the measurement above is why it is not 10ms.
+const FINAL_DRAIN: Duration = Duration::from_millis(100);
 
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
 #[derive(Debug, Default)]
@@ -1945,6 +2025,58 @@ where
     }
 }
 
+/// Writes out what the streams still hold once the sheep task has let go,
+/// and stops after [`FINAL_DRAIN`] however much is left.
+///
+/// Files only. `logs_tx` is closed -- that is what brought us here -- and
+/// the bus subscribers it fed are gone with the sheep task. The file is the
+/// record, which is [`drain_ready`]'s reasoning for the same choice.
+///
+/// Each stream is retired on EOF or a read failure, exactly as the pump's
+/// own loop retires it, so a child that has exited ends this in one poll per
+/// stream. The budget covers the other case: a lamb that inherited a write
+/// end and outlives its parent keeps the pipe open, and without a bound the
+/// pump would follow it for as long as it cared to talk.
+///
+/// A read failure is dropped rather than logged. The pump's loop reports
+/// one, and this runs only where the sheep is already going away.
+///
+/// A retired stream does not clear its number from `files.pipes` the way the
+/// pump's own loop does, and does not need to: the only reader of those
+/// numbers is a descriptor report, the caller `break`s as soon as this
+/// returns, and nothing survives to be asked.
+async fn final_drain<O, E>(files: &mut LogFiles, streams: &mut Streams<O, E>)
+where
+    O: AsyncRead + Unpin,
+    E: AsyncRead + Unpin,
+{
+    let drained = timeout(FINAL_DRAIN, async {
+        while streams.out.is_some() || streams.err.is_some() {
+            // Bound before the `match` for the reason the pump's own arms
+            // do: the future borrows `streams`, and a scrutinee's
+            // temporaries outlive the arms.
+            tokio::select! {
+                result = next_line(&mut streams.out) => {
+                    match result {
+                        Ok(Some(line)) => files.stream(false).append(&line).await,
+                        Ok(None) | Err(_) => streams.out = None,
+                    }
+                }
+                result = next_line(&mut streams.err) => {
+                    match result {
+                        Ok(Some(line)) => files.stream(true).append(&line).await,
+                        Ok(None) | Err(_) => streams.err = None,
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::debug!("a pump left the pipe still open at its sheep task's exit");
+    }
+}
+
 /// Pumps a sheep's stdout and stderr to completion, and stays reachable the
 /// whole time it does.
 ///
@@ -2107,6 +2239,21 @@ fn spawn_log_pump<O, E>(
                     files.flush_idle().await;
                 }
             }
+        }
+        // Whatever the streams still hold, before the readers go with this
+        // task. Here rather than in the branch that prompted it, because
+        // FOUR exits reach this line and every one of them can leave a line
+        // unread: two `AfterLine::LogsClosed`, the control channel's own
+        // `None`, and `logs_tx.closed()`. Only the `while` running out is
+        // free of it, and that one costs nothing, since both streams are
+        // already retired and the drain has nothing to loop over.
+        //
+        // Not while parked. A parked pump has had its descriptors reported
+        // and is holding the pipe for a successor to adopt; reading it here
+        // would take bytes out of a pipe this image no longer owns the
+        // reading of. The `select!`'s own read arms carry the same guard.
+        if files.reading() {
+            final_drain(&mut files, &mut streams).await;
         }
         // A `BufWriter` cannot flush itself as it drops, and every way out of
         // the loop above drops both of them: without this, whatever a child
@@ -2786,6 +2933,229 @@ mod tests {
         }
         let distinct: BTreeSet<RawFd> = named.iter().copied().collect();
         assert_eq!(distinct.len(), 4, "four descriptors, four numbers: {fds:?}");
+    }
+
+    /// Fails if BOTH pipes filled to capacity cannot be drained.
+    ///
+    /// This is the bound [`FINAL_DRAIN`] rests on. A child that has been
+    /// reaped cannot have left more than its pipes' capacity behind, because
+    /// its pipes are the only thing it had to write into, so two full pipes
+    /// are the worst case the drain ever faces on the path it exists for.
+    /// Anything larger means a writer is still alive, which is the lamb the
+    /// budget caps rather than bounds.
+    ///
+    /// Both streams, not just stdout. `final_drain` selects between two
+    /// readers and a reaped child can leave a full pipe behind on each, so a
+    /// bound derived from one of them would be half the real number.
+    ///
+    /// Over real pipes rather than the in-memory pair, since the capacity is
+    /// the whole point and only the kernel's is the real one. The line count
+    /// is read off the fill rather than assumed, so a platform with a
+    /// different pipe capacity asserts its own number.
+    ///
+    /// # Why completeness is the bound check
+    ///
+    /// The wait is [`PUMP_DEADLINE`] rather than [`FINAL_DRAIN`], and that
+    /// is deliberate rather than an oversight. `final_drain` is itself
+    /// wrapped in `timeout(FINAL_DRAIN, ..)`, so a drain that did not fit
+    /// the budget would be CUT OFF and the lines it had not reached would
+    /// never arrive. Every line landing is therefore the same claim as the
+    /// drain fitting, and it is the claim that survives a slow disk.
+    ///
+    /// Binding the wait to `FINAL_DRAIN` instead would assert something
+    /// else: that this machine can also schedule the task, flush a
+    /// `BufWriter` and let the filesystem catch up inside 100ms. That is a
+    /// measurement of the runner rather than of the drain, and it is exactly
+    /// the kind of assertion this whole branch exists to stop making.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn both_pipes_filled_to_capacity_drain_inside_the_budget() {
+        let pump = PumpHarness::start_over_pipes();
+        // 64 bytes a line: short enough to be a round fraction of a pipe,
+        // long enough that filling one does not take many thousands of
+        // syscalls.
+        let line = format!("{}\n", "x".repeat(63));
+        let out_lines = fill_pipe(&pump.out_writer, &line).await;
+        let err_lines = fill_pipe(&pump.err_writer, &line).await;
+        assert!(
+            out_lines > 0 && err_lines > 0,
+            "neither pipe took a whole line: stdout={out_lines} stderr={err_lines}"
+        );
+
+        drop(pump.out_writer);
+        drop(pump.err_writer);
+        drop(pump.logs);
+
+        for (path, want, stream) in [
+            (&pump.out_path, out_lines, "stdout"),
+            (&pump.err_path, err_lines, "stderr"),
+        ] {
+            let settled = timeout(PUMP_DEADLINE, async {
+                while fs::read_to_string(path).unwrap_or_default().lines().count() < want {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(
+                settled.is_ok(),
+                "a full {stream} pipe did not drain inside {FINAL_DRAIN:?}: {want} lines \
+                 written, {} landed",
+                fs::read_to_string(path).unwrap_or_default().lines().count()
+            );
+        }
+    }
+
+    /// How many times [`a_last_line_written_before_the_sheep_task_lets_go_reaches_the_file`]
+    /// reconstructs the race.
+    ///
+    /// One attempt is not enough and no amount of care makes it enough: the
+    /// two ready branches are picked between at random, so a broken pump
+    /// passes a single attempt about two times in five. Thirty-two takes
+    /// that to roughly 2e-13, which is a deterministic test in every sense
+    /// that matters, and it costs nothing while the pump is right -- the
+    /// only slow attempt is one that has already failed.
+    const RACE_ATTEMPTS: usize = 32;
+
+    /// Fills one pipe with whole lines until the kernel refuses another, and
+    /// answers with how many went in.
+    ///
+    /// `try_write` rather than a timed `write_all`, because saturation has
+    /// to be something the kernel REPORTS rather than something the test
+    /// infers from a wait. A `write_all` that has not returned yet is a full
+    /// pipe, a descheduled thread and a pump that is merely slow, all with
+    /// the same appearance, and only the first of those is what this case is
+    /// about.
+    ///
+    /// A short write is the pipe filling partway through a line. Those bytes
+    /// stay in it and are not counted, so the answer is a count of WHOLE
+    /// lines and the caller's assertion stays exact. Any other error is a
+    /// real failure and says so rather than passing for saturation.
+    ///
+    /// `#[cfg(unix)]` because the type it takes is: `tokio::net::unix` does
+    /// not exist on Windows, and its only caller is a `cfg(unix)` case. The
+    /// gate this needed is `cargo check --target x86_64-pc-windows-gnu`,
+    /// which is a phase gate rather than a task one, so CI found it.
+    #[cfg(unix)]
+    async fn fill_pipe(writer: &tokio::net::unix::pipe::Sender, line: &str) -> usize {
+        // Once, before the loop, and this is what makes the `WouldBlock`
+        // below the kernel's own answer. `try_write` reports `WouldBlock`
+        // for a pipe tokio has not yet seen become writable as readily as
+        // for a full one, so without this the first call returns it and the
+        // fill measures nothing. After it, a refusal is `EAGAIN` from the
+        // write itself.
+        timeout(PUMP_DEADLINE, writer.writable())
+            .await
+            .expect("an empty pipe is writable")
+            .expect("the pipe is open");
+
+        let mut whole = 0usize;
+        loop {
+            match writer.try_write(line.as_bytes()) {
+                Ok(written) if written == line.len() => whole += 1,
+                Ok(_) => return whole,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return whole,
+                Err(error) => {
+                    panic!("the fill failed for a reason that is not a full pipe: {error}")
+                }
+            }
+        }
+    }
+
+    /// Fails if a line the child wrote before its sheep task let go never
+    /// reaches the log file.
+    ///
+    /// The pump's `select!` has a branch for the sheep task dropping its
+    /// `logs` receiver, and it is there for a lamb that holds the pipe open
+    /// past the child's own exit. The hazard is that the branch competes
+    /// with the read branches rather than following them: a child that
+    /// writes and exits leaves both ready in the same poll, and the pump
+    /// used to break on the closed channel and drop the reader with the
+    /// bytes still in the pipe.
+    ///
+    /// This is the stop path an operator meets. A `shutdown_with_message`
+    /// sheep is told to wind up, writes what it has to say, and exits; the
+    /// daemon reaps it, the sheep task returns, and that last line is the
+    /// one at risk. `cli_e2e`'s
+    /// `a_flock_of_every_carried_kind_survives_a_daemon_reload` is where it
+    /// surfaced, twenty seconds of polling against a log file that stayed
+    /// empty, on a CI runner too busy to schedule the pump in between.
+    ///
+    /// Nothing here waits on the child, because there is no child: the
+    /// harness writes the line itself and then does the one thing
+    /// `run_sheep` does when it returns. That is the whole of the race, with
+    /// the process lifecycle that normally hides it taken out.
+    #[tokio::test]
+    async fn a_last_line_written_before_the_sheep_task_lets_go_reaches_the_file() {
+        for attempt in 0..RACE_ATTEMPTS {
+            let mut pump = PumpHarness::start();
+            pump.out_writer.write_all(b"last-words\n").await.unwrap();
+            // The child exiting, then `run_sheep` breaking out of its loop:
+            // the write end closes and the receiver goes, in that order,
+            // with the line still unread in between.
+            drop(pump.out_writer);
+            drop(pump.err_writer);
+            drop(pump.logs);
+
+            let settled = timeout(PUMP_DEADLINE, async {
+                while !fs::read_to_string(&pump.out_path)
+                    .unwrap_or_default()
+                    .contains("last-words")
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(
+                settled.is_ok(),
+                "attempt {attempt}: the pump dropped the line it had not read yet, \
+                 leaving {:?}",
+                fs::read_to_string(&pump.out_path)
+            );
+        }
+    }
+
+    /// The same line, lost the other way: through the control channel
+    /// rather than through `logs`.
+    ///
+    /// `logs` and `log_ctl` do not close together in the ordinary case. The
+    /// sheep task holds the `logs` receiver and returns when its child does,
+    /// while the slot holds a `log_ctl` sender that outlives it, so the
+    /// pump's `ctl_rx.recv()` answers `None` only once the slot goes too:
+    /// a delete, or the daemon shutting down. Those are the cases where both
+    /// close at once, and the control arm's own `None` is then a fourth way
+    /// out of the loop that can win the same random pick.
+    ///
+    /// Which is why the drain does not live in the branch that prompted it.
+    /// It runs on the way out, once, so it cannot matter which exit was
+    /// taken. This case fails if it is ever moved back into one of them.
+    #[tokio::test]
+    async fn a_last_line_survives_the_control_channel_closing_with_the_logs() {
+        for attempt in 0..RACE_ATTEMPTS {
+            let mut pump = PumpHarness::start();
+            pump.out_writer.write_all(b"last-words\n").await.unwrap();
+            drop(pump.out_writer);
+            drop(pump.err_writer);
+            // A delete: the slot's sender and the sheep task's receiver go
+            // in the same moment, so all four exits are live at once.
+            drop(pump.ctl);
+            drop(pump.logs);
+
+            let settled = timeout(PUMP_DEADLINE, async {
+                while !fs::read_to_string(&pump.out_path)
+                    .unwrap_or_default()
+                    .contains("last-words")
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(
+                settled.is_ok(),
+                "attempt {attempt}: the pump took an exit that skips the drain, \
+                 leaving {:?}",
+                fs::read_to_string(&pump.out_path)
+            );
+        }
     }
 
     /// Fails if two instances of one `merge_logs` app end up naming one
