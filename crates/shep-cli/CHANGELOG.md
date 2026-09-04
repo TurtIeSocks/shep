@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-04
+
+### Changed
+
+- One name reaches both the topic and the re-read request
+
+
 ## [0.2.0] - 2026-09-04
 
 ### Added
