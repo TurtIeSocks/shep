@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/shep-channel",
     "crates/shep-core",
     "crates/shep-daemon",
     "crates/shep-client",
@@ -26,12 +27,22 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # `cargo publish` strips `path` from a dependency and needs a version to put
-# in its place, so these four need one even though every consumer in this
+# in its place, so these five need one even though every consumer in this
 # workspace resolves them by path. There is no `version.workspace = true`
 # form inside a dependency entry, since Cargo only supports that shorthand for
 # the `[package]` table. This literal is not sourced from
 # `workspace.package.version` above and a release bump has to touch both
 # places by hand. If that drifts, `cargo-release` is the mechanical fix.
+#
+# `default-features = false` here, not on the consuming side: Cargo only
+# lets a member's `workspace = true` entry turn a workspace-inherited
+# dependency's default features BACK ON, never off: the workspace's own
+# value is a floor a member cannot lower, only raise. shep-core is this
+# workspace's only in-tree consumer today and wants the wire types without
+# the `client` feature, so the floor is set to off here; a future in-tree
+# consumer that wants the client opts back in with
+# `shep-channel = { workspace = true, default-features = true }`.
+shep-channel = { path = "crates/shep-channel", version = "0.2.2", default-features = false }
 shep-core = { path = "crates/shep-core", version = "0.2.2" }
 shep-daemon = { path = "crates/shep-daemon", version = "0.2.2" }
 shep-client = { path = "crates/shep-client", version = "0.2.2" }

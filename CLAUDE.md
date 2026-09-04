@@ -282,9 +282,13 @@ re-running that suite in isolation with the mutation still applied.
 
 ## Architecture
 
-Five workspace members, one distributed binary (`shep`): shep-core,
-shep-daemon, shep-client, shep-cli (published as `shep`), and
-shep-cli-redirect, a placeholder holding the `shep-cli` name on crates.io.
+Seven published workspace members, one distributed binary (`shep`):
+shep-core, shep-daemon, shep-client, shep-macros (the `DogConfig` derive),
+shep-cli (published as `shep`), shep-channel (the client an app links to
+speak the shepherd channel), and shep-cli-redirect, a placeholder holding
+the `shep-cli` name on crates.io. This line said "five" on main and "six"
+on the branch that added shep-channel, and both were wrong once the two
+met: neither counted the other's crate.
 Each crate's Cargo.toml `description` states its role.
 
 **The docs site is `web/`** -- an Astro site, published, and part of the
@@ -375,11 +379,17 @@ never costs clarity.
 - Every new public item needs docs and a deliberate Debug decision (redacted
   for anything carrying env/secrets, with an exact-string test — IR-41).
 - `#![forbid(unsafe_code)]` is LIVE in core/client/cli, not planned. Unsafe
-  lives in exactly two files, both in shep-daemon and both carrying their own
-  `#![allow(unsafe_code)]` with per-block `// SAFETY:` (IR-22/23):
-  `sys.rs` (eight sites on unix) and `sys_windows.rs` (ten on Windows). This
-  line said "planned" and named only `sys.rs` for the whole of the Windows
-  port.
+  lives in three files across two crates, each carrying its own
+  `#![allow(unsafe_code)]` or `#[allow(unsafe_code)]` with per-block
+  `// SAFETY:` (IR-22/23): shep-daemon's `sys.rs` (eight sites on unix) and
+  `sys_windows.rs` (ten on Windows), and shep-channel's `endpoint.rs` (two
+  sites, one per platform: taking the descriptor the shepherd names in
+  `SHEP_CHANNEL_FD`, sound because a process-global guard makes it reachable
+  at most once per process, and `PeekNamedPipe` on Windows, which
+  `PipeReader`'s own doc comment exists to justify). This line said
+  "planned" and named only `sys.rs` for the whole of the Windows port, then
+  said "exactly two files" after shep-channel added a third, then said "one
+  site" in `endpoint.rs` after it had grown a second.
 - Open design decisions live at the bottom of map.md and in goals.md's open
   questions — check them before making architectural calls; if a decision is
   listed there, it is the maintainer's, not yours.
@@ -651,6 +661,20 @@ What that means for anyone editing this workspace:
   compiles a `cfg(windows)` item, and the `windows-gnu` cross-check is
   `cargo check`, which executes nothing. `.github/workflows/test.yml`'s
   `windows-latest` legs are what actually run this tier. Read the CI result.
+- **A `cfg(windows)` arm that compiles has been checked for spelling, not
+  for behaviour, and the difference has already cost a shipped bug.**
+  shep-channel's named-pipe arm type-checked on every Windows CI run for as
+  long as it existed and deadlocked the first time a process actually
+  executed it: the shepherd hands an app ONE pipe instance, `try_clone` is
+  `DuplicateHandle`, and Windows serialises every operation on a synchronous
+  file object, so the reader thread parked in `ReadFile` held it against the
+  writer thread's `ready()` forever. Fixed 2026-09-02 by `PipeReader`, which
+  peeks rather than parks. **When a platform arm has no test that runs it,
+  say so out loud rather than letting a green CI imply otherwise** — the PR
+  that introduced it did say so, in as many words, which is the only reason
+  anyone went looking. The same audit found the docs site's Python sample
+  opening the pipe twice, which succeeds and silently discards everything
+  the app writes.
 
 The instances redesign merged too: `increment_var` is removed, and refused
 with the replacement named rather than a bare serde error. Env values, args,

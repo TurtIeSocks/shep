@@ -34,6 +34,13 @@ schema = ["dep:schemars"]
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# The shepherd channel's wire types, and their only definition. This crate
+# re-exports them because `BusEvent::Channel` carries a `ChildMessage`
+# verbatim to every bus subscriber, so the message a bus event holds has to
+# be the same type an app writing on fd 3 constructs. `default-features =
+# false` takes the types without the client: nothing in the daemon opens fd 3
+# from the app side.
+shep-channel = { workspace = true, default-features = false }
 toml.workspace = true
 serde-saphyr.workspace = true
 json5.workspace = true

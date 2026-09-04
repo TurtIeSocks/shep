@@ -121,6 +121,10 @@ name = "shep-client"
 version_group = "shep"
 
 [[package]]
+name = "shep-channel"
+version_group = "shep"
+
+[[package]]
 name = "shep-macros"
 version_group = "shep"
 
