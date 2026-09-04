@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.34] - 2026-09-04
+
+### Changed
+
+- Drop a redundant test and cut atomic_file's comments back
+- One staging-file helper for every $SHEP_HOME store ([#115](https://github.com/shep-pm/shep/pull/115))
+
+### Fixed
+
+- Create_staging_file refuses a path separator in its name parts
+
+
 ## [0.1.33] - 2026-09-04
 
 ### Fixed
