@@ -705,14 +705,26 @@ mod tests {
 
     /// Accepts exactly one connection and then never answers it — up, but
     /// stalled forever, exactly the shape `sink_timeout` exists for.
-    async fn slow_sink() -> SocketAddr {
+    /// A sink that accepts a connection and then never answers, plus a
+    /// signal that fires the moment it has accepted one.
+    ///
+    /// The signal is what lets a caller assert an ORDER rather than a
+    /// duration. Without it the only way to say "the fast sink was not stuck
+    /// behind the slow one" is to bound the fast sink's arrival by a wall
+    /// clock, which is a claim about how quickly a runner schedules two
+    /// tasks rather than about the loop.
+    async fn slow_sink() -> (SocketAddr, tokio::sync::oneshot::Receiver<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (connected, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (_stream, _peer) = listener.accept().await.unwrap();
+            // Ignored: the receiver is dropped by any caller that does not
+            // care, and this task's job afterwards is to never answer.
+            let _ = connected.send(());
             core::future::pending::<()>().await;
         });
-        addr
+        (addr, rx)
     }
 
     fn base_info(name: &str, status: ProcStatus, restarts: u32) -> ProcessInfo {
@@ -973,14 +985,27 @@ mod tests {
     /// `a_dropped_frame_makes_bark_poll_and_catch_up` gives above: the
     /// paused one it used to run under could not elapse the deadline it was
     /// given, so an inline-awaiting loop would have hung here rather than
-    /// failed. The budget is 2s against a 10s `sink_timeout`. It was 50ms of
-    /// nominal virtual time, which no clock ever enforced; a real 50ms is a
-    /// claim about how fast a contended runner schedules two tasks, and this
-    /// project has lost CI runs to exactly that. Five times under the
-    /// timeout is still the whole of what this test means.
+    /// failed.
+    ///
+    /// No duration carries the meaning, though, which is the part worth
+    /// reading. The proof is an ORDER: the slow sink signals that it has
+    /// accepted and parked, and the fast sink is reached AFTER that. An
+    /// inline-awaiting loop could not do it, because it would still be
+    /// parked on the slow delivery. `sink_timeout` is ten minutes here for
+    /// the same reason the poll above is 60s, to make the elapsed-time path
+    /// to success unreachable inside a test that finishes in milliseconds,
+    /// so a timeout firing is the only thing that can end this test early
+    /// and it can only end it in failure.
+    ///
+    /// An earlier revision bounded the fast sink at 2s against a 10s
+    /// `sink_timeout` and called five times under the timeout the whole
+    /// meaning. It was defensible and it was still a claim about how fast a
+    /// contended runner schedules two tasks, which is what this project has
+    /// lost CI runs to. The timeouts below are failure guards now and
+    /// nothing else, so their exact values do not change what passes.
     #[tokio::test]
     async fn a_slow_sink_never_stalls_the_loop() {
-        let slow_addr = slow_sink().await;
+        let (slow_addr, slow_connected) = slow_sink().await;
         let (fast_addr, fast_captured) = one_shot_sink(200, "").await;
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
@@ -1023,7 +1048,7 @@ mod tests {
             rules: Vec::new(),
             poll: UpDuration::from_millis(60_000),
             history_bytes: barks::DEFAULT_MAX_BYTES,
-            sink_timeout: UpDuration::from_millis(10_000),
+            sink_timeout: UpDuration::from_millis(600_000),
         };
 
         let (tx, rx) = tokio::sync::broadcast::channel(8);
@@ -1041,11 +1066,24 @@ mod tests {
             ScriptedConfig::answering(String::new()),
         ));
 
-        let req = tokio::time::timeout(Duration::from_secs(2), fast_captured)
+        // The order is the assertion. First the slow sink confirms it has a
+        // connection and is parked on it, so the loop is provably mid-delivery
+        // to a sink that will never answer.
+        tokio::time::timeout(Duration::from_secs(30), slow_connected)
+            .await
+            .expect("the slow sink must be reached at all, or this test proves nothing")
+            .unwrap();
+
+        // Then the fast sink is reached anyway. A loop awaiting firings inline
+        // could not get here: it would still be parked on the delivery above,
+        // for the ten minutes `sink_timeout` allows it. Both timeouts are
+        // failure guards, so their values change how long a broken loop takes
+        // to report, never what passes.
+        let req = tokio::time::timeout(Duration::from_secs(30), fast_captured)
             .await
             .expect(
-                "the fast sink must be reached promptly; a slow sink in flight \
-                 must not stall the loop",
+                "the fast sink must be reached while a slow sink is still in \
+                 flight; a slow sink must not stall the loop",
             )
             .unwrap();
         assert_eq!(req.method, "POST");
