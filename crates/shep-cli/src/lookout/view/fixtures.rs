@@ -445,9 +445,6 @@ pub fn app_in_settings() -> App {
     app
 }
 
-/// [`app_in_settings`] with the control gate open, for the one test that
-/// proves an action key stays unreachable even when actions would otherwise
-/// be permitted.
 /// [`app_in_settings_with_control`] with the cursor already moved onto
 /// `field`'s row, by real `SelectDown` keypresses -- not by poking the
 /// cursor index directly, so a test using this fixture is exercising the
@@ -480,6 +477,9 @@ pub fn app_in_settings_at() -> (App, Instant) {
     (app, t0)
 }
 
+/// [`app_in_settings`] with the control gate open, for the one test that
+/// proves an action key stays unreachable even when actions would otherwise
+/// be permitted.
 pub fn app_in_settings_with_control() -> App {
     let mut app = app_in_settings();
     app.set_control_for_tests(Control::Allowed);

@@ -529,12 +529,11 @@ pub struct Settings {
 #[derive(Debug, Clone)]
 enum Pending {
     /// A free-text edit under construction. Only [`SettingField::Socket`]
-    /// and [`SettingField::MaxCronSleep`] ever reach this -- task 8's own
-    /// territory. Nothing in this task constructs it; the variant exists now
-    /// so [`Settings::pending`] and [`App::confirm_setting`] have a shape to
-    /// pass a non-`Armed`, non-`Sent` state through rather than gaining a
-    /// second `Option` the day it lands.
-    #[allow(dead_code)]
+    /// and [`SettingField::MaxCronSleep`] ever reach this: `Enter` on
+    /// either row opens it, seeded with that field's own on-disk value
+    /// ([`App::confirm_setting`]), and [`App::on_settings_text_key`] is
+    /// the only place a [`KeyPress::TextChar`] or [`KeyPress::TextBackspace`]
+    /// ever reaches it while [`Settings`] owns the keyboard.
     Typing {
         /// Which scalar.
         field: SettingField,
@@ -554,11 +553,12 @@ enum Pending {
         at: Instant,
     },
     /// Sent: [`Effect::WriteSetting`] is in flight, waiting on
-    /// [`Msg::SettingWritten`].
+    /// [`Msg::SettingWritten`]. Carries no `edit`: nothing reads the sent
+    /// candidate back off `Pending` -- `Msg::SettingWritten`'s own `edit`
+    /// (the one [`Effect::WriteSetting`] round-trips) is what every match
+    /// site actually uses, so this variant only ever needs the rendered
+    /// question.
     Sent {
-        /// The edit that was sent.
-        #[allow(dead_code)]
-        edit: SettingEdit,
         /// The same rendered question, so the prompt line does not change
         /// wording between the question and its own answer.
         text: String,
@@ -595,6 +595,20 @@ impl Settings {
             Some(Pending::Armed { text, .. }) => Some(SettingsPrompt { text, sent: false }),
             Some(Pending::Sent { text, .. }) => Some(SettingsPrompt { text, sent: true }),
             Some(Pending::Typing { .. }) | None => None,
+        }
+    }
+
+    /// The field and buffer of an in-flight free-text edit, or `None` --
+    /// including while nothing is armed, while a cycled candidate is
+    /// `Armed` or `Sent`, and once the screen is closed. The view's own
+    /// window into [`Pending::Typing`], the same way [`Self::pending`] is
+    /// its window into `Armed`/`Sent`; the two never overlap; see
+    /// [`Self::pending`]'s own `Typing` arm.
+    #[must_use]
+    pub fn typing(&self) -> Option<(&SettingField, &str)> {
+        match &self.pending {
+            Some(Pending::Typing { field, buffer }) => Some((field, buffer.as_str())),
+            _ => None,
         }
     }
 
@@ -646,12 +660,34 @@ impl Settings {
         })
     }
 
+    /// The snapshot's own rendered value for one of the two free-text
+    /// fields [`Self::current_value`] does not cover -- what
+    /// [`App::confirm_setting`] seeds [`Pending::Typing`]'s buffer with.
+    /// Only ever called with [`SettingField::Socket`] or
+    /// [`SettingField::MaxCronSleep`]: the other four are cycled, not
+    /// typed, and never open an editor.
+    fn text_seed(&self, field: SettingField) -> &str {
+        match field {
+            SettingField::Socket => self.snapshot.socket.value.as_str(),
+            SettingField::MaxCronSleep => self.snapshot.max_cron_sleep.value.as_str(),
+            SettingField::LogLevel
+            | SettingField::LogJson
+            | SettingField::AllowControl
+            | SettingField::StyleLevel => {
+                unreachable!("text_seed only ever reaches the two free-text fields")
+            }
+        }
+    }
+
     /// Folds a landed write back into the row it changed: the snapshot's
     /// own [`ScalarView`] for `field` becomes `value`, sourced
-    /// [`StyleSource::Config`] -- the write just put it in the file.
-    /// [`SettingEdit::Unset`] never reaches here (this task only ever
-    /// arms `Set`), and the two fields this task never cycles are matched
-    /// out for exhaustiveness rather than reached.
+    /// [`StyleSource::Config`] -- the write just put it in the file. A
+    /// landed [`SettingEdit::Unset`] (`socket` or `max_cron_sleep`, task
+    /// 8's own) is matched out and does nothing rather than reverting the
+    /// row to `the default`: this reducer has no way to render that
+    /// value without re-reading the document, and `r` already does that.
+    /// The row is stale until then, the same way a dog write already
+    /// leaves the RUNNING column until the next poll.
     fn record_written(&mut self, edit: &SettingEdit) {
         let SettingEdit::Set { field, value } = edit else {
             return;
@@ -812,6 +848,63 @@ fn confirm_text(field: SettingField, value: &str) -> String {
         SettingField::Socket | SettingField::MaxCronSleep => unreachable!(
             "Settings::next_candidate never arms these two -- they are task 8's Pending::Typing"
         ),
+    }
+}
+
+/// The confirm sentence for a free-text edit -- verbatim, per the design
+/// spec's own table, and the pair this repository's voice review already
+/// signed off on. Only ever built from [`App::on_settings_text_key`]'s
+/// `TextApply` arm, and only ever with an edit naming
+/// [`SettingField::Socket`] or [`SettingField::MaxCronSleep`]: the other
+/// four fields build their sentence through [`confirm_text`] instead,
+/// which never sees an [`SettingEdit::Unset`] because none of the four is
+/// optional. The `Socket` sentence says both halves on purpose: that a
+/// reload will not move it, and that an env var or a boot flag may shadow
+/// it anyway even after this edit lands.
+fn confirm_text_for_edit(edit: &SettingEdit) -> String {
+    match edit {
+        SettingEdit::Set {
+            field: SettingField::Socket,
+            value,
+        } => format!(
+            "set socket to {value}? needs the shepherd stopped and started; a reload will not move it, and it will not apply if the shepherd was booted with SHEP_SOCKET or --socket"
+        ),
+        SettingEdit::Set {
+            field: SettingField::MaxCronSleep,
+            value,
+        } => format!(
+            "set max_cron_sleep to {value}? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_MAX_CRON_SLEEP or --max-cron-sleep"
+        ),
+        SettingEdit::Unset {
+            field: SettingField::Socket,
+        } => "unset socket? it goes back to the default under $SHEP_HOME, and needs the shepherd stopped and started"
+            .to_string(),
+        SettingEdit::Unset {
+            field: SettingField::MaxCronSleep,
+        } => "unset max_cron_sleep? it goes back to the daemon's own default, and needs shep daemon reload"
+            .to_string(),
+        SettingEdit::Set { .. } | SettingEdit::Unset { .. } => unreachable!(
+            "on_settings_text_key only ever builds an edit for socket or max_cron_sleep"
+        ),
+    }
+}
+
+/// What [`App`]'s `Msg::SettingWritten` `Err` arm reopens
+/// [`Pending::Typing`] with, for the two free-text fields: the field and
+/// the text the operator typed, recovered from the edit
+/// [`Effect::WriteSetting`] carried. `None` for the four cycled fields,
+/// which reopen nothing -- a refusal there clears the row's pending state
+/// and raises the notice on its own, same as before this task.
+fn typed_text_of(edit: &SettingEdit) -> Option<(SettingField, String)> {
+    match edit {
+        SettingEdit::Set {
+            field: field @ (SettingField::Socket | SettingField::MaxCronSleep),
+            value,
+        } => Some((*field, value.clone())),
+        SettingEdit::Unset {
+            field: field @ (SettingField::Socket | SettingField::MaxCronSleep),
+        } => Some((*field, String::new())),
+        _ => None,
     }
 }
 
@@ -1221,11 +1314,21 @@ impl App {
             // notice with the refusal's own words rather than a generic
             // one -- the same "say why" rule `arm`'s refusal ladder follows.
             //
-            // Both arms clear `pending` on the settings screen alone, in two
-            // separate blocks rather than one shared borrow of `self`: this
-            // arm needs to set `self.notice` on the `Err` path, and Rust
-            // will not let a `&mut self.settings` borrow stay live across
-            // that assignment to a different field of the same `self`.
+            // For the two free-text fields, `Err` also reopens
+            // [`Pending::Typing`] with the text the operator typed
+            // ([`typed_text_of`]) and switches [`InputMode::Text`] back on:
+            // the refusal is discovered under `apply_setting`'s own lock,
+            // after the confirm, so it has to land as a re-opened editor
+            // rather than a blank row -- an operator who typed a long path
+            // must not have to retype it to fix one character. The four
+            // cycled fields have nothing to reopen; their `Err` matches the
+            // behaviour this arm already had.
+            //
+            // Both arms touch the settings screen and `self.notice` (and,
+            // on a text-field refusal, `self.mode`) in separate blocks
+            // rather than one shared borrow of `self`: Rust will not let a
+            // `&mut self.settings` borrow stay live across an assignment to
+            // a different field of the same `self`.
             Msg::SettingWritten { edit, result } => {
                 match result {
                     Ok(()) => {
@@ -1235,8 +1338,14 @@ impl App {
                         }
                     }
                     Err(message) => {
+                        let reopened = typed_text_of(&edit);
                         if let Some(settings) = self.settings.as_mut() {
-                            settings.pending = None;
+                            settings.pending = reopened
+                                .clone()
+                                .map(|(field, buffer)| Pending::Typing { field, buffer });
+                        }
+                        if reopened.is_some() {
+                            self.mode = InputMode::Text;
                         }
                         self.notice = Some(Notice {
                             text: message,
@@ -1562,24 +1671,29 @@ impl App {
                     self.settings = None;
                 }
             }
-            KeyPress::SelectUp => {
+            // An armed candidate eats the FIRST movement key rather than
+            // also moving the cursor -- the same cancel-before-act rule
+            // `on_key`'s own dashboard branch already follows for
+            // `x`/`R`/`L` (see its "A stray `j` during a pending confirm"
+            // comment): without it, the operator would see the prompt
+            // vanish and the cursor move on the same keypress, and the
+            // next reflexive Enter would apply an edit to a row they had
+            // already lost track of. `Sent` is untouched, same as the
+            // dashboard's own guard, which only fires on `Stage::Armed`:
+            // a request already in flight is not cancellable by a keypress.
+            KeyPress::SelectUp | KeyPress::SelectDown | KeyPress::SelectFirst | KeyPress::SelectLast => {
                 if let Some(settings) = self.settings.as_mut() {
-                    settings.move_by(-1);
-                }
-            }
-            KeyPress::SelectDown => {
-                if let Some(settings) = self.settings.as_mut() {
-                    settings.move_by(1);
-                }
-            }
-            KeyPress::SelectFirst => {
-                if let Some(settings) = self.settings.as_mut() {
-                    settings.move_to_first();
-                }
-            }
-            KeyPress::SelectLast => {
-                if let Some(settings) = self.settings.as_mut() {
-                    settings.move_to_last();
+                    if matches!(settings.pending, Some(Pending::Armed { .. })) {
+                        settings.pending = None;
+                    } else {
+                        match key {
+                            KeyPress::SelectUp => settings.move_by(-1),
+                            KeyPress::SelectDown => settings.move_by(1),
+                            KeyPress::SelectFirst => settings.move_to_first(),
+                            KeyPress::SelectLast => settings.move_to_last(),
+                            _ => unreachable!(),
+                        }
+                    }
                 }
             }
             KeyPress::Cycle => return self.cycle_setting(),
@@ -1639,19 +1753,34 @@ impl App {
         Effect::None
     }
 
-    /// The operator's `Enter` on the settings screen. Sends an armed
-    /// candidate and moves it to [`Pending::Sent`]; leaves anything else
-    /// (nothing armed, or a `Typing` edit task 8 owns) untouched.
+    /// The operator's `Enter` on the settings screen. Three meanings,
+    /// picked in this order:
+    ///
+    /// - Nothing is pending and the cursor sits on [`SettingField::Socket`]
+    ///   or [`SettingField::MaxCronSleep`]: opens [`Pending::Typing`],
+    ///   seeded with that field's own on-disk value, and switches
+    ///   [`InputMode::Text`] on -- [`Self::on_settings_text_key`] is what
+    ///   answers every key from here on, not this function again.
+    /// - Something is [`Pending::Armed`]: sends it and moves it to
+    ///   [`Pending::Sent`], same as before this task.
+    /// - Anything else (nothing pending on a cycled row, or already
+    ///   `Sent`): untouched.
     fn confirm_setting(&mut self) -> Effect {
         let Some(settings) = self.settings.as_mut() else {
             return Effect::None;
         };
+        if settings.pending.is_none()
+            && let Some(SettingsRow::Scalar(field @ (SettingField::Socket | SettingField::MaxCronSleep))) =
+                settings.cursor()
+        {
+            let buffer = settings.text_seed(field).to_string();
+            settings.pending = Some(Pending::Typing { field, buffer });
+            self.mode = InputMode::Text;
+            return Effect::None;
+        }
         match settings.pending.take() {
             Some(Pending::Armed { edit, text, .. }) => {
-                settings.pending = Some(Pending::Sent {
-                    edit: edit.clone(),
-                    text,
-                });
+                settings.pending = Some(Pending::Sent { text });
                 Effect::WriteSetting(edit)
             }
             other => {
@@ -1805,6 +1934,19 @@ impl App {
         }
     }
 
+    /// The one text keymap's own router: the filter box while the
+    /// settings screen is closed, [`Self::on_settings_text_key`]'s editor
+    /// while it is open. A previous task closed the window where the two
+    /// could both own [`InputMode::Text`] at once -- see `Msg::Settings`'s
+    /// own arm -- so this split is total: exactly one of the two ever
+    /// answers a given keypress.
+    fn on_text_key(&mut self, key: KeyPress) -> Effect {
+        if self.settings.is_some() {
+            return self.on_settings_text_key(key);
+        }
+        self.on_filter_text_key(key)
+    }
+
     /// The filter box's keymap.
     ///
     /// Ctrl-C still quits: in raw mode it is a key event and not a signal,
@@ -1819,7 +1961,7 @@ impl App {
     /// somebody was mid-word. The status bar hides it under the box instead
     /// and shows it when the box closes. See the phase plan's "Shapes the
     /// design named" #2.
-    fn on_text_key(&mut self, key: KeyPress) -> Effect {
+    fn on_filter_text_key(&mut self, key: KeyPress) -> Effect {
         match key {
             KeyPress::Quit => Effect::Quit,
             KeyPress::TextChar(typed) => {
@@ -1842,6 +1984,62 @@ impl App {
             }
             _ => Effect::None,
         }
+    }
+
+    /// The settings editor's own text keymap, in force for as long as a
+    /// [`Pending::Typing`] owns [`InputMode::Text`].
+    ///
+    /// Does not trim the buffer, on `TextChar` or on `TextBackspace`
+    /// alike: this repository does not widen an accepted input grammar
+    /// without a basis in the spec, the same rule
+    /// [`Self::on_filter_text_key`]'s own filter buffer carries.
+    ///
+    /// `TextApply` arms rather than writes: an empty buffer becomes
+    /// [`SettingEdit::Unset`], anything else becomes [`SettingEdit::Set`],
+    /// and either way the edit moves to [`Pending::Armed`] rather than
+    /// going out -- the operator's next `Enter`, on the now-closed editor,
+    /// is what sends it, the same second-`Enter` shape every other confirm
+    /// on this screen already uses.
+    ///
+    /// `TextAbandon` drops [`Pending::Typing`] back to `None` and leaves
+    /// the screen open, matching [`KeyPress::Escape`]'s own doc: the
+    /// cascade backs out of the innermost thing first.
+    fn on_settings_text_key(&mut self, key: KeyPress) -> Effect {
+        let now = self.now;
+        let Some(settings) = self.settings.as_mut() else {
+            return Effect::None;
+        };
+        match key {
+            KeyPress::Quit => return Effect::Quit,
+            KeyPress::TextChar(typed) => {
+                if let Some(Pending::Typing { buffer, .. }) = settings.pending.as_mut() {
+                    buffer.push(typed);
+                }
+            }
+            KeyPress::TextBackspace => {
+                if let Some(Pending::Typing { buffer, .. }) = settings.pending.as_mut() {
+                    buffer.pop();
+                }
+            }
+            KeyPress::TextApply => {
+                if let Some(Pending::Typing { field, buffer }) = settings.pending.take() {
+                    let edit = if buffer.is_empty() {
+                        SettingEdit::Unset { field }
+                    } else {
+                        SettingEdit::Set { field, value: buffer }
+                    };
+                    let text = confirm_text_for_edit(&edit);
+                    settings.pending = Some(Pending::Armed { edit, text, at: now });
+                }
+                self.mode = InputMode::Normal;
+            }
+            KeyPress::TextAbandon => {
+                settings.pending = None;
+                self.mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+        Effect::None
     }
 
     /// The rows the table draws, in `(name, instance, id)` order: the whole
@@ -4543,5 +4741,129 @@ mod tests {
             "the flag beats the file rather than being dropped by it"
         );
         assert_eq!(row.value, "plain");
+    }
+
+    #[test]
+    fn enter_on_a_text_row_opens_the_editor_seeded_with_the_current_value() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let (field, buffer) = app.settings().unwrap().typing().expect("the editor opens");
+        assert_eq!(*field, SettingField::MaxCronSleep);
+        assert_eq!(buffer, "30s");
+    }
+
+    #[test]
+    fn typing_then_enter_arms_rather_than_writing() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..3 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        for c in "45s".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
+        }
+        assert_eq!(app.update(Msg::Key(KeyPress::TextApply)), Effect::None);
+        let prompt = app.settings().unwrap().pending().unwrap();
+        assert!(!prompt.sent, "the editor arms; a second Enter is what sends");
+        assert!(prompt.text.contains("45s"), "got: {}", prompt.text);
+        assert!(
+            prompt.text.contains("SHEP_MAX_CRON_SLEEP"),
+            "got: {}",
+            prompt.text
+        );
+    }
+
+    #[test]
+    fn an_empty_editor_arms_an_unset() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..8 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.starts_with("unset max_cron_sleep?"), "got: {text}");
+    }
+
+    #[test]
+    fn the_socket_confirm_rules_out_the_reload_it_would_otherwise_imply() {
+        let mut app = fixtures::app_in_settings_on(SettingField::Socket);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+        assert!(text.contains("stopped and started"), "got: {text}");
+        assert!(text.contains("a reload will not move it"), "got: {text}");
+    }
+
+    /// A refusal is discovered under the lock, so it lands after the confirm.
+    /// The typed text has to survive it, or the operator retypes a path to fix
+    /// one character.
+    #[test]
+    fn a_refused_write_reopens_the_editor_with_the_text_intact() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..3 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        for c in "500ms".chars() {
+            let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        let _ = app.update(Msg::SettingWritten {
+            edit,
+            result: Err("max_cron_sleep is 500ms, below the 1s floor".into()),
+        });
+
+        let (_, buffer) = app.settings().unwrap().typing().expect("the editor reopens");
+        assert_eq!(buffer, "500ms");
+        assert!(app.notice().unwrap().to_string().contains("below the 1s floor"));
+    }
+
+    #[test]
+    fn escape_abandons_the_editor_and_keeps_the_screen_open() {
+        let mut app = fixtures::app_in_settings_on(SettingField::Socket);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let _ = app.update(Msg::Key(KeyPress::TextAbandon));
+        assert!(app.settings().unwrap().typing().is_none());
+        assert!(app.settings().is_some());
+    }
+
+    #[test]
+    fn a_closed_scalar_has_no_editor() {
+        let mut app = fixtures::app_in_settings_with_control(); // on log_level
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        assert!(
+            app.settings().unwrap().typing().is_none(),
+            "log_level is a cycle, not a text field"
+        );
+    }
+
+    /// fails if an armed candidate survives a movement key. `space` on
+    /// `log_level` arms it; `j` must cancel that arm instead of also
+    /// moving the cursor to `log_json` -- the same cancel-before-act rule
+    /// the dashboard's `x`/`R`/`L` already follow (task 7 review finding
+    /// A).
+    #[test]
+    fn movement_cancels_an_armed_candidate_rather_than_also_moving() {
+        let mut app = fixtures::app_in_settings_with_control(); // cursor on log_level
+        let before = app.settings().unwrap().cursor();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        assert!(
+            app.settings().unwrap().pending().is_some(),
+            "space must arm before this test means anything"
+        );
+        let _ = app.update(Msg::Key(KeyPress::SelectDown));
+        assert!(
+            app.settings().unwrap().pending().is_none(),
+            "the armed candidate must not survive the movement key"
+        );
+        assert_eq!(
+            app.settings().unwrap().cursor(),
+            before,
+            "the cursor must not also move on the same keypress"
+        );
     }
 }

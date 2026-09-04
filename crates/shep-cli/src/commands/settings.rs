@@ -84,9 +84,10 @@ pub enum SettingField {
 /// text an operator typed into the screen's own editor, no secret among
 /// the six scalars this reaches.
 ///
-/// Constructed only by [`apply_setting`]'s own tests today.
-/// `#[allow(dead_code)]` for the same reason [`load_settings`] carries it.
-#[allow(dead_code)]
+/// Constructed by `lookout::app`: `App::cycle_setting` for the four cycled
+/// scalars, and `App::on_settings_text_key`'s `TextApply` arm for `socket`
+/// and `max_cron_sleep`, the two this crate's free-text editor can also
+/// [`Self::Unset`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingEdit {
     /// Write `field` to `value`.
@@ -358,9 +359,8 @@ fn dog_candidates(doc: &ShepToml) -> Vec<DogView> {
 /// [`DaemonConfig::load`] refuses), or [`SettingEdit::Unset`] named a
 /// field that has no unset form.
 ///
-/// Not called outside this module's own tests yet: see [`load_settings`]'s
-/// own note. `#[allow(dead_code)]` for the same reason.
-#[allow(dead_code)]
+/// Called by `lookout::mod::run_ui`'s `Effect::WriteSetting` arm, the same
+/// `spawn_blocking` shape [`load_settings`]'s own note describes.
 pub fn apply_setting(path: &Path, edit: &SettingEdit) -> Result<(), SettingError> {
     ShepToml::try_edit(path, |doc| -> Result<(), SettingError> {
         match edit {

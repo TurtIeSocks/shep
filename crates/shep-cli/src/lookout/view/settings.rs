@@ -8,12 +8,13 @@
 //! a value cut short says so with the same trailing `…`, rather than
 //! spilling into the column beside it.
 //!
-//! Four of the six scalars (`log_level`, `log_json`, `allow_control`,
-//! `style level`) are editable, and their armed candidate is what one extra
-//! line under the dogs table shows, when there is one. `socket` and
-//! `max_cron_sleep` still only ever show what `shep.toml` says today: task
-//! 8's own free-text editor is what makes those two, and the dogs table's
-//! own enable/disable, editable as well.
+//! All six scalars are editable. Four (`log_level`, `log_json`,
+//! `allow_control`, `style level`) cycle, and their armed candidate is what
+//! one extra line under the dogs table shows, when there is one. `socket`
+//! and `max_cron_sleep` are free text instead: `Enter` on either row opens
+//! an editor in that same slot ([`Settings::typing`]), and both are the
+//! only two fields an empty buffer can unset. The dogs table's own
+//! enable/disable is editable as well.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -372,6 +373,23 @@ fn content_lines(settings: &Settings, palette: Palette, width: u16) -> Vec<Line<
             format!("  {text}"),
             palette.attention(),
         )));
+    } else if let Some((field, buffer)) = settings.typing() {
+        // The free-text editor's own line, in the same slot the prompt
+        // above uses -- the two never coexist ([`Settings::pending`]
+        // returns `None` for `Pending::Typing`), so this is an `else if`
+        // rather than a second, always-checked block. The cursor is a
+        // character rather than a style, the same call the status bar's
+        // own filter box already makes: the ANSI gallery renders
+        // foregrounds only, so a reversed cell would come out unstyled
+        // there.
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  editing {}: {buffer}\u{258f}   enter applies   esc cancels",
+                field_label(*field)
+            ),
+            palette.attention(),
+        )));
     }
 
     lines
@@ -403,6 +421,7 @@ mod tests {
 
     use super::super::fixtures;
     use super::*;
+    use crate::lookout::app::{KeyPress, Msg};
     use crate::lookout::frames::render_text;
     use crate::style::StyleSource;
 
@@ -498,6 +517,30 @@ mod tests {
         assert!(
             !rendered.contains('…'),
             "SCALAR_SOURCE_W must fit \"the default\" whole: got {rendered:?}"
+        );
+    }
+
+    /// fails if the free-text editor stops showing what is being typed, or
+    /// stops naming the field it belongs to -- the same claim
+    /// `the_cursor_mark_sits_on_exactly_the_selected_row` makes for the
+    /// cursor, aimed at task 8's own line instead.
+    #[test]
+    fn the_editor_line_names_its_field_and_shows_the_buffer() {
+        let mut app = fixtures::app_in_settings_on(SettingField::Socket);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let settings = app.settings().unwrap();
+        let palette = app.palette();
+        let lines = content_lines(settings, palette, 120);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("editing socket:")
+                    && line.contains("/home/ada/.shep/run/shep.sock")),
+            "got: {rendered:?}"
         );
     }
 }
