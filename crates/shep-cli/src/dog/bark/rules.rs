@@ -58,7 +58,7 @@ fn default_debounce() -> UpDuration {
 // unknown from `Rule`'s point of view. Everything `sinks` and `debounce`
 // do not consume flows into `Trigger`'s deserialize instead, which catches
 // the typo one level down from where the attribute used to sit.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, schemars::JsonSchema)]
 pub struct Rule {
     /// What fires it.
     #[serde(flatten)]
@@ -79,7 +79,7 @@ pub struct Rule {
 /// `deny_unknown_fields` lives here rather than on [`Rule`] — see that
 /// type's own doc for why the combination with `#[serde(flatten)]` forced
 /// the move.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "on", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Trigger {
     /// Any of these bus event kinds, by their wire spelling

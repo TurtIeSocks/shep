@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use shep_client::RequestError;
+use shep_client::dogs::DogConfig;
 use shep_core::barks::{self, SinkOutcome};
 use shep_core::protocol::{BusEvent, ProcessInfo};
 use shep_core::values::UpDuration;
@@ -52,10 +53,19 @@ use crate::exit::ExitCode;
 /// `deny_unknown_fields`: a misspelled key must be a startup error naming
 /// it, the same reasoning [`super::metrics::MetricsConfig`] gives for its
 /// own section.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, schemars::JsonSchema, DogConfig)]
 #[serde(deny_unknown_fields, default)]
 pub struct BarkConfig {
     /// Named sinks, `[dog.bark.sinks]`.
+    ///
+    /// Marked whole, not per URL, and the difference is where the mark
+    /// lands. `#[shep(secret)]` names a field of THIS type, and the URL is
+    /// a field of [`Sink`] one level down, so a mark there is absent from
+    /// the schema shep generates for [`BarkConfig`]: every sink would go
+    /// out with its bearer token as an ordinary string. Marking the map
+    /// says less than marking each URL would, and it says it about the
+    /// type shep actually asks. Over-redacting is the safe direction.
+    #[shep(secret)]
     pub sinks: BTreeMap<String, Sink>,
     /// Named rules, `[[dog.bark.rules]]`. Empty means
     /// [`Rules::default_rules`].
@@ -549,6 +559,32 @@ mod tests {
 
     use super::*;
     use crate::http::{HttpRequest, read_request, write_response};
+
+    /// The sinks map carries the credential marker, and the rules beside
+    /// it do not.
+    ///
+    /// Marked at the map rather than at each `Sink`'s `url`, because
+    /// `#[shep(secret)]` names a field of the type being asked and the URL
+    /// belongs to a type one level down. See [`BarkConfig::sinks`]. The key
+    /// is spelled out rather than read from `shep_core::dogs::SECRET_KEY`
+    /// for the reason `sinks.rs`'s own marker test gives.
+    #[test]
+    fn the_bark_schema_marks_the_sinks_map_and_leaves_the_rules_plain() {
+        let schema = shep_client::dogs::config_schema::<BarkConfig>()
+            .expect("`sinks` is a property of this type");
+        let schema = schema.as_value();
+
+        assert_eq!(
+            schema.pointer("/properties/sinks/x-shep-secret"),
+            Some(&serde_json::Value::Bool(true)),
+            "every sink holds a webhook URL, which is a bearer credential"
+        );
+        assert_eq!(
+            schema.pointer("/properties/rules/x-shep-secret"),
+            None,
+            "a rule names sinks and holds no credential of its own"
+        );
+    }
 
     /// [`EventSource`] over the real thing bark's local subscription lags
     /// on: a `tokio::sync::broadcast::Receiver`. Only ever built by tests —
