@@ -507,8 +507,18 @@ repeatedly, `ConfigDrift` itself among them: *"Additive: `PROTOCOL_VERSION`
 stays 1, a daemon that predates the request answers its existing 'does not
 implement that request' error."* The 1 to 2 bump was for `SelectorSpec`, a type
 nested inside requests an older daemon already knows how to decode, which is a
-different situation. An older daemon meeting `ApplyConfig` fails to decode the
-verb, which is the outcome every earlier additive variant shipped with.
+different situation. A daemon predating `ApplyConfig` fails to decode the verb,
+which is the outcome every earlier additive variant shipped with.
+
+Three builds are worth telling apart here, because "an older daemon" now
+straddles them. One predating `ApplyConfig` would fail on the verb. One that
+has `ApplyConfig` but predates the rename would decode the verb and fail on the
+value, since `"policy"` is a variant it has never heard of. Neither happens in
+practice on the shipped binary: `PROTOCOL_VERSION` is 3, so the handshake
+refuses first with `protocol_mismatch` and exit 6, and no request is sent at
+all. Verified against a real 0.1.30 daemon rather than reasoned about. That
+refusal is the whole point of the bump, since both decode failures reach an
+operator as a dead client with nothing naming the cause.
 
 Note what `#[non_exhaustive]` does and does not buy here, since an earlier
 version of this paragraph leaned on it. It forces a crate outside `shep-core`
