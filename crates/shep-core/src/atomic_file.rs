@@ -64,6 +64,12 @@ pub const OWNER_ONLY_FILE_MODE: u32 = 0o600;
 /// had one process's `rename` consume the other's staging file, and the
 /// loser died with `ENOENT` renaming a path that no longer existed.
 ///
+/// Neither may contain a path separator. `tempfile` allows one and joins
+/// the result onto `parent`, so a `..` in front of a separator would stage
+/// the file outside the directory this function's whole contract is that
+/// it stays inside. No caller passes anything but a literal, and this is
+/// what keeps that true now the helper is public.
+///
 /// On unix the mode goes to the `open` itself rather than a later `chmod`
 /// pass, so there is no window in which a file holding a webhook token
 /// sits at whatever the process umask leaves it.
@@ -81,14 +87,26 @@ pub const OWNER_ONLY_FILE_MODE: u32 = 0o600;
 /// body forwards those three calls.
 ///
 /// # Errors
-/// The staging file could not be created in `parent`: the directory is
-/// missing or unwritable, or `tempfile` ran out of attempts at a unique
-/// name.
+/// - [`std::io::ErrorKind::InvalidInput`] when `prefix` or `suffix`
+///   contains `/` or `\`. Both are refused on both platforms, so the same
+///   argument is accepted or refused wherever it runs.
+/// - Otherwise, the staging file could not be created in `parent`: the
+///   directory is missing or unwritable, or `tempfile` ran out of attempts
+///   at a unique name.
 pub fn create_staging_file(
     parent: &Path,
     prefix: &str,
     suffix: &str,
 ) -> std::io::Result<tempfile::NamedTempFile> {
+    for (label, part) in [("prefix", prefix), ("suffix", suffix)] {
+        if part.contains(['/', '\\']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("staging file {label} must not contain a path separator: {part:?}"),
+            ));
+        }
+    }
+
     let mut builder = tempfile::Builder::new();
     builder.prefix(prefix).suffix(suffix);
 
@@ -185,6 +203,30 @@ mod tests {
         assert!(name.starts_with("barks"), "{name}");
         assert!(name.ends_with(".tmp"), "{name}");
         assert!(name.len() > "barks.tmp".len(), "no unique middle: {name}");
+    }
+
+    /// fails if a separator in either argument reaches `tempfile`, which
+    /// allows one and joins the result onto `parent`. Both spellings are
+    /// refused on both platforms so an argument cannot be legal on one and
+    /// an escape on the other.
+    #[test]
+    fn a_path_separator_is_refused_in_either_argument() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for (prefix, suffix) in [
+            ("../escape", ".tmp"),
+            ("kv", "/etc/passwd"),
+            ("..\\escape", ".tmp"),
+            ("kv", "\\tmp"),
+        ] {
+            let err = create_staging_file(dir.path(), prefix, suffix)
+                .expect_err("a separator must not reach tempfile");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{prefix:?} {suffix:?}: {err:?}"
+            );
+        }
     }
 
     /// fails if the staging file is created readable by anyone but its
