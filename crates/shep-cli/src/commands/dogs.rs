@@ -162,7 +162,14 @@ async fn connect_or_absent(
 /// [`ShepToml::try_edit`] is generic over the closure's error precisely so
 /// a verb whose refusal is its own thing does not have to dress it up as a
 /// [`ShepTomlError`] it is not.
-enum EnableRefusal {
+///
+/// `Debug` is derived rather than redacted (IR-41): [`Self::Config`]
+/// forwards to [`ShepTomlError`]'s own manually redacted `Debug`, which is
+/// where a secret in the document would surface, and
+/// [`Self::UnknownDog`] carries dog names that this same refusal already
+/// prints to the operator on its way out.
+#[derive(Debug)]
+pub(crate) enum EnableRefusal {
     /// The read-modify-write underneath the closure failed; rendered by
     /// [`fail_config`], exactly as [`ShepToml::edit`]'s `Err` always was.
     Config(ShepTomlError),
@@ -180,8 +187,10 @@ impl From<ShepTomlError> for EnableRefusal {
     }
 }
 
-/// `shep enable <name>`: writes the config, and starts the dog if a
-/// shepherd is running.
+/// `enable`'s config half: which [`DogSource`] `name` resolves to, whether
+/// it names a dog at all, and the write itself. Split out from [`enable`]
+/// so a caller with no rows to print -- the settings screen -- can reuse
+/// the decision without reusing the reporting.
 ///
 /// A name that is neither built-in nor adopted is refused before anything
 /// is written. [`dog_source`] reads that distinction as an absence — a
@@ -191,20 +200,25 @@ impl From<ShepTomlError> for EnableRefusal {
 /// <typo>` on a restart ladder that cannot ever succeed: `dog::run_dog`
 /// refuses the name once per attempt until the budget is spent, while
 /// `shep dogs` reports the dog's `SOURCE` as `built-in`, which it is not.
-pub async fn enable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
-    // `try_edit` rather than `edit`, and the check inside the closure
-    // rather than before the call: the refusal must skip `save` entirely
-    // (a refused enable leaves `shep.toml` untouched, down to its inode),
-    // and the adopted-name lookup it turns on must happen under the lock
-    // that keeps a concurrent `shep adopt` from landing between the check
-    // and the write.
-    // `result_large_err` on the closure, for the same reason and on the same
-    // platform as the module-wide allow in `commands::shep_toml` -- see the
-    // banner there. `EnableRefusal::Config` carries that module's error, so
-    // this closure is measured against the same 128-byte threshold the
-    // `try_edit` call in `lib.rs`'s `shep style` arm already allows for.
-    #[cfg_attr(windows, allow(clippy::result_large_err))]
-    let source = match ShepToml::try_edit(&paths.daemon_config, |cfg| {
+///
+/// `try_edit` rather than `edit`, and the check inside the closure rather
+/// than before the call: the refusal must skip `save` entirely (a refused
+/// enable leaves `shep.toml` untouched, down to its inode), and the
+/// adopted-name lookup it turns on must happen under the lock that keeps a
+/// concurrent `shep adopt` from landing between the check and the write.
+/// `result_large_err` on the closure, for the same reason and on the same
+/// platform as the module-wide allow in `commands::shep_toml` -- see the
+/// banner there. `EnableRefusal::Config` carries that module's error, so
+/// this closure is measured against the same 128-byte threshold the
+/// `try_edit` call in `lib.rs`'s `shep style` arm already allows for.
+///
+/// # Errors
+/// [`EnableRefusal::Config`] if the read-modify-write underneath the
+/// closure failed. [`EnableRefusal::UnknownDog`] if `name` is neither one
+/// of [`crate::dog::BUILT_IN_DOGS`] nor a key of `[daemon] adopted_dogs`.
+#[cfg_attr(windows, allow(clippy::result_large_err))]
+pub(crate) fn enable_in_config(path: &Path, name: &str) -> Result<DogSource, EnableRefusal> {
+    ShepToml::try_edit(path, |cfg| {
         // Read from the config rather than assumed: `shep adopt` records
         // the binary and `shep enable` is what starts it afterwards, so a
         // hardcoded `BuiltIn` here sends the shepherd off to spawn `shep
@@ -217,7 +231,13 @@ pub async fn enable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) ->
         }
         cfg.enable_dog(name);
         Ok(source)
-    }) {
+    })
+}
+
+/// `shep enable <name>`: writes the config, and starts the dog if a
+/// shepherd is running.
+pub async fn enable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
+    let source = match enable_in_config(&paths.daemon_config, name) {
         Ok(source) => source,
         Err(EnableRefusal::Config(err)) => return fail_config(streams, &err),
         Err(EnableRefusal::UnknownDog { adopted }) => {
@@ -345,18 +365,30 @@ async fn enable_after_config(
     }
 }
 
-/// `shep disable <name>`: removes it from the config, and stops it if a
-/// shepherd is running.
-pub async fn disable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
-    let source = match ShepToml::edit(&paths.daemon_config, |cfg| {
-        // `disable_dog` leaves `[daemon] adopted_dogs` alone — that is the
-        // difference between `disable` and `rehome` — so this reads the
-        // same answer before or after the edit. It is read for the report
-        // only: `DisableDog` carries a name and nothing else.
+/// `disable`'s config half: which [`DogSource`] `name` resolved to, and
+/// the removal from `[daemon] enabled_dogs`. Split out from [`disable`]
+/// so a caller with no rows to print -- the settings screen -- can reuse
+/// the decision without reusing the reporting.
+///
+/// `disable_dog` leaves `[daemon] adopted_dogs` alone, which is the
+/// difference between `disable` and `rehome`, so this reads the same
+/// answer before or after the edit. It is read for the report only:
+/// `DisableDog` carries a name and nothing else.
+///
+/// # Errors
+/// [`ShepTomlError`] if the read-modify-write underneath the edit failed.
+pub(crate) fn disable_in_config(path: &Path, name: &str) -> Result<DogSource, ShepTomlError> {
+    ShepToml::edit(path, |cfg| {
         let source = dog_source(cfg, name);
         cfg.disable_dog(name);
         source
-    }) {
+    })
+}
+
+/// `shep disable <name>`: removes it from the config, and stops it if a
+/// shepherd is running.
+pub async fn disable(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) -> ExitCode {
+    let source = match disable_in_config(&paths.daemon_config, name) {
         Ok(source) => source,
         Err(err) => return fail_config(streams, &err),
     };
@@ -1908,6 +1940,55 @@ mod tests {
     use super::*;
     use crate::cli::Format;
 
+    /// The redaction IR-41 requires of [`EnableRefusal`], pinned as exact
+    /// strings rather than as a "contains no secret" probe: this type
+    /// derives `Debug`, so what it prints is decided half by the derive and
+    /// half by [`ShepTomlError`]'s own manual impl, and a change to either
+    /// one alone could start printing the document. `shep.toml` can hold a
+    /// dog's webhook token in an un-migrated `[dog.<name>]` table, which is
+    /// exactly what a `toml_edit` parse error quotes into its `Display`.
+    ///
+    /// The three cases are the two the wrapper can be built from and the
+    /// one it owns: a `WrongShape` (no document anywhere in it), a `Parse`
+    /// (the one that has a document to leak), and an `UnknownDog` (names
+    /// the refusal prints to the operator anyway).
+    #[test]
+    fn enable_refusal_debug_never_prints_the_document() {
+        let path = std::path::PathBuf::from("/home/ada/.shep/shep.toml");
+        let secret = "https://hooks.example.com/services/T00/B00/super-secret-token";
+        let broken = format!("[dog.bark]\nwebhook = \"{secret}\"\n[daemon\n");
+        let source = broken.parse::<toml_edit::DocumentMut>().unwrap_err();
+
+        let wrong_shape = EnableRefusal::Config(ShepTomlError::WrongShape {
+            path: path.clone(),
+            key: "style",
+            found: "string",
+        });
+        assert_eq!(
+            format!("{wrong_shape:?}"),
+            "Config(WrongShape { path: \"/home/ada/.shep/shep.toml\", key: \"style\", \
+             found: \"string\" })"
+        );
+
+        let parse = EnableRefusal::Config(ShepTomlError::Parse { path, source });
+        let debug = format!("{parse:?}");
+        assert!(
+            !debug.contains(secret),
+            "the document must never reach Debug: {debug}"
+        );
+        assert!(!debug.contains("webhook"), "{debug}");
+        assert_eq!(
+            debug,
+            "Config(Parse { path: \"/home/ada/.shep/shep.toml\", message: \"invalid table \
+             header\\nexpected `.`, `]`\" })"
+        );
+
+        let unknown = EnableRefusal::UnknownDog {
+            adopted: vec!["otel".to_string()],
+        };
+        assert_eq!(format!("{unknown:?}"), "UnknownDog { adopted: [\"otel\"] }");
+    }
+
     /// Every test in this module drives one of the dog verbs under
     /// `--format table` -- none of them exercises the JSON envelope -- so
     /// `fmt` is fixed here rather than threaded through every call site.
@@ -1918,6 +1999,60 @@ mod tests {
             style: crate::style::Presentation::BARE,
             fmt: Format::Table,
         }
+    }
+
+    #[test]
+    fn enable_in_config_writes_the_name_and_reports_a_built_in_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+
+        let source = enable_in_config(&path, "metrics").unwrap();
+
+        assert!(matches!(source, DogSource::BuiltIn));
+        assert!(
+            ShepToml::read_only(&path)
+                .unwrap()
+                .enabled_dog_names()
+                .contains(&"metrics".to_string())
+        );
+    }
+
+    #[test]
+    fn enable_in_config_refuses_a_name_that_is_no_dog_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "").unwrap();
+
+        let refusal = enable_in_config(&path, "nonsense");
+
+        assert!(matches!(refusal, Err(EnableRefusal::UnknownDog { .. })));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "a refused enable leaves shep.toml untouched"
+        );
+    }
+
+    #[test]
+    fn disable_in_config_removes_the_name_and_keeps_the_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "[daemon]\nenabled_dogs = [\"otel\"]\n\n[daemon.adopted_dogs]\notel = \"/usr/local/bin/shep-otel\"\n",
+        )
+        .unwrap();
+
+        let source = disable_in_config(&path, "otel").unwrap();
+
+        assert!(matches!(source, DogSource::Adopted { .. }));
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert!(cfg.enabled_dog_names().is_empty());
+        assert_eq!(
+            cfg.adopted_dog_names(),
+            vec!["otel".to_string()],
+            "disable is not rehome, so the adoption survives"
+        );
     }
 
     /// fails if `enable` sends anything but `EnableDog` with the name and

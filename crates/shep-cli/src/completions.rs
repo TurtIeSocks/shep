@@ -18,10 +18,10 @@ use crate::exit::ExitCode;
 
 /// Writes the completion script for `args.shell` to `out`.
 ///
-/// Its own tests call it on every target, but the Windows build's `run`
-/// wires up no verb yet (spec §11's functional tier), so production code
-/// never reaches it there — same reasoning as `main.rs`'s `resolve_paths`.
-#[cfg_attr(windows, allow(dead_code))]
+/// Its own tests call it on every target, and `run`'s `Commands::Completions`
+/// arm calls it unconditionally too: there is one `run`, not a per-platform
+/// pair, so production code reaches this function on every target the crate
+/// ships for.
 pub fn completions(out: &mut dyn std::io::Write, args: &CompletionArgs) -> ExitCode {
     clap_complete::aot::generate(args.shell, &mut Cli::command(), "shep", out);
     ExitCode::Success

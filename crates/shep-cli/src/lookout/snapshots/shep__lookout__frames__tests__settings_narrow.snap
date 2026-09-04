@@ -1,0 +1,28 @@
+---
+source: crates/shep-cli/src/lookout/frames.rs
+expression: render_text(&buffer)
+---
+shep lookout   /home/ada/.shep 2 in the flock
+  [daemon]                                   
+> log_level        warn           shep.toml  
+  log_json         false          the default
+  socket           /home/ada/.s…  shep.toml  
+  max_cron_sleep   30s            shep.toml  
+                                             
+  [whistle]                                  
+  allow_control    false          the default
+                                             
+  [style]                                    
+  level            full           shep.toml  
+                                             
+  [dogs]                                     
+  space arms, Enter applies; a dog needs no …
+  NAME               IN FILE  RUNNING        
+  otel               no       online         
+  ledger             yes      not running    
+  bark               yes      silent         
+                                             
+                                             
+                                             
+                                             
+esc/s close   j/k select   g/G fir… read-only

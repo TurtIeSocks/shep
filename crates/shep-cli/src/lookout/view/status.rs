@@ -8,8 +8,9 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::super::app::{ActionState, App, Control, InputMode, Link, RowKey};
+use super::super::app::{ActionState, App, Control, InputMode, Link, RowKey, Settings};
 use super::flock::fit;
+use super::settings::field_label;
 
 /// The title: what this is, where it points, and how big the flock is.
 ///
@@ -62,19 +63,74 @@ pub fn banner_line(app: &App) -> Option<Line<'static>> {
     }
 }
 
-/// The bottom line: six slots, highest priority first — an armed confirm,
-/// the filter box while editing, a notice, an in-flight action, the applied
-/// filter line, then the key hint — with the control state always rendered
-/// on the right. See the phase plan's "Shapes the design named" #2 for why
-/// the box and the applied filter line are two slots and not one.
+/// The bottom line: eight slots, highest priority first -- the settings
+/// screen's own armed or in-flight edit, a dashboard armed confirm, the
+/// settings screen's own free-text editor, the filter box while editing, a
+/// notice, an in-flight action, the applied filter line, then the key hint
+/// -- with the control state always rendered on the right. See the phase
+/// plan's "Shapes the design named" #2 for why the box and the applied
+/// filter line are two slots and not one. The editor slot sits ahead of the
+/// filter box for the same reason the two confirms sit ahead of it:
+/// `App::settings().and_then(Settings::typing)` is only ever `Some` while
+/// the settings screen owns `InputMode::Text`, and the filter box's own
+/// `App::filter` is untouched the whole time, so checking the editor first
+/// is what keeps the two from ever answering the same keystroke with the
+/// wrong sentence.
+///
+/// **The settings confirm moved here from the body pane.** It used to be
+/// the last line `view::settings::content_lines` drew -- structurally the
+/// first thing a short terminal's `.take(area.height)` truncation dropped,
+/// which meant an operator could arm a candidate, see no change anywhere
+/// on screen, and press Enter into an edit nothing showed them was coming.
+/// This bar is a fixed row the layout never cuts, the same property the
+/// dashboard's own sheep confirm (the slot below this one) already relies
+/// on, so the fix is to give the settings screen's confirm the identical
+/// treatment rather than teach the body pane to tier. The body still
+/// echoes the same line beneath the table when there is room for it
+/// (`content_lines`'s own doc), the same redundancy the free-text editor
+/// slot below already has -- belt, not a second source of truth: both
+/// read `Settings::pending`/`Settings::typing` directly.
 #[must_use]
 pub fn status_line(app: &App, width: u16) -> Line<'static> {
     let palette = app.palette();
-    let (left, left_style) = if let Some(action) = app.action().filter(|a| !a.sent) {
-        // Slot 1. A18: a question awaiting an answer outranks everything,
+    let (left, left_style) = if let Some(prompt) = app.settings().and_then(Settings::pending) {
+        // Slot 1. The settings screen's own armed scalar or dog edit, or
+        // its in-flight sentence once sent. Outranks everything below,
+        // including the dashboard's own action confirm just underneath --
+        // moot in practice, since `Msg::Settings`'s own `opening` arm
+        // clears `self.action` the moment the screen opens and no
+        // dashboard action can arm while it stays open (`on_key`'s own
+        // settings short circuit), so the two can never actually compete
+        // for this slot on the same frame.
+        let text = if prompt.sent {
+            format!("{}  sent, waiting for the shepherd", prompt.text)
+        } else {
+            format!("{}  enter confirms, any other key cancels", prompt.text)
+        };
+        (text, palette.attention())
+    } else if let Some(action) = app.action().filter(|a| !a.sent) {
+        // Slot 2. A18: a question awaiting an answer outranks everything,
         // including the filter box, which it cannot coexist with anyway
         // because `/` cancels a confirm before it opens the box.
         (confirm_prompt(&action), palette.attention())
+    } else if let Some((field, buffer)) = app.settings().and_then(Settings::typing) {
+        // The settings screen's own free-text editor, checked ahead of the
+        // dashboard's filter-box branch below: both share `InputMode::Text`
+        // (task 8's editor reuses the filter box's keymap), but this one is
+        // typing into `socket` or `max_cron_sleep`, not `App::filter`. A bar
+        // that fell through to the filter branch here would render the
+        // dashboard's own (untouched) query under the label "filter" while
+        // the body pane's own `editing socket: ...` line says something
+        // else entirely on the same frame -- the screen would contradict
+        // itself. `field_label` is shared with `view::settings` so the two
+        // panes can never disagree about what to call the field.
+        (
+            format!(
+                "editing {}  {buffer}\u{258f}   enter applies   esc cancels",
+                field_label(*field)
+            ),
+            palette.attention(),
+        )
     } else if app.mode() == InputMode::Text {
         // ABOVE the notice, not below it. `Msg::BusLagged`,
         // `BusEvent::Dropped` and `BusEvent::DaemonShutdown` all raise notices
@@ -106,7 +162,7 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
             },
         )
     } else if let Some(action) = app.action() {
-        // Slot 4. BELOW the notice, and that is load-bearing rather than a
+        // Slot 5. BELOW the notice, and that is load-bearing rather than a
         // concession. `arm`'s "one action is already in flight" IS a notice,
         // so a bar that put this line above notices would swallow the answer
         // to the operator's own keypress: they press `R` while a stop is out,
@@ -127,13 +183,20 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // overlay anywhere in this module, and one rule under the header
         // beats a full border for a pane somebody reads at 3am.
         (text, palette.attention())
-    } else if !app.filter().is_empty() {
+    } else if app.settings().is_none() && !app.filter().is_empty() {
+        // Gated on the screen being closed: the filter survives the swap
+        // into settings (`App::on_settings_key` never touches it), but `/`
+        // and `esc` mean something else entirely while the screen owns the
+        // keyboard, so this line would be false the moment it stayed up.
         (
             format!("filter \"{}\"   / edit   esc clear", app.filter()),
             palette.muted(),
         )
     } else {
-        (hint_for(app.control()), palette.muted())
+        (
+            hint_for(app.control(), app.settings().is_some()),
+            palette.muted(),
+        )
     };
     // Always rendered, in both states. An operator who does not know whether
     // their dashboard can act is one keystroke from finding out the wrong
@@ -201,23 +264,52 @@ fn in_flight_text(action: &ActionState<'_>) -> String {
 
 /// The key hint.
 ///
-/// Two forms now that the three action keys exist. This file's standing
-/// rule: a hint that needs a footnote to be true is an asterisk, not a hint,
-/// so `Control::Allowed`'s form is only ever handed to a dashboard where `x`,
-/// `R` and `L` really do arm a confirm.
+/// Three forms now: the settings screen's own, and the dashboard's two.
+/// `settings_open` picks between them, and wins outright, because the
+/// dashboard's `x`/`R`/`L`/`r`/`/` mean nothing while the screen owns the
+/// keyboard. This file's standing rule: a hint that needs a footnote to be
+/// true is an asterisk, not a hint, so `Control::Allowed`'s dashboard form
+/// is only ever handed to a dashboard where `x`, `R` and `L` really do arm a
+/// confirm, and the settings form is only ever handed to a dashboard where
+/// they do nothing at all.
 ///
-/// The read-only text is 59 characters, up from the 48 that shipped before
-/// this phase. It still truncates at the 39 columns the 49-column gap test
-/// leaves for it, and the first 40 characters are byte-identical to the old
-/// hint, so `a_truncated_hint_still_leaves_a_gap_before_the_control_label`
-/// measures exactly what it was written to measure and the `narrow` and
-/// `cramped` frames do not move.
-fn hint_for(control: Control) -> String {
+/// `s settings` is APPENDED to both dashboard forms, never inserted: the
+/// read-only text's first 40 characters have to stay byte-identical for
+/// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` and the
+/// `narrow`/`cramped` gallery frames to keep measuring what they were
+/// written to measure, and appending is the one edit that cannot move them.
+/// The settings forms below follow the same rule against each other: the
+/// read-only one is a prefix of the control one, and the two edit keys are
+/// appended rather than inserted.
+///
+/// The settings screen takes `control` for the same reason the dashboard
+/// does, which it did not until a whole-branch review caught it: the
+/// argument was taken and then thrown away on the `settings_open` branch,
+/// so a read-only lookout was told `space cycle` about a key that refuses.
+/// That is exactly the asterisk the rule above forbids, and the dashboard
+/// omits `x`, `R` and `L` for the same reason.
+fn hint_for(control: Control, settings_open: bool) -> String {
+    if settings_open {
+        // `esc/s close` names both keys that close the screen, which is how
+        // `s` gets said here at all -- on this screen `s` is the close key,
+        // not the open one. `r` and `Enter` were missing outright.
+        return match control {
+            Control::ReadOnly => "esc/s close   j/k select   g/G first/last   r refresh   q quit",
+            Control::Allowed => {
+                "esc/s close   j/k select   g/G first/last   r refresh   space cycle   enter apply   q quit"
+            }
+        }
+        .to_string();
+    }
     match control {
-        Control::ReadOnly => "q quit   j/k select   g/G first/last   r refresh   / filter",
+        Control::ReadOnly => {
+            "q quit   j/k select   g/G first/last   r refresh   / filter   s settings"
+        }
         // `g/G` and `r` drop out to make room. They are the two an operator
         // rediscovers by pressing them; an action key is not.
-        Control::Allowed => "q quit   j/k select   / filter   x stop   R restart   L reload",
+        Control::Allowed => {
+            "q quit   j/k select   / filter   x stop   R restart   L reload   s settings"
+        }
     }
     .to_string()
 }
@@ -241,10 +333,11 @@ mod tests {
     use shep_core::protocol::BusEvent;
 
     use super::super::fixtures::{
-        acting_app, allowed_app, armed_app, armed_app_with_a_filter_and_a_notice, editing_app,
-        filtered_app, rendered,
+        acting_app, allowed_app, app_in_settings, app_in_settings_on, app_in_settings_with_control,
+        armed_app, armed_app_with_a_filter_and_a_notice, editing_app, filtered_app, rendered,
     };
     use super::*;
+    use crate::commands::settings::SettingField;
     use crate::lookout::app::{ActionVerb, App, KeyPress, Msg};
     use crate::lookout::theme::Palette;
 
@@ -387,6 +480,31 @@ mod tests {
         assert!(bar.contains("ctrl-c quits"), "got {bar:?}");
     }
 
+    /// fails if the bar falls through to the dashboard's own filter box
+    /// while the settings screen's free-text editor owns `InputMode::Text`
+    /// instead -- the review finding this pins: before the fix, this state
+    /// rendered "filter  <the dashboard's untouched query>" under the
+    /// editor's own body line saying "editing socket: ...", contradicting
+    /// itself on one frame.
+    #[test]
+    fn the_bar_shows_the_settings_editor_rather_than_the_filter_box() {
+        let mut app = app_in_settings_on(SettingField::Socket);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("editing socket  "),
+            "names the field being typed: {bar:?}"
+        );
+        assert!(
+            bar.contains("/home/ada/.shep/run/shep.sock\u{258f}"),
+            "shows the buffer and the cursor, not the dashboard's own filter: {bar:?}"
+        );
+        assert!(
+            !bar.contains("filter "),
+            "must not read as the filter box: {bar:?}"
+        );
+    }
+
     /// fails if a notice covers the box. A `Dropped` event arrives with no
     /// keypress and `on_text_key` does not clear notices, so a bar that
     /// ranked the notice higher would take the operator's half-typed query
@@ -410,7 +528,7 @@ mod tests {
     fn closing_the_box_shows_the_notice_that_was_waiting() {
         let mut app = editing_app("we");
         app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
-        app.update(Msg::Key(KeyPress::FilterApply));
+        app.update(Msg::Key(KeyPress::TextApply));
         let bar = rendered(&status_line(&app, 120));
         assert!(bar.contains("dropped 3 events"), "got {bar:?}");
     }
@@ -533,5 +651,52 @@ mod tests {
             open.contains("/ filter"),
             "and the filter key survives both forms"
         );
+    }
+
+    /// fails if the settings screen advertises its edit keys behind a
+    /// closed gate, or stops naming the three keys it binds and never
+    /// mentioned.
+    ///
+    /// The same rule as the test above, on the screen that ignored it:
+    /// `hint_for` took `control` and discarded it whenever the settings
+    /// screen was open, so a read-only lookout read `space cycle` next to
+    /// the word `read-only` on the same line, about a key that refuses.
+    /// The published gallery pinned it.
+    ///
+    /// `Enter`, `r` and `s` are all bound on that screen and none of them
+    /// was named. `s` arrives as `esc/s close`, because on this screen `s`
+    /// is the key that closes rather than the one that opens.
+    #[test]
+    fn the_settings_edit_keys_are_advertised_only_when_the_gate_is_open() {
+        let closed = rendered(&status_line(&app_in_settings(), 200));
+        for key in ["space cycle", "enter apply"] {
+            assert!(
+                !closed.contains(key),
+                "{key} advertised read-only: {closed:?}"
+            );
+        }
+        let open = rendered(&status_line(&app_in_settings_with_control(), 200));
+        for key in ["space cycle", "enter apply"] {
+            assert!(
+                open.contains(key),
+                "{key} missing when the gate is open: {open:?}"
+            );
+        }
+        for both in [&closed, &open] {
+            assert!(both.contains("esc/s close"), "got {both:?}");
+            assert!(both.contains("r refresh"), "got {both:?}");
+        }
+    }
+
+    /// fails if `q` stops being named on the settings screen's own status
+    /// bar -- `App` handles it there (`app.rs`'s settings key dispatch),
+    /// same as on the dashboard, but neither settings hint form said so.
+    #[test]
+    fn q_quit_is_named_on_the_settings_screen_in_both_control_states() {
+        let closed = rendered(&status_line(&app_in_settings(), 200));
+        let open = rendered(&status_line(&app_in_settings_with_control(), 200));
+        for hint in [&closed, &open] {
+            assert!(hint.contains("q quit"), "got {hint:?}");
+        }
     }
 }

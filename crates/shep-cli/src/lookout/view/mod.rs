@@ -10,6 +10,7 @@ pub mod bleats;
 pub mod detail;
 pub mod flock;
 pub mod host;
+pub mod settings;
 pub mod status;
 
 // `pub`, not private: Task 8's `a_heartbeat_puts_the_host_strip_on_the_frame`
@@ -21,6 +22,7 @@ pub mod status;
 pub mod fixtures;
 
 use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use self::flock::MIN_HEIGHT;
@@ -195,6 +197,27 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         width,
     );
     y += 1;
+
+    // The settings screen owns the whole body between the title and the
+    // status bar -- decision 1 of the design spec: "the title line and the
+    // status bar stay put". That is a swap, not an overlay: the banner,
+    // the host strip, the flock table and the two bottom panes all belong
+    // to the dashboard body this branch replaces, so none of them draw
+    // while the screen is open.
+    if let Some(settings) = app.settings() {
+        let body = Rect {
+            x: area.x,
+            y,
+            width,
+            // `bottom - y` never underflows: `y` is `area.y + 1` here and
+            // `bottom` is `area.y + height - 1`, and `height >= MIN_HEIGHT`
+            // (6) is already checked above, so `bottom > y` always holds.
+            height: bottom - y,
+        };
+        settings::draw_settings(app, settings, body, buffer);
+        buffer.set_line(area.x, bottom, &status::status_line(app, width), width);
+        return;
+    }
 
     if let Some(banner) = status::banner_line(app) {
         buffer.set_line(area.x, y, &banner, width);
@@ -529,6 +552,56 @@ mod tests {
         for (width, height) in [(1, 1), (20, 3), (31, 6), (80, 24), (250, 60), (400, 200)] {
             let _ = draw_to(&app, width, height);
         }
+    }
+
+    /// The settings screen's own twin of the sweep above. `Rect::height`
+    /// is `bottom - y`, computed once per frame rather than checked, so
+    /// this is what proves `MIN_HEIGHT` (6) actually keeps it from
+    /// underflowing at the floor the guard claims to cover.
+    #[test]
+    fn drawing_the_settings_screen_never_panics_across_the_size_sweep() {
+        let app = fixtures::app_in_settings();
+        for (width, height) in [(1, 1), (20, 3), (33, 6), (80, 24), (250, 60), (400, 200)] {
+            let _ = draw_to(&app, width, height);
+        }
+    }
+
+    /// fails if an armed settings candidate ever draws with nothing on
+    /// screen to show it. `view::settings::content_lines`'s own pending
+    /// line used to be the ONLY place this showed, drawn last in the body
+    /// and cut by `draw_settings`'s `.take(area.height)` the moment the
+    /// body ran out of room -- an operator could arm an edit, see no
+    /// change anywhere, and press Enter into it blind. This is the
+    /// mutation that would catch a regression back to that state: at 200x10
+    /// the body alone has nowhere near the ~20 rows `settings_snapshot`'s
+    /// six scalars, two dogs and a two-line pending prompt need, so a body
+    /// with no independent floor would drop the confirm here exactly as it
+    /// used to. Width stays generous (200) so only HEIGHT is under test --
+    /// the confirm sentence itself runs long, and a narrow width would
+    /// truncate it in the status bar too and confound the two properties.
+    /// `status_line`'s own Slot 1 (`view::status`'s doc) is a fixed row
+    /// `draw` always reserves regardless of body height, which is the
+    /// property this pins: the confirm survives on the LAST line even
+    /// though the body above it has plainly been cut.
+    #[test]
+    fn an_armed_settings_candidate_survives_a_body_too_short_to_hold_it() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+
+        // 10 rows total, 8 of them body (title and status bar are the other
+        // two): nowhere near the ~20 rows `settings_snapshot`'s six scalars,
+        // two dogs and a two-line pending prompt need, so the body's OWN
+        // echo of this line is not on screen at this height -- confirmed by
+        // `settings_confirm`'s own gallery frame needing (180, 30) to show
+        // it at all. If the status bar slot below were ever removed, this
+        // assertion is what would catch the confirm vanishing again.
+        let rendered = draw_to(&app, 200, 10);
+        let last_line = rendered.lines().last().expect("at least one row");
+        assert!(
+            last_line.contains(text.trim()),
+            "the confirm must survive on the status bar's fixed row: {last_line:?}"
+        );
     }
 
     /// fails if a tier can render taller than the terminal it was chosen for.
