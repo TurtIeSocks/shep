@@ -42,10 +42,12 @@ use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 ///
 /// # Errors
 ///
-/// - [`DogMigrationError::WouldOverwrite`] when a name holding VALUES is
-///   present in both files. Two values for one key is a question shep
-///   cannot answer, so it refuses and changes nothing. An empty
-///   `[dog.<name>]` is not one of the two -- see [`declared_dog_names`].
+/// - [`DogMigrationError::WouldOverwrite`] when a name holds VALUES in
+///   BOTH files. Two values for one key is a question shep cannot answer,
+///   so it refuses and changes nothing. An empty section is not one of the
+///   two on either side: an empty `[dog.<name>]` in the source is skipped
+///   (see [`declared_dog_names`]) and an empty `[<name>]` in the
+///   destination is written over.
 /// - [`DogMigrationError::SectionsUnreadable`] when `shep.toml` declares a
 ///   name under `[dog]` that did not come back as a section to move.
 ///   Refused rather than skipped: `take_dog_sections` has already struck
@@ -163,7 +165,25 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         // decision 1 calls this file hand-editable, and decision 9 promises
         // `toml_edit` for exactly this reason).
         let mut merged = read_dogs_document(&paths.dogs_config)?;
-        if let Some(name) = incoming.keys().find(|name| merged.contains_key(name)) {
+        // Over VALUES on both sides, the same rule `incoming`'s own filter
+        // and [`declared_dog_names`] apply to the source. `WouldOverwrite`
+        // exists because two values for one key is a question shep cannot
+        // answer, and a bare `[metrics]` in `dogs.toml` is not one of the
+        // two: there is no second value to guess between, so the section
+        // carrying values wins and the header it lands on held nothing to
+        // lose. Refusing on it took a boot down over an empty header, the
+        // same way the source side did before
+        // `an_empty_section_colliding_with_a_configured_one_is_not_a_refusal`.
+        //
+        // Table-like only, deliberately. A destination `[[metrics]]` is an
+        // array of tables and not a section this migration could merge
+        // into, so it still refuses rather than being quietly replaced.
+        let collides = |name: &String| {
+            merged
+                .get(name)
+                .is_some_and(|item| !item.as_table_like().is_some_and(TableLike::is_empty))
+        };
+        if let Some(name) = incoming.keys().find(|name| collides(name)) {
             return Err(DogMigrationError::WouldOverwrite { name: name.clone() });
         }
         let mut moved: Vec<String> = incoming.keys().cloned().collect();
@@ -436,9 +456,11 @@ pub(crate) enum DogMigrationError {
     /// `name` has a section carrying values in both files, so the move
     /// would silently pick one of the two.
     ///
-    /// An empty `[dog.<name>]` never raises this. It is not a value, it is
-    /// what every `shep enable` before this branch scaffolded, and refusing
-    /// on it took a mixed-version host to a shepherd that would not boot.
+    /// An empty section never raises this, on either side. It is not a
+    /// value, it is what every `shep enable` before this branch
+    /// scaffolded, and refusing on it took a mixed-version host to a
+    /// shepherd that would not boot. In the source it is skipped; in
+    /// `dogs.toml` it is the header the moved section lands on.
     WouldOverwrite {
         /// The dog named in both `shep.toml` and `dogs.toml`.
         name: String,
@@ -980,6 +1002,33 @@ mod tests {
         );
     }
 
+    /// Fails if a bare header in `dogs.toml` can refuse a section that
+    /// carries values.
+    ///
+    /// The mirror of
+    /// [`an_empty_section_colliding_with_a_configured_one_is_not_a_refusal`],
+    /// which made this exemption on the source side and left the
+    /// destination side alone. `WouldOverwrite` exists because two values
+    /// for one key is a question shep cannot answer; a bare `[metrics]`
+    /// holds no value, so there is no second answer and nothing to guess
+    /// between. Refusing on it took a boot down over a header.
+    #[test]
+    fn a_bare_header_in_dogs_toml_does_not_refuse_a_configured_section() {
+        let (_dir, paths) = home_with("[dog.metrics]\nbind = \"127.0.0.1:19615\"\n");
+        std::fs::write(&paths.dogs_config, "[metrics]\n").expect("write");
+
+        let moved = migrate_dog_sections(&paths).expect("an empty destination is not a value");
+
+        assert_eq!(moved, vec!["metrics".to_string()]);
+        let written = std::fs::read_to_string(&paths.dogs_config).expect("read");
+        let parsed = DogsConfig::load(Some(&written)).expect("valid");
+        assert_eq!(
+            parsed.dog["metrics"]["bind"].as_str(),
+            Some("127.0.0.1:19615"),
+            "the section that had values is the one left standing: {written}"
+        );
+    }
+
     /// Fails if a header an operator spelled with spaces inside the
     /// brackets strands its section in `shep.toml` forever.
     ///
@@ -1037,7 +1086,10 @@ mod tests {
 
     // The one case that must never silently merge: an operator who already
     // hand-wrote dogs.toml and still has a stale section in shep.toml. Two
-    // values for one key, and picking either would be shep guessing.
+    // values for one key, and picking either would be shep guessing. The
+    // destination holding a VALUE is what makes it two, which is the half
+    // `a_bare_header_in_dogs_toml_does_not_refuse_a_configured_section`
+    // does not have.
     #[test]
     fn an_existing_dogs_file_makes_the_migration_refuse() {
         let (_dir, paths) = home_with("[dog.metrics]\nbind = \"127.0.0.1:9615\"\n");
@@ -1045,7 +1097,10 @@ mod tests {
 
         let err = migrate_dog_sections(&paths).expect_err("both files hold metrics");
 
-        assert!(matches!(err, DogMigrationError::WouldOverwrite { .. }));
+        assert!(matches!(
+            err,
+            DogMigrationError::WouldOverwrite { ref name } if name == "metrics"
+        ));
         assert!(
             std::fs::read_to_string(&paths.daemon_config)
                 .expect("read")
