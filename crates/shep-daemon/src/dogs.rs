@@ -2097,6 +2097,67 @@ mod tests {
     /// request, which is not what any caller here is asking.
     const DOG_FIXTURE_START_BUDGET: Duration = Duration::from_secs(10);
 
+    /// How often [`settle_until`] looks while the watch works.
+    ///
+    /// Finer than [`DOG_SILENCE_POLL`] so a rung is seen inside the poll
+    /// period it lands in, which is the resolution the timing assertions
+    /// below are read at.
+    const SETTLE_STEP: Duration = Duration::from_millis(250);
+
+    /// How long [`settle_until`] gives a rung before it gives up.
+    ///
+    /// A whole warm-up plus both rungs is fifteen seconds of virtual time,
+    /// so this is generous by a wide margin on purpose: it is a hang guard
+    /// and not a timing assertion, and the assertions that DO measure make
+    /// their own claims. Generosity is free here, because the clock it
+    /// bounds is virtual -- a wait that never settles fails in about no real
+    /// time at all rather than sitting on a wall clock.
+    const LADDER_BUDGET: Duration = Duration::from_secs(45);
+
+    /// Waits for `settled` to answer true, and answers how much virtual time
+    /// that took.
+    ///
+    /// The forcing mechanism (IR-46) the two watch tests below run on, and
+    /// the reason neither counts yields any more. Under `start_paused` the
+    /// runtime advances the clock itself, but only once every task is idle,
+    /// and work on the blocking pool holds it there: measured on this
+    /// workspace, a 60s virtual sleep did not resolve until a 300ms
+    /// `spawn_blocking` had returned. That is what makes sleeping here a
+    /// barrier rather than a slower spin, and it matters
+    /// because each of `spawn_silent_dog_watch`'s looks goes through a
+    /// supervisor round trip and a write into the dog's own log, which
+    /// `narrate` puts on the blocking pool.
+    ///
+    /// A `yield_now` loop cannot do this, and that is the bug being removed
+    /// rather than a style preference. Yielding keeps a task runnable, so
+    /// the runtime never idles, so the clock never advances of its own
+    /// accord and the blocking pool is never waited for. What is left is a
+    /// wall-clock race between a few hundred cheap scheduler passes and a
+    /// real file write, which a loaded machine wins: these tests passed on
+    /// every quiet run and failed on CI, and raising the yield count only
+    /// moved the load at which they failed.
+    ///
+    /// Panics, naming `what`, if `settled` has not answered true within
+    /// `within` of virtual time. Bounded rather than open so a watch that
+    /// stops looking says so here, instead of hanging until the harness
+    /// times out the whole binary and names nothing -- the second failure
+    /// shape IR-46 exists to catch.
+    async fn settle_until(
+        what: &str,
+        within: Duration,
+        mut settled: impl FnMut() -> bool,
+    ) -> Duration {
+        let began = Instant::now();
+        tokio::time::timeout(within, async {
+            while !settled() {
+                tokio::time::sleep(SETTLE_STEP).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not happen within {within:?} of virtual time"));
+        began.elapsed()
+    }
+
     async fn start_test_dog(ctx: &crate::rpc::RpcContext, name: &str) {
         let spec = DogSpec {
             name: name.to_string(),
@@ -2339,14 +2400,10 @@ mod tests {
     /// would keep passing even if the watcher's `ticks.tick().await` path
     /// were deleted entirely.
     ///
-    /// IR-46: paused virtual time, advanced past one whole
-    /// [`DOG_SILENCE_BUDGET`], is the forcing mechanism -- not a real sleep,
-    /// so this stays in the fast tier rather than `mod slow`. The loop of
-    /// `yield_now` calls below is what lets the watcher's own spawned task,
-    /// and the engine task it talks to over a channel, actually run:
-    /// `tokio::time::advance` wakes a sleeper whose deadline has elapsed,
-    /// it does not itself drive the scheduler through everything that
-    /// sleeper then does.
+    /// IR-46: [`settle_until`] is the forcing mechanism -- virtual time the
+    /// runtime walks by itself, under a timeout this test sets, rather than
+    /// a real sleep. So this stays in the fast tier rather than `mod slow`.
+    ///
     /// Fails if the warm-up swallows the one verdict it exists to protect.
     ///
     /// The regression this exists for: `PEER_CONTACT_WARMUP` was three
@@ -2363,6 +2420,12 @@ mod tests {
     /// across the real boundary instead.
     #[tokio::test(start_paused = true)]
     async fn a_dog_that_never_calls_still_earns_its_rebuild_after_the_warm_up() {
+        // A lower bound on when `PeerContacts` started warming, taken
+        // before the harness that builds it. The timing assertion below
+        // reads against this rather than against the watch's own spawn,
+        // because the map's clock starts inside `harness` and nothing out
+        // here can ask it when.
+        let map_started_no_earlier_than = Instant::now();
         let h = crate::testing::harness(vec![
             ProcScript::never_exits(),
             ProcScript::never_exits(),
@@ -2379,45 +2442,47 @@ mod tests {
             contacts.clone(),
             h.ctx.events.clone(),
         );
-        tokio::task::yield_now().await;
 
-        // Nothing may be judged while the map is cold, however long the dog
-        // has been quiet. Walking a whole budget with the watch running is
-        // what proves the gate holds rather than merely exists.
-        let ticks_in_a_budget = (DOG_SILENCE_BUDGET.as_nanos() / DOG_SILENCE_POLL.as_nanos())
-            .try_into()
-            .expect("a silence budget of a few seconds fits in a u32 tick count");
-        for _ in 0..ticks_in_a_budget {
-            tokio::time::advance(DOG_SILENCE_POLL).await;
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            refusals.stale().is_empty() && refusals.restarting().is_empty(),
-            "a cold map must judge nothing at all"
+        // Waiting for the first rung, rather than walking a fixed number of
+        // ticks and then asserting nothing happened, is what turns the
+        // warm-up gate from assumed into proved. An "assert nothing yet"
+        // over a fixed walk passes just as happily when the watch's loop
+        // never ran at all, which is the vacuous shape IR-46 names.
+        let restart_rung = settle_until("the silent dog's restart rung", LADDER_BUDGET, || {
+            !refusals.restarting().is_empty()
+        })
+        .await;
+        assert_eq!(
+            refusals.restarting(),
+            vec!["metrics".to_string()],
+            "the dog nothing ever connected from is the one that earns the rung"
         );
 
-        // Now warm, and the ladder gets its two rungs: a restart, then the
-        // stale verdict, this time read off a map that has been listening.
-        for _ in 0..(ticks_in_a_budget * 6) {
-            tokio::time::advance(DOG_SILENCE_POLL).await;
-            // A rung awaits a real restart through the supervisor, so the
-            // watch needs more than one yield per step to get through it.
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-        for _ in 0..512 {
-            if refusals.stale().contains(&"metrics".to_string()) {
-                break;
-            }
-            tokio::time::advance(DOG_SILENCE_POLL).await;
-            tokio::task::yield_now().await;
-        }
-
+        // WHEN the rung landed is the whole regression. A ladder running on
+        // a cold map reaches this one budget after the watch spawned; one
+        // that waits reaches it a budget after the warm-up ends, and the
+        // warm-up cannot have ended before `map_started_no_earlier_than`.
+        // The `is_warming` assertion above is what makes this discriminate:
+        // it pins the map as still cold at spawn, so the two cases cannot
+        // land on the same instant.
+        let first_rung_at = map_started_no_earlier_than.elapsed();
         assert!(
-            refusals.stale().contains(&"metrics".to_string()),
-            "a dog nothing ever connected from must still reach the stale rung"
+            first_rung_at >= PEER_CONTACT_WARMUP + DOG_SILENCE_BUDGET,
+            "a cold map must judge nothing: the first rung landed {first_rung_at:?} in, \
+             which is inside the {PEER_CONTACT_WARMUP:?} warm-up plus one \
+             {DOG_SILENCE_BUDGET:?} budget of silence it has to wait out"
         );
+        assert!(
+            restart_rung >= DOG_SILENCE_BUDGET,
+            "no rung can be earned in less than a whole budget of silence: {restart_rung:?}"
+        );
+
+        // The second rung, read off a map that has now been listening for
+        // longer than any dog has been quiet.
+        settle_until("the silent dog's stale rung", LADDER_BUDGET, || {
+            refusals.stale().contains(&"metrics".to_string())
+        })
+        .await;
         let info = h
             .ctx
             .supervisor
@@ -2454,38 +2519,26 @@ mod tests {
 
         // The watcher's own interval fires an immediate first tick, which
         // records the dog as seen-silent-since-now the same way every
-        // direct-call test above seeds `seen`. That first tick has to
-        // actually run, against the PRE-advance clock, before time moves --
-        // otherwise the "first look" lands after the jump and the dog
-        // never accrues a whole budget of silence.
-        tokio::task::yield_now().await;
-
-        // `Interval::tick()` reports the DEADLINE it was scheduled for, not
-        // the clock's current instant -- so one large `advance` collapses
-        // every missed tick into a single wake whose reported time has only
-        // moved forward by one `DOG_SILENCE_POLL`, not by however far the
-        // clock actually jumped. Advancing one poll period at a time, and
-        // letting the watcher's own task run after each step, is what
-        // actually walks its reported `now` past a whole budget the way a
-        // real, un-paused clock would.
-        let ticks_in_a_budget = (DOG_SILENCE_BUDGET.as_nanos() / DOG_SILENCE_POLL.as_nanos())
-            .try_into()
-            .expect("a silence budget of a few seconds fits in a u32 tick count");
-        for _ in 0..ticks_in_a_budget {
-            tokio::time::advance(DOG_SILENCE_POLL).await;
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..64 {
-            if !refusals.restarting().is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        // direct-call test above seeds `seen`. Nothing here has to arrange
+        // for that tick to run: the wait below idles the runtime, and an
+        // idle runtime is exactly when the paused clock moves and a due
+        // timer fires.
+        let waited = settle_until("the silent dog's restart", LADDER_BUDGET, || {
+            !refusals.restarting().is_empty()
+        })
+        .await;
 
         assert_eq!(
             refusals.restarting(),
             vec!["metrics".to_string()],
             "one budget of silence, driven through the watcher's own tick, must earn exactly one restart"
+        );
+        // The budget is the claim this test's name makes, so it is asserted
+        // rather than assumed. A watch that judged a dog early would earn
+        // the same restart and pass on the line above alone.
+        assert!(
+            waited >= DOG_SILENCE_BUDGET,
+            "a restart is earned by a whole budget of silence, not by less: {waited:?}"
         );
         assert!(
             refusals.stale().is_empty(),
