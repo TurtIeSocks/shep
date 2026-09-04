@@ -5,6 +5,8 @@
 //! file, `fsync`ed, then `rename`d over the target, so a reader never
 //! observes a fragment. [`sync_dir`] is the last step of that shape: it
 //! makes the *rename* durable, which the temp file's own `fsync` does not.
+//! On unix. It is a no-op on Windows, so every durability claim below, and
+//! in the six writers that call it, is a unix one.
 //!
 //! The two halves answer different questions, and it is easy to buy one
 //! and believe you bought both. `File::sync_all` on the staging file
@@ -24,6 +26,28 @@
 
 use std::path::Path;
 
+// Why the two arms differ, which is not a caller's question (IR-31).
+//
+// UNIX. `fsync` on a directory descriptor is the portable way to flush the
+// entry a rename created, and `EINVAL` is tolerated because POSIX lets
+// `fsync` answer it when the implementation has no synchronized I/O to
+// perform for the file it was handed. Some FUSE and network mounts answer
+// exactly that for a directory, and reporting it as a failed write would
+// break writes that do land, on hosts where they land today. Every other
+// error propagates: a helper that swallowed `EIO` could never tell a
+// caller that the durability it asked for did not happen.
+//
+// WINDOWS. There is no call to make. `File::open` on a directory fails
+// outright unless the handle carries `FILE_FLAG_BACKUP_SEMANTICS`, which
+// `std` does not pass, so the unix arm would not even compile into
+// something runnable. NTFS journals metadata operations, which keeps the
+// filesystem CONSISTENT across a crash, and that is a weaker promise than
+// the unix arm makes: `MoveFileEx` without `MOVEFILE_WRITE_THROUGH` does
+// not force the rename out, so a power cut can still lose it. Closing that
+// would mean reaching past `std` for a directory handle, or a
+// write-through rename in place of `NamedTempFile::persist`. Neither is
+// free and neither is done here, so the honest position is that the
+// guarantee below is a unix one.
 /// Flushes `dir`'s own metadata, making renames into it durable.
 ///
 /// Call it after the `rename` that installs a staged file, not before: it
@@ -34,26 +58,16 @@ use std::path::Path;
 ///
 /// # Platforms
 ///
-/// A no-op on Windows, which has no equivalent of this call and does not
-/// need one for the same reasons. `File::open` on a directory fails there
-/// outright unless the handle is opened with `FILE_FLAG_BACKUP_SEMANTICS`,
-/// which `std` does not do; and NTFS journals metadata operations, so the
-/// rename `NamedTempFile::persist` performs is already recorded rather
-/// than left sitting in a cache for a directory flush to chase.
+/// Unix only. On Windows this is a no-op that answers `Ok` without
+/// touching `dir`, so a rename there is as durable as NTFS makes it and no
+/// more. Callers get the same API on both and a weaker guarantee on one.
 ///
 /// # Errors
 ///
 /// - [`std::io::Error`] when `dir` could not be opened, or when flushing
-///   it failed for a reason the filesystem could act on.
-///
-/// `EINVAL` is deliberately not one of them. POSIX lets `fsync` answer it
-/// when the implementation has no synchronized I/O to perform for the file
-/// it was handed, which is how some FUSE and network mounts answer for a
-/// directory. Reporting that as a failed write would break writes that do
-/// land, on hosts where they land today, so it reads as "this filesystem
-/// has no such step" and the write stands. Every other error is real and
-/// propagates: a helper that swallowed `EIO` could never tell a caller
-/// that the durability it asked for did not happen.
+///   it failed for a reason the filesystem could act on. `EINVAL` is not
+///   one of them: it reads as "this filesystem has no such step" and the
+///   write stands. Never returns an error on Windows.
 pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

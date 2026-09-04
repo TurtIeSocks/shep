@@ -256,8 +256,10 @@ impl From<std::io::Error> for SnapshotError {
 
 /// Writes `snapshot` to `path` atomically: a temp file in the same
 /// directory (so `rename(2)` is guaranteed atomic, which it only is within
-/// one filesystem), `fsync`ed, renamed over `path`, and the directory
-/// `fsync`ed in turn so the rename itself survives a power cut.
+/// one filesystem), `fsync`ed, renamed over `path`, and on unix the
+/// directory `fsync`ed in turn so the rename itself survives a power cut.
+/// `shep_core::atomic_file::sync_dir` is a no-op on Windows, where that
+/// last guarantee is only as strong as NTFS makes it.
 ///
 /// That last step matters more here than anywhere else this workspace
 /// writes. The roll exists to be read back by the restore that runs
