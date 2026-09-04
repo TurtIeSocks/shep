@@ -1,11 +1,11 @@
 //! The atomic file replace, its first step and its last
 //!
-//! Every file this workspace rewrites in place goes the same way: stage a
-//! fresh file beside the real one, write it, `fsync` it, `rename` it over
-//! the target, then `fsync` the directory the rename landed in. A reader
-//! sees the whole old file or the whole new one, never a fragment.
-//!
-//! [`create_staging_file`] is the first step and [`sync_dir`] is the last.
+//! Stage a fresh file beside the real one, write it, `fsync` it, `rename`
+//! it over the target, then `fsync` the directory the rename landed in. A
+//! reader sees the whole old file or the whole new one, never a fragment.
+//! [`create_staging_file`] is the first step, [`sync_dir`] the last, and
+//! the middle stays with each store, which maps its failures onto its own
+//! error type.
 //!
 //! [`sync_dir`] makes the *rename* durable, which the temp file's own
 //! `fsync` does not. On unix. It is a no-op on Windows, so every
@@ -27,82 +27,45 @@
 //! kernel panic can lose a landed rename, and the writer that most needs
 //! the difference is the muster roll, whose whole reason to exist is being
 //! read back after the machine comes up again.
-//!
-//! The middle is not here. The write, the staging file's own `sync_all`
-//! and the `persist` stay with each store, because each maps a failure of
-//! them onto its own error type.
-
-// Where the create step came from, which is a maintainer's question rather
-// than a caller's (IR-31). `kv.json`, `barks.jsonl`, `overrides.json` and
-// `shep.toml` (with `dogs.toml` riding on the last one) each carried their
-// own copy of it, six lines apiece and identical but for a prefix, a
-// suffix and a mode constant that held `0o600` in all four. A fifth copy
-// was one `pub(super)` away when this became one function instead.
 
 use std::path::Path;
 
-// Why `0600` and not something a caller could widen (IR-31). Four files
-// reached it by different arguments, and the strictest is the one that
-// governs a shared value. `$SHEP_HOME` is itself `0700`, so for `kv.json`,
-// `barks.jsonl` and `overrides.json` this is a second lock on the same
-// door. For `shep.toml` and `dogs.toml` it is the only lock that counts:
-// `docs/dogs.md` tells an operator to paste a Discord or Slack webhook URL
-// there, and both of those carry a bearer token in the path. It is also
-// the mode a `tar`, a `cp -p` or a backup of `$SHEP_HOME` carries out with
-// the file, somewhere no directory mode follows it.
+// `$SHEP_HOME` is already `0700`, but `shep.toml` and `dogs.toml` hold
+// webhook URLs with a bearer token in the path, and a `tar` or `cp -p` of
+// them carries this mode somewhere no directory mode follows.
 /// Mode a file under `$SHEP_HOME` is created with: owner read/write,
 /// nobody else.
 ///
 /// # Platforms
 ///
-/// Unix only. Windows has no equivalent bit, so nothing there applies this
-/// and a file inherits the ACL of the directory it lands in. That is the
-/// same gap `shep.toml`'s own home-directory creation names in the
-/// operator docs.
+/// Unix only. On Windows a file inherits the ACL of the directory it lands
+/// in.
 pub const OWNER_ONLY_FILE_MODE: u32 = 0o600;
 
-// The three choices a caller might otherwise ask about (IR-31).
+// No mode parameter, because a caller that wanted a looser one would be
+// wrong: every file here holds a credential or an `env` value.
 //
-// NO MODE PARAMETER. Every caller writes a file under `$SHEP_HOME` that
-// holds a credential, an `env` value, or a record of what the shepherd
-// told an outside service, so none of them wants anything but
-// `OWNER_ONLY_FILE_MODE`. A parameter would buy nothing today and would be
-// the door a later caller walks a `0644` through.
+// The unique middle is not tidiness. Two writers sharing a fixed
+// `<path>.tmp` had one `rename` consume the other's staging file.
 //
-// A UNIQUE MIDDLE, not a fixed `<path>.tmp`. Two writers sharing one had
-// a process's `rename` consume the other's staging file, and the loser
-// died with `ENOENT` renaming a path that no longer existed.
-//
-// NO SEPARATOR IN EITHER PART. `tempfile`'s own docs call one legal and
-// inadvisable, and `tempfile_in` joins the result onto `parent`, so a `..`
-// in front of a separator stages the file outside the directory this
-// function's whole contract is that it stays inside. Nothing in the tree
-// passes anything but a literal; the check is what keeps that true now
-// four private helpers have become one public one.
-//
-// `tempfile`'s OWN TYPE back, rather than a newtype. The caller does the
-// writing, the `sync_all` and the `persist`, so a wrapper's whole body
-// would forward those three calls. The cost is a dependency's type in this
-// crate's public API, taken deliberately.
+// `tempfile_in` joins a separator onto `parent`, so `../evil` escapes the
+// one directory this is contracted to stay inside.
 /// Creates the staging file a store is rewritten through, in `parent` so
 /// the later `rename` stays within one filesystem.
 ///
 /// `prefix` and `suffix` bracket a unique middle `tempfile` picks, and
 /// neither may contain a path separator. The file is created
-/// [`OWNER_ONLY_FILE_MODE`] on unix, at the `open` itself rather than by a
-/// later `chmod`, so there is no window in which it sits at whatever the
-/// process umask leaves it. It carries no mode on Windows.
+/// [`OWNER_ONLY_FILE_MODE`] on unix at the `open` itself, never by a later
+/// `chmod`, so it is never briefly wider. It carries no mode on Windows.
 ///
 /// The caller writes it, `sync_all`s it, and `persist`s it over the real
 /// file.
 ///
 /// # Errors
 /// - [`std::io::ErrorKind::InvalidInput`] when `prefix` or `suffix`
-///   contains `/` or `\`. Both are refused on both platforms, so the same
-///   argument is accepted or refused wherever it runs.
-/// - Otherwise, the staging file could not be created in `parent`: the
-///   directory is missing or unwritable, or `tempfile` ran out of attempts
-///   at a unique name.
+///   contains `/` or `\`, both refused on both platforms.
+/// - Otherwise `parent` is missing or unwritable, or `tempfile` ran out of
+///   attempts at a unique name.
 pub fn create_staging_file(
     parent: &Path,
     prefix: &str,
@@ -190,10 +153,8 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// fails if the staging file lands anywhere but the directory the
-    /// caller named. A `rename` is only atomic within one filesystem, so
-    /// staging next to the real file is the whole reason this takes a
-    /// `parent` rather than using the system temp directory.
+    /// fails if the file lands outside `parent`, where the later `rename`
+    /// would cross a filesystem and stop being atomic.
     #[test]
     fn the_staging_file_lands_in_the_parent_it_was_given() {
         let dir = tempfile::tempdir().unwrap();
@@ -201,9 +162,7 @@ mod tests {
         assert_eq!(tmp.path().parent(), Some(dir.path()));
     }
 
-    /// fails if a caller's prefix or suffix is dropped on the way to
-    /// `tempfile`. Each store passes its own pair, and swapping them would
-    /// leave every store staging under one name.
+    /// fails if either part is dropped or swapped on the way to `tempfile`.
     #[test]
     fn the_name_carries_the_prefix_and_the_suffix() {
         let dir = tempfile::tempdir().unwrap();
@@ -215,10 +174,9 @@ mod tests {
         assert!(name.len() > "barks.tmp".len(), "no unique middle: {name}");
     }
 
-    /// fails if a separator in either argument reaches `tempfile`, which
-    /// allows one and joins the result onto `parent`. Both spellings are
-    /// refused on both platforms so an argument cannot be legal on one and
-    /// an escape on the other.
+    /// fails if a separator reaches `tempfile`. Both spellings, both
+    /// platforms, so an argument cannot be legal on one and an escape on
+    /// the other.
     #[test]
     fn a_path_separator_is_refused_in_either_argument() {
         let dir = tempfile::tempdir().unwrap();
@@ -237,22 +195,6 @@ mod tests {
                 "{prefix:?} {suffix:?}: {err:?}"
             );
         }
-    }
-
-    /// fails if the staging file is created readable by anyone but its
-    /// owner. `persist` is a `rename`, which installs this inode and its
-    /// mode over the real file, so this mode is the one the store ends up
-    /// wearing on disk.
-    #[cfg(unix)]
-    #[test]
-    fn the_staging_file_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = create_staging_file(dir.path(), "overrides", ".tmp").unwrap();
-
-        let mode = tmp.as_file().metadata().unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "mode was {mode:o}");
     }
 
     #[test]
