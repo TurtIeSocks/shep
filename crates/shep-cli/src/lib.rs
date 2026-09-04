@@ -198,8 +198,13 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
     // the two `run` arms (`cfg(unix)`/`cfg(windows)`) or at every `Streams`
     // construction inside them — see `resolve_style` and `must_render_bare`
     // for why the two steps (what is configured, and whether the hard rule
-    // overrides it) are kept separate.
-    let (configured, _source) = resolve_style(&cli.global);
+    // overrides it) are kept separate. `style_source` rides all the way
+    // down to `lookout::lookout`, which is the one caller that reports it
+    // rather than only consuming the level: the settings screen's own
+    // STYLE LEVEL row needs to say which layer won, and it has to be this
+    // same resolution rather than a second one, so the screen and the rest
+    // of the CLI can never disagree.
+    let (configured, style_source) = resolve_style(&cli.global);
     let level = if must_render_bare(std::io::stdout().is_terminal(), cli.global.format) {
         style::StyleLevel::Bare
     } else {
@@ -220,7 +225,9 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
         std::env::var_os("COLORTERM").as_deref(),
         output::terminal_width(),
     );
-    std::process::ExitCode::from(runtime.block_on(run(cli, style)) as u8)
+    std::process::ExitCode::from(
+        runtime.block_on(run(cli, style, (configured, style_source))) as u8,
+    )
 }
 
 /// Before clap's own "unrecognized subcommand" error (suggestions and
@@ -834,7 +841,19 @@ fn scaffold_first_run_interpreters(paths: &ShepPaths) {
 /// the same way, so it can tell the operator whether the value it just
 /// wrote is what will actually run or whether `--style`/`$SHEP_STYLE`
 /// still outranks it.
-async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
+///
+/// `resolved_style` is [`run_argv`]'s own `resolve_style(&cli.global)`
+/// call, the unforced pair `style` above is partly built from. The one
+/// caller that needs the pair itself rather than only the level is the
+/// lookout dispatch: the settings screen's own STYLE LEVEL row reports
+/// which layer won, and reading that back from the same resolution this
+/// function already holds is what keeps the screen and the rest of the
+/// CLI from ever disagreeing about it.
+async fn run(
+    cli: Cli,
+    style: style::Presentation,
+    resolved_style: (style::StyleLevel, style::StyleSource),
+) -> ExitCode {
     let fmt = cli.global.format;
     // Resolved once, here, rather than at each of the seventeen call sites
     // that reach a shepherd: `cli.command` is partially moved by the
@@ -1096,7 +1115,7 @@ async fn run(cli: Cli, style: style::Presentation) -> ExitCode {
             style,
             fmt,
         };
-        return lookout::lookout(&mut streams, &paths, args).await;
+        return lookout::lookout(&mut streams, &paths, args, resolved_style).await;
     }
 
     // Not in the locked block below, for the reason `lookout`'s own comment
@@ -2623,14 +2642,24 @@ mod tests {
 
         let cli = Cli::try_parse_from(["shep", "--home", missing, "startup"]).unwrap();
         assert_eq!(
-            run(cli, style::Presentation::BARE).await,
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
             ExitCode::Usage,
             "startup must refuse a $SHEP_HOME that is not there"
         );
 
         let cli = Cli::try_parse_from(["shep", "--home", missing, "unstartup"]).unwrap();
         assert_ne!(
-            run(cli, style::Presentation::BARE).await,
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
             ExitCode::Usage,
             "unstartup removes a unit and never reads the home a --home names"
         );
@@ -2834,7 +2863,12 @@ mod tests {
             let home = dir.path().to_str().unwrap();
             let cli = Cli::try_parse_from(["shep", "--home", home, "style", raw]).unwrap();
             assert_eq!(
-                run(cli, style::Presentation::BARE).await,
+                run(
+                    cli,
+                    style::Presentation::BARE,
+                    (style::StyleLevel::Full, style::StyleSource::Default),
+                )
+                .await,
                 ExitCode::Success,
                 "style {raw}"
             );
@@ -2862,7 +2896,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_str().unwrap();
         let cli = Cli::try_parse_from(["shep", "--home", home, "style"]).unwrap();
-        assert_eq!(run(cli, style::Presentation::BARE).await, ExitCode::Success);
+        assert_eq!(
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
+            ExitCode::Success
+        );
 
         assert!(
             !dir.path().join("shep.toml").exists(),
@@ -2925,7 +2967,15 @@ mod tests {
         use clap::Parser;
         let argv = ["shep", "completions", "bash"];
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
-        assert_eq!(run(cli, style::Presentation::BARE).await, ExitCode::Success);
+        assert_eq!(
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
+            ExitCode::Success
+        );
     }
 
     /// fails if the absent-socket case stops naming the next command, or if a
@@ -3271,7 +3321,12 @@ mod tests {
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
 
         assert_eq!(
-            run(cli, style::Presentation::BARE).await,
+            run(
+                cli,
+                style::Presentation::BARE,
+                (style::StyleLevel::Full, style::StyleSource::Default),
+            )
+            .await,
             ExitCode::DaemonUnreachable,
             "`kill` against an unowned home must reach its own socket-free path"
         );

@@ -38,6 +38,7 @@ use shep_core::status::ProcStatus;
 
 use super::theme::Palette;
 use crate::commands::settings::{SettingField, SettingsSnapshot};
+use crate::style::{StyleLevel, StyleSource};
 use crate::vocabulary::Reported;
 
 /// Whether this lookout may act on a sheep.
@@ -728,6 +729,14 @@ pub struct App {
     /// The settings screen's own state. `None` is the dashboard; `Some` is
     /// the screen, open over it.
     settings: Option<Settings>,
+    /// The resolved style level and which layer chose it, from
+    /// `run_argv`'s own `resolve_style`. `App::new` defaults it to
+    /// `(StyleLevel::Full, StyleSource::Default)`; `run_argv`'s `lookout`
+    /// dispatch immediately overrides it with the real resolution through
+    /// `Self::set_style`, so the settings screen's own STYLE LEVEL row
+    /// reads the same answer the rest of the CLI does rather than a second,
+    /// independently derived one.
+    style: (StyleLevel, StyleSource),
 }
 
 impl App {
@@ -751,6 +760,7 @@ impl App {
             lambs: None,
             action: None,
             settings: None,
+            style: (StyleLevel::Full, StyleSource::Default),
         }
     }
 
@@ -891,7 +901,24 @@ impl App {
             // nothing to show.
             Msg::Settings { result } => {
                 match result {
-                    Ok(snapshot) => self.settings = Some(Settings::new(snapshot)),
+                    Ok(snapshot) => {
+                        // Clears an action that armed while the read was in
+                        // flight (`s`, then `x`, then this landing): once
+                        // this branch runs, `on_key`'s settings short
+                        // circuit intercepts every key ahead of the
+                        // armed-confirm cancel block, and `on_settings_key`
+                        // no-ops `Confirm`. Without this, the prompt would
+                        // sit on screen, unreachable by Enter or by any
+                        // other key, until `CONFIRM_EXPIRY`. This is the
+                        // same closing-by-construction `on_key`'s own
+                        // comment already argues for `/` and the filter
+                        // box: a sheep confirm and the settings screen can
+                        // never coexist, and this is the one place
+                        // `self.settings` becomes `Some`, so clearing here
+                        // covers both the keypress and the race.
+                        self.action = None;
+                        self.settings = Some(Settings::new(snapshot));
+                    }
                     Err(message) => {
                         self.notice = Some(Notice {
                             text: message,
@@ -1905,6 +1932,24 @@ impl App {
     #[must_use]
     pub fn settings(&self) -> Option<&Settings> {
         self.settings.as_ref()
+    }
+
+    /// The resolved style level and which layer chose it. What
+    /// `Effect::LoadSettings` hands `commands::settings::load_settings`
+    /// for the STYLE LEVEL row, so the screen never re-resolves on its own.
+    #[must_use]
+    pub fn style(&self) -> (StyleLevel, StyleSource) {
+        self.style
+    }
+
+    /// Sets the resolved style level and its source. Called exactly once,
+    /// by `run_argv`'s `lookout` dispatch, right after construction: `App`
+    /// has no way to resolve this itself (it holds no `GlobalArgs` and
+    /// reads no files), so the caller that already computed it hands it
+    /// over rather than this type inventing a second, divergent way to get
+    /// one.
+    pub(crate) fn set_style(&mut self, style: (StyleLevel, StyleSource)) {
+        self.style = style;
     }
 
     /// Overrides the control gate a fixture built with. `App::new` takes
@@ -3850,5 +3895,78 @@ mod tests {
         let _ = app.update(Msg::Key(KeyPress::Cycle));
         let notice = app.notice().expect("the refusal has to say why");
         assert!(notice.is_grave());
+    }
+
+    /// fails if an action armed while the read is still in flight survives
+    /// the screen opening. `s` raises `Effect::LoadSettings` while
+    /// `self.settings` is still `None`, so `x` reaches `arm()` normally and
+    /// succeeds; once the read lands, `on_key`'s settings branch runs ahead
+    /// of the armed-confirm cancel block and `on_settings_key` no-ops
+    /// `Confirm`, so nothing would ever reach the code that resolves an
+    /// armed action. The fix is the same closing-by-construction `on_key`'s
+    /// own comment already argues for `/` and the filter box.
+    #[test]
+    fn opening_the_screen_clears_an_action_armed_while_the_read_was_in_flight() {
+        let mut app = fixtures::allowed_app();
+        let _ = app.update(Msg::Key(KeyPress::Settings));
+        let _ = app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop)));
+        assert!(
+            app.action().is_some(),
+            "the arm must still succeed before the read lands"
+        );
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert!(
+            app.action().is_none(),
+            "no armed action may survive the screen opening"
+        );
+    }
+
+    /// fails if `App::set_style` does not round trip exactly: the flag
+    /// source in particular, since that is the layer the settings screen's
+    /// own STYLE LEVEL row was silently dropping before this was wired
+    /// through `App` at all.
+    #[test]
+    fn set_style_round_trips_exactly() {
+        let mut app = fixtures::full_app();
+        assert_eq!(
+            app.style(),
+            (StyleLevel::Full, StyleSource::Default),
+            "the default before anyone calls set_style"
+        );
+        app.set_style((StyleLevel::Bare, StyleSource::Flag));
+        assert_eq!(app.style(), (StyleLevel::Bare, StyleSource::Flag));
+    }
+
+    /// fails if the settings screen's own STYLE LEVEL row can disagree with
+    /// the style `App` was told to carry. Drives the exact call
+    /// `Effect::LoadSettings` makes (`load_settings(path, socket_default,
+    /// app.style())`) against a real file on disk whose own `[style]
+    /// level` names a THIRD, different level -- proving the row reports
+    /// the value threaded onto `App`, not one re-derived from the file,
+    /// which is what a flag "reaching the row" rather than being dropped
+    /// actually means.
+    #[test]
+    fn the_style_set_on_the_app_reaches_the_settings_row_undropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[style]\nlevel = \"bare\"\n").unwrap();
+        let socket_default = dir.path().join("run").join("shep.sock");
+
+        let mut app = fixtures::full_app();
+        app.set_style((StyleLevel::Plain, StyleSource::Flag));
+
+        let result = crate::commands::settings::load_settings(&path, &socket_default, app.style())
+            .map_err(|err| err.to_string());
+        let _ = app.update(Msg::Settings { result });
+
+        let row = &app.settings().unwrap().snapshot().style_level;
+        assert_eq!(
+            row.source,
+            StyleSource::Flag,
+            "the flag beats the file rather than being dropped by it"
+        );
+        assert_eq!(row.value, "plain");
     }
 }

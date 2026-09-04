@@ -68,6 +68,7 @@ use self::theme::Palette;
 use crate::cli::LookoutArgs;
 use crate::exit::ExitCode;
 use crate::output::Streams;
+use crate::style::{StyleLevel, StyleSource};
 
 /// How often the uptime column is re-derived.
 ///
@@ -102,7 +103,18 @@ pub const MIN_REDRAW: Duration = Duration::from_millis(33);
 ///
 /// After that it does not exit on its own at all: the ladder and the freeze
 /// take over, and the operator quits.
-pub async fn lookout(streams: &mut Streams<'_>, paths: &ShepPaths, args: &LookoutArgs) -> ExitCode {
+///
+/// `style` is `run_argv`'s own already-resolved `(StyleLevel, StyleSource)`
+/// pair, the same one every other verb's rendering already uses. Handed
+/// straight to `App::set_style` below, so the settings screen's own STYLE
+/// LEVEL row reports the layer that actually won rather than resolving a
+/// second, possibly disagreeing answer of its own.
+pub async fn lookout(
+    streams: &mut Streams<'_>,
+    paths: &ShepPaths,
+    args: &LookoutArgs,
+    style: (StyleLevel, StyleSource),
+) -> ExitCode {
     // A TUI piped into a file is a usage error, not a rendering mode: the
     // alternative is writing alternate-screen escapes into somebody's log.
     // This is also what makes the refusal testable — `assert_cmd` captures
@@ -152,12 +164,13 @@ pub async fn lookout(streams: &mut Streams<'_>, paths: &ShepPaths, args: &Lookou
         std::env::var_os("COLORTERM").as_deref(),
     );
     let control = resolve_control(args.allow_control, &paths.kv);
-    let app = App::new(
+    let mut app = App::new(
         palette,
         control,
         paths.home.to_string_lossy().into_owned(),
         Instant::now(),
     );
+    app.set_style(style);
 
     // Hook first, then the guard, then raw mode, then the alternate screen —
     // nothing that can panic in between. See `term`'s own module doc.
@@ -522,26 +535,20 @@ where
             // rather than as an oversight: `spawn_blocking` even though the
             // read takes no lock, because "no file I/O on the redraw task"
             // is cheaper to hold as a rule than to re-judge at every call
-            // site. The style resolution the settings screen's own STYLE
-            // LEVEL row needs lives inside the same closure for the same
-            // reason -- reading `shep.toml` a second time out here, just to
-            // decide the layer, would be exactly the I/O this arm exists to
-            // avoid.
+            // site.
             //
-            // The flag layer is not resolved here: `shep lookout` carries no
-            // `--style` of its own today (`LookoutArgs` has no such field),
-            // so `crate::style::resolve`'s `flag` argument is `None` rather
-            // than a shortcut -- there is genuinely nothing to read.
+            // The style passed in is `app.style()`, not a fresh resolution:
+            // `run_argv` already resolved `--style`/`$SHEP_STYLE`/
+            // `shep.toml`'s `[style] level` once, before this loop started,
+            // and handed the result to `App::set_style`. Reading it back
+            // here rather than resolving again is what keeps the settings
+            // screen's own STYLE LEVEL row agreeing with the rest of the
+            // CLI about which layer won, flag included.
             Effect::LoadSettings => {
                 let path = daemon_config.clone();
                 let socket_default = socket_default.clone();
+                let style = app.style();
                 let result = tokio::task::spawn_blocking(move || {
-                    let config_text = std::fs::read_to_string(&path).ok();
-                    let style = crate::style::resolve(
-                        None,
-                        std::env::var("SHEP_STYLE").ok().as_deref(),
-                        crate::style_from_config(config_text.as_deref()),
-                    );
                     crate::commands::settings::load_settings(&path, &socket_default, style)
                 })
                 .await
