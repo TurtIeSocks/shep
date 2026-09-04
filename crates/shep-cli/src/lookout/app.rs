@@ -795,7 +795,7 @@ impl Settings {
             _ => None,
         };
         let in_file = (field == SettingField::StyleLevel)
-            .then(|| self.snapshot.style_level_in_file.as_deref())
+            .then_some(self.snapshot.style_level_in_file.as_deref())
             .flatten();
         let base: String = match (armed_here, in_file) {
             (Some(value), _) | (None, Some(value)) => value.to_string(),
