@@ -5,7 +5,7 @@ description: Use when writing, reviewing, or refactoring ANY Rust code in the sh
 
 # shep Idiomatic Rust
 
-**REQUIRED READING before writing code: [docs/idiomatic-rust.md](../../../docs/idiomatic-rust.md)** — 46 numbered rules (IR-1..IR-46) distilled from rand 0.10.2, the project's quality bar. Cite rules by number in reviews. Full evidence: `docs/idiomatic-rust/lenses/`.
+**REQUIRED READING before writing code: [docs/idiomatic-rust.md](../../../docs/idiomatic-rust.md)** — 47 numbered rules (IR-1..IR-47) distilled from rand 0.10.2, the project's quality bar. Cite rules by number in reviews. Full evidence: `docs/idiomatic-rust/lenses/`.
 
 ## Baseline-failure checklist
 
