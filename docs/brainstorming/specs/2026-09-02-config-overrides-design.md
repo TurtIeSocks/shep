@@ -199,7 +199,14 @@ for the operator who means it.
 The original complaint is fixed by a reset, not by the default:
 `instances = 5` edited into a template reaches a running app through
 `shep start Flockfile.toml --reset=file`, which routes to the existing scale
-path and leaves the running instances alone.
+path and applies it, scaling the four running instances up to five. This is
+the opposite case from the footgun `file` fixes, above: there the template
+said nothing about `instances`, and `file` left the count alone because
+there was nothing to put back. Here the template DOES declare `instances`,
+so `file` puts back exactly what it declares, on the same terms as every
+other field it covers. What `file` never does is move a key the template is
+silent on to the compiled default of one, which is the behaviour a reset
+covering undeclared keys (`policy` or `all`) would have instead.
 
 ### 4. A load never kills a process and never prunes
 
