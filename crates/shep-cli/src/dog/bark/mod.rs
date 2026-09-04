@@ -1099,7 +1099,18 @@ sinks = ["oncall"]
     /// config is sinks and rules, pure data with no OS resource attached;
     /// a bark that restarted itself instead would add a restart to the
     /// column an operator reads as instability.
-    #[tokio::test(start_paused = true)]
+    ///
+    /// The one test in this module that does NOT pause the clock, and it
+    /// is about how this fails rather than how it passes. Under
+    /// `start_paused` the deadline inside [`await_real_io`] cannot elapse:
+    /// `spawn_blocking` inhibits auto-advance for as long as it runs, so
+    /// nothing moves the virtual clock to the timeout and a broken swap
+    /// hangs the suite instead of failing it. Measured, by mutating the
+    /// swap into a no-op. On a real clock the same wait is bounded, and
+    /// nothing here needs a paused one: the only timer in the loop is a
+    /// 60s poll interval that must not fire either way, and there is no
+    /// sleep anywhere below.
+    #[tokio::test]
     async fn a_config_change_swaps_barks_sinks_in_place() {
         let (old_addr, mut old_captured) = one_shot_sink(200, "").await;
         let (new_addr, new_captured) = one_shot_sink(200, "").await;
@@ -1129,7 +1140,7 @@ sinks = ["oncall"]
         .unwrap();
         tx.send(errored_event("web")).unwrap();
 
-        let req = await_real_io(Duration::from_secs(5), new_captured)
+        let req = tokio::time::timeout(Duration::from_secs(5), new_captured)
             .await
             .expect("the bark must reach the sink the new section names")
             .unwrap();
@@ -1152,5 +1163,4 @@ sinks = ["oncall"]
 
         loop_handle.abort();
     }
-
 }

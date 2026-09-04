@@ -556,5 +556,4 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<BusEvent>(&json).unwrap(), event);
     }
-
 }
