@@ -330,25 +330,40 @@ owed here (IR-41), and the call site says so rather than leaving it silent.
 
 ## Data flow
 
-Two new effects, both performed in `run_ui` on `spawn_blocking`. The blocking
-matters for the write: the config lock has no deadline, so a concurrent
-`shep adopt` would otherwise freeze the redraw, the tick and the bus drain
-together. The read takes no lock at all, following
+Three effects, each performed in `run_ui` on `spawn_blocking`, and none of
+them awaited in its own arm: the `JoinHandle` is wrapped in a future that
+resolves to the `Msg` its result belongs in, pushed into a `FuturesUnordered`
+the `select!` drains as a fifth arm, and the loop is back at the `select!`
+before the I/O has started. Both halves matter for a write, and
+`spawn_blocking` alone only buys the first. It keeps the blocking off a
+runtime worker thread; awaiting the handle inline would still park the UI task
+until the write landed, which freezes the redraw, the tick and the bus drain
+for exactly as long as doing the write on this task would have. The config
+lock has no deadline, so a concurrent `shep adopt` is enough to make that
+unbounded. The read takes no lock at all, following
 `adopted_dog_path_readonly`'s argument, and rides `spawn_blocking` anyway so
 that the rule is "no file I/O on the redraw task" rather than a judgement call
 per site.
 
 ```
-s              -> Effect::LoadSettings   -> Msg::Settings { fields, dogs }
+s              -> Effect::LoadSettings   -> Msg::Settings { result }
 Enter, armed   -> Effect::WriteSetting   -> Msg::SettingWritten { edit, result }
+Enter, dog     -> Effect::WriteDog       -> Msg::DogWritten { edit, result }
 ```
 
-A scalar write ends there, in a notice. A dog write chains one step further,
-because its file half and its daemon half are two acts:
+A dog toggle is its own effect rather than a third shape of `WriteSetting`,
+because its file half and its daemon half are two acts and only the dog has a
+second one.
+
+A scalar write ends there: `Msg::SettingWritten` carries `Result<(), String>`,
+and its `Ok` arm raises a fresh `Effect::LoadSettings` so the row redraws from
+the document rather than from what was just typed into it. A dog write chains
+one step further, and `Msg::DogWritten` carries `Result<DogSource, String>`
+because the daemon half needs the source the file half resolved:
 
 ```
-Msg::SettingWritten { Ok(source) } -> Effect::Send(Sent::Dog { .. })
-                                   -> Msg::Replied -> notice
+Msg::DogWritten { Ok(source) } -> Effect::Send(Sent::Dog { .. })
+                               -> Msg::Replied -> notice
 ```
 
 File first, then the daemon, which is `shep enable`'s own order. `Sent` gains a

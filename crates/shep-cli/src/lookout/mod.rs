@@ -52,6 +52,8 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -270,7 +272,7 @@ pub fn resolve_control(flag: bool, kv: &Path) -> Control {
 /// thing with a `TestBackend` and a finite `Stream` — no terminal, no socket.
 /// Returns the terminal so that test can read the last frame.
 ///
-/// Four arms, `biased` in this order:
+/// Five arms, `biased` in this order:
 ///
 /// 1. **`SIGTERM`.** In raw mode Ctrl-C is a key event, not a signal, so this
 ///    arm is not about the operator — it is a session teardown or a `kill`.
@@ -279,7 +281,12 @@ pub fn resolve_control(flag: bool, kv: &Path) -> Control {
 /// 2. **The keyboard**, for latency: a keypress that waited behind a burst of
 ///    bus events feels like a hung program.
 /// 3. **The link's messages.**
-/// 4. **The heartbeat**, which advances the uptime column and nothing else.
+/// 4. **The settings screen's finished file I/O**, each one a
+///    `spawn_blocking` this loop itself asked for. Above the heartbeat
+///    because a result the operator is waiting on beats a clock tick, and
+///    below the keyboard because `q` must still land while one is in
+///    flight.
+/// 5. **The heartbeat**, which advances the uptime column and nothing else.
 ///
 /// **`biased` makes an exhausted arm a hazard, not a detail.** A `Stream` that
 /// has ended returns `Poll::Ready(None)` immediately and forever, and an `mpsc`
@@ -290,7 +297,12 @@ pub fn resolve_control(flag: bool, kv: &Path) -> Control {
 /// heartbeat never got polled, and a key source that ended would spin this loop
 /// at full tilt forever. So arms 2 and 3 each carry a **branch precondition**
 /// (`, if !keys_done` / `, if !link_done`) that takes them out of the running
-/// for good once their source is done. Arm 4 is unconditional, so the `select!`
+/// for good once their source is done. Arm 4 needs the same guard for a
+/// different reason: an EMPTY `FuturesUnordered` is `Ready(None)` on every
+/// poll, exactly like an ended stream, so `, if !inflight.is_empty()` takes
+/// it out of the running, but only until the next effect pushes into it.
+/// That is why arm 4's condition is live rather than a `done` flag set
+/// once. Arm 5 is unconditional, so the `select!`
 /// always has an enabled branch. Arm 1 needs the same idea in its other form —
 /// `std::future::pending()` — because a missing signal handler is not a
 /// condition that changes.
@@ -298,8 +310,9 @@ pub fn resolve_control(flag: bool, kv: &Path) -> Control {
 /// The redraw is not an arm: it happens after the `select!`, gated on `dirty`
 /// and on [`MIN_REDRAW`] having elapsed.
 ///
-/// **This phase adds no arm to the `select!` above.** The host sample rides
-/// arm 4, the heartbeat: sampling memory and a load average costs
+/// **The settings screen adds arm 4, and it is the only arm this loop has
+/// gained since.** The host sample rides
+/// the heartbeat arm instead: sampling memory and a load average costs
 /// microseconds and no process-table walk, so it rides along for free rather
 /// than re-deriving the arm-retirement reasoning this doc just walked
 /// through. The feed and the lambs both ride the redraw gate below instead of
@@ -356,6 +369,32 @@ where
     // arm, for the reason this function's doc gives about the `biased`
     // select's arm retirement.
     let mut lambs_dirty = false;
+    // The settings screen's file I/O, in flight. Each entry is one
+    // `spawn_blocking` this loop asked for, wrapped so that it resolves to
+    // the `Msg` its result belongs in and nothing else: the arm that drains
+    // this set applies whatever comes out, exactly as it applies a key or a
+    // link message, and never has to remember which effect started it.
+    //
+    // A SET rather than a single slot, because more than one write really
+    // can be in flight once they stop being awaited inline: `cycle_scalar`
+    // and `cycle_dog` overwrite `Settings::pending` unconditionally, so
+    // `space` during a `Pending::Sent` re-arms, and the `Enter` after it
+    // yields a second `Effect::WriteSetting` while the first is still
+    // running. `apply_setting` takes the config lock, so two writes queue
+    // behind each other on disk rather than interleaving, and each lands as
+    // its own `Msg`. `Effect::LoadSettings` shares the set rather than
+    // owning one of its own: it is the same "off this task, back as a
+    // `Msg`" shape, it takes no lock, and a load raised while a write is in
+    // flight is the ordinary case rather than a conflict (the `Ok` arm of
+    // `Msg::SettingWritten` raises exactly that).
+    //
+    // If the loop breaks with entries still here, the set is dropped and
+    // their `JoinHandle`s with it. A `spawn_blocking` task is not cancelled
+    // by dropping its handle: it runs to completion, and the runtime's own
+    // shutdown waits for it. So nothing is half-written, `ShepToml::save`
+    // stages and renames either way, and the only thing lost is the notice
+    // the reducer would have shown on a screen that is already gone.
+    let mut inflight: FuturesUnordered<BoxFuture<'static, Msg>> = FuturesUnordered::new();
     // `Option`, not `Instant::now() - MIN_REDRAW`: subtracting from a fresh
     // `Instant` is a panic on a platform whose monotonic clock starts near
     // zero, and "has never drawn" is what the first iteration actually means.
@@ -459,9 +498,15 @@ where
                     None
                 }
             },
+            // `FuturesUnordered::next` is cancel-safe: the futures live in
+            // the set, not in the future this arm polls, so losing a
+            // `select!` race loses no progress. The branch precondition is
+            // not optional -- see this function's doc for what an empty set
+            // does to a `biased` select.
+            done = inflight.next(), if !inflight.is_empty() => done,
             _ = heartbeat.tick() => {
-                // The host sample rides this arm rather than adding a fifth
-                // one. The `biased` select's arm-retirement reasoning is the
+                // The host sample rides this arm rather than adding one of
+                // its own. The `biased` select's arm-retirement reasoning is the
                 // subtlest thing in this module and this phase deliberately
                 // does not re-derive it; sampling memory and a load average
                 // is microseconds and no process-table walk.
@@ -531,11 +576,12 @@ where
                 }
                 dirty = true;
             }
-            // The one arm that does file I/O off this task on purpose,
-            // rather than as an oversight: `spawn_blocking` even though the
-            // read takes no lock, because "no file I/O on the redraw task"
-            // is cheaper to hold as a rule than to re-judge at every call
-            // site.
+            // The read arm, off this task on purpose rather than as an
+            // oversight: `spawn_blocking` even though the read takes no
+            // lock, because "no file I/O on the redraw task" is cheaper to
+            // hold as a rule than to re-judge at every call site. Pushed
+            // into `inflight` rather than awaited here, for the reason
+            // `Effect::WriteSetting`'s own arm spells out.
             //
             // The style passed in is `app.style()`, not a fresh resolution:
             // `run_argv` already resolved `--style`/`$SHEP_STYLE`/
@@ -548,16 +594,19 @@ where
                 let path = daemon_config.clone();
                 let socket_default = socket_default.clone();
                 let style = app.style();
-                let result = tokio::task::spawn_blocking(move || {
+                let handle = tokio::task::spawn_blocking(move || {
                     crate::commands::settings::load_settings(&path, &socket_default, style)
-                })
-                .await
-                .map_err(|err| err.to_string())
-                .and_then(|inner| inner.map_err(|err| err.to_string()));
-                // `let _`: `Msg::Settings` returns `Effect::None`
-                // unconditionally, the same reason `Msg::Bleats`'s call site
-                // above gives.
-                let _ = app.update(Msg::Settings { result });
+                });
+                // Pushed, not awaited. The `Msg` is built inside the wrapper
+                // so the arm that drains `inflight` stays one line; the
+                // reducer sees exactly what it saw when this was inline.
+                inflight.push(Box::pin(async move {
+                    let result = handle
+                        .await
+                        .map_err(|err| err.to_string())
+                        .and_then(|inner| inner.map_err(|err| err.to_string()));
+                    Msg::Settings { result }
+                }));
                 dirty = true;
             }
             // The one arm that writes `shep.toml`, and off this task on
@@ -565,7 +614,13 @@ where
             // `ShepToml::try_edit`'s own lock, which blocks with no
             // deadline. A concurrent `shep adopt` holding it would freeze
             // this task's redraw, its tick and its bus drain right along
-            // with the write if this ran inline.
+            // with the write if this loop waited for it here. It does not:
+            // the handle goes into `inflight` and the loop is back in the
+            // `select!` before the write has taken the lock. `spawn_blocking`
+            // alone would not have bought that -- it moves the blocking off a
+            // runtime worker, and awaiting the handle in this arm would have
+            // frozen the screen for exactly as long as awaiting the write
+            // itself.
             // The `WriteAuthority` is deliberately dropped here: it is a
             // proof carried by the effect, not a value this arm reads. Its
             // job was done in `App::confirm_setting`, which could not have
@@ -573,32 +628,33 @@ where
             Effect::WriteSetting(edit, _authority) => {
                 let path = daemon_config.clone();
                 let for_msg = edit.clone();
-                let result = tokio::task::spawn_blocking(move || {
+                let handle = tokio::task::spawn_blocking(move || {
                     crate::commands::settings::apply_setting(&path, &edit)
-                })
-                .await
-                .map_err(|err| err.to_string())
-                .and_then(|inner| inner.map_err(|err| err.to_string()));
-                // `let _`: `Msg::SettingWritten` returns `Effect::None`
-                // unconditionally, the same reason `Msg::Settings`'s own
-                // call site above gives.
-                let _ = app.update(Msg::SettingWritten {
-                    edit: for_msg,
-                    result,
                 });
+                inflight.push(Box::pin(async move {
+                    let result = handle
+                        .await
+                        .map_err(|err| err.to_string())
+                        .and_then(|inner| inner.map_err(|err| err.to_string()));
+                    Msg::SettingWritten {
+                        edit: for_msg,
+                        result,
+                    }
+                }));
                 dirty = true;
             }
             // The one arm that writes `shep.toml`'s `enabled_dogs`, off this
-            // task for the same reason `Effect::WriteSetting`'s own arm
-            // gives: `dogs::enable_in_config`/`dogs::disable_in_config`
+            // task and out of this loop's way for the same reason
+            // `Effect::WriteSetting`'s own arm gives:
+            // `dogs::enable_in_config`/`dogs::disable_in_config`
             // both take `ShepToml::edit`'s (or `try_edit`'s) lock, which
-            // blocks with no deadline.
+            // blocks with no deadline, and this arm does not wait for it.
             // `_authority`: the same proof, dropped for the same reason
             // `Effect::WriteSetting`'s own arm gives.
             Effect::WriteDog(edit, _authority) => {
                 let path = daemon_config.clone();
                 let for_msg = edit.clone();
-                let result = tokio::task::spawn_blocking(move || {
+                let handle = tokio::task::spawn_blocking(move || {
                     if edit.enable {
                         crate::commands::dogs::enable_in_config(&path, &edit.name)
                             .map_err(|err| enable_refusal_message(&err, &edit.name))
@@ -606,20 +662,23 @@ where
                         crate::commands::dogs::disable_in_config(&path, &edit.name)
                             .map_err(|err| err.to_string())
                     }
-                })
-                .await
-                .map_err(|err| err.to_string())
-                .and_then(|inner| inner);
-                // `let _`: `Msg::DogWritten` returns either `Effect::Send`
-                // or `Effect::None` -- never something this loop has to act
-                // on inline, the same reason `Msg::SettingWritten`'s own
-                // call site above gives for its own `Effect::None`. A
-                // `Send` reaches the next iteration through `msgs` exactly
-                // as an ordinary key's `Effect::Send` would.
-                let _ = app.update(Msg::DogWritten {
-                    edit: for_msg,
-                    result,
                 });
+                // `Msg::DogWritten` answers with `Effect::Send` on the `Ok`
+                // arm, and it reaches this loop through `inflight` like any
+                // other message: the effect is applied by the `match` below
+                // on the iteration that drains it, so the daemon half of a
+                // dog toggle goes out exactly as an ordinary key's
+                // `Effect::Send` does.
+                inflight.push(Box::pin(async move {
+                    let result = handle
+                        .await
+                        .map_err(|err| err.to_string())
+                        .and_then(|inner| inner);
+                    Msg::DogWritten {
+                        edit: for_msg,
+                        result,
+                    }
+                }));
                 dirty = true;
             }
             Effect::None => dirty = true,
@@ -1192,5 +1251,123 @@ mod tests {
             request_rx.try_recv().is_err(),
             "no lamb request when the detail pane is not drawn"
         );
+    }
+
+    /// fails if a settings write freezes the loop.
+    ///
+    /// The property, not the mechanism: with a write in flight and unable to
+    /// finish, the loop still processes what comes after it. `spawn_blocking`
+    /// on its own does not buy that -- awaiting the handle in the effect arm
+    /// keeps the UI task parked until the write lands, which is the shape
+    /// this test was written against.
+    ///
+    /// The write is held up by taking `shep.toml`'s own lock first, from a
+    /// second file descriptor. `flock(2)` excludes per open file
+    /// description, not per process, so `ShepToml::try_edit`'s
+    /// `FlockArg::LockExclusive` blocks in the daemon-less way a concurrent
+    /// `shep adopt` would make it block, with no deadline and nothing to
+    /// wake it. `q` after the confirm is what has to keep working.
+    ///
+    /// Unix only: the Windows arm of `ConfigLock` polls a `share_mode(0)`
+    /// open instead, and reaching for it from here would test that
+    /// primitive rather than this loop.
+    ///
+    /// IR-46: bounded, by the same `timeout` every other loop test here
+    /// carries -- a loop that never left would otherwise hang the suite.
+    /// The clock is the real one, unlike every other test in this module:
+    /// a paused clock auto-advances only while the runtime has nothing to
+    /// do, and a blocking thread parked on a lock is something to do, so
+    /// the timeout below would never fire and a regression would hang the
+    /// suite instead of failing it. Nothing here waits on the clock in the
+    /// passing case, so the real one costs milliseconds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_loop_keeps_running_while_a_settings_write_is_stuck() {
+        use nix::fcntl::{Flock, FlockArg};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("shep.toml");
+        std::fs::write(&config, "[daemon]\nlog_level = \"info\"\n").unwrap();
+        let socket_default = dir.path().join("run/shep.sock");
+
+        // Held for the whole of `run_ui` below, and released only once it
+        // has returned.
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join("shep.toml.lock"))
+            .unwrap();
+        let held = Flock::lock(lock_file, FlockArg::LockExclusive).unwrap();
+
+        let (msg_tx, msg_rx) = mpsc::channel(16);
+        let (poll_tx, _poll_rx) = mpsc::channel(4);
+        let (request_tx, _request_rx) = mpsc::channel(4);
+
+        // The screen is opened by handing the reducer the read it would
+        // otherwise have asked for, so the four messages below arrive in a
+        // fixed order: no `Effect::LoadSettings` has to land first for
+        // `space` to find a row.
+        let snapshot = crate::commands::settings::load_settings(
+            &config,
+            &socket_default,
+            (StyleLevel::Full, StyleSource::Default),
+        )
+        .unwrap();
+        msg_tx
+            .send(Msg::Settings {
+                result: Ok(snapshot),
+            })
+            .await
+            .unwrap();
+        // `space` arms the first row (`[daemon] log_level`), `Enter` sends
+        // it, and `q` is the key that must still be answered.
+        msg_tx.send(Msg::Key(KeyPress::Cycle)).await.unwrap();
+        msg_tx.send(Msg::Key(KeyPress::Confirm)).await.unwrap();
+        msg_tx.send(Msg::Key(KeyPress::Quit)).await.unwrap();
+        drop(msg_tx);
+
+        let app = App::new(
+            Palette::detect(None, None, None),
+            Control::Allowed,
+            dir.path().display().to_string(),
+            Instant::now(),
+        );
+        let terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_ui(
+                app,
+                terminal,
+                stream::empty(),
+                msg_rx,
+                poll_tx,
+                request_tx,
+                config.clone(),
+                socket_default,
+                FakeLocal::default(),
+            ),
+        )
+        .await
+        .expect("the loop answered `q` with a write still in flight");
+
+        // The other half of the same property: the write was not cancelled
+        // by the loop leaving. `spawn_blocking` runs its closure to
+        // completion whatever happens to the handle, so releasing the lock
+        // here lets it land -- on a real quit the runtime's own shutdown is
+        // what waits for it. Polled rather than slept on for a fixed
+        // duration: the wait is another thread taking a lock, which is
+        // microseconds, and the ceiling only exists so a failure reports
+        // rather than hangs.
+        drop(held);
+        let mut written = false;
+        for _ in 0..500 {
+            if std::fs::read_to_string(&config).unwrap().contains("debug") {
+                written = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(written, "the write that was in flight still landed");
     }
 }
