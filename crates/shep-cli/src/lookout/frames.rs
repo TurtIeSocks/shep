@@ -33,6 +33,7 @@
 //! build, and cost nothing when they run under `cargo test`.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -1306,15 +1307,24 @@ fn settings_snapshot_for_gallery() -> SettingsSnapshot {
 fn settings_snapshot_with_dog_drift() -> SettingsSnapshot {
     SettingsSnapshot {
         dogs: vec![
+            // Both carry a real path, and they have to: `BUILT_IN_DOGS` is
+            // `["metrics", "bark"]`, and `dog_candidates` builds every
+            // other name out of `[daemon] adopted_dogs`, whose values ARE
+            // the paths. So a non-built-in dog with `adopted_path: None`
+            // is a row `load_settings` cannot produce from a document
+            // shep wrote (only a hand-edited non-string value could), and
+            // it rendered
+            // `built-in` for two dogs that are not. The spec's own decision
+            // 9 mockup gives these two paths.
             DogView {
                 name: "otel".to_string(),
                 enabled: false,
-                adopted_path: None,
+                adopted_path: Some(PathBuf::from("/usr/local/bin/shep-otel")),
             },
             DogView {
                 name: "ledger".to_string(),
                 enabled: true,
-                adopted_path: None,
+                adopted_path: Some(PathBuf::from("/opt/ledger/bin/dog")),
             },
             DogView {
                 name: "bark".to_string(),

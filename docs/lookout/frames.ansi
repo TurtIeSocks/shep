@@ -865,8 +865,8 @@ shep lookout   /home/ada/.shep                                                  
 [0m[38;5;245m  [dogs][0m                                                                                                                [0m
 [0m[38;5;245m  space arms, Enter applies; a dog needs no reload                                                                      [0m
 [0m[38;5;245m  NAME                                                                IN FILE  SOURCE                    RUNNING        [0m
-  otel                                                                no       built-in                  online         [0m
-  ledger                                                              yes      built-in                  not running    [0m
+  otel                                                                no       /usr/local/bin/shep-otel  online         [0m
+  ledger                                                              yes      /opt/ledger/bin/dog       not running    [0m
   bark                                                                yes      built-in                  silent         [0m
                                                                                                                         [0m
                                                                                                                         [0m

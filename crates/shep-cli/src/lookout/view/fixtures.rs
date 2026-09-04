@@ -2,6 +2,7 @@
 //! in one file rather than three.
 
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use ratatui::text::Line;
@@ -538,15 +539,20 @@ pub fn app_in_settings_with_dog_drift() -> App {
     app.update(Msg::Key(KeyPress::Settings));
     app.update(Msg::Settings {
         result: Ok(settings_snapshot_with_dogs(vec![
+            // Real paths, not `None`: `otel` and `ledger` are not in
+            // `BUILT_IN_DOGS`, so `dog_candidates` can only have built them
+            // from `[daemon] adopted_dogs`, and every value in that map is
+            // a path. A `None` here is a row the reader cannot produce
+            // from a document shep wrote.
             DogView {
                 name: "otel".to_string(),
                 enabled: false,
-                adopted_path: None,
+                adopted_path: Some(PathBuf::from("/usr/local/bin/shep-otel")),
             },
             DogView {
                 name: "ledger".to_string(),
                 enabled: true,
-                adopted_path: None,
+                adopted_path: Some(PathBuf::from("/opt/ledger/bin/dog")),
             },
         ])),
     });
@@ -590,7 +596,7 @@ fn settings_snapshot_for_toggle_tests() -> SettingsSnapshot {
         DogView {
             name: "otel".to_string(),
             enabled: true,
-            adopted_path: None,
+            adopted_path: Some(PathBuf::from("/usr/local/bin/shep-otel")),
         },
     ])
 }
