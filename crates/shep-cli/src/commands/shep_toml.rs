@@ -22,9 +22,16 @@
 //! after the same bug: two writers racing on `barks.jsonl` silently lost
 //! half of each other's records until an advisory lock landed there.
 //!
-//! `#[cfg(unix)]` wholesale, at `commands`' own declaration in `main.rs` —
-//! `flock(2)` and unix mode bits are both Unix-only, and Windows is shep's
-//! 0% tier where no verb runs at all.
+//! `commands` itself carries no platform gate -- `mod commands;` at
+//! `lib.rs` is unconditional, and there is no `main.rs` in this crate;
+//! Phase 15 made `shep` a library with three thin `[[bin]]` targets over
+//! it. `flock(2)` and unix mode bits are Unix-only, so each call site that
+//! needs one gates itself individually and carries a real Windows arm
+//! rather than an unimplemented one: [`ConfigLock`] and
+//! [`ConfigLock::acquire`] below are each `#[cfg(unix)]`/`#[cfg(windows)]`
+//! pairs (`flock(2)` against `share_mode(0)`), and [`create_home_dir`]
+//! folds a unix-only `.mode()` call into an otherwise portable
+//! `DirBuilder`.
 
 // `clippy::result_large_err` fires on every `Result<_, ShepTomlError>`
 // signature in this module on Windows, and on none of them on macOS or
@@ -559,38 +566,13 @@ impl ShepToml {
         Ok(())
     }
 
-    /// `[style] level`, or `None` when the document never wrote it -- the
-    /// distinction the whole settings screen rests on. A key written to
-    /// its own default is still `Some`, because [`DaemonConfig::load`]'s
+    /// `[daemon] log_json`, or `None` when the document never wrote it --
+    /// the distinction the whole settings screen rests on. A key written
+    /// to its own default is still `Some`, because [`DaemonConfig::load`]'s
     /// `#[serde(default)]` on every section makes that fact unrecoverable
     /// once the file is parsed into a config: only reading the document
-    /// directly, the way this reader and the five below it do, can still
-    /// tell "the operator wrote this" from "nobody ever did".
-    ///
-    /// The raw string as written -- `full`, `plain`, `bare`, or whatever
-    /// else an operator typed. Whether it names a real [`StyleLevel`] is
-    /// [`DaemonConfig::load`]'s question, not this reader's.
-    ///
-    /// `commands::settings` (task 3) turned out not to need this. The
-    /// screen's `[style]` row reads the already-resolved
-    /// `(StyleLevel, StyleSource)` pair `lib.rs`'s `resolve_style` hands
-    /// it, which is a stronger answer than re-parsing the document: it is
-    /// exactly the value and layer a running `shep style` would report,
-    /// and this reader cannot see `$SHEP_STYLE` or `--style` shadowing it.
-    /// No caller is scheduled yet. `#[allow(dead_code)]` says so
-    /// explicitly rather than inventing a call site nothing needs.
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn style_level(&self) -> Option<String> {
-        self.table("style")?
-            .get("level")?
-            .as_str()
-            .map(String::from)
-    }
-
-    /// `[daemon] log_json`, or `None` when the document never wrote it.
-    /// See [`Self::style_level`] for why absence and a written default are
-    /// two different facts, not one.
+    /// directly, the way this reader and its four siblings below do, can
+    /// still tell "the operator wrote this" from "nobody ever did".
     #[must_use]
     pub fn daemon_log_json(&self) -> Option<bool> {
         self.table("daemon")?.get("log_json")?.as_bool()
@@ -1490,7 +1472,6 @@ mod tests {
         assert_eq!(cfg.daemon_socket(), None);
         assert_eq!(cfg.daemon_max_cron_sleep(), None);
         assert_eq!(cfg.whistle_allow_control(), None);
-        assert_eq!(cfg.style_level(), None);
     }
 
     /// The distinction the screen rests on: a key written to its own default is

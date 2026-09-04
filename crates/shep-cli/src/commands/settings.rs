@@ -13,7 +13,7 @@
 //! document, not from [`DaemonConfig`]: every `[daemon]` and `[whistle]`
 //! section is `#[serde(default)]`, so a loaded config cannot tell "the
 //! operator wrote this at its own default value" from "nobody ever wrote
-//! it" -- see `shep_toml::ShepToml::style_level`'s own doc for that
+//! it" -- see `shep_toml::ShepToml::daemon_log_json`'s own doc for that
 //! argument in full. Reading a value out of a loaded [`DaemonConfig`] and
 //! calling it the file's would silently destroy the distinction this
 //! screen exists to show.
@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use shep_core::config::daemon::{DaemonSection, WhistleSection};
-use shep_core::config::{DaemonConfig, DaemonConfigError};
+use shep_core::config::{DaemonConfig, DaemonConfigError, parse_daemon_bool};
 use shep_core::values::UpDuration;
 
 use crate::commands::shep_toml::{ShepToml, ShepTomlError};
@@ -153,6 +153,20 @@ pub struct DogView {
 }
 
 /// What [`apply_setting`] can fail with.
+///
+/// `Debug` is derived rather than redacted (IR-41): [`Self::Config`]
+/// forwards to [`ShepTomlError`]'s own manually redacted `Debug`, which is
+/// where a secret in the document (a dog's webhook token in an
+/// un-migrated `[dog.<name>]` table) would actually surface, and
+/// [`Self::Invalid`] carries either `DaemonConfig::load`'s own refusal
+/// message or this module's own -- both describe a key and a rule, never
+/// a value read back out of the file.
+///
+/// Not `#[non_exhaustive]`, the same reasoning [`ShepTomlError`] states
+/// for itself in this same crate: shep-cli has no published surface, so
+/// there is no downstream `match` outside this binary for the attribute
+/// to protect, and every exhaustive `match` on this enum is one we want
+/// the compiler to break the moment a new failure mode is added.
 #[derive(Debug)]
 pub enum SettingError {
     /// [`ShepToml::try_edit`]'s own setup or write failed -- the lock, the
@@ -404,24 +418,20 @@ fn unset_field(doc: &mut ShepToml, field: SettingField) -> Result<(), SettingErr
     Ok(())
 }
 
-/// `"true"`/`"false"` only -- the same closed grammar
-/// [`shep_core::config::parse_daemon_bool`] accepts for `SHEP_LOG_JSON`,
-/// so a boolean typed into this screen and one set through the
-/// environment never silently disagree on what counts as valid.
+/// Delegates to [`parse_daemon_bool`] rather than hand-rolling a near
+/// duplicate: that function already accepts `"1"`/`"0"`/`"true"`/`"false"`
+/// for `SHEP_LOG_JSON`, and [`StyleLevel::parse`]'s own doc states the
+/// principle this follows -- the screen's grammar and the environment's
+/// grammar for the same field must never be able to silently disagree on
+/// what counts as valid input. An operator who knows `SHEP_LOG_JSON=1`
+/// works must not be refused typing `1` here.
 fn parse_bool_field(value: &str) -> Result<bool, SettingError> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(SettingError::Invalid(format!(
-            "{value} is not true or false"
-        ))),
-    }
+    parse_daemon_bool(value)
+        .ok_or_else(|| SettingError::Invalid(format!("{value} is not a valid boolean")))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::MetadataExt as _;
-
     use super::*;
 
     /// The style pair every test that does not care about `[style]` uses:
@@ -465,8 +475,13 @@ mod tests {
         );
     }
 
+    // `.ino()` needs `std::os::unix::fs::MetadataExt`, so this one test is
+    // unix-only; the CI Windows leg still runs the other six.
+    #[cfg(unix)]
     #[test]
     fn a_value_the_loader_refuses_leaves_the_file_byte_identical() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
         let before = "# mine\n[daemon]\nlog_level = \"debug\"\n";
