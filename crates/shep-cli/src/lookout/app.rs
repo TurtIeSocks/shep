@@ -3960,7 +3960,11 @@ mod tests {
         let _ = app.update(Msg::Key(KeyPress::FilterStart));
         let _ = app.update(Msg::Key(KeyPress::TextChar('w')));
         let _ = app.update(Msg::Key(KeyPress::TextChar('e')));
-        assert_eq!(app.mode(), InputMode::Text, "the box is open before the read lands");
+        assert_eq!(
+            app.mode(),
+            InputMode::Text,
+            "the box is open before the read lands"
+        );
         let _ = app.update(Msg::Settings {
             result: Ok(fixtures::settings_snapshot()),
         });
@@ -3970,11 +3974,7 @@ mod tests {
             InputMode::Normal,
             "the box must not survive the screen opening"
         );
-        assert_eq!(
-            app.filter(),
-            "we",
-            "the typed query is kept, not discarded"
-        );
+        assert_eq!(app.filter(), "we", "the typed query is kept, not discarded");
     }
 
     /// fails if `App::set_style` does not round trip exactly: the flag
