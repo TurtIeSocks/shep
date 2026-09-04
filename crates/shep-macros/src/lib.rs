@@ -57,9 +57,13 @@ const SECRET: &str = "secret";
 /// }
 /// ```
 ///
-/// The example is `ignore`d rather than run because `shep-client` depends on
-/// this crate, so this crate cannot depend back on it to compile a doctest.
-/// The derive's behaviour is tested in `shep-client`, where it is used.
+/// The example is `ignore`d because `shep_client::dogs::DogConfig` does not
+/// exist yet, so there is nothing for a doctest to import. That is a fact
+/// about today rather than a property of the crate: a dev-dependency cycle is
+/// allowed, since dev-dependencies sit outside the library build graph, so
+/// once the trait lands this should become a running doctest with
+/// `shep-client` as a dev-dependency. The derive's behaviour is tested in
+/// `shep-client`, where it is used.
 ///
 /// # What it expands to
 ///
