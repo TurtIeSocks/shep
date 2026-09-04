@@ -452,14 +452,18 @@ a field the running child holds parks as pending and `shep reload`/`shep
 restart` promote it, re-resolving identity only when `user` or `group` moved.
 **A reset can kill, and that is deliberate.** `instances` is Structural, held
 out of a plain load entirely and routed through `handle_scale` under any
-mode but `file`, whose `Ordering::Less` arm deletes the instances above the
+mode but `env`, whose `Ordering::Less` arm deletes the instances above the
 new count on the same path `shep delete` takes
-(`a_plain_load_never_scales_and_a_reset_does` pins it). The sharp edge: a
-Flockfile that never mentions `instances` still means 1 under `policy` or
-`all`, because that is the compiled default the reset falls back to, so an
-app stocked to four goes to one against a file that has no opinion about
-the count. `file` is the mode that survives this, because there is nothing
-declared to put back. The overrides page carries the warning. A `CFG`
+(`a_plain_load_never_scales_and_a_reset_does` pins it). `file` scales too,
+when the template declares `instances`: it takes the count on the same
+terms as every other key it declares. The sharp edge is the undeclared
+case. A Flockfile that never mentions `instances` still means 1 under
+`policy` or `all`, because that is the compiled default the reset falls
+back to, so an app stocked to four goes to one against a file that has no
+opinion about the count. `file` is the mode that survives that specific
+case, because `merge_declared` never puts an undeclared `instances` in
+scope, so there is nothing to put back. The overrides page carries the
+warning. A `CFG`
 column in `shep flock` and in `shep lookout` marks a sheep with pending
 (`!N`) or overridden (`*N`) fields, and `shep describe` lists the names. A
 per-app refusal exits non-zero. The four-way field classification lives in
