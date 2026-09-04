@@ -303,7 +303,7 @@ pub fn run_loop<E: EventSource, F: FlockSource, C: ConfigSource>(
                         // Ahead of the ordinary event arm, and matched on
                         // the variant rather than on the dog's name: the
                         // subscription is what narrows this to bark's own
-                        // topic (`config.dog.bark`), so a name check here
+                        // topic (`config.dog.<name>`), so a name check here
                         // would be a second place for the name to be
                         // wrong rather than a second line of defence.
                         Some(Ok(BusEvent::DogConfigChanged { .. })) => {
