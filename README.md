@@ -18,9 +18,10 @@ The face in the STATUS column is the fastest thing on the page to read:
 `(o.o)` online, `(o~o)` starting, `(>_<)` waiting to restart, `(-.-)` stopped,
 `(x.x)` errored.
 
-> Status: `0.1.24`, and pre-1.0 means anything can still change. macOS, Linux
-> and Windows. The Windows tier is the newest of the three, and the three
-> things it will not do are under [Windows](#windows) below.
+> Status: pre-1.0, so anything can still change. The version badge above is
+> the published one. macOS, Linux and Windows. The Windows tier is the newest
+> of the three, and the three things it will not do are under
+> [Windows](#windows) below.
 
 ## Install
 
@@ -28,6 +29,37 @@ The face in the STATUS column is the fastest thing on the page to read:
 cargo install shep
 shep welcome
 ```
+
+Homebrew, on macOS and Linux:
+
+```bash
+brew install shep-pm/shep/shep
+```
+
+Scoop, on Windows:
+
+```powershell
+scoop bucket add shep https://github.com/shep-pm/scoop-shep
+scoop install shep
+```
+
+Or take a prebuilt archive off any
+[release](https://github.com/shep-pm/shep/releases). Seven targets, each with
+its own `.sha256` beside it and all of them in one `SHA256SUMS`.
+
+Notes worth having before you pick:
+
+- The Homebrew formula compiles the tree, so the first install is minutes
+  rather than seconds. Scoop takes the published binary.
+- The formula ships no `brew services` definition. `shep startup` installs
+  shep's own launchd job, and running both would leave two pointed at one
+  shepherd.
+- On Windows `shep.exe` needs the Visual C++ redistributable, which Windows
+  does not carry. If it will not start, `scoop bucket add extras` and then
+  `scoop install extras/vcredist2022`. The bucket has to be added first, since
+  a fresh Scoop has only `main`.
+- Every channel installs all three binaries, `shep`, `shep-runtime` and
+  `shep-dev`, but only `shep` is put on your PATH by the Windows packages.
 
 ## Coming from pm2
 

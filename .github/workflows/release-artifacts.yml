@@ -303,10 +303,17 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $archive = 'shep-x86_64-pc-windows-msvc.zip'
-          gh release download $env:TAG --pattern "$archive.sha256" --dir sums
-          if ($LASTEXITCODE -ne 0) { throw "could not download $archive.sha256 from $env:TAG" }
+          # The sidecar drops the archive's extension rather than appending to
+          # it: upload-rust-binary-action names it after `archive:`, which is
+          # `shep-$target`. So it is `shep-x86_64-pc-windows-msvc.sha256`, and
+          # `$archive.sha256` would name a file no release carries. `gh release
+          # download` exits non-zero when a pattern matches nothing, so this
+          # failed the whole job the first time it ran for real.
+          $sidecar = 'shep-x86_64-pc-windows-msvc.sha256'
+          gh release download $env:TAG --pattern $sidecar --dir sums
+          if ($LASTEXITCODE -ne 0) { throw "could not download $sidecar from $env:TAG" }
           # sha256sum format: the hash, then whitespace, then the filename.
-          $checksum = (Get-Content "sums/$archive.sha256" -Raw).Trim().Split()[0]
+          $checksum = (Get-Content "sums/$sidecar" -Raw).Trim().Split()[0]
           if ($checksum -notmatch '^[0-9a-fA-F]{64}$') {
             throw "the sidecar for $archive did not start with a sha256: '$checksum'"
           }
@@ -491,9 +498,15 @@ jobs:
         run: |
           set -euo pipefail
           archive="shep-${TARGET}.tar.gz"
+          # Not "${archive}.sha256". The sidecar is named after the action's
+          # `archive:` input, `shep-$target`, with the extension replaced
+          # rather than appended. `gh release download` treats a pattern that
+          # matches nothing as an error, so getting this wrong fails the job.
+          sidecar="shep-${TARGET}.sha256"
           gh release download "$TAG" --pattern "$archive"
-          gh release download "$TAG" --pattern "${archive}.sha256"
-          sha256sum --check "${archive}.sha256"
+          gh release download "$TAG" --pattern "$sidecar"
+          # The line inside names the archive, so this checks the .tar.gz.
+          sha256sum --check "$sidecar"
           # Where `cargo deb --no-build --target` looks for them.
           mkdir -p "target/${TARGET}/release"
           tar -xzf "$archive" -C "target/${TARGET}/release" \
@@ -561,8 +574,16 @@ jobs:
           set -euo pipefail
           version="${TAG#shep-v}"
           archive=shep-x86_64-pc-windows-msvc.zip
-          gh release download "$TAG" --pattern "${archive}.sha256" --dir sums
-          hash="$(cut -d' ' -f1 < "sums/${archive}.sha256")"
+          # Not "${archive}.sha256". The sidecar takes the action's `archive:`
+          # name, `shep-$target`, and adds `.sha256` to that rather than to the
+          # archive filename. A pattern matching nothing is an error in `gh
+          # release download`, which is how this job failed the first time it
+          # ran against a real release.
+          sidecar=shep-x86_64-pc-windows-msvc.sha256
+          gh release download "$TAG" --pattern "$sidecar" --dir sums
+          # `<hash> *<file>` on Windows archives, two spaces elsewhere. Either
+          # way the hash is the first space-separated field.
+          hash="$(cut -d' ' -f1 < "sums/$sidecar")"
           # All 64 characters, anchored. A `case` glob is a prefix match, so
           # `[0-9a-fA-F]*` accepted a truncated sidecar and would have put a
           # one-character hash in the bucket, where every install of that

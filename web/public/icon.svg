@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="shep">
+  <!-- The favicon at web/public/favicon.svg, padded to a square and given a
+       backdrop. The mark's own viewBox is 104x78 and its body is cream, so on
+       a white package page it is both the wrong shape and nearly invisible.
+       The backdrop is the meadow token from web/src/styles/tokens.css.
+       icon.png is rasterised from this file at 256x256; regenerate it if this
+       changes. The Chocolatey package's iconUrl points at that PNG on
+       shep-pm.com, so it has to stay at this path. -->
+  <rect width="128" height="128" rx="24" fill="#2e8b57"/>
+  <g transform="translate(4,12.75) scale(1.25)">
+    <g fill="#17251C">
+      <rect x="40" y="52" width="8" height="21" rx="4"/>
+      <rect x="66" y="52" width="8" height="21" rx="4"/>
+    </g>
+    <path d="M40 20c6-9 22-10 28-2 10-3 19 4 18 13 7 4 7 15-1 19-2 8-12 11-19 8-8 5-21 4-26-3-10 1-17-7-15-16-4-8 4-18 15-19Z" fill="#FFFDF5" stroke="#17251C" stroke-width="4" stroke-linejoin="round"/>
+    <ellipse cx="26" cy="34" rx="9" ry="7" transform="rotate(-28 26 34)" fill="#17251C"/>
+    <ellipse cx="27" cy="48" rx="15" ry="14" fill="#17251C"/>
+    <circle cx="22" cy="45" r="3" fill="#FFFDF5"/>
+    <circle cx="21.4" cy="45.6" r="1.4" fill="#17251C"/>
+  </g>
+</svg>

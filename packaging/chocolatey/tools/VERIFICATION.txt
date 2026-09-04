@@ -16,8 +16,9 @@ download the same archive and compare:
   Get-FileHash shep-x86_64-pc-windows-msvc.zip -Algorithm SHA256
 
 The same value is published beside the archive on the release as
-shep-x86_64-pc-windows-msvc.zip.sha256, and again in that release's
-SHA256SUMS.
+shep-x86_64-pc-windows-msvc.sha256, and again in that release's SHA256SUMS.
+The sidecar drops the archive's extension rather than appending to it, so
+there is no shep-x86_64-pc-windows-msvc.zip.sha256 to fetch.
 
 The binaries are built from tagged source by
 .github/workflows/release-artifacts.yml, which also records Sigstore build

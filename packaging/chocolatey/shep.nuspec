@@ -16,12 +16,13 @@
     <bugTrackerUrl>https://github.com/shep-pm/shep/issues</bugTrackerUrl>
     <licenseUrl>https://github.com/shep-pm/shep#license</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
-    <!-- No iconUrl yet. It is a validator Guideline (CPMR0033) rather than a
-         Requirement, so the package is approvable without one, and shep has
-         no artwork to point at: web/public/ carries favicon.ico and
-         favicon.svg, neither of which is a PNG. When artwork exists, CPMR0076
-         forbids linking a raw GitHub URL, so it has to go through a CDN such
-         as jsdelivr or Statically. -->
+    <!-- web/public/favicon.svg, padded to a square and put on the site's
+         meadow green. The source is web/public/icon.svg and the PNG beside it
+         is rasterised from that at 256x256. Served from shep-pm.com rather
+         than from raw.githubusercontent.com, which CPMR0076 forbids: the site
+         is GitHub Pages behind a CDN, and the file is in web/public/ so an
+         Astro build copies it to the site root. -->
+    <iconUrl>https://shep-pm.com/icon.png</iconUrl>
     <copyright>Copyright (c) TurtIeSocks</copyright>
     <!-- Spaces, never commas (CPMR0014), and no "chocolatey" (CPMR0048). -->
     <tags>shep process-manager supervisor daemon cli rust pm2 foreground service</tags>
@@ -71,6 +72,15 @@ case, so they are installed without shims.
 stopping your processes on your behalf. Run `shep kill` first.
 ]]></description>
     <releaseNotes>https://github.com/shep-pm/shep/releases</releaseNotes>
+    <!-- shep.exe imports VCRUNTIME140.dll, which ships with the Visual C++
+         redistributable rather than with Windows. Rust's MSVC targets link the
+         CRT dynamically unless the build sets `+crt-static`, and this one does
+         not, so a machine without the redistributable fails to start the
+         binary at all. Verified by reading the import strings out of the
+         shep-x86_64-pc-windows-msvc.zip that shep-v0.1.25 published. -->
+    <dependencies>
+      <dependency id="vcredist140" />
+    </dependencies>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />
