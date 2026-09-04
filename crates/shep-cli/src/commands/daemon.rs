@@ -333,9 +333,23 @@ pub async fn boot_supervisor(
     let notify_socket: Option<std::ffi::OsString> = None;
     let mut options = boot_options(&config, args, notify_socket.as_deref());
     options.delete_flock_on_shutdown = delete_flock_on_shutdown;
-    boot(TokioRunner::new(), paths, options)
+    let daemon = boot(TokioRunner::new(), paths, options)
         .await
-        .map_err(DaemonRunError::Boot)
+        .map_err(DaemonRunError::Boot)?;
+    // The one publisher of `config.dog.<name>` in the workspace, and it is
+    // here because this is where the bus is: the migration above ran before
+    // `boot`, in a process that had none yet, so the announcement waits for
+    // the daemon it will travel through. A dog that attaches after this
+    // frame has gone out has not missed anything -- it asks for its section
+    // at startup, and the section it gets is the moved one.
+    //
+    // The other two writers of `dogs.toml` deliberately say nothing, each
+    // for its own reason, and both carry that reason at their own call site:
+    // `reload_with_wait`'s pre-flight below, and `forget_dog_section` in
+    // `commands::dogs`. Neither is fixable by routing a CLI write through a
+    // request variant, and neither wants to be.
+    daemon.context().announce_dog_config(&moved);
+    Ok(daemon)
 }
 
 /// Runs the supervisor in this process until a signal or `KillDaemon`.
@@ -715,6 +729,22 @@ async fn reload_with_wait(
     // This is the CLI process, and nothing below has signalled the
     // predecessor yet, so a refusal here ends the verb with the running
     // shepherd untouched -- which is the whole point.
+    //
+    // NO `config.dog.<name>` frame goes out from here, unlike the same
+    // call in `boot_supervisor` above, and that is the deliberate half.
+    // This is an operator's own short-lived process: it has no bus, and
+    // the daemon's bus is not something a client may publish onto. Adding
+    // a request variant so a CLI write could reach it would put an
+    // announcement anything holding the socket can forge next to one the
+    // daemon makes about work it did itself. Nothing is lost by the
+    // silence: this pre-flight is followed immediately by the handover it
+    // is clearing the way for, and the migration relocates values without
+    // changing any of them. A dog that re-reads its section against the
+    // successor finds the same settings in the new file, and a dog that
+    // never re-reads is already holding them. Both exist: bark's event
+    // source ends on a handover, so it exits and comes back up reading
+    // `dogs.toml`, while metrics redials underneath a `ReconnectingClient`,
+    // keeps its pid and its `restarts 0`, and reads no config again.
     match dog_migration::migrate_dog_sections(paths) {
         Ok(moved) if moved.is_empty() => {}
         Ok(moved) => {

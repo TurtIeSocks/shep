@@ -251,6 +251,7 @@ pub struct Handovers {
     hellos: Arc<Mutex<Vec<Hello>>>,
     envelopes: Arc<Mutex<Vec<(u32, Envelope)>>>,
     armed_list: Arc<Mutex<Vec<ProcessInfo>>>,
+    armed_dog_section: Arc<Mutex<String>>,
     task: JoinHandle<()>,
 }
 
@@ -305,6 +306,17 @@ impl Handovers {
     pub fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
         *self.armed_list.lock().unwrap() = flock;
     }
+
+    /// Arms the `[<name>]` section every generation answers
+    /// `Request::DogConfig` with. Empty until a test says otherwise, which
+    /// is what a home with no dog configured really answers.
+    ///
+    /// Not consumed, for the same reason [`Self::reply_to_list`] is not: a
+    /// dog asks its own section again after a handover, and again whenever
+    /// a `config.dog.<name>` frame tells it to.
+    pub fn reply_to_dog_config(&self, section: &str) {
+        *self.armed_dog_section.lock().unwrap() = section.to_owned();
+    }
 }
 
 impl Drop for Handovers {
@@ -332,6 +344,7 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
     let hellos: Arc<Mutex<Vec<Hello>>> = Arc::new(Mutex::new(Vec::new()));
     let envelopes: Arc<Mutex<Vec<(u32, Envelope)>>> = Arc::new(Mutex::new(Vec::new()));
     let armed_list: Arc<Mutex<Vec<ProcessInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let armed_dog_section: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
     let task = tokio::spawn({
         let cut_on_next_request = Arc::clone(&cut_on_next_request);
@@ -339,6 +352,7 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
         let hellos = Arc::clone(&hellos);
         let envelopes = Arc::clone(&envelopes);
         let armed_list = Arc::clone(&armed_list);
+        let armed_dog_section = Arc::clone(&armed_dog_section);
         async move {
             let mut generation: u32 = 0;
             while let Ok(stream) = listener.accept().await {
@@ -387,6 +401,14 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
                                     Response::Flock(armed_list.lock().unwrap().clone())
                                 }
                                 Request::Subscribe { .. } => Response::Subscribed,
+                                // A real answer rather than the `Pong`
+                                // below, because a dog refuses to run on a
+                                // reply it cannot parse: this is the first
+                                // request every dog makes, and a fixture
+                                // that fumbles it never sees the second.
+                                Request::DogConfig { .. } => Response::DogSection {
+                                    toml: armed_dog_section.lock().unwrap().clone().into(),
+                                },
                                 _ => Response::Pong,
                             };
                             write_reply(&mut frames, id, response).await;
@@ -405,6 +427,7 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
         hellos,
         envelopes,
         armed_list,
+        armed_dog_section,
         task,
     }
 }

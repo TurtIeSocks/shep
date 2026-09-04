@@ -362,6 +362,16 @@ jobs:
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: 'cargo test -p shep-daemon --locked --no-default-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # shep-client's `schema` feature is ON by default and a dog is
+      # allowed to turn it off, so the opt-out needs a leg of its own: the
+      # shep-daemon line above says nothing about it. Without one, the
+      # crate's `#[cfg(test)] mod tests` named `schemars` in a build that
+      # has no schemars and nothing noticed, because the task gate is
+      # `--all-features`. `cargo test` rather than `cargo check`, both to
+      # match the line above and because the doctest was broken the same
+      # way and only a doctest run reads it.
+      - run: cargo test -p shep-client --locked --no-default-features
+        if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: 'cargo test --workspace --locked --all-features -- --skip ::slow:: --skip two_concurrent_boots --skip signal_ignored_then_kill_tree_reaps --skip a_reload_costs_a'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
   # Tests that need a quiet machine, run serially in a job of their own.

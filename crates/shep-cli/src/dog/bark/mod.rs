@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use shep_client::RequestError;
+use shep_client::dogs::DogConfig;
 use shep_core::barks::{self, SinkOutcome};
 use shep_core::protocol::{BusEvent, ProcessInfo};
 use shep_core::values::UpDuration;
@@ -52,10 +53,19 @@ use crate::exit::ExitCode;
 /// `deny_unknown_fields`: a misspelled key must be a startup error naming
 /// it, the same reasoning [`super::metrics::MetricsConfig`] gives for its
 /// own section.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, schemars::JsonSchema, DogConfig)]
 #[serde(deny_unknown_fields, default)]
 pub struct BarkConfig {
     /// Named sinks, `[dog.bark.sinks]`.
+    ///
+    /// Marked whole, not per URL, and the difference is where the mark
+    /// lands. `#[shep(secret)]` names a field of THIS type, and the URL is
+    /// a field of [`Sink`] one level down, so a mark there is absent from
+    /// the schema shep generates for [`BarkConfig`]: every sink would go
+    /// out with its bearer token as an ordinary string. Marking the map
+    /// says less than marking each URL would, and it says it about the
+    /// type shep actually asks. Over-redacting is the safe direction.
+    #[shep(secret)]
     pub sinks: BTreeMap<String, Sink>,
     /// Named rules, `[[dog.bark.rules]]`. Empty means
     /// [`Rules::default_rules`].
@@ -137,6 +147,49 @@ pub trait FlockSource: Send + Sync {
     fn flock(&self) -> impl Future<Output = Result<Vec<ProcessInfo>, RequestError>> + Send;
 }
 
+/// What bark re-asks its own `[bark]` section through, so a config change
+/// is drivable without a socket.
+///
+/// The shepherd publishes `config.dog.bark` and says nothing about what
+/// changed (`BusEvent::DogConfigChanged`), so the frame is a prompt and
+/// this trait is the answer to it: one `Request::DogConfig` for bark's own
+/// section, which is the only section that request ever answers with.
+///
+/// `Sync` for the same reason [`FlockSource`] is: [`run_loop`]'s own future
+/// holds a `&C` across the `.await` in [`reloaded_config`].
+pub trait ConfigSource: Send + Sync {
+    /// This dog's `[bark]` section as it stands now, empty when the file
+    /// has no such section.
+    ///
+    /// # Errors
+    /// Whatever the underlying source could not answer with -- for the
+    /// production implementation, whatever `Request::DogConfig` failed
+    /// with.
+    fn section(&self) -> impl Future<Output = Result<String, RequestError>> + Send;
+}
+
+/// The rule set a `[bark]` section means: its own rules, or
+/// [`rules::Rules::default_rules`] when it configured none.
+///
+/// One function rather than two copies, because it is asked twice now: at
+/// startup by `dog::run_bark`, and again on every `config.dog.bark` frame
+/// by [`run_loop`]. A change that gave a reloading bark different defaults
+/// from a starting one would be invisible until the alert it silently
+/// stopped sending.
+///
+/// # Errors
+/// - [`rules::RulesError`] -- as [`rules::Rules::new`]: a rule routing to a
+///   sink the section does not define, an unknown event kind, or an
+///   insecure webhook scheme.
+pub fn rules_for(config: &BarkConfig) -> Result<Rules, rules::RulesError> {
+    let rule_list = if config.rules.is_empty() {
+        Rules::default_rules(&config.sinks)
+    } else {
+        config.rules.clone()
+    };
+    Rules::new(rule_list, &config.sinks)
+}
+
 /// Bark's loop: subscribe for speed, poll for correctness.
 ///
 /// **A dropped frame polls immediately** rather than waiting for the next
@@ -180,16 +233,17 @@ pub trait FlockSource: Send + Sync {
 /// the caller's `config`/`barks_path` outlive. Callers still `.await` or
 /// `tokio::spawn` the result exactly as they would an `async fn` — the
 /// sugar difference is invisible at every call site in this module.
-pub fn run_loop<E: EventSource, F: FlockSource>(
+pub fn run_loop<E: EventSource, F: FlockSource, C: ConfigSource>(
     events: E,
     flock: F,
     rules: Rules,
     config: &BarkConfig,
     barks_path: &Path,
-) -> impl Future<Output = ExitCode> + Send + use<E, F> {
-    let sinks = Arc::new(config.sinks.clone());
-    let sink_timeout = config.sink_timeout.as_duration();
-    let max_bytes = config.history_bytes;
+    config_source: C,
+) -> impl Future<Output = ExitCode> + Send + use<E, F, C> {
+    let mut sinks = Arc::new(config.sinks.clone());
+    let mut sink_timeout = config.sink_timeout.as_duration();
+    let mut max_bytes = config.history_bytes;
     // `interval_at`, not `interval`: a plain `tokio::time::interval` fires
     // its first tick immediately, which would make every dog poll once at
     // startup for no reason attributable to either a drop or the interval
@@ -197,7 +251,7 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
     // by one of those two, never by the timer's own startup quirk —
     // `a_dropped_frame_makes_bark_poll_and_catch_up` is built entirely on
     // being able to say "the poll ran because of the lag."
-    let poll_period = config.poll.as_duration();
+    let mut poll_period = config.poll.as_duration();
     let barks_path = Arc::new(barks_path.to_path_buf());
 
     async move {
@@ -246,6 +300,47 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
                         // carries it, under "The bark dog still restarts
                         // once per reload".
                         None => break,
+                        // Ahead of the ordinary event arm, and matched on
+                        // the variant rather than on the dog's name: the
+                        // subscription is what narrows this to bark's own
+                        // topic (`config.dog.<name>`), so a name check here
+                        // would be a second place for the name to be
+                        // wrong rather than a second line of defence.
+                        Some(Ok(BusEvent::DogConfigChanged { .. })) => {
+                            if let Some((next, next_rules)) = reloaded_config(&config_source).await {
+                                // In place, never a restart. Sinks and
+                                // rules are pure data with no OS resource
+                                // attached, so nothing here has to be
+                                // rebound or reopened -- the metrics dog's
+                                // `bind` is the case that would. A bark
+                                // that answered a config change by exiting
+                                // would add a restart to the column an
+                                // operator reads as instability, and would
+                                // have to say so in this log to be told
+                                // apart from a crash loop.
+                                sinks = Arc::new(next.sinks.clone());
+                                sink_timeout = next.sink_timeout.as_duration();
+                                max_bytes = next.history_bytes;
+                                // Rebuilt, which resets each rule's
+                                // per-subject debounce: a subject already
+                                // alerted on can alert once more straight
+                                // after a change. The alternative is
+                                // carrying state across a rule set the
+                                // operator may have renumbered, where
+                                // index 0 no longer means the rule it did
+                                // when the debounce was recorded.
+                                rules = next_rules;
+                                if next.poll.as_duration() != poll_period {
+                                    poll_period = next.poll.as_duration();
+                                    poll_interval = tokio::time::interval_at(
+                                        tokio::time::Instant::now() + poll_period,
+                                        poll_period,
+                                    );
+                                    poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                                }
+                                eprintln!("shep dog bark: reloaded [bark] from dogs.toml");
+                            }
+                        }
                         Some(Ok(event)) => {
                             let firings = rules.on_event(&event, now_ms());
                             spawn_firings(firings, &sinks, &append_lock, &barks_path, sink_timeout, max_bytes);
@@ -265,6 +360,46 @@ pub fn run_loop<E: EventSource, F: FlockSource>(
         }
 
         ExitCode::Success
+    }
+}
+
+/// Re-asks `source` for `[bark]` and rebuilds what a config change can
+/// swap, or `None` when the answer cannot be used.
+///
+/// Every failure is reported and dropped rather than propagated: a dog
+/// that exited on a bad edit would stop alerting at exactly the moment an
+/// operator is editing config, and the section it was already running on
+/// is still a working one. What reaches stderr is the FACT and the
+/// parser's own position, never the section: `[bark]` carries webhook URLs
+/// that are themselves bearer credentials.
+async fn reloaded_config<C: ConfigSource>(source: &C) -> Option<(BarkConfig, Rules)> {
+    let section = match source.section().await {
+        Ok(section) => section,
+        Err(err) => {
+            eprintln!("shep dog bark: could not re-read [bark] from the shepherd: {err}");
+            return None;
+        }
+    };
+    // Empty means the section is gone, which is a legitimate edit and not
+    // a failure -- the same reading `DogRuntime::config` gives it at
+    // startup. bark keeps running with no sinks and no rules.
+    let config = if section.is_empty() {
+        BarkConfig::default()
+    } else {
+        match toml::from_str::<BarkConfig>(&section) {
+            Ok(config) => config,
+            Err(_err) => {
+                eprintln!("shep dog bark: [bark] in dogs.toml does not parse; see `shep dogs`");
+                return None;
+            }
+        }
+    };
+    match rules_for(&config) {
+        Ok(rules) => Some((config, rules)),
+        Err(err) => {
+            eprintln!("shep dog bark: keeping the running rules; the new ones are refused: {err}");
+            None
+        }
     }
 }
 
@@ -425,6 +560,48 @@ mod tests {
     use super::*;
     use crate::http::{HttpRequest, read_request, write_response};
 
+    /// The sinks map carries the credential marker, and the rules beside
+    /// it do not.
+    ///
+    /// Marked at the map rather than at each `Sink`'s `url`, because
+    /// `#[shep(secret)]` names a field of the type being asked and the URL
+    /// belongs to a type one level down. See [`BarkConfig::sinks`]. The key
+    /// is spelled out rather than read from `shep_core::dogs::SECRET_KEY`
+    /// for the reason `sinks.rs`'s own marker test gives.
+    ///
+    /// `Rule` is checked where it lives, under `$defs`, and not only as the
+    /// `rules` array at the top level. The array was never going to be
+    /// marked and pinning it said nothing: `Rule::sinks` shares a name with
+    /// the credential above it, so the definition is the one place a marker
+    /// could land on a list of sink names.
+    #[test]
+    fn the_bark_schema_marks_the_sinks_map_and_leaves_the_rules_plain() {
+        let schema = shep_client::dogs::config_schema::<BarkConfig>()
+            .expect("`sinks` is a property of this type");
+        let schema = schema.as_value();
+
+        assert_eq!(
+            schema.pointer("/properties/sinks/x-shep-secret"),
+            Some(&serde_json::Value::Bool(true)),
+            "every sink holds a webhook URL, which is a bearer credential"
+        );
+        assert_eq!(
+            schema.pointer("/properties/rules/x-shep-secret"),
+            None,
+            "a rule names sinks and holds no credential of its own"
+        );
+        assert!(
+            schema.pointer("/$defs/Rule/properties/sinks").is_some(),
+            "the pointer below is only a check while `Rule` still has this \
+             shape, so a rename that moved it must fail here first"
+        );
+        assert_eq!(
+            schema.pointer("/$defs/Rule/properties/sinks/x-shep-secret"),
+            None,
+            "a rule's sinks are names, and a name is not a credential"
+        );
+    }
+
     /// [`EventSource`] over the real thing bark's local subscription lags
     /// on: a `tokio::sync::broadcast::Receiver`. Only ever built by tests —
     /// the production path implements this trait for
@@ -469,6 +646,37 @@ mod tests {
         }
     }
 
+    /// A [`ConfigSource`] answering one fixed `[bark]` section, counting
+    /// how many times it was asked. The count is what proves the loop
+    /// RE-ASKS on a `config.dog.bark` frame rather than acting on the frame
+    /// itself: shep publishes that a section changed and nothing about what
+    /// changed, so a loop that did not ask learned nothing.
+    #[derive(Clone)]
+    struct ScriptedConfig {
+        section: Arc<String>,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl ScriptedConfig {
+        fn answering(section: String) -> Self {
+            Self {
+                section: Arc::new(section),
+                calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ConfigSource for ScriptedConfig {
+        async fn section(&self) -> Result<String, RequestError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((*self.section).clone())
+        }
+    }
+
     /// Binds an ephemeral port, accepts exactly one connection, answers
     /// `status`/`body`, and hands the captured request back through the
     /// returned receiver. The same shape `sinks.rs`'s own test module
@@ -497,50 +705,26 @@ mod tests {
 
     /// Accepts exactly one connection and then never answers it — up, but
     /// stalled forever, exactly the shape `sink_timeout` exists for.
-    async fn slow_sink() -> SocketAddr {
+    /// A sink that accepts a connection and then never answers, plus a
+    /// signal that fires the moment it has accepted one.
+    ///
+    /// The signal is what lets a caller assert an ORDER rather than a
+    /// duration. Without it the only way to say "the fast sink was not stuck
+    /// behind the slow one" is to bound the fast sink's arrival by a wall
+    /// clock, which is a claim about how quickly a runner schedules two
+    /// tasks rather than about the loop.
+    async fn slow_sink() -> (SocketAddr, tokio::sync::oneshot::Receiver<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (connected, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (_stream, _peer) = listener.accept().await.unwrap();
+            // Ignored: the receiver is dropped by any caller that does not
+            // care, and this task's job afterwards is to never answer.
+            let _ = connected.send(());
             core::future::pending::<()>().await;
         });
-        addr
-    }
-
-    /// Awaits `fut` against `timeout`, under a genuinely real clock rather
-    /// than the paused one `#[tokio::test(start_paused = true)]` installs.
-    ///
-    /// Bridges through [`tokio::task::spawn_blocking`] — the technique
-    /// `tokio::time::pause`'s own doc names under "Preventing auto-advance"
-    /// — because a plain `tokio::time::timeout(..).await` races real
-    /// socket I/O against the paused clock's auto-advance and reliably
-    /// LOSES: with nothing else runnable, tokio jumps straight from "now"
-    /// to the next pending timer's deadline in one step (confirmed against
-    /// `tokio` 1.53's own `time::park_thread_timeout`, which does exactly
-    /// one non-blocking, zero-duration I/O poll before deciding to jump —
-    /// not a bounded real wait), and a loopback TCP round trip does not
-    /// finish inside that single zero-duration poll. `spawn_blocking`
-    /// inhibits auto-advance for as long as it runs (tokio tracks this
-    /// with a plain counter — see `Clock::inhibit_auto_advance`), so the
-    /// nested `Handle::block_on` below waits out `timeout` on the ACTUAL
-    /// wall clock while this test's spawned server and this dog's own
-    /// delivery task keep running normally on the runtime's own worker
-    /// thread, freed by the calling test task moving off it.
-    ///
-    /// A bare `tokio::time::timeout` loses this race 100% of the time under
-    /// a paused clock, never intermittently: a minimal reproduction (two
-    /// tasks, a real `TcpListener`, nothing else) confirmed it. The
-    /// property each test asserts — a real delivery over a real socket
-    /// happened — is unchanged; only the mechanism used to wait for it
-    /// without fighting the paused clock is different.
-    async fn await_real_io<T: Send + 'static>(
-        timeout: Duration,
-        fut: impl Future<Output = T> + Send + 'static,
-    ) -> Result<T, tokio::time::error::Elapsed> {
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || handle.block_on(tokio::time::timeout(timeout, fut)))
-            .await
-            .expect("the spawn_blocking bridge task must not itself panic")
+        (addr, rx)
     }
 
     fn base_info(name: &str, status: ProcStatus, restarts: u32) -> ProcessInfo {
@@ -640,9 +824,19 @@ mod tests {
     /// THE test this dog exists for. fails if the poll is only ever driven
     /// by its interval: `web`'s `errored` frame is genuinely dropped by a
     /// real broadcast channel, so a loop that reconciles on a timer alone
-    /// stays silent for the whole poll interval — and under a paused clock,
-    /// forever.
-    #[tokio::test(start_paused = true)]
+    /// stays silent for the whole poll interval, which this fixture sets to
+    /// 60s.
+    ///
+    /// A real clock, and the 60s is what replaces the paused one. This test
+    /// used to pause the clock and wait through a `spawn_blocking` bridge,
+    /// a combination in which the deadline could never elapse: the bridge
+    /// inhibits auto-advance, so nothing moved the virtual clock to the
+    /// timeout and a regression hung the suite instead of failing it.
+    /// Measured, by making `spawn_firings` a no-op: over a minute, then
+    /// killed by hand. Nothing here needs the clock stopped. No interval can
+    /// fire inside a test that finishes in milliseconds, so the poll below
+    /// is still attributable to the lag and to nothing else.
+    #[tokio::test]
     async fn a_dropped_frame_makes_bark_poll_and_catch_up() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
         for i in 0..64 {
@@ -673,9 +867,13 @@ mod tests {
             gave_up_rules(),
             &config_with_sink(addr, &barks_path),
             &barks_path,
+            // Never asked: no `config.dog.bark` frame is sent here, and
+            // `calls()` in the config test is what proves the loop only
+            // asks when one is.
+            ScriptedConfig::answering(String::new()),
         ));
 
-        let req = await_real_io(Duration::from_secs(5), captured)
+        let req = tokio::time::timeout(Duration::from_secs(5), captured)
             .await
             .expect("a dropped frame must produce a delivered bark")
             .unwrap();
@@ -687,16 +885,13 @@ mod tests {
         // building the outcome, appending to `barks.jsonl`). A short,
         // bounded poll — not a sleep the test just hopes is long enough —
         // covers that ordinary scheduling gap.
-        let recorded = await_real_io(Duration::from_secs(5), {
-            let barks_path = barks_path.clone();
-            async move {
-                loop {
-                    let records = shep_core::barks::read(&barks_path).unwrap();
-                    if !records.is_empty() {
-                        break records;
-                    }
-                    tokio::task::yield_now().await;
+        let recorded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let records = shep_core::barks::read(&barks_path).unwrap();
+                if !records.is_empty() {
+                    break records;
                 }
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -708,8 +903,8 @@ mod tests {
         assert_eq!(
             flock.calls(),
             1,
-            "the poll ran because of the lag, not because an interval elapsed \
-             — the clock is paused, so no interval has"
+            "the poll ran because of the lag, not because an interval elapsed: \
+             the interval is 60s and this test is milliseconds old"
         );
 
         loop_handle.abort();
@@ -783,11 +978,34 @@ mod tests {
     /// before the loop is given a chance to run either delivery to
     /// completion. If firings were awaited inline rather than spawned, the
     /// fast sink could only be reached after the slow one's own
-    /// `sink_timeout` (10s of virtual time) elapsed; this asserts it is
-    /// reached in well under that, with no timer needing to fire at all.
-    #[tokio::test(start_paused = true)]
+    /// `sink_timeout` elapsed; this asserts it is reached in well under
+    /// that.
+    ///
+    /// A real clock, for the reason
+    /// `a_dropped_frame_makes_bark_poll_and_catch_up` gives above: the
+    /// paused one it used to run under could not elapse the deadline it was
+    /// given, so an inline-awaiting loop would have hung here rather than
+    /// failed.
+    ///
+    /// No duration carries the meaning, though, which is the part worth
+    /// reading. The proof is an ORDER: the slow sink signals that it has
+    /// accepted and parked, and the fast sink is reached AFTER that. An
+    /// inline-awaiting loop could not do it, because it would still be
+    /// parked on the slow delivery. `sink_timeout` is ten minutes here for
+    /// the same reason the poll above is 60s, to make the elapsed-time path
+    /// to success unreachable inside a test that finishes in milliseconds,
+    /// so a timeout firing is the only thing that can end this test early
+    /// and it can only end it in failure.
+    ///
+    /// An earlier revision bounded the fast sink at 2s against a 10s
+    /// `sink_timeout` and called five times under the timeout the whole
+    /// meaning. It was defensible and it was still a claim about how fast a
+    /// contended runner schedules two tasks, which is what this project has
+    /// lost CI runs to. The timeouts below are failure guards now and
+    /// nothing else, so their exact values do not change what passes.
+    #[tokio::test]
     async fn a_slow_sink_never_stalls_the_loop() {
-        let slow_addr = slow_sink().await;
+        let (slow_addr, slow_connected) = slow_sink().await;
         let (fast_addr, fast_captured) = one_shot_sink(200, "").await;
         let dir = tempfile::tempdir().unwrap();
         let barks_path = dir.path().join("barks.jsonl");
@@ -830,7 +1048,7 @@ mod tests {
             rules: Vec::new(),
             poll: UpDuration::from_millis(60_000),
             history_bytes: barks::DEFAULT_MAX_BYTES,
-            sink_timeout: UpDuration::from_millis(10_000),
+            sink_timeout: UpDuration::from_millis(600_000),
         };
 
         let (tx, rx) = tokio::sync::broadcast::channel(8);
@@ -839,13 +1057,33 @@ mod tests {
             .unwrap();
 
         let flock = ScriptedFlock::answering(Vec::new());
-        let loop_handle = tokio::spawn(run_loop(rx, flock, rules, &config, &barks_path));
+        let loop_handle = tokio::spawn(run_loop(
+            rx,
+            flock,
+            rules,
+            &config,
+            &barks_path,
+            ScriptedConfig::answering(String::new()),
+        ));
 
-        let req = await_real_io(Duration::from_millis(50), fast_captured)
+        // The order is the assertion. First the slow sink confirms it has a
+        // connection and is parked on it, so the loop is provably mid-delivery
+        // to a sink that will never answer.
+        tokio::time::timeout(Duration::from_secs(30), slow_connected)
+            .await
+            .expect("the slow sink must be reached at all, or this test proves nothing")
+            .unwrap();
+
+        // Then the fast sink is reached anyway. A loop awaiting firings inline
+        // could not get here: it would still be parked on the delivery above,
+        // for the ten minutes `sink_timeout` allows it. Both timeouts are
+        // failure guards, so their values change how long a broken loop takes
+        // to report, never what passes.
+        let req = tokio::time::timeout(Duration::from_secs(30), fast_captured)
             .await
             .expect(
-                "the fast sink must be reached promptly; a slow sink in flight \
-                 must not stall the loop",
+                "the fast sink must be reached while a slow sink is still in \
+                 flight; a slow sink must not stall the loop",
             )
             .unwrap();
         assert_eq!(req.method, "POST");
@@ -920,5 +1158,78 @@ sinks = ["oncall"]
         // against the sinks parsed alongside them — the parse succeeding
         // is necessary but not sufficient for the dog to actually start.
         Rules::new(config.rules, &config.sinks).expect("both documented rules route to real sinks");
+    }
+
+    /// fails if a `config.dog.bark` frame does not reach bark's sinks. The
+    /// swap is observable at the only place it matters: the next firing is
+    /// delivered to the sink the NEW section names, over a real socket,
+    /// while the old sink's server is still up and receives nothing.
+    ///
+    /// The loop is the same loop throughout, which is the other half of
+    /// what this pins. bark answers a config change in place because its
+    /// config is sinks and rules, pure data with no OS resource attached;
+    /// a bark that restarted itself instead would add a restart to the
+    /// column an operator reads as instability.
+    ///
+    /// A real clock, and it is about how this fails rather than how it
+    /// passes. This test found the trap the other two in this module then
+    /// had to be taken out of: under `start_paused`, a deadline awaited
+    /// through a `spawn_blocking` bridge cannot elapse, because the bridge
+    /// inhibits auto-advance and nothing else moves the virtual clock to
+    /// it. A broken swap hung the suite rather than failing it. Measured,
+    /// by mutating the swap into a no-op. On a real clock the same wait is
+    /// bounded and the same mutation fails in 5.01s.
+    #[tokio::test]
+    async fn a_config_change_swaps_barks_sinks_in_place() {
+        let (old_addr, mut old_captured) = one_shot_sink(200, "").await;
+        let (new_addr, new_captured) = one_shot_sink(200, "").await;
+        let dir = tempfile::tempdir().unwrap();
+        let barks_path = dir.path().join("barks.jsonl");
+        let source = ScriptedConfig::answering(format!(
+            "[sinks.ops]\nkind = \"json\"\nurl = \"http://{new_addr}/hook\"\n"
+        ));
+
+        let (tx, rx) = broadcast::channel(16);
+        let loop_handle = tokio::spawn(run_loop(
+            rx,
+            ScriptedFlock::answering(Vec::new()),
+            gave_up_rules(),
+            &config_with_sink(old_addr, &barks_path),
+            &barks_path,
+            source.clone(),
+        ));
+
+        // One receiver, one queue: the loop reads these in the order they
+        // were sent and awaits the re-ask before it takes the second, so
+        // the delivery below is attributable to the new section and never
+        // to a race this test would have to sleep through.
+        tx.send(BusEvent::DogConfigChanged {
+            dog: "bark".to_owned(),
+        })
+        .unwrap();
+        tx.send(errored_event("web")).unwrap();
+
+        let req = tokio::time::timeout(Duration::from_secs(5), new_captured)
+            .await
+            .expect("the bark must reach the sink the new section names")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&req.body).contains("web"));
+
+        assert_eq!(source.calls(), 1, "one frame, one re-ask");
+        assert!(
+            !loop_handle.is_finished(),
+            "bark swaps its config in place; it does not exit to pick one up"
+        );
+        // `try_recv`, never an await: the old sink's server is still
+        // parked in `accept`, so it holds its own sender alive and an
+        // await here would wait for a connection that must never come.
+        // The delivery above has already happened, so a bark that went to
+        // the old address would be sitting in this channel now.
+        assert!(
+            old_captured.try_recv().is_err(),
+            "the sink the old section named must be left alone"
+        );
+
+        loop_handle.abort();
     }
 }

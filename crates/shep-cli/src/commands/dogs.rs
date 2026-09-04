@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use shep_client::{Client, ConnectError, PROTOCOL_VERSION};
 use shep_core::barks;
+use shep_core::dogs::{DogVersion, SCHEMA_FLAG, VERSION_FLAG, parse_version_answer};
 use shep_core::paths::ShepPaths;
 use shep_core::protocol::{DogSource, Request, Response, SelectorSpec};
 
@@ -548,17 +549,21 @@ impl core::error::Error for AdoptRefusal {}
 /// is an [`ExitCode::Internal`].
 /// Proves this kernel can exec `path`, and asks it what protocol it speaks.
 ///
-/// The candidate is spawned twice over: once bare, to prove the exec works
-/// at all rather than discovering it at supervision time, and once with
-/// `--version` to read the contract in `docs/dogs.md`. A group-writable
-/// binary is reported rather than refused, since an operator naming a path
-/// has already made that call.
+/// The candidate is spawned once per probe flag, and no more: `--version`
+/// first, which proves the exec works at all rather than leaving it to be
+/// discovered at supervision time and reads the contract in
+/// `docs/dogs.md`, then `--schema`, which asks the dog to describe its own
+/// config. The second runs only once the first has decided nothing is being
+/// refused. A group-writable binary is reported rather than refused, since
+/// an operator naming a path has already made that call.
 ///
 /// # Errors
 /// [`AdoptRefusal`] when the path does not resolve, is not a file this
 /// kernel will exec, or answers a protocol this shep cannot talk to. A
 /// candidate that does not answer `--version` is NOT an error: its protocol
 /// is recorded as unknown, which `docs/dogs.md` promises is never a refusal.
+/// Nothing a candidate does with `--schema` is an error either, down to
+/// failing to run at all; see [`DogSchema`].
 pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, AdoptRefusal> {
     vet_binary_within(path, home, name, VERSION_BUDGET)
 }
@@ -587,11 +592,11 @@ pub fn vet_binary(path: &Path, home: &Path, name: &str) -> Result<VettedBinary, 
 ///
 /// # What `budget` actually bounds
 ///
-/// One wait, not the call. [`version_answer`] bounds two things separately
-/// and gives each the full `budget`: the wait for the child to exit, and
-/// the wait for its output to arrive. So the call is bounded by roughly
-/// twice `budget`, plus up to 50ms on macOS for
-/// `macos_deferred_exec_failure`'s own poll.
+/// One wait, not the call. [`answer_text`] bounds two things separately and
+/// gives each the full `budget`: the wait for the child to exit, and the
+/// wait for its output to arrive. So one probe is bounded by roughly twice
+/// `budget`, plus up to 50ms on macOS for `macos_deferred_exec_failure`'s
+/// own poll, and a vet runs two of them, `--version` and then `--schema`.
 ///
 /// Deliberate, and the alternative is worse. One absolute deadline shared
 /// between the two waits reads tidier and would make this doc a single
@@ -652,32 +657,18 @@ pub fn vet_binary_within(
             shep: PROTOCOL_VERSION,
         });
     }
+    // Asked AFTER the protocol refusal above, so a candidate shep is about
+    // to refuse is not run a third time to answer a question the refusal
+    // makes moot.
+    let schema = ask_schema(&canonical, home, name, budget);
     Ok(VettedBinary {
         path: canonical,
         group_writable,
         answer,
+        schema,
     })
 }
 
-/// Runs `path` with [`VERSION_FLAG`] and reads what it answers, within
-/// [`VERSION_BUDGET`].
-///
-/// `Ok(None)` is an UNKNOWN protocol and is never a fault: silence, output
-/// shep cannot read, a run that failed, and a run still going when the
-/// budget ran out all arrive here the same way. Answering is optional and stays
-/// optional, so every dog written before the contract existed reads as
-/// unknown rather than as broken.
-///
-/// Two callers ask the same binary the same question for different reasons.
-/// [`vet_binary`] asks a candidate nobody has adopted yet;
-/// [`warn_of_a_dog_a_restart_would_break`] asks a dog that has been adopted
-/// for months, because the answer lives in the binary and the binary
-/// changes on disk with nothing watching (G12 row 5). Neither writes the
-/// answer down.
-///
-/// # Errors
-/// [`AdoptRefusal::WillNotExec`], and only that: nothing here judges the
-/// answer it read, so [`AdoptRefusal::ProtocolMismatch`] stays
 /// The environment the probe runs a candidate with: what the daemon would
 /// give the dog, and nothing else.
 ///
@@ -724,15 +715,38 @@ fn probe_env() -> Vec<(String, String)> {
     env
 }
 
+/// Runs `path` with `flag`, one of [`VERSION_FLAG`] or [`SCHEMA_FLAG`], and
+/// hands back what it printed on stdout, within `budget`.
+///
+/// One spawn shape for both probes rather than two, because the argument
+/// each of them changes is the flag and everything else about running a
+/// stranger's binary is the same: the cleared environment, the two
+/// variables a dog is promised, the null stdin and stderr, the bounded
+/// wait, and the kill afterwards. A second, looser path would be a second
+/// place for one of those to be missing.
+///
+/// `Ok(None)` is NO ANSWER, and is never a fault: silence, a run that
+/// failed, and a run still going when the budget ran out all arrive here
+/// the same way. Answering either flag is optional and stays optional, so
+/// every dog written before the contract existed reads as unanswered rather
+/// than as broken. `Ok(Some(text))` is only ever the output of a run that
+/// exited 0, which is what `docs/dogs.md` asks a dog for; nothing here
+/// reads `text`, so what counts as a usable answer is each caller's own
+/// question.
+///
+/// # Errors
+/// [`AdoptRefusal::WillNotExec`], and only that: nothing here judges the
+/// answer it read, so [`AdoptRefusal::ProtocolMismatch`] stays
 /// [`vet_binary`]'s to raise. A caller that only wants an answer treats the
 /// error as one more way of not getting one.
-fn ask_version(
+fn ask(
     path: &Path,
+    flag: &str,
     home: &Path,
     name: &str,
     budget: Duration,
-) -> Result<Option<DogVersion>, AdoptRefusal> {
-    // Spawned with ONE argument, `--version`, and torn down
+) -> Result<Option<String>, AdoptRefusal> {
+    // Spawned with ONE argument, the flag being asked, and torn down
     // unconditionally: `kill` is ignored (a process that already exited is
     // not a failure to vet), but `wait` always runs, on every path out of
     // this match, so no zombie survives a refusal or a success.
@@ -744,12 +758,13 @@ fn ask_version(
     // right, because they are different runs. A supervised dog must work
     // for a stranger who never read this repo, so shep asks it for nothing.
     // This process is a throwaway that exists only to be observed and
-    // killed, so the cost of a candidate disagreeing about `--version` is
-    // an unknown protocol -- and `docs/dogs.md` promises that an unknown
-    // protocol is never a refusal. The vet asks; the supervisor does not.
+    // killed, so the cost of a candidate disagreeing about a probe flag is
+    // an unknown protocol or an unread schema -- and `docs/dogs.md`
+    // promises that neither is a refusal. The vet asks; the supervisor does
+    // not.
     //
     // A candidate is somebody else's binary and is not assumed to be well
-    // behaved about any of it: [`version_answer`] bounds the wait by
+    // behaved about any of it: [`answer_text`] bounds the wait by
     // `budget`, so one that never exits costs that and is then killed,
     // rather than hanging the command that asked.
     //
@@ -809,12 +824,21 @@ fn ask_version(
     // than to the terminal. A candidate that writes on its way up would
     // otherwise scribble over the operator's terminal mid-vet, and a hostile
     // one could imitate shep's own output at the exact moment somebody is
-    // deciding whether to trust it. The pipe is read by [`version_answer`]
-    // and never rendered.
+    // deciding whether to trust it.
+    //
+    // The pipe is read by [`answer_text`], and part of what comes back IS
+    // rendered: [`report_dog_version`] puts the parsed version string in a
+    // notice. What makes that safe is `emit_notice`, which runs every message
+    // through `terminal_safe::sanitise` before it reaches the stream, not the
+    // pipe. An earlier revision of this comment said the answer was "never
+    // rendered", which was false and pointed at the wrong protection, so
+    // anyone removing that `sanitise` call would have read this and believed
+    // there was nothing downstream to break.
+    //
     // `env_clear` and then the allowlist, never the operator's environment.
     // Argued at the top of this function; `probe_env` builds the list.
     match Command::new(path)
-        .arg(VERSION_FLAG)
+        .arg(flag)
         .env_clear()
         .envs(probe_env())
         .env("SHEP_HOME", home)
@@ -837,11 +861,67 @@ fn ask_version(
                 let _ = child.wait();
                 return Err(AdoptRefusal::WillNotExec { reason });
             }
-            let answer = version_answer(&mut child, reading, budget);
+            let answer = answer_text(&mut child, reading, budget);
             let _ = child.kill();
             let _ = child.wait();
             Ok(answer)
         }
+    }
+}
+
+/// Asks `path` for its version with [`VERSION_FLAG`] and parses the answer.
+///
+/// `Ok(None)` is an UNKNOWN protocol and is never a fault: everything
+/// [`ask`] answers `None` for, plus output with no line 1 to read a version
+/// from.
+///
+/// Two callers ask the same binary the same question for different reasons.
+/// [`vet_binary`] asks a candidate nobody has adopted yet;
+/// [`warn_of_a_dog_a_restart_would_break`] asks a dog that has been adopted
+/// for months, because the answer lives in the binary and the binary
+/// changes on disk with nothing watching (G12 row 5). Neither writes the
+/// answer down.
+///
+/// # Errors
+/// [`AdoptRefusal::WillNotExec`], and only that, for the reason [`ask`]
+/// gives.
+fn ask_version(
+    path: &Path,
+    home: &Path,
+    name: &str,
+    budget: Duration,
+) -> Result<Option<DogVersion>, AdoptRefusal> {
+    Ok(ask(path, VERSION_FLAG, home, name, budget)?
+        .as_deref()
+        .and_then(parse_version_answer))
+}
+
+/// Asks `path` for its config schema with [`SCHEMA_FLAG`], and reads the
+/// answer as JSON.
+///
+/// No `Result`, because nothing a candidate does to this probe can refuse
+/// an adopt (decision 4): a dog whose schema flag is broken may still do
+/// its job perfectly, and the version probe has already answered the only
+/// question that can. So a failure to spawn arrives as
+/// [`DogSchema::Silent`], the same as a dog that has never heard of the
+/// flag.
+///
+/// The answer is not written anywhere, here or by any caller (decision 7).
+/// `cargo install` replaces a dog's binary with nothing watching, so a
+/// stored schema would be wrong at the moment it mattered, and a stale
+/// schema is worse than a stale version number because it mislabels which
+/// field is a credential.
+fn ask_schema(path: &Path, home: &Path, name: &str, budget: Duration) -> DogSchema {
+    // A run that exited 0 and printed nothing is a dog with no schema, not
+    // a dog whose schema failed to parse: empty input IS invalid JSON, so
+    // without this the ordinary case would earn the warning meant for a
+    // broken one.
+    match ask(path, SCHEMA_FLAG, home, name, budget) {
+        Ok(Some(text)) if !text.trim().is_empty() => match serde_json::from_str(&text) {
+            Ok(schema) => DogSchema::Published(schema),
+            Err(_) => DogSchema::Unreadable,
+        },
+        Ok(_) | Err(_) => DogSchema::Silent,
     }
 }
 
@@ -861,20 +941,60 @@ pub struct VettedBinary {
     /// with no first line. `adopt` reports it and does not record it; see
     /// [`DogVersion`].
     pub answer: Option<DogVersion>,
+    /// What it answered when asked for its config schema. Read by the
+    /// caller and written down by nobody, for the reason [`ask_schema`]
+    /// gives.
+    pub schema: DogSchema,
 }
 
-/// The flag [`vet_binary`] asks a candidate with, and the one
-/// `docs/dogs.md` publishes as the contract.
-const VERSION_FLAG: &str = "--version";
+/// What a candidate answered when asked for its config schema, and the
+/// three answers are not one `Option`: only one of the two ways of having
+/// no schema is worth telling an operator about.
+///
+/// Nothing here is a refusal. A dog with a broken schema flag may still do
+/// its job perfectly, and refusing one would be shep judging a binary on a
+/// question the binary never promised to answer.
+#[derive(PartialEq, Eq)]
+pub enum DogSchema {
+    /// The dog printed JSON, and this is it, exactly as it wrote it. It is
+    /// not validated as JSON Schema past being JSON: the dog is the
+    /// authority on its own config, and a shep that disagreed about the
+    /// document's shape would be wrong in the direction that hides a
+    /// working dog's settings.
+    Published(serde_json::Value),
+    /// The dog answered nothing shep can use: it printed nothing, its run
+    /// failed, it never exited, or it could not be spawned at all. Every
+    /// dog written before this contract existed lands here, so it earns no
+    /// warning.
+    Silent,
+    /// The dog printed something that is not JSON. It meant to answer and
+    /// its answer cannot be read, which is a bug in that dog and the one
+    /// shape `adopt` warns about.
+    Unreadable,
+}
 
-/// The one key [`parse_version_answer`] reads. Every other `shep-` key is
-/// reserved for a number this shep has not heard of, and is ignored rather
-/// than refused, so a dog written against a later contract stays adoptable
-/// by this one.
-const SHEP_PROTOCOL_KEY: &str = "shep-protocol";
+/// Reports THAT there is a schema, never what is in it.
+///
+/// Manual, and a derive here would be a regression (IR-41). A schema
+/// carries the dog's own defaults, which is the same field the secret
+/// marker exists to keep off a screen, and a `{vetted:?}` in a test
+/// assertion or a future log line is all it would take to put a credential
+/// somewhere it is read later. `debug_reports_that_there_is_a_schema_and_never_what_is_in_it`
+/// pins the exact strings.
+impl core::fmt::Debug for DogSchema {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Published(_) => f.write_str("Published(..)"),
+            Self::Silent => f.write_str("Silent"),
+            Self::Unreadable => f.write_str("Unreadable"),
+        }
+    }
+}
 
-/// How long [`ask_version`] gives a binary to answer, and separately how
-/// long it then waits for that answer to reach the reader thread.
+/// How long [`ask`] gives a binary to answer one probe flag, and separately
+/// how long it then waits for that answer to reach the reader thread. Each
+/// flag is asked in its own spawn and gets the whole budget; the name
+/// predates the second flag and the number is the same for both.
 ///
 /// One second, against the milliseconds a `println!` and an exit take. The
 /// generosity is for a cold, dynamically linked binary on a loaded machine,
@@ -896,58 +1016,28 @@ const SHEP_PROTOCOL_KEY: &str = "shep-protocol";
 /// it, never block it.
 pub(crate) const VERSION_BUDGET: Duration = Duration::from_secs(1);
 
-/// How often [`version_answer`] polls within [`VERSION_BUDGET`], following
+/// How often [`answer_text`] polls within [`VERSION_BUDGET`], following
 /// [`macos_deferred_exec_failure`]'s own polled-with-a-budget shape rather
 /// than inventing a second one.
 const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
-/// What a candidate answered to `--version`, parsed by
-/// [`parse_version_answer`] from the format `docs/dogs.md` publishes.
+/// The most a probe will read from a candidate, per spawn.
 ///
-/// The two fields answer different questions and only one of them can
-/// refuse an adopt: see [`AdoptRefusal::ProtocolMismatch`].
-#[derive(Debug, PartialEq, Eq)]
-/// What a dog answered `--version` with.
+/// One mebibyte, against a version answer of two lines and a JSON Schema
+/// that runs to single-digit kilobytes for a config with a lot of fields.
+/// Three orders of magnitude of headroom, and still a bound: without one,
+/// the read is limited only by the budget and by how fast the candidate can
+/// write, which measured at roughly 290MB of resident memory for a second
+/// of spew and is a stranger's binary deciding how much of this machine's
+/// memory to take. `adopt` runs that binary twice, so it is asked twice.
 ///
-/// Two numbers rather than one, because they answer different questions:
-/// `protocol` decides whether the dog can handshake at all, and `version`
-/// only says which build it is. A dog may give the second and not the
-/// first, which is why `protocol` is optional and an absent one is unknown
-/// rather than incompatible.
-pub struct DogVersion {
-    /// The last whitespace-separated field of line 1 -- the version. The
-    /// name before it is ignored, so a crate whose name differs from the
-    /// dog's registered name answers correctly without knowing it.
-    pub version: String,
-    /// The `shep-protocol` line's value, and `None` when the answer carried
-    /// no such line or carried one that is not a decimal number. Answering
-    /// is optional, so `None` is an unknown protocol rather than a fault.
-    pub protocol: Option<u32>,
-}
-
-/// Parses the format `docs/dogs.md` publishes: `<name> <version>` on line
-/// 1, then `<key>: <value>` lines.
-///
-/// `None` when there is no line 1 to read a version from. Everything past
-/// that is tolerated rather than refused -- unknown keys, blank lines, key
-/// order, and a `shep-protocol` that is not a number -- because a shep that
-/// refuses a dog over the shape of text the dog never promised to print is
-/// refusing on its own guess. The strictness is all in the other direction:
-/// only an exact [`SHEP_PROTOCOL_KEY`] carrying a decimal is believed, and
-/// only a believed protocol can refuse.
-fn parse_version_answer(text: &str) -> Option<DogVersion> {
-    let mut lines = text.lines();
-    let version = lines.next()?.split_whitespace().next_back()?.to_string();
-    let mut protocol = None;
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':')
-            && key.trim() == SHEP_PROTOCOL_KEY
-        {
-            protocol = value.trim().parse().ok();
-        }
-    }
-    Some(DogVersion { version, protocol })
-}
+/// Truncation is not a new outcome and never a refusal. A cut-off version
+/// answer is output shep cannot read, which is the unknown protocol it
+/// already was; a cut-off schema is not valid JSON, so it is
+/// [`DogSchema::Unreadable`] and earns the warning decision 4 already
+/// defines. Both need a dog to print a megabyte before answering, which no
+/// dog following the contract does.
+const PROBE_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 /// Drains `stdout` to end on a thread, handing the text back through the
 /// returned channel.
@@ -960,20 +1050,30 @@ fn parse_version_answer(text: &str) -> Option<DogVersion> {
 /// could do forever. On the timeout path the thread is left to end on its
 /// own when the pipe closes: it holds nothing but a `String` and a sender,
 /// and `adopt` is a one-shot command.
-fn read_in_background(mut stdout: std::process::ChildStdout) -> Receiver<String> {
+fn read_in_background(stdout: std::process::ChildStdout) -> Receiver<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::Read as _;
         let mut text = String::new();
+        // Bounded by [`PROBE_OUTPUT_LIMIT`], and the drop that follows is
+        // half of what the bound buys: the read end closes, so a candidate
+        // still writing takes an EPIPE instead of being left blocked on a
+        // full pipe until the budget kills it.
+        //
         // A candidate answering in bytes that are not UTF-8 is answering
-        // nothing shep can read, which is the same unknown as silence.
-        let _ = stdout.read_to_string(&mut text);
+        // nothing shep can read, which is the same unknown as silence. That
+        // now includes a multi-byte character the cap cut in half, since
+        // `read_to_string` leaves `text` empty when it fails: a candidate
+        // that reached the cap mid-character was already answering
+        // something no reader here was going to use.
+        let _ = stdout.take(PROBE_OUTPUT_LIMIT).read_to_string(&mut text);
         let _ = tx.send(text);
     });
     rx
 }
 
-/// Waits, bounded by [`VERSION_BUDGET`], for `child` to answer.
+/// Waits, bounded by `budget`, for `child` to answer, and returns what it
+/// printed.
 ///
 /// Twice that is the worst case rather than once, because the wait for the
 /// exit and the wait for the text the reader thread collected are bounded
@@ -982,20 +1082,22 @@ fn read_in_background(mut stdout: std::process::ChildStdout) -> Receiver<String>
 /// closed; that bound is there for a grandchild still holding the inherited
 /// pipe open, not for anything the dog itself is doing.
 ///
-/// `None` -- an unknown protocol, never a refusal -- for every way of not
-/// answering: no pipe to read, a run that did not exit inside the budget, a
-/// run that exited non-zero, or output with no line 1.
+/// `None` -- no answer, never a refusal -- for every way of not answering:
+/// no pipe to read, a run that did not exit inside the budget, or a run
+/// that exited non-zero. `Some` may still be empty: a run that exited 0 and
+/// printed nothing answered, and it is each caller's own business what that
+/// means for the question it asked.
 ///
 /// The non-zero exit is not a technicality. `docs/dogs.md` says a dog
 /// answers on stdout AND exits 0, so lines printed by a run that then
 /// failed are not an answer -- and believing them would let a candidate
 /// refuse its own adopt with a protocol number from a code path that did
 /// not work.
-fn version_answer(
+fn answer_text(
     child: &mut Child,
     reading: Option<Receiver<String>>,
     budget: Duration,
-) -> Option<DogVersion> {
+) -> Option<String> {
     let reading = reading?;
     let started = Instant::now();
     loop {
@@ -1006,7 +1108,7 @@ fn version_answer(
             Ok(None) => std::thread::sleep(VERSION_POLL_INTERVAL),
         }
     }
-    parse_version_answer(&reading.recv_timeout(budget).ok()?)
+    reading.recv_timeout(budget).ok()
 }
 
 /// Who besides the owner can write `canonical` and the directory holding
@@ -1202,6 +1304,32 @@ fn report_dog_version(streams: &mut Streams<'_>, name: &str, answer: &DogVersion
     streams.aside(DOG_VERSION_NOTICE, &message);
 }
 
+/// [`emit_notice`] code for the unreadable-schema warning -- caller-defined
+/// like the two above, and like them not a failure: `adopt` succeeded.
+const DOG_SCHEMA_UNREADABLE_NOTICE: &str = "dog_schema_unreadable";
+
+/// Warns that `name` answered the schema flag with something that is not
+/// JSON, and lets the adopt proceed.
+///
+/// The one schema answer worth a line, and the reason is the difference
+/// between a dog that said nothing and a dog that tried. Silence is the
+/// ordinary case, since every dog written before this contract is silent,
+/// and a notice for each of them is how an operator learns to skip the one
+/// that matters. Unreadable output is a bug in that dog which its author
+/// can fix, and shep is the only thing positioned to notice it.
+///
+/// What it costs the operator is named rather than left to be discovered:
+/// the dog works, and the settings it would have described are edited by
+/// hand instead.
+fn warn_unreadable_schema(streams: &mut Streams<'_>, name: &str) {
+    let message = format!(
+        "{name} answered `{SCHEMA_FLAG}` with something that is not JSON, so shep has \
+         no description of its settings and they stay a hand-edited section. The dog \
+         is adopted and runs normally; this is a bug to report to whoever wrote it"
+    );
+    streams.aside(DOG_SCHEMA_UNREADABLE_NOTICE, &message);
+}
+
 /// [`emit_notice`](crate::output::emit_notice) code for the warning
 /// `restart` prints before it restarts a dog whose binary on disk cannot
 /// speak to this shepherd -- caller-defined, like the two above, and like
@@ -1363,6 +1491,12 @@ pub async fn adopt(streams: &mut Streams<'_>, paths: &ShepPaths, args: &AdoptArg
     }
     if let Some(answer) = &vetted.answer {
         report_dog_version(streams, &name, answer);
+    }
+    // The schema itself is reported by nothing and stored by nothing: it is
+    // asked fresh wherever it is needed (decision 7), so the only thing
+    // `adopt` has to say about it is the one way of answering that is a bug.
+    if vetted.schema == DogSchema::Unreadable {
+        warn_unreadable_schema(streams, &name);
     }
     if let Err(err) = ShepToml::edit(&paths.daemon_config, |cfg| {
         cfg.adopt_dog(&name, &path);
@@ -1646,6 +1780,15 @@ pub async fn rehome(streams: &mut Streams<'_>, paths: &ShepPaths, name: &str) ->
     // `shep.toml` by now, so the daemon half below would stop it and the
     // operator would be told it was forgotten while its configuration, and
     // the webhook URLs in it, were still on disk.
+    //
+    // The third writer of `dogs.toml`, and the one that needs no
+    // `config.dog.<name>` frame at all. The other two are in
+    // `commands::daemon`, where `boot_supervisor` publishes and the reload
+    // pre-flight explains why it cannot. This one removes the dog: the
+    // daemon half below stops it, so by the time anything could be told
+    // its section changed there is no subscriber left to tell. A frame
+    // here would reach a process on its way out and ask it to re-read a
+    // section that is gone.
     if let Err(err) = dog_migration::forget_dog_section(&paths.dogs_config, name) {
         return fail_dogs_config(streams, &err);
     }
@@ -2272,15 +2415,37 @@ mod tests {
         chmod(dir.path(), 0o700);
     }
 
-    /// Writes an executable `/bin/sh` script at `dir/name` whose body is
-    /// `body`, for the `--version` cases below: a dog's answer is text on
-    /// stdout and an exit status, and a shell script is the shortest thing
-    /// that can produce any pair of those on demand.
-    fn dog_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    /// Writes an executable `/bin/sh` script at `dir/name` that dispatches
+    /// on `$1` the way a real dog does: `version_body` for the version
+    /// flag, `schema_body` for the schema flag, and nothing at all for any
+    /// other argument. A dog's answer is text on stdout and an exit status,
+    /// and a shell script is the shortest thing that can produce any pair of
+    /// those on demand.
+    ///
+    /// The dispatch is not decoration. A fixture that answers every flag the
+    /// same way answers the schema flag with its version text, which is
+    /// unreadable JSON and earns a warning, so nine tests about something
+    /// else would each carry a notice nobody asserts on and a real
+    /// regression in that warning could hide among them.
+    fn probe_script(dir: &Path, name: &str, version_body: &str, schema_body: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version)\n{version_body}\n;;\n\
+             --schema)\n{schema_body}\n;;\nesac\n"
+        );
+        std::fs::write(&path, body).unwrap();
         chmod(&path, 0o755);
         path
+    }
+
+    /// A dog that answers the version flag with `body`, and the schema flag
+    /// the way every dog written before this contract does: with nothing.
+    /// A binary built on clap exits non-zero on a flag it has never heard
+    /// of, and one that ignores its arguments prints its version; both are
+    /// [`DogSchema::Silent`], and silence is the shorter of the two to
+    /// write.
+    fn dog_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        probe_script(dir, name, body, "exit 0")
     }
 
     /// fails if a dog built against a protocol this shep cannot speak is
@@ -2543,6 +2708,45 @@ mod tests {
         );
     }
 
+    /// fails if a candidate decides how much of this machine's memory a
+    /// probe takes. The read is on a thread with no bound but the budget
+    /// and the writer's speed, so a binary that spews reached roughly 290MB
+    /// resident for a second of it, and `adopt` spawns that binary twice.
+    ///
+    /// Twice the cap is written, so a read that stopped anywhere else shows
+    /// up in the length rather than only in the memory it took. `trap ''
+    /// PIPE` is what lets the script reach its own `exit 0` after shep
+    /// closes the pipe underneath it, since a candidate killed by SIGPIPE
+    /// would answer `None` for its exit status and say nothing about where
+    /// the read stopped.
+    ///
+    /// Mutation check: dropping the `take` reddens this on the length.
+    #[test]
+    fn a_candidate_that_will_not_stop_talking_is_read_no_further_than_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk = "a".repeat(1024);
+        let chunks = PROBE_OUTPUT_LIMIT / 1024 * 2;
+        let bin = probe_script(
+            dir.path(),
+            "shep-otel",
+            &format!(
+                "trap '' PIPE\ni=0\nwhile [ $i -lt {chunks} ]; do \
+                 printf '%s' '{chunk}'; i=$((i+1)); done\nexit 0"
+            ),
+            "exit 0",
+        );
+
+        let answer = ask(&bin, VERSION_FLAG, dir.path(), "otel", TEST_BUDGET)
+            .expect("what a candidate prints is never a refusal")
+            .expect("it exited 0, so it answered");
+
+        assert_eq!(
+            answer.len() as u64,
+            PROBE_OUTPUT_LIMIT,
+            "the read stops at the cap, whatever the candidate does after it"
+        );
+    }
+
     /// fails if an answer from a candidate that exited non-zero is
     /// believed. `docs/dogs.md` says a dog answers on stdout **and exits
     /// 0**; a non-zero exit means the run that printed those lines failed,
@@ -2619,6 +2823,239 @@ mod tests {
             }),
             "a protocol that is not a decimal is unknown, not a refusal"
         );
+    }
+
+    /// A dog whose schema half is what the test is about. The version half
+    /// always names this shep's own protocol, so a schema test never fails
+    /// for a reason that has nothing to do with the schema.
+    fn two_flag_dog(dir: &Path, schema_body: &str) -> PathBuf {
+        probe_script(
+            dir,
+            "shep-otel",
+            &format!("echo 'shep-otel 0.1.3'\necho 'shep-protocol: {PROTOCOL_VERSION}'"),
+            schema_body,
+        )
+    }
+
+    /// fails if a dog that answers the schema flag with real JSON Schema is
+    /// not asked, or is asked and not read. This is the whole point of the
+    /// second probe: everything below is a way of getting nothing, and this
+    /// is the way of getting something.
+    ///
+    /// Mutation check: never spawning the schema flag, or dropping the
+    /// parse, leaves `schema` anything but `Published` and reddens this.
+    #[test]
+    fn a_dog_that_answers_a_schema_has_it_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = two_flag_dog(
+            dir.path(),
+            "echo '{\"title\":\"otel\",\"properties\":{\"endpoint\":{\"type\":\"string\"}}}'",
+        );
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+
+        let DogSchema::Published(schema) = &vetted.schema else {
+            panic!("a dog that printed valid JSON Schema has one: {vetted:?}");
+        };
+        assert_eq!(
+            schema["properties"]["endpoint"]["type"], "string",
+            "the schema is kept as the dog wrote it, not summarised"
+        );
+    }
+
+    /// fails if a run that printed a schema and then failed is believed, or
+    /// is treated as a fault. `docs/dogs.md` asks for stdout AND an exit 0,
+    /// so a non-zero exit means the run that printed those bytes did not
+    /// work -- and a dog with a broken schema flag may still scrape
+    /// perfectly, so it is adopted with no schema and no warning.
+    ///
+    /// Mutation check: dropping the exit-status test records that `{}` as a
+    /// published schema and reddens the first assertion.
+    #[tokio::test]
+    async fn a_dog_whose_schema_run_exits_non_zero_has_no_schema_and_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let bin = two_flag_dog(dir.path(), "echo '{}'; exit 3");
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        assert_eq!(
+            vetted.schema,
+            DogSchema::Silent,
+            "a failed run printed no answer, whatever reached stdout"
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::Success, "no schema is not a refusal");
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            !text.contains(DOG_SCHEMA_UNREADABLE_NOTICE),
+            "only unreadable output earns the warning, not a failed run: {text}"
+        );
+    }
+
+    /// fails if silence on the schema flag is anything but a dog with no
+    /// schema. Every dog written before this contract is in that group: it
+    /// exits without printing, or prints its usage on stderr, and a warning
+    /// for each of them is a line about the ordinary case.
+    ///
+    /// Mutation check: treating empty output as unparseable JSON reddens
+    /// both assertions here at once.
+    #[tokio::test]
+    async fn a_dog_that_prints_no_schema_has_no_schema_and_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let bin = two_flag_dog(dir.path(), "exit 0");
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        assert_eq!(vetted.schema, DogSchema::Silent, "silence is no schema");
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::Success, "silence is not a refusal");
+        let text = String::from_utf8(err).unwrap();
+        assert!(
+            !text.contains(DOG_SCHEMA_UNREADABLE_NOTICE),
+            "a dog that answered nothing is the ordinary case, not a warning: {text}"
+        );
+    }
+
+    /// fails if a dog that answers the schema flag with something that is
+    /// not JSON is refused, or is passed over in silence. It is the one
+    /// shape that earns a warning: the dog meant to answer and its answer
+    /// cannot be read, which is a bug in that dog its author can fix.
+    /// Exactly one warning, because the count is what an operator reads.
+    ///
+    /// Mutation check: dropping the `Unreadable` arm silences the warning
+    /// and reddens the count.
+    #[tokio::test]
+    async fn a_dog_that_prints_invalid_json_is_adopted_with_one_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, dir.path());
+        let bin = two_flag_dog(dir.path(), "echo 'error: unrecognized option --schema'");
+
+        let vetted = vet_binary_within(&bin, dir.path(), "otel", TEST_BUDGET).unwrap();
+        assert_eq!(
+            vetted.schema,
+            DogSchema::Unreadable,
+            "output that is not JSON is unreadable, not absent"
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+
+        assert_eq!(code, ExitCode::Success, "a broken schema is not a refusal");
+        let text = String::from_utf8(err).unwrap();
+        assert_eq!(
+            text.matches(&format!("notice[{DOG_SCHEMA_UNREADABLE_NOTICE}]"))
+                .count(),
+            1,
+            "one warning, and only one: {text}"
+        );
+        assert!(
+            paths.daemon_config.exists(),
+            "the dog is adopted despite the warning"
+        );
+    }
+
+    /// Every file under `dir`, recursively, as text. A file shep wrote that
+    /// is not UTF-8 is skipped rather than failing the walk; none of them
+    /// are today, and a binary one could not carry the marker anyway.
+    fn every_file_under(dir: &Path) -> Vec<(PathBuf, String)> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(every_file_under(&path));
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                found.push((path, text));
+            }
+        }
+        found
+    }
+
+    /// fails if a schema reaches anything shep writes. Decision 7: asked
+    /// fresh, stored nowhere, because `cargo install` replaces a dog's
+    /// binary with nothing watching and a stale schema is worse than a
+    /// stale version number, since it mislabels which field is a
+    /// credential.
+    ///
+    /// Nothing stores it today, and it is guaranteed structurally: the
+    /// function that records an adopted dog has no schema to take. A
+    /// structural guarantee is exactly the kind a later signature change
+    /// removes with nothing going red, so this asserts on the files rather
+    /// than on the shape of a call. The whole home is walked, not just
+    /// `shep.toml`, so a schema parked in `dogs.toml` or a cache beside it
+    /// would be caught too. The dog's binary lives in its own directory
+    /// because the fixture script contains the schema text it prints.
+    ///
+    /// Mutation check: appending the schema to `shep.toml` after the edit
+    /// reddens this.
+    #[tokio::test]
+    async fn a_published_schema_reaches_no_file_shep_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let binaries = tempfile::tempdir().unwrap();
+        let paths = ShepPaths::resolve(&|_| None, home.path());
+        let marker = "only-ever-in-the-schema";
+        let bin = two_flag_dog(
+            binaries.path(),
+            &format!("echo '{{\"title\":\"{marker}\",\"properties\":{{}}}}'"),
+        );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = AdoptArgs {
+            name: Some("otel".to_string()),
+            path: bin,
+        };
+        let code = adopt(&mut streams(&mut out, &mut err), &paths, &args).await;
+        assert_eq!(code, ExitCode::Success);
+
+        let written = every_file_under(home.path());
+        assert!(
+            written.iter().any(|(_, text)| text.contains("otel")),
+            "the adopt has to have written the dog somewhere for this to mean anything: {written:?}"
+        );
+        for (path, text) in &written {
+            assert!(
+                !text.contains(marker),
+                "the schema was stored in {}: {text}",
+                path.display()
+            );
+        }
+    }
+
+    /// fails if a schema's own text can reach a log through `Debug`. A dog
+    /// author's `Default` is what a `default` in the schema carries, and it
+    /// is the same field the secret marker exists to keep off a screen, so
+    /// the shape goes out and the content does not (IR-41). Exact string,
+    /// because the failure mode is somebody replacing this with a derive.
+    #[test]
+    fn debug_reports_that_there_is_a_schema_and_never_what_is_in_it() {
+        let schema = DogSchema::Published(serde_json::json!({"token": "hunter2"}));
+        assert_eq!(format!("{schema:?}"), "Published(..)");
+        assert_eq!(format!("{:?}", DogSchema::Silent), "Silent");
+        assert_eq!(format!("{:?}", DogSchema::Unreadable), "Unreadable");
     }
 
     /// fails if a group-writable deployment directory is refused rather

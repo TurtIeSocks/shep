@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use shep_client::ReconnectingClient;
+use shep_client::dogs::DogConfig;
 use shep_core::protocol::{ProcessInfo, Request, Response};
 use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, RefreshKind, System};
 use tokio::net::{TcpListener, TcpStream};
@@ -36,7 +37,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// `deny_unknown_fields`: a misspelled key must be a startup error naming
 /// it, not a dog silently serving on a port the operator did not choose.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+///
+/// `DogConfig` carries no `#[shep(secret)]`, because an address is not a
+/// credential. The derive is still what lets `config_schema` publish this
+/// section, and a config type with nothing to mark still wants the impl.
+#[derive(Debug, Clone, PartialEq, Deserialize, schemars::JsonSchema, DogConfig)]
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     /// Where to listen. Loopback by default; binding wider is explicit.
@@ -297,6 +302,39 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
+
+    /// What `deny_unknown_fields` and `default` do to the generated schema,
+    /// measured rather than assumed: the first becomes
+    /// `additionalProperties: false`, and the second drops `required`
+    /// altogether and puts the real default beside the key.
+    ///
+    /// That combination is what makes a settings pane honest about this
+    /// dog. Every key is optional, so a pane can offer `9615` as the port
+    /// this dog would actually bind rather than as an empty box, and a key
+    /// this dog does not have is refused by the schema before it reaches a
+    /// startup error.
+    #[test]
+    fn the_metrics_schema_offers_the_port_it_would_bind_and_refuses_unknown_keys() {
+        let schema = shep_client::dogs::config_schema::<MetricsConfig>()
+            .expect("this config marks no field, so no mark can be missing");
+        let schema = schema.as_value();
+
+        assert_eq!(
+            schema.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "`deny_unknown_fields` is what catches a misspelled key"
+        );
+        assert_eq!(
+            schema.get("required"),
+            None,
+            "`default` on the type makes every key optional"
+        );
+        assert_eq!(
+            schema.pointer("/properties/bind/default"),
+            Some(&serde_json::Value::String("127.0.0.1:9615".to_owned())),
+            "the default is loopback, and a pane shows the port rather than a blank"
+        );
+    }
 
     /// A minimal, online sheep fixture — enough for the exposition to name
     /// it in a `sheep="..."` label, nothing more precise than that.

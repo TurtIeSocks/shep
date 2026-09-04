@@ -11,11 +11,26 @@ documentation = "https://docs.rs/shep-client"
 keywords = ["shep", "process-manager", "client", "ipc", "async"]
 categories = ["asynchronous", "network-programming", "api-bindings"]
 
-# No `[package.metadata.docs.rs]` here, deliberately: `test-support` is this
-# crate's only feature, and its own comment below says what it is — test
-# scaffolding for other crates' tests, not public API. There is nothing else
-# behind it worth unlocking for docs.rs, unlike shep-core's `schema`.
+# No `[package.metadata.docs.rs]` here, deliberately. There are two features
+# and neither wants unlocking on docs.rs: `schema` is on by default, so the
+# default build already documents `dogs::config_schema` and everything it
+# gates, and `test-support` is test scaffolding rather than public API (its
+# own comment below says so). Unlike shep-core, whose `schema` is OFF by
+# default and whose docs would otherwise render as though half the crate did
+# not exist.
 [features]
+default = ["schema"]
+
+# Option: build a dog's config schema, `dogs::config_schema` and the
+# `dogs::probe` arm that prints it. ON by default, so following the dog docs
+# works with no feature line; off is for a dog that would rather not compile
+# schemars for an answer it does not want to give. Not answering is legal
+# rather than broken (see `dogs`'s module docs), so this stays additive: with
+# it off, `probe` still answers the version flag and exits silently on the
+# schema flag. The name matches the feature shep-core already uses for the
+# same dependency.
+schema = ["dep:schemars", "dep:serde_json"]
+
 # Option: expose `testing` (the hand-rolled daemon fakes) to other crates'
 # tests. Off by default — it is test scaffolding, not public API. Mirrors
 # shep-daemon's `test-fakes` (`crates/shep-daemon/Cargo.toml:12`), which does
@@ -55,6 +70,17 @@ required-features = ["test-support"]
 
 [dependencies]
 shep-core.workspace = true
+# The `DogConfig` derive, re-exported from `dogs` next to the trait it
+# implements so a dog author takes one dependency and never names this crate.
+# Not optional: the derive is what stops `x-shep-secret` being a string a dog
+# author hand-types, and it needs no schemars of its own to emit a name list.
+shep-macros.workspace = true
+# Both behind `schema`. `dogs::config_schema` generates a dog's schema and
+# walks it as a `serde_json::Value` to mark the credential fields; `probe`
+# prints the result. schemars is workspace-pinned and already in the tree
+# through shep-core and whistle, so this adds an edge rather than a crate.
+schemars = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
 tokio-util.workspace = true
 tokio-stream.workspace = true   # wrappers::BroadcastStream, for the event-bus subscription stream

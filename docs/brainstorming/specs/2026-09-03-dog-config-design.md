@@ -166,12 +166,32 @@ adopt's vetting across two crates.
 
 ```rust
 #[derive(Deserialize, DogConfig)]
-struct Sink {
-    kind: SinkKind,
-    #[shep(secret)]
-    url: String,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum Sink {
+    Discord {
+        #[shep(secret)]
+        url: String,
+    },
+    Slack {
+        #[shep(secret)]
+        url: String,
+    },
 }
 ```
+
+**An earlier draft of this example showed a struct-shaped `Sink` carrying a
+`kind: SinkKind` field, and no such type exists.** The real one
+(`crates/shep-cli/src/dog/bark/sinks.rs`) is an internally tagged enum whose
+variants each carry a `url`, and those URLs are the Discord and Slack webhooks
+this marker exists for. The type already holds a manual redacted `Debug` for the
+same reason.
+
+That mattered rather than being a typo: an implementer built the derive against
+the invented shape and refused enums outright, which made the motivating example
+unmarkable. schemars itself has no such limit, measured on bark's exact shape
+including `tag`, `rename_all` and `deny_unknown_fields`: a field-level extend
+inside a variant lands in that variant's subschema, once per variant. So the
+derive walks variants too.
 
 schemars can express this without shep shipping anything:
 `#[schemars(extend("x-shep-secret" = true))]` works at field level in 1.2. On
@@ -187,6 +207,26 @@ cannot go in that position.
 That is the same bug class decision 5 removes for `--version`, and the marker
 is the one field where getting it wrong has a security consequence rather than
 a cosmetic one.
+
+### 6b. Two calls decision 6 left open, settled 2026-09-04
+
+**The derive ships as `shep-macros`, re-exported by `shep-client`.** A proc
+macro cannot live in `shep-client`, so it needs a crate of its own. Keeping it
+minimal and re-exporting means a dog author still takes one dependency and
+writes `use shep_client::dogs::DogConfig`, which is how `shep_core` already
+reaches them. A larger `shep-dog` SDK crate was considered and refused: it
+would be a second published name and would split the dog contract across two
+crates rather than one.
+
+**`shep-client` gains schemars behind a `schema` feature, on by default.** The
+name matches the feature `shep-core` already uses for the same dependency.
+Enabled by default so following the docs works, and opt-out for a dog that does
+not want roughly fourteen crates of build it will never use.
+
+Turning it off is not a broken state, and that falls out of decision 4 rather
+than being a special case: a dog without the feature does not answer `--schema`,
+and a dog that answers nothing is recorded as having no schema and refused
+nothing. The design already had a hole this shape.
 
 ### 7. The schema is asked fresh, never stored
 
@@ -241,11 +281,25 @@ has not adopted the contract yet, bark included until it does.
 ## Wire
 
 `Request` and `Response` are unchanged. `Subscribe` and `DogConfig` already
-exist and `config.dog.<name>` is a topic, not a variant. `PROTOCOL_VERSION`
-stays at 2 and `SCHEMA_VERSION` stays at 1.
+exist, so nothing an operator or a dog SENDS is new.
 
-The new contract is entirely outside the socket: two flags on a binary and what
-they print.
+**`BusEvent` gains a variant, and an earlier draft of this section denied it.**
+It said `config.dog.<name>` is "a topic, not a variant", which is not how the
+bus works: a topic is derived from a variant, `BusEvent::LogOut` giving
+`"log.out"`, and the six that exist (`Process`, `LogOut`, `LogErr`, `Channel`,
+`Dropped`, `DaemonShutdown`) have nowhere to put a config change. Publishing on
+this topic needs a seventh.
+
+That is additive, on the same terms as the six precedents in shep-core's
+changelog: an older peer never subscribed to a topic it does not know, so it
+receives nothing new and breaks on nothing. `PROTOCOL_VERSION` does not move
+again for it. Note that it is already 3, moved by the reset-mode rename in
+`#119`; this section said 2 until that landed.
+
+`SCHEMA_VERSION` stays 1. The bus is not the output envelope.
+
+Everything else in the new contract really is outside the socket: two flags on
+a binary and what they print.
 
 ## Surfacing
 

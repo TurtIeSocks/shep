@@ -141,6 +141,28 @@ impl Deref for Bus {
     }
 }
 
+/// Announces one `config.dog.<name>` per dog whose section changed.
+///
+/// Says THAT it changed and nothing more, per the dog-config design's
+/// decision 8: a dog re-asks with `Request::DogConfig` and decides for
+/// itself whether that means swapping values, rebinding a listener or
+/// asking for its own restart.
+///
+/// Exactly one event per name, and none at all for an empty list, which is
+/// what every boot after the first passes. A dog told twice re-asks twice,
+/// and for a dog that answers a change by restarting itself that is two
+/// restarts on the column an operator reads as instability.
+///
+/// Not published through [`Bus::publish_log`]'s gate: that gate counts
+/// subscribers wanting LOG topics, and a dog subscribed to its own config
+/// is not one of them. The send is a no-op when nothing is attached, which
+/// is the ordinary case here.
+pub fn publish_dog_config_changed(bus: &Bus, dogs: &[String]) {
+    for dog in dogs {
+        let _ = bus.send(BusEvent::DogConfigChanged { dog: dog.clone() }.into());
+    }
+}
+
 /// One subscriber's registered interest in log topics, released on drop.
 ///
 /// `None` for a filter that never wanted logs, so a caller holds the same
@@ -270,7 +292,7 @@ impl SharedEvent {
                     Err(err) => {
                         tracing::warn!(
                             %err,
-                            topic = self.0.event.topic(),
+                            topic = %self.0.event.topic(),
                             "dropping an unencodable bus event"
                         );
                         None
@@ -352,7 +374,7 @@ impl TopicFilter {
     /// True when `event`'s [`BusEvent::topic`] matches one of this filter's patterns.
     #[must_use]
     pub fn matches(&self, event: &BusEvent) -> bool {
-        self.set.is_match(event.topic())
+        self.set.is_match(&*event.topic())
     }
 
     /// True when this filter would match either log topic.
@@ -858,5 +880,52 @@ mod tests {
         );
         bus.publish_log(log_out("dropped again"));
         assert!(plain.try_recv().is_err());
+    }
+
+    /// fails if a dog's config topic drifts out from under the glob a
+    /// subscriber writes, or under a glob that was never meant to reach it.
+    /// `config.*` is what a dashboard watching every dog's config asks for,
+    /// and a `log.*` subscriber that started receiving these would be
+    /// getting frames it never asked for on the busiest filter shep has.
+    #[test]
+    fn a_dog_config_event_is_under_the_config_glob_and_no_other() {
+        let event = BusEvent::DogConfigChanged {
+            dog: "bark".to_string(),
+        };
+        assert!(filter(&["config.*"]).matches(&event));
+        assert!(filter(&["config.dog.bark"]).matches(&event));
+        assert!(!filter(&["log.*"]).matches(&event));
+        assert!(!filter(&["process.*"]).matches(&event));
+        // The dog next door does not hear it, which is the whole point of
+        // putting the name in the topic rather than in a payload every
+        // subscriber has to filter for itself.
+        assert!(!filter(&["config.dog.metrics"]).matches(&event));
+    }
+
+    /// fails if the announcement stops being one event per dog. A dog that
+    /// heard nothing runs on config that has moved out from under it; a dog
+    /// told twice re-asks twice, and for a dog that answers a change by
+    /// restarting itself that is two restarts on the column an operator
+    /// reads as instability.
+    #[tokio::test(start_paused = true)]
+    async fn every_moved_dog_is_announced_exactly_once() {
+        let (bus, mut events) = test_bus(16);
+        let moved = ["metrics".to_string(), "bark".to_string()];
+
+        publish_dog_config_changed(&bus, &moved);
+
+        for dog in &moved {
+            let event = events.try_recv().expect("one event per moved dog");
+            assert_eq!(event.topic(), format!("config.dog.{dog}"));
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "a dog announced twice is a dog restarted twice"
+        );
+
+        // Nothing moved, nothing said: an ordinary boot reaches this call
+        // with an empty list and must leave the bus alone.
+        publish_dog_config_changed(&bus, &[]);
+        assert!(events.try_recv().is_err());
     }
 }

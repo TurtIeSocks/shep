@@ -17,6 +17,12 @@
 #![doc(test(attr(deny(warnings))))]
 #![forbid(unsafe_code)]
 
+// The `DogConfig` derive expands to `impl ::shep_client::dogs::DogConfig`,
+// which is a path this crate does not otherwise have for itself. `dogs`'s own
+// tests derive it, so the name has to resolve from inside. Same reason serde
+// does this.
+extern crate self as shep_client;
+
 // Portable on both tiers: `connection` names `shep_core::transport::ClientStream`
 // rather than `tokio::net::UnixStream` directly, so the OS choice is made one
 // crate down and nothing here has a platform arm at all. `spawn`'s exit-code
@@ -25,6 +31,12 @@
 mod actor;
 mod client;
 mod connection;
+// The dog side of the probe contract: one call a dog makes as its first line.
+// Public because a dog is a third-party binary, so this module IS the API it
+// is written against, and it stays a module rather than a flattened re-export
+// for the same reason `spawn` does: `dogs::probe` reads as an agreement
+// between two processes, which `probe` alone would not.
+pub mod dogs;
 mod events;
 mod reconnect;
 // `spawn` stays a public module rather than a flattened re-export: the

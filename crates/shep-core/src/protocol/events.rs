@@ -1,5 +1,7 @@
 //! Bus events broadcast to subscribed clients
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::channel::ChildMessage;
@@ -144,13 +146,48 @@ pub enum BusEvent {
     },
     /// Daemon is shutting down
     DaemonShutdown,
+    /// A dog's section in `dogs.toml` changed. Published under
+    /// `config.dog.<name>`, so a dog subscribes to its own name and hears
+    /// nobody else's.
+    ///
+    /// Says THAT it changed and nothing about what it means. A dog that
+    /// wants the values re-asks with
+    /// [`Request::DogConfig`](crate::protocol::Request::DogConfig) and
+    /// decides for itself what to do with them: swap values in place,
+    /// rebind a listener, or ask for its own restart. Putting a live
+    /// versus needs-restart axis here would mean shep knowing what a
+    /// third-party dog's fields mean, which is the one thing this whole
+    /// contract refuses.
+    ///
+    /// # What it carries, and what it must never carry
+    ///
+    /// A NAME, and nothing else. The bus is a broadcast: a `config.*`
+    /// subscriber sees every dog's frames, and a `[bark]` section
+    /// routinely holds a webhook URL that is itself a bearer credential,
+    /// which is why [`DogSectionToml`] redacts its own `Debug`.
+    /// `Request::DogConfig` answers a dog for its OWN section, so
+    /// re-asking is the whole design rather than an extra round trip. A
+    /// derived `Debug` is safe here for the same reason: a dog's name is
+    /// what an operator typed into `enabled_dogs`.
+    ///
+    /// [`DogSectionToml`]: crate::protocol::DogSectionToml
+    DogConfigChanged {
+        /// The dog whose section changed.
+        dog: String,
+    },
 }
 
 impl BusEvent {
     /// The dotted subscription topic for this event (spec §6 grammar)
+    ///
+    /// A [`Cow`] rather than a `&'static str`, because one topic is not
+    /// fixed: [`Self::DogConfigChanged`] names its dog in the topic
+    /// itself, which is what lets a dog subscribe to its own config and
+    /// hear nobody else's. Every other variant is still a borrowed
+    /// literal and allocates nothing.
     #[must_use]
-    pub fn topic(&self) -> &'static str {
-        match self {
+    pub fn topic(&self) -> Cow<'static, str> {
+        let fixed = match self {
             Self::Process { event, .. } => match event {
                 ProcessEventKind::Start => "process.start",
                 ProcessEventKind::Online => "process.online",
@@ -177,7 +214,13 @@ impl BusEvent {
             },
             Self::Dropped { .. } => "daemon.dropped",
             Self::DaemonShutdown => "daemon.shutdown",
-        }
+            // The one topic built rather than named. `config.dog.` is the
+            // prefix a subscriber globs on; the dog's own name is the last
+            // segment, so `config.dog.bark` reaches one dog and `config.*`
+            // reaches all of them.
+            Self::DogConfigChanged { dog } => return Cow::Owned(format!("config.dog.{dog}")),
+        };
+        Cow::Borrowed(fixed)
     }
 }
 
@@ -313,6 +356,14 @@ mod tests {
                 },
             },
         ]);
+
+        // Last, so every row above keeps its index. The one topic that is
+        // not a fixed string, and the one frame a dog subscribes to on its
+        // own name: an operator's `dogs.toml` edit reaches a running dog
+        // through this shape or through nothing.
+        events.push(BusEvent::DogConfigChanged {
+            dog: "bark".to_string(),
+        });
 
         insta::assert_json_snapshot!("bus_event_wire_v3", events);
     }
@@ -470,6 +521,39 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("freed 12MB"), "{json}");
+        assert_eq!(serde_json::from_str::<BusEvent>(&json).unwrap(), event);
+    }
+
+    /// fails if a dog's config topic stops naming the dog. The topic is the
+    /// whole of what a dog subscribes with, so a name that did not reach it
+    /// (or reached it under a different separator) leaves the dog attached
+    /// to a topic nothing ever publishes and silently running on config an
+    /// operator has already changed.
+    #[test]
+    fn a_dog_config_event_names_the_dog_in_its_topic() {
+        for dog in ["bark", "metrics", "otel-shipper"] {
+            let event = BusEvent::DogConfigChanged {
+                dog: dog.to_string(),
+            };
+            assert_eq!(event.topic(), format!("config.dog.{dog}"));
+        }
+    }
+
+    /// fails if the event grows a payload. shep says THAT a section changed
+    /// and nothing about what it means or what is in it: a dog re-asks with
+    /// `Request::DogConfig`, which is the one path that answers a dog for
+    /// its own section only. A value on this wire would put another dog's
+    /// webhook credential in front of every subscriber on `config.*`.
+    #[test]
+    fn a_dog_config_event_carries_the_name_and_nothing_else() {
+        let event = BusEvent::DogConfigChanged {
+            dog: "bark".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"dog_config_changed","data":{"dog":"bark"}}"#
+        );
         assert_eq!(serde_json::from_str::<BusEvent>(&json).unwrap(), event);
     }
 }

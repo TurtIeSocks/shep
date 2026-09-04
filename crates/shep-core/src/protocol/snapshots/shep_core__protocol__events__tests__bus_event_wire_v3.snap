@@ -1,6 +1,5 @@
 ---
 source: crates/shep-core/src/protocol/events.rs
-assertion_line: 305
 expression: events
 ---
 [
@@ -292,6 +291,12 @@ expression: events
         "body": "freed 12MB",
         "id": 7
       }
+    }
+  },
+  {
+    "event": "dog_config_changed",
+    "data": {
+      "dog": "bark"
     }
   }
 ]

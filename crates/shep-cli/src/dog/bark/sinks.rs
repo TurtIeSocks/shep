@@ -54,6 +54,7 @@ use core::fmt;
 use std::time::Duration;
 
 use serde::Deserialize;
+use shep_client::dogs::DogConfig;
 use shep_core::barks::Bark;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -67,22 +68,31 @@ use crate::fetch::{self, Target};
 /// Discord or Slack webhook URL is a bearer credential — anyone holding it
 /// can post to that channel. A sink printed into a log, a panic message or
 /// an error chain leaks it to whoever reads the log.
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+///
+/// `#[shep(secret)]` says the same thing to a schema that the `Debug` says
+/// to a log. It reaches a pane only for a dog whose whole config IS a sink,
+/// since the marks a schema carries are the ones the type shep asked about
+/// declared; bark's own section is asked as [`super::BarkConfig`], which
+/// marks the map instead and says why.
+#[derive(Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema, DogConfig)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Sink {
     /// A Discord webhook: `{"content": "..."}`.
     Discord {
         /// The webhook URL.
+        #[shep(secret)]
         url: String,
     },
     /// A Slack incoming webhook: `{"text": "..."}`.
     Slack {
         /// The webhook URL.
+        #[shep(secret)]
         url: String,
     },
     /// A JSON POST with a body the operator templates.
     Json {
         /// Where to POST.
+        #[shep(secret)]
         url: String,
         /// The body, with `{subject}`, `{rule}`, `{message}` and `{at_ms}`
         /// substituted. Defaults to an object carrying all four.
@@ -480,6 +490,41 @@ mod tests {
 
     use super::*;
     use crate::http::{HttpRequest, read_request, write_response};
+
+    /// Every variant's `url` carries the credential marker, and nothing
+    /// beside it does.
+    ///
+    /// The key is spelled out here rather than read from
+    /// `shep_core::dogs::SECRET_KEY`, because the constant and the schema
+    /// agreeing is the thing under test: a rename of one that leaves the
+    /// other behind is how a webhook token reaches a screen (IR-41).
+    ///
+    /// Both halves in one test on purpose. Marking every property would
+    /// pass a test that only looked at the marked one.
+    #[test]
+    fn every_sink_variant_marks_its_url_and_leaves_the_rest_plain() {
+        let schema = shep_client::dogs::config_schema::<Sink>()
+            .expect("`url` is a property of all three variants");
+        let variants = schema
+            .as_value()
+            .get("oneOf")
+            .and_then(|it| it.as_array())
+            .expect("an internally tagged enum is a oneOf");
+        assert_eq!(variants.len(), 3);
+
+        for variant in variants {
+            assert_eq!(
+                variant.pointer("/properties/url/x-shep-secret"),
+                Some(&serde_json::Value::Bool(true)),
+                "a webhook URL is a bearer credential in every variant"
+            );
+            assert_eq!(
+                variant.pointer("/properties/kind/x-shep-secret"),
+                None,
+                "the tag names the variant and is not a credential"
+            );
+        }
+    }
 
     /// A representative fired alert, tagged by `subject` and `message` — the
     /// two fields these tests vary. `at_ms`/`rule` are fixed since no test

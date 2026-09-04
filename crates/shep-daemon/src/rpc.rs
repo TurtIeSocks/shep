@@ -127,6 +127,22 @@ impl RpcContext {
         let _ = self.shutdown.send(true);
     }
 
+    /// Announces that these dogs' `dogs.toml` sections changed.
+    ///
+    /// The daemon's own half of the dog-config contract, and the ONE place
+    /// a `config.dog.<name>` frame comes from. The publisher has to be
+    /// inside the daemon process, because that is where the bus is: the
+    /// CLI's other two writers of `dogs.toml` run in an operator's
+    /// short-lived process and say nothing (see their own call sites for
+    /// which and why).
+    ///
+    /// Public because the caller is `shep`'s own boot, which runs the
+    /// migration before this daemon exists and hands the names over once
+    /// it does.
+    pub fn announce_dog_config(&self, dogs: &[String]) {
+        crate::bus::publish_dog_config_changed(&self.events, dogs);
+    }
+
     /// Writes the muster roll now, reporting what it recorded.
     ///
     /// `None` means the supervisor engine has already stopped: there is
@@ -503,9 +519,13 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 },
             }
         }
-        // Re-read per request, never cached: `shep disable X && shep enable X`
-        // is the supported way to reload a dog's configuration, and a copy
-        // taken at boot would answer that with the section as it was.
+        // Re-read per request, never cached. `shep disable X && shep enable
+        // X` reloads a dog's configuration by bouncing it, and a copy taken
+        // at boot would answer that with the section as it was. It is no
+        // longer the only way: a dog subscribed to `config.dog.<name>` asks
+        // again without going down (`bus::publish_dog_config_changed`), and
+        // that path is this same arm answered a second time, which only a
+        // fresh read makes worth anything.
         Request::DogConfig { name } => match crate::dogs::dog_section(&ctx.dogs_config, &name) {
             Ok(toml) => reply(Ok(Response::DogSection { toml: toml.into() })),
             Err(err) => reply(Err(RpcError {

@@ -111,6 +111,19 @@ is what re-reads it: that stop/start cycle is a fresh process asking a
 fresh question, and the daemon answers off the file as it stands at that
 moment.
 
+**A dog can subscribe instead of waiting to be bounced.** Shep publishes on
+`config.dog.<name>` when it changes a dog's section itself. A dog holding a
+subscription re-asks with `Request::DogConfig` and decides what the change
+means: swap the values, rebind a listener, or ask for its own restart. The
+frame says that the section changed and nothing about what is in it. Bark
+subscribes and swaps in place, since sinks and rules are pure data with no
+OS resource attached. One thing publishes today, the boot that moves a
+section out of `shep.toml`, so a hand edit still needs the stop/start above.
+
+**A dog that restarts itself on a config change has to say so in its own
+log.** Nothing else can tell that apart from a crash loop, and the restart
+count is the column an operator reads as instability.
+
 The reason the section rides the socket instead of the environment is the
 same reason it applies to every dog and not just the ones with obvious
 secrets: an environment variable is readable from the process table,
@@ -256,8 +269,10 @@ exist, is not a file, has no execute bit for anyone, or is world-writable
 that already belongs to a built-in verb or alias, since a dog by that
 name could never be reached. It warns rather than refuses on a merely
 group-writable path. Passing all of that, it actually spawns the binary
-with no arguments and kills it immediately, because the only honest way
-to know whether this kernel can exec a file is to ask this kernel. What
+and kills it immediately, because the only honest way to know whether this
+kernel can exec a file is to ask this kernel. The `--version` probe below
+is that spawn, so the exec proof and the version answer cost one child
+rather than two. What
 gets recorded in `shep.toml` is the canonicalized, absolute path — never
 whatever relative path you typed — because the daemon may resolve it
 again after a reboot from a different working directory than the one
@@ -432,10 +447,10 @@ the ordinary case, not a skew, and comparing the two would report every
 dog that exists.
 
 A candidate gets one second to exit and another to have its output read,
-so two seconds is the worst case rather than one. It is killed either way,
-so a dog
-that ignores `--version` and runs costs that second and is adopted with an
-unknown protocol. It cannot hang the `adopt` that is vetting it.
+and an adopt runs two probes, so roughly four seconds is the worst case. It
+is killed either way, so a dog that ignores both flags and runs costs that
+time and is adopted with an unknown protocol. It cannot hang the `adopt`
+that is vetting it.
 
 None of the answer is written down. `[daemon] adopted_dogs` records the
 path and nothing else, and a protocol stored at adopt time would be a copy
@@ -443,16 +458,27 @@ of a number that can change on disk with nothing watching. That is G12's
 row 5, the one case where the stored copy would be wrong exactly when it
 mattered, so the binary is asked again rather than remembered.
 
-Emitting it needs four lines and no dependency a dog does not already
-have:
+A dog written against `shep-client` answers this probe and the schema one
+below with a single call, as the first line of `main`:
 
 ```rust
-if std::env::args().nth(1).as_deref() == Some("--version") {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    println!("shep-protocol: {}", shep_client::PROTOCOL_VERSION);
-    return;
+fn main() {
+    shep_client::dogs::probe::<MyDogConfig>(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    );
+    // ...normal startup, reached only when this run is not a probe.
 }
 ```
+
+It prints the answer and exits when shep asked a question, and returns when
+it did not, so nothing after it runs on a probe: put it before anything has
+been opened. The name and the version are arguments because `env!` expands
+where it is written, and they are the two facts only the dog knows. The flag
+names, the `shep-protocol` key and the number it carries all come from shep,
+which is the point of the call: they were hand-typed from this page until it
+existed, and a typo in any of them read as "protocol unknown" with nothing
+saying so.
 
 Lines rather than JSON, because a human runs `--version` far more often
 than shep does, and because a stranger writing a dog in a language shep
@@ -577,6 +603,73 @@ which daemon, and a version comparison standing in for one would report
 dogs that are fine. What catches it is the dog's own CI building against
 a current `shep-core`, which is where both published dogs' breakage was
 already visible and unread.
+
+## Answering `--schema`
+
+`shep adopt` asks a second question straight after the first: `--schema`,
+answered on stdout with a JSON Schema for the dog's own `[<name>]` section.
+Same shape as `--version` and the same budget: spawn, read, kill.
+
+Asked of the binary rather than over the socket, because the dog most in
+need of configuring is the one that is disabled or has never started, and it
+has no connection to answer on. Configure then enable is the order an
+operator wants.
+
+`probe` answers this flag too, from its type parameter. Derive `JsonSchema`
+and `DogConfig` on the type the dog deserializes its config into, and mark
+every field holding a credential:
+
+```rust
+use shep_client::dogs::DogConfig;
+
+#[derive(Default, serde::Deserialize, schemars::JsonSchema, DogConfig)]
+#[serde(deny_unknown_fields, default)]
+struct MyDogConfig {
+    /// Where to POST. Doc comments become the schema's descriptions.
+    #[shep(secret)]
+    webhook: String,
+    /// What to watch.
+    path: String,
+}
+```
+
+`#[shep(secret)]` says the field is a bearer credential, and shep renders
+one as `<set>`: replaceable, never read back. The attribute exists rather
+than the schemars extension it expands to because that extension key is a
+string the author types, and a transposed letter in it compiles, validates,
+marks nothing, and paints the credential on screen. Marking a field the
+schema does not have, which is what a `#[serde(rename)]` on it produces, is
+a refusal rather than a silent pass.
+
+**A mark names a field of the type shep asked about.** A credential one type
+down, in a nested struct or in a map's values, is not covered by a mark down
+there: mark the field that holds them. Bark's own `sinks` map is marked
+whole for this reason, and every sink in it carries a webhook URL.
+
+**Answering is optional, exactly as `--version` is.** A dog that says
+nothing is adopted, recorded as having no schema, and refused nothing, which
+is every dog written before this contract. What it gives up is a description
+of itself: a settings pane needs a schema to render, so its section stays a
+file an operator hand-edits. Nothing else changes.
+
+A dog that answers something that is not JSON gets one line, and is adopted
+anyway:
+
+```
+notice[dog_schema_unreadable]: pydog answered `--schema` with something that
+is not JSON, so shep has no description of its settings and they stay a
+hand-edited section. The dog is adopted and runs normally; this is a bug to
+report to whoever wrote it
+```
+
+Silence earns no such line, for the reason an unstated protocol earns none:
+it is the ordinary case, and a notice for every dog is how an operator
+learns to skip the one that matters.
+
+**The answer is not written down**, on the same rule the protocol number
+follows. `cargo install` replaces a binary with nothing watching, and a
+stale schema is worse than a stale version number, because it mislabels
+which field is a credential. Shep asks the binary again when it needs one.
 
 ## What shep writes into a dog's own log
 

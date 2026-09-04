@@ -28,6 +28,9 @@
 pub mod atomic_file;
 pub mod barks;
 pub mod config;
+// The probe contract both sides of a dog's `--version`/`--schema` answer
+// parse: flag names, the answer grammar, the schema's secret marker key.
+pub mod dogs;
 pub mod kv;
 // One definition of the log-line timestamp for the writer and every reader:
 // the daemon stamps, and three different file readers in shep-cli strip.

@@ -2104,7 +2104,10 @@ version = "0.2.0"
 dependencies = [
  "futures-util",
  "nix 0.29.0",
+ "schemars",
+ "serde_json",
  "shep-core",
+ "shep-macros",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -2175,6 +2178,18 @@ name = "shep-examples"
 version = "0.2.0"
 dependencies = [
  "nix 0.29.0",
+]
+
+[[package]]
+name = "shep-macros"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote 1.0.47",
+ "schemars",
+ "serde",
+ "shep-client",
+ "syn 2.0.119",
 ]
 
 [[package]]
