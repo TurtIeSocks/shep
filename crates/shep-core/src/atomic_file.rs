@@ -11,22 +11,6 @@
 //! `fsync` does not. On unix, and there only where the filesystem
 //! implements the flush: it is a no-op on Windows, and it answers `Ok` to
 //! the `EINVAL` some FUSE and network mounts return instead of flushing.
-//!
-//! Those two flushes answer different questions, and it is easy to buy one
-//! and believe you bought both. `File::sync_all` on the staging file
-//! flushes that file's CONTENTS. The directory entry the rename then
-//! creates is a change to the parent DIRECTORY, and it sits in the page
-//! cache until that directory is itself flushed. Lose power in between and
-//! the data survives with nothing pointing at it: the old file is still
-//! there, and the write is silently undone.
-//!
-//! An ordinary crash is not the case [`sync_dir`] covers. A completed
-//! `rename(2)` is visible to every later process whether or not anything
-//! was flushed, so a panic, a `SIGKILL` or an `ENOSPC` already leaves
-//! either the whole old file or the whole new one. Only a power cut or a
-//! kernel panic can lose a landed rename, and the writer that most needs
-//! the difference is the muster roll, whose whole reason to exist is being
-//! read back after the machine comes up again.
 
 use std::path::Path;
 
@@ -92,6 +76,16 @@ pub fn create_staging_file(
     builder.tempfile_in(parent)
 }
 
+// The two flushes answer different questions and it is easy to buy one
+// believing you bought both. `sync_all` on the staging file flushes its
+// CONTENTS; the entry the rename creates is a change to the parent
+// DIRECTORY, which sits in the page cache until that directory is flushed
+// too. Lose power in between and the data survives with nothing pointing
+// at it. A crash is not that case: a completed `rename(2)` is visible to
+// every later process whether or not anything was flushed, so only a power
+// cut or a kernel panic can lose a landed rename. The muster roll needs
+// the difference most, its whole job being read back after a reboot.
+//
 // Why the two arms differ, which is not a caller's question (IR-31).
 //
 // UNIX. `fsync` on a directory descriptor is the portable way to flush the
