@@ -528,8 +528,11 @@ commit lineage" case above is no longer the only hazard. A daemon at
 protocol 2 that has simply not restarted since the upgrade now fails to
 decode `"policy"` for what it already understood as `"settings"`, which is a
 regression of live functionality rather than an unreachable new one, so the
-bump closes that gap with a named `version_skew` refusal instead of leaving
-it as an accepted cost. `docs/decisions.md`'s entry on this reverses the
+bump closes that gap with a named `protocol_mismatch` refusal, exit 6,
+instead of leaving it as an accepted cost. Not `version_skew`, exit 12,
+which this said until 2026-09-04: `refuse_version_skew` runs only after
+`connect_or_spawn` returns `Ok`, and a protocol refusal fails the handshake,
+so it returns `Err` and that check is never reached. `docs/decisions.md`'s entry on this reverses the
 "`PROTOCOL_VERSION` stayed 2" ruling that predates it.
 
 **Verb count: 41 generated, 42 listed, and the difference is `help`.**
