@@ -139,6 +139,9 @@ jobs:
               - 'docs/whistle/tools.md'
               - 'docs/lookout/frames.txt'
               - 'docs/lookout/frames.ansi'
+              # The report that runs after every nextest leg. A change to it
+              # is a change to what the Rust jobs do.
+              - '.github/actions/**'
             # benches/ is its own workspace, excluded from the root one, so
             # the main matrix never compiles it and only the bench job below
             # cares when it changes.
@@ -284,6 +287,14 @@ jobs:
       # or they stop running on this platform. 14 of them, 6.8s warm.
       - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      # `!cancelled()` on purpose, and only here: this step must run after
+      # a FAILED test step, since that is when the junit is worth reading,
+      # and it is harmless after a failed toolchain install, because the
+      # report finds no file and says so.
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-test-${{ matrix.os }}-${{ matrix.toolchain }}
   minimal-versions:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -300,6 +311,10 @@ jobs:
         with: { tool: nextest }
       - run: "cargo +stable nextest run --profile ci --workspace -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
       - run: 'cargo +stable test --workspace --doc'
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-minimal-versions
   musl:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
@@ -334,6 +349,10 @@ jobs:
         with: { tool: nextest }
       - run: "cargo nextest run --profile ci --workspace --locked --target x86_64-unknown-linux-musl --test-threads 2 -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'"
       - run: 'cargo test --workspace --locked --target x86_64-unknown-linux-musl --doc'
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-musl
   # CLAUDE.md's phase-gate cross-check
   # (`cargo check --workspace --all-targets --all-features --target
   # x86_64-pc-windows-gnu`) had no workflow behind it, so it only ran when a
@@ -416,6 +435,10 @@ jobs:
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
       - run: 'cargo test --workspace --locked --all-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-features-${{ matrix.os }}
   # Tests that need a quiet machine, run serially in a job of their own.
   #
   # Two groups belong here and neither is a flaky test in the usual sense:
@@ -488,6 +511,11 @@ jobs:
       - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
         with: { tool: nextest }
       - run: "cargo nextest run --profile ci-slow --workspace --locked --all-features -E 'test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a)'"
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-slow-${{ matrix.os }}
+          profile: ci-slow
   # `cargo llvm-cov` on its own runs `cargo test --tests`, and `--tests` does
   # not build a package's examples. Four of `daemon_e2e`'s reload tests exec
   # `examples/reuse_port_sheep`, the SO_REUSEPORT fixture the whole reload
@@ -528,6 +556,10 @@ jobs:
           cargo llvm-cov clean --workspace
           cargo nextest run --profile ci --workspace --locked -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'
           cargo llvm-cov report --lcov --output-path lcov.info
+      - uses: ./.github/actions/nextest-report
+        if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
+        with:
+          name: junit-coverage
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: coverage, path: lcov.info }
   bench:

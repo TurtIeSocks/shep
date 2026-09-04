@@ -12,7 +12,12 @@
 # and both of the 2026-09-04 failures would have been hidden by one: a
 # missing precondition in a test, and the log pump dropping a child's last
 # line 39 times in 64 at the seam. Read a retried failure before shrugging at
-# it. `--junit` is on so the retries are countable rather than invisible.
+# it. Every CI profile below writes junit, and
+# .github/actions/nextest-report reads it after each leg: a test that passed
+# only on retry becomes a warning on the run and a row in the job summary,
+# so the retries are countable rather than invisible. Until 2026-09-04 this
+# comment claimed `--junit` was on while no profile named a path, so nothing
+# was written and nothing could have been counted.
 
 [profile.ci]
 # Report every failure in one run. A matrix leg is expensive to re-trigger
@@ -28,6 +33,11 @@ fail-fast = false
 filter = 'kind(test)'
 retries = 2
 
+# Written under target/nextest/ci/. The path is relative to that store
+# directory, not to the workspace root.
+[profile.ci.junit]
+path = "junit.xml"
+
 [profile.ci-slow]
 # The `slow` job's tier: real FSEvents, real inotify, real elapsed time, and
 # two thread races. Serial, because the only load should be its own.
@@ -39,3 +49,8 @@ test-threads = 1
 # cannot hold still, and a quiet serial job is already the answer to that. A
 # retry would instead let a real debouncer regression through, which is the
 # one thing the tier was carved out to protect.
+
+# No retries, but the same report: a `slow` failure is a real one and the
+# artifact is what a person reads when the job is red.
+[profile.ci-slow.junit]
+path = "junit.xml"
