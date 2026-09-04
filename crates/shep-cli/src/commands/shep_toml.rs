@@ -274,6 +274,11 @@ impl ShepToml {
     /// # Errors
     /// [`ShepTomlError::Io`] if `path` exists and could not be read.
     /// [`ShepTomlError::Parse`] if `path` exists and is not valid TOML.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     pub fn read_only(path: &Path) -> Result<Self, ShepTomlError> {
         Self::open(path)
     }
@@ -435,6 +440,11 @@ impl ShepToml {
     /// distinct from [`Self::adopted_dog_names`]: a dog can be adopted and
     /// not enabled, or (for one of the six built into the daemon) enabled
     /// without ever being adopted.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     #[must_use]
     pub fn enabled_dog_names(&self) -> Vec<String> {
         self.table("daemon")
@@ -552,6 +562,11 @@ impl ShepToml {
     /// The raw string as written -- `full`, `plain`, `bare`, or whatever
     /// else an operator typed. Whether it names a real [`StyleLevel`] is
     /// [`DaemonConfig::load`]'s question, not this reader's.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     #[must_use]
     pub fn style_level(&self) -> Option<String> {
         self.table("style")?
@@ -563,6 +578,11 @@ impl ShepToml {
     /// `[daemon] log_json`, or `None` when the document never wrote it.
     /// See [`Self::style_level`] for why absence and a written default are
     /// two different facts, not one.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     #[must_use]
     pub fn daemon_log_json(&self) -> Option<bool> {
         self.table("daemon")?.get("log_json")?.as_bool()
@@ -571,6 +591,11 @@ impl ShepToml {
     /// `[daemon] log_level`, or `None` when the document never wrote it,
     /// as the raw string on disk. Whether it names a real `LogLevel` is
     /// [`DaemonConfig::load`]'s question, not this reader's.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     #[must_use]
     pub fn daemon_log_level(&self) -> Option<String> {
         self.table("daemon")?
@@ -580,6 +605,11 @@ impl ShepToml {
     }
 
     /// `[daemon] socket`, or `None` when the document never wrote it.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     #[must_use]
     pub fn daemon_socket(&self) -> Option<PathBuf> {
         self.table("daemon")?
@@ -592,6 +622,11 @@ impl ShepToml {
     /// it, as the raw string on disk -- not the parsed `UpDuration`. The
     /// settings screen shows what the file says; parsing it here would
     /// put a second opinion about the grammar next to `DaemonConfig`'s.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     #[must_use]
     pub fn daemon_max_cron_sleep(&self) -> Option<String> {
         self.table("daemon")?
@@ -602,6 +637,11 @@ impl ShepToml {
 
     /// `[whistle] allow_control`, or `None` when the document never wrote
     /// it.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     #[must_use]
     pub fn whistle_allow_control(&self) -> Option<bool> {
         self.table("whistle")?.get("allow_control")?.as_bool()
@@ -614,6 +654,11 @@ impl ShepToml {
     /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
     /// something other than a table. See [`Self::set_style_level`], the
     /// setter this one and its four siblings below are modelled on.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     pub fn set_daemon_log_json(&mut self, value: bool) -> Result<(), ShepTomlError> {
         self.section_table_mut("daemon")?
             .insert("log_json", Item::Value(value.into()));
@@ -628,6 +673,11 @@ impl ShepToml {
     /// # Errors
     /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
     /// something other than a table.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     pub fn set_daemon_log_level(&mut self, value: &str) -> Result<(), ShepTomlError> {
         self.section_table_mut("daemon")?
             .insert("log_level", Item::Value(value.into()));
@@ -640,6 +690,11 @@ impl ShepToml {
     /// # Errors
     /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
     /// something other than a table.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     pub fn set_daemon_socket(&mut self, value: &Path) -> Result<(), ShepTomlError> {
         self.section_table_mut("daemon")?.insert(
             "socket",
@@ -656,6 +711,11 @@ impl ShepToml {
     /// # Errors
     /// [`ShepTomlError::WrongShape`] -- `daemon` is already there as
     /// something other than a table.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     pub fn set_daemon_max_cron_sleep(&mut self, value: &str) -> Result<(), ShepTomlError> {
         self.section_table_mut("daemon")?
             .insert("max_cron_sleep", Item::Value(value.into()));
@@ -668,6 +728,11 @@ impl ShepToml {
     /// # Errors
     /// [`ShepTomlError::WrongShape`] -- `whistle` is already there as
     /// something other than a table.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     pub fn set_whistle_allow_control(&mut self, value: bool) -> Result<(), ShepTomlError> {
         self.section_table_mut("whistle")?
             .insert("allow_control", Item::Value(value.into()));
@@ -679,6 +744,11 @@ impl ShepToml {
     /// table. Unlike the setters above, there is no shape for this to
     /// refuse: removing a key from a table that is not a table is already
     /// a no-op.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     pub fn unset_daemon_socket(&mut self) {
         if let Some(daemon) = self.doc.get_mut("daemon").and_then(Item::as_table_mut) {
             daemon.remove("socket");
@@ -687,6 +757,11 @@ impl ShepToml {
 
     /// Removes `[daemon] max_cron_sleep` if it is set. See
     /// [`Self::unset_daemon_socket`] for why this has no `Result`.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     pub fn unset_daemon_max_cron_sleep(&mut self) {
         if let Some(daemon) = self.doc.get_mut("daemon").and_then(Item::as_table_mut) {
             daemon.remove("max_cron_sleep");
@@ -778,6 +853,11 @@ impl ShepToml {
     /// shape case, which is fine for a reader (there is nothing to refuse,
     /// only nothing to report) even though a setter cannot let that same
     /// silence stand.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     fn table(&self, section: &str) -> Option<&Table> {
         self.doc.get(section).and_then(Item::as_table)
     }
@@ -788,6 +868,11 @@ impl ShepToml {
     /// scalar setter above shares, factored out rather than repeated five
     /// times. [`Self::set_style_level`] carries this same shape inline,
     /// for one key rather than five.
+    ///
+    /// Not called outside this module's own tests yet: `commands::settings`
+    /// (task 3) is the caller. `#[allow(dead_code)]` says so explicitly
+    /// rather than inventing a call site nothing needs yet.
+    #[allow(dead_code)]
     fn section_table_mut(&mut self, section: &'static str) -> Result<&mut Table, ShepTomlError> {
         let item = self
             .doc
@@ -1506,6 +1591,16 @@ mod tests {
         assert!(text.contains("enabled_dogs = [\"metrics\"]"), "got: {text}");
         assert!(text.contains("level = \"full\""), "got: {text}");
         assert!(text.contains("log_level = \"debug\""), "got: {text}");
+
+        // The four checks above are substring checks against the whole file
+        // and cannot tell `log_level = "debug"` landing under `[daemon]`
+        // from the same bytes landing under `[style]` or anywhere else --
+        // reading it back through the section-aware reader is what pins
+        // the section, since `daemon_log_level` walks the `[daemon]` table
+        // specifically and would read `None` if the setter had written
+        // into a different one.
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.daemon_log_level().as_deref(), Some("debug"));
     }
 
     #[test]
@@ -1547,6 +1642,106 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "daemon = \"loud\"\n"
         );
+    }
+
+    /// `enabled_dog_names` is `adopted_dog_names`'s sibling and was left
+    /// untouched by the brief's own six tests. A dog can be adopted and not
+    /// enabled, or (for a built-in) enabled without ever being adopted, so
+    /// this reads `[daemon] enabled_dogs` specifically, in file order.
+    #[test]
+    fn enabled_dog_names_reads_the_array_in_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[daemon]\nenabled_dogs = [\"metrics\", \"bark\"]\n").unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.enabled_dog_names(), vec!["metrics", "bark"]);
+    }
+
+    /// A document with no `[daemon] enabled_dogs` at all reads as empty,
+    /// never a panic or a default entry invented on its behalf.
+    #[test]
+    fn enabled_dog_names_is_empty_when_the_document_never_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[daemon]\nlog_level = \"debug\"\n").unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.enabled_dog_names(), Vec::<String>::new());
+    }
+
+    /// `set_daemon_socket` has no caller until the settings screen lands,
+    /// so this is the only thing that exercises it before then. Reads back
+    /// through `daemon_socket`, which is what actually pins that the value
+    /// landed under `[daemon] socket` rather than merely appearing
+    /// somewhere in the file (the gap `setting_a_scalar_keeps_the_comments_
+    /// and_the_keys_around_it` had before this same fix round).
+    #[test]
+    fn setting_the_socket_reads_back_through_daemon_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[daemon]\nlog_level = \"debug\"\n").unwrap();
+
+        ShepToml::try_edit(&path, |cfg| {
+            cfg.set_daemon_socket(Path::new("/tmp/shep.sock"))
+        })
+        .unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.daemon_socket(), Some(PathBuf::from("/tmp/shep.sock")));
+        assert_eq!(cfg.daemon_log_level().as_deref(), Some("debug"));
+    }
+
+    /// `unset_daemon_socket`'s own sibling test, pinning the same thing
+    /// `unsetting_removes_the_key_and_leaves_its_neighbours` pins for
+    /// `max_cron_sleep`: the key goes, its neighbours stay.
+    #[test]
+    fn unsetting_the_socket_removes_the_key_and_leaves_its_neighbours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(
+            &path,
+            "[daemon]\nlog_level = \"debug\"\nsocket = \"/tmp/shep.sock\"\n",
+        )
+        .unwrap();
+
+        ShepToml::edit(&path, ShepToml::unset_daemon_socket).unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.daemon_socket(), None);
+        assert_eq!(cfg.daemon_log_level().as_deref(), Some("debug"));
+    }
+
+    /// `set_daemon_max_cron_sleep` has no caller until the settings screen
+    /// lands. Reads back through `daemon_max_cron_sleep`, the raw string as
+    /// written, not a parsed `UpDuration`.
+    #[test]
+    fn setting_max_cron_sleep_reads_back_through_daemon_max_cron_sleep() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[daemon]\nlog_level = \"debug\"\n").unwrap();
+
+        ShepToml::try_edit(&path, |cfg| cfg.set_daemon_max_cron_sleep("45s")).unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.daemon_max_cron_sleep().as_deref(), Some("45s"));
+        assert_eq!(cfg.daemon_log_level().as_deref(), Some("debug"));
+    }
+
+    /// `set_whistle_allow_control` has no caller until the settings screen
+    /// lands. Reads back through `whistle_allow_control`, which is what
+    /// pins the value under `[whistle]` rather than `[daemon]`.
+    #[test]
+    fn setting_whistle_allow_control_reads_back_through_whistle_allow_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shep.toml");
+        std::fs::write(&path, "[daemon]\nlog_level = \"debug\"\n").unwrap();
+
+        ShepToml::try_edit(&path, |cfg| cfg.set_whistle_allow_control(true)).unwrap();
+
+        let cfg = ShepToml::read_only(&path).unwrap();
+        assert_eq!(cfg.whistle_allow_control(), Some(true));
+        assert_eq!(cfg.daemon_log_level().as_deref(), Some("debug"));
     }
 
     /// fails if the first `shep enable` on a host that has never booted a
