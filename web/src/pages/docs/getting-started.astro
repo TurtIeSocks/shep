@@ -119,10 +119,9 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       running flock is additive, so the protocol number did not move for
       it, and the handshake passed while the shepherd then ended the
       connection on an envelope it could not read. It refuses cleanly now,
-      because the <code>--reset</code>/<code>--reset-all</code> flags
-      changed their own wire spelling and that is not additive the same
-      way, so the protocol number moved with it. Reloading first is still
-      the whole fix either way.
+      because the <code>--reset</code> flag's own wire spelling changed and
+      that is not additive the same way, so the protocol number moved with
+      it. Reloading first is still the whole fix either way.
     </p>
 
     <h2>2. Write a Flockfile</h2>
