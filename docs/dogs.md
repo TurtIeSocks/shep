@@ -420,9 +420,9 @@ question costs one argument on a process that was going to start anyway.
 The refusal names both numbers and both ways out:
 
 ```
-/usr/local/bin/shep-otel: this dog was built for shep protocol 1, and this
-shep speaks 2; reinstall the dog without --locked so it builds against the
-current shep-core, or run a shep that speaks 1
+/usr/local/bin/shep-otel: this dog was built for shep protocol 2, and this
+shep speaks 3; reinstall the dog without --locked so it builds against the
+current shep-core, or run a shep that speaks 2
 ```
 
 Only a stated protocol can refuse an adopt. The version is never compared
@@ -472,9 +472,9 @@ the upgrade.
 
 ```
 notice[dog_binary_skew]: `log-rotate`'s binary at /usr/local/bin/shep-log-rotate
-was built for shep protocol 3, and this shep speaks 2; restarting it brings it
-back on that binary, unable to connect. Run a shep that speaks 3, or reinstall
-the dog against protocol 2, and restart it again
+was built for shep protocol 4, and this shep speaks 3; restarting it brings it
+back on that binary, unable to connect. Run a shep that speaks 4, or reinstall
+the dog against protocol 3, and restart it again
 ```
 
 Then it restarts the dog. This is a warning and never a refusal: the
