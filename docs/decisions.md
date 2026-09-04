@@ -34,7 +34,7 @@ go for the full argument. The commit that removed them names itself.
 - [Config and packaging](#config-and-packaging) (5)
 - [serve, dev and runtime](#serve-dev-and-runtime) (8)
 - [Output and first run](#output-and-first-run) (7)
-- [Config overrides](#config-overrides) (6)
+- [Config overrides](#config-overrides) (8)
 
 ## Core types and the daemon's shape
 
