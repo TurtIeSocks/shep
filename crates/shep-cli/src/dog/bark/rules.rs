@@ -43,7 +43,7 @@ fn default_debounce() -> UpDuration {
     UpDuration::from_millis(5 * 60 * 1_000)
 }
 
-/// One entry under `[dog.bark.rules]`.
+/// One entry under `[[bark.rules]]` in `dogs.toml`.
 ///
 /// A misspelled key anywhere in a rule is a startup error naming the bad
 /// key, never a silently ignored setting. See
@@ -63,9 +63,9 @@ pub struct Rule {
     /// What fires it.
     #[serde(flatten)]
     pub when: Trigger,
-    /// Sinks by name, from `[dog.bark.sinks]`. At least one; a rule
-    /// routing nowhere is a rule that fires into a file and is refused at
-    /// startup rather than discovered during an incident.
+    /// Sinks by name, from `[bark.sinks]` in `dogs.toml`. At least one; a
+    /// rule routing nowhere is a rule that fires into a file and is
+    /// refused at startup rather than discovered during an incident.
     pub sinks: Vec<String>,
     /// How long after one firing this rule stays quiet FOR THE SAME
     /// SUBJECT. Per-subject, never global: a flock where one sheep flaps
@@ -631,7 +631,7 @@ mod tests {
         );
     }
 
-    /// fails if `[dog.bark]` with sinks and no rules alerts on nothing.
+    /// fails if a `[bark]` with sinks and no rules alerts on nothing.
     /// "The shepherd gave up" is on by default with nothing to tune — that
     /// is what makes it the alert that cannot be missed.
     #[test]
@@ -919,9 +919,9 @@ sinks = ["oncall"]
     }
 
     /// fails if an `event` rule cannot be parsed from TOML — not shown in
-    /// the published docs, but a real `Trigger` variant a `[[dog.bark.
-    /// rules]]` entry can name, and the same flatten mechanism the docs'
-    /// two forms exercise.
+    /// the published docs, but a real `Trigger` variant a `[[bark.rules]]`
+    /// entry can name, and the same flatten mechanism the docs' two forms
+    /// exercise.
     #[test]
     fn an_event_rule_parses_from_toml() {
         let rule: Rule = toml::from_str(
