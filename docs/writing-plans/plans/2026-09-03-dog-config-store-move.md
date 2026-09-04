@@ -499,11 +499,15 @@ Expected: FAIL, `cannot find function 'migrate_dog_sections'`.
 ///
 /// # Errors
 ///
-/// - [`DogMigrationError::WouldOverwrite`] when a name is present in both
-///   files. Two values for one key is a question shep cannot answer, so it
-///   refuses and changes nothing.
-/// - [`DogMigrationError::Read`], [`DogMigrationError::Write`] and
-///   [`DogMigrationError::Edit`] for the underlying I/O.
+/// - [`DogMigrationError::WouldOverwrite`] when a name holds values in
+///   both files. Two values for one key is a question shep cannot answer,
+///   so it refuses and changes nothing.
+/// - [`DogMigrationError::Parse`] when `dogs.toml` exists and is not valid
+///   TOML, and [`DogMigrationError::Render`] when the merged map will not
+///   serialize.
+/// - [`DogMigrationError::Read`] and [`DogMigrationError::Write`] for the
+///   underlying I/O, and [`DogMigrationError::Toml`] for whatever
+///   `ShepToml` failed at.
 pub fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, DogMigrationError> {
     let existing_source = match std::fs::read_to_string(&paths.daemon_config) {
         Ok(source) => source,
