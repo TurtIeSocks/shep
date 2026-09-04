@@ -10,6 +10,7 @@ pub mod bleats;
 pub mod detail;
 pub mod flock;
 pub mod host;
+pub mod settings;
 pub mod status;
 
 // `pub`, not private: Task 8's `a_heartbeat_puts_the_host_strip_on_the_frame`
@@ -21,6 +22,7 @@ pub mod status;
 pub mod fixtures;
 
 use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use self::flock::MIN_HEIGHT;
@@ -195,6 +197,27 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         width,
     );
     y += 1;
+
+    // The settings screen owns the whole body between the title and the
+    // status bar -- decision 1 of the design spec: "the title line and the
+    // status bar stay put". That is a swap, not an overlay: the banner,
+    // the host strip, the flock table and the two bottom panes all belong
+    // to the dashboard body this branch replaces, so none of them draw
+    // while the screen is open.
+    if let Some(settings) = app.settings() {
+        let body = Rect {
+            x: area.x,
+            y,
+            width,
+            // `bottom - y` never underflows: `y` is `area.y + 1` here and
+            // `bottom` is `area.y + height - 1`, and `height >= MIN_HEIGHT`
+            // (6) is already checked above, so `bottom > y` always holds.
+            height: bottom - y,
+        };
+        settings::draw_settings(app, settings, body, buffer);
+        buffer.set_line(area.x, bottom, &status::status_line(app, width), width);
+        return;
+    }
 
     if let Some(banner) = status::banner_line(app) {
         buffer.set_line(area.x, y, &banner, width);
@@ -527,6 +550,18 @@ mod tests {
             at: Instant::now(),
         });
         for (width, height) in [(1, 1), (20, 3), (31, 6), (80, 24), (250, 60), (400, 200)] {
+            let _ = draw_to(&app, width, height);
+        }
+    }
+
+    /// The settings screen's own twin of the sweep above. `Rect::height`
+    /// is `bottom - y`, computed once per frame rather than checked, so
+    /// this is what proves `MIN_HEIGHT` (6) actually keeps it from
+    /// underflowing at the floor the guard claims to cover.
+    #[test]
+    fn drawing_the_settings_screen_never_panics_across_the_size_sweep() {
+        let app = fixtures::app_in_settings();
+        for (width, height) in [(1, 1), (20, 3), (33, 6), (80, 24), (250, 60), (400, 200)] {
             let _ = draw_to(&app, width, height);
         }
     }
