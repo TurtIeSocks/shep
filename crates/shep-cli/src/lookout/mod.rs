@@ -28,6 +28,7 @@
 //! exists.
 
 pub mod app;
+pub mod field;
 // `#[cfg(test)]`: every item in `frames` is read by tests and by the gallery
 // writer, and by nothing else. The package has a `[lib]` target, but `pub`
 // here still exempts nothing from `dead_code`: `mod
