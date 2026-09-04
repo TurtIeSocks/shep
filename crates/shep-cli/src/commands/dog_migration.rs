@@ -28,7 +28,7 @@ use std::path::Path;
 
 use shep_core::config::{DogsConfig, DogsConfigError};
 use shep_core::paths::ShepPaths;
-use toml_edit::{DocumentMut, Item, Table, TableLike};
+use toml_edit::{DocumentMut, Item, TableLike};
 
 use super::shep_toml::{ConfigLock, ShepToml, ShepTomlError, create_config_file};
 
@@ -197,9 +197,19 @@ pub(crate) fn migrate_dog_sections(paths: &ShepPaths) -> Result<Vec<String>, Dog
         // -- inside the blank line that separated them. Renumbering from
         // one past the destination's own last table is what makes a
         // migration read like an append.
+        //
+        // Over EVERY positioned table in the destination, not the
+        // top-level `Item::Table`s alone, which is what this counted. A
+        // `dogs.toml` whose own sections are `[bark.sinks]` (nested under
+        // an implicit `bark` that holds no position of its own) and
+        // `[[bark.rules]]` (an array of tables, never an `Item::Table`)
+        // answered "no positions at all", so the scan said 0, the moved
+        // section took 0, and it rendered FIRST and jammed against the
+        // section it was supposed to follow. That is the shape a real
+        // `dogs.toml` has as soon as bark is configured.
         let mut next = merged
             .iter()
-            .filter_map(|(_, item)| item.as_table().and_then(Table::position))
+            .filter_map(|(_, item)| last_position(item))
             .max()
             .map_or(0, |last| last + 1);
         for (name, mut section) in incoming {
@@ -360,6 +370,42 @@ fn declares_nothing(value: &toml::Value) -> bool {
         toml::Value::Table(table) => table.is_empty(),
         toml::Value::Array(items) => items.iter().all(declares_nothing),
         _ => false,
+    }
+}
+
+/// The highest render position any table inside `item` holds, or `None`
+/// when it holds no positioned table at all.
+///
+/// [`renumber_tables`]'s read-only twin, and it walks the same three
+/// shapes for the same reason: `toml_edit` positions every table
+/// individually, so a nested `[bark.sinks]` and an `[[bark.rules]]` entry
+/// each carry one and neither is an `Item::Table` at the top level. A scan
+/// that looked only there reported no positions for a `dogs.toml` made
+/// entirely of those, and the migration then appended at 0.
+///
+/// An implicit parent (`bark` itself, when the file only ever wrote
+/// `[bark.sinks]`) has no position of its own, hence the descent into
+/// children rather than a test on the parent alone.
+fn last_position(item: &Item) -> Option<usize> {
+    match item {
+        Item::Table(table) => table
+            .position()
+            .into_iter()
+            .chain(table.iter().filter_map(|(_, child)| last_position(child)))
+            .max(),
+        Item::ArrayOfTables(array) => array
+            .iter()
+            .flat_map(|table| {
+                table
+                    .position()
+                    .into_iter()
+                    .chain(table.iter().filter_map(|(_, child)| last_position(child)))
+            })
+            .max(),
+        // Neither holds a positioned table: an inline `metrics = { .. }`
+        // is a key/value pair and renders above the tables, with the other
+        // pairs.
+        Item::Value(_) | Item::None => None,
     }
 }
 
@@ -904,6 +950,46 @@ mod tests {
             headers,
             vec!["[a]", "[b]", "[c]", "[bark.sinks]", "[[bark.rules]]"],
             "the migration appends; it does not interleave: {written}"
+        );
+    }
+
+    /// Fails if a destination whose own sections are nested or an array of
+    /// tables sends the moved section to the FRONT of the file.
+    ///
+    /// The counterpart to
+    /// [`a_moved_dog_with_sub_tables_lands_in_one_piece_at_the_end`], which
+    /// puts the shapes in the source. Here they are in `dogs.toml`, which
+    /// is where the scan for "one past the last table" had to see them and
+    /// did not: it read `Item::Table` positions at the top level only, so
+    /// `[bark.sinks]` (nested one level under an implicit `bark`) and
+    /// `[[bark.rules]]` (an array of tables) both counted as position
+    /// nothing. The scan answered 0, the moved `[metrics]` took position 0,
+    /// and `toml_edit` rendered it first and jammed against `[bark.sinks]`
+    /// with no blank line between them. Reproduced against a real flock on
+    /// exactly this fixture.
+    ///
+    /// TWO `[[bark.rules]]` entries, not one, and that is what makes the
+    /// array arm of the scan load-bearing rather than decorative: with one
+    /// entry a scan that saw only the nested table answered 1, tied with
+    /// the array's own 1, and happened to render correctly anyway. With
+    /// two, the same blind scan wedges `[metrics]` between them.
+    ///
+    /// The exact string is the assertion, blank lines and all: nothing
+    /// here is lost either way, so a reparse agrees with a wrecked file
+    /// and only the rendering tells them apart.
+    #[test]
+    fn a_moved_dog_lands_after_a_destination_of_nested_and_array_tables() {
+        let (_dir, paths) = home_with(
+            "[daemon]\nlog_level = \"info\"\n\n[dog.metrics]\nbind = \"127.0.0.1:19615\"\n",
+        );
+        let before = "[bark.sinks]\noncall = { url = \"u\" }\n\n[[bark.rules]]\non = \"gave_up\"\n\n[[bark.rules]]\non = \"restarted\"\n";
+        std::fs::write(&paths.dogs_config, before).expect("write");
+
+        migrate_dog_sections(&paths).expect("migrate");
+
+        assert_eq!(
+            std::fs::read_to_string(&paths.dogs_config).expect("read"),
+            format!("{before}\n[metrics]\nbind = \"127.0.0.1:19615\"\n")
         );
     }
 
