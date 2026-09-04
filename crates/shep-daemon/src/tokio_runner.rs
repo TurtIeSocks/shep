@@ -152,7 +152,7 @@ const READ_BUFFER: usize = 8 * 1024;
 ///
 /// # Where the number comes from
 ///
-/// 500ms, against a measured worst case of 7 to 12ms.
+/// 100ms, against a measured worst case of 7 to 12ms.
 ///
 /// A child that has been reaped cannot have left more than its pipes'
 /// capacity behind, because its pipes are the only thing it had to write
@@ -165,22 +165,33 @@ const READ_BUFFER: usize = 8 * 1024;
 /// measurement kept as a case, so a later cut to this number fails a test
 /// rather than silently truncating a dying sheep's last words.
 ///
-/// # Why the headroom is this wide
+/// # Why it is not wider
 ///
-/// Because it is nearly free, and the failure it prevents is not.
+/// A draining pump is deaf, and a handover asks pumps questions.
 ///
-/// Nothing joins this task. [`spawn_log_pump`] returns `()` and keeps no
-/// handle, and the sheep task has already sent `Msg::Exited` before dropping
-/// the receiver that ends the pump, so no operator is waiting on this budget
-/// and `shep stop` does not return any later for it. Its whole cost is how
-/// long one ending pump holds two descriptors and two files when a lamb
-/// keeps the pipe open, where 500ms and 100ms are the same answer.
+/// `final_drain` runs inside a `select!` handler, so for as long as it lasts
+/// the pump is not polling `ctl_rx`. `supervisor::report_fds` says what that
+/// costs in as many words: a pump that has stopped serving its mailbox fills
+/// it and blocks the send, and the sweep gives every pump one
+/// `REPORT_DEADLINE` (2s) between them. So this budget is not free after
+/// all, and is spent out of that one.
 ///
-/// The cost of being too small is the bug this exists to fix, one machine
-/// slower. 100ms was the first value here and it is roughly 9x the measured
-/// worst case, which is thin for a CI runner that can be an order of
-/// magnitude slower than the machine above. 500ms is about 45x and buys that
-/// margin with something nobody is waiting for.
+/// It looked free at first, and the reasoning that made it look free was
+/// wrong in an instructive way: nothing joins this task, `spawn_log_pump`
+/// returns `()`, and `Msg::Exited` has already gone by the time the pump
+/// ends, so no operator waits on the drain. All true, and all beside the
+/// point, because the party that waits is not an operator but the next
+/// handover. This was briefly 500ms on the strength of that argument, and
+/// CI went red on a handover case two commits later. The failure was never
+/// pinned on it, but 500ms was a quarter of `REPORT_DEADLINE` bought with an
+/// argument that had a hole in it, and 100ms is 9x the measured worst case
+/// without the hole.
+///
+/// Serving `ctl_rx` from inside the drain would remove the tradeoff, the way
+/// [`reserve_slot`] does for its own wait. It is not done here because a
+/// `ReportFds` answered mid-drain would name descriptors this pump is about
+/// to close, and getting that right is a bigger change than the budget is
+/// worth.
 ///
 /// # What the number is NOT
 ///
@@ -189,7 +200,7 @@ const READ_BUFFER: usize = 8 * 1024;
 /// likes, so no budget is sufficient there and this one is a cap on how long
 /// ONE ending sheep may delay its own pump's teardown. That case is why a
 /// budget exists at all; the measurement above is why it is not 10ms.
-const FINAL_DRAIN: Duration = Duration::from_millis(500);
+const FINAL_DRAIN: Duration = Duration::from_millis(100);
 
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
 #[derive(Debug, Default)]
