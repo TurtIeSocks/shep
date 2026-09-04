@@ -467,13 +467,21 @@ mod tests {
         assert_eq!(snap.log_json.source, StyleSource::Default);
         assert_eq!(snap.allow_control.source, StyleSource::Default);
         assert_eq!(snap.max_cron_sleep.source, StyleSource::Default);
+        assert_eq!(
+            snap.style_level_in_file, None,
+            "a fresh home has never written [style], so the reader must say so"
+        );
     }
 
     #[test]
     fn a_declared_scalar_reads_as_config_even_at_its_default_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shep.toml");
-        std::fs::write(&path, "[daemon]\nlog_level = \"warn\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "[daemon]\nlog_level = \"warn\"\n\n[style]\nlevel = \"bare\"\n",
+        )
+        .unwrap();
 
         let snap = load_settings(&path, &socket_default_fixture(), style_fixture()).unwrap();
         assert_eq!(snap.log_level.value, "warn");
@@ -481,6 +489,12 @@ mod tests {
             snap.log_level.source,
             StyleSource::Config,
             "a key written to its own default is still a key someone wrote"
+        );
+        assert_eq!(
+            snap.style_level_in_file,
+            Some("bare".to_string()),
+            "load_settings must read [style] level off the real document, \
+             not just carry the resolved level `style_fixture` supplies"
         );
     }
 
