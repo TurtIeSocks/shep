@@ -42,6 +42,27 @@ const DOGS_CAPTION: &str = "space arms, Enter applies; a dog needs no reload";
 /// leave, NAME never shrinks below a name worth reading.
 const DOG_NAME_MIN: u16 = 8;
 
+/// The columns every line on this screen spends on the selection mark and
+/// the space after it, before any cell is drawn.
+///
+/// [`super::flock::GUTTER`]'s twin, and it exists for the reason that one
+/// does: a budget that forgets it is a budget every line overruns. Both the
+/// dogs table and the scalar rows draw [`mark`] plus a space, so the width
+/// a tier is chosen for and the width its cells are fitted into is the
+/// terminal MINUS this, never the terminal itself. Leaving it out put every
+/// dogs line two columns over its budget at every width -- 122 columns
+/// drawn into a 120-column terminal -- with `Buffer::set_line` clipping the
+/// overflow in silence. RUNNING is last, so what got clipped was always the
+/// diagnostic half: `waiting-restart` is exactly 15 characters in a 15-wide
+/// column, so it drew as `waiting-resta` with no ellipsis to say so.
+const GUTTER: u16 = 2;
+
+/// The width the rows themselves are laid out in: the terminal minus
+/// [`GUTTER`].
+const fn body_width(width: u16) -> u16 {
+    width.saturating_sub(GUTTER)
+}
+
 /// One column of the dogs table.
 ///
 /// `Debug` is derived rather than redacted (IR-41): a bare variant name,
@@ -105,8 +126,15 @@ const ALL_DOG_COLUMNS: &[DogColumn] = &[
 const NO_SOURCE: &[DogColumn] = &[DogColumn::Name, DogColumn::InFile, DogColumn::Running];
 const FLOOR_DOG_COLUMNS: &[DogColumn] = &[DogColumn::Name, DogColumn::Running];
 
-/// The narrowest terminal the dogs table's floor column set will draw into:
-/// [`DogColumn::Running`] plus [`DOG_NAME_MIN`] plus one gap.
+/// The narrowest the dogs TABLE will draw into: [`DogColumn::Running`] plus
+/// [`DOG_NAME_MIN`] plus one gap.
+///
+/// The table's floor, not the terminal's, exactly as
+/// [`super::flock::MIN_WIDTH`] is: a terminal also has to pay [`GUTTER`]
+/// for the selection mark, so the narrowest TERMINAL this table fits is
+/// `DOG_MIN_WIDTH + GUTTER`. Every threshold in [`DOG_TIERS`] is a table
+/// width and is compared against [`body_width`], never against the raw
+/// terminal.
 const DOG_MIN_WIDTH: u16 = DogColumn::Running.width() + DOG_NAME_MIN + 2;
 
 /// Width thresholds, widest first, mirroring [`super::flock::TIERS`]'s own
@@ -428,15 +456,24 @@ fn content_lines(
     lines.push(Line::default());
 
     lines.push(section_header("[dogs]", palette));
+    // `body_width`, not `width`: every line below draws `mark`'s own two
+    // columns before its first cell, so the table is laid out in what is
+    // left after them. `view::mod`'s own `draw` does the same for the flock
+    // table, and this pane had not.
+    let table_width = body_width(width);
+    // Fitted rather than printed raw: the caption is 48 columns and the
+    // screen draws from `view::MIN_TERM_WIDTH` (33) up, so on a narrow
+    // terminal it was cut mid-word by `Buffer::set_line` with nothing
+    // saying it had been cut.
     lines.push(Line::from(Span::styled(
-        format!("  {DOGS_CAPTION}"),
+        format!("  {}", fit(DOGS_CAPTION, table_width)),
         palette.muted(),
     )));
-    let rendered_columns = columns_for(width);
-    lines.push(dog_header_line(rendered_columns, width, palette));
-    for (index, dog) in dog_rows(app, width).iter().enumerate() {
+    let rendered_columns = columns_for(table_width);
+    lines.push(dog_header_line(rendered_columns, table_width, palette));
+    for (index, dog) in dog_rows(app, table_width).iter().enumerate() {
         let selected = cursor == Some(SettingsRow::Dog(index));
-        lines.push(dog_line(dog, rendered_columns, width, selected));
+        lines.push(dog_line(dog, rendered_columns, table_width, selected));
     }
 
     // One prompt line under the table, echoing the status bar's own Slot 1
@@ -511,6 +548,7 @@ mod tests {
     use super::*;
     use crate::lookout::app::{KeyPress, Msg};
     use crate::lookout::frames::render_text;
+    use crate::output::width::visible_width;
     use crate::style::StyleSource;
 
     /// The whole screen at a comfortable width. The snapshot is the
@@ -541,18 +579,39 @@ mod tests {
     /// fails if a dogs-table tier can render wider than the terminal it was
     /// chosen for -- the same claim `flock`'s own
     /// `every_tier_fits_the_width_it_claims` makes for the flock table.
+    ///
+    /// Measures the RENDERED lines rather than summing the declared widths,
+    /// which is what the arithmetic version of this test did and why it
+    /// could not fail. Every row and the header carry `mark`'s own
+    /// two-column prefix, and the sum left it out exactly as the code did,
+    /// so the test agreed with the bug: every dogs line came out two
+    /// columns over its budget at every width, `Buffer::set_line` clipped
+    /// the overflow in silence, and RUNNING is the last column, so
+    /// `waiting-restart` (15 characters in a 15-wide column) always drew as
+    /// `waiting-resta` with no ellipsis to say it had been cut.
     #[test]
     fn every_dogs_tier_fits_the_width_it_claims() {
-        for width in DOG_MIN_WIDTH..=200 {
-            let columns = columns_for(width);
-            let fixed: u16 = columns.iter().map(|c| c.width()).sum();
-            let gaps = u16::try_from(columns.len() - 1).unwrap() * 2;
-            assert!(
-                fixed + gaps + DOG_NAME_MIN <= width,
-                "width {width} chose {} columns needing {}",
-                columns.len(),
-                fixed + gaps + DOG_NAME_MIN
-            );
+        let app = fixtures::app_in_settings_with_dog_drift();
+        let settings = app.settings().unwrap();
+        let palette = app.palette();
+        for width in (DOG_MIN_WIDTH + GUTTER)..=200 {
+            let rendered: Vec<String> = content_lines(&app, settings, palette, width)
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            // Everything from the `[dogs]` header down: the caption, the
+            // column header and one line per dog.
+            let table = rendered
+                .iter()
+                .position(|line| line.contains("[dogs]"))
+                .expect("the dogs section is always drawn");
+            for line in &rendered[table..] {
+                assert!(
+                    visible_width(line) <= usize::from(width),
+                    "width {width} drew {} columns: {line:?}",
+                    visible_width(line)
+                );
+            }
         }
     }
 

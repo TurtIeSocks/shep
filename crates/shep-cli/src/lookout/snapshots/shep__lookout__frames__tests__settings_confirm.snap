@@ -17,9 +17,9 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                                                                                     
   [dogs]                                                                                                                                                                            
   space arms, Enter applies; a dog needs no reload                                                                                                                                  
-  NAME                                                                                                                              IN FILE  SOURCE                    RUNNING      
-  bark                                                                                                                              no       built-in                  not running  
-  metrics                                                                                                                           yes      built-in                  not running  
+  NAME                                                                                                                            IN FILE  SOURCE                    RUNNING        
+  bark                                                                                                                            no       built-in                  not running    
+  metrics                                                                                                                         yes      built-in                  not running    
                                                                                                                                                                                     
   set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key cancels          
                                                                                                                                                                                     

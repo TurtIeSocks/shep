@@ -180,9 +180,9 @@ const settingsFresh = `shep lookout   /home/ada/.shep                           
 
   [dogs]
   space arms, Enter applies; a dog needs no reload
-  NAME                                                                  IN FILE  SOURCE                    RUNNING
-  bark                                                                  no       built-in                  not running
-  metrics                                                               no       built-in                  not running
+  NAME                                                                IN FILE  SOURCE                    RUNNING
+  bark                                                                no       built-in                  not running
+  metrics                                                             no       built-in                  not running
 
 esc close   j/k select   g/G first/last   space cycle                                                          read-only`;
 
@@ -201,9 +201,9 @@ const settingsConfirm = `shep lookout   /home/ada/.shep                         
 
   [dogs]
   space arms, Enter applies; a dog needs no reload
-  NAME                                                                                                                              IN FILE  SOURCE                    RUNNING
-  bark                                                                                                                              no       built-in                  not running
-  metrics                                                                                                                           yes      built-in                  not running
+  NAME                                                                                                                            IN FILE  SOURCE                    RUNNING
+  bark                                                                                                                            no       built-in                  not running
+  metrics                                                                                                                         yes      built-in                  not running
 
   set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key cancels
 set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key ca… control enabled`;
@@ -223,10 +223,10 @@ const settingsDogs = `shep lookout   /home/ada/.shep                            
 
   [dogs]
   space arms, Enter applies; a dog needs no reload
-  NAME                                                                  IN FILE  SOURCE                    RUNNING
-  otel                                                                  no       built-in                  online
-  ledger                                                                yes      built-in                  not running
-  bark                                                                  yes      built-in                  silent
+  NAME                                                                IN FILE  SOURCE                    RUNNING
+  otel                                                                no       built-in                  online
+  ledger                                                              yes      built-in                  not running
+  bark                                                                yes      built-in                  silent
 
 esc close   j/k select   g/G first/last   space cycle                                                          read-only`;
 ---

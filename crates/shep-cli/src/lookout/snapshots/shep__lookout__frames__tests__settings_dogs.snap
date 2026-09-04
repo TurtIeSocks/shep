@@ -17,10 +17,10 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         
   [dogs]                                                                                                                
   space arms, Enter applies; a dog needs no reload                                                                      
-  NAME                                                                  IN FILE  SOURCE                    RUNNING      
-  otel                                                                  no       built-in                  online       
-  ledger                                                                yes      built-in                  not running  
-  bark                                                                  yes      built-in                  silent       
+  NAME                                                                IN FILE  SOURCE                    RUNNING        
+  otel                                                                no       built-in                  online         
+  ledger                                                              yes      built-in                  not running    
+  bark                                                                yes      built-in                  silent         
                                                                                                                         
                                                                                                                         
                                                                                                                         

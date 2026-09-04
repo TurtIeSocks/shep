@@ -723,10 +723,10 @@ shep lookout   /home/ada/.shep                                                  
   level            full                            the default  the next command reads it                               [0m
                                                                                                                         [0m
 [0m[38;5;245m  [dogs][0m                                                                                                                [0m
-[0m[38;5;245m  space arms, Enter applies; a dog needs no reload[0m                                                                      [0m
-[0m[38;5;245m  NAME                                                                  IN FILE  SOURCE                    RUNNING      [0m
-  bark                                                                  no       built-in                  not running  [0m
-  metrics                                                               no       built-in                  not running  [0m
+[0m[38;5;245m  space arms, Enter applies; a dog needs no reload                                                                      [0m
+[0m[38;5;245m  NAME                                                                IN FILE  SOURCE                    RUNNING        [0m
+  bark                                                                no       built-in                  not running    [0m
+  metrics                                                             no       built-in                  not running    [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -758,10 +758,10 @@ shep lookout   /home/ada/.shep                                                  
   level            full                            shep.toml    the next command reads it                               [0m
                                                                                                                         [0m
 [0m[38;5;245m  [dogs][0m                                                                                                                [0m
-[0m[38;5;245m  space arms, Enter applies; a dog needs no reload[0m                                                                      [0m
-[0m[38;5;245m  NAME                                                                  IN FILE  SOURCE                    RUNNING      [0m
-  bark                                                                  no       built-in                  not running  [0m
-  metrics                                                               yes      built-in                  not running  [0m
+[0m[38;5;245m  space arms, Enter applies; a dog needs no reload                                                                      [0m
+[0m[38;5;245m  NAME                                                                IN FILE  SOURCE                    RUNNING        [0m
+  bark                                                                no       built-in                  not running    [0m
+  metrics                                                             yes      built-in                  not running    [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
@@ -793,10 +793,10 @@ shep lookout   /home/ada/.shep                                                  
   level            full                            shep.toml    the next command reads it                                                                                           [0m
                                                                                                                                                                                     [0m
 [0m[38;5;245m  [dogs][0m                                                                                                                                                                            [0m
-[0m[38;5;245m  space arms, Enter applies; a dog needs no reload[0m                                                                                                                                  [0m
-[0m[38;5;245m  NAME                                                                                                                              IN FILE  SOURCE                    RUNNING      [0m
-  bark                                                                                                                              no       built-in                  not running  [0m
-  metrics                                                                                                                           yes      built-in                  not running  [0m
+[0m[38;5;245m  space arms, Enter applies; a dog needs no reload                                                                                                                                  [0m
+[0m[38;5;245m  NAME                                                                                                                            IN FILE  SOURCE                    RUNNING        [0m
+  bark                                                                                                                            no       built-in                  not running    [0m
+  metrics                                                                                                                         yes      built-in                  not running    [0m
                                                                                                                                                                                     [0m
 [0m[38;5;221m  set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key cancels[0m          [0m
                                                                                                                                                                                     [0m
@@ -828,10 +828,10 @@ shep lookout   /home/ada/.shep                                                  
   level            full                            shep.toml    the next command reads it                               [0m
                                                                                                                         [0m
 [0m[38;5;245m  [dogs][0m                                                                                                                [0m
-[0m[38;5;245m  space arms, Enter applies; a dog needs no reload[0m                                                                      [0m
-[0m[38;5;245m  NAME                                                                  IN FILE  SOURCE                    RUNNING      [0m
-  bark                                                                  no       built-in                  not running  [0m
-  metrics                                                               yes      built-in                  not running  [0m
+[0m[38;5;245m  space arms, Enter applies; a dog needs no reload                                                                      [0m
+[0m[38;5;245m  NAME                                                                IN FILE  SOURCE                    RUNNING        [0m
+  bark                                                                no       built-in                  not running    [0m
+  metrics                                                             yes      built-in                  not running    [0m
                                                                                                                         [0m
 [0m[38;5;221m  editing socket: /home/ada/.shep/run/s▏   enter applies   esc cancels[0m                                                  [0m
                                                                                                                         [0m
@@ -863,11 +863,11 @@ shep lookout   /home/ada/.shep                                                  
   level            full                            shep.toml    the next command reads it                               [0m
                                                                                                                         [0m
 [0m[38;5;245m  [dogs][0m                                                                                                                [0m
-[0m[38;5;245m  space arms, Enter applies; a dog needs no reload[0m                                                                      [0m
-[0m[38;5;245m  NAME                                                                  IN FILE  SOURCE                    RUNNING      [0m
-  otel                                                                  no       built-in                  online       [0m
-  ledger                                                                yes      built-in                  not running  [0m
-  bark                                                                  yes      built-in                  silent       [0m
+[0m[38;5;245m  space arms, Enter applies; a dog needs no reload                                                                      [0m
+[0m[38;5;245m  NAME                                                                IN FILE  SOURCE                    RUNNING        [0m
+  otel                                                                no       built-in                  online         [0m
+  ledger                                                              yes      built-in                  not running    [0m
+  bark                                                                yes      built-in                  silent         [0m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
