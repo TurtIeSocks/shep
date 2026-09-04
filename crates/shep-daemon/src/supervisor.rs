@@ -5705,8 +5705,8 @@ impl<R: ProcessRunner> Actor<R> {
     ///   **A reset can kill, and that is the ruling rather than an
     ///   oversight.** `instances` is [`ApplyGroup::Structural`], held out of
     ///   [`ResetDepth::None`] however unestablished it is and routed through
-    ///   [`Self::handle_scale`] under either reset flag. That function's
-    ///   `Ordering::Less` arm calls [`Self::begin_manual_ids`] with
+    ///   [`Self::handle_scale`] under any of the three modes that reach it.
+    ///   That function's `Ordering::Less` arm calls [`Self::begin_manual_ids`] with
     ///   [`ManualKind::Delete`], the same path `shep delete` takes, so
     ///   reducing a count deletes the instances above it.
     ///   `a_plain_load_never_scales_and_a_reset_does` pins both halves.
@@ -22549,8 +22549,9 @@ mod tests {
     ///
     /// Returns the stored config, the template and the override record the
     /// two of them imply, in the order [`merge_declared`] takes them. Every
-    /// mode is measured on the same three values, because the modes are a
-    /// two-by-two grid and only a shared fixture makes the grid visible.
+    /// mode is measured on the same three values, because the four modes
+    /// are deliberately not a two-by-two grid (see [`merge_declared`]'s own
+    /// doc) and only a shared fixture makes that visible.
     fn reset_grid() -> (AppConfig, DeclaredApp, shep_core::overrides::AppOverrides) {
         let mut stored = AppConfig::minimal("web", "./srv");
         stored.max_restarts = 3;
