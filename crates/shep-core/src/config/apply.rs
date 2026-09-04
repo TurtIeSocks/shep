@@ -139,11 +139,15 @@ pub fn is_classified(field: &str) -> bool {
 /// not. That one is coherent, not useless, and is left out only because
 /// nobody has asked for it.
 ///
-/// `#[non_exhaustive]`: no fifth depth is anticipated, but this type travels
-/// inside `Request::ApplyConfig` on the wire, so the attribute stays as
-/// insurance against a peer on an older build that cannot decode a variant
-/// it predates; without it, a non-exhaustive match at a call site in another
-/// crate would silently compile against a peer that can never receive it.
+/// `#[non_exhaustive]`: no fifth depth is anticipated, and the attribute buys
+/// SOURCE compatibility rather than wire compatibility. It forces a crate
+/// outside this one to carry a wildcard arm, so adding a variant does not
+/// break its build. It does nothing for serde, which is worth stating because
+/// an earlier version of this comment claimed otherwise: this enum carries no
+/// `#[serde(other)]`, so a build meeting a variant it predates fails to
+/// deserialize with `unknown variant`, measured rather than assumed. That is
+/// the whole reason renaming `Settings` to `Policy` moved `PROTOCOL_VERSION`
+/// to 3 instead of riding the additive precedent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

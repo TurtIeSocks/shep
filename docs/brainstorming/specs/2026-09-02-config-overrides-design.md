@@ -497,15 +497,25 @@ for `&self` on the grounds that applying under a running sheep is the outcome
 being ruled out, which was right for a request that reports. The applier is a
 sibling.
 
-`PROTOCOL_VERSION` stays 2, and this corrects an earlier draft of this spec
-that said it moves to 3. The rule at `protocol/mod.rs:43` keeps the version for
-new variants behind `#[non_exhaustive]`, and `shep-core`'s CHANGELOG applies it
+`ApplyConfig` on its own did not move `PROTOCOL_VERSION`, and this corrected an
+earlier draft of this spec that said it did. It has since moved to 3 anyway,
+for a different reason recorded below: renaming `ResetDepth::Settings` to
+`Policy` changed the wire string for an operation that already worked, which is
+not the additive shape this paragraph describes. The rule at `protocol/mod.rs:43`
+keeps the version for new variants, and `shep-core`'s CHANGELOG applies it
 repeatedly, `ConfigDrift` itself among them: *"Additive: `PROTOCOL_VERSION`
 stays 1, a daemon that predates the request answers its existing 'does not
 implement that request' error."* The 1 to 2 bump was for `SelectorSpec`, a type
 nested inside requests an older daemon already knows how to decode, which is a
 different situation. An older daemon meeting `ApplyConfig` fails to decode the
 verb, which is the outcome every earlier additive variant shipped with.
+
+Note what `#[non_exhaustive]` does and does not buy here, since an earlier
+version of this paragraph leaned on it. It forces a crate outside `shep-core`
+to carry a wildcard arm, so adding a variant does not break its build. It does
+nothing for serde: this enum has no `#[serde(other)]`, so a build meeting a
+variant it predates fails with `unknown variant` rather than falling back.
+Measured, not assumed.
 
 `SCHEMA_VERSION` stays 1. `ProcessInfo` gains `pending: Vec<String>` and
 `overridden: Vec<String>`, both additive, both names only, because `env`

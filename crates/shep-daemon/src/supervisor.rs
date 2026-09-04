@@ -2890,8 +2890,11 @@ fn merge_declared(
             // and a template silent about it leaves the count alone by this
             // same rule, which is the footgun `File` exists to fix.
             ResetDepth::File => incoming.declared.contains(key),
-            // `ResetDepth::Env` and `ResetDepth::None`, plus any depth a
-            // newer client knows that this build does not.
+            // `ResetDepth::Env` and `ResetDepth::None`. Nothing else can
+            // arrive here: a depth this build does not know fails to
+            // deserialize before dispatch, since the enum carries no
+            // `#[serde(other)]`, so the connection ends on the envelope
+            // rather than reaching this match.
             //
             // `Env` shares this arm WHOLE, and it is worth saying which
             // parts of the rule it is sharing rather than leaving it to
@@ -2910,8 +2913,8 @@ fn merge_declared(
             // do that.
             //
             // For `None` itself: append-only is the rule that cannot
-            // overwrite something an operator set, so it is also the one an
-            // unrecognised depth falls back to.
+            // overwrite something an operator set, which is what a load
+            // arriving through a merged pull request has to be.
             _ => {
                 key != "instances" && incoming.declared.contains(key) && !established.contains(key)
             }
