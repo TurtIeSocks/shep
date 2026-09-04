@@ -1940,6 +1940,55 @@ mod tests {
     use super::*;
     use crate::cli::Format;
 
+    /// The redaction IR-41 requires of [`EnableRefusal`], pinned as exact
+    /// strings rather than as a "contains no secret" probe: this type
+    /// derives `Debug`, so what it prints is decided half by the derive and
+    /// half by [`ShepTomlError`]'s own manual impl, and a change to either
+    /// one alone could start printing the document. `shep.toml` can hold a
+    /// dog's webhook token in an un-migrated `[dog.<name>]` table, which is
+    /// exactly what a `toml_edit` parse error quotes into its `Display`.
+    ///
+    /// The three cases are the two the wrapper can be built from and the
+    /// one it owns: a `WrongShape` (no document anywhere in it), a `Parse`
+    /// (the one that has a document to leak), and an `UnknownDog` (names
+    /// the refusal prints to the operator anyway).
+    #[test]
+    fn enable_refusal_debug_never_prints_the_document() {
+        let path = std::path::PathBuf::from("/home/ada/.shep/shep.toml");
+        let secret = "https://hooks.example.com/services/T00/B00/super-secret-token";
+        let broken = format!("[dog.bark]\nwebhook = \"{secret}\"\n[daemon\n");
+        let source = broken.parse::<toml_edit::DocumentMut>().unwrap_err();
+
+        let wrong_shape = EnableRefusal::Config(ShepTomlError::WrongShape {
+            path: path.clone(),
+            key: "style",
+            found: "string",
+        });
+        assert_eq!(
+            format!("{wrong_shape:?}"),
+            "Config(WrongShape { path: \"/home/ada/.shep/shep.toml\", key: \"style\", \
+             found: \"string\" })"
+        );
+
+        let parse = EnableRefusal::Config(ShepTomlError::Parse { path, source });
+        let debug = format!("{parse:?}");
+        assert!(
+            !debug.contains(secret),
+            "the document must never reach Debug: {debug}"
+        );
+        assert!(!debug.contains("webhook"), "{debug}");
+        assert_eq!(
+            debug,
+            "Config(Parse { path: \"/home/ada/.shep/shep.toml\", message: \"invalid table \
+             header\\nexpected `.`, `]`\" })"
+        );
+
+        let unknown = EnableRefusal::UnknownDog {
+            adopted: vec!["otel".to_string()],
+        };
+        assert_eq!(format!("{unknown:?}"), "UnknownDog { adopted: [\"otel\"] }");
+    }
+
     /// Every test in this module drives one of the dog verbs under
     /// `--format table` -- none of them exercises the JSON envelope -- so
     /// `fmt` is fixed here rather than threaded through every call site.
