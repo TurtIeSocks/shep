@@ -261,11 +261,25 @@ has not adopted the contract yet, bark included until it does.
 ## Wire
 
 `Request` and `Response` are unchanged. `Subscribe` and `DogConfig` already
-exist and `config.dog.<name>` is a topic, not a variant. `PROTOCOL_VERSION`
-stays at 2 and `SCHEMA_VERSION` stays at 1.
+exist, so nothing an operator or a dog SENDS is new.
 
-The new contract is entirely outside the socket: two flags on a binary and what
-they print.
+**`BusEvent` gains a variant, and an earlier draft of this section denied it.**
+It said `config.dog.<name>` is "a topic, not a variant", which is not how the
+bus works: a topic is derived from a variant, `BusEvent::LogOut` giving
+`"log.out"`, and the six that exist (`Process`, `LogOut`, `LogErr`, `Channel`,
+`Dropped`, `DaemonShutdown`) have nowhere to put a config change. Publishing on
+this topic needs a seventh.
+
+That is additive, on the same terms as the six precedents in shep-core's
+changelog: an older peer never subscribed to a topic it does not know, so it
+receives nothing new and breaks on nothing. `PROTOCOL_VERSION` does not move
+again for it. Note that it is already 3, moved by the reset-mode rename in
+`#119`; this section said 2 until that landed.
+
+`SCHEMA_VERSION` stays 1. The bus is not the output envelope.
+
+Everything else in the new contract really is outside the socket: two flags on
+a binary and what they print.
 
 ## Surfacing
 
