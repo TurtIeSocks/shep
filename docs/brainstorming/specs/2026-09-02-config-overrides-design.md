@@ -143,14 +143,29 @@ anything. An operator who set `max_memory = "2G"` on a box that was OOMing must
 not lose it to a merge that touched an unrelated line.
 
 Widening it takes `--reset=<mode>`, and the mode is required. Four values,
-because there are exactly two axes and no more:
+and a mode touches only what its name says:
 
-| mode | `env` | keys the template does not declare |
-| --- | --- | --- |
-| `file` | kept | kept |
-| `policy` | kept | dropped |
-| `env` | reset | kept |
-| `all` | reset | dropped |
+| mode | `env` | keys the template declares | keys it does not |
+| --- | --- | --- | --- |
+| `file` | kept | reset | kept |
+| `policy` | kept | reset | reset |
+| `env` | reset | kept | kept |
+| `all` | reset | reset | reset |
+
+**This is deliberately not a two by two grid, and an earlier draft of this
+section claimed it was.** There are two independent choices, but the second
+one has three settings rather than two: policy can go untouched, or back to
+what the template declares, or back for every key including the ones the
+template never named. Six combinations exist. These four are the ones worth
+having, and the discarded two are both modes that reset undeclared keys while
+sparing declared ones, which is an operation nobody wants.
+
+The grid framing produced a real defect before it was caught. Under it, `env`
+was the baseline reset plus env, so `--reset=env` also put back every field
+the template declared. That is coherent, and it fails the rule this whole
+naming exercise exists to enforce: an operator typing `--reset=env` does not
+expect their restart budget reset because the template happens to mention it.
+A mode touches what its name says.
 
 `policy` and `env` are the two halves this design already splits config into,
 one paragraph down, so the flag values and the prose use one vocabulary rather
