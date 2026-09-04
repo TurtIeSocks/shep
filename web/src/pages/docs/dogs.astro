@@ -613,11 +613,10 @@ current shep-core, or run a shep that speaks 2`}</CodeBlock>
     </p>
     <p>
       A candidate gets one second to exit and another to have its output
-      read, so two seconds is the worst case rather than one. It is killed
-      either way, so a
-      dog that ignores <code>--version</code> and runs costs that second and
-      is adopted with an unknown protocol. It can't hang the{" "}
-      <code>adopt</code> that's vetting it.
+      read, and an adopt runs two probes, so roughly four seconds is the
+      worst case. It is killed either way, so a dog that ignores both flags
+      and runs costs that time and is adopted with an unknown protocol. It
+      can't hang the <code>adopt</code> that's vetting it.
     </p>
     <p>
       None of the answer is written down. <code>[daemon] adopted_dogs</code>{" "}

@@ -447,10 +447,10 @@ the ordinary case, not a skew, and comparing the two would report every
 dog that exists.
 
 A candidate gets one second to exit and another to have its output read,
-so two seconds is the worst case rather than one. It is killed either way,
-so a dog
-that ignores `--version` and runs costs that second and is adopted with an
-unknown protocol. It cannot hang the `adopt` that is vetting it.
+and an adopt runs two probes, so roughly four seconds is the worst case. It
+is killed either way, so a dog that ignores both flags and runs costs that
+time and is adopted with an unknown protocol. It cannot hang the `adopt`
+that is vetting it.
 
 None of the answer is written down. `[daemon] adopted_dogs` records the
 path and nothing else, and a protocol stored at adopt time would be a copy
