@@ -738,8 +738,13 @@ async fn reload_with_wait(
     // announcement anything holding the socket can forge next to one the
     // daemon makes about work it did itself. Nothing is lost by the
     // silence: this pre-flight is followed immediately by the handover it
-    // is clearing the way for, and every dog re-asks for its section when
-    // it comes back up against the successor.
+    // is clearing the way for, and the migration relocates values without
+    // changing any of them. A dog that re-reads its section against the
+    // successor finds the same settings in the new file, and a dog that
+    // never re-reads is already holding them. Both exist: bark's event
+    // source ends on a handover, so it exits and comes back up reading
+    // `dogs.toml`, while metrics redials underneath a `ReconnectingClient`,
+    // keeps its pid and its `restarts 0`, and reads no config again.
     match dog_migration::migrate_dog_sections(paths) {
         Ok(moved) if moved.is_empty() => {}
         Ok(moved) => {
