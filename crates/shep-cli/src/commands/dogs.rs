@@ -162,6 +162,12 @@ async fn connect_or_absent(
 /// [`ShepToml::try_edit`] is generic over the closure's error precisely so
 /// a verb whose refusal is its own thing does not have to dress it up as a
 /// [`ShepTomlError`] it is not.
+///
+/// `Debug` is derived rather than redacted (IR-41): [`Self::Config`]
+/// forwards to [`ShepTomlError`]'s own manually redacted `Debug`, which is
+/// where a secret in the document would surface, and
+/// [`Self::UnknownDog`] carries dog names that this same refusal already
+/// prints to the operator on its way out.
 #[derive(Debug)]
 pub(crate) enum EnableRefusal {
     /// The read-modify-write underneath the closure failed; rendered by
@@ -364,8 +370,8 @@ async fn enable_after_config(
 /// so a caller with no rows to print -- the settings screen -- can reuse
 /// the decision without reusing the reporting.
 ///
-/// `disable_dog` leaves `[daemon] adopted_dogs` alone — that is the
-/// difference between `disable` and `rehome` — so this reads the same
+/// `disable_dog` leaves `[daemon] adopted_dogs` alone, which is the
+/// difference between `disable` and `rehome`, so this reads the same
 /// answer before or after the edit. It is read for the report only:
 /// `DisableDog` carries a name and nothing else.
 ///
