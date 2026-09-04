@@ -584,11 +584,64 @@ where
                 });
                 dirty = true;
             }
+            // The one arm that writes `shep.toml`'s `enabled_dogs`, off this
+            // task for the same reason `Effect::WriteSetting`'s own arm
+            // gives: `dogs::enable_in_config`/`dogs::disable_in_config`
+            // both take `ShepToml::edit`'s (or `try_edit`'s) lock, which
+            // blocks with no deadline.
+            Effect::WriteDog(edit) => {
+                let path = daemon_config.clone();
+                let for_msg = edit.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    if edit.enable {
+                        crate::commands::dogs::enable_in_config(&path, &edit.name)
+                            .map_err(|err| enable_refusal_message(&err, &edit.name))
+                    } else {
+                        crate::commands::dogs::disable_in_config(&path, &edit.name)
+                            .map_err(|err| err.to_string())
+                    }
+                })
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|inner| inner);
+                // `let _`: `Msg::DogWritten` returns either `Effect::Send`
+                // or `Effect::None` -- never something this loop has to act
+                // on inline, the same reason `Msg::SettingWritten`'s own
+                // call site above gives for its own `Effect::None`. A
+                // `Send` reaches the next iteration through `msgs` exactly
+                // as an ordinary key's `Effect::Send` would.
+                let _ = app.update(Msg::DogWritten {
+                    edit: for_msg,
+                    result,
+                });
+                dirty = true;
+            }
             Effect::None => dirty = true,
         }
     }
 
     terminal
+}
+
+/// Renders [`crate::commands::dogs::EnableRefusal`] for the settings
+/// screen's own notice line.
+///
+/// Not that module's own `fail_enable_unknown_dog`: that function writes
+/// straight to a [`crate::output::Streams`] and picks an [`ExitCode`], and
+/// this call site has neither -- it hands a plain sentence to
+/// [`app::Msg::DogWritten`], which is the shape every notice on this screen
+/// already carries. `name` is this closure's own argument rather than
+/// re-derived from the refusal (`EnableRefusal::UnknownDog` does not carry
+/// it), so the wrong name never lands in a sentence about someone else's
+/// dog.
+fn enable_refusal_message(err: &crate::commands::dogs::EnableRefusal, name: &str) -> String {
+    use crate::commands::dogs::EnableRefusal;
+    match err {
+        EnableRefusal::Config(err) => err.to_string(),
+        EnableRefusal::UnknownDog { .. } => {
+            format!("{name} is not a dog shep knows about")
+        }
+    }
 }
 
 #[cfg(test)]

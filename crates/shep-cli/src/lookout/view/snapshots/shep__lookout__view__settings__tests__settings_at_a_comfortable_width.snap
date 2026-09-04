@@ -17,9 +17,9 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         
   [dogs]                                                                                                                
   space arms, Enter applies; a dog needs no reload                                                                      
-  NAME                                                                                   IN FILE  SOURCE                
-  bark                                                                                   no       built-in              
-  metrics                                                                                yes      built-in              
+  NAME                                                                  IN FILE  SOURCE                    RUNNING      
+  bark                                                                  no       built-in                  not running  
+  metrics                                                               yes      built-in                  not running  
                                                                                                                         
                                                                                                                         
                                                                                                                         

@@ -14,7 +14,11 @@
 //! and `max_cron_sleep` are free text instead: `Enter` on either row opens
 //! an editor in that same slot ([`Settings::typing`]), and both are the
 //! only two fields an empty buffer can unset. The dogs table's own
-//! enable/disable is editable as well.
+//! enable/disable is editable as well, and its RUNNING column
+//! ([`dog_rows`]) joins the file's own `enabled`/`SOURCE` pair against the
+//! live flock, which is the only one of the three that can drift from it.
+
+use std::path::PathBuf;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -23,7 +27,8 @@ use ratatui::text::{Line, Span};
 use super::super::app::{App, Settings, SettingsRow};
 use super::super::theme::Palette;
 use super::flock::{fit, mark};
-use crate::commands::settings::{DogView, ScalarView, SettingField, SettingsSnapshot};
+use crate::commands::settings::{ScalarView, SettingField, SettingsSnapshot};
+use crate::vocabulary::Reported;
 
 /// The dogs caption, verbatim. Not "space applies": this screen arms and
 /// confirms like every other action in lookout (`x`, `R`, `L`), and a
@@ -50,11 +55,10 @@ pub enum DogColumn {
     /// `built-in`, or the adopted binary's path.
     Source,
     /// The join against the live flock: whether the dog is actually up.
-    /// This task never renders it -- task 9's `dog_rows` supplies the data
-    /// this cell needs, and until then drawing a RUNNING header over a
-    /// column with nothing under it would be a rendering bug wearing a
-    /// header. The variant and its place in [`DOG_TIERS`] exist now anyway, so
-    /// task 9 extends the drop order rather than re-arguing it.
+    /// [`dog_rows`] supplies the word this cell shows -- the same one
+    /// [`super::flock::Column::Status`] would print for a sheep of that
+    /// name, off [`crate::vocabulary::Reported`] -- or [`None`] when no
+    /// dog of this name is running, which reads `not running`.
     Running,
 }
 
@@ -122,10 +126,8 @@ const DOG_TIERS: &[(u16, &[DogColumn])] = &[
 
 /// The widest dogs-table column set that fits `width`.
 ///
-/// Includes [`DogColumn::Running`] in every tier, even though nothing in
-/// this task draws it -- see that variant's own doc. A caller that wants the
-/// columns this task actually renders filters it out; `draw_settings` does
-/// exactly that.
+/// Includes [`DogColumn::Running`] in every tier -- it is the floor,
+/// alongside NAME, and `draw_settings` renders every column this returns.
 #[must_use]
 pub fn columns_for(width: u16) -> &'static [DogColumn] {
     DOG_TIERS
@@ -145,14 +147,77 @@ fn dog_name_width(width: u16, columns: &[DogColumn]) -> u16 {
         .max(DOG_NAME_MIN)
 }
 
-/// One dog's cell text.
+/// One row of the dogs table, with the file and the live flock joined by
+/// name. Declared here rather than in the [`SettingsSnapshot`] task's own
+/// module because the join is this one's whole subject: that snapshot
+/// carries [`crate::commands::settings::DogView`]'s `enabled` and
+/// `adopted_path` alone, and [`Self::running`] is what [`dog_rows`] adds.
 ///
-/// [`DogColumn::Running`] is never reached in this task: [`draw_settings`]
-/// filters it out of the rendered column set before calling this, per
-/// that variant's own doc. The arm stays here rather than being left
-/// unimplemented so the match is exhaustive and a future column cannot fall
-/// through it unnoticed.
-fn dog_cell(dog: &DogView, column: DogColumn) -> String {
+/// `Debug` is derived rather than redacted (IR-41): a name, a bool, a
+/// rendered word and a path, none of which is a secret -- a dog's own
+/// config, which can be, lives in `dogs.toml` and neither this type nor the
+/// [`DogView`](crate::commands::settings::DogView) it is built from ever
+/// touches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DogRow {
+    /// The dog's name.
+    pub name: String,
+    /// Whether `[daemon] enabled_dogs` names it -- a fact about the file,
+    /// never about whether the shepherd has actually started it.
+    pub enabled: bool,
+    /// The word the flock table would show for this dog's own row, or
+    /// `None` when no dog of this name is running.
+    pub running: Option<String>,
+    /// `None` for a built-in dog; the adopted binary's path otherwise.
+    pub adopted_path: Option<PathBuf>,
+}
+
+/// The dogs table's rows: `app`'s settings snapshot joined against its own
+/// live flock, by name.
+///
+/// `app` rather than `Settings` alone: the file half
+/// ([`SettingsSnapshot::dogs`]) and the join's other half
+/// (`App::all_rows`, the live flock) live on two different types, and this
+/// is the one function that reads both. Returns the empty vector when the
+/// settings screen is not open -- `draw_settings` never calls this while it
+/// is closed, but a caller that did gets no rows rather than a panic.
+#[must_use]
+pub fn dog_rows(app: &App, width: u16) -> Vec<DogRow> {
+    // Not read: every dogs-table tier keeps `DogColumn::Running`, so there
+    // is no width where the join this function does would go unrendered --
+    // see `columns_for`'s own doc. Kept in the signature to match every
+    // other view function in this file, which takes the render width it is
+    // about to be fit into.
+    let _ = width;
+    let Some(settings) = app.settings() else {
+        return Vec::new();
+    };
+    let running_by_name: std::collections::BTreeMap<&str, String> = app
+        .all_rows()
+        .into_iter()
+        .filter(|row| row.info.dog.is_some())
+        .map(|row| {
+            (
+                row.info.name.as_str(),
+                Reported::of(row.info.status, row.info.handshook).word(),
+            )
+        })
+        .collect();
+    settings
+        .snapshot()
+        .dogs
+        .iter()
+        .map(|dog| DogRow {
+            name: dog.name.clone(),
+            enabled: dog.enabled,
+            running: running_by_name.get(dog.name.as_str()).cloned(),
+            adopted_path: dog.adopted_path.clone(),
+        })
+        .collect()
+}
+
+/// One dog's cell text.
+fn dog_cell(dog: &DogRow, column: DogColumn) -> String {
     match column {
         DogColumn::Name => dog.name.clone(),
         DogColumn::InFile => if dog.enabled { "yes" } else { "no" }.to_string(),
@@ -160,7 +225,10 @@ fn dog_cell(dog: &DogView, column: DogColumn) -> String {
             .adopted_path
             .as_ref()
             .map_or_else(|| "built-in".to_string(), |path| path.display().to_string()),
-        DogColumn::Running => String::new(),
+        DogColumn::Running => dog
+            .running
+            .clone()
+            .unwrap_or_else(|| "not running".to_string()),
     }
 }
 
@@ -184,7 +252,7 @@ fn dog_header_line(columns: &[DogColumn], width: u16, palette: Palette) -> Line<
 }
 
 /// One dog's row.
-fn dog_line(dog: &DogView, columns: &[DogColumn], width: u16, selected: bool) -> Line<'static> {
+fn dog_line(dog: &DogRow, columns: &[DogColumn], width: u16, selected: bool) -> Line<'static> {
     let name_width = dog_name_width(width, columns);
     let mut text = format!("{} ", mark(selected));
     for (index, column) in columns.iter().enumerate() {
@@ -307,7 +375,16 @@ const fn section_for(field: SettingField) -> &'static str {
 /// agree today would silently desync the moment either one reordered, and
 /// the cursor -- which [`Settings::rows`] alone defines -- would then land
 /// on a row this function drew somewhere else.
-fn content_lines(settings: &Settings, palette: Palette, width: u16) -> Vec<Line<'static>> {
+///
+/// Takes `app` as well as `settings`, unlike every scalar row above it:
+/// [`dog_rows`] is the one read here that needs the live flock, which lives
+/// on `App` and not on `Settings` alone.
+fn content_lines(
+    app: &App,
+    settings: &Settings,
+    palette: Palette,
+    width: u16,
+) -> Vec<Line<'static>> {
     let snapshot = settings.snapshot();
     let cursor = settings.cursor();
 
@@ -344,18 +421,11 @@ fn content_lines(settings: &Settings, palette: Palette, width: u16) -> Vec<Line<
         format!("  {DOGS_CAPTION}"),
         palette.muted(),
     )));
-    // `Running` is dropped from what actually draws -- see its own doc --
-    // so NAME reclaims the columns it would have taken rather than leaving
-    // them blank.
-    let rendered_columns: Vec<DogColumn> = columns_for(width)
-        .iter()
-        .copied()
-        .filter(|column| *column != DogColumn::Running)
-        .collect();
-    lines.push(dog_header_line(&rendered_columns, width, palette));
-    for (index, dog) in snapshot.dogs.iter().enumerate() {
+    let rendered_columns = columns_for(width);
+    lines.push(dog_header_line(rendered_columns, width, palette));
+    for (index, dog) in dog_rows(app, width).iter().enumerate() {
         let selected = cursor == Some(SettingsRow::Dog(index));
-        lines.push(dog_line(dog, &rendered_columns, width, selected));
+        lines.push(dog_line(dog, rendered_columns, width, selected));
     }
 
     // One prompt line under the table, in the shape the status bar's own
@@ -400,14 +470,15 @@ fn content_lines(settings: &Settings, palette: Palette, width: u16) -> Vec<Line<
 
 /// Draws the settings screen into `area`, straight into `buffer`.
 ///
-/// `app` supplies the palette; every other fact this screen shows, including
-/// its one armed or in-flight prompt line, comes off `settings`.
+/// `app` supplies the palette and the live flock [`dog_rows`] joins against;
+/// every other fact this screen shows, including its one armed or in-flight
+/// prompt line, comes off `settings`.
 pub fn draw_settings(app: &App, settings: &Settings, area: Rect, buffer: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let palette = app.palette();
-    for (offset, line) in content_lines(settings, palette, area.width)
+    for (offset, line) in content_lines(app, settings, palette, area.width)
         .iter()
         .enumerate()
         .take(usize::from(area.height))
@@ -489,7 +560,7 @@ mod tests {
         let app = fixtures::app_in_settings();
         let settings = app.settings().unwrap();
         let palette = app.palette();
-        let lines = content_lines(settings, palette, 120);
+        let lines = content_lines(&app, settings, palette, 120);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -533,7 +604,7 @@ mod tests {
         let _ = app.update(Msg::Key(KeyPress::Confirm));
         let settings = app.settings().unwrap();
         let palette = app.palette();
-        let lines = content_lines(settings, palette, 120);
+        let lines = content_lines(&app, settings, palette, 120);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -543,5 +614,32 @@ mod tests {
                 && line.contains("/home/ada/.shep/run/shep.sock")),
             "got: {rendered:?}"
         );
+    }
+
+    /// `otel` runs while the file has it disabled, which is what "a removed
+    /// name keeps running" looks like. `ledger` is enabled and absent,
+    /// which is a dog that failed to start.
+    #[test]
+    fn the_dogs_table_joins_the_file_against_the_running_flock() {
+        let app = fixtures::app_in_settings_with_dog_drift();
+        let rows = dog_rows(&app, 120);
+
+        let otel = rows.iter().find(|r| r.name == "otel").unwrap();
+        assert!(!otel.enabled);
+        assert_eq!(otel.running.as_deref(), Some("online"));
+
+        let ledger = rows.iter().find(|r| r.name == "ledger").unwrap();
+        assert!(ledger.enabled);
+        assert_eq!(ledger.running, None);
+    }
+
+    /// Phase 3b: a dog that never completed a handshake reads `silent`, not
+    /// `online`, and this table must not undo that.
+    #[test]
+    fn a_dog_that_never_handshook_reads_silent_here_too() {
+        let app = fixtures::app_in_settings_with_silent_dog();
+        let rows = dog_rows(&app, 120);
+        let bark = rows.iter().find(|r| r.name == "bark").unwrap();
+        assert_eq!(bark.running.as_deref(), Some("silent"));
     }
 }
