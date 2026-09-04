@@ -7,7 +7,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same thirty frames with colour; read it with `less -R`.
+frames.ansi is the same thirty-one frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -24,11 +24,11 @@ it read and dropped are counted exactly; bytes below its 64 KiB window were
 never read at all, so those are reported in bytes, because nothing counted the
 lines in them and guessing would be worse than saying so.
 
-The last five frames are the settings screen, `s` from the dashboard. It owns
+The last six frames are the settings screen, `s` from the dashboard. It owns
 the whole body between the title and the status bar rather than sharing it
 with the flock table, so a fresh $SHEP_HOME, some scalars declared, an armed
-confirm, the socket editor mid-type and the dogs table's own drift each get a
-frame of their own.
+confirm, the socket editor mid-type, the dogs table's own drift and the same
+screen at 45 columns each get a frame of their own.
 
 
 === healthy_wide  (120x30) ===
@@ -879,3 +879,32 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         [0m
                                                                                                                         [0m
 [0m[38;5;245mesc close   j/k select   g/G first/last   space cycle                                                          read-only[0m
+
+
+=== settings_narrow  (45x24) ===
+The same screen at 45 columns. Both of its tables have dropped a column rather than clipping: the scalar rows have lost the apply cost and kept SOURCE, and the dogs table has lost SOURCE and kept RUNNING. Each keeps whichever half is not said anywhere else.
+
+shep lookout   /home/ada/.shep[0m[38;5;245m 2 in the flock[0m
+[0m[38;5;245m  [daemon][0m                                   [0m
+> log_level        warn           shep.toml  [0m
+  log_json         false          the default[0m
+  socket           /home/ada/.s…  shep.toml  [0m
+  max_cron_sleep   30s            shep.toml  [0m
+                                             [0m
+[0m[38;5;245m  [whistle][0m                                  [0m
+  allow_control    false          the default[0m
+                                             [0m
+[0m[38;5;245m  [style][0m                                    [0m
+  level            full           shep.toml  [0m
+                                             [0m
+[0m[38;5;245m  [dogs][0m                                     [0m
+[0m[38;5;245m  space arms, Enter applies; a dog needs no …[0m
+[0m[38;5;245m  NAME               IN FILE  RUNNING        [0m
+  otel               no       online         [0m
+  ledger             yes      not running    [0m
+  bark               yes      silent         [0m
+                                             [0m
+                                             [0m
+                                             [0m
+                                             [0m
+[0m[38;5;245mesc close   j/k select   g/G first… read-only[0m

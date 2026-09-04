@@ -363,34 +363,161 @@ const fn apply_cost(field: SettingField, source: StyleSource) -> &'static str {
 /// NAME column width: fits `max_cron_sleep`, the longest field name, with a
 /// column of padding.
 const SCALAR_NAME_W: u16 = 15;
-/// VALUE column width: fits `/home/ada/.shep/run/shep.sock` (29 columns),
-/// an ordinary absolute socket path, whole -- a value already past this
-/// budget still truncates through [`fit`] rather than growing the column.
+/// VALUE column width where the terminal can afford it: fits
+/// `/home/ada/.shep/run/shep.sock` (29 columns), an ordinary absolute
+/// socket path, whole. A cap rather than a fixed width -- a narrow terminal
+/// gets [`SCALAR_VALUE_MIN`] instead, and a value past whatever budget it
+/// lands on truncates through [`fit`].
 const SCALAR_VALUE_W: u16 = 30;
+/// The floor on VALUE: enough for `not set`, `waiting`, a level name or the
+/// tail of a path, never a whole socket path. Below this the row stops
+/// saying anything and there is nothing left to trade.
+const SCALAR_VALUE_MIN: u16 = 10;
 /// SOURCE column width: `$SHEP_STYLE` and `the default` are both 11 columns,
 /// the widest two words [`crate::style::StyleSource::Display`] ever prints.
 const SCALAR_SOURCE_W: u16 = 11;
-/// The floor on the apply-cost column once `width` is too narrow to give it
-/// the remainder: enough for `needs`, never a whole sentence.
+/// The floor on the apply-cost column once the terminal is too narrow to
+/// give it the remainder: enough for `needs`, never a whole sentence.
 const SCALAR_COST_MIN: u16 = 8;
 
-/// One scalar row: name, value, source, apply cost.
+/// One column of a scalar row.
+///
+/// `Debug` is derived rather than redacted (IR-41): a bare variant name,
+/// nothing a `{:?}` could leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarColumn {
+    /// The document's own key for this field.
+    Name,
+    /// What the file says, or the compiled fallback when it says nothing.
+    /// The flexible column, between [`SCALAR_VALUE_MIN`] and
+    /// [`SCALAR_VALUE_W`].
+    Value,
+    /// Which layer the value came from.
+    Source,
+    /// What applying an edit to this field costs. Takes whatever the other
+    /// three leave.
+    Cost,
+}
+
+const SCALAR_ALL: &[ScalarColumn] = &[
+    ScalarColumn::Name,
+    ScalarColumn::Value,
+    ScalarColumn::Source,
+    ScalarColumn::Cost,
+];
+const SCALAR_NO_COST: &[ScalarColumn] = &[
+    ScalarColumn::Name,
+    ScalarColumn::Value,
+    ScalarColumn::Source,
+];
+const SCALAR_FLOOR: &[ScalarColumn] = &[ScalarColumn::Name, ScalarColumn::Value];
+
+/// The narrowest the scalar rows will draw into, as a body width: NAME, a
+/// gap and VALUE at its floor. The terminal also pays [`GUTTER`], the same
+/// split [`DOG_MIN_WIDTH`] documents.
+const SCALAR_MIN_WIDTH: u16 = SCALAR_NAME_W + 2 + SCALAR_VALUE_MIN;
+
+/// Width thresholds for the scalar rows, widest first, the same shape
+/// [`DOG_TIERS`] and [`super::flock::TIERS`] both use.
+///
+/// The apply cost drops first, and SOURCE second, which is the reverse of
+/// the dogs table's order and is deliberate. The cost is the widest cell
+/// here (a whole sentence), and it is the one fact this screen says TWICE:
+/// arming a field puts it verbatim in the confirm, in the status bar, on a
+/// row the body pane's `.take(area.height)` cannot reach. SOURCE appears
+/// nowhere else at all, and it is the column decision 4 of the design spec
+/// exists for: it is what separates "the operator wrote this" from "nobody
+/// ever did", which is the state a fresh `$SHEP_HOME` opens in. NAME and
+/// VALUE are the floor for the reason ID/NAME/STATUS is the flock table's:
+/// those two are the pane.
+///
+/// This table did not exist until a whole-branch review found the rows
+/// drawn at fixed widths summing to 72 while the screen draws from
+/// [`super::MIN_TERM_WIDTH`] (33) up. At 40 columns SOURCE and the cost
+/// were gone with no marker; at 60 the cost cell clipped mid-word to
+/// `the defau`. The dogs table directly beneath had tiered properly the
+/// whole time.
+const SCALAR_TIERS: &[(u16, &[ScalarColumn])] = &[
+    (
+        SCALAR_NAME_W + 2 + SCALAR_VALUE_MIN + 2 + SCALAR_SOURCE_W + 2 + SCALAR_COST_MIN,
+        SCALAR_ALL,
+    ),
+    (
+        SCALAR_NAME_W + 2 + SCALAR_VALUE_MIN + 2 + SCALAR_SOURCE_W,
+        SCALAR_NO_COST,
+    ),
+    (SCALAR_MIN_WIDTH, SCALAR_FLOOR),
+];
+
+/// The widest scalar column set that fits `width`, a BODY width.
+fn scalar_columns_for(width: u16) -> &'static [ScalarColumn] {
+    SCALAR_TIERS
+        .iter()
+        .find(|(threshold, _)| width >= *threshold)
+        .map_or(SCALAR_FLOOR, |(_, columns)| *columns)
+}
+
+/// What VALUE and the apply cost get out of `width`, once NAME, SOURCE and
+/// the separators are paid for.
+///
+/// VALUE takes the remainder up to [`SCALAR_VALUE_W`] and never below
+/// [`SCALAR_VALUE_MIN`]; the cost takes what is left after that, so a wide
+/// terminal spends its extra columns on the sentence rather than on padding
+/// a value that has already been shown whole. The cost's number is zero
+/// when [`ScalarColumn::Cost`] is not in `columns`, and nothing reads it
+/// then.
+fn scalar_widths(width: u16, columns: &[ScalarColumn]) -> (u16, u16) {
+    let fixed = SCALAR_NAME_W
+        + if columns.contains(&ScalarColumn::Source) {
+            SCALAR_SOURCE_W
+        } else {
+            0
+        };
+    let gaps = u16::try_from(columns.len().saturating_sub(1)).unwrap_or(0) * 2;
+    let remainder = width.saturating_sub(fixed).saturating_sub(gaps);
+    if columns.contains(&ScalarColumn::Cost) {
+        let value = remainder
+            .saturating_sub(SCALAR_COST_MIN)
+            .clamp(SCALAR_VALUE_MIN, SCALAR_VALUE_W);
+        (value, remainder.saturating_sub(value).max(SCALAR_COST_MIN))
+    } else {
+        (remainder.clamp(SCALAR_VALUE_MIN, SCALAR_VALUE_W), 0)
+    }
+}
+
+/// One scalar cell's text.
+fn scalar_cell(field: SettingField, view: &ScalarView, column: ScalarColumn) -> String {
+    match column {
+        ScalarColumn::Name => field_label(field).to_string(),
+        ScalarColumn::Value => view.value.clone(),
+        ScalarColumn::Source => view.source.to_string(),
+        ScalarColumn::Cost => apply_cost(field, view.source).to_string(),
+    }
+}
+
+/// One scalar row: name, value, source, apply cost, as many of those as
+/// `width` (a BODY width) can pay for.
 fn scalar_line(
     field: SettingField,
     view: &ScalarView,
     selected: bool,
     width: u16,
 ) -> Line<'static> {
-    let fixed = 1 + 1 + SCALAR_NAME_W + 2 + SCALAR_VALUE_W + 2 + SCALAR_SOURCE_W + 2;
-    let cost_width = width.saturating_sub(fixed).max(SCALAR_COST_MIN);
-    let text = format!(
-        "{} {}  {}  {}  {}",
-        mark(selected),
-        fit(field_label(field), SCALAR_NAME_W),
-        fit(&view.value, SCALAR_VALUE_W),
-        fit(&view.source.to_string(), SCALAR_SOURCE_W),
-        fit(apply_cost(field, view.source), cost_width),
-    );
+    let columns = scalar_columns_for(width);
+    let (value_width, cost_width) = scalar_widths(width, columns);
+    let mut text = format!("{} ", mark(selected));
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            text.push_str("  ");
+        }
+        let cell_width = match column {
+            ScalarColumn::Name => SCALAR_NAME_W,
+            ScalarColumn::Value => value_width,
+            ScalarColumn::Source => SCALAR_SOURCE_W,
+            ScalarColumn::Cost => cost_width,
+        };
+        text.push_str(&fit(&scalar_cell(field, view, *column), cell_width));
+    }
     Line::from(Span::raw(text))
 }
 
@@ -450,7 +577,7 @@ fn content_lines(
             field,
             scalar_view(snapshot, field),
             cursor == Some(row),
-            width,
+            body_width(width),
         ));
     }
     lines.push(Line::default());
@@ -610,6 +737,57 @@ mod tests {
                     visible_width(line) <= usize::from(width),
                     "width {width} drew {} columns: {line:?}",
                     visible_width(line)
+                );
+            }
+        }
+    }
+
+    /// fails if the scalar rows stop tiering, or start dropping the wrong
+    /// column first.
+    ///
+    /// The cost sentence goes first because arming the field repeats it
+    /// verbatim in the status bar; SOURCE goes second because it appears
+    /// nowhere else on the screen at all. Widths are BODY widths, two
+    /// columns narrower than the terminal -- see `GUTTER`.
+    #[test]
+    fn the_scalar_apply_cost_drops_before_its_source() {
+        assert!(scalar_columns_for(118).contains(&ScalarColumn::Cost));
+        assert!(!scalar_columns_for(43).contains(&ScalarColumn::Cost));
+        assert!(
+            scalar_columns_for(43).contains(&ScalarColumn::Source),
+            "SOURCE is the screen's own subject and outlives the cost"
+        );
+        assert!(!scalar_columns_for(33).contains(&ScalarColumn::Source));
+        assert!(
+            scalar_columns_for(33).contains(&ScalarColumn::Value),
+            "NAME and VALUE are the floor"
+        );
+    }
+
+    /// fails if ANY line of the settings screen renders wider than the
+    /// terminal it was drawn for -- the scalar rows included, which is the
+    /// half `every_dogs_tier_fits_the_width_it_claims` above does not
+    /// reach.
+    ///
+    /// The scalar rows had no width adaptation at all: fixed widths of 15,
+    /// 30 and 11 with only the trailing cost column clamped, so the
+    /// narrowest row they could draw was 72 columns while the screen draws
+    /// from `MIN_TERM_WIDTH` (33) up. At 40 columns SOURCE and the cost
+    /// were gone with no marker, and at 60 the cost cell clipped mid-word
+    /// to `the defau`, both silently, because `Buffer::set_line` clips
+    /// without saying so.
+    #[test]
+    fn every_settings_line_fits_the_terminal_it_was_drawn_for() {
+        let app = fixtures::app_in_settings_with_dog_drift();
+        let settings = app.settings().unwrap();
+        let palette = app.palette();
+        for width in super::super::MIN_TERM_WIDTH..=200 {
+            for line in content_lines(&app, settings, palette, width) {
+                let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    visible_width(&rendered) <= usize::from(width),
+                    "width {width} drew {}: {rendered:?}",
+                    visible_width(&rendered)
                 );
             }
         }

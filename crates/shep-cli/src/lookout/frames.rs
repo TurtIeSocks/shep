@@ -203,6 +203,9 @@ pub enum Scene {
     /// The settings screen's dogs table, showing the drift it exists to
     /// make visible.
     SettingsDogs,
+    /// The settings screen on a narrow terminal, where both of its tables
+    /// have dropped a column.
+    SettingsNarrow,
 }
 
 impl Scene {
@@ -238,6 +241,7 @@ impl Scene {
         Self::SettingsConfirm,
         Self::SettingsTyping,
         Self::SettingsDogs,
+        Self::SettingsNarrow,
     ];
 
     /// The snapshot name and the gallery heading.
@@ -274,11 +278,12 @@ impl Scene {
             Self::SettingsConfirm => "settings_confirm",
             Self::SettingsTyping => "settings_typing",
             Self::SettingsDogs => "settings_dogs",
+            Self::SettingsNarrow => "settings_narrow",
         }
     }
 
     /// One sentence saying what this frame is for, printed above it in the
-    /// gallery so the maintainer does not have to hold thirty of them in her head.
+    /// gallery so the maintainer does not have to hold thirty-one of them in her head.
     ///
     /// Every clause here is pinned by an assertion in
     /// `every_scene_shows_the_thing_it_is_named_for` — a caption may not say
@@ -376,6 +381,9 @@ impl Scene {
             Self::SettingsDogs => {
                 "The dogs table showing the drift it exists to reveal: otel running while disabled in the file, ledger enabled and absent, and bark enabled, running, and silent."
             }
+            Self::SettingsNarrow => {
+                "The same screen at 45 columns. Both of its tables have dropped a column rather than clipping: the scalar rows have lost the apply cost and kept SOURCE, and the dogs table has lost SOURCE and kept RUNNING. Each keeps whichever half is not said anywhere else."
+            }
         }
     }
 
@@ -429,6 +437,12 @@ impl Scene {
             // scene's width. A narrower frame would truncate the very flag
             // this scene exists to show.
             Self::SettingsConfirm => (180, 30),
+            // 45: `SCALAR_TIERS`'s middle tier, and `DOG_TIERS`'s. Wide
+            // enough that both tables still draw a real row, narrow enough
+            // that both have given a column up -- which is the one thing
+            // this frame is here to show, and the axis every other settings
+            // frame (120 and 180) misses.
+            Self::SettingsNarrow => (45, 24),
             // HealthyWide, Errored, Grouped, Retrying, Frozen, Refused, FeedGap,
             // FeedMissing, HostUnknown, Lambs, LambsUnknown: every scene that
             // carries all three optional panes at their ordinary rows.
@@ -603,7 +617,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
         // `dog_rows`'s own join sees: `otel` up and healthy, `bark` up but
         // never handshook. `ledger` (armed enabled in the snapshot below)
         // has no row here at all, which is what "enabled and absent" means.
-        Scene::SettingsDogs => vec![
+        Scene::SettingsDogs | Scene::SettingsNarrow => vec![
             dog_sheep(90, "otel", None),
             dog_sheep(91, "bark", Some(false)),
         ],
@@ -693,10 +707,10 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     // moving the cursor in them would change a snapshot for no reason.
     // `Grouped` is excluded for a fifth reason: its cursor belongs on the
     // group header, which is the whole scene, and it goes there below.
-    // `SettingsDogs` is excluded for a sixth: its flock has no id 2 at all
-    // -- the dashboard behind it is invisible once the settings screen
-    // draws over the whole body, so there is nothing for a cursor there to
-    // do.
+    // `SettingsDogs` and `SettingsNarrow` are excluded for a sixth: their
+    // flock has no id 2 at all -- the dashboard behind them is invisible
+    // once the settings screen draws over the whole body, so there is
+    // nothing for a cursor there to do.
     if !matches!(
         which,
         Scene::Empty
@@ -705,6 +719,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
             | Scene::TableOnly
             | Scene::Grouped
             | Scene::SettingsDogs
+            | Scene::SettingsNarrow
     ) {
         select_id(&mut app, 2);
     }
@@ -966,7 +981,7 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 app.update(Msg::Key(KeyPress::TextBackspace));
             }
         }
-        Scene::SettingsDogs => {
+        Scene::SettingsDogs | Scene::SettingsNarrow => {
             app.update(Msg::Key(KeyPress::Settings));
             app.update(Msg::Settings {
                 result: Ok(settings_snapshot_with_dog_drift()),
@@ -1325,7 +1340,7 @@ These are real frames, rendered headlessly through ratatui's TestBackend by
 
 Nothing here is a mockup.
 
-frames.ansi is the same thirty frames with colour; read it with `less -R`.
+frames.ansi is the same thirty-one frames with colour; read it with `less -R`.
 
 All four panes are here: the flock table (the spine), the host-usage strip,
 the sheep detail pane and the bleats feed. `>` marks the selected sheep, and
@@ -1342,11 +1357,11 @@ it read and dropped are counted exactly; bytes below its 64 KiB window were
 never read at all, so those are reported in bytes, because nothing counted the
 lines in them and guessing would be worse than saying so.
 
-The last five frames are the settings screen, `s` from the dashboard. It owns
+The last six frames are the settings screen, `s` from the dashboard. It owns
 the whole body between the title and the status bar rather than sharing it
 with the flock table, so a fresh $SHEP_HOME, some scalars declared, an armed
-confirm, the socket editor mid-type and the dogs table's own drift each get a
-frame of their own.
+confirm, the socket editor mid-type, the dogs table's own drift and the same
+screen at 45 columns each get a frame of their own.
 ";
 
 #[cfg(test)]
@@ -1466,7 +1481,7 @@ mod tests {
     /// in this module runs on both platforms, and the dashboard itself was
     /// exercised against a live Windows flock.
     #[cfg(unix)]
-    #[allow(clippy::too_many_lines)] // thirty captions, each pinned clause by clause
+    #[allow(clippy::too_many_lines)] // thirty-one captions, each pinned clause by clause
     fn every_scene_shows_the_thing_it_is_named_for() {
         // "All three panes at 120x30: the host strip under the title, the
         //  detail pane and the bleats feed under the table. `>` marks the
@@ -1996,6 +2011,26 @@ mod tests {
                 .is_some_and(|row| row.contains("yes") && row.contains("silent")),
             "bark: enabled, running, never handshook: {dogs:?}"
         );
+
+        // "The same screen at 45 columns. Both of its tables have dropped a
+        //  column rather than clipping: the scalar rows have lost the apply
+        //  cost and kept SOURCE, and the dogs table has lost SOURCE and
+        //  kept RUNNING. Each keeps whichever half is not said anywhere
+        //  else."
+        let narrow = render_text(&scene(Scene::SettingsNarrow).1);
+        assert!(
+            narrow.contains("shep.toml"),
+            "the scalar rows keep SOURCE: {narrow:?}"
+        );
+        assert!(
+            !narrow.contains("needs shep daemon reload"),
+            "and lose the apply cost: {narrow:?}"
+        );
+        assert!(
+            dog_row_for(&narrow, "otel").is_some_and(|row| row.contains("online")),
+            "the dogs table keeps RUNNING: {narrow:?}"
+        );
+        assert!(!narrow.contains("built-in"), "and loses SOURCE: {narrow:?}");
     }
 
     /// fails if the gallery's cursor walk budgets by SHEEP rather than by
@@ -2064,7 +2099,7 @@ mod tests {
         // above already guarantees it, so it would be a line that cannot
         // fail. The literal can — it is what catches a scene added to the
         // enum and not to `ALL`, or the reverse.
-        assert_eq!(Scene::ALL.len(), 30);
+        assert_eq!(Scene::ALL.len(), 31);
     }
 
     /// fails if a 12b pane introduced a text MODIFIER. `sgr` renders
