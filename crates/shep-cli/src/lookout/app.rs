@@ -1616,16 +1616,23 @@ impl App {
         match result {
             Ok(Response::DogStarted(_)) if enable => {
                 self.notice = Some(Notice {
-                    text: format!("{prefix}: done"),
+                    text: format!("{prefix}: the shepherd started it"),
                     grave: false,
                 });
             }
             Ok(Response::Deleted(_)) if !enable => {
                 self.notice = Some(Notice {
-                    text: format!("{prefix}: done"),
+                    text: format!("{prefix}: the shepherd stopped and deregistered it"),
                     grave: false,
                 });
             }
+            // Also reached by a mismatched guard above -- an `EnableDog`
+            // that somehow answered `Response::Deleted`, or a `DisableDog`
+            // that somehow answered `Response::DogStarted`. Neither reply
+            // agrees with the request this reducer sent, so this is the
+            // right arm for both: "something this lookout does not
+            // understand" is true of an answer to the wrong verb too, not
+            // only of a variant this binary has never heard of.
             Ok(_unrecognised) => {
                 self.notice = Some(Notice {
                     text: format!(
@@ -5355,5 +5362,115 @@ mod tests {
             app.settings().unwrap().pending().is_some(),
             "a scalar is local file I/O and needs no shepherd"
         );
+    }
+
+    /// Drives a dog toggle all the way to `Effect::Send`, the setup every
+    /// `on_dog_reply` test below shares: arm, confirm (the file half),
+    /// `Msg::DogWritten` landing `Ok` (the daemon half goes out). Panics
+    /// with a message naming which step failed, rather than an unwrap,
+    /// since every caller is a test asserting on what happens next.
+    fn armed_and_sent_dog(name: &str) -> (App, Sent) {
+        let mut app = fixtures::app_in_settings_on_dog(name);
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::WriteDog(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send the file half first");
+        };
+        let Effect::Send(sent) = app.update(Msg::DogWritten {
+            edit,
+            result: Ok(DogSource::BuiltIn),
+        }) else {
+            panic!("a landed write must raise the daemon half");
+        };
+        (app, sent)
+    }
+
+    /// `EnableDog` answers `Response::DogStarted`, and the reply's own
+    /// sentence names what the shepherd did rather than a bare "done" --
+    /// the same convention `on_action_reply`'s own `outcome()` sets for a
+    /// sheep action.
+    #[test]
+    fn a_landed_enable_names_what_the_shepherd_did() {
+        let (mut app, sent) = armed_and_sent_dog("metrics");
+        assert!(
+            app.settings().unwrap().pending().is_some(),
+            "the sent line stays up until the reply lands"
+        );
+        let info = ProcessInfo::builder(50, "metrics", ProcStatus::Online)
+            .pid(Some(50_000))
+            .dog(Some(DogSource::BuiltIn))
+            .build();
+        app.update(Msg::Replied {
+            sent,
+            result: Ok(Response::DogStarted(info)),
+        });
+        assert_eq!(
+            app.notice().map(ToString::to_string).as_deref(),
+            Some("enable metrics: the shepherd started it")
+        );
+        assert!(!app.notice().unwrap().is_grave());
+        assert!(
+            app.settings().unwrap().pending().is_none(),
+            "the sent line clears once the reply lands"
+        );
+    }
+
+    /// `DisableDog` answers `Response::Deleted`, the same reply `Delete`
+    /// gives -- and disable's own reply names the deregistration, the
+    /// sharpest fact on this screen, since the confirm that said so is
+    /// gone by the time this lands.
+    #[test]
+    fn a_landed_disable_names_the_deregistration() {
+        let (mut app, sent) = armed_and_sent_dog("otel");
+        app.update(Msg::Replied {
+            sent,
+            result: Ok(Response::Deleted(vec![50])),
+        });
+        assert_eq!(
+            app.notice().map(ToString::to_string).as_deref(),
+            Some("disable otel: the shepherd stopped and deregistered it")
+        );
+        assert!(!app.notice().unwrap().is_grave());
+    }
+
+    /// fails if a reply this binary does not understand -- or the RIGHT
+    /// SHAPE for the WRONG verb -- reads as success. `metrics` is armed as
+    /// an `enable`, so `Response::Deleted` (the shape a `DisableDog` gets)
+    /// is a mismatched guard rather than a recognised reply, and
+    /// `Response::Pong` is a reply this binary has genuinely never heard of
+    /// -- both must land in the same refusal, the same pairing
+    /// `an_unrecognised_reply_says_so_rather_than_reading_as_success` makes
+    /// for a sheep action.
+    #[test]
+    fn an_unrecognised_dog_reply_says_so_rather_than_reading_as_success() {
+        for reply in [Response::Pong, Response::Deleted(vec![1])] {
+            let (mut app, sent) = armed_and_sent_dog("metrics");
+            app.update(Msg::Replied {
+                sent,
+                result: Ok(reply),
+            });
+            assert_eq!(
+                app.notice().map(ToString::to_string).as_deref(),
+                Some(
+                    "enable metrics: the shepherd answered something this lookout does not understand"
+                )
+            );
+            assert!(app.notice().unwrap().is_grave());
+        }
+    }
+
+    /// fails if a connection that died mid-request reports as anything
+    /// else, the same claim
+    /// `a_connection_that_died_mid_request_says_so_under_the_same_prefix`
+    /// makes for a sheep action.
+    #[test]
+    fn a_dog_reply_that_failed_to_send_says_so_under_the_same_prefix() {
+        let (mut app, sent) = armed_and_sent_dog("metrics");
+        app.update(Msg::Replied {
+            sent,
+            result: Err(RequestError::Closed),
+        });
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert!(said.starts_with("enable metrics: "), "got {said:?}");
+        assert!(said.contains(&RequestError::Closed.to_string()));
     }
 }
