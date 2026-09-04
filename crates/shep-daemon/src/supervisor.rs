@@ -5944,9 +5944,18 @@ impl<R: ProcessRunner> Actor<R> {
         ) && incoming.declared.contains("instances")
             && incoming.config.instances != running.instances
         {
+            // Names the SCOPE, not just the remedy. This said "`shep start
+            // --reset=file` to take the file's count", which reads as a way
+            // to move the count on its own, and the guard fires under
+            // `--reset=env` too: an operator who typed `env` precisely
+            // because they wanted nothing but `env` touched was being sent
+            // to a mode that also puts back every key the template declares.
+            // No mode scales without doing that, so the message says so and
+            // says which of the three costs the least.
             refusals.push(format!(
-                "instances: this load never reshapes a flock; `shep start --reset=file` to \
-                 take the file's count of {}",
+                "instances: this load never reshapes a flock; no mode scales without also \
+                 putting back every setting the file declares, and `--reset=file` is the \
+                 narrowest that does, taking the file's count of {}",
                 incoming.config.instances
             ));
         }
@@ -22845,12 +22854,22 @@ mod tests {
             4,
             "`env` scaled a flock: {reply:?}"
         );
-        assert!(
-            reply[0]
-                .refused
-                .as_deref()
-                .is_some_and(|why| why.contains("instances")),
-            "an operator whose count did not move must be told why: {reply:?}"
+        // Exact, not a `contains("instances")`. This guard fires under
+        // `env` as well as under a plain load, so the sentence an `env`
+        // operator reads is the whole point of the assertion: a substring
+        // check passed while the message advised `--reset=file` for its
+        // count without saying that mode also puts back every setting the
+        // template declares, and it passed just as happily when the message
+        // named a spelling that had become a usage error.
+        assert_eq!(
+            reply[0].refused.as_deref(),
+            Some(
+                "instances: this load never reshapes a flock; no mode scales without also \
+                 putting back every setting the file declares, and `--reset=file` is the \
+                 narrowest that does, taking the file's count of 2"
+            ),
+            "an operator whose count did not move must be told why, and what the \
+             mode they are pointed at would cost them: {reply:?}"
         );
     }
 
@@ -23233,12 +23252,13 @@ mod tests {
         assert_eq!(
             reply[0].refused.as_deref(),
             Some(
-                "instances: this load never reshapes a flock; `shep start --reset=file` to \
-                 take the file's count of 1"
+                "instances: this load never reshapes a flock; no mode scales without also \
+                 putting back every setting the file declares, and `--reset=file` is the \
+                 narrowest that does, taking the file's count of 1"
             ),
             "the refusal must name a mode an operator can actually type, \
              not the bare flag `shep start --reset` now refuses on its \
-             own: {reply:?}"
+             own, and it must name what following the advice costs: {reply:?}"
         );
         assert_eq!(
             reply[0]
