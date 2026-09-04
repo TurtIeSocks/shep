@@ -114,15 +114,15 @@ import CodeBlock from "../../components/docs/CodeBlock.astro";
       names this exact command as the fix.
     </Callout>
     <p class="fine">
-      <code>shep start &lt;Flockfile&gt;</code> is the one verb that does not
-      refuse cleanly across that skew. Applying a Flockfile to a running
-      flock is a request a shepherd from before this release has no arm for,
-      and the protocol number did not move for it, so the handshake passes
-      and the shepherd then ends the connection on an envelope it cannot
-      read.
-      Reloading first is the whole fix. The tidier refusal would have cost a
-      protocol bump, which refuses every older client for every verb rather
-      than this one.
+      <code>shep start &lt;Flockfile&gt;</code> used to be the one verb that
+      did not refuse cleanly across that skew: applying a Flockfile to a
+      running flock is additive, so the protocol number did not move for
+      it, and the handshake passed while the shepherd then ended the
+      connection on an envelope it could not read. It refuses cleanly now,
+      because the <code>--reset</code>/<code>--reset-all</code> flags
+      changed their own wire spelling and that is not additive the same
+      way, so the protocol number moved with it. Reloading first is still
+      the whole fix either way.
     </p>
 
     <h2>2. Write a Flockfile</h2>

@@ -341,7 +341,7 @@ expression: requests
           ]
         }
       ],
-      "reset": "settings"
+      "reset": "policy"
     }
   },
   {

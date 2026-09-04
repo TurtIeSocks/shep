@@ -124,30 +124,55 @@ pub fn is_classified(field: &str) -> bool {
 
 /// How much of a Flockfile load overwrites what the operator has set since.
 ///
-/// `#[non_exhaustive]`: a fourth depth is plausible, the mirror image of
-/// `Settings` -- reset only `env` back to the template while leaving every
-/// other operator-tuned setting alone. This type travels inside
-/// `Request::ApplyConfig` on the wire, so the attribute is protecting
-/// against an older daemon that cannot decode a variant it predates; without
-/// it, a non-exhaustive match there would silently compile against a peer
-/// that can never receive the new depth.
+/// Two axes, and the design spec (`2026-09-02-config-overrides-design.md`
+/// §3) says there are no more: whether `env` is reset, and whether a key the
+/// template does not declare is left alone. Four combinations, four
+/// variants.
+///
+/// `#[non_exhaustive]`: no fifth depth is anticipated, but this type travels
+/// inside `Request::ApplyConfig` on the wire, so the attribute stays as
+/// insurance against a peer on an older build that cannot decode a variant
+/// it predates; without it, a non-exhaustive match at a call site in another
+/// crate would silently compile against a peer that can never receive it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ResetDepth {
     /// Append keys nobody established. Overwrite nothing. The default,
     /// because a Flockfile arrives from the app's own repository.
+    ///
+    /// `env`: kept. A key the template does not declare: kept, since there
+    /// is nothing established to append it against.
     #[default]
     None,
+    /// Put back what the template declares, and nothing else.
+    ///
+    /// `env`: kept. A key the template does not declare: kept -- an app
+    /// stocked to four instances against a file with no `instances` line
+    /// keeps its count, because the file never entered that argument. This
+    /// is the mode that fixes the footgun `Policy` below reintroduces.
+    File,
     /// Put non-`env` settings back to the template, `env` kept. Every
     /// setting goes back, declared or not: a key the template is silent
     /// about goes to the value a fresh start off that template would give
     /// it. `env` is operator-supplied data while the rest is operator-tuned
     /// policy: resetting policy is recoverable, resetting data takes the
     /// app's database away.
-    Settings,
+    ///
+    /// `env`: kept. A key the template does not declare: dropped back to
+    /// the template's own default.
+    Policy,
+    /// Reset `env` back to the template and leave everything else alone.
+    ///
+    /// `env`: reset. A key the template does not declare: kept, on the same
+    /// reasoning as `File` -- this mode touches data, not policy, so it has
+    /// no opinion about a key the template is silent on.
+    Env,
     /// Put everything back to the template, `env` included, and drop the
     /// override record.
+    ///
+    /// `env`: reset. A key the template does not declare: dropped back to
+    /// the template's own default.
     All,
 }
 

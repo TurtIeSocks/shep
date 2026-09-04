@@ -482,8 +482,8 @@ today moves only through the file plus `--reset-all`, and editing one in
 place is a later slice (spec decisions 10 and 11).
 
 **Restart the shepherd after upgrading to it.** `PROTOCOL_VERSION` did NOT
-move for `ApplyConfig` or for `Add` (both variants are additive, and six
-precedents in shep-core's changelog agree), so an older shepherd cannot
+move for `ApplyConfig` itself or for `Add` (both variants are additive, and
+six precedents in shep-core's changelog agree), so an older shepherd cannot
 decode either one. **This paragraph said the operator meets a dead client,
 full stop, and that is wrong: it skips the skew guard, which fires first in
 the common case.** `refuse_version_skew` compares the shepherd's reported
@@ -505,6 +505,20 @@ before any request is sent. So the two cases are:
 where an operator reads. `every_exempt_verb_is_one_of_the_documented_recovery_verbs`
 pins `add` at `Enforce`, since it reaches that through the `_` arm rather
 than by being named.
+
+**`PROTOCOL_VERSION` moved to 3 on 2026-09-04, for `ApplyConfig`'s payload
+rather than for `ApplyConfig` itself.** The two-case analysis above still
+holds for `Add` and for `ApplyConfig`'s own addition. It stopped holding for
+`ResetDepth::Settings`, renamed to `ResetDepth::Policy` (with `File`/`Env`
+added) in the same commit: a rename changes the wire spelling of an
+operation — `--reset` — that already ships, so the "versions match, same
+commit lineage" case above is no longer the only hazard. A daemon at
+protocol 2 that has simply not restarted since the upgrade now fails to
+decode `"policy"` for what it already understood as `"settings"`, which is a
+regression of live functionality rather than an unreachable new one, so the
+bump closes that gap with a named `version_skew` refusal instead of leaving
+it as an accepted cost. `docs/decisions.md`'s entry on this reverses the
+"`PROTOCOL_VERSION` stayed 2" ruling that predates it.
 
 **Verb count: 41 generated, 42 listed, and the difference is `help`.**
 `./web/scripts/generate-cli-reference.sh` prints its own number every time it

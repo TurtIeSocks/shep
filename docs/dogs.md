@@ -385,7 +385,7 @@ The format is line-oriented text:
 
 ```
 shep-log-rotate 0.1.3
-shep-protocol: 2
+shep-protocol: 3
 ```
 
 - Line 1 is `<name> <version>`. Shep takes the last whitespace-separated

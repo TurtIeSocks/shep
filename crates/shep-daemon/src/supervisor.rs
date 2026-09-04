@@ -2761,13 +2761,14 @@ const EXTRAS_FIELDS: &[&str] = &[
 ///
 /// Called from the two arms that merge `env` and from neither of the others,
 /// which is the whole of the fix this function exists for. It used to be two
-/// blanket statements below the match, so [`ResetDepth::Settings`] -- the one
-/// depth that touches `env` not at all -- established every env key the file
-/// declared and spent every env override the file named. A `--reset` against
-/// a template that had grown `NEW_KEY` reported nothing, merged nothing, and
-/// recorded `declared_env: ["NEW_KEY"]`, after which no plain load could ever
-/// append it, because it was established. Only `--reset-all` recovered, and
-/// that takes every other env value with it.
+/// blanket statements below the match, so [`ResetDepth::Policy`] -- one of
+/// the two depths that touch `env` not at all, alongside [`ResetDepth::File`]
+/// -- established every env key the file declared and spent every env
+/// override the file named. A `--reset` against a template that had grown
+/// `NEW_KEY` reported nothing, merged nothing, and recorded
+/// `declared_env: ["NEW_KEY"]`, after which no plain load could ever append
+/// it, because it was established. Only `--reset-all` recovered, and that
+/// takes every other env value with it.
 ///
 /// One gap is left, and deliberately: under [`ResetDepth::None`] an env key
 /// skipped because an override already holds it is established anyway, so
@@ -2807,15 +2808,19 @@ fn establish_env(next: &mut AppOverrides, incoming: &DeclaredApp) {
 ///   `instances` is excluded from this depth however unestablished it is:
 ///   see the `in_scope` arm below for why appending a count is not the same
 ///   kind of act as appending a value.
-/// - [`ResetDepth::Settings`] puts every key but `env` in scope.
+/// - [`ResetDepth::Policy`] puts every key but `env` in scope.
 /// - [`ResetDepth::All`] puts every key in scope, `env` included, and drops
 ///   the whole override record afterwards.
+/// - [`ResetDepth::File`] and [`ResetDepth::Env`] are Task 1 stand-ins here:
+///   routed identically to `Policy` and `All` respectively until Task 2
+///   gives the undeclared-key axis its own rule. See `in_scope` below.
 ///
 /// `env` merges one level deeper than the rest, because it is a table rather
 /// than a value: under `None` an env key the file declares and nobody
-/// established is appended and the rest are left alone, under `All` the
-/// file's table replaces it whole, and under `Settings` it is not touched at
-/// all (see [`ResetDepth::Settings`] for why data and policy part company
+/// established is appended and the rest are left alone, under `All` (and,
+/// for now, `Env`, its Task 1 stand-in) the file's table replaces it whole,
+/// and under `Policy` (and `File`, on the same terms) it is not touched at
+/// all (see [`ResetDepth::Policy`] for why data and policy part company
 /// here).
 ///
 /// # Errors
@@ -2857,7 +2862,12 @@ fn merge_declared(
             continue;
         }
         let in_scope = match reset {
-            ResetDepth::Settings | ResetDepth::All => true,
+            // Task 1 stand-in: `File` is routed identically to `Policy` and
+            // `Env` identically to `All` here, on this axis (which keys not
+            // declared by the template are in scope). Task 2 gives `File`
+            // and `Env` their own rule on this axis instead of borrowing
+            // `Policy`'s and `All`'s.
+            ResetDepth::Policy | ResetDepth::All | ResetDepth::File | ResetDepth::Env => true,
             // `ResetDepth::None`, and any depth a newer client knows that
             // this build does not: append-only is the rule that cannot
             // overwrite something an operator set, so it is the one an
@@ -2907,8 +2917,17 @@ fn merge_declared(
         // policy: a `--reset` that took an app's database credentials away
         // would be a different kind of event from one that put its restart
         // budget back.
-        ResetDepth::Settings => {}
-        ResetDepth::All => {
+        //
+        // `File` lands in this arm too, and on this axis it is not a Task 1
+        // stand-in: the design keeps `env` on `File` the same as `Policy`
+        // (both keep it), so this arm is already `File`'s real behaviour.
+        ResetDepth::Policy | ResetDepth::File => {}
+        // `Env` lands in this arm as a Task 1 stand-in for now -- routed
+        // identically to `All` until Task 2 exists to say otherwise -- but
+        // here too the design's own table has `Env` resetting `env` the same
+        // way `All` does, so this arm is also already `Env`'s real
+        // behaviour; only the undeclared-key axis above still needs Task 2.
+        ResetDepth::All | ResetDepth::Env => {
             next.fields.remove("env");
             merged.insert(
                 "env".to_string(),
@@ -5871,8 +5890,16 @@ impl<R: ProcessRunner> Actor<R> {
         // count, and the additive default exists so that a template cannot
         // change what an operator set; the store cannot yet tell a stocked
         // count from an untouched one, so no plain load may act on the field.
-        if !matches!(reset, ResetDepth::Settings | ResetDepth::All)
-            && incoming.declared.contains("instances")
+        //
+        // Task 1 stand-in: `File` and `Env` are folded into this check
+        // alongside `Policy` and `All` respectively, so scale is allowed
+        // under either for now. Task 2 decides whether `File` -- the mode
+        // built to fix exactly this footgun -- should hold `instances` out
+        // the same way `None` does.
+        if !matches!(
+            reset,
+            ResetDepth::Policy | ResetDepth::All | ResetDepth::File | ResetDepth::Env
+        ) && incoming.declared.contains("instances")
             && incoming.config.instances != running.instances
         {
             refusals.push(format!(
@@ -6078,7 +6105,10 @@ impl<R: ProcessRunner> Actor<R> {
         // PREVIOUS load left, while the cache above already moved to
         // `next_overrides`; the refusal reported alongside `Applied` names
         // that case rather than hiding it.
-        let overridden_names: Vec<String> = if matches!(reset, ResetDepth::All) {
+        // Task 1 stand-in: `Env` is folded in alongside `All` so it also
+        // drops the whole record, until Task 2 decides whether `Env`
+        // dropping the record is its real behaviour too.
+        let overridden_names: Vec<String> = if matches!(reset, ResetDepth::All | ResetDepth::Env) {
             Vec::new()
         } else {
             next_overrides.fields.keys().cloned().collect()
@@ -6093,9 +6123,12 @@ impl<R: ProcessRunner> Actor<R> {
         // one lock. Recorded only for an app that got this far: the record
         // says what this load established, and a load that refused
         // established nothing.
+        //
+        // Task 1 stand-in: `Env` joins `All` here on the same terms as the
+        // `overridden_names` check above.
         changes.insert(
             name.clone(),
-            (!matches!(reset, ResetDepth::All)).then_some(next_overrides),
+            (!matches!(reset, ResetDepth::All | ResetDepth::Env)).then_some(next_overrides),
         );
         let (mut applied, mut pending): (Vec<String>, Vec<String>) = if park_all {
             // Nothing reached the running instances at all, so nothing may be
@@ -22177,7 +22210,7 @@ mod tests {
         let mut worker = AppConfig::minimal("worker", "./srv");
         worker.max_restarts = 7;
 
-        // `Settings`, not `None`: a plain load holds `instances` out of the
+        // `Policy`, not `None`: a plain load holds `instances` out of the
         // merge entirely (it never reshapes a flock), so the two keys could
         // not meet under it and the merge would be perfectly valid.
         let reply = apply_config(
@@ -22186,7 +22219,7 @@ mod tests {
                 declared_app(broken, &["name", "script", "instances", "out_file"]),
                 declared_app(worker, &["name", "script", "max_restarts"]),
             ],
-            ResetDepth::Settings,
+            ResetDepth::Policy,
         )
         .await;
 
@@ -22356,7 +22389,7 @@ mod tests {
         let reply = apply_config(
             &mut actor,
             vec![declared_app(file, &["name", "script"])],
-            ResetDepth::Settings,
+            ResetDepth::Policy,
         )
         .await;
 
@@ -22409,7 +22442,7 @@ mod tests {
         let settings_dir = tempfile::tempdir().unwrap();
         let (mut actor, _enforcer) = actor_over(&settings_dir, &[stored("web")]);
         shep_core::overrides::put(&actor.paths.overrides, "web", &record()).unwrap();
-        apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+        apply_config(&mut actor, vec![file()], ResetDepth::Policy).await;
         let settings = actor.sheep[&0].entry.spec.config().clone();
         let settings_pending = actor.sheep[&0].entry.pending.clone();
         assert_eq!(
@@ -22462,7 +22495,7 @@ mod tests {
     }
 
     /// fails if a `--reset` establishes an env key it never merged. The
-    /// `Settings` depth touches env not at all, so a template that has grown
+    /// `Policy` depth touches env not at all, so a template that has grown
     /// `NEW_KEY` reports nothing and merges nothing -- and used to record the
     /// key as established anyway, after which no plain load could ever append
     /// it and only `--reset-all` could recover, taking every other env value
@@ -22483,7 +22516,7 @@ mod tests {
             file.env = BTreeMap::from([("NEW_KEY".to_string(), "1".to_string())]);
             declared_app(file, &["name", "script", "env"])
         };
-        let reset = apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+        let reset = apply_config(&mut actor, vec![file()], ResetDepth::Policy).await;
 
         assert!(
             actor.sheep[&0].entry.spec.config().env.is_empty(),
@@ -22669,7 +22702,7 @@ mod tests {
         let reply = apply_config(
             &mut actor,
             vec![declared_app(file, &["name", "script", "instances"])],
-            ResetDepth::Settings,
+            ResetDepth::Policy,
         )
         .await;
 
@@ -22704,7 +22737,7 @@ mod tests {
                 file,
                 &["name", "script", "instances", "watch", "cwd"],
             )],
-            ResetDepth::Settings,
+            ResetDepth::Policy,
         )
         .await;
 
@@ -22813,7 +22846,7 @@ mod tests {
         let reset_dir = tempfile::tempdir().unwrap();
         let (mut actor, _enforcer) =
             actor_over(&reset_dir, &[app_with("web", |app| app.instances = 2)]);
-        let reply = apply_config(&mut actor, vec![file()], ResetDepth::Settings).await;
+        let reply = apply_config(&mut actor, vec![file()], ResetDepth::Policy).await;
         assert_eq!(actor.ids_of_name("web"), vec![0], "--reset must take it");
         assert_eq!(reply[0].applied, vec!["instances".to_string()]);
     }
@@ -22905,7 +22938,7 @@ mod tests {
                         "liveness_probe",
                     ],
                 )],
-                ResetDepth::Settings,
+                ResetDepth::Policy,
             )
             .await;
             assert!(

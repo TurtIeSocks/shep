@@ -1378,7 +1378,7 @@ fn reset_depth(args: &StartArgs) -> ResetDepth {
     if args.reset_all {
         ResetDepth::All
     } else if args.reset {
-        ResetDepth::Settings
+        ResetDepth::Policy
     } else {
         ResetDepth::None
     }
@@ -3274,7 +3274,7 @@ mod tests {
         }
 
         assert_eq!(sent_depth(false, false).await, ResetDepth::None);
-        assert_eq!(sent_depth(true, false).await, ResetDepth::Settings);
+        assert_eq!(sent_depth(true, false).await, ResetDepth::Policy);
         assert_eq!(sent_depth(false, true).await, ResetDepth::All);
     }
 
