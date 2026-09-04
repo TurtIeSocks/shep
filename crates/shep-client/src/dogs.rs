@@ -67,8 +67,12 @@ pub trait DogConfig {
     const SECRET_FIELDS: &'static [&'static str];
 }
 
-/// A field marked `#[shep(secret)]` whose name appears nowhere in the
-/// generated schema, so the marker had nothing to land on.
+/// A field marked `#[shep(secret)]` that names no property of the config
+/// type's own schema, so the marker had nothing to land on.
+///
+/// A like-named property of some other type under `$defs` does not count.
+/// That is a different field of a different type, and letting it answer for
+/// this one is how a renamed credential ships unmarked.
 ///
 /// `Debug` is derived: the field it names is an identifier from the dog's
 /// own source, never a credential's value (IR-41).
@@ -84,11 +88,11 @@ impl core::fmt::Display for SecretFieldMissing {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "the field `{}` is marked `#[shep(secret)]` but the schema has no \
-             property of that name, so the credential would go out unmarked. \
-             A `#[serde(rename)]` on the field, or a `rename_all_fields` on \
-             the type, renames the property and leaves the mark with nothing \
-             to land on.",
+            "the field `{}` is marked `#[shep(secret)]` but this type's own \
+             schema has no property of that name, so the credential would go \
+             out unmarked. A `#[serde(rename)]` on the field, or a \
+             `rename_all_fields` on the type, renames the property and leaves \
+             the mark with nothing to land on.",
             self.field
         )
     }
@@ -99,7 +103,9 @@ impl core::error::Error for SecretFieldMissing {}
 
 /// The JSON Schema a dog answers the schema flag with: what `schemars`
 /// generates for `T`, with every field `T` marked `#[shep(secret)]` carrying
-/// [`SECRET_KEY`].
+/// [`SECRET_KEY`]. The marks land on `T`'s own fields: the types `T` merely
+/// mentions answer for themselves, and are asked separately when one of them
+/// is what shep asked about.
 ///
 /// [`probe`] calls this. It is public because a dog that renders its own
 /// settings, or a test that wants to see the marks, should not have to spawn
@@ -107,9 +113,11 @@ impl core::error::Error for SecretFieldMissing {}
 ///
 /// # Errors
 ///
-/// [`SecretFieldMissing`] when a marked name appears in no property anywhere
-/// in the schema. That is a credential which did not get marked, so it is an
-/// error rather than a silent pass.
+/// [`SecretFieldMissing`] when a marked name matches no property of `T`'s own
+/// representation. That is a credential which did not get marked, so it is an
+/// error rather than a silent pass. A property of that name under `$defs`
+/// belongs to another type, so it neither carries the mark nor answers for
+/// it.
 #[cfg(feature = "schema")]
 pub fn config_schema<T: DogConfig + schemars::JsonSchema>()
 -> Result<schemars::Schema, SecretFieldMissing> {
@@ -128,25 +136,44 @@ pub fn config_schema<T: DogConfig + schemars::JsonSchema>()
     Ok(schema)
 }
 
-/// Writes `key` into every property named in `secrets`, wherever in the
-/// schema that property occurs, and records which names were reached.
+/// Where `schemars` puts the schema of every OTHER named type the root
+/// mentions, and the one keyword [`mark_secrets_in_object`] refuses to walk.
+#[cfg(feature = "schema")]
+const DEFS: &str = "$defs";
+
+/// Writes `key` into every property named in `secrets` that belongs to the
+/// root type's OWN representation, and records which names were reached.
 ///
-/// Every object node is visited rather than only the root's `properties`,
-/// which is what makes an enum work. A tagged enum's schema has NO top-level
-/// `properties` at all: it is a `oneOf` of one object per variant, each with
-/// its own. Reading only the top level would find nothing, mark nothing, and
-/// say nothing, which is the failure this whole contract exists to remove.
-/// Walking the tree covers `anyOf` and `allOf` (untagged and adjacently
-/// tagged enums) and `$defs` for free, rather than by listing keywords that a
-/// later serde representation could add to.
+/// The whole node is walked rather than only its `properties`, because a
+/// struct is the one shape that has a top-level `properties` to read. An
+/// internally tagged enum is a `oneOf` of one object per variant, an untagged
+/// one an `anyOf`, and an adjacently tagged one nests each variant's fields
+/// under the content property's own `properties`. Reading the top level alone
+/// would find nothing in all three, mark nothing, and say nothing, which is
+/// the failure this whole contract exists to remove.
 ///
-/// Two consequences, both deliberate. Marking is by NAME, so two variants
-/// sharing a field name are both marked even if only one carried the
-/// attribute; that over-redacts, which is the safe direction. And a property
-/// whose schema is not an object (a bare `true`, which is legal JSON Schema
-/// and which `schemars` does not emit for a typed field) is left alone and
-/// not recorded as found, so it surfaces as [`SecretFieldMissing`] rather
-/// than as a silent miss.
+/// [`DEFS`] is where the walk stops, and that is what keeps the mark on the
+/// type shep asked about. Entering it marks a property because some stranger
+/// one level down shares a name, and records that name as found, which then
+/// answers the missing-name check on behalf of a field that never got marked.
+/// Both halves were live at once: `BarkConfig::sinks` holds webhook
+/// credentials and is marked, `Rule::sinks` lists sink names and is not, and
+/// the second came out marked while a renamed credential could have come out
+/// plain.
+///
+/// Stopping there costs the root nothing. A root enum's variant objects are
+/// emitted inline, and a recursive root points at itself with `$ref: "#"`
+/// rather than through a definition, so no shape this contract accepts keeps
+/// its own fields in `$defs`. A `$ref` needs no skipping of its own: it is a
+/// string, and a string is a leaf.
+///
+/// Two consequences remain, both deliberate. Marking is by NAME within that
+/// representation, so two variants sharing a field name are both marked even
+/// if only one carried the attribute; that over-redacts, which is the safe
+/// direction. And a property whose schema is not an object (a bare `true`,
+/// which is legal JSON Schema and which `schemars` does not emit for a typed
+/// field) is left alone and not recorded as found, so it surfaces as
+/// [`SecretFieldMissing`] rather than as a silent miss.
 #[cfg(feature = "schema")]
 fn mark_secrets_in_object(
     map: &mut serde_json::Map<String, serde_json::Value>,
@@ -164,7 +191,10 @@ fn mark_secrets_in_object(
             }
         }
     }
-    for value in map.values_mut() {
+    for (keyword, value) in map.iter_mut() {
+        if keyword == DEFS {
+            continue;
+        }
         mark_secrets(value, secrets, key, found);
     }
 }
@@ -343,6 +373,32 @@ mod tests {
         url: String,
     }
 
+    /// A type the root only mentions, so `schemars` hoists it into `$defs`.
+    /// Its `token` is an ordinary string, and it is named to collide with
+    /// the credential the two roots below mark.
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+    struct Inner {
+        token: String,
+    }
+
+    #[derive(schemars::JsonSchema, DogConfig)]
+    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+    struct Outer {
+        #[shep(secret)]
+        token: String,
+        inner: Inner,
+    }
+
+    #[derive(schemars::JsonSchema, DogConfig)]
+    #[allow(dead_code, reason = "read by the generated schema, not by Rust")]
+    struct RenamedOuter {
+        #[shep(secret)]
+        #[serde(rename = "api_token")]
+        token: String,
+        inner: Inner,
+    }
+
     /// Both halves in one test on purpose: an implementation that marked
     /// every property would pass a test that only checked the marked one.
     #[test]
@@ -400,6 +456,39 @@ mod tests {
         assert_eq!(
             config_schema::<Renamed>(),
             Err(SecretFieldMissing { field: "url" })
+        );
+    }
+
+    /// A mark names a field of the type shep asked about, so a like-named
+    /// property of some other type the root merely mentions is not that
+    /// field and must come out plain. `Rule::sinks` is the live case: it
+    /// lists sink NAMES, one level under a `BarkConfig::sinks` that really
+    /// does hold credentials.
+    #[test]
+    fn a_like_named_property_of_a_nested_type_is_left_plain() {
+        let schema = config_schema::<Outer>().expect("`token` is a real property of the root");
+        let schema = schema.as_value();
+
+        assert_eq!(
+            schema.pointer("/properties/token/x-shep-secret"),
+            Some(&serde_json::Value::Bool(true)),
+            "the root's own marked field carries the marker"
+        );
+        assert_eq!(
+            schema.pointer("/$defs/Inner/properties/token/x-shep-secret"),
+            None,
+            "a stranger that shares the name is not the marked field"
+        );
+    }
+
+    /// The same reach, pointing the other way: a `$defs` entry that happens
+    /// to carry the pre-rename name would satisfy the missing-field check on
+    /// behalf of a credential that shipped unmarked.
+    #[test]
+    fn a_renamed_secret_field_is_an_error_even_when_a_nested_type_has_the_old_name() {
+        assert_eq!(
+            config_schema::<RenamedOuter>(),
+            Err(SecretFieldMissing { field: "token" })
         );
     }
 
