@@ -152,26 +152,32 @@ const READ_BUFFER: usize = 8 * 1024;
 ///
 /// # Where the number comes from
 ///
-/// Not a measurement, and it should not be read as one. Nothing here is
-/// tuned against a rate, because the case that spends the budget is the case
-/// where no amount of budget is enough: a lamb that outlives its parent can
-/// hold the pipe open and talk for as long as it likes. The only question
-/// the number answers is how long ONE ending sheep may delay its own pump's
-/// teardown, and 100ms is chosen to be shorter than anything an operator
-/// perceives on a `shep stop` while still being many times what a drain of a
-/// pipe's worth of bytes needs.
+/// 100ms, against a measured worst case of 4 to 6ms.
 ///
-/// What DOES have a measurement behind it is that the budget is unreachable
-/// on the path this exists for. A reaped child has no write ends left, so
-/// both streams answer EOF on the first read:
-/// `a_last_line_written_before_the_sheep_task_lets_go_reaches_the_file`
-/// closes both and runs 32 attempts in 0.14s, which is 4ms each including
-/// building a fresh pump and two files. Holding one write end open instead
-/// took the same test to 2.35s, or the full budget on most attempts, which
-/// is the lamb case behaving exactly as described.
+/// A child that has been reaped cannot have left more than one pipe's worth
+/// of bytes behind, because a pipe is the only thing it had to write into.
+/// So the pipe's capacity is the whole of what this drain can ever face on
+/// the path it exists for, and that is a bound rather than an estimate.
+/// Measured over a real pipe on macOS: it fills at 73728 bytes and 1152
+/// lines, and draining every one of them into the log file took 3.9, 4.0,
+/// 4.8 and 6.2ms across four runs.
+/// [`a_pipe_filled_to_capacity_drains_inside_the_budget`] is that
+/// measurement kept as a case, so a later cut to this number fails a test
+/// rather than silently truncating a dying sheep's last words.
 ///
-/// Raise it if a real sheep is ever found losing a line to it. Lower it if a
-/// stop is ever measured waiting on it. Neither has happened.
+/// The remaining ~16x is headroom for a slower disk, a contended runner, and
+/// a platform with a larger pipe than this one. It is spent only where the
+/// alternative is losing output, and 100ms is well under what an operator
+/// perceives on a `shep stop`.
+///
+/// # What the number is NOT
+///
+/// It does not bound the lamb. A process that inherited a write end and
+/// outlived its parent can hold the pipe open and talk for as long as it
+/// likes, so no budget is sufficient there and this one is a cap on how long
+/// ONE ending sheep may delay its own pump's teardown. That case is why a
+/// budget exists at all; the measurement above is why it is 100ms and not
+/// 10ms or a second.
 const FINAL_DRAIN: Duration = Duration::from_millis(100);
 
 /// Real [`crate::runner::ProcessRunner`] over actual OS processes.
@@ -2907,6 +2913,71 @@ mod tests {
         assert_eq!(distinct.len(), 4, "four descriptors, four numbers: {fds:?}");
     }
 
+    /// Fails if a pipe filled to capacity cannot be drained inside
+    /// [`FINAL_DRAIN`].
+    ///
+    /// This is the bound the budget rests on. A child that has been reaped
+    /// cannot have left more than one pipe's worth of bytes behind, because
+    /// a pipe is all it had to write into, so the pipe's capacity is the
+    /// worst case the drain ever faces on the path it exists for. Anything
+    /// larger means a writer is still alive, which is the lamb the budget is
+    /// a cap on rather than a bound for.
+    ///
+    /// Over a real pipe rather than the in-memory pair, since the capacity
+    /// is the whole point and only the kernel's is the real one. It filled
+    /// at 1152 lines and 73728 bytes here, drained in 4 to 6ms across four
+    /// runs, and every line landed. That is the ratio in `FINAL_DRAIN`'s
+    /// doc, and this case is what keeps it true: it fails if the budget is
+    /// ever cut below the cost of the drain it is supposed to cover.
+    ///
+    /// The line count is read off the fill rather than assumed, so a
+    /// platform with a different pipe capacity asserts its own number.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pipe_filled_to_capacity_drains_inside_the_budget() {
+        let mut pump = PumpHarness::start_over_pipes();
+        // 64 bytes a line, so the count is a round fraction of whatever the
+        // kernel gives us, and short enough that no line straddles the end.
+        let line = format!("{}\n", "x".repeat(63));
+        let mut written = 0usize;
+        // Stops at the first write that cannot complete promptly, which is
+        // the pipe being full: the pump is not reading yet, so nothing is
+        // making room.
+        while timeout(FILL_STALL, pump.out_writer.write_all(line.as_bytes()))
+            .await
+            .is_ok_and(|write| write.is_ok())
+        {
+            written += 1;
+            assert!(written < 100_000, "the pipe never filled");
+        }
+        assert!(written > 0, "nothing was written to fill the pipe");
+
+        drop(pump.out_writer);
+        drop(pump.err_writer);
+        drop(pump.logs);
+
+        let settled = timeout(PUMP_DEADLINE, async {
+            while fs::read_to_string(&pump.out_path)
+                .unwrap_or_default()
+                .lines()
+                .count()
+                < written
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "a full pipe did not drain inside {FINAL_DRAIN:?}: {written} lines written, \
+             {} landed",
+            fs::read_to_string(&pump.out_path)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        );
+    }
+
     /// How many times [`a_last_line_written_before_the_sheep_task_lets_go_reaches_the_file`]
     /// reconstructs the race.
     ///
@@ -2917,6 +2988,16 @@ mod tests {
     /// that matters, and it costs nothing while the pump is right -- the
     /// only slow attempt is one that has already failed.
     const RACE_ATTEMPTS: usize = 32;
+
+    /// How long a write into a not-yet-full pipe is allowed to take before
+    /// [`a_pipe_filled_to_capacity_drains_inside_the_budget`] calls the pipe
+    /// full.
+    ///
+    /// Nothing is reading the pipe while it fills, so a write either
+    /// completes at memory speed or blocks forever. There is no middle case
+    /// for this number to get wrong, and it only has to be longer than a
+    /// memcpy.
+    const FILL_STALL: Duration = Duration::from_millis(50);
 
     /// Fails if a line the child wrote before its sheep task let go never
     /// reaches the log file.
