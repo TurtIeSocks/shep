@@ -8,9 +8,9 @@
 //! error type.
 //!
 //! [`sync_dir`] makes the *rename* durable, which the temp file's own
-//! `fsync` does not. On unix. It is a no-op on Windows, so every
-//! durability claim below, and in the six writers that call it, is a unix
-//! one.
+//! `fsync` does not. On unix, and there only where the filesystem
+//! implements the flush: it is a no-op on Windows, and it answers `Ok` to
+//! the `EINVAL` some FUSE and network mounts return instead of flushing.
 //!
 //! Those two flushes answer different questions, and it is easy to buy one
 //! and believe you bought both. `File::sync_all` on the staging file
