@@ -428,13 +428,16 @@ fn content_lines(
         lines.push(dog_line(dog, rendered_columns, width, selected));
     }
 
-    // One prompt line under the table, in the shape the status bar's own
-    // `confirm_prompt`/`in_flight_text` use for a sheep confirm: a question
-    // styled `attention` while it waits on `Enter`, an in-flight sentence
-    // once it has gone out. Drawn here rather than in the status bar itself
-    // -- the settings screen owns its own body between the title and that
-    // bar, and this prompt is about one row in the table above it, not
-    // about the whole dashboard.
+    // One prompt line under the table, echoing the status bar's own Slot 1
+    // (`view::status::status_line`'s own doc): a question styled
+    // `attention` while it waits on `Enter`, an in-flight sentence once it
+    // has gone out. The status bar is the line of record now -- it is a
+    // fixed row `draw_settings`'s own `.take(area.height)` never reaches,
+    // where this body echo used to be the ONLY place an armed candidate
+    // showed at all, and the first thing a short terminal cut. Kept here
+    // too, for the same reason the free-text editor line below is kept in
+    // both places: when there is room, seeing the confirm sit right under
+    // the row it names is worth the redundancy.
     if let Some(prompt) = settings.pending() {
         lines.push(Line::default());
         let text = if prompt.sent {

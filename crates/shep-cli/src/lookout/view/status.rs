@@ -63,23 +63,53 @@ pub fn banner_line(app: &App) -> Option<Line<'static>> {
     }
 }
 
-/// The bottom line: seven slots, highest priority first -- an armed
-/// confirm, the settings screen's own free-text editor, the filter box
-/// while editing, a notice, an in-flight action, the applied filter line,
-/// then the key hint -- with the control state always rendered on the
-/// right. See the phase plan's "Shapes the design named" #2 for why the
-/// box and the applied filter line are two slots and not one. The editor
-/// slot sits ahead of the filter box for the same reason the confirm sits
-/// ahead of both: `App::settings().and_then(Settings::typing)` is only
-/// ever `Some` while the settings screen owns `InputMode::Text`, and the
-/// filter box's own `App::filter` is untouched the whole time, so checking
-/// the editor first is what keeps the two from ever answering the same
-/// keystroke with the wrong sentence.
+/// The bottom line: eight slots, highest priority first -- the settings
+/// screen's own armed or in-flight edit, a dashboard armed confirm, the
+/// settings screen's own free-text editor, the filter box while editing, a
+/// notice, an in-flight action, the applied filter line, then the key hint
+/// -- with the control state always rendered on the right. See the phase
+/// plan's "Shapes the design named" #2 for why the box and the applied
+/// filter line are two slots and not one. The editor slot sits ahead of the
+/// filter box for the same reason the two confirms sit ahead of it:
+/// `App::settings().and_then(Settings::typing)` is only ever `Some` while
+/// the settings screen owns `InputMode::Text`, and the filter box's own
+/// `App::filter` is untouched the whole time, so checking the editor first
+/// is what keeps the two from ever answering the same keystroke with the
+/// wrong sentence.
+///
+/// **The settings confirm moved here from the body pane.** It used to be
+/// the last line `view::settings::content_lines` drew -- structurally the
+/// first thing a short terminal's `.take(area.height)` truncation dropped,
+/// which meant an operator could arm a candidate, see no change anywhere
+/// on screen, and press Enter into an edit nothing showed them was coming.
+/// This bar is a fixed row the layout never cuts, the same property the
+/// dashboard's own sheep confirm (the slot below this one) already relies
+/// on, so the fix is to give the settings screen's confirm the identical
+/// treatment rather than teach the body pane to tier. The body still
+/// echoes the same line beneath the table when there is room for it
+/// (`content_lines`'s own doc), the same redundancy the free-text editor
+/// slot below already has -- belt, not a second source of truth: both
+/// read `Settings::pending`/`Settings::typing` directly.
 #[must_use]
 pub fn status_line(app: &App, width: u16) -> Line<'static> {
     let palette = app.palette();
-    let (left, left_style) = if let Some(action) = app.action().filter(|a| !a.sent) {
-        // Slot 1. A18: a question awaiting an answer outranks everything,
+    let (left, left_style) = if let Some(prompt) = app.settings().and_then(Settings::pending) {
+        // Slot 1. The settings screen's own armed scalar or dog edit, or
+        // its in-flight sentence once sent. Outranks everything below,
+        // including the dashboard's own action confirm just underneath --
+        // moot in practice, since `Msg::Settings`'s own `opening` arm
+        // clears `self.action` the moment the screen opens and no
+        // dashboard action can arm while it stays open (`on_key`'s own
+        // settings short circuit), so the two can never actually compete
+        // for this slot on the same frame.
+        let text = if prompt.sent {
+            format!("{}  sent, waiting for the shepherd", prompt.text)
+        } else {
+            format!("{}  enter confirms, any other key cancels", prompt.text)
+        };
+        (text, palette.attention())
+    } else if let Some(action) = app.action().filter(|a| !a.sent) {
+        // Slot 2. A18: a question awaiting an answer outranks everything,
         // including the filter box, which it cannot coexist with anyway
         // because `/` cancels a confirm before it opens the box.
         (confirm_prompt(&action), palette.attention())
@@ -132,7 +162,7 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
             },
         )
     } else if let Some(action) = app.action() {
-        // Slot 4. BELOW the notice, and that is load-bearing rather than a
+        // Slot 5. BELOW the notice, and that is load-bearing rather than a
         // concession. `arm`'s "one action is already in flight" IS a notice,
         // so a bar that put this line above notices would swallow the answer
         // to the operator's own keypress: they press `R` while a stop is out,

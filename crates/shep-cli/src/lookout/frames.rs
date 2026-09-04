@@ -1229,6 +1229,7 @@ fn dog_sheep(id: u32, name: &str, handshook: Option<bool>) -> ProcessInfo {
 /// If the settings screen is not open. Gallery scaffolding: a scene that
 /// called this before `Msg::Settings` landed is a defect in the scene, not
 /// in the screen.
+#[track_caller]
 fn move_settings_cursor_to(app: &mut App, field: SettingField) {
     let target = app
         .settings()

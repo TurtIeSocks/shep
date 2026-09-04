@@ -566,6 +566,44 @@ mod tests {
         }
     }
 
+    /// fails if an armed settings candidate ever draws with nothing on
+    /// screen to show it. `view::settings::content_lines`'s own pending
+    /// line used to be the ONLY place this showed, drawn last in the body
+    /// and cut by `draw_settings`'s `.take(area.height)` the moment the
+    /// body ran out of room -- an operator could arm an edit, see no
+    /// change anywhere, and press Enter into it blind. This is the
+    /// mutation that would catch a regression back to that state: at 200x10
+    /// the body alone has nowhere near the ~20 rows `settings_snapshot`'s
+    /// six scalars, two dogs and a two-line pending prompt need, so a body
+    /// with no independent floor would drop the confirm here exactly as it
+    /// used to. Width stays generous (200) so only HEIGHT is under test --
+    /// the confirm sentence itself runs long, and a narrow width would
+    /// truncate it in the status bar too and confound the two properties.
+    /// `status_line`'s own Slot 1 (`view::status`'s doc) is a fixed row
+    /// `draw` always reserves regardless of body height, which is the
+    /// property this pins: the confirm survives on the LAST line even
+    /// though the body above it has plainly been cut.
+    #[test]
+    fn an_armed_settings_candidate_survives_a_body_too_short_to_hold_it() {
+        let mut app = fixtures::app_in_settings_with_control();
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let text = app.settings().unwrap().pending().unwrap().text.to_string();
+
+        // 10 rows total, 8 of them body (title and status bar are the other
+        // two): nowhere near the ~20 rows `settings_snapshot`'s six scalars,
+        // two dogs and a two-line pending prompt need, so the body's OWN
+        // echo of this line is not on screen at this height -- confirmed by
+        // `settings_confirm`'s own gallery frame needing (180, 30) to show
+        // it at all. If the status bar slot below were ever removed, this
+        // assertion is what would catch the confirm vanishing again.
+        let rendered = draw_to(&app, 200, 10);
+        let last_line = rendered.lines().last().expect("at least one row");
+        assert!(
+            last_line.contains(text.trim()),
+            "the confirm must survive on the status bar's fixed row: {last_line:?}"
+        );
+    }
+
     /// fails if a tier can render taller than the terminal it was chosen for.
     /// The height twin of `every_tier_fits_the_width_it_claims`, and the check
     /// that makes the tier table a claim rather than a wish: every tier's

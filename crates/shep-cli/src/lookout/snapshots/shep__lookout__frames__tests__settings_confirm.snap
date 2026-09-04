@@ -31,4 +31,4 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                                                                                     
                                                                                                                                                                                     
                                                                                                                                                                                     
-esc close   j/k select   g/G first/last   space cycle                                                                                                                control enabled
+set log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key ca… control enabled

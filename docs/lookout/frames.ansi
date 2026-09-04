@@ -808,7 +808,7 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                                                                                     [0m
                                                                                                                                                                                     [0m
                                                                                                                                                                                     [0m
-[0m[38;5;245mesc close   j/k select   g/G first/last   space cycle                                                                                                                control enabled[0m
+[0m[38;5;221mset log_level to info? needs shep daemon reload, and will not apply if the shepherd was booted with SHEP_LOG_LEVEL or --log-level  enter confirms, any other key ca…[0m[38;5;245m control enabled[0m
 
 
 === settings_typing  (120x30) ===
