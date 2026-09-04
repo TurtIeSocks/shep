@@ -566,7 +566,11 @@ where
             // deadline. A concurrent `shep adopt` holding it would freeze
             // this task's redraw, its tick and its bus drain right along
             // with the write if this ran inline.
-            Effect::WriteSetting(edit) => {
+            // The `WriteAuthority` is deliberately dropped here: it is a
+            // proof carried by the effect, not a value this arm reads. Its
+            // job was done in `App::confirm_setting`, which could not have
+            // built this variant without it.
+            Effect::WriteSetting(edit, _authority) => {
                 let path = daemon_config.clone();
                 let for_msg = edit.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -589,7 +593,9 @@ where
             // gives: `dogs::enable_in_config`/`dogs::disable_in_config`
             // both take `ShepToml::edit`'s (or `try_edit`'s) lock, which
             // blocks with no deadline.
-            Effect::WriteDog(edit) => {
+            // `_authority`: the same proof, dropped for the same reason
+            // `Effect::WriteSetting`'s own arm gives.
+            Effect::WriteDog(edit, _authority) => {
                 let path = daemon_config.clone();
                 let for_msg = edit.clone();
                 let result = tokio::task::spawn_blocking(move || {

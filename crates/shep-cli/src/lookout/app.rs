@@ -253,6 +253,51 @@ pub enum Msg {
     },
 }
 
+/// The one gate on writing `shep.toml` from the settings screen.
+///
+/// Lives in its own module with a private field so that [`Control`] is
+/// checked ONCE, structurally, rather than remembered key by key. Nothing
+/// outside this module can build a [`WriteAuthority`] -- not `App`, not the
+/// key handlers, not the tests -- so the only way to reach it is
+/// [`WriteAuthority::granted`], which hands back [`None`] for
+/// [`Control::ReadOnly`]. [`Effect::WriteSetting`] and [`Effect::WriteDog`]
+/// each carry one, so a settings write is not something a handler is
+/// trusted to check before performing: it is something the handler cannot
+/// name without having passed the check.
+///
+/// That matters because the first version of this gate was a check on one
+/// key (`space`, [`App::cycle_setting`]), and the editor `Enter` added
+/// later walked straight around it: a read-only lookout could type a new
+/// `socket` and apply it. A fourth door added tomorrow cannot repeat that,
+/// because it cannot construct the effect it would have to return.
+mod authority {
+    use super::Control;
+
+    /// Proof that `--allow-control` was on when a settings write was built.
+    ///
+    /// `Debug` is derived rather than redacted (IR-41): a zero-sized token
+    /// with no field a `{:?}` could print.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WriteAuthority(());
+
+    impl WriteAuthority {
+        /// A token when `control` permits writing, [`None`] otherwise.
+        ///
+        /// The sole constructor. The unit field above is private to this
+        /// module, so every other module in this crate reaches a
+        /// [`WriteAuthority`] through here or not at all.
+        #[must_use]
+        pub const fn granted(control: Control) -> Option<Self> {
+            match control {
+                Control::ReadOnly => None,
+                Control::Allowed => Some(Self(())),
+            }
+        }
+    }
+}
+
+pub use authority::WriteAuthority;
+
 /// What the caller has to do after an update.
 ///
 /// Not `Copy`: [`Self::Send`] carries a [`Sent`], whose `Sent::Action`
@@ -303,7 +348,11 @@ pub enum Effect {
     /// (`FlockArg::LockExclusive`), so a concurrent `shep adopt` on the same
     /// file would freeze the UI task's redraw, its tick and its bus drain
     /// right along with the write.
-    WriteSetting(SettingEdit),
+    ///
+    /// The [`WriteAuthority`] is not decoration: it is the only thing that
+    /// makes `--allow-control` a property of this effect rather than a
+    /// check each key handler has to remember. See its own doc.
+    WriteSetting(SettingEdit, WriteAuthority),
     /// Apply one dog's file half; the result lands as [`Msg::DogWritten`].
     ///
     /// Raised by [`App::confirm_setting`] once an armed dog row's Enter
@@ -313,7 +362,10 @@ pub enum Effect {
     /// notice, a dog write ends in a request to the shepherd
     /// ([`Sent::Dog`]). `super::run_ui` runs this on `spawn_blocking`, the
     /// same reason [`Self::WriteSetting`]'s own doc gives.
-    WriteDog(DogEdit),
+    ///
+    /// Carries a [`WriteAuthority`] for the same reason
+    /// [`Self::WriteSetting`] does.
+    WriteDog(DogEdit, WriteAuthority),
 }
 
 /// The connection's state, as the dashboard reports it.
@@ -1072,6 +1124,12 @@ pub const CONFIRM_EXPIRY: Duration = Duration::from_secs(10);
 /// The sentence `r` gives when the link is gone. The action keys refuse with
 /// the same one, so the two cannot drift apart.
 const LINK_GONE: &str = "the shepherd is gone — nothing left to ask";
+
+/// The sentence every closed-gate refusal gives, on the dashboard and on
+/// the settings screen alike. One string, so an operator who has met it
+/// once on `x` recognises it on `space` -- and so the two cannot drift
+/// apart the way the checks behind them once did.
+const READ_ONLY_REFUSAL: &str = "read-only: actions need --allow-control";
 
 /// The whole dashboard's state.
 #[derive(Debug)]
@@ -1932,19 +1990,37 @@ impl App {
         Effect::None
     }
 
-    /// `space` on the settings screen. Arms a candidate for the cursor's
-    /// row, or refuses and says why the same way an action key does; the
-    /// gate is the same read-only check `arm` makes for a sheep action,
-    /// because a keystroke that mutates `shep.toml` needs the same fat-finger
-    /// catch a keystroke that stops a sheep does. Dispatches by row kind:
-    /// [`Self::cycle_scalar`] for one of the six fields,
-    /// [`Self::cycle_dog`] for a [`SettingsRow::Dog`] row.
-    fn cycle_setting(&mut self) -> Effect {
-        if self.control == Control::ReadOnly {
+    /// The [`WriteAuthority`] every settings write path has to hold, or
+    /// [`None`] with the refusal already raised.
+    ///
+    /// The one place [`Control`] is read on this screen. Every door that
+    /// can end in a changed `shep.toml` -- `space` on a scalar, `space` on
+    /// a dog, `Enter` opening the free-text editor, `Enter` applying an
+    /// armed candidate -- comes through here, and it is not a convention
+    /// they are trusted to follow: [`Effect::WriteSetting`] and
+    /// [`Effect::WriteDog`] cannot be built without the token this returns.
+    /// See [`WriteAuthority`]'s own doc for why the gate is shaped this way
+    /// rather than as a check per key.
+    fn authorize_write(&mut self) -> Option<WriteAuthority> {
+        let authority = WriteAuthority::granted(self.control);
+        if authority.is_none() {
             self.notice = Some(Notice {
-                text: "read-only: actions need --allow-control".to_string(),
+                text: READ_ONLY_REFUSAL.to_string(),
                 grave: true,
             });
+        }
+        authority
+    }
+
+    /// `space` on the settings screen. Arms a candidate for the cursor's
+    /// row, or refuses and says why the same way an action key does; the
+    /// gate is [`Self::authorize_write`], the same one every other door on
+    /// this screen passes, because a keystroke that mutates `shep.toml`
+    /// needs the same fat-finger catch a keystroke that stops a sheep does.
+    /// Dispatches by row kind: [`Self::cycle_scalar`] for one of the six
+    /// fields, [`Self::cycle_dog`] for a [`SettingsRow::Dog`] row.
+    fn cycle_setting(&mut self) -> Effect {
+        if self.authorize_write().is_none() {
             return Effect::None;
         }
         let Some(cursor) = self.settings.as_ref().and_then(Settings::cursor) else {
@@ -2034,15 +2110,37 @@ impl App {
     ///   doc for why they are not the same effect.
     /// - Anything else (nothing pending on a cycled row, or already
     ///   `Sent`): untouched.
+    ///
+    /// The first two both go through [`Self::authorize_write`] and refuse
+    /// under [`Control::ReadOnly`]; the third does nothing, so it raises no
+    /// refusal for a key that was never going to act. Opening the editor is
+    /// gated as well as applying it, because an editor a read-only operator
+    /// can type a whole socket path into before being told no is a worse
+    /// refusal than one that arrives on the keypress that asked.
     fn confirm_setting(&mut self) -> Effect {
+        let Some(settings) = self.settings.as_ref() else {
+            return Effect::None;
+        };
+        let opens_editor = settings.pending.is_none()
+            && matches!(
+                settings.cursor(),
+                Some(SettingsRow::Scalar(
+                    SettingField::Socket | SettingField::MaxCronSleep
+                ))
+            );
+        if !opens_editor && !settings.is_armed() {
+            return Effect::None;
+        }
+        let Some(authority) = self.authorize_write() else {
+            return Effect::None;
+        };
         let Some(settings) = self.settings.as_mut() else {
             return Effect::None;
         };
-        if settings.pending.is_none()
-            && let Some(SettingsRow::Scalar(
-                field @ (SettingField::Socket | SettingField::MaxCronSleep),
-            )) = settings.cursor()
-        {
+        if opens_editor {
+            let Some(SettingsRow::Scalar(field)) = settings.cursor() else {
+                return Effect::None;
+            };
             let buffer = settings.text_seed(field).to_string();
             settings.pending = Some(Pending::Typing { field, buffer });
             self.mode = InputMode::Text;
@@ -2051,11 +2149,11 @@ impl App {
         match settings.pending.take() {
             Some(Pending::Armed { edit, text, .. }) => {
                 settings.pending = Some(Pending::Sent { text });
-                Effect::WriteSetting(edit)
+                Effect::WriteSetting(edit, authority)
             }
             Some(Pending::DogArmed { edit, text, .. }) => {
                 settings.pending = Some(Pending::Sent { text });
-                Effect::WriteDog(edit)
+                Effect::WriteDog(edit, authority)
             }
             other => {
                 settings.pending = other;
@@ -2077,7 +2175,7 @@ impl App {
     /// approved table.
     fn arm(&mut self, verb: ActionVerb) -> Effect {
         let refusal = if self.control == Control::ReadOnly {
-            Some("read-only: actions need --allow-control".to_string())
+            Some(READ_ONLY_REFUSAL.to_string())
         } else if let Link::Retrying { attempt } = self.link {
             // NOT `LINK_GONE` here: that sentence says the shepherd is gone,
             // which is false while it is still being redialled, and a
@@ -4755,6 +4853,140 @@ mod tests {
         assert!(app.action().is_none(), "no sheep confirm can arm from here");
     }
 
+    /// fails if ANY key route on the settings screen reaches a write while
+    /// the gate is closed.
+    ///
+    /// Not "the cycle key refuses", which is all
+    /// `a_read_only_lookout_opens_the_screen_and_refuses_the_edit_key`
+    /// below ever checked. `space` was the only door the first version of
+    /// this gate guarded, and the free-text editor added a task later
+    /// walked straight around it: `SelectDown, SelectDown, Confirm,
+    /// TextChar, TextChar, TextApply, Confirm` on a `Control::ReadOnly`
+    /// lookout came back `WriteSetting(Set { field: Socket, .. })`. So this
+    /// walks every sequence that ends in a write instead of naming one key,
+    /// and asserts the two write effects never come back.
+    ///
+    /// The refusal is checked per keypress rather than at the end because
+    /// `on_settings_key` clears `self.notice` on every key: a route whose
+    /// last press is a no-op `Enter` has already had the sentence wiped by
+    /// the time the walk finishes.
+    #[test]
+    fn no_key_route_writes_the_config_while_the_gate_is_closed() {
+        use KeyPress::{Confirm, Cycle, SelectDown, TextApply, TextChar};
+
+        // The six scalars come first in `Settings::rows`, in the order
+        // `log_level, log_json, socket, max_cron_sleep, allow_control,
+        // level`, and `fixtures::settings_snapshot` carries two dogs after
+        // them -- so two `SelectDown`s reach `socket` and six reach the
+        // first dog row.
+        let routes: &[(&str, &[KeyPress])] = &[
+            ("space on a cycled scalar", &[Cycle, Confirm]),
+            (
+                "the socket editor",
+                &[
+                    SelectDown,
+                    SelectDown,
+                    Confirm,
+                    TextChar('/'),
+                    TextChar('x'),
+                    TextApply,
+                    Confirm,
+                ],
+            ),
+            (
+                "the max_cron_sleep editor",
+                &[
+                    SelectDown,
+                    SelectDown,
+                    SelectDown,
+                    Confirm,
+                    TextChar('9'),
+                    TextChar('s'),
+                    TextApply,
+                    Confirm,
+                ],
+            ),
+            (
+                "the whistle gate",
+                &[
+                    SelectDown, SelectDown, SelectDown, SelectDown, Cycle, Confirm,
+                ],
+            ),
+            (
+                "space on a dog row",
+                &[
+                    SelectDown, SelectDown, SelectDown, SelectDown, SelectDown, SelectDown, Cycle,
+                    Confirm,
+                ],
+            ),
+        ];
+
+        for (what, keys) in routes {
+            let mut app = fixtures::app_in_settings(); // Control::ReadOnly
+            let mut refused = false;
+            for key in *keys {
+                let effect = app.update(Msg::Key(*key));
+                assert!(
+                    !matches!(effect, Effect::WriteSetting(..) | Effect::WriteDog(..)),
+                    "{what}: a read-only lookout reached {effect:?}"
+                );
+                refused |= app.notice().is_some_and(Notice::is_grave);
+            }
+            assert!(refused, "{what}: the refusal has to say why");
+            assert!(
+                app.settings().unwrap().pending().is_none(),
+                "{what}: nothing is left armed"
+            );
+            assert!(
+                app.settings().unwrap().typing().is_none(),
+                "{what}: no editor is left open"
+            );
+        }
+    }
+
+    /// fails if the same five routes stop reaching a write once the gate is
+    /// open. The twin of
+    /// `no_key_route_writes_the_config_while_the_gate_is_closed`, and the
+    /// half that keeps it honest: a gate that refused everything would pass
+    /// that test and be useless.
+    #[test]
+    fn every_one_of_those_routes_writes_once_the_gate_is_open() {
+        use KeyPress::{Confirm, Cycle, SelectDown, TextApply, TextChar};
+
+        let routes: &[(&str, &[KeyPress])] = &[
+            ("space on a cycled scalar", &[Cycle, Confirm]),
+            (
+                "the socket editor",
+                &[
+                    SelectDown,
+                    SelectDown,
+                    Confirm,
+                    TextChar('/'),
+                    TextChar('x'),
+                    TextApply,
+                    Confirm,
+                ],
+            ),
+            (
+                "space on a dog row",
+                &[
+                    SelectDown, SelectDown, SelectDown, SelectDown, SelectDown, SelectDown, Cycle,
+                    Confirm,
+                ],
+            ),
+        ];
+
+        for (what, keys) in routes {
+            let mut app = fixtures::app_in_settings_with_control();
+            let mut wrote = false;
+            for key in *keys {
+                let effect = app.update(Msg::Key(*key));
+                wrote |= matches!(effect, Effect::WriteSetting(..) | Effect::WriteDog(..));
+            }
+            assert!(wrote, "{what}: an open gate has to reach the write");
+        }
+    }
+
     #[test]
     fn a_read_only_lookout_opens_the_screen_and_refuses_the_edit_key() {
         let mut app = fixtures::app_in_settings(); // Control::ReadOnly
@@ -4828,10 +5060,13 @@ mod tests {
         let effect = app.update(Msg::Key(KeyPress::Confirm));
         assert!(matches!(
             effect,
-            Effect::WriteSetting(SettingEdit::Set {
-                field: SettingField::LogLevel,
-                ..
-            })
+            Effect::WriteSetting(
+                SettingEdit::Set {
+                    field: SettingField::LogLevel,
+                    ..
+                },
+                _
+            )
         ));
         assert!(app.settings().unwrap().pending().unwrap().sent);
     }
@@ -4840,7 +5075,7 @@ mod tests {
     fn a_written_edit_updates_the_row_and_its_source() {
         let mut app = fixtures::app_in_settings_with_control();
         let _ = app.update(Msg::Key(KeyPress::Cycle));
-        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send");
         };
         let SettingEdit::Set {
@@ -4889,7 +5124,7 @@ mod tests {
             let _ = app.update(Msg::Key(KeyPress::TextBackspace));
         }
         let _ = app.update(Msg::Key(KeyPress::TextApply));
-        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send");
         };
         assert!(matches!(
@@ -4925,7 +5160,7 @@ mod tests {
         let before = app.settings().unwrap().cursor();
         let _ = app.update(Msg::Key(KeyPress::Confirm));
         let _ = app.update(Msg::Key(KeyPress::TextApply));
-        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send");
         };
         let _ = app.update(Msg::SettingWritten {
@@ -4959,7 +5194,7 @@ mod tests {
         let mut app = fixtures::app_in_settings_with_control();
         let before = app.settings().unwrap().snapshot().log_level.clone();
         let _ = app.update(Msg::Key(KeyPress::Cycle));
-        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send");
         };
         let _ = app.update(Msg::SettingWritten {
@@ -5193,7 +5428,7 @@ mod tests {
             let _ = app.update(Msg::Key(KeyPress::TextChar(c)));
         }
         let _ = app.update(Msg::Key(KeyPress::TextApply));
-        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+        let Effect::WriteSetting(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send");
         };
         let _ = app.update(Msg::SettingWritten {
@@ -5306,7 +5541,7 @@ mod tests {
     fn a_written_dog_toggle_raises_the_daemon_half() {
         let mut app = fixtures::app_in_settings_on_dog("metrics");
         let _ = app.update(Msg::Key(KeyPress::Cycle));
-        let Effect::WriteDog(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+        let Effect::WriteDog(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send the file half first");
         };
         let effect = app.update(Msg::DogWritten {
@@ -5323,7 +5558,7 @@ mod tests {
     fn a_refused_file_half_never_reaches_the_shepherd() {
         let mut app = fixtures::app_in_settings_on_dog("metrics");
         let _ = app.update(Msg::Key(KeyPress::Cycle));
-        let Effect::WriteDog(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+        let Effect::WriteDog(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send the file half first");
         };
         let effect = app.update(Msg::DogWritten {
@@ -5372,7 +5607,7 @@ mod tests {
     fn armed_and_sent_dog(name: &str) -> (App, Sent) {
         let mut app = fixtures::app_in_settings_on_dog(name);
         let _ = app.update(Msg::Key(KeyPress::Cycle));
-        let Effect::WriteDog(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+        let Effect::WriteDog(edit, _) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send the file half first");
         };
         let Effect::Send(sent) = app.update(Msg::DogWritten {
