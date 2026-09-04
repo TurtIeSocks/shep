@@ -31,4 +31,4 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                                         
                                                                                                                         
                                                                                                                         
-esc close   j/k select   g/G first/last   space cycle                                                          read-only
+esc/s close   j/k select   g/G first/last   r refresh                                                          read-only

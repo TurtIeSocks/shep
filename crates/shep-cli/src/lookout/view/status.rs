@@ -278,9 +278,28 @@ fn in_flight_text(action: &ActionState<'_>) -> String {
 /// `a_truncated_hint_still_leaves_a_gap_before_the_control_label` and the
 /// `narrow`/`cramped` gallery frames to keep measuring what they were
 /// written to measure, and appending is the one edit that cannot move them.
+/// The settings forms below follow the same rule against each other: the
+/// read-only one is a prefix of the control one, and the two edit keys are
+/// appended rather than inserted.
+///
+/// The settings screen takes `control` for the same reason the dashboard
+/// does, which it did not until a whole-branch review caught it: the
+/// argument was taken and then thrown away on the `settings_open` branch,
+/// so a read-only lookout was told `space cycle` about a key that refuses.
+/// That is exactly the asterisk the rule above forbids, and the dashboard
+/// omits `x`, `R` and `L` for the same reason.
 fn hint_for(control: Control, settings_open: bool) -> String {
     if settings_open {
-        return "esc close   j/k select   g/G first/last   space cycle".to_string();
+        // `esc/s close` names both keys that close the screen, which is how
+        // `s` gets said here at all -- on this screen `s` is the close key,
+        // not the open one. `r` and `Enter` were missing outright.
+        return match control {
+            Control::ReadOnly => "esc/s close   j/k select   g/G first/last   r refresh",
+            Control::Allowed => {
+                "esc/s close   j/k select   g/G first/last   r refresh   space cycle   enter apply"
+            }
+        }
+        .to_string();
     }
     match control {
         Control::ReadOnly => {
@@ -314,8 +333,8 @@ mod tests {
     use shep_core::protocol::BusEvent;
 
     use super::super::fixtures::{
-        acting_app, allowed_app, app_in_settings_on, armed_app,
-        armed_app_with_a_filter_and_a_notice, editing_app, filtered_app, rendered,
+        acting_app, allowed_app, app_in_settings, app_in_settings_on, app_in_settings_with_control,
+        armed_app, armed_app_with_a_filter_and_a_notice, editing_app, filtered_app, rendered,
     };
     use super::*;
     use crate::commands::settings::SettingField;
@@ -632,5 +651,40 @@ mod tests {
             open.contains("/ filter"),
             "and the filter key survives both forms"
         );
+    }
+
+    /// fails if the settings screen advertises its edit keys behind a
+    /// closed gate, or stops naming the three keys it binds and never
+    /// mentioned.
+    ///
+    /// The same rule as the test above, on the screen that ignored it:
+    /// `hint_for` took `control` and discarded it whenever the settings
+    /// screen was open, so a read-only lookout read `space cycle` next to
+    /// the word `read-only` on the same line, about a key that refuses.
+    /// The published gallery pinned it.
+    ///
+    /// `Enter`, `r` and `s` are all bound on that screen and none of them
+    /// was named. `s` arrives as `esc/s close`, because on this screen `s`
+    /// is the key that closes rather than the one that opens.
+    #[test]
+    fn the_settings_edit_keys_are_advertised_only_when_the_gate_is_open() {
+        let closed = rendered(&status_line(&app_in_settings(), 200));
+        for key in ["space cycle", "enter apply"] {
+            assert!(
+                !closed.contains(key),
+                "{key} advertised read-only: {closed:?}"
+            );
+        }
+        let open = rendered(&status_line(&app_in_settings_with_control(), 200));
+        for key in ["space cycle", "enter apply"] {
+            assert!(
+                open.contains(key),
+                "{key} missing when the gate is open: {open:?}"
+            );
+        }
+        for both in [&closed, &open] {
+            assert!(both.contains("esc/s close"), "got {both:?}");
+            assert!(both.contains("r refresh"), "got {both:?}");
+        }
     }
 }

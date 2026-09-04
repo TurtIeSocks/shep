@@ -25,4 +25,4 @@ shep lookout   /home/ada/.shep 2 in the flock
                                              
                                              
                                              
-esc close   j/k select   g/G first… read-only
+esc/s close   j/k select   g/G fir… read-only
