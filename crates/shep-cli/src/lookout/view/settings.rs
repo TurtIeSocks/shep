@@ -221,7 +221,10 @@ fn scalar_view(snapshot: &SettingsSnapshot, field: SettingField) -> &ScalarView 
 
 /// The name printed in the NAME cell -- the document's own key, except
 /// `[style] level`, which drops the `style_` a section header already says.
-const fn field_label(field: SettingField) -> &'static str {
+/// `pub(super)`: `status::status_line`'s own editor-line branch names the
+/// field being typed with this same word, so the status bar and the body
+/// pane never disagree about what to call `socket` or `max_cron_sleep`.
+pub(super) const fn field_label(field: SettingField) -> &'static str {
     match field {
         SettingField::LogLevel => "log_level",
         SettingField::LogJson => "log_json",
@@ -536,10 +539,8 @@ mod tests {
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains("editing socket:")
-                    && line.contains("/home/ada/.shep/run/shep.sock")),
+            rendered.iter().any(|line| line.contains("editing socket:")
+                && line.contains("/home/ada/.shep/run/shep.sock")),
             "got: {rendered:?}"
         );
     }

@@ -38,7 +38,7 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 
 use super::theme::Palette;
-use crate::commands::settings::{ScalarView, SettingEdit, SettingField, SettingsSnapshot};
+use crate::commands::settings::{SettingEdit, SettingField, SettingsSnapshot};
 use crate::style::{StyleLevel, StyleSource};
 use crate::vocabulary::Reported;
 
@@ -679,37 +679,13 @@ impl Settings {
         }
     }
 
-    /// Folds a landed write back into the row it changed: the snapshot's
-    /// own [`ScalarView`] for `field` becomes `value`, sourced
-    /// [`StyleSource::Config`] -- the write just put it in the file. A
-    /// landed [`SettingEdit::Unset`] (`socket` or `max_cron_sleep`, task
-    /// 8's own) is matched out and does nothing rather than reverting the
-    /// row to `the default`: this reducer has no way to render that
-    /// value without re-reading the document, and `r` already does that.
-    /// The row is stale until then, the same way a dog write already
-    /// leaves the RUNNING column until the next poll.
-    fn record_written(&mut self, edit: &SettingEdit) {
-        let SettingEdit::Set { field, value } = edit else {
-            return;
-        };
-        let view = ScalarView {
-            value: value.clone(),
-            source: StyleSource::Config,
-        };
-        match field {
-            SettingField::LogLevel => self.snapshot.log_level = view,
-            SettingField::LogJson => self.snapshot.log_json = view,
-            SettingField::AllowControl => self.snapshot.allow_control = view,
-            SettingField::StyleLevel => self.snapshot.style_level = view,
-            SettingField::Socket | SettingField::MaxCronSleep => {}
-        }
-    }
-
     /// What the screen reads off disk. `view::settings::content_lines` is
-    /// the real caller, reading it to render every row's value and source
-    /// -- `Settings::record_written` is what keeps it current once a write
-    /// lands, so a read here after a landed edit shows the new value, not
-    /// the one `Effect::LoadSettings` last found on disk.
+    /// the real caller, reading it to render every row's value and source.
+    /// A landed write does not update this in place any more: `App`'s own
+    /// `Msg::SettingWritten` `Ok` arm raises a fresh [`Effect::LoadSettings`]
+    /// instead, the same read `r` and the initial `s` both already go
+    /// through, so `Set` and `Unset` land the same way and neither can
+    /// drift from whatever else changed in the document meanwhile.
     #[must_use]
     pub fn snapshot(&self) -> &SettingsSnapshot {
         &self.snapshot
@@ -1258,7 +1234,16 @@ impl App {
             // opening immediately. A failed read leaves the dashboard up: an
             // empty settings screen would say nothing about why it has
             // nothing to show.
+            //
+            // This is also where a landed write's own re-read lands
+            // (`Msg::SettingWritten`'s `Ok` arm raises `Effect::LoadSettings`
+            // rather than hand-updating one row) and where `r` lands. Both
+            // arrive with `self.settings` already `Some`, and the cursor is
+            // preserved across them rather than reset: `opening` below is
+            // true only the first time, when `s` itself is what raised the
+            // read.
             Msg::Settings { result } => {
+                let opening = self.settings.is_none();
                 match result {
                     Ok(snapshot) => {
                         // Clears an action that armed while the read was in
@@ -1297,7 +1282,17 @@ impl App {
                         // out would be the one filter edit in this whole
                         // screen that vanishes without an Esc.
                         self.mode = InputMode::Normal;
-                        self.settings = Some(Settings::new(snapshot));
+                        // The cursor: reset to the first row only while
+                        // `opening`. `Settings::cursor` clamps on every
+                        // read, so a preserved cursor sitting past a
+                        // shorter dogs list still lands somewhere real
+                        // rather than out of bounds.
+                        let cursor = self.settings.as_ref().map_or(0, |settings| settings.cursor);
+                        let mut settings = Settings::new(snapshot);
+                        if !opening {
+                            settings.cursor = cursor;
+                        }
+                        self.settings = Some(settings);
                     }
                     Err(message) => {
                         self.notice = Some(Notice {
@@ -1308,8 +1303,14 @@ impl App {
                 }
                 Effect::None
             }
-            // An [`Effect::WriteSetting`] landed. `Ok` folds the value into
-            // the row it changed and clears the prompt; `Err` leaves the row
+            // An [`Effect::WriteSetting`] landed. `Ok` clears the prompt and
+            // raises a fresh [`Effect::LoadSettings`] rather than folding
+            // the write into the row by hand: that covers `Set` and
+            // `Unset` uniformly (an `Unset` has no local value to fold in,
+            // only the document does), picks up anything else that changed
+            // on disk in the meantime, and is the same read `r` and the
+            // initial `s` already go through -- see [`Msg::Settings`]'s own
+            // doc for how the cursor survives it. `Err` leaves the row
             // exactly as it read before the write, and raises a grave
             // notice with the refusal's own words rather than a generic
             // one -- the same "say why" rule `arm`'s refusal ladder follows.
@@ -1323,38 +1324,33 @@ impl App {
             // must not have to retype it to fix one character. The four
             // cycled fields have nothing to reopen; their `Err` matches the
             // behaviour this arm already had.
-            //
-            // Both arms touch the settings screen and `self.notice` (and,
-            // on a text-field refusal, `self.mode`) in separate blocks
-            // rather than one shared borrow of `self`: Rust will not let a
-            // `&mut self.settings` borrow stay live across an assignment to
-            // a different field of the same `self`.
-            Msg::SettingWritten { edit, result } => {
-                match result {
-                    Ok(()) => {
-                        if let Some(settings) = self.settings.as_mut() {
-                            settings.pending = None;
-                            settings.record_written(&edit);
-                        }
+            Msg::SettingWritten { edit, result } => match result {
+                Ok(()) => {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.pending = None;
                     }
-                    Err(message) => {
-                        let reopened = typed_text_of(&edit);
-                        if let Some(settings) = self.settings.as_mut() {
-                            settings.pending = reopened
-                                .clone()
-                                .map(|(field, buffer)| Pending::Typing { field, buffer });
-                        }
-                        if reopened.is_some() {
-                            self.mode = InputMode::Text;
-                        }
-                        self.notice = Some(Notice {
-                            text: message,
-                            grave: true,
-                        });
-                    }
+                    Effect::LoadSettings
                 }
-                Effect::None
-            }
+                Err(message) => {
+                    // `typed_text_of` names the field, so the two branches
+                    // below never share a borrow of `self.settings` that
+                    // would fight the `self.notice` assignment beneath
+                    // them.
+                    if let Some((field, buffer)) = typed_text_of(&edit) {
+                        if let Some(settings) = self.settings.as_mut() {
+                            settings.pending = Some(Pending::Typing { field, buffer });
+                        }
+                        self.mode = InputMode::Text;
+                    } else if let Some(settings) = self.settings.as_mut() {
+                        settings.pending = None;
+                    }
+                    self.notice = Some(Notice {
+                        text: message,
+                        grave: true,
+                    });
+                    Effect::None
+                }
+            },
         }
     }
 
@@ -1681,7 +1677,10 @@ impl App {
             // already lost track of. `Sent` is untouched, same as the
             // dashboard's own guard, which only fires on `Stage::Armed`:
             // a request already in flight is not cancellable by a keypress.
-            KeyPress::SelectUp | KeyPress::SelectDown | KeyPress::SelectFirst | KeyPress::SelectLast => {
+            KeyPress::SelectUp
+            | KeyPress::SelectDown
+            | KeyPress::SelectFirst
+            | KeyPress::SelectLast => {
                 if let Some(settings) = self.settings.as_mut() {
                     if matches!(settings.pending, Some(Pending::Armed { .. })) {
                         settings.pending = None;
@@ -1698,7 +1697,11 @@ impl App {
             }
             KeyPress::Cycle => return self.cycle_setting(),
             KeyPress::Confirm => return self.confirm_setting(),
-            KeyPress::Refresh => {}
+            // Re-reads `shep.toml`, so another process's write shows up --
+            // the design spec's own table entry for `r`. `Msg::Settings`'s
+            // own doc is what keeps the cursor from resetting to the first
+            // row on the way back, the same as a landed write's reload.
+            KeyPress::Refresh => return Effect::LoadSettings,
             // Unreachable from here, and named rather than wildcarded so a
             // future variant does not fall silently into an arm that
             // ignores it: an action key in particular must never be
@@ -1770,8 +1773,9 @@ impl App {
             return Effect::None;
         };
         if settings.pending.is_none()
-            && let Some(SettingsRow::Scalar(field @ (SettingField::Socket | SettingField::MaxCronSleep))) =
-                settings.cursor()
+            && let Some(SettingsRow::Scalar(
+                field @ (SettingField::Socket | SettingField::MaxCronSleep),
+            )) = settings.cursor()
         {
             let buffer = settings.text_seed(field).to_string();
             settings.pending = Some(Pending::Typing { field, buffer });
@@ -2026,10 +2030,17 @@ impl App {
                     let edit = if buffer.is_empty() {
                         SettingEdit::Unset { field }
                     } else {
-                        SettingEdit::Set { field, value: buffer }
+                        SettingEdit::Set {
+                            field,
+                            value: buffer,
+                        }
                     };
                     let text = confirm_text_for_edit(&edit);
-                    settings.pending = Some(Pending::Armed { edit, text, at: now });
+                    settings.pending = Some(Pending::Armed {
+                        edit,
+                        text,
+                        at: now,
+                    });
                 }
                 self.mode = InputMode::Normal;
             }
@@ -2605,6 +2616,7 @@ mod tests {
     use shep_core::protocol::{ProcessEventKind, RpcError, RpcErrorCode};
 
     use super::super::view::fixtures;
+    use crate::commands::settings::ScalarView;
 
     fn sheep(id: u32, name: &str, status: ProcStatus) -> ProcessInfo {
         ProcessInfo::builder(id, name, status)
@@ -4561,16 +4573,115 @@ mod tests {
         let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
             panic!("Enter must send");
         };
+        let SettingEdit::Set {
+            value: candidate, ..
+        } = edit.clone()
+        else {
+            panic!("cycling only ever arms Set");
+        };
+
+        let effect = app.update(Msg::SettingWritten {
+            edit,
+            result: Ok(()),
+        });
+        assert_eq!(
+            effect,
+            Effect::LoadSettings,
+            "a landed write re-reads rather than hand-folding the row"
+        );
+        assert!(app.settings().unwrap().pending().is_none());
+
+        // The re-read itself: `run_ui` drives this through `spawn_blocking`
+        // and `load_settings`; this test drives the landing message
+        // directly, the same way the fixtures that open the screen already
+        // do for the initial `s`.
+        let mut updated = fixtures::settings_snapshot();
+        updated.log_level = ScalarView {
+            value: candidate,
+            source: StyleSource::Config,
+        };
+        let _ = app.update(Msg::Settings {
+            result: Ok(updated.clone()),
+        });
+
+        assert_eq!(app.settings().unwrap().snapshot(), &updated);
+    }
+
+    /// The other half of the row-update story: an `Unset` has no local
+    /// value to fold in (only the document does), which is exactly why the
+    /// fix routes both through the same re-read rather than growing a
+    /// second, `Unset`-shaped folding path.
+    #[test]
+    fn an_unset_write_returns_the_row_to_the_default() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        for _ in 0..8 {
+            let _ = app.update(Msg::Key(KeyPress::TextBackspace));
+        }
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
+        assert!(matches!(
+            edit,
+            SettingEdit::Unset {
+                field: SettingField::MaxCronSleep
+            }
+        ));
+
+        let effect = app.update(Msg::SettingWritten {
+            edit,
+            result: Ok(()),
+        });
+        assert_eq!(effect, Effect::LoadSettings);
+
+        let mut updated = fixtures::settings_snapshot();
+        updated.max_cron_sleep = ScalarView {
+            value: "30s".to_string(),
+            source: StyleSource::Default,
+        };
+        let _ = app.update(Msg::Settings {
+            result: Ok(updated.clone()),
+        });
+
+        assert_eq!(app.settings().unwrap().snapshot(), &updated);
+    }
+
+    /// fails if a landed write's own reload throws the cursor back to the
+    /// first row -- `Msg::Settings`'s `opening` check is what this pins.
+    #[test]
+    fn the_cursor_survives_a_landed_writes_reload() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let before = app.settings().unwrap().cursor();
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let _ = app.update(Msg::Key(KeyPress::TextApply));
+        let Effect::WriteSetting(edit) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("Enter must send");
+        };
         let _ = app.update(Msg::SettingWritten {
             edit,
             result: Ok(()),
         });
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert_eq!(app.settings().unwrap().cursor(), before);
+    }
 
+    /// fails if `r` throws the cursor back to the first row the same way a
+    /// landed write's own reload almost did.
+    #[test]
+    fn the_cursor_survives_a_refresh() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let before = app.settings().unwrap().cursor();
         assert_eq!(
-            app.settings().unwrap().snapshot().log_level.source,
-            StyleSource::Config
+            app.update(Msg::Key(KeyPress::Refresh)),
+            Effect::LoadSettings
         );
-        assert!(app.settings().unwrap().pending().is_none());
+        let _ = app.update(Msg::Settings {
+            result: Ok(fixtures::settings_snapshot()),
+        });
+        assert_eq!(app.settings().unwrap().cursor(), before);
     }
 
     #[test]
@@ -4764,7 +4875,10 @@ mod tests {
         }
         assert_eq!(app.update(Msg::Key(KeyPress::TextApply)), Effect::None);
         let prompt = app.settings().unwrap().pending().unwrap();
-        assert!(!prompt.sent, "the editor arms; a second Enter is what sends");
+        assert!(
+            !prompt.sent,
+            "the editor arms; a second Enter is what sends"
+        );
         assert!(prompt.text.contains("45s"), "got: {}", prompt.text);
         assert!(
             prompt.text.contains("SHEP_MAX_CRON_SLEEP"),
@@ -4817,9 +4931,18 @@ mod tests {
             result: Err("max_cron_sleep is 500ms, below the 1s floor".into()),
         });
 
-        let (_, buffer) = app.settings().unwrap().typing().expect("the editor reopens");
+        let (_, buffer) = app
+            .settings()
+            .unwrap()
+            .typing()
+            .expect("the editor reopens");
         assert_eq!(buffer, "500ms");
-        assert!(app.notice().unwrap().to_string().contains("below the 1s floor"));
+        assert!(
+            app.notice()
+                .unwrap()
+                .to_string()
+                .contains("below the 1s floor")
+        );
     }
 
     #[test]

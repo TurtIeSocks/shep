@@ -8,8 +8,9 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::super::app::{ActionState, App, Control, InputMode, Link, RowKey};
+use super::super::app::{ActionState, App, Control, InputMode, Link, RowKey, Settings};
 use super::flock::fit;
+use super::settings::field_label;
 
 /// The title: what this is, where it points, and how big the flock is.
 ///
@@ -62,11 +63,18 @@ pub fn banner_line(app: &App) -> Option<Line<'static>> {
     }
 }
 
-/// The bottom line: six slots, highest priority first — an armed confirm,
-/// the filter box while editing, a notice, an in-flight action, the applied
-/// filter line, then the key hint — with the control state always rendered
-/// on the right. See the phase plan's "Shapes the design named" #2 for why
-/// the box and the applied filter line are two slots and not one.
+/// The bottom line: seven slots, highest priority first -- an armed
+/// confirm, the settings screen's own free-text editor, the filter box
+/// while editing, a notice, an in-flight action, the applied filter line,
+/// then the key hint -- with the control state always rendered on the
+/// right. See the phase plan's "Shapes the design named" #2 for why the
+/// box and the applied filter line are two slots and not one. The editor
+/// slot sits ahead of the filter box for the same reason the confirm sits
+/// ahead of both: `App::settings().and_then(Settings::typing)` is only
+/// ever `Some` while the settings screen owns `InputMode::Text`, and the
+/// filter box's own `App::filter` is untouched the whole time, so checking
+/// the editor first is what keeps the two from ever answering the same
+/// keystroke with the wrong sentence.
 #[must_use]
 pub fn status_line(app: &App, width: u16) -> Line<'static> {
     let palette = app.palette();
@@ -75,6 +83,24 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // including the filter box, which it cannot coexist with anyway
         // because `/` cancels a confirm before it opens the box.
         (confirm_prompt(&action), palette.attention())
+    } else if let Some((field, buffer)) = app.settings().and_then(Settings::typing) {
+        // The settings screen's own free-text editor, checked ahead of the
+        // dashboard's filter-box branch below: both share `InputMode::Text`
+        // (task 8's editor reuses the filter box's keymap), but this one is
+        // typing into `socket` or `max_cron_sleep`, not `App::filter`. A bar
+        // that fell through to the filter branch here would render the
+        // dashboard's own (untouched) query under the label "filter" while
+        // the body pane's own `editing socket: ...` line says something
+        // else entirely on the same frame -- the screen would contradict
+        // itself. `field_label` is shared with `view::settings` so the two
+        // panes can never disagree about what to call the field.
+        (
+            format!(
+                "editing {}  {buffer}\u{258f}   enter applies   esc cancels",
+                field_label(*field)
+            ),
+            palette.attention(),
+        )
     } else if app.mode() == InputMode::Text {
         // ABOVE the notice, not below it. `Msg::BusLagged`,
         // `BusEvent::Dropped` and `BusEvent::DaemonShutdown` all raise notices
@@ -258,10 +284,11 @@ mod tests {
     use shep_core::protocol::BusEvent;
 
     use super::super::fixtures::{
-        acting_app, allowed_app, armed_app, armed_app_with_a_filter_and_a_notice, editing_app,
-        filtered_app, rendered,
+        acting_app, allowed_app, app_in_settings_on, armed_app,
+        armed_app_with_a_filter_and_a_notice, editing_app, filtered_app, rendered,
     };
     use super::*;
+    use crate::commands::settings::SettingField;
     use crate::lookout::app::{ActionVerb, App, KeyPress, Msg};
     use crate::lookout::theme::Palette;
 
@@ -402,6 +429,31 @@ mod tests {
         assert!(bar.contains("enter applies"), "got {bar:?}");
         assert!(bar.contains("esc cancels"), "got {bar:?}");
         assert!(bar.contains("ctrl-c quits"), "got {bar:?}");
+    }
+
+    /// fails if the bar falls through to the dashboard's own filter box
+    /// while the settings screen's free-text editor owns `InputMode::Text`
+    /// instead -- the review finding this pins: before the fix, this state
+    /// rendered "filter  <the dashboard's untouched query>" under the
+    /// editor's own body line saying "editing socket: ...", contradicting
+    /// itself on one frame.
+    #[test]
+    fn the_bar_shows_the_settings_editor_rather_than_the_filter_box() {
+        let mut app = app_in_settings_on(SettingField::Socket);
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let bar = rendered(&status_line(&app, 120));
+        assert!(
+            bar.contains("editing socket  "),
+            "names the field being typed: {bar:?}"
+        );
+        assert!(
+            bar.contains("/home/ada/.shep/run/shep.sock\u{258f}"),
+            "shows the buffer and the cursor, not the dashboard's own filter: {bar:?}"
+        );
+        assert!(
+            !bar.contains("filter "),
+            "must not read as the filter box: {bar:?}"
+        );
     }
 
     /// fails if a notice covers the box. A `Dropped` event arrives with no
