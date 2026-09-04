@@ -314,7 +314,7 @@ mod tests {
             },
         ]);
 
-        insta::assert_json_snapshot!("bus_event_wire_v2", events);
+        insta::assert_json_snapshot!("bus_event_wire_v3", events);
     }
 
     #[test]

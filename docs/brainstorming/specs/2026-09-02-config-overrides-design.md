@@ -133,14 +133,57 @@ the template now said, a merged pull request would be a path into a running
 flock: `user = "root"`, a changed `script`, a swapped `NODE_ENV`. Splitting on
 the argument type closes that without a flag anyone can alias on by default.
 
-### 3. A file load is additive, and two flags widen it
+### 3. A file load is additive, and one flag widens it four ways
 
-- No flag: append keys that are **not in the established set**. Never
-  overwrite.
-- `--reset`: put non-env process settings back to the template. Keep env and
-  keep operator-added keys.
-- `--reset-all`: put everything back to the template and delete operator-added
-  keys.
+No flag appends keys that are **not in the established set** and overwrites
+nothing. That is the whole default, and it stays the default because a
+Flockfile arrives from the app's own repository through a pull request:
+somebody merges, a deploy runs `shep start Flockfile.toml`, and nobody typed
+anything. An operator who set `max_memory = "2G"` on a box that was OOMing must
+not lose it to a merge that touched an unrelated line.
+
+Widening it takes `--reset=<mode>`, and the mode is required. Four values,
+and a mode touches only what its name says:
+
+| mode | `env` | keys the template declares | keys it does not |
+| --- | --- | --- | --- |
+| `file` | kept | reset | kept |
+| `policy` | kept | reset | reset |
+| `env` | reset | kept | kept |
+| `all` | reset | reset | reset |
+
+**This is deliberately not a two by two grid, and an earlier draft of this
+section claimed it was.** There are two independent choices, but the second
+one has three settings rather than two: policy can go untouched, or back to
+what the template declares, or back for every key including the ones the
+template never named. Six combinations exist. These four are the ones worth
+having. One discarded combination resets nothing at all, so it is the
+additive default with extra typing. The other is `file` plus `env`: reset
+env, and reset only what the template declares, sparing everything it does
+not. That one is coherent, not useless: it is simply left out because
+nobody has asked for it.
+
+The grid framing produced a real defect before it was caught. Under it, `env`
+was the baseline reset plus env, so `--reset=env` also put back every field
+the template declared. That is coherent, and it fails the rule this whole
+naming exercise exists to enforce: an operator typing `--reset=env` does not
+expect their restart budget reset because the template happens to mention it.
+A mode touches what its name says.
+
+`policy` and `env` are the two halves this design already splits config into,
+one paragraph down, so the flag values and the prose use one vocabulary rather
+than two. `file` is named for the thing the operator is looking at: it puts
+back what the file actually says and leaves everything the file has no opinion
+about alone. `all` is the only mode that is strictly the most, and the set is
+deliberately not a ladder, because `env` and `policy` are different axes rather
+than different sizes.
+
+**`--reset` with no value is an error that prints the table.** A destructive
+verb should make an operator name the destruction, the way `git reset` makes
+them choose between `--soft`, `--mixed` and `--hard`. The value is required
+with an equals sign, `--reset=file`, because `StartArgs.targets` is a greedy
+variadic positional and a space-separated value next to one of those is where
+argument parsing gets ambiguous.
 
 **"Not in the established set" is the definition that matters**, and it must
 not be implemented as "equals the default". Every `AppConfig` field always has
@@ -159,14 +202,29 @@ an app where nobody set one, which is inside the trust already extended to a
 file whose `script` you execute, and is written down here rather than left to
 be discovered.
 
-`--reset` skipping env is a special case and the right one. Env is
-operator-supplied data; the rest is operator-tuned policy. Resetting policy is
-recoverable, resetting data takes the app's database away.
+**`file` is the mode that fixes a footgun rather than adding a feature.** A
+reset that also resets what the template is silent about is how an app stocked
+to four instances drops to one against a file with no `instances` line: the
+compiled default wins an argument the file never entered. Under `file` there is
+nothing to put back, so the count survives. `policy` keeps the old behaviour for
+an operator who genuinely wants the box returned to a clean template.
 
-The original complaint is fixed by `--reset`, not by the default:
+Env skipping is a special case and the right one for `file` and `policy`. Env is
+operator-supplied data; the rest is operator-tuned policy. Resetting policy is
+recoverable, resetting data takes the app's database away. `env` and `all` exist
+for the operator who means it.
+
+The original complaint is fixed by a reset, not by the default:
 `instances = 5` edited into a template reaches a running app through
-`shep start Flockfile.toml --reset`, which routes to the existing scale path
-and leaves the running instances alone.
+`shep start Flockfile.toml --reset=file`, which routes to the existing scale
+path and applies it, scaling the four running instances up to five. This is
+the opposite case from the footgun `file` fixes, above: there the template
+said nothing about `instances`, and `file` left the count alone because
+there was nothing to put back. Here the template DOES declare `instances`,
+so `file` puts back exactly what it declares, on the same terms as every
+other field it covers. What `file` never does is move a key the template is
+silent on to the compiled default of one, which is the behaviour a reset
+covering undeclared keys (`policy` or `all`) would have instead.
 
 ### 4. A load never kills a process and never prunes
 
@@ -249,7 +307,7 @@ the muster restore of a sheep saved while stopped.
 means deciding there, not here."* So the work is a request variant, an rpc arm
 and a verb, not new supervisor machinery.
 
-`--reset` and `--reset-all` apply, since the load path is shared. On an app
+Every `--reset=<mode>` applies, since the load path is shared. On an app
 that is already running it appends config and leaves it running: refusing would
 break re-running it after a template edit, and stopping it would break decision
 4. An added app has `instances_running = 0`, so `restorable()` will not bring
@@ -439,15 +497,35 @@ for `&self` on the grounds that applying under a running sheep is the outcome
 being ruled out, which was right for a request that reports. The applier is a
 sibling.
 
-`PROTOCOL_VERSION` stays 2, and this corrects an earlier draft of this spec
-that said it moves to 3. The rule at `protocol/mod.rs:43` keeps the version for
-new variants behind `#[non_exhaustive]`, and `shep-core`'s CHANGELOG applies it
+`ApplyConfig` on its own did not move `PROTOCOL_VERSION`, and this corrected an
+earlier draft of this spec that said it did. It has since moved to 3 anyway,
+for a different reason recorded below: renaming `ResetDepth::Settings` to
+`Policy` changed the wire string for an operation that already worked, which is
+not the additive shape this paragraph describes. The rule at `protocol/mod.rs:43`
+keeps the version for new variants, and `shep-core`'s CHANGELOG applies it
 repeatedly, `ConfigDrift` itself among them: *"Additive: `PROTOCOL_VERSION`
 stays 1, a daemon that predates the request answers its existing 'does not
 implement that request' error."* The 1 to 2 bump was for `SelectorSpec`, a type
 nested inside requests an older daemon already knows how to decode, which is a
-different situation. An older daemon meeting `ApplyConfig` fails to decode the
-verb, which is the outcome every earlier additive variant shipped with.
+different situation. A daemon predating `ApplyConfig` fails to decode the verb,
+which is the outcome every earlier additive variant shipped with.
+
+Three builds are worth telling apart here, because "an older daemon" now
+straddles them. One predating `ApplyConfig` would fail on the verb. One that
+has `ApplyConfig` but predates the rename would decode the verb and fail on the
+value, since `"policy"` is a variant it has never heard of. Neither happens in
+practice on the shipped binary: `PROTOCOL_VERSION` is 3, so the handshake
+refuses first with `protocol_mismatch` and exit 6, and no request is sent at
+all. Verified against a real 0.1.30 daemon rather than reasoned about. That
+refusal is the whole point of the bump, since both decode failures reach an
+operator as a dead client with nothing naming the cause.
+
+Note what `#[non_exhaustive]` does and does not buy here, since an earlier
+version of this paragraph leaned on it. It forces a crate outside `shep-core`
+to carry a wildcard arm, so adding a variant does not break its build. It does
+nothing for serde: this enum has no `#[serde(other)]`, so a build meeting a
+variant it predates fails with `unknown variant` rather than falling back.
+Measured, not assumed.
 
 `SCHEMA_VERSION` stays 1. `ProcessInfo` gains `pending: Vec<String>` and
 `overridden: Vec<String>`, both additive, both names only, because `env`
@@ -507,8 +585,12 @@ sheep.
 
 - an established key is not overwritten by a later file load
 - a key absent from the established set is appended by a later file load
-- `--reset` restores process settings and leaves env alone
-- `--reset-all` deletes operator-added keys
+- `--reset=file` restores what the template declares and leaves everything
+  it is silent about alone, including an instance count the file never mentions
+- `--reset=policy` restores process settings, declared or not, and leaves env
+- `--reset=env` restores env and leaves policy
+- `--reset=all` restores both and deletes operator-added keys
+- `--reset` with no value is a usage error that prints the four modes
 - a G3 override lands as pending and does not touch the running child
 - `shep reload` promotes pending, and promoting a `user` change resets
   `credentials` to `Unresolved`
@@ -563,5 +645,5 @@ that catches a wrong prop; a build stays green on one.
   set is what that file declared. No override store exists yet, and additive
   append is a no-op on the first run.
 - **`shep stock` behaves identically** from the outside. It now writes an
-  override rather than the spec directly, and `--reset-all` is the way to
+  override rather than the spec directly, and `--reset=all` is the way to
   discard one.

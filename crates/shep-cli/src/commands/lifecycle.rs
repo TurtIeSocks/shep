@@ -13,6 +13,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use clap::ValueEnum as _;
 use shep_client::{Client, START_DEADLINE};
 use shep_core::config::{
     AppConfig, DeclaredApp, FlockFormat, Flockfile, FlockfileError, ResetDepth,
@@ -22,7 +23,7 @@ use shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec, SheepApp
 use shep_core::selector::ProcessSelector;
 
 use crate::cli::Format;
-use crate::cli::{SelectorArgs, StartArgs, StockArgs};
+use crate::cli::{ResetMode, SelectorArgs, StartArgs, StockArgs};
 use crate::commands::bounded::{Bounded, run_bounded};
 use crate::commands::dogs;
 use crate::commands::selector::parse_selector;
@@ -1355,33 +1356,26 @@ fn apply_interpreters(
     }
 }
 
-/// The depth of an `apply_declared` call chosen by `--reset`/`--reset-all`.
+/// The `--reset=<mode>` the operator typed, `None` when they typed nothing.
 ///
-/// `clap`'s `conflicts_with` already refuses the two together, so at most one
-/// of `args.reset`/`args.reset_all` is ever set here.
-/// The reset flag the operator typed, `None` when they typed neither.
-///
-/// Named so the two arms that REFUSE a reset can quote back the flag the
-/// operator actually wrote. `clap`'s `conflicts_with` refuses the two
-/// together, so `--reset-all` winning here is a tie that cannot happen.
-fn reset_flag(args: &StartArgs) -> Option<&'static str> {
-    if args.reset_all {
-        Some("--reset-all")
-    } else if args.reset {
-        Some("--reset")
-    } else {
-        None
-    }
+/// Named so the two arms that REFUSE a reset can quote back the flag AND the
+/// mode the operator actually wrote, rather than a bare `--reset` that does
+/// not by itself parse: an operator who typed `--reset=file` should see
+/// `--reset=file` in the refusal, not a flag spelling that would now be a
+/// usage error on its own.
+fn reset_flag(args: &StartArgs) -> Option<String> {
+    args.reset.map(|mode| {
+        let name = mode
+            .to_possible_value()
+            .expect("every ResetMode variant has a possible value")
+            .get_name()
+            .to_string();
+        format!("--reset={name}")
+    })
 }
 
 fn reset_depth(args: &StartArgs) -> ResetDepth {
-    if args.reset_all {
-        ResetDepth::All
-    } else if args.reset {
-        ResetDepth::Settings
-    } else {
-        ResetDepth::None
-    }
+    args.reset.map_or(ResetDepth::None, ResetMode::to_depth)
 }
 
 /// Which of the two verbs that read a Flockfile is running.
@@ -2120,8 +2114,7 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
-            reset: false,
-            reset_all: false,
+            reset: None,
         };
         {
             let mut streams = Streams {
@@ -2265,8 +2258,7 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
-            reset: false,
-            reset_all: false,
+            reset: None,
         }
     }
 
@@ -3239,14 +3231,14 @@ mod tests {
         );
     }
 
-    /// fails if `--reset`/`--reset-all` do not reach the wire as the depth
-    /// they name. `reset_depth` is the only place that mapping happens, and
+    /// fails if `--reset=<mode>` does not reach the wire as the depth it
+    /// names. `reset_depth` is the only place that mapping happens, and
     /// nothing else in this file would notice if it collapsed to `None`.
     #[tokio::test]
-    async fn reset_flags_choose_the_apply_config_depth_on_the_wire() {
+    async fn reset_modes_choose_the_apply_config_depth_on_the_wire() {
         use shep_client::testing::fake_client_answering;
 
-        async fn sent_depth(reset: bool, reset_all: bool) -> ResetDepth {
+        async fn sent_depth(reset: Option<ResetMode>) -> ResetDepth {
             let dir = tempfile::tempdir().unwrap();
             let flockfile = dir.path().join("Flockfile.toml");
             std::fs::write(
@@ -3260,7 +3252,6 @@ mod tests {
                     .await;
             let mut args = start_args(flockfile.to_str().unwrap());
             args.reset = reset;
-            args.reset_all = reset_all;
             let (code, _printed, _said) = start_against_with_args(&client, &args).await;
             assert_eq!(code, ExitCode::Success);
             let mut sent = Vec::new();
@@ -3273,9 +3264,14 @@ mod tests {
             sent[0]
         }
 
-        assert_eq!(sent_depth(false, false).await, ResetDepth::None);
-        assert_eq!(sent_depth(true, false).await, ResetDepth::Settings);
-        assert_eq!(sent_depth(false, true).await, ResetDepth::All);
+        assert_eq!(sent_depth(None).await, ResetDepth::None);
+        assert_eq!(sent_depth(Some(ResetMode::File)).await, ResetDepth::File);
+        assert_eq!(
+            sent_depth(Some(ResetMode::Policy)).await,
+            ResetDepth::Policy
+        );
+        assert_eq!(sent_depth(Some(ResetMode::Env)).await, ResetDepth::Env);
+        assert_eq!(sent_depth(Some(ResetMode::All)).await, ResetDepth::All);
     }
 
     /// fails if a reset flag is accepted when the target is a NAME. There is
@@ -3291,14 +3287,15 @@ mod tests {
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
 
         let mut args = start_args("zam");
-        args.reset = true;
+        args.reset = Some(ResetMode::Env);
         let (code, printed, said) = start_against_with_args(&client, &args).await;
 
         assert_eq!(code, ExitCode::Usage);
         assert!(printed.is_empty(), "a refusal prints no data envelope");
         assert!(
-            said.contains("--reset") && said.contains("zam"),
-            "the refusal names the flag and the token it was refused for: {said}"
+            said.contains("--reset=env") && said.contains("zam"),
+            "the refusal must echo the mode the operator actually typed, \
+             not a bare --reset that is now its own usage error: {said}"
         );
     }
 
@@ -3317,14 +3314,15 @@ mod tests {
             fake_client_answering(&path, a_daemon_for(a_clustered_flock(&[0, 1, 2]), &[])).await;
 
         let mut args = start_args(script.to_str().unwrap());
-        args.reset = true;
+        args.reset = Some(ResetMode::All);
         let (code, printed, said) = start_against_with_args(&client, &args).await;
 
         assert_eq!(code, ExitCode::Usage);
         assert!(printed.is_empty(), "a refusal prints no data envelope");
         assert!(
-            said.contains("--reset") && said.contains("zam"),
-            "the refusal names the flag and the token it was refused for: {said}"
+            said.contains("--reset=all") && said.contains("zam"),
+            "the refusal must echo the mode the operator actually typed, \
+             not a bare --reset that is now its own usage error: {said}"
         );
         assert!(
             applies(&mut envelopes).is_empty(),
@@ -3436,7 +3434,7 @@ mod tests {
                     "api",
                     Vec::new(),
                     Vec::new(),
-                    Some("instances: a plain load never reshapes a flock".to_string()),
+                    Some("instances: this load never reshapes a flock".to_string()),
                 ),
             ]),
             _ => Response::Pong,
@@ -3654,8 +3652,7 @@ mod tests {
             cwd: None,
             interpreter: None,
             flockfile: false,
-            reset: false,
-            reset_all: false,
+            reset: None,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();

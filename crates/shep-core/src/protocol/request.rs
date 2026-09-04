@@ -72,7 +72,7 @@ pub enum SelectorSpec {
     /// By fold name
     Fold(String),
     // Both field names are part of the wire contract, and the byte shape is
-    // pinned by `request_wire_v2`, so renaming either breaks that snapshot
+    // pinned by `request_wire_v3`, so renaming either breaks that snapshot
     // rather than sliding through unnoticed.
     /// By app name and instance slot
     ///
@@ -339,6 +339,13 @@ pub enum Request {
         /// How much of what the operator has set since a template last
         /// loaded this request may overwrite. Default
         /// [`ResetDepth::None`], which overwrites nothing.
+        ///
+        /// `ResetDepth::Settings` was renamed to `ResetDepth::Policy` (and
+        /// `File`/`Env` were added) in protocol 3, and the reason that
+        /// version exists: unlike an added variant, a rename changes the
+        /// wire spelling of an operation that was already shipping, so a
+        /// daemon built against protocol 2 cannot decode a client sending
+        /// the new name.
         reset: ResetDepth,
     },
     /// Stop matching sheep (stay registered)
@@ -2542,7 +2549,7 @@ mod tests {
                             .collect(),
                         declared_env: ["DATABASE_URL"].iter().map(|k| (*k).to_string()).collect(),
                     }],
-                    reset: ResetDepth::Settings,
+                    reset: ResetDepth::Policy,
                 },
             },
             // The same app as the `start` row above, deliberately: the two
@@ -2560,7 +2567,7 @@ mod tests {
                 },
             },
         ];
-        insta::assert_json_snapshot!("request_wire_v2", requests);
+        insta::assert_json_snapshot!("request_wire_v3", requests);
     }
 
     #[test]
@@ -2940,7 +2947,7 @@ mod tests {
                 result: Ok(Response::Added(vec![])),
             },
         ];
-        insta::assert_json_snapshot!("reply_wire_v2", replies);
+        insta::assert_json_snapshot!("reply_wire_v3", replies);
     }
 
     /// fails if `applied` or `pending` ever carries a field's VALUE rather
@@ -2986,7 +2993,9 @@ mod tests {
     /// fails if the new field breaks an older peer, on the same terms as
     /// `last_exit` and `lambs` before it. A daemon that predates smits sends
     /// no `smit` key, and this decoding to `None` rather than erroring is
-    /// what keeps `PROTOCOL_VERSION` at 2 rather than needing another bump.
+    /// why the field cost `PROTOCOL_VERSION` no bump of its own. The
+    /// constant has moved since, for a reason unrelated to this field, so
+    /// this says what the field did rather than what the constant is.
     #[test]
     fn a_process_info_without_a_smit_key_still_deserializes() {
         let fixture = r#"{"id":1,"name":"web","status":"online","pid":42,"restarts":0,"uptime_ms":10,"fold":null,"out_file":null,"err_file":null,"cpu_percent":null,"memory_bytes":null,"dog":null,"lambs":null,"last_exit":null}"#;
@@ -2996,12 +3005,12 @@ mod tests {
 
     /// fails if `handshook` breaks an older peer, on the same terms as
     /// `smit` and `instance` before it. A daemon that predates the field
-    /// sends no `handshook` key and still announces protocol 2, so this
-    /// decoding to `None` rather than erroring is what keeps
-    /// `PROTOCOL_VERSION` at 2: the evolution rule in this module's parent
-    /// says an additive optional field keeps the version, and a required
-    /// one would make a current client unable to list against that daemon
-    /// at all.
+    /// sends no `handshook` key, so this decoding to `None` rather than
+    /// erroring is why the field cost `PROTOCOL_VERSION` no bump of its
+    /// own: the evolution rule in this module's parent says an additive
+    /// optional field keeps the version, and a required one would make a
+    /// current client unable to list against that daemon at all. The
+    /// constant has moved since, for a reason unrelated to this field.
     ///
     /// The fixture is a DOG's row, deliberately — that is the one row where
     /// the missing key changes what a renderer prints, and `None` there has
@@ -3114,7 +3123,7 @@ mod tests {
             dog_name: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
-        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":2}"#);
+        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":3}"#);
     }
 
     /// fails if a non-dog client's `Hello` grows a key. The CLI is the
@@ -3132,7 +3141,7 @@ mod tests {
         let json = serde_json::to_string(&dog).unwrap();
         assert_eq!(
             json,
-            r#"{"client_version":"0.1.0","protocol":2,"dog_name":"metrics"}"#
+            r#"{"client_version":"0.1.0","protocol":3,"dog_name":"metrics"}"#
         );
         assert_eq!(serde_json::from_str::<Hello>(&json).unwrap(), dog);
     }

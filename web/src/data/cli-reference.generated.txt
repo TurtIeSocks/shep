@@ -159,25 +159,21 @@ Options:
           file merely has that extension. Without this flag `shep start server.js` starts
           `server.js` as a script, which is what it has always meant.
 
-      --reset
-          Put process settings back to what the Flockfile says, keeping env.
+      --reset[=<RESET>]
+          Widen a Flockfile load past its additive default: append nothing, overwrite instead. A
+          mode touches only what its name says; see the four below. Refused when the target supplies
+          no template to reset to: a sheep name reads no file, and a bare script path is a command
+          line rather than a file.
           
-          Every setting goes back, whether the file declares it or not: a key the file is silent
-          about goes to the value a fresh `shep start` off that same file would give it. Without
-          this flag a load is additive: it appends keys nobody has set and overwrites nothing. `env`
-          is operator-supplied data and survives even this reset; everything else is operator-tuned
-          policy, and resetting policy is recoverable. Refused when the target supplies no template
-          to reset to: a sheep name reads no file, and a bare script path is a command line rather
-          than a file.
+          The value is required, with an equals sign: `--reset=file`, never `--reset file`.
+          `targets` is a greedy variadic positional, and a space-separated value next to one of
+          those is where argument parsing gets ambiguous.
 
-      --reset-all
-          Put everything back to what the Flockfile says, including env, and drop the override
-          record.
-          
-          The wider of the two resets: `--reset` keeps `env` because it is operator-supplied data,
-          not policy, and losing it takes the app's database away. This flag drops it too. Refused
-          on the same targets `--reset` is: a sheep name reads no file, and a bare script path is a
-          command line rather than a file.
+          Possible values:
+          - file:   Put back what the template declares, `env` kept
+          - policy: Put back every setting but `env`, declared or not
+          - env:    Put back only `env`
+          - all:    Put back everything, `env` included, and drop the override record
 
   -h, --help
           Print help (see a summary with '-h')
@@ -288,25 +284,21 @@ Options:
           file merely has that extension. Without this flag `shep start server.js` starts
           `server.js` as a script, which is what it has always meant.
 
-      --reset
-          Put process settings back to what the Flockfile says, keeping env.
+      --reset[=<RESET>]
+          Widen a Flockfile load past its additive default: append nothing, overwrite instead. A
+          mode touches only what its name says; see the four below. Refused when the target supplies
+          no template to reset to: a sheep name reads no file, and a bare script path is a command
+          line rather than a file.
           
-          Every setting goes back, whether the file declares it or not: a key the file is silent
-          about goes to the value a fresh `shep start` off that same file would give it. Without
-          this flag a load is additive: it appends keys nobody has set and overwrites nothing. `env`
-          is operator-supplied data and survives even this reset; everything else is operator-tuned
-          policy, and resetting policy is recoverable. Refused when the target supplies no template
-          to reset to: a sheep name reads no file, and a bare script path is a command line rather
-          than a file.
+          The value is required, with an equals sign: `--reset=file`, never `--reset file`.
+          `targets` is a greedy variadic positional, and a space-separated value next to one of
+          those is where argument parsing gets ambiguous.
 
-      --reset-all
-          Put everything back to what the Flockfile says, including env, and drop the override
-          record.
-          
-          The wider of the two resets: `--reset` keeps `env` because it is operator-supplied data,
-          not policy, and losing it takes the app's database away. This flag drops it too. Refused
-          on the same targets `--reset` is: a sheep name reads no file, and a bare script path is a
-          command line rather than a file.
+          Possible values:
+          - file:   Put back what the template declares, `env` kept
+          - policy: Put back every setting but `env`, declared or not
+          - env:    Put back only `env`
+          - all:    Put back everything, `env` included, and drop the override record
 
   -h, --help
           Print help (see a summary with '-h')

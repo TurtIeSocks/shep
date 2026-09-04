@@ -437,23 +437,33 @@ shep-owned store at `$SHEP_HOME/overrides.json` (locked and `0600`, like the
 KV store). `shep start <Flockfile>` now sends `Request::ApplyConfig` and
 merges the file into the sheep of the same name: additive by default, so it
 appends keys nobody has established and overwrites nothing, because a
-Flockfile arrives through a pull request. `--reset` puts non-`env` settings
-back to the template and `--reset-all` puts everything back and drops the
-record; both are refused when the target names a sheep, since a name reads
-no file. Both are refused on a bare script path too, for the same reason. A
-load with NO FLAG never prunes and never kills, and the merge itself registers
-nothing, though the `shep start` carrying it still registers and starts an app
-the flock does not have, by its own fresh path --
+Flockfile arrives through a pull request. Widening it takes
+`--reset=<mode>`, one flag with four required values rather than two
+booleans: `file` puts back what the template declares and leaves `env` and
+every undeclared key alone; `policy` does the same but for every key,
+declared or not; `env` puts back only `env`; `all` does both. `--reset`
+with no value is a usage error naming the four. Every mode is refused when
+the target names a sheep, since a name reads no file, and on a bare script
+path too, for the same reason. A load with NO FLAG never prunes and never
+kills, and the merge itself registers nothing, though the `shep start`
+carrying it still registers and starts an app the flock does not have, by
+its own fresh path --
 a field the running child holds parks as pending and `shep reload`/`shep
 restart` promote it, re-resolving identity only when `user` or `group` moved.
 **A reset can kill, and that is deliberate.** `instances` is Structural, held
-out of a plain load entirely and routed through `handle_scale` under either
-reset flag, whose `Ordering::Less` arm deletes the instances above the new
-count on the same path `shep delete` takes (`a_plain_load_never_scales_and_a_reset_does`
-pins it). The sharp edge: a Flockfile that never mentions `instances` still
-means 1 under a reset, because that is the compiled default the reset falls
+out of a plain load entirely and routed through `handle_scale` under any
+mode but `env`, whose `Ordering::Less` arm deletes the instances above the
+new count on the same path `shep delete` takes
+(`a_plain_load_never_scales_and_a_reset_does` pins it). `file` scales too,
+when the template declares `instances`: it takes the count on the same
+terms as every other key it declares. The sharp edge is the undeclared
+case. A Flockfile that never mentions `instances` still means 1 under
+`policy` or `all`, because that is the compiled default the reset falls
 back to, so an app stocked to four goes to one against a file that has no
-opinion about the count. The overrides page carries the warning. A `CFG`
+opinion about the count. `file` is the mode that survives that specific
+case, because `merge_declared` never puts an undeclared `instances` in
+scope, so there is nothing to put back. The overrides page carries the
+warning. A `CFG`
 column in `shep flock` and in `shep lookout` marks a sheep with pending
 (`!N`) or overridden (`*N`) fields, and `shep describe` lists the names. A
 per-app refusal exits non-zero. The four-way field classification lives in
@@ -475,15 +485,17 @@ on which verb read it is one nobody could reason about. Four places consult
 it: which request a fresh app goes out as, whether an app the flock already
 has is resumed after the merge, what a name target that resolves to a
 registered sheep does, and the notice code. `Request::Add` /
-`Response::Added` are additive, so `PROTOCOL_VERSION` stays at 2 and the
-paragraph below applies to `shep add` too. **The fill-in half of
+`Response::Added` are additive and did not move `PROTOCOL_VERSION` on
+their own; it later moved to 3 for an unrelated reason, recorded below, and
+the paragraph below applies to `shep add` too. **The fill-in half of
 "register, fill in, start" does not exist yet**: an established `env` key
-today moves only through the file plus `--reset-all`, and editing one in
-place is a later slice (spec decisions 10 and 11).
+today moves only through the file plus `--reset=env` (or `--reset=all`,
+which also drops the override record), and editing one in place is a later
+slice (spec decisions 10 and 11).
 
 **Restart the shepherd after upgrading to it.** `PROTOCOL_VERSION` did NOT
-move for `ApplyConfig` or for `Add` (both variants are additive, and six
-precedents in shep-core's changelog agree), so an older shepherd cannot
+move for `ApplyConfig` itself or for `Add` (both variants are additive, and
+six precedents in shep-core's changelog agree), so an older shepherd cannot
 decode either one. **This paragraph said the operator meets a dead client,
 full stop, and that is wrong: it skips the skew guard, which fires first in
 the common case.** `refuse_version_skew` compares the shepherd's reported
@@ -505,6 +517,23 @@ before any request is sent. So the two cases are:
 where an operator reads. `every_exempt_verb_is_one_of_the_documented_recovery_verbs`
 pins `add` at `Enforce`, since it reaches that through the `_` arm rather
 than by being named.
+
+**`PROTOCOL_VERSION` moved to 3 on 2026-09-04, for `ApplyConfig`'s payload
+rather than for `ApplyConfig` itself.** The two-case analysis above still
+holds for `Add` and for `ApplyConfig`'s own addition. It stopped holding for
+`ResetDepth::Settings`, renamed to `ResetDepth::Policy` (with `File`/`Env`
+added) in the same commit: a rename changes the wire spelling of an
+operation (`--reset`) that already ships, so the "versions match, same
+commit lineage" case above is no longer the only hazard. A daemon at
+protocol 2 that has simply not restarted since the upgrade now fails to
+decode `"policy"` for what it already understood as `"settings"`, which is a
+regression of live functionality rather than an unreachable new one, so the
+bump closes that gap with a named `protocol_mismatch` refusal, exit 6,
+instead of leaving it as an accepted cost. Not `version_skew`, exit 12,
+which this said until 2026-09-04: `refuse_version_skew` runs only after
+`connect_or_spawn` returns `Ok`, and a protocol refusal fails the handshake,
+so it returns `Err` and that check is never reached. `docs/decisions.md`'s entry on this reverses the
+"`PROTOCOL_VERSION` stayed 2" ruling that predates it.
 
 **Verb count: 41 generated, 42 listed, and the difference is `help`.**
 `./web/scripts/generate-cli-reference.sh` prints its own number every time it
