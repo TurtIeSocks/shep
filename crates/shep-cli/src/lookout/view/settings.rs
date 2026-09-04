@@ -621,7 +621,7 @@ fn content_lines(
             format!("{}  enter confirms, any other key cancels", prompt.text)
         };
         lines.push(Line::from(Span::styled(
-            format!("  {text}"),
+            format!("  {}", fit(&text, table_width)),
             palette.attention(),
         )));
     } else if let Some((field, buffer)) = settings.typing() {
@@ -636,8 +636,14 @@ fn content_lines(
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             format!(
-                "  editing {}: {buffer}\u{258f}   enter applies   esc cancels",
-                field_label(*field)
+                "  {}",
+                fit(
+                    &format!(
+                        "editing {}: {buffer}\u{258f}   enter applies   esc cancels",
+                        field_label(*field)
+                    ),
+                    table_width,
+                )
             ),
             palette.attention(),
         )));
