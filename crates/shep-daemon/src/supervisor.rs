@@ -22456,9 +22456,9 @@ mod tests {
     }
 
     /// fails if a reset does not put every non-env setting back to the file,
-    /// or if the two depths do not part company over env. `--reset` restores
-    /// settings, declared or not, and leaves env; `--reset-all` takes env
-    /// with it and drops the record.
+    /// or if the two depths do not part company over env. `--reset=policy`
+    /// restores settings, declared or not, and leaves env; `--reset=all`
+    /// takes env with it and drops the record.
     #[tokio::test(start_paused = true)]
     async fn reset_restores_every_setting_and_only_reset_all_takes_env() {
         // The operator's three edits since the file established name, script
@@ -22495,13 +22495,14 @@ mod tests {
         let settings_pending = actor.sheep[&0].entry.pending.clone();
         assert_eq!(
             settings.max_restarts, 10,
-            "--reset puts a declared setting back to the file's"
+            "--reset=policy puts a declared setting back to the file's"
         );
         assert_eq!(
             settings.min_uptime,
             AppConfig::default().min_uptime,
-            "--reset puts a field the file never declared back to the file's \
-             own value, which for an undeclared key is the compiled default"
+            "--reset=policy puts a field the file never declared back to the \
+             file's own value, which for an undeclared key is the compiled \
+             default"
         );
         assert_eq!(
             settings_pending
@@ -22510,7 +22511,7 @@ mod tests {
                 .get("OPERATOR")
                 .map(String::as_str),
             Some("1"),
-            "--reset keeps env"
+            "--reset=policy keeps env"
         );
 
         let all_dir = tempfile::tempdir().unwrap();
@@ -22523,7 +22524,7 @@ mod tests {
         assert_eq!(
             all.min_uptime,
             AppConfig::default().min_uptime,
-            "--reset-all drops a field the operator added"
+            "--reset=all drops a field the operator added"
         );
         assert!(
             all_pending
@@ -22532,13 +22533,13 @@ mod tests {
                 .config()
                 .env
                 .is_empty(),
-            "--reset-all drops an env key the operator added"
+            "--reset=all drops an env key the operator added"
         );
         assert!(
             shep_core::overrides::get(&actor.paths.overrides, "web")
                 .unwrap()
                 .is_none(),
-            "--reset-all removes the override record"
+            "--reset=all removes the override record"
         );
     }
 
@@ -22895,12 +22896,12 @@ mod tests {
         );
     }
 
-    /// fails if a `--reset` establishes an env key it never merged. The
-    /// `Policy` depth touches env not at all, so a template that has grown
-    /// `NEW_KEY` reports nothing and merges nothing -- and used to record the
-    /// key as established anyway, after which no plain load could ever append
-    /// it and only `--reset-all` could recover, taking every other env value
-    /// with it.
+    /// fails if a `--reset=policy` establishes an env key it never merged.
+    /// The `Policy` depth touches env not at all, so a template that has
+    /// grown `NEW_KEY` reports nothing and merges nothing -- and used to
+    /// record the key as established anyway, after which no plain load
+    /// could ever append it and only `--reset=all` could recover, taking
+    /// every other env value with it.
     #[tokio::test(start_paused = true)]
     async fn a_settings_reset_does_not_establish_an_env_key_it_never_merged() {
         let dir = tempfile::tempdir().unwrap();
@@ -22921,7 +22922,7 @@ mod tests {
 
         assert!(
             actor.sheep[&0].entry.spec.config().env.is_empty(),
-            "a `--reset` merges no env at all: {reset:?}"
+            "a `--reset=policy` merges no env at all: {reset:?}"
         );
         assert!(
             shep_core::overrides::get(&actor.paths.overrides, "web")
