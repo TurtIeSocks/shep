@@ -1759,6 +1759,14 @@ The entry above was right about `ApplyConfig` itself: the variant is additive, a
 
 `verified crates/shep-cli/src/commands/daemon.rs (the pre-flight validates shep.toml before the reload) and web/src/pages/docs/getting-started.astro`
 
+### --reset and --reset-all become one flag, --reset=<mode>, with four values rather than a two by two grid
+
+`ResetDepth::{Settings, All}` and the two boolean flags behind them are gone. `--reset=<mode>` replaces both, required with an equals sign, and the four values are `file`, `policy`, `env`, `all`. A mode touches only what its name says: `file` puts back what the template declares and nothing it is silent on; `policy` widens that to every key, declared or not; `env` touches only `env`; `all` is both.
+
+**Why:** The original two-flag design read env and everything-else as a single axis with two stops, which made `--reset` restore every non-env setting whether the template declared it or not. That default is the exact footgun this rename exists to fix: an app stocked to four instances against a Flockfile with no `instances` line dropped to one, because the compiled default won an argument the file never entered. `file` is the mode with nothing to put back in that case, so the count survives. The other gap the two-flag design left was an operator who wanted their env restored without losing policy tuning; `--reset` and `--reset-all` both meant "restore policy" was inseparable from "restore env" once env was in scope at all, and `env` is the mode that separates them. Six combinations exist across the two real axes (env: keep or reset; policy: keep, reset-declared, or reset-everything), and the four kept are the ones an operator would ask for; the other two both reset undeclared keys while sparing declared ones, which nobody wants. `PROTOCOL_VERSION` moved from 2 to 3 for this, recorded above, because the rename changes the wire spelling of an operation that already shipped.
+
+`verified crates/shep-core/src/config/apply.rs (ResetDepth), crates/shep-cli/src/cli.rs (ResetMode) and crates/shep-daemon/src/supervisor.rs (merge_declared)`
+
 ## Dog config store
 
 ### A dog's section moved out of `shep.toml` into a hand-editable `dogs.toml`, migrated once at boot, and a name in both files is a refusal rather than a merge
