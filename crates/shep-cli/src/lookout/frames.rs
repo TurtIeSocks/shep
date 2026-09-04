@@ -658,10 +658,10 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
                 "web"
             };
             for typed in query.chars() {
-                app.update(Msg::Key(KeyPress::FilterChar(typed)));
+                app.update(Msg::Key(KeyPress::TextChar(typed)));
             }
             if which == Scene::FilterActive {
-                app.update(Msg::Key(KeyPress::FilterApply));
+                app.update(Msg::Key(KeyPress::TextApply));
             }
         }
         _ => {}

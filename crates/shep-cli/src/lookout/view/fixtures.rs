@@ -310,21 +310,21 @@ pub fn filtered_app_of(flock: Vec<ProcessInfo>, query: &str) -> App {
     if !query.is_empty() {
         app.update(Msg::Key(KeyPress::FilterStart));
         for typed in query.chars() {
-            app.update(Msg::Key(KeyPress::FilterChar(typed)));
+            app.update(Msg::Key(KeyPress::TextChar(typed)));
         }
-        app.update(Msg::Key(KeyPress::FilterApply));
+        app.update(Msg::Key(KeyPress::TextApply));
     }
     app
 }
 
 /// The same four sheep with `query` half-typed and the box still OPEN: no
-/// `FilterApply`, which is the whole difference between this and
+/// `TextApply`, which is the whole difference between this and
 /// [`filtered_app`].
 pub fn editing_app(query: &str) -> App {
     let mut app = app_with(named_flock(), plain());
     app.update(Msg::Key(KeyPress::FilterStart));
     for typed in query.chars() {
-        app.update(Msg::Key(KeyPress::FilterChar(typed)));
+        app.update(Msg::Key(KeyPress::TextChar(typed)));
     }
     app
 }

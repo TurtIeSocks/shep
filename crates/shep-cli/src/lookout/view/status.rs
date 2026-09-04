@@ -410,7 +410,7 @@ mod tests {
     fn closing_the_box_shows_the_notice_that_was_waiting() {
         let mut app = editing_app("we");
         app.update(Msg::Event(BusEvent::Dropped { count: 3 }));
-        app.update(Msg::Key(KeyPress::FilterApply));
+        app.update(Msg::Key(KeyPress::TextApply));
         let bar = rendered(&status_line(&app, 120));
         assert!(bar.contains("dropped 3 events"), "got {bar:?}");
     }

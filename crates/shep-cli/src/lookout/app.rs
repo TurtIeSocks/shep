@@ -105,14 +105,16 @@ pub enum KeyPress {
     Confirm,
     /// `/` — open the filter box, carrying whatever query is already set.
     FilterStart,
-    /// One printable character typed into the box.
-    FilterChar(char),
-    /// `Backspace` in the box.
-    FilterBackspace,
-    /// `Enter` in the box: apply and leave.
-    FilterApply,
-    /// `Esc` in the box: clear the filter and leave.
-    FilterAbandon,
+    /// One printable character typed into whichever text field is open.
+    /// The reducer decides which that is, the same division `Escape`'s own
+    /// doc argues for, because the keymap cannot see it.
+    TextChar(char),
+    /// `Backspace` in whichever text field is open.
+    TextBackspace,
+    /// `Enter` in whichever text field is open: apply and leave.
+    TextApply,
+    /// `Esc` in whichever text field is open: abandon the edit and leave.
+    TextAbandon,
 }
 
 /// Everything that can change the dashboard.
@@ -1010,10 +1012,10 @@ impl App {
             // the top of this function has already taken. Named rather than
             // wildcarded so a future variant does not fall silently into an
             // arm that ignores it.
-            KeyPress::FilterChar(_)
-            | KeyPress::FilterBackspace
-            | KeyPress::FilterApply
-            | KeyPress::FilterAbandon => Effect::None,
+            KeyPress::TextChar(_)
+            | KeyPress::TextBackspace
+            | KeyPress::TextApply
+            | KeyPress::TextAbandon => Effect::None,
         }
     }
 
@@ -1178,21 +1180,21 @@ impl App {
     fn on_text_key(&mut self, key: KeyPress) -> Effect {
         match key {
             KeyPress::Quit => Effect::Quit,
-            KeyPress::FilterChar(typed) => {
+            KeyPress::TextChar(typed) => {
                 let mut query = self.filter.clone();
                 query.push(typed);
                 self.set_filter(query)
             }
-            KeyPress::FilterBackspace => {
+            KeyPress::TextBackspace => {
                 let mut query = self.filter.clone();
                 query.pop();
                 self.set_filter(query)
             }
-            KeyPress::FilterApply => {
+            KeyPress::TextApply => {
                 self.mode = InputMode::Normal;
                 Effect::None
             }
-            KeyPress::FilterAbandon => {
+            KeyPress::TextAbandon => {
                 self.mode = InputMode::Normal;
                 self.set_filter(String::new())
             }
@@ -2697,10 +2699,10 @@ mod tests {
         app.update(Msg::Key(KeyPress::FilterStart));
         assert_eq!(app.mode(), InputMode::Text);
         for letter in ['w', 'e', 'b'] {
-            app.update(Msg::Key(KeyPress::FilterChar(letter)));
+            app.update(Msg::Key(KeyPress::TextChar(letter)));
         }
         assert_eq!(app.rows().len(), 1, "narrowed before Enter");
-        app.update(Msg::Key(KeyPress::FilterApply));
+        app.update(Msg::Key(KeyPress::TextApply));
         assert_eq!(app.mode(), InputMode::Normal);
         assert_eq!(
             app.rows().len(),
@@ -2714,10 +2716,10 @@ mod tests {
     fn backspace_widens_the_table_back_out() {
         let (mut app, _t0) = started();
         app.update(Msg::Key(KeyPress::FilterStart));
-        app.update(Msg::Key(KeyPress::FilterChar('w')));
-        app.update(Msg::Key(KeyPress::FilterChar('z')));
+        app.update(Msg::Key(KeyPress::TextChar('w')));
+        app.update(Msg::Key(KeyPress::TextChar('z')));
         assert_eq!(app.rows().len(), 0);
-        app.update(Msg::Key(KeyPress::FilterBackspace));
+        app.update(Msg::Key(KeyPress::TextBackspace));
         assert_eq!(
             app.rows().len(),
             2,
@@ -2731,8 +2733,8 @@ mod tests {
     fn esc_while_editing_clears_the_filter_and_leaves_the_box() {
         let (mut app, _t0) = started();
         app.update(Msg::Key(KeyPress::FilterStart));
-        app.update(Msg::Key(KeyPress::FilterChar('w')));
-        app.update(Msg::Key(KeyPress::FilterAbandon));
+        app.update(Msg::Key(KeyPress::TextChar('w')));
+        app.update(Msg::Key(KeyPress::TextAbandon));
         assert_eq!(app.mode(), InputMode::Normal);
         assert_eq!(app.filter(), "");
         assert_eq!(app.rows().len(), 3);
@@ -2768,9 +2770,9 @@ mod tests {
     fn a_notice_raised_while_typing_is_deferred_and_not_destroyed() {
         let (mut app, _t0) = started();
         app.update(Msg::Key(KeyPress::FilterStart));
-        app.update(Msg::Key(KeyPress::FilterChar('w')));
+        app.update(Msg::Key(KeyPress::TextChar('w')));
         app.update(Msg::Event(BusEvent::DaemonShutdown));
-        app.update(Msg::Key(KeyPress::FilterChar('e')));
+        app.update(Msg::Key(KeyPress::TextChar('e')));
         assert!(
             app.notice().is_some(),
             "typing did not wipe the shepherd's announcement"
