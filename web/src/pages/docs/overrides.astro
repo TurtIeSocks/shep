@@ -298,8 +298,9 @@ const store = `$ cat $SHEP_HOME/overrides.json
     </p>
     <p class="fine">
       Every mode is refused outright when the target supplies no template.
-      Naming a sheep is one: <code>--reset needs a Flockfile to reset to; web
-      names a sheep, not a file</code>, exit 2. A bare script path is the
+      Naming a sheep is one: <code>--reset=policy needs a Flockfile to reset
+      to; web names a sheep, not a file</code>, exit 2, with the mode you
+      typed echoed back. A bare script path is the
       other, for the same reason and with the same exit code, since the
       command line is not a template either. There is nothing to reset to in
       either case, and doing nothing quietly would be worse.
