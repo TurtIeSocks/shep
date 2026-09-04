@@ -194,9 +194,10 @@ fn run_argv(argv: Vec<OsString>) -> std::process::ExitCode {
             err.exit();
         }
     };
-    // Resolved once, here, and passed down rather than re-derived at each of
-    // the two `run` arms (`cfg(unix)`/`cfg(windows)`) or at every `Streams`
-    // construction inside them — see `resolve_style` and `must_render_bare`
+    // Resolved once, here, and passed down rather than re-derived inside
+    // `run` itself (there is one `run`, unconditional on platform, not a
+    // `cfg(unix)`/`cfg(windows)` pair) or at every `Streams` construction
+    // inside it — see `resolve_style` and `must_render_bare`
     // for why the two steps (what is configured, and whether the hard rule
     // overrides it) are kept separate. `style_source` rides all the way
     // down to `lookout::lookout`, which is the one caller that reports it
@@ -445,11 +446,11 @@ async fn print_shepherd_status(argv: &[OsString]) {
 /// `--home` invocation still works in an environment with no `$HOME` at all.
 ///
 /// Pure tier on purpose (no `#[cfg(unix)]`): its own test runs on every
-/// target, and [`resolve_style`] below calls it from `run_argv` — shared,
-/// unconditional code — to find `shep.toml` for the style level's config
-/// layer. That is the one Windows call site today; the Windows build's `run`
-/// itself still does not call it, since refusing outright is the whole
-/// Windows deliverable for now.
+/// target, and `run` calls it on every target too, since it has no
+/// platform split of its own. [`resolve_style`] reaches it through
+/// `run_argv` to find `shep.toml` for the style level's config layer, and
+/// `ensure_home` and every dispatch arm that needs `$SHEP_HOME` before
+/// doing its own work reach it the same way.
 fn resolve_paths(global: &GlobalArgs) -> Result<ShepPaths, ExitCode> {
     let env = |key: &str| match key {
         "SHEP_HOME" => global
@@ -2846,12 +2847,14 @@ mod tests {
     /// or if what it writes is not what `style_from_config` (the same
     /// reader `resolve_style` uses) reads back.
     ///
-    /// `#[cfg(unix)]` because every verb refuses on Windows with "shep does
-    /// not yet support Windows", so there is no write to observe there. This
-    /// gate was missing when the test landed and turned CI's two Windows legs
-    /// red; the local gate could not see it, because a macOS `cargo test`
-    /// never compiles a Windows arm and the windows-gnu cross-check is
-    /// `cargo check`, which does not run anything.
+    /// `#[cfg(unix)]`: `shep style <level>` genuinely runs on Windows now
+    /// (only `startup`/`unstartup` refuse there), but this test drives that
+    /// write through `commands::shep_toml`'s `ConfigLock`, and nothing in
+    /// this crate has ever compiled or run that lock's `cfg(windows)` arm --
+    /// a macOS `cargo test` never reaches it and the windows-gnu cross-check
+    /// is `cargo check`, which does not run anything. Gating this test
+    /// unix-only says so plainly rather than asserting a Windows write this
+    /// worktree cannot actually observe.
     #[cfg(unix)]
     #[tokio::test]
     async fn style_with_a_level_writes_shep_toml_and_the_config_reads_it_back() {
@@ -2889,8 +2892,11 @@ mod tests {
     /// no-arg form is a report, and only a report, the same guarantee
     /// `resolve_style_reads_the_flag_and_the_real_shep_toml_it_names`
     /// above pins for what it *reads*.
-    /// `#[cfg(unix)]` for the same reason as the test above: the verb
-    /// refuses on Windows before it can report anything.
+    /// `#[cfg(unix)]` to stay paired with the test above rather than for a
+    /// reason of its own: it drives the same `run` dispatch through the
+    /// same real `$SHEP_HOME`, and keeping both gated the same way keeps
+    /// the pair's Windows coverage (or the lack of it) legible in one
+    /// place instead of one gated and one not for no visible reason.
     #[cfg(unix)]
     #[tokio::test]
     async fn style_with_no_level_reports_and_writes_nothing() {
