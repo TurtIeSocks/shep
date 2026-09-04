@@ -166,12 +166,32 @@ adopt's vetting across two crates.
 
 ```rust
 #[derive(Deserialize, DogConfig)]
-struct Sink {
-    kind: SinkKind,
-    #[shep(secret)]
-    url: String,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum Sink {
+    Discord {
+        #[shep(secret)]
+        url: String,
+    },
+    Slack {
+        #[shep(secret)]
+        url: String,
+    },
 }
 ```
+
+**An earlier draft of this example showed a struct-shaped `Sink` carrying a
+`kind: SinkKind` field, and no such type exists.** The real one
+(`crates/shep-cli/src/dog/bark/sinks.rs`) is an internally tagged enum whose
+variants each carry a `url`, and those URLs are the Discord and Slack webhooks
+this marker exists for. The type already holds a manual redacted `Debug` for the
+same reason.
+
+That mattered rather than being a typo: an implementer built the derive against
+the invented shape and refused enums outright, which made the motivating example
+unmarkable. schemars itself has no such limit, measured on bark's exact shape
+including `tag`, `rename_all` and `deny_unknown_fields`: a field-level extend
+inside a variant lands in that variant's subschema, once per variant. So the
+derive walks variants too.
 
 schemars can express this without shep shipping anything:
 `#[schemars(extend("x-shep-secret" = true))]` works at field level in 1.2. On
