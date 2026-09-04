@@ -1,0 +1,23 @@
+[package]
+name = "shep-macros"
+description = "The DogConfig derive for shep plugins: marks a config field as a credential so shep renders it redacted"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/shep-macros"
+keywords = ["shep", "process-manager", "derive", "macro", "schema"]
+categories = ["development-tools", "config"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true, features = ["derive", "parsing", "printing", "clone-impls", "proc-macro"] }
+quote.workspace = true
+proc-macro2.workspace = true
+
+[lints]
+workspace = true

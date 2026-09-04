@@ -94,8 +94,8 @@ annotate-snippets.workspace = true
 anstyle.workspace = true
 encoding_rs_io.workspace = true
 pest.workspace = true
-quote.workspace = true
-syn.workspace = true
+quote-floor.workspace = true
+syn-floor.workspace = true
 
 [lints]
 workspace = true

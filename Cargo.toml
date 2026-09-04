@@ -4,6 +4,7 @@ members = [
     "crates/shep-core",
     "crates/shep-daemon",
     "crates/shep-client",
+    "crates/shep-macros",
     "crates/shep-cli",
     "crates/shep-cli-redirect",
     # Small runnable demos of shep's supervision behaviours (probes, restart
@@ -25,15 +26,16 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # `cargo publish` strips `path` from a dependency and needs a version to put
-# in its place, so these three need one even though every consumer in this
+# in its place, so these four need one even though every consumer in this
 # workspace resolves them by path. There is no `version.workspace = true`
-# form inside a dependency entry — Cargo only supports that shorthand for
-# the `[package]` table — so this literal is not sourced from
+# form inside a dependency entry, since Cargo only supports that shorthand for
+# the `[package]` table. This literal is not sourced from
 # `workspace.package.version` above and a release bump has to touch both
 # places by hand. If that drifts, `cargo-release` is the mechanical fix.
 shep-core = { path = "crates/shep-core", version = "0.2.0" }
 shep-daemon = { path = "crates/shep-daemon", version = "0.2.0" }
 shep-client = { path = "crates/shep-client", version = "0.2.0" }
+shep-macros = { path = "crates/shep-macros", version = "0.2.0" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
@@ -60,8 +62,20 @@ annotate-snippets = { version = "0.12.3", default-features = false }
 anstyle = { version = "1.0.5", default-features = false }
 encoding_rs_io = { version = "0.1.2", default-features = false }
 pest = { version = "2.0.2", default-features = false }
-quote = { version = "0.3.15", default-features = false }
-syn = { version = "1.0.1", default-features = false }
+# Renamed keys, not the plain names: `shep-macros` needs the CURRENT syn and
+# quote to build a real proc macro, and a workspace dependency key can only be
+# spelled once. These two entries are floors for someone else's under-declared
+# transitive dependency and are never compiled, so they are the pair that gives
+# the names up.
+quote-floor = { package = "quote", version = "0.3.15", default-features = false }
+syn-floor = { package = "syn", version = "1.0.1", default-features = false }
+# The current lines of the same two crates, plus proc-macro2, for
+# `shep-macros`. `proc-macro` is what lets a `proc_macro2::TokenStream` become
+# the `proc_macro::TokenStream` a derive has to return, so it is not optional
+# here even though it is not a default.
+proc-macro2 = { version = "1.0", default-features = false, features = ["proc-macro"] }
+quote = { version = "1.0", default-features = false, features = ["proc-macro"] }
+syn = { version = "2.0", default-features = false }
 json5 = { version = "0.4", default-features = false }
 # regex 1.8.0's compiled-size accounting lets `selector_spec_oversized_regex_is_rejected`'s
 # huge pattern slip under the 1 MiB `size_limit`; 1.9+ rejects it. Floor to 1.9 so the

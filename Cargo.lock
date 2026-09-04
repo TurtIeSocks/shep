@@ -2178,6 +2178,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shep-macros"
+version = "0.1.34"
+dependencies = [
+ "proc-macro2",
+ "quote 1.0.47",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
