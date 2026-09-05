@@ -10,6 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-05
+
+### Added
+
+- SheepConfig, SetSheepEnv and SetDogConfig on the wire
+- Handle SetSheepField, writing an override rather than a template
+- A dog's section can be written over the wire, and the dog is told
+
+### Fixed
+
+- A dog can no longer be given a sheep's env override **(BREAKING)**
+- SetSheepEnv records what every other config write records
+- A removed env key keeps being reported as an override
+- Box the sheep config on the wire, and fix a doc link
+- A dog that is not running can still be configured
+- Hand the pane the section an operator wrote, not a re-render
+- Carry a dog table's header decor across a pane write
+- The known-dog set grows when a dog is enabled
+- Drop Deref from EnvValue and DogSectionToml
+- A stopped engine answers a dog config write instead of panicking
+- A dog's section keeps its sub-tables on the way out
+
+
 ## [0.2.5] - 2026-09-05
 
 
