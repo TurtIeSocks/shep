@@ -389,6 +389,64 @@ pub enum Request {
         /// and a derived `Debug` on [`Request`] would print it (IR-41).
         value: Option<EnvValue>,
     },
+    /// Sets one config field on one sheep, recorded as an operator
+    /// override.
+    ///
+    /// [`Self::SetSheepEnv`]'s twin for everything that is not `env`, and
+    /// it exists for the reason that one does rather than by symmetry.
+    /// [`Self::ApplyConfig`] can move a single field -- one
+    /// [`DeclaredApp`] declaring one key, at [`ResetDepth::File`] -- but it
+    /// moves it AS A TEMPLATE: the merge spends the operator's override for
+    /// every key it puts back, on the correct reasoning that a key just
+    /// reset to the file is not a key an operator is still holding a value
+    /// for. A pane's value IS the operator's, so the sheep still differs
+    /// from its file and must keep saying so. Sent through `ApplyConfig`,
+    /// an edit landed and then vanished from `overridden`, the `*` marker
+    /// never appeared, and `shep flock`'s `CFG` column did not count it.
+    ///
+    /// One field, not a map: a pane edits one row at a time, and a request
+    /// that took several would need [`Response::Applied`]'s per-field
+    /// reporting back again for no caller that wants it.
+    ///
+    /// `env` is refused here and goes through [`Self::SetSheepEnv`]. So are
+    /// `name` and `instances`, which are
+    /// [`ApplyGroup::Structural`](crate::config::ApplyGroup::Structural):
+    /// identity and flock shape rather than runtime knobs, and the count
+    /// moves through [`Self::Scale`].
+    ///
+    /// The four-way apply classification governs exactly as it does for a
+    /// load. A `Live` field is in force at the daemon's next decision, a
+    /// `NextSpawn` field reaches the stored spec, and a `NeedsRespawn`
+    /// field parks for `shep reload` to promote.
+    ///
+    /// Answers [`Response::SheepFieldSet`], or
+    /// [`RpcErrorCode::NotFound`] when no sheep has that name.
+    SetSheepField {
+        /// The sheep's name, not a selector, for [`Self::SheepConfig`]'s
+        /// reason.
+        name: String,
+        /// The [`AppConfig`] field to set. A key that type has no such
+        /// field is refused with [`RpcErrorCode::InvalidConfig`] rather
+        /// than ignored.
+        key: String,
+        /// The new value, in the shape that field serializes as. The daemon
+        /// MUST re-validate the resulting config (peer input is untrusted)
+        /// and refuses with [`RpcErrorCode::InvalidConfig`] when it does not
+        /// deserialize or does not normalize; nothing is written in either
+        /// case.
+        ///
+        /// A bare [`serde_json::Value`] and NOT a redacting newtype, unlike
+        /// [`Self::SetSheepEnv`]'s [`EnvValue`], and the asymmetry is
+        /// deliberate. `env` is the one field [`AppConfig`]'s own manual
+        /// `Debug` redacts; `cwd`, `script` and `args` are printed in the
+        /// clear by every request that already carries a whole config
+        /// ([`Self::Start`], [`Self::Add`], [`Self::ApplyConfig`]). A
+        /// newtype here would protect one copy of a value this enum prints
+        /// three other ways, which reads as a guarantee the wire does not
+        /// make. Widening that protection is a change to [`AppConfig`]'s
+        /// `Debug`, not to this field.
+        value: serde_json::Value,
+    },
     /// Replaces one dog's `[<name>]` section in `dogs.toml` and publishes
     /// `config.dog.<name>` so a running dog re-reads it.
     ///
@@ -1760,6 +1818,35 @@ pub enum Response {
         /// The key.
         key: String,
     },
+    /// Answer to `SetSheepField`: which field moved, and whether the
+    /// running child has it.
+    ///
+    /// **Not [`Self::Applied`]'s three lists, and the difference is the
+    /// request's own shape.** `applied`, `pending` and `refused` exist
+    /// because `ApplyConfig` carries N apps of M fields, so a caller cannot
+    /// otherwise tell which field went where or that one app of eleven was
+    /// refused. This request carries ONE field of ONE sheep, so `refused`
+    /// would be a second way to say no beside the `Err` arm -- a client
+    /// checking only the `Err` would silently swallow the other -- and the
+    /// two lists collapse to the one bit that is left.
+    ///
+    /// That bit is not redundant with the field's own
+    /// [`ApplyGroup`](crate::config::ApplyGroup), which the caller already
+    /// knows. It is the daemon's answer about state a caller cannot see:
+    /// `autostart` is `NextSpawn` and yet reports as in force, because it
+    /// is read at muster rather than at a spawn, and a `Live` field whose
+    /// config subset will not normalize on its own parks instead of
+    /// applying.
+    SheepFieldSet {
+        /// The sheep.
+        name: String,
+        /// The field that moved.
+        key: String,
+        /// `true` when the running child does not have the value yet and
+        /// `shep reload <name>` is what promotes it. A client rendering
+        /// this says so, the same rule [`SheepApplied::pending`] carries.
+        pending: bool,
+    },
     /// Answer to `SetDogConfig`: the section was written and the topic
     /// published.
     DogConfigSet {
@@ -2869,12 +2956,27 @@ mod tests {
                     value: Some("postgres://localhost/app".to_string().into()),
                 },
             },
+            // `SetSheepEnv`'s twin for everything that is not `env`, and
+            // pinned beside it: the two are one letter apart in the tag and
+            // a reader that crossed them would write a config field into an
+            // env map. `value` is a bare JSON value rather than a string,
+            // which is the half a hand-written reader gets wrong -- an
+            // integer field is an integer here, not `"32"`.
+            Envelope {
+                id: 30,
+                deadline_ms: None,
+                body: Request::SetSheepField {
+                    name: "web".to_string(),
+                    key: "max_restarts".to_string(),
+                    value: serde_json::json!(32),
+                },
+            },
             // The second request carrying a `DogSectionToml`, and pinned
             // beside its reader: `DogConfig` asks for a section and this
             // writes one back, so the two have to agree about the shape a
             // section takes on the wire.
             Envelope {
-                id: 30,
+                id: 31,
                 deadline_ms: None,
                 body: Request::SetDogConfig {
                     name: "bark".to_string(),
@@ -3279,10 +3381,11 @@ mod tests {
                     vec!["env".to_string()],
                 )))),
             },
-            // The two acknowledgements. Neither echoes what was written:
+            // The three acknowledgements. None echoes what was written:
             // `SheepEnvSet` names the key and not its value, for the reason
-            // the row above pins, and `DogConfigSet` names the dog and not
-            // the section.
+            // the row above pins, `SheepFieldSet` does the same and adds
+            // the one bit the caller cannot derive, and `DogConfigSet`
+            // names the dog and not the section.
             Reply {
                 id: 35,
                 result: Ok(Response::SheepEnvSet {
@@ -3290,8 +3393,20 @@ mod tests {
                     key: "DATABASE_URL".to_string(),
                 }),
             },
+            // `pending` pinned TRUE, because `false` is the value a reader
+            // that dropped the field entirely would decode by accident, and
+            // the two answers send an operator to different places: one
+            // says the change is in force, the other says to reload.
             Reply {
                 id: 36,
+                result: Ok(Response::SheepFieldSet {
+                    name: "web".to_string(),
+                    key: "script".to_string(),
+                    pending: true,
+                }),
+            },
+            Reply {
+                id: 37,
                 result: Ok(Response::DogConfigSet {
                     name: "bark".to_string(),
                 }),

@@ -740,6 +740,19 @@ expression: replies
     "id": 36,
     "result": {
       "Ok": {
+        "kind": "sheep_field_set",
+        "data": {
+          "name": "web",
+          "key": "script",
+          "pending": true
+        }
+      }
+    }
+  },
+  {
+    "id": 37,
+    "result": {
+      "Ok": {
         "kind": "dog_config_set",
         "data": {
           "name": "bark"
