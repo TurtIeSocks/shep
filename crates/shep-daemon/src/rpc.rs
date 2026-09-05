@@ -20,7 +20,7 @@ use core::time::Duration;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::watch;
 
@@ -43,6 +43,65 @@ use crate::supervisor::{Applied, ConnId, SupervisorError, SupervisorHandle};
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
 /// Ceiling on a client-supplied deadline — a peer cannot pin a daemon task open.
 pub(crate) const MAX_DEADLINE_MS: u64 = 60_000;
+
+/// Every dog name this shepherd may hold a section for, running or not.
+///
+/// Seeded with the built-in dogs plus every name `[daemon] adopted_dogs`
+/// and `[daemon] enabled_dogs` carry, assembled by the CLI and handed over
+/// in [`crate::boot::BootOptions::known_dogs`] -- this crate does not read
+/// `shep.toml`.
+///
+/// **It grows.** That seed is a boot-time snapshot, and it used to be the
+/// whole of the set: a dog adopted against a running shepherd stayed
+/// unknown to it until `shep daemon reload`, so adopt-then-configure was
+/// refused, which is bark's own situation on a fresh install. The set now
+/// learns a name from the request that starts the dog. `shep adopt` and
+/// `shep enable` both send `Request::EnableDog`, so that is one door and
+/// not two, and it is the same door that has just written `shep.toml`.
+///
+/// **It never shrinks.** `shep disable` takes a dog off the flock and
+/// leaves its section in `dogs.toml`, and a dog that is switched off is
+/// exactly the one the dog-config design's decision 4 argues is most in
+/// need of configuring. Forgetting a name on disable would put the refusal
+/// back, one step further along.
+///
+/// A set rather than the caller's `Vec`, because the one question asked of
+/// it is membership, and a built-in name can appear in both of the two
+/// lists it is built from. Behind an `Arc<Mutex<_>>` rather than a bare
+/// `Arc` because [`RpcContext`] is cloned once per connection, and every
+/// clone has to see a name a sibling connection has just enabled.
+#[derive(Debug, Clone)]
+pub(crate) struct KnownDogs {
+    names: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl KnownDogs {
+    /// Wraps a boot-time seed.
+    pub(crate) fn new(names: BTreeSet<String>) -> Self {
+        Self {
+            names: Arc::new(Mutex::new(names)),
+        }
+    }
+
+    /// Whether this shepherd may hold a section for `name`.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.lock().contains(name)
+    }
+
+    /// Records that `name` is a dog this shepherd knows about.
+    pub(crate) fn insert(&self, name: &str) {
+        self.lock().insert(name.to_owned());
+    }
+
+    /// A poisoned lock is recovered rather than propagated, the rule
+    /// [`crate::dogs::DogRefusals`] follows for the same shape: the set
+    /// behind it is a list of names with no invariant a panic mid-write
+    /// could have broken, and refusing to configure any dog for the life
+    /// of the process is a worse answer than a slightly stale one.
+    fn lock(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        self.names.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Everything a request handler may touch — one clone per connection.
 ///
@@ -75,20 +134,8 @@ pub struct RpcContext {
     /// (`crate::dogs::dog_section`).
     pub(crate) dogs_config: PathBuf,
     /// Every dog name this shepherd may hold a section for, running or
-    /// not.
-    ///
-    /// The built-in dogs plus every name `[daemon] adopted_dogs` and
-    /// `[daemon] enabled_dogs` carry, assembled by the CLI and handed over
-    /// in [`crate::boot::BootOptions::known_dogs`] -- this crate does not
-    /// read `shep.toml`. Fixed for the life of the process, and refreshed
-    /// by a `shep daemon reload`, whose successor re-execs and re-reads
-    /// that file.
-    ///
-    /// A set rather than the caller's `Vec`, because the one question
-    /// asked of it is membership, and a built-in name can appear in both
-    /// of the two lists it is built from. Behind an `Arc` because
-    /// [`RpcContext`] is cloned once per connection and this never changes.
-    pub(crate) known_dogs: Arc<BTreeSet<String>>,
+    /// not. See [`KnownDogs`].
+    pub(crate) known_dogs: KnownDogs,
     /// This daemon's `$SHEP_HOME` layout, for assembling a dog's app config.
     pub(crate) paths: ShepPaths,
     /// This daemon's crate version, echoed in the handshake.
@@ -582,6 +629,15 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                             daemon_version: None,
                         })),
                         Ok(info) => {
+                            // The one place this daemon learns of a dog it
+                            // was not told about at boot. `shep adopt` and
+                            // `shep enable` both arrive here, and both have
+                            // just written the name into `shep.toml`, which
+                            // this crate does not read. Recorded on the
+                            // success arm only: the refusal above is a
+                            // sheep holding the name, and that is not a dog
+                            // to remember.
+                            ctx.known_dogs.insert(&info.name);
                             // Wording is about the binary this shepherd
                             // resolved, not about a spawn having happened:
                             // `start_dog` is idempotent by name, so this may be
@@ -770,7 +826,10 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
             if !ctx.known_dogs.contains(&name) && !running_dog().await {
                 return reply(Err(RpcError {
                     code: RpcErrorCode::NotFound,
-                    message: format!("no dog named {name}"),
+                    message: format!(
+                        "no dog named {name}; `shep adopt` or `shep enable` makes one known \
+                         to this shepherd"
+                    ),
                     daemon_version: None,
                 }));
             }
@@ -3846,7 +3905,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dog_that_is_adopted_and_never_started_can_still_be_configured() {
         let mut h = harness(vec![]);
-        h.ctx.known_dogs = Arc::new(["otel".to_string()].into_iter().collect());
+        h.ctx.known_dogs = KnownDogs::new(["otel".to_string()].into_iter().collect());
 
         let reply = reply_of(
             dispatch(
@@ -3912,13 +3971,74 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dog_adopted_since_boot_is_reached_through_the_running_flock() {
         let mut h = harness(vec![ProcScript::never_exits()]);
-        h.ctx.known_dogs = Arc::new(BTreeSet::new());
+        h.ctx.known_dogs = KnownDogs::new(BTreeSet::new());
         enable_dog(&h.ctx, 1, "bark").await;
 
         let reply = reply_of(
             dispatch(
                 envelope(
                     2,
+                    Request::SetDogConfig {
+                        name: "bark".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "bark".to_string()
+            }
+        );
+    }
+
+    /// fails if the known set goes stale the moment a dog stops running.
+    ///
+    /// The boot-time list is a snapshot, so a dog adopted against a running
+    /// shepherd is in neither half of the old guard once it is off the
+    /// flock, and both of these were refused:
+    ///
+    /// - adopt, disable, configure, enable
+    /// - adopt, the dog crashes for want of config, configure
+    ///
+    /// The second is bark's own situation on a fresh install, and
+    /// `docs/dogs.md` promises configure-then-enable works.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_adopted_since_boot_stays_configurable_once_it_is_disabled() {
+        let mut h = harness(vec![ProcScript::never_exits()]);
+        h.ctx.known_dogs = KnownDogs::new(BTreeSet::new());
+        enable_dog(&h.ctx, 1, "bark").await;
+        let disabled = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::DisableDog {
+                        name: "bark".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(disabled.result.is_ok(), "{:?}", disabled.result);
+        assert!(
+            !h.ctx
+                .supervisor
+                .list()
+                .await
+                .iter()
+                .any(|info| info.name == "bark"),
+            "the flock must not hold it, or the widening answers and the test means nothing"
+        );
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    3,
                     Request::SetDogConfig {
                         name: "bark".to_string(),
                         toml: "poll = \"30s\"\n".to_string().into(),

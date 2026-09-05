@@ -35,7 +35,6 @@
 
 use core::fmt;
 use core::time::Duration;
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 #[cfg(unix)]
@@ -1394,12 +1393,7 @@ pub async fn boot<R: ProcessRunner>(
         registry,
         snapshot_path: paths.snapshot.clone(),
         dogs_config: paths.dogs_config.clone(),
-        known_dogs: options
-            .known_dogs
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into(),
+        known_dogs: crate::rpc::KnownDogs::new(options.known_dogs.iter().cloned().collect()),
         paths: paths.clone(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         dog_refusals,

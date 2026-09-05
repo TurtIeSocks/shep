@@ -538,7 +538,7 @@ pub(crate) fn harness_with_runner(
             // The two built-in dogs, which is what a `$SHEP_HOME` with
             // nothing adopted hands a real boot. A test wanting an adopted
             // name assigns its own set over this one.
-            known_dogs: Arc::new(
+            known_dogs: crate::rpc::KnownDogs::new(
                 ["metrics".to_string(), "bark".to_string()]
                     .into_iter()
                     .collect(),
