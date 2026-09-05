@@ -1,6 +1,20 @@
 # Design: the sheep and dog config panes
 
-Status: designed 2026-09-04, not implemented.
+Status: designed 2026-09-04, implemented 2026-09-05.
+
+**Four things below are wrong about what shipped, and they are left in place
+with this note rather than rewritten, because a spec that quietly matches the
+code teaches nobody what the design got wrong.** Decision 6b says the write
+side is done because `ApplyConfig` exists; it is not, and two review rounds
+proved it (see the amendment under that decision). The Wire section says two
+new `Request` variants against four shipped, and names the `_v3` snapshots
+that are `_v4` on disk. Decision 3's "declaration order" shipped as
+alphabetical, because `serde_json::Map` is a `BTreeMap` without
+`preserve_order` and nothing in the tree enables it. Decision 9's clause that
+a `{{shared:DB_HOST}}` reference "shows in full" is not implementable as
+written: `SheepConfigView::new` clears every env value before the pane sees
+it, so every key renders `<set>`. The docs describe the shipped behaviour
+correctly; this document is the one that is wrong.
 
 This builds the half of
 [the config overrides design](2026-09-02-config-overrides-design.md)'s
@@ -175,6 +189,19 @@ A second request answers with the sheep's effective `AppConfig`, `env`
 replaced by its key names alone. Every other field is operator-supplied
 policy that the pane is about to let them edit, so withholding a value would
 make the pane unusable while protecting nothing.
+
+**Amendment, 2026-09-05: "the write side is done" was wrong, and the branch
+ended with three write doors rather than none.** `ApplyConfig` moves one field
+only as `reset: File` with a one-key `declared` set, which tells the daemon
+the TEMPLATE declares that key. The daemon then correctly spends the
+operator's override for it, because a key put back to the template is not one
+an operator still holds a value for. A pane is the operator, so the sheep
+still differs from its file and the record saying so was being deleted: the
+`*` marker added for exactly this never appeared for the pane's own writes.
+`Request::SetSheepField` exists because of that, `Request::SetSheepEnv`
+because `ApplyConfig` has no depth that overwrites one established env key,
+and `Request::SetDogConfig` because a dog's section needs a publisher only the
+daemon has. `docs/decisions.md` carries the full argument.
 
 Decision 12 is untouched by this: env VALUES still never cross the wire, and
 the pane still writes env without reading it back. Both new requests ride the

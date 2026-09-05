@@ -538,10 +538,14 @@ registered sheep does, and the notice code. `Request::Add` /
 `Response::Added` are additive and did not move `PROTOCOL_VERSION` on
 their own; it later moved to 3 for an unrelated reason, recorded below, and
 the paragraph below applies to `shep add` too. **The fill-in half of
-"register, fill in, start" does not exist yet**: an established `env` key
-today moves only through the file plus `--reset=env` (or `--reset=all`,
-which also drops the override record), and editing one in place is a later
-slice (spec decisions 10 and 11).
+"register, fill in, start" shipped with the config panes**: `shep lookout`'s
+sheep pane sets or removes one `env` key at a time through
+`Request::SetSheepEnv`, and one non-`env` field through
+`Request::SetSheepField`, both behind `--allow-control`. Env stays
+write-only: the pane sets a value and no request ever sends one back, so an
+operator who forgets one reads it from wherever they got it, not from shep.
+Before that slice an established key moved only through the file plus
+`--reset=env` (or `--reset=all`, which also drops the override record).
 
 **Restart the shepherd after upgrading to it.** `PROTOCOL_VERSION` did NOT
 move for `ApplyConfig` itself or for `Add` (both variants are additive, and
@@ -567,6 +571,14 @@ before any request is sent. So the two cases are:
 where an operator reads. `every_exempt_verb_is_one_of_the_documented_recovery_verbs`
 pins `add` at `Enforce`, since it reaches that through the `_` arm rather
 than by being named.
+
+**`PROTOCOL_VERSION` moved to 4 on 2026-09-04.** It went to 3 first, for
+`ApplyConfig`'s payload rename described below, and then to 4 for the three
+requests the lookout config panes needed. The second move is argued in
+`docs/decisions.md` and is the one that broke the additive rule on purpose:
+those three variants ARE additive, and the rule said not to bump, and skipping
+the bump is what made `ApplyConfig` fail on a dead client rather than a named
+refusal. The paragraph below is about the 3.
 
 **`PROTOCOL_VERSION` moved to 3 on 2026-09-04, for `ApplyConfig`'s payload
 rather than for `ApplyConfig` itself.** The two-case analysis above still
