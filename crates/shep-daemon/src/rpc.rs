@@ -1034,6 +1034,15 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             message: msg.clone(),
             daemon_version: None,
         },
+        // `InvalidConfig`, like `InvalidScale` above and for its reason: a
+        // request aimed at a dog is one the caller can aim elsewhere. The
+        // bare payload is the same sentence `apply_one` puts in front of an
+        // operator whose Flockfile named a dog, so the two doors read alike.
+        SupervisorError::IsADog(msg) => RpcError {
+            code: RpcErrorCode::InvalidConfig,
+            message: msg.clone(),
+            daemon_version: None,
+        },
         // `InvalidConfig`, like `InvalidScale` above and for its reason:
         // this is something the caller asked for that it can ask
         // differently, and telling an operator "unexpected daemon-side
@@ -2658,6 +2667,95 @@ mod tests {
         let started =
             reply_of(dispatch(envelope(1, Request::Start { apps: vec![config] }), ctx).await);
         assert!(started.result.is_ok(), "{:?}", started.result);
+    }
+
+    /// fails if a dog can be handed a sheep's env override. A dog runs at
+    /// the daemon's own trust level and its binary is what `shep adopt`
+    /// vetted, so a `PATH`, an `LD_PRELOAD` or a `DYLD_INSERT_LIBRARIES`
+    /// parked for its next respawn is arbitrary code at that level. Nothing
+    /// in the tree sends this yet; the socket is live, which is the whole
+    /// reason it is refused at the daemon rather than at a caller.
+    ///
+    /// Asserts the store and the entry as well as the code: a refusal that
+    /// answered `InvalidConfig` after writing would be the same hole with a
+    /// better error message.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_is_refused_an_env_override_rather_than_given_one() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let dog = enable_dog(&h.ctx, 1, "bark").await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "bark".to_string(),
+                        key: "PATH".to_string(),
+                        value: Some("/tmp/evil".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("a dog was given an env override")
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("bark is a dog"), "{}", err.message);
+
+        assert!(
+            shep_core::overrides::get(&h.ctx.paths.overrides, "bark")
+                .unwrap()
+                .is_none(),
+            "the refusal still wrote the store"
+        );
+        let described = reply_of(
+            dispatch(
+                envelope(
+                    3,
+                    Request::Describe {
+                        selector: SelectorSpec::Name("bark".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(infos)) = described.result else {
+            panic!("expected Described")
+        };
+        assert_eq!(infos[0].id, dog.id);
+        assert_eq!(infos[0].pending, None, "the refusal still parked a config");
+    }
+
+    /// fails if a dog's whole `AppConfig` can be read through the sheep
+    /// config pane. No other request hands a client a config at all, so this
+    /// would be a read surface that exists for dogs and nothing else, and a
+    /// dog's config is what `shep adopt` vetted rather than anything an
+    /// operator is meant to edit here.
+    #[tokio::test(start_paused = true)]
+    async fn a_dogs_config_is_not_readable_through_the_sheep_config_pane() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        enable_dog(&h.ctx, 1, "bark").await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SheepConfig {
+                        name: "bark".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("a dog's config was served to a pane")
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("bark is a dog"), "{}", err.message);
     }
 
     /// fails if a config pane's answer carries an env VALUE, and fails if

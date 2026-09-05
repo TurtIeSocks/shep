@@ -729,10 +729,10 @@ pub(crate) enum Msg {
 
 /// Error type returned from supervisor commands.
 ///
-/// `#[non_exhaustive]`: ten variants today cover lookup, spawn, a batch
-/// refused before it was registered, reload overlap, an invalid scale, the
-/// two log-maintenance failure classes, an env edit the config validator
-/// refuses, and an unusable override store.
+/// `#[non_exhaustive]`: eleven variants today cover lookup, spawn, a batch
+/// refused before it was registered, reload overlap, an invalid scale, a
+/// request aimed at a dog, the two log-maintenance failure classes, an env
+/// edit the config validator refuses, and an unusable override store.
 /// A pause verb, if one is ever built, is the next candidate for its own
 /// variant rather than a reason to overload an existing one. shep-daemon is
 /// a published library an out-of-tree matcher should not break for (IR-20).
@@ -842,6 +842,20 @@ pub enum SupervisorError {
     /// flush's is one file — and one file can belong to several sheep at
     /// once (see [`FlushError::message`](crate::runner::FlushError::message)).
     FlushFailed(String),
+    /// A request whose target is a dog, and which a dog is not a valid
+    /// target for; carries the refusal in plain English.
+    ///
+    /// A dog runs at the daemon's own trust level and its binary is what
+    /// `shep adopt` vetted, so its config is not an operator's to edit
+    /// through a pane and not a pane's to read. `Actor::apply_one` refuses
+    /// a Flockfile the same way and in the same words, and
+    /// `Actor::handle_scale` refuses a scale for the neighbouring reason.
+    ///
+    /// Maps to
+    /// [`RpcErrorCode::InvalidConfig`](shep_core::protocol::RpcErrorCode::InvalidConfig),
+    /// like [`Self::InvalidScale`] and for its reason: this is something
+    /// the caller asked for that it can ask differently.
+    IsADog(String),
     /// A `SetSheepEnv` whose result is not a config this build accepts;
     /// carries `normalize`'s own refusal.
     ///
@@ -880,6 +894,7 @@ impl fmt::Display for SupervisorError {
             Self::InvalidScale(msg) => write!(f, "cannot scale: {msg}"),
             Self::ReopenFailed(msg) => write!(f, "log reopen failed: {msg}"),
             Self::FlushFailed(msg) => write!(f, "log flush failed: {msg}"),
+            Self::IsADog(msg) => write!(f, "refused: {msg}"),
             Self::InvalidEnv(msg) => write!(f, "cannot set that env key: {msg}"),
             Self::Overrides(msg) => write!(f, "overrides store unusable: {msg}"),
             Self::EngineStopped => f.write_str("supervisor engine has shut down"),
@@ -1047,6 +1062,7 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
+    /// - [`SupervisorError::IsADog`] - the name is a dog's.
     /// - [`SupervisorError::EngineStopped`] - the actor is gone. An unknown
     ///   name is `Ok(None)` rather than an error, so the caller can word the
     ///   refusal itself.
@@ -1072,6 +1088,9 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
+    /// - [`SupervisorError::IsADog`] - the name is a dog's, and a dog's
+    ///   config is not an operator's to edit through a pane.
+    /// - [`SupervisorError::InvalidEnv`] - `normalize` refuses the result.
     /// - [`SupervisorError::Overrides`] - the override store could not be
     ///   read or written, so nothing was recorded and nothing parked.
     /// - [`SupervisorError::EngineStopped`] - the actor is gone.
@@ -3154,6 +3173,21 @@ fn reached_spec(
     normalize(config).map_err(|err| err.to_string())
 }
 
+/// The one sentence every door that refuses to touch a dog's config says.
+///
+/// Three doors say it: [`Actor::apply_one`], where a Flockfile named a dog;
+/// [`Actor::handle_sheep_config`], where a pane asked to read one; and
+/// [`Actor::handle_set_sheep_env`], where a pane asked to write one. An
+/// operator who meets it from any of them is being told the same thing and
+/// pointed at the same verb, which is the reason it is one function rather
+/// than three literals that drift.
+fn dog_config_refusal(name: &str) -> String {
+    format!(
+        "{name} is a dog, and a dog's config comes from `shep adopt` rather than \
+         from a Flockfile"
+    )
+}
+
 /// `app` with its instance count set to `instances`, or `None` if the result
 /// does not normalize.
 ///
@@ -3354,7 +3388,7 @@ impl<R: ProcessRunner> Actor<R> {
             // override store and parks a config for a spawn that a shutdown
             // is not going to reach anyway.
             Command::SheepConfig { name, reply } => {
-                let _ = reply.send(Ok(self.handle_sheep_config(&name)));
+                let _ = reply.send(self.handle_sheep_config(&name));
                 false
             }
             Command::SetSheepEnv {
@@ -5947,30 +5981,44 @@ impl<R: ProcessRunner> Actor<R> {
             .or_else(|| ids.first().copied())
     }
 
-    /// One sheep's effective config for a pane, or `None` when no sheep has
-    /// that name.
+    /// One sheep's effective config for a pane, or `Ok(None)` when no sheep
+    /// has that name.
     ///
     /// Reads and writes nothing. `env` is emptied on the way out by
     /// [`SheepConfigView::new`], which is the only constructor, so no path
     /// out of here can carry a value.
-    fn handle_sheep_config(&self, name: &str) -> Option<SheepConfigView> {
-        let id = self.representative_id(name)?;
-        let slot = self.sheep.get(&id)?;
+    ///
+    /// # Errors
+    ///
+    /// - [`SupervisorError::IsADog`] - the name is a dog's. No other
+    ///   request hands a client a whole `AppConfig`, so serving one here
+    ///   would be a read surface that exists for dogs and nothing else.
+    fn handle_sheep_config(&self, name: &str) -> Result<Option<SheepConfigView>, SupervisorError> {
+        let Some(id) = self.representative_id(name) else {
+            return Ok(None);
+        };
+        let Some(slot) = self.sheep.get(&id) else {
+            return Ok(None);
+        };
+        if slot.entry.dog.is_some() {
+            return Err(SupervisorError::IsADog(dog_config_refusal(name)));
+        }
         // [`Self::intended_spec`], not the running `spec`: a pane has to
         // show what the sheep is MEANT to be, or an operator's own parked
         // edit reads as never having landed. `pending` beside it is what
         // says the running child does not have it yet, and it is computed
-        // exactly as `ProcessInfo::pending` is so the pane and the listing
+        // exactly as `ProcessInfo::pending` is, so the pane and the listing
         // never disagree about the same sheep.
-        let config = self.intended_spec(id)?.config().clone();
-        let pending = slot.entry.pending.as_ref().map_or_else(Vec::new, |parked| {
-            slot.entry.spec.config().drifted_fields(parked.config())
-        });
-        Some(SheepConfigView::new(
+        let Some(config) = self.intended_spec(id).map(|spec| spec.config().clone()) else {
+            return Ok(None);
+        };
+        Ok(Some(SheepConfigView::new(
             config,
             self.overridden_for(name),
-            pending,
-        ))
+            slot.entry.pending.as_ref().map_or_else(Vec::new, |parked| {
+                slot.entry.spec.config().drifted_fields(parked.config())
+            }),
+        )))
     }
 
     /// Records `key` on `name`'s env as an operator override, or removes it
@@ -5996,6 +6044,8 @@ impl<R: ProcessRunner> Actor<R> {
     ///
     /// # Errors
     ///
+    /// - [`SupervisorError::IsADog`] - the name is a dog's. Raised before
+    ///   the store is read, so nothing was written.
     /// - [`SupervisorError::InvalidEnv`] - the resulting config is one
     ///   `normalize` refuses. Nothing was written.
     /// - [`SupervisorError::Overrides`] - the override store could not be
@@ -6009,6 +6059,21 @@ impl<R: ProcessRunner> Actor<R> {
         let Some(id) = self.representative_id(name) else {
             return Ok(false);
         };
+        // BEFORE the store is read and long before it is written. A dog
+        // runs at the daemon's own trust level and its binary is what `shep
+        // adopt` vetted, so a `PATH`, an `LD_PRELOAD` or a
+        // `DYLD_INSERT_LIBRARIES` parked for its next respawn is arbitrary
+        // code at that level -- and a dog is never in the override store,
+        // so nothing further down this function would have caught it.
+        // `Self::apply_one` refuses a Flockfile that names a dog for the
+        // same reason and says the same sentence.
+        if self
+            .sheep
+            .get(&id)
+            .is_some_and(|slot| slot.entry.dog.is_some())
+        {
+            return Err(SupervisorError::IsADog(dog_config_refusal(name)));
+        }
         // The config an unchanged next spawn would use, which is a parked
         // one when an earlier load left one: building on the RUNNING config
         // instead would drop that load's change on the floor, which is
@@ -6134,10 +6199,7 @@ impl<R: ProcessRunner> Actor<R> {
         // declares for one is unestablished forever and the additive rule
         // that protects a sheep can never engage.
         if slot.entry.dog.is_some() {
-            return refuse(format!(
-                "{name} is a dog, and a dog's config comes from `shep adopt` rather than \
-                 from a Flockfile"
-            ));
+            return refuse(dog_config_refusal(&name));
         }
         // Two configs, and the difference between them is this function's
         // whole subject. `running` is what the child was spawned from;
