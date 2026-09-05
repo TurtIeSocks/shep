@@ -13,8 +13,9 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 use shep_core::config::{ApplyGroup, GROUP_ORDER, apply_group, flockfile_schema_json};
 use shep_core::protocol::{EnvValue, SheepConfigView};
+use shep_core::values::{MemSize, UpDuration};
 
-use super::field::{FieldKind, FieldSet};
+use super::field::{FieldKind, FieldSet, ValueKind};
 use super::viewport::Viewport;
 
 /// Which thing the pane is editing.
@@ -179,6 +180,21 @@ pub enum PaneEdit {
         /// The value, or [`None`] to remove the key.
         value: Option<EnvValue>,
     },
+}
+
+/// `canonical` with `unit` appended when it is bare digits.
+///
+/// [`MemSize`] and [`UpDuration`] both print bare digits, with no unit at
+/// all, for exactly the ambiguous case: a byte count that is not a whole
+/// `K`/`M`/`G`, or a millisecond count that is not a whole `s`/`m`/`h`.
+/// Every other case already ends in a letter of its own, so appending
+/// unconditionally would print `"3Gb"` for three gibibytes.
+fn with_bare_unit(canonical: String, unit: &str) -> String {
+    if canonical.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{canonical}{unit}")
+    } else {
+        canonical
+    }
 }
 
 impl PaneEdit {
@@ -1031,7 +1047,7 @@ impl ConfigPane {
         let shown = match value.as_value() {
             Value::Null => "(unset)".to_owned(),
             _ if secret => "<set>".to_owned(),
-            Value::String(text) => text.clone(),
+            Value::String(text) => self.resolved_display(key, text),
             other => other.to_string(),
         };
         // `ApplyGroup` is `#[non_exhaustive]`, so the wildcard is required
@@ -1072,6 +1088,11 @@ impl ConfigPane {
     /// dog's schema is somebody else's, and one declaring a field named
     /// `env` reads its own section, not [`Self::env_keys`], which
     /// [`Self::dog`] always leaves empty.
+    ///
+    /// This is the parseable form: what [`Self::begin_typing`] seeds an
+    /// editor with. [`Self::display_value`] is the one a row draws, and the
+    /// two disagree exactly for a [`ValueKind`] field, where a seed has to
+    /// stay something the daemon's own grammar still accepts.
     #[must_use]
     pub fn value(&self, key: &str) -> String {
         if key == "env" && matches!(self.target, PaneTarget::Sheep { .. }) {
@@ -1086,6 +1107,37 @@ impl ConfigPane {
             Some(Value::Bool(flag)) => flag.to_string(),
             Some(Value::Number(number)) => number.to_string(),
             Some(other) => other.to_string(),
+        }
+    }
+
+    /// [`Self::value`], resolved through its own grammar for a
+    /// [`MemSize`]/[`UpDuration`] field: what a row draws instead of the
+    /// digits an operator would otherwise have to already know the
+    /// convention for.
+    #[must_use]
+    pub fn display_value(&self, key: &str) -> String {
+        self.resolved_display(key, &self.value(key))
+    }
+
+    /// `raw` resolved through `key`'s own grammar, when `key` is one of
+    /// shep-core's unit types. Display only: [`Self::value`] is what an
+    /// editor still seeds and sends, so a suffix minted here never travels
+    /// back out as part of a value.
+    ///
+    /// A `raw` that fails to parse, including whatever is mid-edit, comes
+    /// back unchanged: this has no business guessing at a string shep is
+    /// about to refuse on its own.
+    fn resolved_display(&self, key: &str, raw: &str) -> String {
+        match self.fields.by_key(key).and_then(|field| field.value_kind) {
+            Some(ValueKind::MemSize) => raw.parse::<MemSize>().map_or_else(
+                |_| raw.to_owned(),
+                |size| with_bare_unit(size.to_string(), " B"),
+            ),
+            Some(ValueKind::UpDuration) => raw.parse::<UpDuration>().map_or_else(
+                |_| raw.to_owned(),
+                |duration| with_bare_unit(duration.to_string(), "ms"),
+            ),
+            None => raw.to_owned(),
         }
     }
 
@@ -1475,6 +1527,80 @@ mod tests {
             !matches!(value.as_value(), serde_json::Value::String(_)),
             "an integer field must not travel as a string"
         );
+    }
+
+    /// `kill_timeout` defaults to 1600ms, which `UpDuration::Display`
+    /// prints as the bare digits `"1600"`; `listen_timeout` defaults to
+    /// 3s, which it already prints with a unit. `value` stays the raw,
+    /// parseable form an editor would seed from.
+    #[test]
+    fn a_bare_up_duration_shows_its_resolved_unit_and_a_suffixed_one_is_unchanged() {
+        let pane = ConfigPane::sheep(web());
+        assert_eq!(pane.display_value("kill_timeout"), "1600ms");
+        assert_eq!(pane.value("kill_timeout"), "1600");
+        assert_eq!(pane.display_value("listen_timeout"), "3s");
+    }
+
+    /// 64 bytes is not a whole `K`/`M`/`G`, so `MemSize::Display` prints
+    /// the bare digits `"64"`; 512 mebibytes already prints with a unit.
+    #[test]
+    fn a_bare_mem_size_shows_its_resolved_unit_and_a_suffixed_one_is_unchanged() {
+        for (bytes, want) in [(64, "64 B"), (512 << 20, "512M")] {
+            let config = AppConfig {
+                name: "web".into(),
+                max_memory: Some(MemSize::from_bytes(bytes)),
+                ..AppConfig::default()
+            };
+            let pane = ConfigPane::sheep(SheepConfigView::new(config, Vec::new(), Vec::new()));
+            assert_eq!(pane.display_value("max_memory"), want, "{bytes} bytes");
+        }
+    }
+
+    /// A field with no `MemSize`/`UpDuration` grammar is untouched by
+    /// `display_value`, the same as `value`.
+    #[test]
+    fn a_field_with_no_unit_grammar_displays_the_same_either_way() {
+        let pane = ConfigPane::sheep(web());
+        assert_eq!(pane.display_value("cwd"), pane.value("cwd"));
+        assert_eq!(
+            pane.display_value("max_restarts"),
+            pane.value("max_restarts")
+        );
+    }
+
+    /// The confirm sentence quotes what a write would actually mean, not
+    /// the digits the operator typed: this is the moment the maintainer's
+    /// own report says nothing warned them.
+    #[test]
+    fn arming_a_bare_number_on_a_mem_size_field_confirms_the_resolved_value() {
+        let mut pane = ConfigPane::sheep(web());
+        pane.move_to_key("max_memory");
+        pane.begin_typing();
+        for c in "64".chars() {
+            pane.type_char(c);
+        }
+        pane.apply_typing(Instant::now());
+        let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
+            panic!("{:?}", pane.pending_edit());
+        };
+        assert!(text.contains("set max_memory = 64 B?"), "{text}");
+    }
+
+    /// A buffer that does not parse renders as typed rather than guessed
+    /// at or hidden: shep is the one that gets to refuse it.
+    #[test]
+    fn an_unparseable_buffer_on_a_unit_field_confirms_as_typed() {
+        let mut pane = ConfigPane::sheep(web());
+        pane.move_to_key("max_memory");
+        pane.begin_typing();
+        for c in "banana".chars() {
+            pane.type_char(c);
+        }
+        pane.apply_typing(Instant::now());
+        let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
+            panic!("{:?}", pane.pending_edit());
+        };
+        assert!(text.contains("set max_memory = banana?"), "{text}");
     }
 
     #[test]

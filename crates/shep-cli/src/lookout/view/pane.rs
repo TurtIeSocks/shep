@@ -156,8 +156,10 @@ fn field_line(
     };
     // A secret's value is never rendered, only whether there is one. The
     // Flockfile schema marks nothing secret today; a dog's own schema can,
-    // and this pane draws both.
-    let raw = pane.value(&field.key);
+    // and this pane draws both. `display_value`, not `value`: a
+    // `MemSize`/`UpDuration` field's bare number is resolved for the row,
+    // not for whatever an editor would seed.
+    let raw = pane.display_value(&field.key);
     // An editor open on this field replaces the cell with what is being
     // typed, cursor included. The same `\u{258f}` every text box in
     // lookout draws; a character rather than a reversed cell because the
@@ -781,6 +783,35 @@ mod tests {
             ]
         );
         assert_eq!(glyphed(' ').len(), 39 - 2 - 6);
+    }
+
+    /// `kill_timeout` and `exp_backoff_restart_delay` default to 1600ms
+    /// and 100ms, which `UpDuration::Display` prints as bare digits with
+    /// no unit; `listen_timeout` defaults to 3s, which it already prints
+    /// with one.
+    #[test]
+    fn a_bare_duration_or_mem_size_shows_its_resolved_unit_in_the_row() {
+        let text = text_of(&pane_lines(&web_pane(), fixtures::plain(), 120, 0));
+        let row = |key: &str| {
+            text.iter()
+                .find(|line| line.contains(key))
+                .unwrap_or_else(|| panic!("{key} is drawn at 120 columns: {text:?}"))
+        };
+        assert!(
+            row("kill_timeout").contains("1600ms"),
+            "{:?}",
+            row("kill_timeout")
+        );
+        assert!(
+            row("exp_backoff_restart_delay").contains("100ms"),
+            "{:?}",
+            row("exp_backoff_restart_delay")
+        );
+        assert!(
+            row("listen_timeout").contains("3s"),
+            "{:?}",
+            row("listen_timeout")
+        );
     }
 
     /// `MIN_TERM_WIDTH` drops the cost cell and `plain` renders muted as

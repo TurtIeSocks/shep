@@ -104,6 +104,7 @@ pub fn settings_field_set() -> crate::lookout::field::FieldSet {
         help: field.key().to_owned(),
         group: Some(group.to_owned()),
         kind,
+        value_kind: None,
         default: None,
         secret: false,
         editable: true,

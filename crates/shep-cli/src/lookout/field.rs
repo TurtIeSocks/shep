@@ -26,6 +26,22 @@ pub enum FieldKind {
     Opaque,
 }
 
+/// Which of shep-core's own string grammars a [`FieldKind::Text`] field
+/// actually holds, so the pane can show what a bare number means instead
+/// of the digits an operator typed.
+///
+/// Read off the schema's `$ref` name rather than guessed from the field
+/// key: a dog's own schema can reuse either grammar under any name it
+/// likes, and the Flockfile schema already names both types for exactly
+/// this reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    /// `$ref: MemSize`. A bare number is bytes.
+    MemSize,
+    /// `$ref: UpDuration`. A bare number is milliseconds.
+    UpDuration,
+}
+
 /// One field of a form.
 ///
 /// `Debug` is derived rather than redacted (IR-41): this is a schema, and a
@@ -51,6 +67,10 @@ pub struct Field {
     pub group: Option<String>,
     /// The widget.
     pub kind: FieldKind,
+    /// Which shep-core grammar a [`FieldKind::Text`] field's string is,
+    /// when it is one of the two the pane knows how to resolve. `None`
+    /// for every other field, [`FieldKind::Text`] included.
+    pub value_kind: Option<ValueKind>,
     /// The schema's own `default`, rendered as the pane will show it. `None`
     /// for an absent or `null` default.
     pub default: Option<String>,
@@ -169,6 +189,33 @@ fn resolve<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
         .unwrap_or(schema)
 }
 
+/// The name of a `$ref: "#/$defs/<Name>"`, direct or inside an `anyOf`
+/// arm, before [`resolve`] replaces it with the schema it points to.
+///
+/// [`resolve`] and [`strip_nullable`] both need the referenced schema's
+/// body; [`kind_of`] calls them first and the ref name is gone by the
+/// time it returns, so this reads the original, unresolved schema.
+fn ref_name(schema: &Value) -> Option<&str> {
+    let target = schema.get("$ref").or_else(|| {
+        schema
+            .get("anyOf")?
+            .as_array()?
+            .iter()
+            .find_map(|arm| arm.get("$ref"))
+    })?;
+    target.as_str()?.strip_prefix("#/$defs/")
+}
+
+/// [`ValueKind::MemSize`] or [`ValueKind::UpDuration`] when `schema`
+/// names one of those two defs, else [`None`].
+fn value_kind_of(schema: &Value) -> Option<ValueKind> {
+    match ref_name(schema)? {
+        "MemSize" => Some(ValueKind::MemSize),
+        "UpDuration" => Some(ValueKind::UpDuration),
+        _ => None,
+    }
+}
+
 /// `anyOf: [T, {type: null}]` is `T` with the field optional. Anything
 /// else is left as it was.
 fn strip_nullable<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
@@ -255,11 +302,15 @@ fn field_from(key: &str, schema: &Value, defs: &Map<String, Value>) -> Field {
         .map(str::to_owned);
     let kind = kind_of(schema, defs);
     let editable = kind != FieldKind::Opaque;
+    let value_kind = (kind == FieldKind::Text)
+        .then(|| value_kind_of(schema))
+        .flatten();
     Field {
         key: key.to_owned(),
         help,
         group,
         kind,
+        value_kind,
         default: render_default(schema.get("default")),
         secret: schema
             .get(shep_core::dogs::SECRET_KEY)
@@ -352,6 +403,34 @@ mod tests {
             set.by_key("kind").unwrap().kind,
             FieldKind::Choice(vec!["http".into(), "tcp".into(), "exec".into()])
         );
+    }
+
+    /// The `$ref` name has to survive `strip_nullable` unwrapping the
+    /// `anyOf`, and it names `MemSize`/`UpDuration` regardless of which of
+    /// the two schema shapes carries it.
+    #[test]
+    fn a_text_field_records_which_shep_core_grammar_it_holds() {
+        let d = props(json!({
+            "MemSize": { "type": "string" },
+            "UpDuration": { "type": "string" },
+        }));
+        let p = props(json!({
+            "max_memory": {
+                "anyOf": [{ "$ref": "#/$defs/MemSize" }, { "type": "null" }],
+            },
+            "kill_timeout": { "$ref": "#/$defs/UpDuration" },
+            "cwd": { "type": "string" },
+        }));
+        let set = FieldSet::from_properties(&p, &d, &[]);
+        assert_eq!(
+            set.by_key("max_memory").unwrap().value_kind,
+            Some(ValueKind::MemSize)
+        );
+        assert_eq!(
+            set.by_key("kill_timeout").unwrap().value_kind,
+            Some(ValueKind::UpDuration)
+        );
+        assert_eq!(set.by_key("cwd").unwrap().value_kind, None);
     }
 
     #[test]
@@ -474,5 +553,34 @@ mod tests {
         );
         assert_eq!(set.by_key("env").unwrap().kind, FieldKind::Map);
         assert_eq!(set.by_key("autorestart").unwrap().kind, FieldKind::Bool);
+    }
+
+    #[test]
+    fn the_real_flockfile_schema_marks_every_mem_size_and_up_duration_field() {
+        let schema = shep_core::config::flockfile_schema_json().to_value();
+        let defs = schema["$defs"].as_object().unwrap();
+        let props = defs["AppConfig"]["properties"].as_object().unwrap();
+        let set = FieldSet::from_properties(props, defs, shep_core::config::GROUP_ORDER);
+        assert_eq!(
+            set.by_key("max_memory").unwrap().value_kind,
+            Some(ValueKind::MemSize)
+        );
+        for key in [
+            "kill_timeout",
+            "listen_timeout",
+            "min_uptime",
+            "graceful_timeout",
+            "action_timeout",
+            "restart_delay",
+            "watch_delay",
+            "exp_backoff_restart_delay",
+        ] {
+            assert_eq!(
+                set.by_key(key).unwrap().value_kind,
+                Some(ValueKind::UpDuration),
+                "{key}"
+            );
+        }
+        assert_eq!(set.by_key("cwd").unwrap().value_kind, None);
     }
 }

@@ -28,10 +28,10 @@ expression: "text_of(&lines).join(\"\\n\")"
    action_timeout             3s                                                                              now       
    autorestart                true                                                                            now       
    autostart                  true                                                                            next start
-   exp_backoff_restart_delay  100                                                                             now       
+   exp_backoff_restart_delay  100ms                                                                           now       
    graceful_timeout           8s                                                                              now       
  ~ ignore_watch               []                                                                              now       
-   kill_timeout               1600                                                                            now       
+   kill_timeout               1600ms                                                                          now       
    listen_timeout             3s                                                                              next start
  ~ liveness_probe             (unset)                                                                         now       
    max_memory                 (unset)                                                                         now       

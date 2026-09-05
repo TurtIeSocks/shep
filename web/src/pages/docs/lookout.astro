@@ -578,6 +578,15 @@ esc/s close   j/k select   g/G fir… read-only`;
       marked <code>=</code> or <code>~</code> gives its own reason instead,
       in both states, because the flag would not have helped it.
     </p>
+    <p class="fine">
+      A field whose grammar accepts a bare number, such as
+      <code>max_memory</code> or <code>kill_timeout</code>, shows its
+      resolved value rather than the digits on disk: <code>64</code> reads
+      as <code>64 B</code>, and <code>1600</code> as <code>1600ms</code>,
+      because a bare <code>max_memory</code> is bytes and a bare timer is
+      milliseconds, neither of which is what most operators expect. The
+      grammar itself is unchanged; only what the row draws is.
+    </p>
     <p>Two markers can sit in front of a key, and the pane's own key hint
       names both, so the meaning is on screen wherever the pane is:</p>
     <ul>
