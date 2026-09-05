@@ -2897,7 +2897,43 @@ const EXTRAS_FIELDS: &[&str] = &[
 ];
 
 /// Records what a load's `env` branch just merged: the file's env keys are
-/// established from here, and an override of one is spent.
+/// established from here, and an override of one is spent -- unless it is a
+/// tombstone, which is spent by nothing a load can do.
+///
+/// # Why a tombstone survives and a value does not
+///
+/// Spending an override the file declares is right for a VALUE: the file now
+/// supplies that key, so the operator's copy of it has nothing left to say
+/// and keeping it would mark a sheep that no longer differs. This rule
+/// predates `Actor::handle_set_sheep_env`, and it was written when an
+/// override could only ever be a value.
+///
+/// A tombstone (a JSON `null`) means the ABSENCE of a key, and the file
+/// declaring that key is exactly the case where it still has work to do: the
+/// file says `DB_PASS=fromfile`, the sheep has no `DB_PASS`, and those two
+/// are not the same app. Spending it made `AppOverrides::fields` come back
+/// empty after the first load, so `ProcessEntry::overridden` stopped naming
+/// `env` and the `CFG` column claimed a sheep matched its Flockfile while it
+/// did not. That column is the operator's only signal that a sheep diverges,
+/// and a removal is the one edit that could make it lie.
+///
+/// The removal itself never depended on this: `merge_declared`'s env loop
+/// skips a key held in `overridden_env`, which counts a null like any other
+/// entry, and `declared_env` blocks it again from the second load on. So this
+/// was a reporting failure rather than a data one, which is precisely why
+/// nothing caught it.
+///
+/// # This function's position no longer matters, and that is the point
+///
+/// It is called AFTER the env merge in both arms, and the obvious worry is
+/// that swapping the two would let a load resurrect a removed value. It
+/// cannot, and preserving the tombstone is what makes that true: the loop
+/// skips a key that is in the map, this function no longer takes one out of
+/// the map, so there is nothing for an ordering to expose. Measured both
+/// ways -- moving the call above the loop changes no test, and so does
+/// additionally reading `overridden_env` off `next` rather than off the
+/// original record. Take the same pair of edits against a build that spends
+/// the tombstone and the file's value comes back.
 ///
 /// Called from the two arms that merge `env` and from neither of the others,
 /// which is the whole of the fix this function exists for. It used to be two
@@ -2923,6 +2959,9 @@ const EXTRAS_FIELDS: &[&str] = &[
 fn establish_env(next: &mut AppOverrides, incoming: &DeclaredApp) {
     if let Some(serde_json::Value::Object(env)) = next.fields.get_mut("env") {
         for key in &incoming.declared_env {
+            if env.get(key).is_some_and(serde_json::Value::is_null) {
+                continue;
+            }
             env.remove(key);
         }
         if env.is_empty() {
@@ -6146,11 +6185,19 @@ impl<R: ProcessRunner> Actor<R> {
             )));
         };
         let was_overridden = map.contains_key(key);
+        // A tombstone is left alone rather than removed and re-inserted,
+        // which makes a second removal of the same key a no-op instead of a
+        // deletion. Without this, removing an already-removed key drops the
+        // tombstone (there is nothing in the config to remove, so the
+        // re-insert below does not fire) and the next load of a file that
+        // still declares the key puts its value back.
+        let tombstoned = map.get(key).is_some_and(serde_json::Value::is_null);
         match value {
             Some(value) => map.insert(
                 key.to_string(),
                 serde_json::Value::String(value.to_string()),
             ),
+            None if tombstoned => None,
             None => map.remove(key),
         };
         // # What a removal MEANS in the store
@@ -6182,8 +6229,12 @@ impl<R: ProcessRunner> Actor<R> {
         // branch of `merge_declared` reads this map for its KEYS only -- so
         // a null is read exactly as "somebody has spoken for this key",
         // which is what stops a later plain load silently putting it back.
-        // `--reset=env` and `--reset=all` clear it through `establish_env`,
-        // which is right: a reset is the operator asking for the file's env.
+        // `--reset=env` and `--reset=all` clear it, which is right: a reset
+        // is the operator asking for the file's env. The line that does it
+        // is `merge_declared`'s own `next.fields.remove("env")` in that
+        // arm, which drops the whole map before `establish_env` is reached
+        // -- NOT `establish_env`, which by then has nothing left to find and
+        // which deliberately preserves a tombstone it does find.
         if value.is_none() && was_in_config && (!was_overridden || file_declares) {
             map.insert(key.to_string(), serde_json::Value::Null);
         }

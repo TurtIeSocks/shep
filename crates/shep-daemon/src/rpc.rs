@@ -3039,6 +3039,102 @@ mod tests {
         assert!(!view.env_keys.contains(&"DB_PASS".to_string()));
     }
 
+    /// fails if a removal stops being REPORTED once the Flockfile that
+    /// declares the key is loaded again.
+    ///
+    /// Two things have to compose and neither is pinned by the tombstone
+    /// test above, which stops before any load. `merge_declared`'s env loop
+    /// must skip a key held in `overridden_env`, which counts a null like
+    /// any other entry, so the file's value does not come back. And
+    /// `establish_env`, which runs after that loop, must NOT spend the
+    /// tombstone the way it spends an override carrying a value, or the
+    /// store comes back empty and `overridden` stops naming `env` while the
+    /// sheep genuinely still differs from its file.
+    ///
+    /// The second is the operator-visible half: `overridden` is the only
+    /// signal a sheep diverges from its Flockfile, and the `CFG` column in
+    /// `shep flock` and `shep lookout` reads it. A removal is the one edit
+    /// that can make it claim identical when it is not.
+    ///
+    /// Loaded TWICE on purpose. The second load only skips the key because
+    /// the first one preserved the record, so a single load would pass
+    /// against a build that spent the tombstone and leaned on
+    /// `declared_env` alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_removed_key_stays_removed_and_stays_reported_across_reloads() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let removed = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "DB_PASS".to_string(),
+                        value: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(removed.result.is_ok(), "{:?}", removed.result);
+
+        // The Flockfile still declares the key the operator removed, which
+        // is the whole point: a deploy re-runs the same file.
+        for id in [3, 4] {
+            let loaded = reply_of(
+                dispatch(
+                    envelope(
+                        id,
+                        Request::ApplyConfig {
+                            apps: vec![DeclaredApp {
+                                config: {
+                                    let mut app = AppConfig::minimal("web", "./srv");
+                                    app.env
+                                        .insert("DB_PASS".to_string(), "fromfile".to_string());
+                                    app
+                                },
+                                declared: ["name", "script"]
+                                    .iter()
+                                    .map(|k| (*k).to_string())
+                                    .collect(),
+                                declared_env: ["DB_PASS"]
+                                    .iter()
+                                    .map(|k| (*k).to_string())
+                                    .collect(),
+                            }],
+                            reset: ResetDepth::None,
+                        },
+                    ),
+                    &h.ctx,
+                )
+                .await,
+            );
+            let Ok(Response::Applied(report)) = loaded.result else {
+                panic!("expected Applied")
+            };
+            assert_eq!(report[0].refused, None);
+
+            let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+                .unwrap()
+                .expect("the removal is still recorded");
+            assert_eq!(
+                stored.fields["env"]["DB_PASS"],
+                serde_json::Value::Null,
+                "load {id} spent the tombstone"
+            );
+
+            let view = sheep_config_view(&h.ctx, id + 10, "web").await;
+            assert!(
+                !view.env_keys.contains(&"DB_PASS".to_string()),
+                "load {id} put the file's value back"
+            );
+            assert_eq!(view.overridden, ["env"], "load {id} stopped reporting it");
+        }
+    }
+
     /// fails if `SetSheepEnv` writes the store before it validates. Two
     /// halves, and the second is the one a refactor breaks: `SHEP_NAME` is
     /// injected per instance and refused in a hand-written env, so this is
