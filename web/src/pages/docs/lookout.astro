@@ -569,6 +569,52 @@ esc/s close   j/k select   g/G fir… read-only`;
       the dashboard's <code>x</code>/<code>R</code>/<code>L</code> confirm
       uses.
     </p>
+    <h2>The config pane</h2>
+    <p>
+      <code>e</code> on a selected sheep opens its config over the dashboard:
+      every Flockfile field, the value in force, and what changing it would
+      cost. Read-only so far.
+    </p>
+    <p>Two markers can sit in front of a key:</p>
+    <ul>
+      <li><code>*</code> an operator has overridden it</li>
+      <li>
+        <code>!</code> it is parked until the next respawn, so the running
+        child is not holding it yet
+      </li>
+    </ul>
+    <p>The last column is what a change would cost:</p>
+    <ul>
+      <li><code>now</code> the shepherd re-reads it at the next decision</li>
+      <li>
+        <code>next start</code> it reaches the next process this sheep spawns
+      </li>
+      <li>
+        <code>respawn</code> the running child holds it, so that instance has
+        to be replaced
+      </li>
+      <li>
+        <code>read-only</code> identity or flock shape rather than a runtime
+        knob. That is <code>name</code> and <code>instances</code>; the count
+        moves with <code>shep stock</code>, not from here.
+      </li>
+    </ul>
+    <p>Keys, local to the pane while it's open:</p>
+    <ul>
+      <li><code>e</code> opens the pane, and closes it again</li>
+      <li><code>j</code>/<code>k</code>, arrows move the cursor one row</li>
+      <li><code>g</code>/<code>G</code> jump to the first or last field</li>
+      <li>
+        <code>r</code> re-reads the config and leaves the cursor where it was
+      </li>
+      <li><code>Esc</code> closes the pane; it never quits lookout</li>
+    </ul>
+    <p class="fine">
+      A group row opens one too. Every instance of a multi-instance app
+      shares one stored spec, so the pane is about the app rather than about
+      whichever instance the cursor was over.
+    </p>
+
     <h2>Where to go next</h2>
 
     <div class="next-grid">
