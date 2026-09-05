@@ -11,6 +11,7 @@
 //! than ending it; see [`link::RECONNECT_ATTEMPTS`].
 
 pub mod app;
+pub mod field;
 // `#[cfg(test)]`: every item in `frames` is read by tests and by the gallery
 // writer, and by nothing else. `pub` exempts nothing from `dead_code` here,
 // since `mod lookout` in `lib.rs` is private rather than `pub mod`.
@@ -18,11 +19,13 @@ pub mod app;
 pub mod frames;
 pub mod input;
 pub mod link;
+pub mod pane;
 pub mod source;
 pub mod tail;
 pub mod term;
 pub mod theme;
 pub mod view;
+pub mod viewport;
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -33,6 +36,7 @@ use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::Rect;
 use shep_core::paths::ShepPaths;
 use tokio::sync::mpsc;
 
@@ -176,6 +180,7 @@ pub async fn lookout(
         msg_rx,
         poll_tx,
         request_tx,
+        paths.home.clone(),
         paths.daemon_config.clone(),
         paths.socket.clone(),
         source::LocalReader::new(),
@@ -225,6 +230,11 @@ pub async fn run_ui<B: Backend, S, L>(
     mut msgs: mpsc::Receiver<Msg>,
     polls: mpsc::Sender<()>,
     requests: mpsc::Sender<self::app::Sent>,
+    // `$SHEP_HOME` as this invocation resolved it. Only `Effect::LoadDogPane`
+    // reads it: `commands::dogs::ask` sets `SHEP_HOME` for the probed
+    // candidate, so a home other than `--home`'s could point a schema probe
+    // at the live daemon's socket instead.
+    home: std::path::PathBuf,
     // The settings screen's own read target. Two owned `PathBuf`s rather than
     // `&ShepPaths`, so a test can hand this loop an arbitrary pair, and cloned
     // into each `spawn_blocking` closure that outlives this stack frame.
@@ -300,6 +310,13 @@ where
             lambs_dirty = false;
         }
         if dirty && may_draw {
+            // Told before the draw it is about to feed, not after: a
+            // scrolled screen's cursor must never land on a row the
+            // terminal that size implies could not have shown.
+            if let Ok(size) = terminal.size() {
+                let area = Rect::new(0, 0, size.width, size.height);
+                app.note_body_rows(view::body_rows(area));
+            }
             let _ = terminal.draw(|frame| view::draw(&app, frame));
             dirty = false;
             last_draw = Some(Instant::now());
@@ -440,6 +457,52 @@ where
                 }));
                 dirty = true;
             }
+            // Off this task: an adopted dog's schema probe spawns its own
+            // binary and can block up to `VERSION_BUDGET`, which would
+            // freeze the redraw and bus drain if awaited inline. `Silent`
+            // and `Unreadable` both mean no pane here.
+            Effect::LoadDogPane { name, adopted_path } => {
+                let home = home.clone();
+                let handle = tokio::task::spawn_blocking(move || {
+                    let schema = match (crate::dog::builtin_schema(&name), adopted_path.as_deref())
+                    {
+                        (Some(schema), _) => Some(schema),
+                        (None, Some(path)) => {
+                            match crate::commands::dogs::ask_schema(
+                                path,
+                                &home,
+                                &name,
+                                crate::commands::dogs::VERSION_BUDGET,
+                            ) {
+                                crate::commands::dogs::DogSchema::Published(schema) => Some(schema),
+                                crate::commands::dogs::DogSchema::Silent
+                                | crate::commands::dogs::DogSchema::Unreadable => None,
+                            }
+                        }
+                        (None, None) => None,
+                    };
+                    let result = schema.ok_or_else(|| {
+                        format!("{name} publishes no schema; edit dogs.toml with $EDITOR")
+                    });
+                    Msg::DogPane {
+                        name,
+                        adopted_path,
+                        result,
+                    }
+                });
+                inflight.push(Box::pin(async move {
+                    // A `spawn_blocking` that panicked is the one case this
+                    // has no `Msg` for, and it is reported as the same
+                    // refusal rather than dropped: a keystroke that produces
+                    // silence reads as a key that is not bound.
+                    handle.await.unwrap_or_else(|err| Msg::DogPane {
+                        name: String::new(),
+                        adopted_path: None,
+                        result: Err(format!("the schema probe failed: {err}")),
+                    })
+                }));
+                dirty = true;
+            }
             // `dogs::enable_in_config`/`dogs::disable_in_config` take
             // `ShepToml`'s own lock, which blocks with no deadline, so this
             // arm does not wait for it either. `_authority` is dropped as in
@@ -566,6 +629,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 FakeLocal::default(),
@@ -611,6 +675,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 FakeLocal::default(),
@@ -679,6 +744,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -739,6 +805,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -820,6 +887,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -886,6 +954,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -950,6 +1019,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                PathBuf::from("/tmp/shep-lookout-tests"),
                 PathBuf::from("/tmp/shep-lookout-tests/shep.toml"),
                 PathBuf::from("/tmp/shep-lookout-tests/run/shep.sock"),
                 local,
@@ -1038,6 +1108,7 @@ mod tests {
                 msg_rx,
                 poll_tx,
                 request_tx,
+                dir.path().to_path_buf(),
                 config.clone(),
                 socket_default,
                 FakeLocal::default(),

@@ -53,6 +53,7 @@ pub fn map_key(event: &Event, mode: InputMode) -> Option<KeyPress> {
         KeyCode::Char('R') => Some(KeyPress::Action(ActionVerb::Restart)),
         KeyCode::Char('L') => Some(KeyPress::Action(ActionVerb::Reload)),
         KeyCode::Char('s') => Some(KeyPress::Settings),
+        KeyCode::Char('e') => Some(KeyPress::Edit),
         KeyCode::Char(' ') => Some(KeyPress::Cycle),
         KeyCode::Enter => Some(KeyPress::Confirm),
         _ => None,
@@ -125,6 +126,15 @@ mod tests {
         assert_eq!(
             map_key(&key(KeyCode::Char(' ')), InputMode::Normal),
             Some(KeyPress::Cycle)
+        );
+        assert_eq!(
+            map_key(&key(KeyCode::Char('e')), InputMode::Normal),
+            Some(KeyPress::Edit)
+        );
+        assert_eq!(
+            map_key(&key(KeyCode::Char('E')), InputMode::Normal),
+            None,
+            "the config pane is lower-case `e`; `E` is unbound"
         );
         assert_eq!(map_key(&key(KeyCode::Char('z')), InputMode::Normal), None);
     }

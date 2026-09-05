@@ -1,10 +1,14 @@
-//! The client<->daemon wire protocol (version 3)
+//! The client<->daemon wire protocol (version 4)
 //!
 //! Typed request/response enums plus bus events. Framing lives in [`wire`];
 //! every type here is snapshot-pinned, so changing a serialized shape bumps
 //! [`PROTOCOL_VERSION`].
 //!
-//! Two test-name conventions assert opposite things: a `*_wire_v3` snapshot
+//! Version 4 bumped on an addition, against the rule below. An older daemon
+//! cannot decode the new config requests, so the handshake must catch the
+//! skew.
+//!
+//! Two test-name conventions assert opposite things: a `*_wire_v4` snapshot
 //! pins the shape this crate serializes today, so it follows
 //! [`PROTOCOL_VERSION`] and gets renamed when that moves; a
 //! `v1_*_fixture_still_deserializes` test pins a literal payload from an old
@@ -22,10 +26,10 @@ pub use channel::{CHANNEL_VERSION, ChildMessage, ShepherdMessage};
 pub use events::{BusEvent, ProcessEventKind};
 pub use frame::ServerFrame;
 pub use request::{
-    ActionOutcome, ActionReply, DogSectionToml, DogSource, Envelope, ExitInfo, Hello, HelloAck,
-    HelloReply, Lamb, LineOutcome, LineReply, ProcessInfo, ProcessInfoBuilder, Reply, Request,
-    Response, RpcError, RpcErrorCode, SelectorSpec, SheepApplied, SheepDrift, SignalOutcome,
-    SignalReply, Smit, SmitError, sort_flock,
+    ActionOutcome, ActionReply, DogSectionToml, DogSource, EnvValue, Envelope, ExitInfo, Hello,
+    HelloAck, HelloReply, Lamb, LineOutcome, LineReply, ProcessInfo, ProcessInfoBuilder, Reply,
+    Request, Response, RpcError, RpcErrorCode, SelectorSpec, SheepApplied, SheepConfigView,
+    SheepDrift, SignalOutcome, SignalReply, Smit, SmitError, sort_flock,
 };
 pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 
@@ -36,4 +40,4 @@ pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 /// Removing, renaming, or retyping anything serialized bumps it, recorded in
 /// the CHANGELOG. Byte fixtures in each protocol module pin the deserialize
 /// direction.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;

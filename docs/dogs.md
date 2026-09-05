@@ -117,8 +117,10 @@ subscription re-asks with `Request::DogConfig` and decides what the change
 means: swap the values, rebind a listener, or ask for its own restart. The
 frame says that the section changed and nothing about what is in it. Bark
 subscribes and swaps in place, since sinks and rules are pure data with no
-OS resource attached. One thing publishes today, the boot that moves a
-section out of `shep.toml`, so a hand edit still needs the stop/start above.
+OS resource attached. Two things publish today: the boot that moves a
+section out of `shep.toml`, and a write from lookout's own dog config pane,
+which is why an edit made there reaches a running bark without bouncing it.
+A hand edit still needs the stop/start above.
 
 **A dog that restarts itself on a config change has to say so in its own
 log.** Nothing else can tell that apart from a crash loop, and the restart
@@ -400,7 +402,7 @@ The format is line-oriented text:
 
 ```
 shep-log-rotate 0.1.3
-shep-protocol: 3
+shep-protocol: 4
 ```
 
 - Line 1 is `<name> <version>`. Shep takes the last whitespace-separated
@@ -435,9 +437,9 @@ question costs one argument on a process that was going to start anyway.
 The refusal names both numbers and both ways out:
 
 ```
-/usr/local/bin/shep-otel: this dog was built for shep protocol 2, and this
-shep speaks 3; reinstall the dog without --locked so it builds against the
-current shep-core, or run a shep that speaks 2
+/usr/local/bin/shep-otel: this dog was built for shep protocol 3, and this
+shep speaks 4; reinstall the dog without --locked so it builds against the
+current shep-core, or run a shep that speaks 3
 ```
 
 Only a stated protocol can refuse an adopt. The version is never compared
@@ -498,9 +500,9 @@ the upgrade.
 
 ```
 notice[dog_binary_skew]: `log-rotate`'s binary at /usr/local/bin/shep-log-rotate
-was built for shep protocol 4, and this shep speaks 3; restarting it brings it
-back on that binary, unable to connect. Run a shep that speaks 4, or reinstall
-the dog against protocol 3, and restart it again
+was built for shep protocol 5, and this shep speaks 4; restarting it brings it
+back on that binary, unable to connect. Run a shep that speaks 5, or reinstall
+the dog against protocol 4, and restart it again
 ```
 
 Then it restarts the dog. This is a warning and never a refusal: the
@@ -648,9 +650,46 @@ whole for this reason, and every sink in it carries a webhook URL.
 
 **Answering is optional, exactly as `--version` is.** A dog that says
 nothing is adopted, recorded as having no schema, and refused nothing, which
-is every dog written before this contract. What it gives up is a description
-of itself: a settings pane needs a schema to render, so its section stays a
-file an operator hand-edits. Nothing else changes.
+is every dog written before this contract. What it gives up is the pane
+below: with no schema to render a form from, its section stays a file an
+operator hand-edits. Nothing else changes.
+
+## What a schema buys: the settings pane
+
+`s` in `shep lookout`, then `e` on the dog's row, opens a form over its
+`[<name>]` section. One row per property, the value the section sets beside
+it, `(unset)` where it sets none, and `<set>` where a field is marked as a
+credential. A property the schema gives a default still reads `(unset)`: the
+pane shows the file, not the dog's own fallback. It writes as well, behind
+`--allow-control`, and it writes the section whole, so the comments in
+`dogs.toml` survive an edit shep made.
+
+The pane is flat, with no section headers, and its cost column is empty on
+every row. shep does not know what a dog's field costs; the dog does. The
+foot of the pane says so once, naming the dog, rather than guessing per
+row:
+
+```
+shep publishes the change; bark decides what to reload
+```
+
+A dog that publishes no schema gets no pane, and a line saying where its
+settings do live:
+
+```
+pydog publishes no schema; edit dogs.toml with $EDITOR
+```
+
+The schema is asked for again when the pane opens rather than cached from
+adopt time, so the dog does not have to be running. Configure then enable is
+the order an operator wants, and it works.
+
+**Asking runs it.** Opening the pane on an adopted dog spawns that binary
+with `--schema`, waits a second for an answer, then kills it, on the same
+terms `shep adopt` asks on. That is a third party's code executing because
+somebody pressed a key, so it is worth knowing before browsing the config of
+a dog you did not write. A built-in dog is shep's own binary and is never
+spawned.
 
 A dog that answers something that is not JSON gets one line, and is adopted
 anyway:
@@ -684,7 +723,7 @@ Shep now writes its own account into the dog's log as well, marked
 
 ```
 2026-09-02T14:22:31.412+02:00 [shep] shep started this dog; its process is pid 5512
-2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as `log-rotate`, on protocol 3
+2026-09-02T14:22:31.480+02:00 [shep] shep accepted this dog's handshake; it is registered with this shepherd as `log-rotate`, on protocol 4
 2026-09-02T14:22:31.492+02:00 rotating web-0-out.log (12.4 MiB)
 ```
 

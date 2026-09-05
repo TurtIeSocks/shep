@@ -1,6 +1,5 @@
 ---
 source: crates/shep-cli/src/lookout/frames.rs
-assertion_line: 1836
 expression: render_text(&buffer)
 ---
 shep lookout   /home/ada/.shep                                                                            4 in the flock
@@ -32,4 +31,4 @@ bleats  web  follows one instance; select one to see its log
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only

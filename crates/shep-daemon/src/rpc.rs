@@ -15,7 +15,7 @@ use core::time::Duration;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::watch;
 
@@ -38,6 +38,45 @@ use crate::supervisor::{Applied, ConnId, SupervisorError, SupervisorHandle};
 pub(crate) const DEFAULT_DEADLINE_MS: u64 = 5_000;
 /// Ceiling on a client-supplied deadline: a peer cannot pin a daemon task open.
 pub(crate) const MAX_DEADLINE_MS: u64 = 60_000;
+
+/// Every dog name this shepherd may hold a section for, running or not.
+///
+/// Seeded at boot from the CLI, which owns `shep.toml`. A
+/// `Request::EnableDog` adds a name, so a dog adopted against a running
+/// shepherd needs no reload. Never shrunk: `shep disable` leaves the
+/// section in `dogs.toml`, where a disabled dog still wants configuring.
+/// A set because the only question asked is membership, behind a mutex
+/// because every connection holds a clone.
+#[derive(Debug, Clone)]
+pub(crate) struct KnownDogs {
+    names: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl KnownDogs {
+    /// Wraps a boot-time seed.
+    pub(crate) fn new(names: BTreeSet<String>) -> Self {
+        Self {
+            names: Arc::new(Mutex::new(names)),
+        }
+    }
+
+    /// Whether this shepherd may hold a section for `name`.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.lock().contains(name)
+    }
+
+    /// Records that `name` is a dog this shepherd knows about.
+    pub(crate) fn insert(&self, name: &str) {
+        self.lock().insert(name.to_owned());
+    }
+
+    /// A poisoned lock is recovered rather than propagated, as
+    /// [`crate::dogs::DogRefusals`] does: these are names with no invariant
+    /// a panic mid-write could have broken.
+    fn lock(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        self.names.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Everything a request handler may touch; one clone per connection.
 ///
@@ -67,6 +106,9 @@ pub struct RpcContext {
     /// disable X && shep enable X` picks up an edited section
     /// (`crate::dogs::dog_section`).
     pub(crate) dogs_config: PathBuf,
+    /// Every dog name this shepherd may hold a section for, running or
+    /// not. See [`KnownDogs`].
+    pub(crate) known_dogs: KnownDogs,
     /// This daemon's `$SHEP_HOME` layout, for assembling a dog's app config.
     pub(crate) paths: ShepPaths,
     /// This daemon's crate version, echoed in the handshake.
@@ -510,6 +552,15 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                             daemon_version: None,
                         })),
                         Ok(info) => {
+                            // The one place this daemon learns of a dog it
+                            // was not told about at boot. `shep adopt` and
+                            // `shep enable` both arrive here, and both have
+                            // just written the name into `shep.toml`, which
+                            // this crate does not read. Recorded on the
+                            // success arm only: the refusal above is a
+                            // sheep holding the name, and that is not a dog
+                            // to remember.
+                            ctx.known_dogs.insert(&info.name);
                             // Wording is about the binary this shepherd
                             // resolved, not about a spawn having happened:
                             // `start_dog` is idempotent by name, so this may
@@ -587,6 +638,128 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 Err(err) => reply(Err(rpc_error(&err))),
             },
         },
+        // The two config-pane reads and writes. Neither takes a selector:
+        // a pane edits one sheep, so an unknown name is `NotFound` here
+        // rather than an empty match.
+        Request::SheepConfig { name } => match ctx.supervisor.sheep_config(name.clone()).await {
+            Ok(Some(view)) => reply(Ok(Response::SheepConfig(Box::new(view)))),
+            Ok(None) => reply(Err(RpcError {
+                code: RpcErrorCode::NotFound,
+                message: format!("no sheep named {name}"),
+                daemon_version: None,
+            })),
+            Err(err) => reply(Err(rpc_error(&err))),
+        },
+        Request::SetSheepEnv { name, key, value } => {
+            match ctx
+                .supervisor
+                .set_sheep_env(name.clone(), key.clone(), value)
+                .await
+            {
+                // Recorded exactly as `Start`, `Add`, `Scale` and
+                // `ApplyConfig` record theirs, and for the reason
+                // `Scale`'s arm gives: the muster roll is written from the
+                // registry (`snapshot::muster`) and nothing on the restore
+                // path reads the override store, so an env edit that
+                // skipped this would survive a `shep daemon reload` (the
+                // handover blob carries `pending`) and vanish on a cold
+                // restart. The same field class behaving differently
+                // depending on which request set it is the bug.
+                Ok(Some(app)) => {
+                    ctx.registry.record(&[app]);
+                    reply(Ok(Response::SheepEnvSet { name, key }))
+                }
+                Ok(None) => reply(Err(RpcError {
+                    code: RpcErrorCode::NotFound,
+                    message: format!("no sheep named {name}"),
+                    daemon_version: None,
+                })),
+                Err(err) => reply(Err(rpc_error(&err))),
+            }
+        }
+        Request::SetSheepField { name, key, value } => {
+            match ctx
+                .supervisor
+                .set_sheep_field(name.clone(), key.clone(), value)
+                .await
+            {
+                // Recorded exactly as `SetSheepEnv` records its own, and
+                // for that arm's reason: the muster roll is written from
+                // the registry and nothing on the restore path reads the
+                // override store, so a field edit that skipped this would
+                // survive a `shep daemon reload` and vanish on a cold
+                // restart.
+                Ok(Some(set)) => {
+                    ctx.registry.record(&[set.app]);
+                    reply(Ok(Response::SheepFieldSet {
+                        name,
+                        key,
+                        pending: set.pending,
+                    }))
+                }
+                Ok(None) => reply(Err(RpcError {
+                    code: RpcErrorCode::NotFound,
+                    message: format!("no sheep named {name}"),
+                    daemon_version: None,
+                })),
+                Err(err) => reply(Err(rpc_error(&err))),
+            }
+        }
+        // The inverse of every other config door's guard: `dogs.toml`
+        // holds dogs' sections and nothing else, so what this one refuses
+        // is a sheep's name, not merely a dog no one has heard of. Asked
+        // before the file is opened, so a mistyped name leaves no stray
+        // table behind for a dog that will never exist.
+        //
+        // Guarded on `known_dogs`, not on the running flock: a guard on the
+        // flock alone would refuse the dog most in need of configuring, one
+        // that is disabled or has never started. The running flock is still
+        // consulted too, as a widening, because a dog adopted and enabled
+        // since this shepherd booted is not yet in the list the CLI handed
+        // over at boot.
+        //
+        // Written here rather than through the supervisor: `dogs.toml` is
+        // not supervisor state, and the file's path and the bus are both
+        // already in scope here. The daemon, not the client, writes it
+        // because the daemon is the only publisher of `config.dog.<name>`,
+        // and a section written with nothing publishing that topic leaves
+        // a running dog reading the old one.
+        Request::SetDogConfig { name, toml } => {
+            // A stopped engine runs no dogs, so "not running" is the honest
+            // answer and `known_dogs` is left carrying the guard alone.
+            let running_dog = || async {
+                ctx.supervisor
+                    .list_checked()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|info| info.name == name && info.dog.is_some())
+            };
+            if !ctx.known_dogs.contains(&name) && !running_dog().await {
+                return reply(Err(RpcError {
+                    code: RpcErrorCode::NotFound,
+                    message: format!(
+                        "no dog named {name}; `shep adopt` or `shep enable` makes one known \
+                         to this shepherd"
+                    ),
+                    daemon_version: None,
+                }));
+            }
+            match crate::dogs::set_dog_section(&ctx.dogs_config, &name, toml.as_str()) {
+                Ok(()) => {
+                    crate::bus::publish_dog_config_changed(
+                        &ctx.events,
+                        std::slice::from_ref(&name),
+                    );
+                    reply(Ok(Response::DogConfigSet { name }))
+                }
+                Err(err) => reply(Err(RpcError {
+                    code: RpcErrorCode::InvalidConfig,
+                    message: err.to_string(),
+                    daemon_version: None,
+                })),
+            }
+        }
         // `Request` is #[non_exhaustive]: a verb from a newer client that this
         // daemon has never heard of is an error, not a panic.
         _ => reply(Err(RpcError {
@@ -829,6 +1002,47 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
             message: msg.clone(),
             daemon_version: None,
         },
+        // `InvalidConfig`, like `InvalidScale` above and for its reason: a
+        // request aimed at a dog is one the caller can aim elsewhere. The
+        // bare payload is the same sentence `apply_one` puts in front of an
+        // operator whose Flockfile named a dog, so the two doors read alike.
+        SupervisorError::IsADog(msg) => RpcError {
+            code: RpcErrorCode::InvalidConfig,
+            message: msg.clone(),
+            daemon_version: None,
+        },
+        // `InvalidConfig`, like `InvalidScale` above and for its reason:
+        // this is something the caller asked for that it can ask
+        // differently, and telling an operator "unexpected daemon-side
+        // failure" about their own env key would send them to the wrong
+        // place entirely. The bare payload is `normalize`'s own refusal,
+        // which already names the key.
+        SupervisorError::InvalidEnv(msg) => RpcError {
+            code: RpcErrorCode::InvalidConfig,
+            message: msg.clone(),
+            daemon_version: None,
+        },
+        // `InvalidConfig`, beside `InvalidEnv` above and for its reason:
+        // every shape that reaches it is the caller's own key or value,
+        // which it can ask differently. The bare payload rather than
+        // `err.to_string()`, again like `InvalidEnv`: the message already
+        // names the field.
+        SupervisorError::InvalidField(msg) => RpcError {
+            code: RpcErrorCode::InvalidConfig,
+            message: msg.clone(),
+            daemon_version: None,
+        },
+        // `Internal`, on the same rule the log-maintenance pair above
+        // states: an override store that cannot be read or written is an
+        // unexpected daemon-side failure, and there is no code for it that
+        // a client predating this build could decode. `err.to_string()`
+        // rather than the bare payload, so the reader is told the store was
+        // the thing that failed and not the request.
+        SupervisorError::Overrides(_) => RpcError {
+            code: RpcErrorCode::Internal,
+            message: err.to_string(),
+            daemon_version: None,
+        },
         SupervisorError::EngineStopped => RpcError {
             code: RpcErrorCode::Internal,
             message: "the supervisor engine has stopped".to_string(),
@@ -938,7 +1152,7 @@ mod tests {
     use crate::testing::{
         Harness, SCRIPTED_TREE_BYTES, harness, harness_identifying, harness_with_stats, identity,
     };
-    use shep_core::config::{AppConfig, DeclaredApp, ResetDepth};
+    use shep_core::config::{AppConfig, ApplyGroup, DeclaredApp, ResetDepth, apply_group};
     use shep_core::protocol::{
         ActionOutcome, ActionReply, DogSource, Request, Response, RpcErrorCode, SelectorSpec,
     };
@@ -2270,6 +2484,892 @@ mod tests {
         info
     }
 
+    /// Starts one sheep named `web` carrying a secret env value, which is
+    /// the fixture the config-pane cases below all want.
+    async fn start_web_with_a_secret(ctx: &RpcContext) {
+        let mut config = AppConfig::minimal("web", "./srv");
+        config
+            .env
+            .insert("DB_PASS".to_string(), "hunter2".to_string());
+        let started =
+            reply_of(dispatch(envelope(1, Request::Start { apps: vec![config] }), ctx).await);
+        assert!(started.result.is_ok(), "{:?}", started.result);
+    }
+
+    /// A dog runs at the daemon's own trust level and its binary is what
+    /// `shep adopt` vetted, so a parked `PATH`, `LD_PRELOAD` or
+    /// `DYLD_INSERT_LIBRARIES` for its next respawn would run arbitrary
+    /// code at that level. Refused at the daemon, not at a caller, because
+    /// the socket is already live. Asserts the store as well as the code:
+    /// a refusal that still wrote would be the same hole.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_is_refused_an_env_override_rather_than_given_one() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let dog = enable_dog(&h.ctx, 1, "bark").await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "bark".to_string(),
+                        key: "PATH".to_string(),
+                        value: Some("/tmp/evil".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("a dog was given an env override")
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("bark is a dog"), "{}", err.message);
+
+        assert!(
+            shep_core::overrides::get(&h.ctx.paths.overrides, "bark")
+                .unwrap()
+                .is_none(),
+            "the refusal still wrote the store"
+        );
+        let described = reply_of(
+            dispatch(
+                envelope(
+                    3,
+                    Request::Describe {
+                        selector: SelectorSpec::Name("bark".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(infos)) = described.result else {
+            panic!("expected Described")
+        };
+        assert_eq!(infos[0].id, dog.id);
+        assert_eq!(infos[0].pending, None, "the refusal still parked a config");
+    }
+
+    /// No other request hands a client a config at all, so this would be a
+    /// read surface that exists for dogs and nothing else. A dog's config
+    /// is what `shep adopt` vetted, not something an operator edits here.
+    #[tokio::test(start_paused = true)]
+    async fn a_dogs_config_is_not_readable_through_the_sheep_config_pane() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        enable_dog(&h.ctx, 1, "bark").await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SheepConfig {
+                        name: "bark".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("a dog's config was served to a pane")
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("bark is a dog"), "{}", err.message);
+    }
+
+    /// Reads one sheep's config view, for the cases that assert on it.
+    async fn sheep_config_view(
+        ctx: &RpcContext,
+        id: u64,
+        name: &str,
+    ) -> shep_core::protocol::SheepConfigView {
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    id,
+                    Request::SheepConfig {
+                        name: name.to_string(),
+                    },
+                ),
+                ctx,
+            )
+            .await,
+        );
+        match reply.result {
+            Ok(Response::SheepConfig(view)) => *view,
+            other => panic!("expected SheepConfig, got {other:?}"),
+        }
+    }
+
+    /// Both halves matter: a pane that cannot name the keys cannot offer
+    /// to edit them, and one handed the values has put a secret on a
+    /// socket for nothing (IR-41).
+    #[tokio::test(start_paused = true)]
+    async fn sheep_config_answers_with_env_emptied_and_its_keys_listed() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SheepConfig {
+                        name: "web".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::SheepConfig(view)) = reply.result else {
+            panic!("expected SheepConfig")
+        };
+        assert_eq!(view.name, "web");
+        assert!(view.config.env.is_empty());
+        assert_eq!(view.env_keys, ["DB_PASS"]);
+    }
+
+    /// A pane asking about a sheep deleted out from under it is normal,
+    /// not a daemon fault. `Internal` would send an operator looking for
+    /// a bug in the shepherd.
+    #[tokio::test(start_paused = true)]
+    async fn sheep_config_for_an_unknown_name_is_not_found_not_internal() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SheepConfig {
+                        name: "ghost".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(err.code, RpcErrorCode::NotFound);
+    }
+
+    /// The running process was handed its environment at spawn and cannot
+    /// be handed another, so an edit reported as applied would be one the
+    /// operator believes is in force when it is not.
+    #[tokio::test(start_paused = true)]
+    async fn set_sheep_env_writes_the_store_and_parks_env_until_a_respawn() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "NEW".to_string(),
+                        value: Some("1".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(
+            matches!(reply.result, Ok(Response::SheepEnvSet { .. })),
+            "{:?}",
+            reply.result
+        );
+
+        let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.fields["env"]["NEW"], "1");
+
+        let described = reply_of(
+            dispatch(
+                envelope(
+                    3,
+                    Request::Describe {
+                        selector: SelectorSpec::Name("web".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(infos)) = described.result else {
+            panic!("expected Described")
+        };
+        assert_eq!(
+            infos[0].pending.as_deref(),
+            Some(["env".to_string()].as_slice())
+        );
+    }
+
+    /// The CFG column reads `ProcessEntry::overridden`, so an `env` key
+    /// left in the store's field set after its last value is gone marks a
+    /// sheep that no longer differs from its Flockfile.
+    #[tokio::test(start_paused = true)]
+    async fn removing_the_last_env_override_stops_marking_the_sheep() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        for (id, value) in [(2, Some("1".to_string().into())), (3, None)] {
+            let reply = reply_of(
+                dispatch(
+                    envelope(
+                        id,
+                        Request::SetSheepEnv {
+                            name: "web".to_string(),
+                            key: "NEW".to_string(),
+                            value,
+                        },
+                    ),
+                    &h.ctx,
+                )
+                .await,
+            );
+            assert!(reply.result.is_ok(), "{:?}", reply.result);
+        }
+
+        let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+            .unwrap()
+            .unwrap();
+        assert!(!stored.fields.contains_key("env"), "{stored:?}");
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    4,
+                    Request::SheepConfig {
+                        name: "web".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::SheepConfig(view)) = reply.result else {
+            panic!("expected SheepConfig")
+        };
+        assert!(view.overridden.is_empty(), "{view:?}");
+    }
+
+    /// The muster roll is written from the `FlockRegistry`, and nothing on
+    /// the restore path reads the override store, so a handler that parks
+    /// a config without recording it looks correct in every live test and
+    /// forgets the edit on the next cold start. Asserts the roll rather
+    /// than the registry's own accessor, since the roll is what `shep
+    /// muster` actually restores from.
+    #[tokio::test(start_paused = true)]
+    async fn a_set_env_reaches_the_roll_a_cold_restart_would_come_back_on() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "NEW".to_string(),
+                        value: Some("1".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(reply.result.is_ok(), "{:?}", reply.result);
+
+        let infos = list_flock(&h.ctx, 3).await;
+        let roll = h.ctx.registry.roll(&infos, 0);
+        let web = roll
+            .apps
+            .iter()
+            .find(|entry| entry.app.name == "web")
+            .expect("web is in the roll");
+        assert_eq!(web.app.env.get("NEW").map(String::as_str), Some("1"));
+    }
+
+    /// `map.remove` is a no-op for a key the app's own config supplied, so
+    /// without a tombstone the store comes back empty and the removal
+    /// lives only in `ProcessEntry::pending`, a change the operator just
+    /// made.
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_key_the_operator_never_set_is_still_recorded() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "DB_PASS".to_string(),
+                        value: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(reply.result.is_ok(), "{:?}", reply.result);
+
+        let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+            .unwrap()
+            .expect("the removal is recorded");
+        assert_eq!(
+            stored.fields["env"]["DB_PASS"],
+            serde_json::Value::Null,
+            "a removal is a tombstone, not an absence"
+        );
+
+        let view = sheep_config_view(&h.ctx, 3, "web").await;
+        assert_eq!(view.overridden, ["env"]);
+        assert!(!view.env_keys.contains(&"DB_PASS".to_string()));
+    }
+
+    /// Two things must compose: `merge_declared`'s env loop must skip a
+    /// key held in `overridden_env` so the file's value does not come
+    /// back, and `establish_env`, which runs after, must not spend the
+    /// tombstone the way it spends a valued override, or `overridden`
+    /// stops naming `env` while the sheep still differs from its file.
+    /// Loaded twice on purpose: a single load would pass against a build
+    /// that spent the tombstone and leaned on `declared_env` alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_removed_key_stays_removed_and_stays_reported_across_reloads() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let removed = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "DB_PASS".to_string(),
+                        value: None,
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(removed.result.is_ok(), "{:?}", removed.result);
+
+        // The Flockfile still declares the key the operator removed, which
+        // is the whole point: a deploy re-runs the same file.
+        for id in [3, 4] {
+            let loaded = reply_of(
+                dispatch(
+                    envelope(
+                        id,
+                        Request::ApplyConfig {
+                            apps: vec![DeclaredApp {
+                                config: {
+                                    let mut app = AppConfig::minimal("web", "./srv");
+                                    app.env
+                                        .insert("DB_PASS".to_string(), "fromfile".to_string());
+                                    app
+                                },
+                                declared: ["name", "script"]
+                                    .iter()
+                                    .map(|k| (*k).to_string())
+                                    .collect(),
+                                declared_env: ["DB_PASS"]
+                                    .iter()
+                                    .map(|k| (*k).to_string())
+                                    .collect(),
+                            }],
+                            reset: ResetDepth::None,
+                        },
+                    ),
+                    &h.ctx,
+                )
+                .await,
+            );
+            let Ok(Response::Applied(report)) = loaded.result else {
+                panic!("expected Applied")
+            };
+            assert_eq!(report[0].refused, None);
+
+            let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+                .unwrap()
+                .expect("the removal is still recorded");
+            assert_eq!(
+                stored.fields["env"]["DB_PASS"],
+                serde_json::Value::Null,
+                "load {id} spent the tombstone"
+            );
+
+            let view = sheep_config_view(&h.ctx, id + 10, "web").await;
+            assert!(
+                !view.env_keys.contains(&"DB_PASS".to_string()),
+                "load {id} put the file's value back"
+            );
+            assert_eq!(view.overridden, ["env"], "load {id} stopped reporting it");
+        }
+    }
+
+    /// Two halves, and the second is the one a refactor breaks:
+    /// `SHEP_NAME` is injected per instance and refused in a hand-written
+    /// env, so this is a real refusal an operator can meet from a
+    /// free-text pane, and a handler that wrote first would leave a
+    /// stored override for a config the daemon will not accept.
+    #[tokio::test(start_paused = true)]
+    async fn an_env_key_normalize_refuses_is_invalid_config_and_writes_nothing() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "SHEP_NAME".to_string(),
+                        value: Some("impostor".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("a reserved env key was accepted")
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(
+            shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+                .unwrap()
+                .is_none(),
+            "the refusal still wrote the store"
+        );
+    }
+
+    /// Neither the caller's request nor a refusal they can act on by
+    /// asking differently, which is why it gets a variant of its own
+    /// rather than sharing `InvalidEnv`'s.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_override_store_is_internal_not_a_bad_request() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+        std::fs::write(&h.ctx.paths.overrides, "{ this is not json").unwrap();
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "NEW".to_string(),
+                        value: Some("1".to_string().into()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("an unreadable store was reported as success")
+        };
+        assert_eq!(err.code, RpcErrorCode::Internal);
+        assert!(
+            err.message.contains("overrides store unusable"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// Sends one `SetSheepField` and hands back the reply.
+    async fn set_field(
+        ctx: &RpcContext,
+        id: u64,
+        name: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<Response, RpcError> {
+        reply_of(
+            dispatch(
+                envelope(
+                    id,
+                    Request::SetSheepField {
+                        name: name.to_string(),
+                        key: key.to_string(),
+                        value,
+                    },
+                ),
+                ctx,
+            )
+            .await,
+        )
+        .result
+    }
+
+    /// The same edit through `ApplyConfig` at `ResetDepth::File` moves the
+    /// field and spends the override in `merge_declared`, so the key drops
+    /// from `overridden` and the pane's `*` marker never appears for a
+    /// value the operator just set. Asserted through both `SheepConfig`,
+    /// which the pane reads, and `ListFlock`, which the CFG column reads,
+    /// because the request alone can be correct while both derived views
+    /// are wrong.
+    #[tokio::test(start_paused = true)]
+    async fn a_field_edit_is_reported_as_an_operator_override() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let view = sheep_config_view(&h.ctx, 2, "web").await;
+        assert!(
+            !view.overridden.contains(&"max_restarts".to_string()),
+            "nothing is overridden before the edit: {:?}",
+            view.overridden
+        );
+
+        let reply = set_field(&h.ctx, 3, "web", "max_restarts", serde_json::json!(40)).await;
+        assert!(
+            matches!(reply, Ok(Response::SheepFieldSet { .. })),
+            "{reply:?}"
+        );
+
+        let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+            .unwrap()
+            .expect("the edit is recorded");
+        assert_eq!(stored.fields["max_restarts"], 40);
+
+        let view = sheep_config_view(&h.ctx, 4, "web").await;
+        assert_eq!(view.config.max_restarts, 40, "the pane shows the new value");
+        assert!(
+            view.overridden.contains(&"max_restarts".to_string()),
+            "the `*` marker reads this: {:?}",
+            view.overridden
+        );
+
+        // The CFG column's own source, which is a different code path from
+        // the pane's and is the half that was silently wrong.
+        let infos = list_flock(&h.ctx, 5).await;
+        let web = infos
+            .iter()
+            .find(|info| info.name == "web")
+            .expect("web is in the flock");
+        assert!(
+            web.overridden
+                .as_deref()
+                .is_some_and(|fields| fields.contains(&"max_restarts".to_string())),
+            "{:?}",
+            web.overridden
+        );
+    }
+
+    /// The four-way apply classification governs this door: a `Live`
+    /// field is in force now, a `NeedsRespawn` field parks and says so,
+    /// and the pane's cost column promises exactly this.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_field_applies_now_and_a_respawn_field_parks() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = set_field(&h.ctx, 2, "web", "max_restarts", serde_json::json!(40)).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(!pending, "max_restarts is Live and is in force now");
+        let view = sheep_config_view(&h.ctx, 3, "web").await;
+        assert!(
+            !view.pending.contains(&"max_restarts".to_string()),
+            "{:?}",
+            view.pending
+        );
+
+        let reply = set_field(&h.ctx, 4, "web", "script", serde_json::json!("./next")).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(pending, "script needs a respawn");
+        let view = sheep_config_view(&h.ctx, 5, "web").await;
+        assert!(
+            view.pending.contains(&"script".to_string()),
+            "{:?}",
+            view.pending
+        );
+        // And the Live edit is still in force beside the parked one.
+        assert_eq!(view.config.max_restarts, 40);
+        assert_eq!(
+            view.overridden,
+            ["max_restarts", "script"],
+            "both are the operator's"
+        );
+    }
+
+    /// One of two cases where `pending` carries information `apply_group`
+    /// alone cannot: `reached_spec` builds a subset of the config, running
+    /// plus the one field that reaches, and `normalize` checks fields
+    /// against each other. `watch` needs a `cwd`, and a `cwd` still parked
+    /// is not on that subset, so a `Live` field parks anyway.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_field_whose_subset_will_not_normalize_parks_instead() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        // No `cwd`, which is what makes `watch` refusable on its own.
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(started.result.is_ok(), "{:?}", started.result);
+
+        // `cwd` is NeedsRespawn, so this parks and the running spec still
+        // has none.
+        let reply = set_field(&h.ctx, 2, "web", "cwd", serde_json::json!("/srv")).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(pending, "cwd needs a respawn");
+
+        // `watch` is Live, so `apply_group` alone predicts "in force now".
+        // The merge is valid (it carries the parked `cwd`) but the
+        // subset is `running + watch`, which is a watch with no directory.
+        let reply = set_field(&h.ctx, 3, "web", "watch", serde_json::json!(true)).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert_eq!(
+            apply_group("watch"),
+            ApplyGroup::Live,
+            "the premise: apply_group predicts this one applies now"
+        );
+        assert!(
+            pending,
+            "a Live field the running child cannot be given still parks"
+        );
+
+        // And the pane's own durable marker agrees, so an operator who
+        // misses the status line still sees it on the row.
+        let view = sheep_config_view(&h.ctx, 4, "web").await;
+        assert!(
+            view.pending.contains(&"watch".to_string()),
+            "{:?}",
+            view.pending
+        );
+    }
+
+    /// `autostart` is `ApplyGroup::NextSpawn`, so `apply_group` predicts a
+    /// respawn is needed, but `snapshot::restorable` reads it at muster or
+    /// boot rather than at spawn, so it is in force the moment it lands on
+    /// the stored spec. `kill_signal` is its group-mate and is genuinely
+    /// read at spawn, asserted alongside it to pin the carve-out rather
+    /// than the whole group.
+    #[tokio::test(start_paused = true)]
+    async fn autostart_reports_in_force_and_its_group_mate_reports_pending() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        for key in ["autostart", "kill_signal"] {
+            assert_eq!(
+                apply_group(key),
+                ApplyGroup::NextSpawn,
+                "the premise: both are the same group"
+            );
+        }
+
+        let reply = set_field(&h.ctx, 2, "web", "autostart", serde_json::json!(false)).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(
+            !pending,
+            "autostart is read at muster, so a restart would do nothing"
+        );
+
+        let reply = set_field(&h.ctx, 3, "web", "kill_signal", serde_json::json!("SIGINT")).await;
+        let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
+            panic!("{reply:?}")
+        };
+        assert!(pending, "kill_signal really is read at a spawn");
+    }
+
+    /// The same hole `a_dog_is_refused_an_env_override_rather_than_given_one`
+    /// closes for `env`, sharper here since this door reaches `script` and
+    /// `args` directly and a dog runs at the daemon's own trust level.
+    /// Asserts the store as well as the code: a refusal that still wrote
+    /// would be the same hole with a better error.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_is_refused_a_config_field_rather_than_given_one() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let dog = enable_dog(&h.ctx, 1, "bark").await;
+
+        let reply = set_field(&h.ctx, 2, "bark", "script", serde_json::json!("/tmp/evil")).await;
+        let Err(err) = reply else {
+            panic!("a dog was given a config field")
+        };
+        assert_eq!(err.code, RpcErrorCode::InvalidConfig);
+        assert!(err.message.contains("bark is a dog"), "{}", err.message);
+        assert!(
+            shep_core::overrides::get(&h.ctx.paths.overrides, "bark")
+                .unwrap()
+                .is_none(),
+            "the refusal still wrote the store"
+        );
+        drop(dog);
+    }
+
+    /// `env` would be replaced wholesale by a request carrying one value,
+    /// wiping every other key; `instances` and `name` are Structural, and
+    /// the count moves through `shep stock`.
+    #[tokio::test(start_paused = true)]
+    async fn env_and_the_structural_fields_are_refused_by_this_door() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        for (id, key, value) in [
+            (2, "env", serde_json::json!({ "A": "1" })),
+            (3, "instances", serde_json::json!(4)),
+            (4, "name", serde_json::json!("other")),
+        ] {
+            let reply = set_field(&h.ctx, id, "web", key, value).await;
+            let Err(err) = reply else {
+                panic!("{key} was accepted")
+            };
+            assert_eq!(err.code, RpcErrorCode::InvalidConfig, "{key}");
+            assert!(err.message.contains(key), "{key}: {}", err.message);
+        }
+        assert!(
+            shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+                .unwrap()
+                .is_none(),
+            "a refusal still wrote the store"
+        );
+    }
+
+    /// Three shapes, and each is the caller's: a key `AppConfig` has no
+    /// field for, a value that will not deserialize into the field it
+    /// names, and a value that deserializes and then fails `normalize`.
+    #[tokio::test(start_paused = true)]
+    async fn a_field_this_build_refuses_is_invalid_config_and_writes_nothing() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        for (id, key, value) in [
+            (2, "no_such_field", serde_json::json!(1)),
+            (3, "max_restarts", serde_json::json!("forty")),
+            (
+                4,
+                "cron_restart",
+                serde_json::json!("not a cron expression"),
+            ),
+        ] {
+            let reply = set_field(&h.ctx, id, "web", key, value).await;
+            let Err(err) = reply else {
+                panic!("{key} was accepted")
+            };
+            assert_eq!(err.code, RpcErrorCode::InvalidConfig, "{key}");
+            assert!(
+                shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+                    .unwrap()
+                    .is_none(),
+                "{key}: the refusal still wrote the store"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_store_is_internal_for_a_field_edit_too() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+        std::fs::write(&h.ctx.paths.overrides, "{ this is not json").unwrap();
+
+        let reply = set_field(&h.ctx, 2, "web", "max_restarts", serde_json::json!(40)).await;
+        let Err(err) = reply else {
+            panic!("an unreadable store was reported as success")
+        };
+        assert_eq!(err.code, RpcErrorCode::Internal);
+        assert!(
+            err.message.contains("overrides store unusable"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// The muster roll is a registry record `rpc.rs` writes, not
+    /// something the supervisor does. Nothing on the restore path reads
+    /// the override store, so an edit that skipped it would survive a
+    /// `shep daemon reload` and vanish on a cold restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_field_edit_reaches_the_muster_roll() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = set_field(&h.ctx, 2, "web", "max_restarts", serde_json::json!(40)).await;
+        assert!(reply.is_ok(), "{reply:?}");
+
+        let infos = list_flock(&h.ctx, 3).await;
+        let roll = h.ctx.registry.roll(&infos, 0);
+        let web = roll
+            .apps
+            .iter()
+            .find(|entry| entry.app.name == "web")
+            .expect("web is in the roll");
+        assert_eq!(web.app.max_restarts, 40);
+    }
+
+    /// `Request` is `#[non_exhaustive]` with dispatch ending in a
+    /// wildcard, so a variant missing its arm compiles and passes every
+    /// other test, silently refused at runtime instead. The list below is
+    /// hand-written and nothing makes it exhaustive: a new variant is
+    /// covered only if its author adds it here.
+    #[tokio::test(start_paused = true)]
+    async fn every_new_variant_reaches_an_arm_and_not_the_wildcard() {
+        let h = harness(vec![]);
+        let requests = [
+            Request::SheepConfig {
+                name: "ghost".to_string(),
+            },
+            Request::SetSheepEnv {
+                name: "ghost".to_string(),
+                key: "K".to_string(),
+                value: None,
+            },
+            Request::SetSheepField {
+                name: "ghost".to_string(),
+                key: "max_restarts".to_string(),
+                value: serde_json::json!(1),
+            },
+            Request::SetDogConfig {
+                name: "ghost".to_string(),
+                toml: String::new().into(),
+            },
+        ];
+        for (id, request) in requests.into_iter().enumerate() {
+            let reply = reply_of(
+                dispatch(
+                    envelope(
+                        u64::try_from(id).expect("three requests fit a u64"),
+                        request,
+                    ),
+                    &h.ctx,
+                )
+                .await,
+            );
+            let Err(err) = reply.result else {
+                continue;
+            };
+            assert_ne!(
+                err.message, "this daemon does not implement that request",
+                "a config-pane variant fell through to the wildcard"
+            );
+        }
+    }
+
     /// A handler that answered `Deleted(vec![])` without stopping anything
     /// passes every type-level test and leaves the dog running after `shep
     /// disable` reported success.
@@ -2316,7 +3416,293 @@ mod tests {
         let Ok(Response::DogSection { toml }) = reply.result else {
             panic!("expected DogSection, got {:?}", reply.result)
         };
-        assert!(toml.contains("30s"));
+        assert!(toml.as_str().contains("30s"));
+    }
+
+    /// This door differs from a CLI writing the file directly because it
+    /// publishes: a running dog subscribed to `config.dog.<name>` is the
+    /// only reader that finds out a section moved. Asserted on a
+    /// subscriber rather than the publish call, the way the dog
+    /// contract's own `bark_subscribes_to_its_own_config_topic` does,
+    /// since a publisher that ran proves nothing about what a dog hears.
+    #[tokio::test(start_paused = true)]
+    async fn set_dog_config_writes_the_file_and_a_subscriber_hears_about_it() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        enable_dog(&h.ctx, 1, "bark").await;
+        let mut sub = h.ctx.events.subscribe();
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetDogConfig {
+                        name: "bark".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "bark".to_string()
+            }
+        );
+
+        let text = std::fs::read_to_string(&h.ctx.dogs_config).unwrap();
+        assert!(text.contains("poll = \"30s\""), "{text}");
+
+        // The dog's own spawn narrates itself on the same bus, so the
+        // topic wanted here is not necessarily the first frame waiting.
+        let mut topics = Vec::new();
+        while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await {
+            topics.push(event.to_event().topic().into_owned());
+            if topics
+                .last()
+                .is_some_and(|topic| topic == "config.dog.bark")
+            {
+                break;
+            }
+        }
+        assert!(
+            topics.iter().any(|topic| topic == "config.dog.bark"),
+            "{topics:?}"
+        );
+    }
+
+    /// The dog most in need of configuring is the one that is switched
+    /// off: an operator adopts a dog, sets its webhook, and only then
+    /// enables it. A guard on `supervisor.list()` would refuse exactly
+    /// that dog, and this one has never been started at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_is_adopted_and_never_started_can_still_be_configured() {
+        let mut h = harness(vec![]);
+        h.ctx.known_dogs = KnownDogs::new(["otel".to_string()].into_iter().collect());
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SetDogConfig {
+                        name: "otel".to_string(),
+                        toml: "endpoint = \"http://127.0.0.1:4317\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "otel".to_string()
+            }
+        );
+        let text = std::fs::read_to_string(&h.ctx.dogs_config).unwrap();
+        assert!(text.contains("4317"), "{text}");
+    }
+
+    /// A dog an operator has enabled but that is not up right now
+    /// (crashed, stopped, or simply not spawned on this boot) is still a
+    /// dog whose section this shepherd holds. The harness starts nothing,
+    /// so `bark` is known and absent from the flock.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_that_is_enabled_but_not_running_can_still_be_configured() {
+        let h = harness(vec![]);
+        assert!(h.ctx.supervisor.list().await.is_empty());
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SetDogConfig {
+                        name: "bark".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "bark".to_string()
+            }
+        );
+    }
+
+    /// A dog adopted and enabled since this shepherd started is not in
+    /// the list the CLI handed over at boot (refreshed only by a `shep
+    /// daemon reload`), so a guard that stopped there would refuse a dog
+    /// that is up and answering right now.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_adopted_since_boot_is_reached_through_the_running_flock() {
+        let mut h = harness(vec![ProcScript::never_exits()]);
+        h.ctx.known_dogs = KnownDogs::new(BTreeSet::new());
+        enable_dog(&h.ctx, 1, "bark").await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetDogConfig {
+                        name: "bark".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "bark".to_string()
+            }
+        );
+    }
+
+    /// The boot-time list is a snapshot, so a dog adopted against a running
+    /// shepherd is in neither half of the old guard once it is off the
+    /// flock, and both of these were refused:
+    ///
+    /// - adopt, disable, configure, enable
+    /// - adopt, the dog crashes for want of config, configure
+    ///
+    /// The second is bark's own situation on a fresh install, and
+    /// `docs/dogs.md` promises configure-then-enable works.
+    #[tokio::test(start_paused = true)]
+    async fn a_dog_adopted_since_boot_stays_configurable_once_it_is_disabled() {
+        let mut h = harness(vec![ProcScript::never_exits()]);
+        h.ctx.known_dogs = KnownDogs::new(BTreeSet::new());
+        enable_dog(&h.ctx, 1, "bark").await;
+        let disabled = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::DisableDog {
+                        name: "bark".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(disabled.result.is_ok(), "{:?}", disabled.result);
+        assert!(
+            !h.ctx
+                .supervisor
+                .list()
+                .await
+                .iter()
+                .any(|info| info.name == "bark"),
+            "the flock must not hold it, or the widening answers and the test means nothing"
+        );
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    3,
+                    Request::SetDogConfig {
+                        name: "bark".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        assert_eq!(
+            reply.result.unwrap(),
+            Response::DogConfigSet {
+                name: "bark".to_string()
+            }
+        );
+    }
+
+    /// This is the inverse of the guard every other config door carries:
+    /// `dogs.toml` holds dogs' sections and nothing else, so it has to
+    /// refuse a sheep's name, one nobody registered with it. Refused
+    /// before the file opens, so a mistyped name leaves no stray table
+    /// behind for a dog that will never exist.
+    #[tokio::test(start_paused = true)]
+    async fn setting_a_dogs_config_over_a_sheeps_name_is_refused_and_writes_nothing() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        let started = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::Start {
+                        apps: vec![AppConfig::minimal("web", "./srv")],
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(started.result.is_ok(), "{:?}", started.result);
+        std::fs::write(&h.ctx.dogs_config, "[bark]\npoll = \"60s\"\n").unwrap();
+
+        for (id, name) in [(2, "web"), (3, "ghost")] {
+            let reply = reply_of(
+                dispatch(
+                    envelope(
+                        id,
+                        Request::SetDogConfig {
+                            name: name.to_string(),
+                            toml: "poll = \"30s\"\n".to_string().into(),
+                        },
+                    ),
+                    &h.ctx,
+                )
+                .await,
+            );
+            let Err(err) = reply.result else {
+                panic!("{name} is not a dog and must be refused")
+            };
+            assert_eq!(err.code, RpcErrorCode::NotFound, "{err:?}");
+            assert!(err.message.contains(name), "{err:?}");
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&h.ctx.dogs_config).unwrap(),
+            "[bark]\npoll = \"60s\"\n"
+        );
+    }
+
+    /// `otel` is outside the harness's built-in dogs, so the guard gets past
+    /// `known_dogs` and reaches the running-flock widening, which is the half
+    /// that has to answer on a stopped engine.
+    #[tokio::test]
+    async fn setting_a_dogs_config_against_a_stopped_engine_is_refused_not_a_panic() {
+        let h = harness(vec![]);
+        h.ctx.supervisor.shutdown().await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SetDogConfig {
+                        name: "otel".to_string(),
+                        toml: "poll = \"30s\"\n".to_string().into(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+
+        let Err(err) = reply.result else {
+            panic!("otel is not a known dog and must be refused")
+        };
+        assert_eq!(err.code, RpcErrorCode::NotFound, "{err:?}");
     }
 
     /// Both halves: a filter that excluded dogs outright would leave `shep

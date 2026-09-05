@@ -1,0 +1,18 @@
+---
+source: crates/shep-cli/src/lookout/frames.rs
+expression: render_text(&buffer)
+---
+shep lookout   /home/ada/.shep                                                                            2 in the flock
+  ... 5 above                                                                                                           
+                                                                                                                        
+  [style]                                                                                                               
+  level            full                            shep.toml    the next command reads it                               
+                                                                                                                        
+  [dogs]                                                                                                                
+  space arms, Enter applies; a dog needs no reload                                                                      
+  NAME                                                                IN FILE  SOURCE                    RUNNING        
+  otel                                                                no       /usr/local/bin/shep-otel  online         
+  ledger                                                              yes      /opt/ledger/bin/dog       not running    
+> bark                                                                yes      built-in                  silent         
+                                                                                                                        
+esc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only

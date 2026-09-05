@@ -459,6 +459,14 @@ pub(crate) fn harness_with_runner(
             registry: FlockRegistry::new(),
             snapshot_path: paths.snapshot.clone(),
             dogs_config: paths.dogs_config.clone(),
+            // The two built-in dogs, which is what a `$SHEP_HOME` with
+            // nothing adopted hands a real boot. A test wanting an adopted
+            // name assigns its own set over this one.
+            known_dogs: crate::rpc::KnownDogs::new(
+                ["metrics".to_string(), "bark".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
             paths: paths.clone(),
             daemon_version: "0.1.0".to_string(),
             dog_refusals: crate::dogs::DogRefusals::new(),

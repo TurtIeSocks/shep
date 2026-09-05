@@ -549,6 +549,24 @@ crash or an autorestart respawn still walks into G12 row 5 unannounced. And
 `Child::kill` does not reach descendants, so a probe's grandchild can
 outlive it; closing that needs a process group rather than a patch.
 
+**There are three doors into the override store, not one.** A Flockfile
+load through `Request::ApplyConfig`, described below, is the one that
+existed first and it is the one the rest of this paragraph is about. The
+other two arrived with the lookout config panes: `Request::SetSheepEnv`
+sets or removes one env key, and `Request::SetSheepField` sets one
+non-env field. Both write an operator override directly.
+
+The distinction is not cosmetic and it cost a review round to find. A
+Flockfile load says the TEMPLATE declares this key, so the daemon spends
+any operator override for it, correctly, because a key put back to the
+template is not one an operator is still holding a value for. A pane says
+the OPERATOR sets this key, so the override has to stay: the sheep really
+does still differ from its file. A pane borrowing `ApplyConfig` with
+`--reset=file` and a one-key `declared` set therefore wrote the right value
+and erased the record of it, so the `*` marker built to show operator
+overrides never appeared for the pane's own writes. `SetSheepField` exists
+because of that.
+
 **Config overrides merged on 2026-09-03, and it changes what a Flockfile
 IS.** A Flockfile is a project template committed to the app's repository,
 never written by shep, and what an operator tunes afterwards lives in a
@@ -607,10 +625,14 @@ registered sheep does, and the notice code. `Request::Add` /
 `Response::Added` are additive and did not move `PROTOCOL_VERSION` on
 their own; it later moved to 3 for an unrelated reason, recorded below, and
 the paragraph below applies to `shep add` too. **The fill-in half of
-"register, fill in, start" does not exist yet**: an established `env` key
-today moves only through the file plus `--reset=env` (or `--reset=all`,
-which also drops the override record), and editing one in place is a later
-slice (spec decisions 10 and 11).
+"register, fill in, start" shipped with the config panes**: `shep lookout`'s
+sheep pane sets or removes one `env` key at a time through
+`Request::SetSheepEnv`, and one non-`env` field through
+`Request::SetSheepField`, both behind `--allow-control`. Env stays
+write-only: the pane sets a value and no request ever sends one back, so an
+operator who forgets one reads it from wherever they got it, not from shep.
+Before that slice an established key moved only through the file plus
+`--reset=env` (or `--reset=all`, which also drops the override record).
 
 **Restart the shepherd after upgrading to it.** `PROTOCOL_VERSION` did NOT
 move for `ApplyConfig` itself or for `Add` (both variants are additive, and
@@ -636,6 +658,14 @@ before any request is sent. So the two cases are:
 where an operator reads. `every_exempt_verb_is_one_of_the_documented_recovery_verbs`
 pins `add` at `Enforce`, since it reaches that through the `_` arm rather
 than by being named.
+
+**`PROTOCOL_VERSION` moved to 4 on 2026-09-04.** It went to 3 first, for
+`ApplyConfig`'s payload rename described below, and then to 4 for the four
+requests the lookout config panes needed. The second move is argued in
+`docs/decisions.md` and is the one that broke the additive rule on purpose:
+those four variants are additive, and the rule said not to bump, and skipping
+the bump is what made `ApplyConfig` fail on a dead client rather than a named
+refusal. The paragraph below is about the 3.
 
 **`PROTOCOL_VERSION` moved to 3 on 2026-09-04, for `ApplyConfig`'s payload
 rather than for `ApplyConfig` itself.** The two-case analysis above still

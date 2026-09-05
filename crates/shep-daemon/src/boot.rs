@@ -729,6 +729,22 @@ pub struct BootOptions {
     /// Assembled by the caller from `[daemon] enabled_dogs` and
     /// `[daemon] adopted_dogs`, so shep-daemon never reads `shep.toml` itself.
     pub dogs: Vec<DogSpec>,
+    /// Every dog name this shepherd may hold a section for, running or
+    /// not: the built-in dogs plus every name `[daemon] adopted_dogs`
+    /// records, plus whatever `[daemon] enabled_dogs` names.
+    ///
+    /// Assembled by the caller from the same file [`Self::dogs`] comes out
+    /// of, and for the same reason: shep-daemon never reads `shep.toml`
+    /// itself.
+    ///
+    /// A superset of [`Self::dogs`], and the difference is the whole point
+    /// of carrying both. That one is the spawn list, so it holds only the
+    /// dogs an operator has switched on; this one holds the dogs that
+    /// exist. `Request::SetDogConfig` is guarded on this one, because the
+    /// dog most in need of configuring is the one that is disabled or has
+    /// never started, and a guard on the running set refuses exactly that
+    /// dog.
+    pub known_dogs: Vec<String>,
     /// Wipe the in-memory flock registry before [`RunningDaemon::run`]'s
     /// teardown writes the final muster roll, so that roll describes an empty
     /// flock however the session ended.
@@ -935,6 +951,7 @@ pub async fn boot<R: ProcessRunner>(
         registry,
         snapshot_path: paths.snapshot.clone(),
         dogs_config: paths.dogs_config.clone(),
+        known_dogs: crate::rpc::KnownDogs::new(options.known_dogs.iter().cloned().collect()),
         paths: paths.clone(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         dog_refusals,

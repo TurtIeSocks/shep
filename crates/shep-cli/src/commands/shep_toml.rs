@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
@@ -663,103 +663,11 @@ fn create_home_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// Creates the staging file a config is written through, in `parent` so
-/// the later `rename` stays within one filesystem.
-///
-/// The pair of names stays in this wrapper because
-/// `commands::dog_migration` writes `dogs.toml` through the same staging
-/// name as `shep.toml`, and two call sites spelling it out would drift.
-pub(super) fn create_config_file(parent: &Path) -> std::io::Result<tempfile::NamedTempFile> {
-    shep_core::atomic_file::create_staging_file(parent, "shep", ".toml.tmp")
-}
-
-/// An exclusive advisory lock over one config file, released on drop or by
-/// the kernel if the process dies holding it.
-///
-/// Keyed on the path it is given: [`ShepToml::edit`] locks `shep.toml`,
-/// `commands::dog_migration` locks `dogs.toml`. `shep.toml`'s is always
-/// taken first, to avoid deadlocking the two orderings.
-///
-/// On a sibling `<name>.lock`, never the config itself: [`ShepToml::save`]
-/// renames a new file over the config, so a lock on the config would lock
-/// an inode the next save unlinks. The lock file is never renamed,
-/// rewritten or read, and stays on disk between edits.
-pub(super) struct ConfigLock {
-    /// `flock(2)` is released by this handle's `Drop`. Named with a
-    /// leading underscore because it is held, never read.
-    #[cfg(unix)]
-    _flock: nix::fcntl::Flock<std::fs::File>,
-    /// The lock file, opened with `share_mode(0)`: the same primitive
-    /// [`shep_core::kv`] and [`shep_core::barks`] use.
-    #[cfg(windows)]
-    _handle: std::fs::File,
-}
-
-impl ConfigLock {
-    /// Blocks until this process holds `path`'s lock exclusively.
-    ///
-    /// # Errors
-    /// The lock file could not be created beside `path`, or `flock` failed
-    /// for a reason other than contention (contention blocks rather than
-    /// failing).
-    #[cfg(windows)]
-    pub(super) fn acquire(path: &Path) -> std::io::Result<Self> {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        /// Another handle already holds share access this open denies.
-        const ERROR_SHARING_VIOLATION: i32 = 32;
-        /// How long a contended retry sleeps. The unix arm blocks in the
-        /// kernel; this polls, for the reason `shep_core::kv` documents.
-        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
-
-        let lock_path = lock_path(path);
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .share_mode(0)
-                .open(&lock_path)
-            {
-                Ok(handle) => return Ok(Self { _handle: handle }),
-                Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
-                    std::thread::sleep(RETRY_INTERVAL);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    pub(super) fn acquire(path: &Path) -> std::io::Result<Self> {
-        use nix::fcntl::{Flock, FlockArg};
-
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(shep_core::atomic_file::OWNER_ONLY_FILE_MODE)
-            .open(lock_path(path))?;
-
-        // `LockExclusive` blocks: a `shep enable` waiting its turn behind a
-        // concurrent `shep adopt` is the behaviour wanted here.
-        Flock::lock(file, FlockArg::LockExclusive)
-            .map(|flock| Self { _flock: flock })
-            .map_err(|(_file, errno)| std::io::Error::from(errno))
-    }
-}
-
-/// The lock file that guards `path`: its own name with `.lock` appended,
-/// so it sits in `$SHEP_HOME` next to the config and inherits that
-/// directory's `0700`.
-fn lock_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(".lock");
-    path.parent().unwrap_or_else(|| Path::new(".")).join(name)
-}
+/// `ConfigLock` and `create_config_file` moved to
+/// [`shep_core::config_lock`] so shep-daemon can hold the same lock over
+/// `dogs.toml` shep-cli does; both names still resolve here unchanged for
+/// this crate's own callers.
+pub(super) use shep_core::config_lock::{ConfigLock, create_config_file};
 
 /// What [`ShepToml::edit`] can fail with.
 ///

@@ -59,7 +59,7 @@ pub enum SelectorSpec {
     Regex(String),
     /// By fold name
     Fold(String),
-    // Both field names are wire contract, pinned by `request_wire_v3`.
+    // Both field names are wire contract, pinned by `request_wire_v4`.
     /// By app name and instance slot
     ///
     /// On the wire: `{"kind":"instance","value":{"name":"web","slot":2}}`.
@@ -263,6 +263,119 @@ pub enum Request {
         ///
         /// Spelled `none`/`file`/`env`/`policy` on the wire.
         reset: ResetDepth,
+    },
+    /// One sheep's effective config, for a pane that is about to edit it.
+    ///
+    /// `env` comes back emptied and its key names ride separately, so a
+    /// value never crosses the wire. Read-only: nothing about the sheep
+    /// changes.
+    ///
+    /// Answers [`Response::SheepConfig`], or
+    /// [`RpcErrorCode::NotFound`] when no sheep has that name.
+    SheepConfig {
+        /// The sheep's name, not a selector: a pane edits one sheep, for
+        /// the reason [`Self::Scale`] states at length.
+        name: String,
+    },
+    /// Sets, replaces, or with `None` removes one env key on one sheep,
+    /// recorded as an operator override. Never reads it back.
+    ///
+    /// Its own request rather than a [`Self::ApplyConfig`] depth, because
+    /// no depth does this: `ResetDepth::None` appends only, `File` and
+    /// `Policy` leave env alone, and `Env`/`All` replace the whole map with
+    /// the template's. A pane cannot send the whole map, since it is never
+    /// told the values it would have to send back.
+    ///
+    /// The running child holds the env it was spawned from, so the change
+    /// parks for the next spawn exactly as `ApplyConfig` parks a
+    /// respawn-only field, and `shep reload`/`shep restart` promote it.
+    ///
+    /// Answers [`Response::SheepEnvSet`], or
+    /// [`RpcErrorCode::NotFound`] when no sheep has that name.
+    SetSheepEnv {
+        /// The sheep's name, not a selector, for [`Self::SheepConfig`]'s
+        /// reason.
+        name: String,
+        /// The env key.
+        key: String,
+        /// The value, or `None` to remove the key.
+        ///
+        /// [`EnvValue`], not a bare `String`, for the reason that type's
+        /// own doc gives: this is the most secret-dense field on the wire
+        /// and a derived `Debug` on [`Request`] would print it (IR-41).
+        value: Option<EnvValue>,
+    },
+    /// Sets one config field on one sheep, recorded as an operator
+    /// override.
+    ///
+    /// [`Self::SetSheepEnv`]'s twin for everything that is not `env`, and
+    /// it exists for the reason that one does rather than by symmetry.
+    /// [`Self::ApplyConfig`] can move a single field (one [`DeclaredApp`]
+    /// declaring one key, at [`ResetDepth::File`]), but it moves it as a
+    /// template and spends the operator's override for it. That reasoning
+    /// does not hold here: a pane's value is the operator's, and the sheep
+    /// still differs from its file. Routed through `ApplyConfig`, the `*`
+    /// marker would never appear for that edit.
+    ///
+    /// One field, not a map: a pane edits one row at a time, and a request
+    /// that took several would need [`Response::Applied`]'s per-field
+    /// reporting back again for no caller that wants it.
+    ///
+    /// `env` is refused here and goes through [`Self::SetSheepEnv`]. So are
+    /// `name` and `instances`, which are
+    /// [`ApplyGroup::Structural`](crate::config::ApplyGroup::Structural):
+    /// identity and flock shape rather than runtime knobs, and the count
+    /// moves through [`Self::Scale`].
+    ///
+    /// The four-way apply classification governs exactly as it does for a
+    /// load. A `Live` field is in force at the daemon's next decision, a
+    /// `NextSpawn` field reaches the stored spec, and a `NeedsRespawn`
+    /// field parks for `shep reload` to promote.
+    ///
+    /// Answers [`Response::SheepFieldSet`], or
+    /// [`RpcErrorCode::NotFound`] when no sheep has that name.
+    SetSheepField {
+        /// The sheep's name, not a selector, for [`Self::SheepConfig`]'s
+        /// reason.
+        name: String,
+        /// The [`AppConfig`] field to set. A key that type has no such
+        /// field is refused with [`RpcErrorCode::InvalidConfig`] rather
+        /// than ignored.
+        key: String,
+        /// The new value, in the shape that field serializes as. The daemon
+        /// must re-validate the resulting config (peer input is untrusted)
+        /// and refuses with [`RpcErrorCode::InvalidConfig`] when it does not
+        /// deserialize or does not normalize; nothing is written in either
+        /// case.
+        ///
+        /// A bare [`serde_json::Value`] and not a redacting newtype, unlike
+        /// [`Self::SetSheepEnv`]'s [`EnvValue`], and the asymmetry is
+        /// deliberate. `env` is the one field [`AppConfig`]'s own manual
+        /// `Debug` redacts; `cwd`, `script` and `args` are printed in the
+        /// clear by every request that already carries a whole config
+        /// ([`Self::Start`], [`Self::Add`], [`Self::ApplyConfig`]). A
+        /// newtype here would protect one copy of a value this enum prints
+        /// three other ways, which reads as a guarantee the wire does not
+        /// make. Widening that protection is a change to [`AppConfig`]'s
+        /// `Debug`, not to this field.
+        value: serde_json::Value,
+    },
+    /// Replaces one dog's `[<name>]` section in `dogs.toml` and publishes
+    /// `config.dog.<name>` so a running dog re-reads it.
+    ///
+    /// The writing twin of [`Self::DogConfig`], which reads the same
+    /// section.
+    ///
+    /// Answers [`Response::DogConfigSet`].
+    SetDogConfig {
+        /// The dog's name, the config key.
+        name: String,
+        /// The whole section, as TOML text.
+        ///
+        /// [`DogSectionToml`], not a bare `String`, for the reason that
+        /// type's own doc gives: a section can hold a dog's credentials and
+        /// this is what keeps them out of a `{:?}` (IR-41).
+        toml: DogSectionToml,
     },
     /// Stop matching sheep (stay registered)
     Stop {
@@ -935,6 +1048,9 @@ pub struct LineReply {
 /// out of the process table and out of crash dumps. The manual `Debug`
 /// below prints only a length, since [`Response`] derives `Debug`.
 ///
+/// [`Self::as_str`] is the only way out: a `Deref<Target = str>` would hand
+/// the type `ToString` and defeat that `Debug`.
+///
 /// `#[serde(transparent)]`: the wire representation is a bare `String`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -954,19 +1070,61 @@ impl From<String> for DogSectionToml {
     }
 }
 
-impl core::ops::Deref for DogSectionToml {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
 /// Prints a length, never the section body. Pinned as an exact string by
 /// `dog_section_toml_debug_does_not_leak`.
 impl fmt::Debug for DogSectionToml {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DogSectionToml(<{} bytes>)", self.0.len())
+    }
+}
+
+/// One environment variable's value, on its way to a sheep.
+///
+/// A newtype for one reason, the same one [`DogSectionToml`] exists for: an
+/// env value is the single most secret-dense thing a client can send this
+/// daemon (a database URL, an API token, a signing key), and a derived
+/// `Debug` on [`Request`] would print it in the clear the moment anything
+/// logs a request. Every other secret-bearing field on this wire is already
+/// protected by its inner type ([`AppConfig`]'s own manual `Debug` prints
+/// `env: <N vars>`), and a bare `String` here would have been the first
+/// field in the enum without that protection.
+///
+/// One direction only. Nothing ever sends one back: [`Request::SheepConfig`]
+/// answers with the env keys and no values at all.
+///
+/// [`Self::as_str`] is the only way out, for the reason
+/// [`DogSectionToml`] gives: a `Deref<Target = str>` would hand the type
+/// `ToString` too, and `.to_string()` would return the value in the clear,
+/// defeating the redacted `Debug` below.
+///
+/// `#[serde(transparent)]` makes the wire representation identical to a
+/// bare `String`, so this newtype changes nothing about
+/// [`crate::protocol::PROTOCOL_VERSION`] or the pinned snapshot fixtures.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnvValue(String);
+
+impl EnvValue {
+    /// The value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EnvValue {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// Debug prints a length and never the value (IR-41); see the type doc for
+/// why. Exact-string-tested below (`env_value_debug_does_not_leak`) so a
+/// future `#[derive(Debug)]` fails that test instead of silently reopening
+/// the leak.
+impl fmt::Debug for EnvValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EnvValue(<{} bytes>)", self.0.len())
     }
 }
 
@@ -1054,6 +1212,78 @@ impl SheepApplied {
     }
 }
 
+/// One sheep's effective config as a pane sees it: every field but env's
+/// values, plus which fields an operator has overridden and which are
+/// waiting on a respawn.
+///
+/// The answer to [`Request::SheepConfig`], and the one reply in this module
+/// that carries a whole [`AppConfig`]. [`SheepApplied`] deliberately carries
+/// field names alone, and the difference is what each is for: that one is
+/// printed at an operator who already has the file, this one feeds a pane
+/// that is about to edit fields it has to be able to show first.
+// wire format: changing field names is a breaking change
+//
+// `#[non_exhaustive]`: shep-core is a published library and a sixth field
+// would otherwise break an out-of-tree consumer's construction of this with
+// no version bump to say so (IR-20). [`SheepConfigView::new`] is how the
+// daemon builds one, and it is what enforces the emptied `env`.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheepConfigView {
+    /// The sheep's name.
+    pub name: String,
+    /// The effective config with `env` cleared. Every remaining field is
+    /// operator-supplied policy the pane is about to let them edit, so
+    /// withholding a value would make the pane unusable while protecting
+    /// nothing.
+    pub config: AppConfig,
+    /// The env keys, so the pane can list them. Never the values.
+    pub env_keys: Vec<String>,
+    /// Field names an operator has set that the Flockfile does not declare.
+    pub overridden: Vec<String>,
+    /// Field names parked until the next respawn.
+    pub pending: Vec<String>,
+}
+
+impl SheepConfigView {
+    /// Builds one, clearing `env` and recording its keys.
+    ///
+    /// The clearing happens here rather than at the one call site, so a
+    /// second caller cannot forget it: this constructor is the only way to
+    /// build the type outside this crate, since `#[non_exhaustive]` blocks
+    /// a literal.
+    #[must_use]
+    pub fn new(mut config: AppConfig, overridden: Vec<String>, pending: Vec<String>) -> Self {
+        let env_keys = config.env.keys().cloned().collect();
+        config.env.clear();
+        Self {
+            name: config.name.clone(),
+            config,
+            env_keys,
+            overridden,
+            pending,
+        }
+    }
+}
+
+/// Redacted (IR-41): `config` carries `args` and `cwd`, which routinely hold
+/// a token or a home directory, and this type is what a `{:?}` on a
+/// [`Response`] would print. The three lists are counted rather than named
+/// for the same reason: `env_keys` is a key set, which is itself worth
+/// keeping out of a log.
+impl fmt::Debug for SheepConfigView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SheepConfigView {{ name: {:?}, env_keys: {}, overridden: {}, pending: {} }}",
+            self.name,
+            self.env_keys.len(),
+            self.overridden.len(),
+            self.pending.len()
+        )
+    }
+}
+
 /// One RPC response (pairs with [`Request`] variants)
 ///
 /// Ten variants carry a bare `Vec<ProcessInfo>`. Do not collapse them into
@@ -1096,6 +1326,72 @@ pub enum Response {
     /// Complete where [`Self::Drifted`] is filtered: an app missing from
     /// "what did you do to each of these" looks like one the daemon dropped.
     Applied(Vec<SheepApplied>),
+    /// Answer to `SheepConfig`: one sheep's config with `env` emptied and
+    /// its keys listed beside it.
+    ///
+    /// Boxed, and the only variant here that is. This one carries a whole
+    /// [`AppConfig`], which is several times the size of anything else in
+    /// the enum, and a `Response` is inside a `Reply` which is inside a
+    /// [`ServerFrame`](crate::protocol::ServerFrame): without the box,
+    /// every frame the daemon sends costs the largest config's worth of
+    /// stack for a variant almost none of them use.
+    ///
+    /// The enum-level `#[allow(clippy::large_enum_variant)]` below does not
+    /// cover it, and the difference is the point of that allow's own
+    /// argument: boxing `DogStarted` would be a source break for every
+    /// `Response::DogStarted(info)` in and out of this workspace, where
+    /// this variant has never shipped and so breaks nobody.
+    ///
+    /// `Box<T>` serializes exactly as `T`, so the wire bytes and the pinned
+    /// fixtures are untouched.
+    SheepConfig(Box<SheepConfigView>),
+    /// Answer to `SetSheepEnv`: the key that was set or removed.
+    ///
+    /// Never the value, and never the resulting env map. This reply exists
+    /// to confirm which key moved, and echoing what was just written back
+    /// down a socket would undo the whole point of `SheepConfig` withholding
+    /// it (IR-41).
+    SheepEnvSet {
+        /// The sheep.
+        name: String,
+        /// The key.
+        key: String,
+    },
+    /// Answer to `SetSheepField`: which field moved, and whether the
+    /// running child has it.
+    ///
+    /// Not [`Self::Applied`]'s three lists; the difference is the
+    /// request's own shape. `applied`, `pending` and `refused` exist
+    /// because `ApplyConfig` carries N apps of M fields, so a caller cannot
+    /// otherwise tell which field went where or that one app of eleven was
+    /// refused. This request carries one field of one sheep, so `refused`
+    /// would be a second way to say no beside the `Err` arm (a client
+    /// checking only the `Err` would silently swallow the other), and the
+    /// two lists collapse to the one bit that is left.
+    ///
+    /// That bit is not redundant with the field's own
+    /// [`ApplyGroup`](crate::config::ApplyGroup), which the caller already
+    /// knows. It is the daemon's answer about state a caller cannot see:
+    /// `autostart` is `NextSpawn` and yet reports as in force, because it
+    /// is read at muster rather than at a spawn, and a `Live` field whose
+    /// config subset will not normalize on its own parks instead of
+    /// applying.
+    SheepFieldSet {
+        /// The sheep.
+        name: String,
+        /// The field that moved.
+        key: String,
+        /// `true` when the running child does not have the value yet and
+        /// `shep reload <name>` is what promotes it. A client rendering
+        /// this says so, the same rule [`SheepApplied::pending`] carries.
+        pending: bool,
+    },
+    /// Answer to `SetDogConfig`: the section was written and the topic
+    /// published.
+    DogConfigSet {
+        /// The dog.
+        name: String,
+    },
     /// Answer to `Stop`
     Stopped(Vec<ProcessInfo>),
     /// Answer to `Restart`
@@ -1662,6 +1958,57 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }
 
+    /// Also pins that the newtype protecting this field costs the wire
+    /// nothing: a bare string either way, so no fixture and no protocol
+    /// version moves for it.
+    #[test]
+    fn env_value_debug_does_not_leak() {
+        let request = Request::SetSheepEnv {
+            name: "web".to_string(),
+            key: "DATABASE_URL".to_string(),
+            value: Some("postgres://user:hunter2@localhost/app".to_string().into()),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("EnvValue(<37 bytes>)"), "{debug}");
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            json.contains(r#""value":"postgres://user:hunter2@localhost/app""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+    }
+
+    /// The pane edits everything else about a sheep, so the config itself
+    /// has to travel; `env` is the one map in it that holds secrets, and
+    /// the keys travel while the values never do (IR-41).
+    #[test]
+    fn a_sheep_config_view_never_carries_an_env_value() {
+        let mut config = AppConfig::minimal("web", "./srv");
+        config
+            .env
+            .insert("DB_PASS".to_string(), "hunter2".to_string());
+        let view = SheepConfigView::new(config, Vec::new(), Vec::new());
+        assert!(view.config.env.is_empty());
+        assert_eq!(view.env_keys, ["DB_PASS"]);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
+    }
+
+    /// A `{:?}` on a `Response` reaches it, and `config` holds `args` and
+    /// `cwd` as well as the env keys (IR-41).
+    #[test]
+    fn a_sheep_config_views_debug_is_the_exact_redacted_string() {
+        let mut config = AppConfig::minimal("web", "./srv");
+        config.env.insert("A".to_string(), "1".to_string());
+        let view = SheepConfigView::new(config, vec!["max_restarts".to_string()], Vec::new());
+        assert_eq!(
+            format!("{view:?}"),
+            r#"SheepConfigView { name: "web", env_keys: 1, overridden: 1, pending: 0 }"#
+        );
+    }
+
     #[test]
     fn request_wire_snapshots() {
         let requests = vec![
@@ -1899,8 +2246,60 @@ mod tests {
                     apps: vec![AppConfig::minimal("web", "./srv")],
                 },
             },
+            // The four config-pane requests. `SheepConfig` takes a name
+            // rather than a selector, like `Scale` and `SetSmit` above and
+            // for their reason: a pane edits one sheep.
+            Envelope {
+                id: 28,
+                deadline_ms: None,
+                body: Request::SheepConfig {
+                    name: "web".to_string(),
+                },
+            },
+            // `value` is pinned as `Some`, because the `None` spelling is
+            // what removes the key, and a reader that guessed the two apart
+            // wrongly would delete an operator's env instead of setting it.
+            // The value is a placeholder, not a secret: this is the one
+            // request in the enum that carries an env value at all, and it
+            // travels in one direction only, nothing ever reads it back.
+            Envelope {
+                id: 29,
+                deadline_ms: None,
+                body: Request::SetSheepEnv {
+                    name: "web".to_string(),
+                    key: "DATABASE_URL".to_string(),
+                    value: Some("postgres://localhost/app".to_string().into()),
+                },
+            },
+            // `SetSheepEnv`'s twin for everything that is not `env`, and
+            // pinned beside it: the two are one letter apart in the tag and
+            // a reader that crossed them would write a config field into an
+            // env map. `value` is a bare JSON value rather than a string,
+            // which is the half a hand-written reader gets wrong: an
+            // integer field is an integer here, not `"32"`.
+            Envelope {
+                id: 30,
+                deadline_ms: None,
+                body: Request::SetSheepField {
+                    name: "web".to_string(),
+                    key: "max_restarts".to_string(),
+                    value: serde_json::json!(32),
+                },
+            },
+            // The second request carrying a `DogSectionToml`, and pinned
+            // beside its reader: `DogConfig` asks for a section and this
+            // writes one back, so the two have to agree about the shape a
+            // section takes on the wire.
+            Envelope {
+                id: 31,
+                deadline_ms: None,
+                body: Request::SetDogConfig {
+                    name: "bark".to_string(),
+                    toml: "debounce = \"30s\"\n".to_string().into(),
+                },
+            },
         ];
-        insta::assert_json_snapshot!("request_wire_v3", requests);
+        insta::assert_json_snapshot!("request_wire_v4", requests);
     }
 
     #[test]
@@ -2210,8 +2609,56 @@ mod tests {
                 id: 33,
                 result: Ok(Response::Added(vec![])),
             },
+            // The config pane's answer, and the row that proves its whole
+            // security property: `env` serializes as an empty object while
+            // `env_keys` names the key beside it, so an out-of-tree reader
+            // learns here that a value never travels (IR-41).
+            Reply {
+                id: 34,
+                result: Ok(Response::SheepConfig(Box::new(SheepConfigView::new(
+                    {
+                        let mut config = AppConfig::minimal("web", "./srv");
+                        config
+                            .env
+                            .insert("DATABASE_URL".to_string(), "postgres://x".to_string());
+                        config
+                    },
+                    vec!["max_restarts".to_string()],
+                    vec!["env".to_string()],
+                )))),
+            },
+            // The three acknowledgements. None echoes what was written:
+            // `SheepEnvSet` names the key and not its value, for the reason
+            // the row above pins, `SheepFieldSet` does the same and adds
+            // the one bit the caller cannot derive, and `DogConfigSet`
+            // names the dog and not the section.
+            Reply {
+                id: 35,
+                result: Ok(Response::SheepEnvSet {
+                    name: "web".to_string(),
+                    key: "DATABASE_URL".to_string(),
+                }),
+            },
+            // `pending` pinned `true`, because `false` is the value a reader
+            // that dropped the field entirely would decode by accident, and
+            // the two answers send an operator to different places: one
+            // says the change is in force, the other says to reload.
+            Reply {
+                id: 36,
+                result: Ok(Response::SheepFieldSet {
+                    name: "web".to_string(),
+                    key: "script".to_string(),
+                    pending: true,
+                }),
+            },
+            Reply {
+                id: 37,
+                result: Ok(Response::DogConfigSet {
+                    name: "bark".to_string(),
+                }),
+            },
         ];
-        insta::assert_json_snapshot!("reply_wire_v3", replies);
+        insta::assert_json_snapshot!("reply_wire_v4", replies);
     }
 
     /// Asserts on the JSON, not the struct: a `Vec<String>` cannot say which
@@ -2338,7 +2785,7 @@ mod tests {
             dog_name: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
-        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":3}"#);
+        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":4}"#);
     }
 
     #[test]
@@ -2351,7 +2798,7 @@ mod tests {
         let json = serde_json::to_string(&dog).unwrap();
         assert_eq!(
             json,
-            r#"{"client_version":"0.1.0","protocol":3,"dog_name":"metrics"}"#
+            r#"{"client_version":"0.1.0","protocol":4,"dog_name":"metrics"}"#
         );
         assert_eq!(serde_json::from_str::<Hello>(&json).unwrap(), dog);
     }

@@ -631,6 +631,8 @@ fn ask_version(
 /// Asks `path` for its config schema with [`SCHEMA_FLAG`], and reads the
 /// answer as JSON.
 ///
+/// `pub(crate)`: `shep lookout`'s dog config pane calls this too.
+///
 /// No `Result`: nothing a candidate does to this probe can refuse an adopt.
 /// A failure to spawn arrives as [`DogSchema::Silent`], like a dog that has
 /// never heard of the flag.
@@ -638,7 +640,7 @@ fn ask_version(
 /// The answer is written down by nothing. `cargo install` replaces a dog's
 /// binary with nothing watching, and a stale schema mislabels which field is
 /// a credential.
-fn ask_schema(path: &Path, home: &Path, name: &str, budget: Duration) -> DogSchema {
+pub(crate) fn ask_schema(path: &Path, home: &Path, name: &str, budget: Duration) -> DogSchema {
     // Empty output is a dog with no schema, not a schema that failed to
     // parse: empty input is invalid JSON, so without the guard the ordinary
     // case earns the warning meant for a broken one.

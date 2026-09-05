@@ -55,6 +55,80 @@ pub enum SettingField {
     StyleLevel,
 }
 
+impl SettingField {
+    /// The TOML key, which is also what a [`crate::lookout::field::Field::key`]
+    /// carries for the same scalar.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::LogLevel => "log_level",
+            Self::LogJson => "log_json",
+            Self::Socket => "socket",
+            Self::MaxCronSleep => "max_cron_sleep",
+            Self::AllowControl => "allow_control",
+            Self::StyleLevel => "level",
+        }
+    }
+
+    /// The inverse of [`Self::key`]. `None` for a key no scalar has.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Some(match key {
+            "log_level" => Self::LogLevel,
+            "log_json" => Self::LogJson,
+            "socket" => Self::Socket,
+            "max_cron_sleep" => Self::MaxCronSleep,
+            "allow_control" => Self::AllowControl,
+            "level" => Self::StyleLevel,
+            _ => return None,
+        })
+    }
+}
+
+/// The six scalars as a [`crate::lookout::field::FieldSet`], in the order
+/// the screen has always shown them, grouped by their section.
+///
+/// Hand-built rather than read off a schema, because `shep.toml` has none.
+/// That is the point of the model: it is the common shape, not the schema.
+/// The choices for `log_level` and `level` are the ladders
+/// `Settings::next_candidate` already cycles: `LOG_LEVEL_ORDER` and
+/// `STYLE_LEVEL_ORDER` in `lookout::app`, mapped through each enum's own
+/// string form.
+#[must_use]
+pub fn settings_field_set() -> crate::lookout::field::FieldSet {
+    use crate::lookout::app::{LOG_LEVEL_ORDER, STYLE_LEVEL_ORDER};
+    use crate::lookout::field::{Field, FieldKind, FieldSet};
+
+    let f = |field: SettingField, group: &str, kind: FieldKind| Field {
+        key: field.key().to_owned(),
+        help: field.key().to_owned(),
+        group: Some(group.to_owned()),
+        kind,
+        default: None,
+        secret: false,
+        editable: true,
+    };
+    let log_levels = FieldKind::Choice(
+        LOG_LEVEL_ORDER
+            .iter()
+            .map(|l| l.as_str().to_owned())
+            .collect(),
+    );
+    let style_levels =
+        FieldKind::Choice(STYLE_LEVEL_ORDER.iter().map(ToString::to_string).collect());
+    FieldSet::from_fields(
+        vec![
+            f(SettingField::LogLevel, "[daemon]", log_levels),
+            f(SettingField::LogJson, "[daemon]", FieldKind::Bool),
+            f(SettingField::Socket, "[daemon]", FieldKind::Text),
+            f(SettingField::MaxCronSleep, "[daemon]", FieldKind::Text),
+            f(SettingField::AllowControl, "[whistle]", FieldKind::Bool),
+            f(SettingField::StyleLevel, "[style]", style_levels),
+        ],
+        &["[daemon]", "[whistle]", "[style]"],
+    )
+}
+
 /// One edit, ready to apply
 ///
 /// `Debug` is derived, not redacted: none of the six scalars this reaches
@@ -353,10 +427,66 @@ fn parse_bool_field(value: &str) -> Result<bool, SettingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lookout::field::FieldKind;
 
     /// The style pair every test that does not care about `[style]` uses.
     fn style_fixture() -> (StyleLevel, StyleSource) {
         (StyleLevel::Full, StyleSource::Config)
+    }
+
+    #[test]
+    fn every_setting_field_round_trips_through_its_key() {
+        for field in [
+            SettingField::LogLevel,
+            SettingField::LogJson,
+            SettingField::Socket,
+            SettingField::MaxCronSleep,
+            SettingField::AllowControl,
+            SettingField::StyleLevel,
+        ] {
+            assert_eq!(SettingField::from_key(field.key()), Some(field));
+        }
+        assert_eq!(SettingField::from_key("no_such_key"), None);
+    }
+
+    #[test]
+    fn the_settings_field_set_lists_the_six_scalars_in_the_screens_fixed_order() {
+        let set = settings_field_set();
+        let keys: Vec<&str> = set.fields().iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "log_level",
+                "log_json",
+                "socket",
+                "max_cron_sleep",
+                "allow_control",
+                "level"
+            ]
+        );
+        let mut groups: Vec<&str> = Vec::new();
+        for field in set.fields() {
+            let group = field
+                .group
+                .as_deref()
+                .expect("every scalar names a section");
+            if groups.last() != Some(&group) {
+                groups.push(group);
+            }
+        }
+        assert_eq!(groups, ["[daemon]", "[whistle]", "[style]"]);
+    }
+
+    #[test]
+    fn the_cycled_scalars_are_choices_and_the_typed_ones_are_text() {
+        let set = settings_field_set();
+        assert!(matches!(
+            set.by_key("log_level").unwrap().kind,
+            FieldKind::Choice(_)
+        ));
+        assert_eq!(set.by_key("log_json").unwrap().kind, FieldKind::Bool);
+        assert_eq!(set.by_key("socket").unwrap().kind, FieldKind::Text);
+        assert_eq!(set.by_key("max_cron_sleep").unwrap().kind, FieldKind::Text);
     }
 
     fn socket_default_fixture() -> PathBuf {

@@ -232,8 +232,9 @@ const store = `$ cat $SHEP_HOME/overrides.json
     <h2>The CFG column</h2>
     <p>
       <code>!1</code> in <code>CFG</code> means one field is parked on this
-      sheep. <code>*1</code> would mean one field an operator set that the
-      current Flockfile does not declare, and <code>-</code> means neither.
+      sheep. <code>*1</code> means one field an operator has taken ownership
+      of, whether or not the current Flockfile declares it, and
+      <code>-</code> means neither.
       It is a count rather than a list because the cell is three characters
       wide; <code>shep describe</code> is where the names are:
     </p>
@@ -443,16 +444,27 @@ const store = `$ cat $SHEP_HOME/overrides.json
       They are the record of what the Flockfile has established, kept so a
       later load can tell "the file used to say this and no longer does"
       apart from "the file never mentioned it". <code>fields</code> is the
-      other half: settings an operator has that the current file does not
-      declare, which is what a <code>*N</code> in <code>CFG</code> counts.
+      other half: settings an operator has taken ownership of, whether or
+      not the current file declares them, which is what a <code>*N</code> in
+      <code>CFG</code> counts.
     </p>
-    <Callout variant="note">
-      The verb that sets one field on a running sheep is not in this
-      release, so <code>fields</code> is empty in practice today and
-      <code>CFG</code> reads <code>!N</code> or <code>-</code>. The merge
-      already honours the half of the store that verb will write; what is
-      missing is the door.
-    </Callout>
+    <p>
+      The door that writes <code>fields</code> is
+      <a href="/docs/lookout">the config pane</a>: <code>e</code> on a sheep
+      in <code>shep lookout</code>, behind <code>--allow-control</code>. One
+      key at a time, and the value is recorded as yours rather than spent,
+      so the key keeps its <code>*</code> and a later <code>shep start</code>
+      of the app's Flockfile leaves it alone. There is no flag on
+      <code>shep start</code> that sets one field: a load is a template
+      arriving through a pull request, and an operator's own value is not a
+      thing a template says.
+    </p>
+    <p class="fine">
+      A pane edit is not a <code>--reset=file</code> at one key, which is
+      what it used to send. That merge is a template load, so it moved the
+      field correctly and then dropped the override for it, and the
+      <code>*</code> the operator had just earned never appeared.
+    </p>
     <p class="fine">
       A store carrying a version number higher than this shep understands is
       refused rather than read or rewritten. It holds an operator's live

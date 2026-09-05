@@ -136,12 +136,16 @@ pub fn spawn_cron_worker(
                         | SupervisorError::FlushFailed(_)
                         | SupervisorError::ReloadInFlight(_)
                         | SupervisorError::InvalidScale(_)
-                        | SupervisorError::CannotStart(_)),
+                        | SupervisorError::CannotStart(_)
+                        | SupervisorError::IsADog(_)
+                        | SupervisorError::InvalidEnv(_)
+                        | SupervisorError::InvalidField(_)
+                        | SupervisorError::Overrides(_)),
                     ) => {
-                        // Named rather than a catch-all: a restart touches
-                        // no log files, starts no reload, scales nothing
-                        // and registers no batch, so a variant this path
-                        // can produce still fails to compile if added.
+                        // None of these nine can arrive here. A restart
+                        // writes no logs, reloads nothing, scales nothing,
+                        // and names no dog, field or override. Named rather
+                        // than a catch-all, so a new variant fails to compile.
                         tracing::warn!(name, %err, "cron-triggered restart reported an unrelated failure");
                     }
                     Err(err @ SupervisorError::EngineStopped) => {

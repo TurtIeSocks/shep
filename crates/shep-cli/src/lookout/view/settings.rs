@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use super::super::app::{App, Settings, SettingsRow};
 use super::super::theme::Palette;
 use super::flock::{fit, mark};
+use super::scroll::Attempt;
 use crate::commands::settings::{ScalarView, SettingField, SettingsSnapshot};
 use crate::style::StyleSource;
 use crate::vocabulary::Reported;
@@ -279,14 +280,7 @@ fn scalar_view(snapshot: &SettingsSnapshot, field: SettingField) -> &ScalarView 
 /// `pub(super)`: `status::status_line` names the field being typed with
 /// this same word, so the status bar and body pane agree.
 pub(super) const fn field_label(field: SettingField) -> &'static str {
-    match field {
-        SettingField::LogLevel => "log_level",
-        SettingField::LogJson => "log_json",
-        SettingField::Socket => "socket",
-        SettingField::MaxCronSleep => "max_cron_sleep",
-        SettingField::AllowControl => "allow_control",
-        SettingField::StyleLevel => "level",
-    }
+    field.key()
 }
 
 /// What applying this field costs. `log_level`, `log_json` and
@@ -423,7 +417,7 @@ fn scalar_widths(width: u16, columns: &[ScalarColumn]) -> (u16, u16) {
 /// One scalar cell's text.
 fn scalar_cell(field: SettingField, view: &ScalarView, column: ScalarColumn) -> String {
     match column {
-        ScalarColumn::Name => field_label(field).to_string(),
+        ScalarColumn::Name => field_label(field).to_owned(),
         ScalarColumn::Value => view.value.clone(),
         ScalarColumn::Source => view.source.to_string(),
         ScalarColumn::Cost => apply_cost(field, view.source).to_string(),
@@ -457,15 +451,12 @@ fn scalar_line(
 }
 
 /// Which `[section]` a scalar field's row lives under.
-const fn section_for(field: SettingField) -> &'static str {
-    match field {
-        SettingField::LogLevel
-        | SettingField::LogJson
-        | SettingField::Socket
-        | SettingField::MaxCronSleep => "[daemon]",
-        SettingField::AllowControl => "[whistle]",
-        SettingField::StyleLevel => "[style]",
-    }
+fn section_for(settings: &Settings, field: SettingField) -> &str {
+    settings
+        .fields()
+        .by_key(field.key())
+        .and_then(|f| f.group.as_deref())
+        .unwrap_or("")
 }
 
 /// Every line of the screen's body, top to bottom: `[daemon]`'s four rows,
@@ -477,92 +468,282 @@ const fn section_for(field: SettingField) -> &'static str {
 ///
 /// Takes `app` as well as `settings`: [`dog_rows`] needs the live flock,
 /// which lives on `App`, not on `Settings`.
+///
+/// `height` is the body's row budget; zero means unlimited, for a test
+/// with no real terminal. [`Viewport`] scrolls in data rows while height
+/// counts lines, so its offset is only a starting point: this walks
+/// forward from it until the cursor's row fits, through
+/// [`super::scroll::to_cursor`], shared with the config pane.
+///
+/// [`cursor_only`] is that walk's last resort, for a body too short for
+/// even one row's own chrome.
+///
+/// [`Viewport`]: crate::lookout::viewport::Viewport
 fn content_lines(
     app: &App,
     settings: &Settings,
     palette: Palette,
     width: u16,
+    height: u16,
 ) -> Vec<Line<'static>> {
+    let total_rows = settings.rows().len();
+    let cursor_row = settings.view().cursor().min(total_rows.saturating_sub(1));
+    let budget = if height == 0 {
+        usize::MAX
+    } else {
+        usize::from(height)
+    };
+    // Six scalars are unconditional, so an empty screen is unreachable
+    // today. Handled rather than indexed on faith, because the fallback
+    // below has a row to draw and this does not.
+    if total_rows == 0 {
+        return body_from(app, settings, palette, width, budget, 0).lines;
+    }
+    super::scroll::to_cursor(
+        cursor_row,
+        settings.view().offset(),
+        |offset| body_from(app, settings, palette, width, budget, offset),
+        || cursor_only(app, settings, palette, width, budget, cursor_row),
+    )
+}
+
+/// The cursor's own row, alone, for a body too short to hold the chrome
+/// that row's section costs.
+///
+/// The last resort, reached only when every offset down to the cursor's own
+/// left it undrawn. `MIN_HEIGHT` is six rows, four of body, and a dog row
+/// needs the blank line, the `[dogs]` header, the caption and the column
+/// header above it before it may be drawn at all: six lines for one row.
+/// A screen that declares a minimum height should draw something at it,
+/// and the selected row is the something.
+///
+/// Markers are added around it while they fit, the cursor's row first: it
+/// is the one line this function exists to guarantee.
+fn cursor_only(
+    app: &App,
+    settings: &Settings,
+    palette: Palette,
+    width: u16,
+    budget: usize,
+    cursor_row: usize,
+) -> Vec<Line<'static>> {
+    let rows = settings.rows();
+    let table_width = body_width(width);
+    let mut lines = Vec::new();
+    match rows.get(cursor_row) {
+        Some(SettingsRow::Scalar(field)) => lines.push(scalar_line(
+            *field,
+            scalar_view(settings.snapshot(), *field),
+            true,
+            table_width,
+        )),
+        Some(SettingsRow::Dog(index)) => {
+            let dogs = dog_rows(app, table_width);
+            if let Some(dog) = dogs.get(*index) {
+                lines.push(dog_line(dog, columns_for(table_width), table_width, true));
+            }
+        }
+        None => {}
+    }
+
+    let hidden_below = rows.len().saturating_sub(cursor_row + 1);
+    if cursor_row > 0 && lines.len() < budget {
+        lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!("  ... {cursor_row} above"),
+                palette.muted(),
+            )),
+        );
+    }
+    if hidden_below > 0 && lines.len() < budget {
+        lines.push(Line::from(Span::styled(
+            format!("  ... {hidden_below} below"),
+            palette.muted(),
+        )));
+    }
+    lines
+}
+
+/// Lays the body out from data row `offset`, spending at most `budget`
+/// lines.
+///
+/// Every line pushed is counted, including the ones no data row owns. The
+/// `... N above` marker and the `... N below` marker are both reserved for
+/// before a row is admitted rather than appended afterwards, so a height
+/// that binds cuts a row instead of cutting the sentence that says a row
+/// was cut.
+fn body_from(
+    app: &App,
+    settings: &Settings,
+    palette: Palette,
+    width: u16,
+    budget: usize,
+    offset: usize,
+) -> Attempt {
     let snapshot = settings.snapshot();
     let cursor = settings.cursor();
+    let rows = settings.rows();
+    let total_rows = rows.len();
+    let cursor_row = settings.view().cursor().min(total_rows.saturating_sub(1));
+    // The `... N above` marker is inserted at the top once everything under
+    // it is laid out, so its line is held back from the very first check.
+    let above = usize::from(offset > 0);
+    // Whether a row at `index` still leaves room for `need` more lines. The
+    // `... N below` marker is only owed when a row follows this one: a row
+    // that fills the last line and has nothing under it needs no marker.
+    let room = |taken: usize, need: usize, index: usize| {
+        taken + need + above + usize::from(index + 1 < total_rows) <= budget
+    };
 
-    let mut lines = Vec::new();
-    let mut current_section: Option<&'static str> = None;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_section: Option<&str> = None;
+    // A section's header, and the blank line ahead of it for every
+    // section after the first, held here rather than pushed straight
+    // away: pushed alongside the first row of its section that survives
+    // the offset skip, so the view still names a section it opens in.
+    let mut pending_header: Vec<Line<'static>> = Vec::new();
+    let mut drawn = 0usize;
+    let mut row_index = 0usize;
+    let mut full = false;
 
     // The scalar rows sort first in `Settings::rows`, ahead of every
     // `SettingsRow::Dog`, so `break` here stops once the scalars end.
-    for row in settings.rows() {
+    for row in rows.iter().copied() {
         let SettingsRow::Scalar(field) = row else {
             break;
         };
-        let section = section_for(field);
+        let index = row_index;
+        row_index += 1;
+        let section = section_for(settings, field);
         if current_section != Some(section) {
+            let mut header = Vec::new();
             if current_section.is_some() {
-                lines.push(Line::default());
+                header.push(Line::default());
             }
-            lines.push(section_header(section, palette));
+            header.push(section_header(section, palette));
+            pending_header = header;
             current_section = Some(section);
         }
+        if index < offset {
+            continue;
+        }
+        if !room(lines.len(), pending_header.len() + 1, index) {
+            full = true;
+            break;
+        }
+        lines.append(&mut pending_header);
         lines.push(scalar_line(
             field,
             scalar_view(snapshot, field),
             cursor == Some(row),
             body_width(width),
         ));
+        drawn += 1;
     }
-    lines.push(Line::default());
 
-    lines.push(section_header("[dogs]", palette));
     // `body_width`, not `width`: every line below draws `mark`'s own two
     // columns before its first cell.
     let table_width = body_width(width);
-    // fitted: the caption is 48 columns and the screen draws from
-    // `view::MIN_TERM_WIDTH` (33) up.
-    lines.push(Line::from(Span::styled(
-        format!("  {}", fit(DOGS_CAPTION, table_width)),
-        palette.muted(),
-    )));
-    let rendered_columns = columns_for(table_width);
-    lines.push(dog_header_line(rendered_columns, table_width, palette));
-    for (index, dog) in dog_rows(app, table_width).iter().enumerate() {
-        let selected = cursor == Some(SettingsRow::Dog(index));
-        lines.push(dog_line(dog, rendered_columns, table_width, selected));
+    if !full {
+        let mut dogs_header = vec![Line::default(), section_header("[dogs]", palette)];
+        // fitted: the caption is 48 columns and the screen draws from
+        // `view::MIN_TERM_WIDTH` (33) up.
+        dogs_header.push(Line::from(Span::styled(
+            format!("  {}", fit(DOGS_CAPTION, table_width)),
+            palette.muted(),
+        )));
+        let rendered_columns = columns_for(table_width);
+        dogs_header.push(dog_header_line(rendered_columns, table_width, palette));
+
+        let dogs = dog_rows(app, table_width);
+        if dogs.is_empty() {
+            // Nothing to gate a header this function will never draw
+            // otherwise: the empty flock still gets to say "[dogs]", same
+            // as `flock::render_table`'s own header for an empty payload.
+            if lines.len() + dogs_header.len() + above <= budget {
+                lines.append(&mut dogs_header);
+            }
+        } else {
+            let mut pending_dogs_header = dogs_header;
+            for (index, dog) in dogs.iter().enumerate() {
+                let global_index = row_index + index;
+                if global_index < offset {
+                    continue;
+                }
+                if !room(lines.len(), pending_dogs_header.len() + 1, global_index) {
+                    break;
+                }
+                lines.append(&mut pending_dogs_header);
+                let selected = cursor == Some(SettingsRow::Dog(index));
+                lines.push(dog_line(dog, rendered_columns, table_width, selected));
+                drawn += 1;
+            }
+        }
+    }
+
+    // Counted off what this pass actually drew, not off `Viewport`'s own
+    // arithmetic: the viewport hides rows against a line budget it cannot
+    // see spent, so its answer and this one disagree once the chrome costs
+    // anything.
+    let hidden_below = total_rows.saturating_sub(offset + drawn);
+    if hidden_below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ... {hidden_below} below"),
+            palette.muted(),
+        )));
+    }
+    if offset > 0 {
+        lines.insert(
+            0,
+            Line::from(Span::styled(
+                format!("  ... {offset} above"),
+                palette.muted(),
+            )),
+        );
     }
 
     // One prompt line under the table, echoing the status bar's Slot 1
     // (`view::status::status_line`): `attention` styled while it waits on
-    // `Enter`, an in-flight sentence once it has gone out.
-    if let Some(prompt) = settings.pending() {
-        lines.push(Line::default());
-        let text = if prompt.sent {
-            format!("{}  sent, waiting for the shepherd", prompt.text)
-        } else {
-            format!("{}  enter confirms, any other key cancels", prompt.text)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  {}", fit(&text, table_width)),
-            palette.attention(),
-        )));
-    } else if let Some((field, buffer)) = settings.typing() {
-        // The cursor is a character, not a style: the ANSI gallery renders
-        // foregrounds only, so a reversed cell would come out unstyled.
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {}",
-                fit(
-                    &format!(
-                        "editing {}: {buffer}\u{258f}   enter applies   esc cancels",
-                        field_label(*field)
-                    ),
-                    table_width,
-                )
-            ),
-            palette.attention(),
-        )));
+    // `Enter`, an in-flight sentence once it has gone out. Both branches
+    // cost two lines, so neither is pushed unless the budget has them.
+    if lines.len() + 2 <= budget {
+        if let Some(prompt) = settings.pending() {
+            lines.push(Line::default());
+            let text = if prompt.sent {
+                format!("{}  sent, waiting for the shepherd", prompt.text)
+            } else {
+                format!("{}  enter confirms, any other key cancels", prompt.text)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {}", fit(&text, table_width)),
+                palette.attention(),
+            )));
+        } else if let Some((field, buffer)) = settings.typing() {
+            // The cursor is a character, not a style: the ANSI gallery
+            // renders foregrounds only, so a reversed cell would come out
+            // unstyled.
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}",
+                    fit(
+                        &format!(
+                            "editing {}: {buffer}\u{258f}   enter applies   esc cancels",
+                            field_label(*field)
+                        ),
+                        table_width,
+                    )
+                ),
+                palette.attention(),
+            )));
+        }
     }
 
-    lines
+    Attempt {
+        cursor_drawn: drawn > 0 && (offset..offset + drawn).contains(&cursor_row),
+        lines,
+    }
 }
 
 /// Draws the settings screen into `area`, straight into `buffer`.
@@ -575,7 +756,7 @@ pub fn draw_settings(app: &App, settings: &Settings, area: Rect, buffer: &mut Bu
         return;
     }
     let palette = app.palette();
-    for (offset, line) in content_lines(app, settings, palette, area.width)
+    for (offset, line) in content_lines(app, settings, palette, area.width, area.height)
         .iter()
         .enumerate()
         .take(usize::from(area.height))
@@ -628,7 +809,7 @@ mod tests {
         let settings = app.settings().unwrap();
         let palette = app.palette();
         for width in (DOG_MIN_WIDTH + GUTTER)..=200 {
-            let rendered: Vec<String> = content_lines(&app, settings, palette, width)
+            let rendered: Vec<String> = content_lines(&app, settings, palette, width, 0)
                 .iter()
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect();
@@ -671,7 +852,7 @@ mod tests {
         let settings = app.settings().unwrap();
         let palette = app.palette();
         for width in super::super::MIN_TERM_WIDTH..=200 {
-            for line in content_lines(&app, settings, palette, width) {
+            for line in content_lines(&app, settings, palette, width, 0) {
                 let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 assert!(
                     visible_width(&rendered) <= usize::from(width),
@@ -695,7 +876,7 @@ mod tests {
         let app = fixtures::app_in_settings();
         let settings = app.settings().unwrap();
         let palette = app.palette();
-        let lines = content_lines(&app, settings, palette, 120);
+        let lines = content_lines(&app, settings, palette, 120, 0);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -705,6 +886,135 @@ mod tests {
         assert!(
             marked[0].contains("log_level"),
             "the cursor opens on the first row: {rendered:?}"
+        );
+    }
+
+    /// The body as strings, at the height the terminal really has.
+    fn body_at(app: &App, height: u16) -> Vec<String> {
+        let settings = app.settings().unwrap();
+        content_lines(app, settings, app.palette(), 120, height)
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect()
+    }
+
+    /// `Viewport` scrolls in data rows while the height it is handed counts
+    /// lines, so the section headers, blank separators, `[dogs]` caption
+    /// and dog column header all have to be counted here too.
+    #[test]
+    fn a_short_terminal_scrolls_and_says_what_it_hid() {
+        let mut app = fixtures::app_in_settings();
+        let height = 10;
+        app.note_body_rows(height);
+        // Walk to the last row. Six scalars plus however many dogs the
+        // fixture carries; `SelectLast` lands on the last one whatever the
+        // count.
+        app.update(Msg::Key(KeyPress::SelectLast));
+        let text = body_at(&app, height);
+        assert!(
+            text.len() <= usize::from(height),
+            "the body fits the height it was given: {text:?}"
+        );
+        assert!(text[0].contains("above"), "{text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("[dogs]")),
+            "the visible section is labelled"
+        );
+        assert_eq!(
+            text.iter().filter(|l| l.starts_with('>')).count(),
+            1,
+            "the cursor's own row is drawn: {text:?}"
+        );
+        let settings = app.settings().unwrap();
+        assert_eq!(settings.view().cursor(), settings.rows().len() - 1);
+        // `Viewport` sees ten rows of room for nine rows of data and scrolls
+        // nothing. The scroll in the frame above is the renderer's, which is
+        // the only layer that knows what the chrome costs.
+        assert_eq!(settings.view().offset(), 0);
+    }
+
+    /// The whole screen at `height`, through the same `note_body_rows` and
+    /// `draw` the event loop runs before every frame.
+    fn screen_at(app: &mut App, height: u16) -> String {
+        let area = Rect::new(0, 0, 120, height);
+        app.note_body_rows(super::super::body_rows(area));
+        let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+        terminal
+            .draw(|frame| super::super::draw(app, frame))
+            .unwrap();
+        render_text(terminal.backend().buffer())
+    }
+
+    /// How many rows the frame marks as selected. One, always.
+    fn marked(text: &str) -> usize {
+        text.lines().filter(|line| line.starts_with('>')).count()
+    }
+
+    /// Six is `view::MIN_HEIGHT`: four lines of body, where a dog row
+    /// costs six lines to draw in place and falls back to drawing alone.
+    #[test]
+    fn the_cursor_survives_every_step_of_a_walk_down_and_back_up() {
+        for height in [6u16, 7, 8, 10, 14, 20] {
+            let mut app = fixtures::app_in_settings_with_dog_drift();
+            let total = app.settings().unwrap().rows().len();
+            for step in 0..=total {
+                let text = screen_at(&mut app, height);
+                assert_eq!(marked(&text), 1, "{height} rows, {step} down:\n{text}");
+                app.update(Msg::Key(KeyPress::SelectDown));
+            }
+            for step in 0..=total {
+                let text = screen_at(&mut app, height);
+                assert_eq!(marked(&text), 1, "{height} rows, {step} up:\n{text}");
+                app.update(Msg::Key(KeyPress::SelectUp));
+            }
+        }
+    }
+
+    /// `settings_short` exercises this only in its mild form: it opens at
+    /// `[style]`, whose one row is the section, so the header sits where it
+    /// would anyway. This opens inside `[daemon]`, three rows past that
+    /// header, which still has to be drawn.
+    #[test]
+    fn a_window_opening_mid_section_still_draws_the_header_it_scrolled_past() {
+        let mut app = fixtures::app_in_settings_on(SettingField::MaxCronSleep);
+        let text = screen_at(&mut app, 6);
+        let body: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert!(
+            body.iter().any(|line| line.trim() == "[daemon]"),
+            "the section above the window is named: {text}"
+        );
+        assert!(
+            !text.contains("log_level"),
+            "and the rows between its header and the window are gone: {text}"
+        );
+        assert_eq!(marked(&text), 1, "{text}");
+        assert!(
+            body.iter().any(|line| line.starts_with("> max_cron_sleep")),
+            "the marked row is the cursor's: {text}"
+        );
+    }
+
+    /// The marker is pushed last, so a clip drops it first before it can
+    /// say anything was cut.
+    #[test]
+    fn the_below_marker_survives_the_height_that_made_it_necessary() {
+        let mut app = fixtures::app_in_settings();
+        let height = 6;
+        app.note_body_rows(height);
+        // Cursor left on the first row, so everything hidden is hidden
+        // below it.
+        let text = body_at(&app, height);
+        assert!(
+            text.len() <= usize::from(height),
+            "the body fits the height it was given: {text:?}"
+        );
+        assert!(
+            text.last().is_some_and(|l| l.contains("below")),
+            "the last line says how many rows were cut: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.starts_with("> log_level")),
+            "the cursor's own row is drawn: {text:?}"
         );
     }
 
@@ -728,7 +1038,7 @@ mod tests {
     fn the_style_cost_cell_stops_promising_the_next_command_when_it_is_outranked() {
         let app = fixtures::app_in_settings_with_shadowed_style(StyleSource::Env);
         let settings = app.settings().unwrap();
-        let lines = content_lines(&app, settings, app.palette(), 120);
+        let lines = content_lines(&app, settings, app.palette(), 120, 0);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -751,7 +1061,7 @@ mod tests {
         let _ = app.update(Msg::Key(KeyPress::Confirm));
         let settings = app.settings().unwrap();
         let palette = app.palette();
-        let lines = content_lines(&app, settings, palette, 120);
+        let lines = content_lines(&app, settings, palette, 120, 0);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())

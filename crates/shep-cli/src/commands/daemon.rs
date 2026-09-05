@@ -260,6 +260,21 @@ pub fn boot_options(
                 }
             })
             .collect(),
+        // Every dog that EXISTS, which is not the list above: that one is
+        // the spawn order and holds only what an operator switched on.
+        // `Request::SetDogConfig` is guarded on this one, because the dog
+        // most in need of configuring is the one that is disabled or has
+        // never started. The same two sources `fail_enable_unknown_dog`
+        // calls valid names, plus `enabled_dogs` itself, so a name a
+        // hand-edited `shep.toml` enables without adopting is still a dog
+        // this shepherd tries to spawn and still one it may hold a section
+        // for.
+        known_dogs: crate::dog::BUILT_IN_DOGS
+            .iter()
+            .map(|built_in| (*built_in).to_string())
+            .chain(config.daemon.adopted_dogs.keys().cloned())
+            .chain(config.daemon.enabled_dogs.iter().cloned())
+            .collect(),
         // Overwritten by `boot_supervisor`, the only caller that ever wants
         // `true`.
         delete_flock_on_shutdown: false,
@@ -978,6 +993,39 @@ otel = "/usr/local/bin/shep-otel"
                     }
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn boot_options_know_every_dog_that_exists_and_not_only_the_enabled_ones() {
+        let src = r#"
+[daemon]
+enabled_dogs = ["metrics"]
+
+[daemon.adopted_dogs]
+otel = "/usr/local/bin/shep-otel"
+"#;
+        let config = DaemonConfig::load(Some(src), &|_| None).unwrap();
+        let opts = boot_options(
+            &config,
+            &DaemonArgs {
+                cmd: None,
+                no_restore: false,
+                foreground: false,
+                log_json: None,
+                log_level: None,
+                socket: None,
+                max_cron_sleep: None,
+            },
+            None,
+        );
+
+        let known: std::collections::BTreeSet<&str> =
+            opts.known_dogs.iter().map(String::as_str).collect();
+        assert_eq!(
+            known,
+            ["bark", "metrics", "otel"].into_iter().collect(),
+            "adopted-and-disabled is the case this field exists for"
         );
     }
 

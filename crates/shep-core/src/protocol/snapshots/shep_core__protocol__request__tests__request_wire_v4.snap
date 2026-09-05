@@ -394,5 +394,42 @@ expression: requests
         }
       ]
     }
+  },
+  {
+    "id": 28,
+    "deadline_ms": null,
+    "body": {
+      "kind": "sheep_config",
+      "name": "web"
+    }
+  },
+  {
+    "id": 29,
+    "deadline_ms": null,
+    "body": {
+      "kind": "set_sheep_env",
+      "name": "web",
+      "key": "DATABASE_URL",
+      "value": "postgres://localhost/app"
+    }
+  },
+  {
+    "id": 30,
+    "deadline_ms": null,
+    "body": {
+      "kind": "set_sheep_field",
+      "name": "web",
+      "key": "max_restarts",
+      "value": 32
+    }
+  },
+  {
+    "id": 31,
+    "deadline_ms": null,
+    "body": {
+      "kind": "set_dog_config",
+      "name": "bark",
+      "toml": "debounce = \"30s\"\n"
+    }
   }
 ]

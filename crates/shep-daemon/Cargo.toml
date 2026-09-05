@@ -43,6 +43,11 @@ serde_json.workspace = true
 # the workspace entry because shep-core needs it to produce the table in the
 # first place; this crate only writes one back out.
 toml.workspace = true
+# `dogs::set_dog_section`'s read-modify-write of `dogs.toml`: the file is
+# hand-editable on purpose, so the daemon edits the document it read rather
+# than rendering a parsed map back out, and a comment or a key order an
+# operator chose survives.
+toml_edit.workspace = true
 # DateTime<Utc> for the Clock seam (cron.rs): cron means wall time, which is
 # not the same clock as tokio::time's paused Instant.
 chrono.workspace = true

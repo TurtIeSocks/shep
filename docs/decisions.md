@@ -25,7 +25,7 @@ go for the full argument. The commit that removed them names itself.
 - [The log plane](#the-log-plane) (6)
 - [Reload](#reload) (9)
 - [Custom actions and the shepherd channel](#custom-actions-and-the-shepherd-channel) (9)
-- [The pm2 cutover](#the-pm2-cutover) (17)
+- [The pm2 cutover](#the-pm2-cutover) (18)
 - [Dogs](#dogs) (31)
 - [Audit debt](#audit-debt) (11)
 - [The Phase 11 verbs and the KV store](#the-phase-11-verbs-and-the-kv-store) (23)
@@ -34,7 +34,11 @@ go for the full argument. The commit that removed them names itself.
 - [Config and packaging](#config-and-packaging) (5)
 - [serve, dev and runtime](#serve-dev-and-runtime) (8)
 - [Output and first run](#output-and-first-run) (7)
-- [Config overrides](#config-overrides) (8)
+- [Config overrides](#config-overrides) (9)
+- [Dog config store](#dog-config-store) (1)
+- [CI flakes, and the log line a stop could lose](#ci-flakes-and-the-log-line-a-stop-could-lose) (4)
+- [CI and releases](#ci-and-releases) (2)
+- [Config pane writes](#config-pane-writes) (1)
 
 ## Core types and the daemon's shape
 
@@ -1759,6 +1763,18 @@ The entry above was right about `ApplyConfig` itself: the variant is additive, a
 
 `verified crates/shep-core/src/protocol/mod.rs (PROTOCOL_VERSION = 3) and the request_wire snapshot renamed from v2 to v3`
 
+### PROTOCOL_VERSION moved to 4 for three additive variants, against the rule the entry above set
+
+`Request` gained `SheepConfig`, `SetSheepEnv` and `SetDogConfig`, and `Response` gained their three answers. All six are additive, with no rename and no retype anywhere in the payload. By the reasoning directly above, that is the shape that does NOT bump: an older daemon was never going to receive them, old traffic keeps working, and only a brand-new capability is unreachable until a restart. It bumped anyway.
+
+**Why:** The precedent was tested by `ApplyConfig` and it failed the operator. A newer CLI against a not-yet-restarted daemon passed the handshake, sent the variant, and had the connection dropped on an envelope the daemon could not decode, so `shep start <Flockfile>` failed on a dead client with no diagnosis. The remedy was correct and undiscoverable, which is why `getting-started.astro` had to grow a paragraph telling operators to restart after upgrading. That paragraph is the cost of not bumping, paid once per additive variant forever.
+
+A bump turns the same skew into a `protocol_mismatch` refusal, exit 6, naming both numbers and the remedy, at the handshake rather than mid-request. The price is that every older client is refused every verb until the shepherd restarts, which the last two releases already asked for.
+
+So the rule the entry above states is narrowed rather than overturned: additivity is what decides whether OLD traffic still decodes, and it does here. It is not what decides whether an operator can understand the failure when they skip the restart. When a new variant is one a running CLI will send on an ordinary path, the second question is the one that matters, and these three are exactly that: a config pane opens on a keypress against whatever daemon is running.
+
+`verified crates/shep-core/src/protocol/mod.rs (PROTOCOL_VERSION = 4), the three *_wire_v3 snapshots renamed to _v4, and the two tests that pin the numeral rather than reading the constant (request.rs hello_handshake_shape and a_dogs_hello_names_the_dog_and_nothing_elses_does). The older-daemon skew fixtures in shep-client/src/reconnect.rs and shep-cli/src/commands/{daemon,dogs}.rs still hardcode 1, 2 and 3 deliberately and were not touched.`
+
 ### The two "reload does not re-read config" entries are about shep reload <sheep>, not shep daemon reload
 
 `shep daemon reload` re-reads `shep.toml`, and always has. The superseded entries under Reload above are about `shep reload <sheep>` and a Flockfile, which are different files read by a different verb.
@@ -1872,3 +1888,21 @@ Every CI nextest profile writes junit, and a composite action runs after every n
 **Why:** Retries went on for the integration tier on 2026-09-04 because a contended runner cannot always schedule a real shepherd and real sheep promptly, and the same day's two CI-only failures (the entry above this section) were both real defects a retry would have hidden. The retry is the right call for the merge and the wrong call for the record, and the record was the half that was missing: `.config/nextest.toml` said "`--junit` is on so the retries are countable" while no profile named a junit path, so a retried test left no trace anywhere a person looks. The report always exits 0. The test step already gave the verdict; this is what a person reads afterwards, and it is deliberately loud rather than a count in a log, because a count in a log is what the previous arrangement amounted to.
 
 `verified .config/nextest.toml, .github/actions/nextest-report/action.yml, .github/workflows/test.yml`
+
+## Config pane writes
+
+### A pane edit gets its own request, `SetSheepField`, instead of a one-key `ApplyConfig`
+
+The config-panes spec said a sheep edit needed no new wire verb, because `ApplyConfig` already merges a config into a running app. It does, and one `DeclaredApp` declaring one key at `ResetDepth::File` really does move that field and nothing else. The pane shipped that way and it was wrong for a reason the field-moving argument never touches.
+
+**Why:** `merge_declared` spends the operator's override for every key it puts back, and the comment above the line says exactly why: a key just reset to the template is not a key an operator is still holding a value for. That is correct for a Flockfile load and false for a pane, whose declared value IS the operator's. So an edit landed and vanished from `ProcessEntry::overridden` on the same round trip: the `*` the pane draws never appeared, `shep flock`'s CFG column counted nothing, and the docs page saying `*` means an operator overrode it was false for the one surface built to set overrides.
+
+`SetSheepField { name, key, value }` writes the override directly rather than pretending to be a template. It is `SetSheepEnv`'s twin end to end, and deliberately so: the same dog guard with the same sentence from `dog_config_refusal`, the same validate-then-write-then-park ordering, the same `InvalidConfig`-for-the-caller and `Internal`-for-the-store split, and the same registry record so the edit reaches the muster roll rather than surviving only a handover. Task 4 built that shape for `env` and stopped; the general case was the gap.
+
+`env` is refused by the new door and keeps `SetSheepEnv`, because a whole env map is never sent -- the pane is not told the values -- so a request carrying one value would wipe every other key. `name` and `instances` are refused too: both are `ApplyGroup::Structural`, and the count moves through `Scale`.
+
+The reply is `SheepFieldSet { name, key, pending }` rather than `Response::Applied`'s three lists. `applied`, `pending` and `refused` exist because `ApplyConfig` carries N apps of M fields; this carries one field of one sheep, so `refused` would be a second way to say no beside the `Err` arm and the two lists collapse to one bit. That bit is not redundant with the field's own `ApplyGroup`, which the caller already knows: `autostart` is `NextSpawn` and yet in force the moment it lands, because `restorable()` reads it at muster rather than at a spawn, and a `Live` field whose config subset will not normalize on its own parks instead of applying. Neither is visible from the client.
+
+`PROTOCOL_VERSION` did not move again. It went to 4 earlier on the same branch, for the entry above, and one bump covers every additive variant that ships with it.
+
+`verified crates/shep-core/src/protocol/request.rs (Request::SetSheepField, Response::SheepFieldSet), crates/shep-daemon/src/supervisor.rs (handle_set_sheep_field, and merge_declared's next.fields.remove(key) which is the line this exists to avoid), crates/shep-daemon/src/rpc.rs (a_field_edit_is_reported_as_an_operator_override)`

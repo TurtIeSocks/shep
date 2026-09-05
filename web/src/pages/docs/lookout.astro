@@ -36,7 +36,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only`;
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only`;
 
 const narrow = `shep lookout   /home/ada/.shep       6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12…
@@ -76,7 +76,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only`;
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only`;
 
 const refused = `shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h
@@ -131,7 +131,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   / filter   x stop   R restart   L reload   s settings                              control enabled`;
+q quit   j/k select   / filter   x stop   R restart   L reload   s settings   e edit                     control enabled`;
 
 const filterActive = `shep lookout   /home/ada/.shep                                                   2 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …
@@ -184,7 +184,7 @@ const settingsFresh = `shep lookout   /home/ada/.shep                           
   bark                                                                no       built-in                  not running
   metrics                                                             no       built-in                  not running
 
-esc/s close   j/k select   g/G first/last   r refresh                                                          read-only`;
+esc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only`;
 
 const settingsConfirm = `shep lookout   /home/ada/.shep                                                                                                                                        6 in the flock
   [daemon]
@@ -228,7 +228,7 @@ const settingsDogs = `shep lookout   /home/ada/.shep                            
   ledger                                                              yes      /opt/ledger/bin/dog       not running
   bark                                                                yes      built-in                  silent
 
-esc/s close   j/k select   g/G first/last   r refresh                                                          read-only`;
+esc/s close   j/k select   g/G first/last   r refresh   q quit                                                 read-only`;
 
 const settingsNarrow = `shep lookout   /home/ada/.shep 2 in the flock
   [daemon]
@@ -569,6 +569,180 @@ esc/s close   j/k select   g/G fir… read-only`;
       the dashboard's <code>x</code>/<code>R</code>/<code>L</code> confirm
       uses.
     </p>
+    <h2>The config pane</h2>
+    <p>
+      <code>e</code> on a selected sheep opens its config over the dashboard:
+      every Flockfile field, the value in force, and what changing it would
+      cost. It writes as well, behind <code>--allow-control</code>. Without
+      the flag the edit keys refuse the same way <code>x</code> does. A row
+      marked <code>=</code> or <code>~</code> gives its own reason instead,
+      in both states, because the flag would not have helped it.
+    </p>
+    <p>Two markers can sit in front of a key:</p>
+    <ul>
+      <li><code>*</code> an operator has overridden it</li>
+      <li>
+        <code>!</code> it is parked until the next respawn, so the running
+        child is not holding it yet
+      </li>
+    </ul>
+    <p>And one in the column before those, when the pane won't edit a field:</p>
+    <ul>
+      <li>
+        <code>=</code> shep refuses a config write to it anywhere, not just
+        here. That is <code>name</code> and <code>instances</code>, and the
+        cost column says <code>read-only</code> to match.
+      </li>
+      <li>
+        <code>~</code> the pane has no widget for the shape, and nothing
+        more. A Flockfile writes these the usual way, so the cost column
+        beside them reports a real cost rather than <code>read-only</code>.
+        Six fields: <code>args</code>, <code>ignore_watch</code>,
+        <code>liveness_probe</code>, <code>readiness_probe</code>,
+        <code>stop_exit_codes</code> and <code>watch_options</code>.
+      </li>
+    </ul>
+    <p class="fine">
+      Both are glyphs rather than a colour on purpose. The narrowest terminal
+      the pane draws into has already dropped the cost column, and
+      <code>plain</code> style has no colour to read, so a greyed-out row
+      would be the only signal left in the case where it says least.
+    </p>
+    <p>
+      The last column is the field's class, which is what a change to it
+      usually costs:
+    </p>
+    <ul>
+      <li><code>now</code> the shepherd re-reads it at the next decision</li>
+      <li>
+        <code>next start</code> it reaches the next process this sheep spawns
+      </li>
+      <li>
+        <code>respawn</code> the running child holds it, so that instance has
+        to be replaced
+      </li>
+      <li>
+        <code>read-only</code> identity or flock shape rather than a runtime
+        knob. That is <code>name</code> and <code>instances</code>; the count
+        moves with <code>shep stock</code>, not from here.
+      </li>
+    </ul>
+    <p class="fine">
+      Read it before you write, not after. It says what kind of field this
+      is, and a particular write can land differently: <code>watch</code>
+      says <code>now</code> and waits for a reload if the
+      <code>cwd</code> it needs is itself still parked, and
+      <code>autostart</code> says <code>next start</code> and takes effect
+      immediately, because shep reads it at muster. The status bar after the
+      write is the one that reports what actually happened, and the
+      <code>!</code> flag on the row carries it afterwards.
+    </p>
+    <p>Keys, local to the pane while it's open:</p>
+    <ul>
+      <li><code>e</code> opens the pane, and closes it again</li>
+      <li><code>j</code>/<code>k</code>, arrows move the cursor one row</li>
+      <li><code>g</code>/<code>G</code> jump to the first or last field</li>
+      <li>
+        <code>r</code> re-reads the config and leaves the cursor where it was
+      </li>
+      <li>
+        <code>space</code> proposes the other value for a bool, or the next
+        one for a choice. Press it again to walk another step.
+      </li>
+      <li>
+        <code>Enter</code> opens the editor on a text or number field, and
+        sends whatever is armed. Two keystrokes to change a field, never one.
+      </li>
+      <li><code>Esc</code> closes the pane; it never quits lookout</li>
+    </ul>
+    <p>
+      One edit changes one field, and it is recorded as yours: the key picks
+      up the <code>*</code> marker here and in <code>shep flock</code>'s
+      <code>CFG</code> column, and a later <code>shep start</code> of the
+      app's Flockfile leaves it alone. Nothing else in the config moves,
+      <code>instances</code> included.
+    </p>
+    <p class="fine">
+      A field the running child already holds parks until the next spawn. The
+      status bar says which of the two happened, and
+      <code>shep reload &lt;sheep&gt;</code> is what promotes a parked one.
+    </p>
+    <p>
+      <code>Enter</code> on the <code>env</code> row opens a sub-screen of
+      that sheep's env key names. No value ever appears there, because the
+      shepherd never sends one: every key reads <code>&lt;set&gt;</code>.
+      <code>Enter</code> on a key types a new value for it, and applying an
+      empty one removes the key. <code>Enter</code> on the
+      <code>+ new</code> row takes <code>KEY=value</code>.
+      <code>Esc</code> goes back to the field list.
+    </p>
+    <p>
+      Env writes arm and confirm like every other one, a set as much as a
+      removal. The old value is overwritten in the store as soon as the
+      shepherd answers, and this screen cannot read a value back to put it
+      there again, so an overwrite loses as much as a delete does.
+    </p>
+    <p class="fine">
+      env is spawn-time in every case, so nothing set here reaches the running
+      child until that child is replaced.
+    </p>
+    <p class="fine">
+      A group row opens one too. Every instance of a multi-instance app
+      shares one stored spec, so the pane is about the app rather than about
+      whichever instance the cursor was over.
+    </p>
+
+    <h2>The dog config pane</h2>
+    <p>
+      <code>e</code> on a dog row of the settings screen opens the same pane
+      over that dog's <code>[&lt;name&gt;]</code> section in
+      <code>dogs.toml</code>. <code>e</code> on the dashboard does not: a dog
+      is not a sheep, and the row there says so instead.
+    </p>
+    <p>
+      The form comes from the dog. Shep asks the binary for its schema when
+      the pane opens rather than reading one it stored, because
+      <code>cargo install</code> replaces a dog with nothing watching and a
+      stale schema mislabels which field is a credential. A built-in dog
+      answers without being spawned at all. A dog that publishes no schema
+      gets no pane, and a line saying where its settings do live:
+    </p>
+    <CodeBlock>{`pydog publishes no schema; edit dogs.toml with $EDITOR`}</CodeBlock>
+    <Callout variant="careful">
+      Asking runs it. Opening the pane on an adopted dog spawns that binary
+      with <code>--schema</code>, waits a second for an answer, then kills
+      it. That is a third party's code executing because you pressed a key,
+      and it is worth knowing before you browse the config of a dog you did
+      not write. A built-in dog is shep's own binary and is never spawned.
+    </Callout>
+    <p>
+      The pane is flat, with no section headers: a dog's schema carries no
+      groups, and inventing some would be shep deciding how somebody else's
+      config reads. The cost column is empty on every row, because shep does
+      not know what a dog's field costs. The foot of the pane says so once,
+      naming the dog:
+    </p>
+    <CodeBlock>{`shep publishes the change; bark decides what to reload`}</CodeBlock>
+    <p>
+      A field the dog marks as a credential reads <code>&lt;set&gt;</code>
+      and never its value, and the editor on it opens empty. Typing a new one
+      replaces it; nothing here can show you what it replaced. A table or a
+      list gets <code>~</code>, the same glyph a sheep's
+      <code>args</code> gets and for the same reason.
+    </p>
+    <p>
+      A write sends the section whole, so the comments and key order in
+      <code>dogs.toml</code> survive it. Applying an empty value removes the
+      key, which puts the dog back on its own default. Neither
+      <code>*</code> nor <code>!</code> appears: a dog has no Flockfile to
+      differ from, and <code>dogs.toml</code> is the one copy of its
+      settings.
+    </p>
+    <p class="fine">
+      <code>r</code> re-reads the section and not the schema, so a keystroke
+      whose job is to re-read a file never respawns somebody else's binary.
+    </p>
+
     <h2>Where to go next</h2>
 
     <div class="next-grid">

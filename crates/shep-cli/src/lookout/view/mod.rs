@@ -9,6 +9,8 @@ pub mod bleats;
 pub mod detail;
 pub mod flock;
 pub mod host;
+pub mod pane;
+pub mod scroll;
 pub mod settings;
 pub mod status;
 
@@ -143,6 +145,22 @@ pub fn panes_for(height: u16) -> Panes {
 /// than nothing, since a blank pane cannot say whether the shepherd has
 /// nothing to run or the dashboard is broken.
 ///
+/// How tall the settings screen's body is for a terminal of `area`, between
+/// the title line and the status bar. Zero for a terminal too small to draw
+/// at all, so a caller that asks before checking size gets a viewport that
+/// never scrolls rather than an underflowed height.
+///
+/// `run_ui` calls this before each draw, so [`App::note_body_rows`] always
+/// reflects the terminal about to be drawn to.
+#[must_use]
+pub fn body_rows(area: Rect) -> u16 {
+    if area.width < MIN_TERM_WIDTH || area.height < MIN_HEIGHT {
+        return 0;
+    }
+    // One row for the title, one for the status bar.
+    area.height - 2
+}
+
 /// Real caller: `super::mod`'s `run_ui`, once per frame.
 pub fn draw(app: &App, frame: &mut Frame<'_>) {
     let area = frame.area();
@@ -187,15 +205,26 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     // status bar. That is a swap, not an overlay: the banner, the host
     // strip, the flock table and the two bottom panes all belong to the
     // body this branch replaces, so none of them draw while it is open.
+    // The config pane owns the same body and is checked first, the same
+    // order `App::on_key` uses.
+    if let Some(pane) = app.config_pane() {
+        let body = Rect {
+            x: area.x,
+            y,
+            width,
+            height: body_rows(area),
+        };
+        pane::draw_pane(app, pane, body, buffer);
+        buffer.set_line(area.x, bottom, &status::status_line(app, width), width);
+        return;
+    }
+
     if let Some(settings) = app.settings() {
         let body = Rect {
             x: area.x,
             y,
             width,
-            // `bottom - y` never underflows: `y` is `area.y + 1` here and
-            // `bottom` is `area.y + height - 1`, and `height >= MIN_HEIGHT`
-            // (6) is already checked above, so `bottom > y` always holds.
-            height: bottom - y,
+            height: body_rows(area),
         };
         settings::draw_settings(app, settings, body, buffer);
         buffer.set_line(area.x, bottom, &status::status_line(app, width), width);
