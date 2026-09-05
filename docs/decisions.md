@@ -1821,6 +1821,16 @@ Teaching `shep ping` to say why it is offline was the other way out, and it was 
 
 `verified crates/shep-cli/tests/cli_e2e.rs (the_control_socket_accepts_throughout_a_handover, DIAL_INTERVAL)`
 
+### A third one-batch assumption, and this one was the test alone
+
+`a_file_created_under_the_root_produces_a_batch_containing_it` failed on the `slow (macos-latest)` job, 0.095s in: `expected "<root>/created.txt" in the batch, got WatchBatch { paths: ["<root>"], rescan: false }`. The first batch carried the watched root and nothing else.
+
+That shape already has a name in this codebase. `watch::mod`'s own doc, next to `an_ordinary_event_on_the_root_itself_produces_no_restart`, describes "FSEvents' arm-time `Create(Folder)`" for the root the moment a watch arms, and the sibling test in the same file, `a_file_created_in_a_nested_subdirectory_also_produces_a_batch`, already carries the inotify version of the same lesson: "the first batch is often the two directories rather than the file." The failing test was the one place in the module still asserting on the first batch alone for a root-level write.
+
+Reproduced directly rather than assumed: 600 runs across three sessions (one cold, one warm, one under four `yes` processes for contention), instrumented to print every first batch that carried only the root. 8 of 600 did. All 8 resolved: `created.txt` arrived in the very next batch, within 500ms every time, never later and never absent. Nothing was lost; the debouncer just occasionally ticks the arm-time folder event into its own batch ahead of the write. The fix is the same `batches_until` the nested-directory test already uses, waiting for a batch containing the file rather than asserting on the first one. It still times out and fails after `SMOKE_DEADLINE` if the write never lands at all, so the defect this test guards (a non-recursive watch, or a dropped batch on the thread-to-tokio bridge) still fails it.
+
+**Why:** three tests in the same `mod slow` share the exposure without having failed yet. `dropping_the_source_stops_delivery`, `a_path_deleted_while_watched_still_produces_a_batch`, and `a_symlinked_root_delivers_the_resolved_path_not_the_one_passed_in` all call `watch_tree` and then assert on `expect_batch`'s first delivery for an event that follows the arm. At a measured ~1.3% rate on this one test, CI's `ci-slow` profile runs it serially and without retries, so the other three are due the same fix on the same evidence whenever one of them is next to go red. None of the three failed here and none were touched, so they're recorded rather than guessed at.
+
 ## CI and releases
 
 ### An intra-workspace dev-dependency names only a path, never a version
