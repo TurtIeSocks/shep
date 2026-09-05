@@ -1,53 +1,15 @@
-//! Building the commented Flockfile `shep init` writes, in every format
-//! shep can read.
+//! Building the commented Flockfile `shep init` writes, in every format shep can read.
 //!
-//! # Why this lives here and not in the CLI
+//! Builds the document uncommented, tagging each line as prose or code,
+//! then comments it in one pass, so adding a format is a table entry
+//! (`Syntax::of`) rather than a rewrite.
 //!
-//! A scaffold is a Flockfile that has not been filled in yet, so it belongs
-//! beside the grammar it is a specimen of. Every fact it needs -- which
-//! fields exist, what each is for, what a plausible value looks like -- comes
-//! from the same schema [`crate::config::flockfile_schema_json`] serves, and
-//! the document shapes it emits are the ones
-//! [`crate::config::Flockfile::parse`] accepts two hundred lines up. Putting
-//! the generator anywhere else would mean a second copy of the grammar's
-//! shape, kept in step by hand.
+//! Two comment styles, tested apart: prose is marker then a space; a
+//! commented field is marker then the value, no space. Uncommenting strips
+//! the marker from exactly the lines whose next character is not a space.
 //!
-//! # The one idea that makes four formats tractable
-//!
-//! A scaffold is almost entirely commented out: the reader uncomments the
-//! lines they want. The obvious way to build one is to write each format's
-//! commented text directly, and it does not work -- the marker ends up
-//! threaded through every structural fragment, so `app:` and `[` and `{` all
-//! have to carry it, and each nesting level becomes its own special case.
-//!
-//! So this module **builds the document uncommented, then comments it in one
-//! final pass.** Every line is tagged as prose or as code, one step emits the
-//! real Flockfile a format would accept, and a second step puts the marker
-//! on. The marker never touches the structure, which is why adding a format
-//! is a table entry rather than a rewrite.
-//!
-//! # The comment convention, which is load-bearing
-//!
-//! Two kinds of comment line, and a test relies on telling them apart:
-//!
-//! - **Prose**, for a reader: marker then a SPACE. `# Every app gets one.`
-//! - **Commented-out config**, meant to be uncommented: marker then the
-//!   config, no space. `#name = "api"`
-//!
-//! Uncommenting therefore means stripping the marker from exactly the lines
-//! whose next character is not a space, which is what lets a test uncomment
-//! each format mechanically and prove the result parses -- that the scaffold
-//! is a real Flockfile rather than plausible-looking prose.
-//!
-//! # Strict JSON is the exception, and it cannot be argued away
-//!
-//! JSON has no comment syntax. Not an awkward one -- none. So the product
-//! this module exists to make cannot be made in it, and [`Scaffold::build`]
-//! emits a live minimal document there instead: real values, no guidance.
-//! [`Depth::All`] is refused for JSON rather than fudged, because a JSON
-//! document naming all forty fields would pin every default explicitly,
-//! which is a Flockfile you would tell somebody not to commit. `.json5` is
-//! the format with JSON's syntax and comments, and the refusal says so.
+//! JSON has no comment syntax, so [`Scaffold::build`] emits a live minimal
+//! document there and refuses [`Depth::All`] rather than pin every default.
 
 use core::fmt;
 
@@ -105,9 +67,9 @@ impl core::error::Error for ScaffoldError {}
 /// The fields [`Depth::Curated`] shows, in the order it shows them.
 ///
 /// An explicit ordered list rather than a flag scattered across `AppConfig`'s
-/// attributes, because membership and ORDER are one editorial decision and
-/// belong somewhere a person can read at a glance. The order is a narrative:
-/// what is it, what runs, keep it alive, where it runs.
+/// attributes, so membership and order stay one editorial decision, readable
+/// at a glance. The order is a narrative: what is it, what runs, keep it
+/// alive, where it runs.
 ///
 /// Generation cannot supply this. schemars emits properties into a sorted
 /// map, so a derived curated file would read `autorestart, cwd, name,
@@ -117,10 +79,10 @@ pub const CURATED: &[&str] = &["name", "script", "autorestart", "cwd"];
 /// Group order for [`Depth::All`], coarsest concern first: what it is and
 /// what runs, then what it receives, then how it is kept alive, then when.
 ///
-/// Fields carrying no `group` sort after all of these. That is deliberate
-/// rather than tidy: half of `AppConfig` is currently ungrouped, so half the
-/// full scaffold is still alphabetical, and leaving those at the end makes
-/// the gap visible instead of hiding it in the middle.
+/// Fields carrying no `group` sort after all of these: half of `AppConfig`
+/// is currently ungrouped, so half the full scaffold is still alphabetical,
+/// and leaving those at the end makes the gap visible instead of burying it
+/// in the middle.
 const GROUP_ORDER: &[&str] = &["process", "inputs", "control", "cron"];
 
 /// One line of a scaffold, before any comment marker is applied.
@@ -157,9 +119,9 @@ struct Syntax {
     ///
     /// JSON and JSON5 separate object members with a comma. TOML and YAML
     /// separate them with a newline and want nothing here, which is a
-    /// different question from whether a TRAILING one is legal.
+    /// different question from whether a trailing one is legal.
     member_sep: &'static str,
-    /// Whether [`Syntax::member_sep`] may follow the LAST field too.
+    /// Whether [`Syntax::member_sep`] may follow the last field too.
     ///
     /// JSON5 allows a trailing comma, so last-ness never has to be tracked
     /// there. Strict JSON does not.
@@ -184,10 +146,9 @@ impl Syntax {
                 trailing_sep: false,
                 quoted_keys: false,
             },
-            // The lone `-` is deliberate. A sequence item whose value is a
-            // block mapping on the following lines is valid YAML, and
-            // writing it that way means the first field needs no special
-            // case for the dash.
+            // The lone `-` works because a sequence item whose value is a
+            // block mapping on the following lines is valid YAML, so the
+            // first field needs no special case for the dash.
             FlockFormat::Yaml => Self {
                 marker: Some("#"),
                 label: "YAML",
@@ -241,20 +202,16 @@ impl Scaffold {
 
     /// The scaffold's text.
     ///
-    /// In a format that has comments the result is entirely commented out,
-    /// so it parses as a document declaring no apps until somebody
-    /// uncomments a line. In strict JSON it is a live minimal Flockfile,
-    /// because there is no comment to hide behind.
+    /// Entirely commented out in a format that has comments, parsing as a
+    /// document declaring no apps; a live minimal Flockfile in strict JSON,
+    /// which has no comment to hide behind.
     ///
     /// # Errors
-    /// - [`ScaffoldError::NoCommentsForAll`] -- [`Depth::All`] in a format
-    ///   with no comment syntax, where the result would pin every default
-    ///   rather than explain it.
+    /// - [`ScaffoldError::NoCommentsForAll`]: [`Depth::All`] in a format
+    ///   with no comment syntax, where the result would pin every default.
     ///
     /// # Panics
-    /// If a name in [`CURATED`] is not a field of `AppConfig`. That is a
-    /// build-time editorial mistake, not a runtime condition, and there is a
-    /// test that fails first.
+    /// If a name in [`CURATED`] is not a field of `AppConfig`.
     #[track_caller]
     pub fn build(self) -> Result<String, ScaffoldError> {
         let syntax = Syntax::of(self.format);
@@ -394,14 +351,9 @@ fn render(syntax: &Syntax, lines: &[Line]) -> String {
                 out.push(' ');
                 out.push_str(text);
             }
-            // The marker goes AFTER the line's own indentation, not before
-            // it. Prose is "marker then a space" and code is "marker then
-            // content", which is what makes uncommenting mechanical -- but a
-            // nested format indents its code, so a marker written first
-            // would be followed by a space and would read as prose. Putting
-            // the indentation outside keeps the marker glued to real
-            // content at every depth, and uncommenting leaves the
-            // indentation exactly where the document needs it.
+            // The marker goes after the line's own indentation, not before
+            // it: a nested format's code is indented, and a marker written
+            // first would be followed by a space and read as prose.
             (Some(marker), Line::Code(code)) => {
                 let content = code.trim_start_matches(' ');
                 let indent = &code[..code.len() - content.len()];
@@ -417,19 +369,14 @@ fn render(syntax: &Syntax, lines: &[Line]) -> String {
 
 /// What a field's line should explain.
 ///
-/// `init.blurb` and the `///` doc have different readers, and this takes the
-/// blurb. Several of `AppConfig`'s docs cite internal type names and spec
-/// section numbers, which mean nothing to somebody editing a Flockfile, and
-/// they carry em dashes because nothing an operator reads renders them.
+/// Takes `init.blurb` rather than the `///` doc: the doc is written for
+/// somebody reading the source, and cites internal type names and spec
+/// section numbers a Flockfile reader would not recognize.
 ///
 /// # Panics
-/// If `field` has no `init.blurb`. Falling back to the `///` doc would be
-/// worse than failing: the operator gets prose written for somebody reading
-/// the source, in a file that otherwise reads as documentation, and nothing
-/// says so.
-/// `tests::every_field_carries_a_group_and_a_blurb` makes this unreachable,
-/// so a panic here means that test was removed rather than that a Flockfile
-/// was odd.
+/// If `field` has no `init.blurb`. Falling back to the `///` doc would put
+/// source-facing prose in a file that otherwise reads as documentation;
+/// `every_field_carries_a_group_and_a_blurb` should make this unreachable.
 #[track_caller]
 fn blurb(name: &str, field: &serde_json::Value) -> String {
     field["init"]
@@ -536,17 +483,9 @@ mod tests {
 
     #[test]
     fn a_commented_scaffold_never_declares_an_app_until_somebody_uncomments_it() {
-        // The file shep writes is a template, not a running configuration,
-        // so none of these may hand back an app. HOW they decline differs by
-        // language and the difference is real rather than a wart worth
-        // hiding: TOML and YAML both read a comments-only file as an empty
-        // document, so they parse and find nothing. JSON5 requires a value,
-        // and a file that is entirely comments does not contain one, so it
-        // refuses at the parser.
-        //
-        // Both readings say the same thing to an operator who ran `shep
-        // start` on a template they had not filled in yet, which is the only
-        // way anybody meets this.
+        // TOML and YAML read a comments-only file as an empty document and
+        // parse with no apps; JSON5 requires a value, so an all-comments
+        // file refuses at the parser instead.
         for format in COMMENTED {
             let scaffold = Scaffold::new(format, Depth::Curated)
                 .build()
@@ -621,12 +560,9 @@ mod tests {
 
     #[test]
     fn every_field_carries_a_group_and_a_blurb() {
-        // Without this the gap is invisible: a field with no `group` sorts
-        // after every grouped one and a field with no `blurb` silently falls
-        // back to its `///` doc, which is written for somebody reading the
-        // source. Several of those cite internal type names and spec section
-        // numbers, so the scaffold reads fine right up until the line that
-        // does not.
+        // A field with no `group` sorts after every grouped one; a field
+        // with no `blurb` silently falls back to its `///` doc, written for
+        // somebody reading the source.
         let schema = crate::config::flockfile_schema_json();
         let props = properties(&schema);
 
@@ -689,9 +625,8 @@ mod tests {
 
     #[test]
     fn the_curated_depth_stays_short() {
-        // The mirror of the drift test above. Nothing else pins that
-        // Curated is SHORT, so a swapped match arm could hand a newcomer all
-        // forty options and no test would notice.
+        // Nothing else pins that Curated is short, so a swapped match arm
+        // could hand a newcomer all forty options and no test would notice.
         for format in COMMENTED {
             let text = Scaffold::new(format, Depth::Curated)
                 .build()

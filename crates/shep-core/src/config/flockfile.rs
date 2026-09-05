@@ -1,7 +1,7 @@
 //! Flockfile: discovery and multi-format parsing
 //!
 //! One document shape across formats: a list of app tables under the `app`
-//! key (`[[app]]` in TOML). Parsing is strict serde — no code execution;
+//! key (`[[app]]` in TOML). Parsing is strict serde, no code execution;
 //! `.js` configs are the CLI's job (it shells out to node and feeds the
 //! resulting JSON through [`FlockFormat::Json`]).
 
@@ -24,23 +24,18 @@ pub struct Flockfile {
     pub apps: Vec<AppConfig>,
 }
 
-/// One app as the document declared it: the validated config, plus the keys
-/// the document literally wrote.
+/// One app as the document declared it: the validated config, plus the
+/// keys the document literally wrote.
 ///
-/// The key set cannot be recovered from [`AppConfig`] afterwards.
-/// `#[serde(default)]` gives every field a value, so a document naming four
-/// keys deserializes identically to one naming forty. A later merge into a
-/// running flock keys on what a template CLAIMS rather than on what its
-/// values are, so the claim has to be carried out of the parser (see
-/// [`Flockfile::parse_declared`]).
+/// The key set cannot be recovered from [`AppConfig`] afterwards:
+/// `#[serde(default)]` gives every field a value, so a document naming
+/// four keys deserializes identically to one naming forty.
+/// [`Flockfile::parse_declared`] carries the claim out for a later merge
+/// that keys on what a template declares, not on its values.
 ///
-/// `Serialize`/`Deserialize` because this type is meant to travel inside a
-/// wire request; the key sets are the whole reason such a request carries
-/// this rather than a bare [`AppConfig`].
-///
-/// Derived `Debug` does not reach for [`AppConfig::env`]'s values: `config`'s
-/// own manual `Debug` already redacts them (IR-41), and `declared_env` holds
-/// only the env table's key NAMES, never the values behind them.
+/// `Serialize`/`Deserialize` since this type travels inside a wire
+/// request, keyed on the same claim. Derived `Debug` is safe: `config`
+/// redacts its own `env`, and `declared_env` holds only key names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeclaredApp {
     /// The app, validated the same way [`Flockfile::parse`] validates one
@@ -51,11 +46,10 @@ pub struct DeclaredApp {
     pub declared_env: BTreeSet<String>,
 }
 
-// Forward-compat decision: application entries are locked to the `app` key
-// on purpose — a typo'd key must fail loudly. `$schema` and `dog` are the
-// two keys explicitly let in beside it (see their own field docs below); a
-// future schema key gets added the same explicit way; older binaries then
-// reject newer Flockfiles by design instead of silently ignoring config.
+// Application entries are locked to the `app` key: a typo'd key must fail
+// loudly. `$schema` and `dog` are the two keys explicitly let in beside
+// it; a future schema key is added the same explicit way, so older
+// binaries reject newer Flockfiles by design rather than ignore them.
 #[derive(Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 // `rename` sets `schema_name`, which schemars uses as the root schema's
@@ -120,24 +114,16 @@ struct RawFlockfile {
 
 /// The committed Flockfile JSON Schema.
 ///
-/// `include_str!` deliberately: it makes the file a compile-time input, so
-/// deleting it fails the build and changing `AppConfig` fails the test
-/// below with the command that fixes it. A committed schema nobody
-/// regenerates is a lie with a filename, and the only reliable guard is one
-/// that runs in `cargo test` rather than in a CI job somebody can forget.
+/// `include_str!` makes the file a compile-time input: deleting it fails
+/// the build, and changing `AppConfig` fails
+/// `the_committed_schema_is_current` with the command that fixes it.
 ///
-/// It lives INSIDE this package, not at the repository root. `cargo package`
-/// packs only files under the package directory, and shep-core and shep
-/// are both published (`docs/releasing.md`), so a root-relative
-/// `include_str!` would compile here and fail for everyone who runs
-/// `cargo install shep`.
+/// Lives inside this package, not the repository root: `cargo package`
+/// packs only files under the package directory, and a root-relative
+/// `include_str!` would fail every `cargo install shep`.
 ///
-/// Read only by `the_committed_schema_is_current` below, so a plain `cargo
-/// build`/`clippy` (no `#[cfg(test)]`) sees no reader and flags it dead.
-/// `#[allow(dead_code)]` says so explicitly rather than moving the
-/// `include_str!` into the test itself, which would trade away the one
-/// property this constant exists for: living outside `#[cfg(test)]` is what
-/// makes deleting the file fail every build, not just `cargo test`.
+/// `#[allow(dead_code)]`: its only reader is `#[cfg(test)]`, so a plain
+/// `cargo build`/`clippy` sees no reader and would otherwise flag it dead.
 #[cfg(feature = "schema")]
 pub const COMMITTED: &str = include_str!("../../assets/flockfile.schema.json");
 
@@ -154,18 +140,14 @@ const REGENERATE: &str =
 /// Renders the Flockfile JSON Schema: the document grammar, pretty-printed
 /// with a trailing newline so the committed file is a well-formed text file.
 ///
-/// Generated from `RawFlockfile` — the type serde actually deserializes a
-/// Flockfile into — so the schema and the parser cannot drift: they are the
-/// same declaration. `AppConfig` supplies the per-app half and lands in
-/// `$defs`.
+/// Generated from `RawFlockfile`, the type serde actually deserializes a
+/// Flockfile into, so the schema and the parser cannot drift.
+/// `AppConfig` supplies the per-app half and lands in `$defs`.
 ///
-/// The schema describes the **deserializer**, not the normalizer.
-/// `AppConfig::kill_signal` is `Option<String>` here and stays a plain string
-/// in the schema, even though `config::normalize` accepts only four
-/// spellings: the schema's job is to describe what serde will parse, and a
-/// schema that described a validation step running elsewhere at another time
-/// would be wrong the moment those two diverged, in a way no test could
-/// catch.
+/// Describes the deserializer, not the normalizer:
+/// `AppConfig::kill_signal` stays a plain string here even though
+/// `config::normalize` accepts only four spellings, since the schema's
+/// job is what serde parses, not what a later validation step accepts.
 #[cfg(feature = "schema")]
 #[track_caller]
 #[must_use]
@@ -179,24 +161,16 @@ pub fn flockfile_schema_string() -> String {
 
 /// Returns the Flockfile JSON Schema.
 ///
-/// Generated from `RawFlockfile` — the type serde actually deserializes a
-/// Flockfile into — so the schema and the parser cannot drift: they are the
-/// same declaration. `AppConfig` supplies the per-app half and lands in
-/// `$defs`.
-///
-/// The schema describes the **deserializer**, not the normalizer.
-/// `AppConfig::kill_signal` is `Option<String>` here and stays a plain string
-/// in the schema, even though `config::normalize` accepts only four
-/// spellings: the schema's job is to describe what serde will parse, and a
-/// schema that described a validation step running elsewhere at another time
-/// would be wrong the moment those two diverged, in a way no test could
-/// catch.
+/// Generated from `RawFlockfile`, the type serde actually deserializes a
+/// Flockfile into, so the schema and the parser cannot drift. Describes
+/// the deserializer, not the normalizer: `AppConfig::kill_signal` stays a
+/// plain string here even though `config::normalize` accepts only four
+/// spellings.
 ///
 /// # Panics
-///
 /// Never in practice: schemars produces a `serde_json::Value` tree, which
-/// `to_string_pretty` cannot fail on. `#[track_caller]` so a future change
-/// that makes it fallible reports the caller (IR-24).
+/// `to_string_pretty` cannot fail on. `#[track_caller]` so a future
+/// fallible change reports the caller.
 #[cfg(feature = "schema")]
 #[track_caller]
 #[must_use]
@@ -207,7 +181,7 @@ pub fn flockfile_schema_json() -> Schema {
 /// Input format of a Flockfile
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlockFormat {
-    /// `Flockfile.toml` — `[[app]]` tables
+    /// `Flockfile.toml`: `[[app]]` tables
     Toml,
     /// `.yaml`/`.yml`
     Yaml,
@@ -232,23 +206,22 @@ impl FlockFormat {
 }
 
 impl Flockfile {
-    /// Parses Flockfile source text in the given format
+    /// Parses Flockfile source text in the given format.
     ///
     /// # Errors
-    ///
-    /// - Format variants ([`FlockfileError::Toml`] etc.) — backend parse
+    /// - Format variants ([`FlockfileError::Toml`] etc.): backend parse
     ///   failure, carrying the backend's message. Json5 additionally rejects
-    ///   sources nested past a depth of 64 before ever handing them to the
-    ///   backend parser (json5's recursive-descent parser stack-overflows on
-    ///   deeply nested input rather than returning an error).
-    /// - [`FlockfileError::NoApps`] — parsed fine but declared no apps.
+    ///   sources nested past a depth of 64 before reaching the backend
+    ///   parser, whose recursive-descent stack-overflows on deep input
+    ///   rather than returning an error.
+    /// - [`FlockfileError::NoApps`]: parsed fine but declared no apps.
     pub fn parse(source: &str, format: FlockFormat) -> Result<Self, FlockfileError> {
         let raw = parse_into::<RawFlockfile>(source, format)?;
         let RawFlockfile {
             schema: _schema,
-            // Discarded here, deliberately and by name. Whatever a dog wrote
-            // under `[dog]` is that dog's to read out of the file itself; shep
-            // only had to stop refusing the document for containing it.
+            // Discarded by name. Whatever a dog wrote under `[dog]` is that
+            // dog's to read out of the file itself; shep only had to stop
+            // refusing the document for containing it.
             dog: _dog,
             apps,
         } = raw;
@@ -260,16 +233,13 @@ impl Flockfile {
 
     /// Parses `text` and reports, per app, which keys the document wrote.
     ///
-    /// Runs the exact same per-format parse and validation [`Flockfile::parse`]
-    /// does, so a document that `parse` accepts or refuses is accepted or
-    /// refused here for the same reason, then separately deserializes the
-    /// same source into a [`serde_json::Value`] and reads each app table's
-    /// keys off it. `AppConfig`'s `#[serde(default)]` erases which keys a
-    /// document actually named, which is exactly the information the value
-    /// pass recovers.
+    /// Runs the same per-format parse and validation [`Flockfile::parse`]
+    /// does, then separately deserializes the same source into a
+    /// [`serde_json::Value`] and reads each app table's keys off it:
+    /// `AppConfig`'s `#[serde(default)]` erases which keys a document
+    /// actually named, which is exactly what the value pass recovers.
     ///
     /// # Errors
-    ///
     /// Every error [`Flockfile::parse`] returns, for the same inputs.
     pub fn parse_declared(
         text: &str,
@@ -319,12 +289,9 @@ impl Flockfile {
     }
 }
 
-// The per-format deserialize `Flockfile::parse` and `Flockfile::parse_declared`
-// both start from, generic over the target type so the same four backends
-// serve both `RawFlockfile` (validation) and `serde_json::Value` (recovering
-// the document's literal keys). Kept as the ONE place that knows the four
-// backends, so the two callers cannot drift on what a valid document looks
-// like.
+// Generic over the target type so the same four backends serve both
+// `RawFlockfile` (validation) and `serde_json::Value` (recovering the
+// document's literal keys), the one place that knows all four.
 fn parse_into<T: serde::de::DeserializeOwned>(
     source: &str,
     format: FlockFormat,
@@ -350,29 +317,15 @@ fn parse_into<T: serde::de::DeserializeOwned>(
     }
 }
 
-// json5's recursive-descent parser stack-overflows (SIGABRT, not a catchable
-// error) on documents nested a few thousand levels deep — reproduced locally
-// around ~4500 levels. 64 is far beyond anything a real Flockfile needs (the
-// deepest legitimate nesting, a probe object inside an app object inside the
-// app array inside the root object, is 4) and comfortably clear of the crash
-// threshold.
+// json5's recursive-descent parser stack-overflows (SIGABRT, uncatchable)
+// around ~4500 levels of nesting. 64 is far beyond the deepest legitimate
+// Flockfile nesting (4) and comfortably clear of the crash threshold.
 const MAX_JSON5_NESTING_DEPTH: u32 = 64;
 
-// Scans `source` for the maximum number of concurrently open `[`/`{`
-// brackets. Skips characters inside quoted strings (single or double,
-// backslash-escaped) and inside `//`/`/* */` comments, so bracket-like (and
-// quote-like) characters there don't distort the count — a `'` inside a `//
-// don't nest` comment must NOT be able to flip the scanner into string mode
-// and make it ignore real brackets that follow (that was exactly the bug in
-// the first version of this guard: it failed OPEN, letting an over-deep
-// document reach json5 and crash it).
-//
-// Fails CLOSED on anything that isn't clean, well-terminated JSON5 lexing:
-// an unterminated `/* ...` comment or an unterminated string at EOF returns
-// `u32::MAX`, which always exceeds `MAX_JSON5_NESTING_DEPTH` — better to
-// reject a malformed document than to under-count it and let it through.
-// Saturating add/sub: a real document would fail the depth check long
-// before `u32` could overflow.
+// Scans for the maximum concurrently-open `[`/`{` depth, skipping quoted
+// strings and `//`/`/* */` comments so bracket-like characters inside
+// them don't distort the count. Fails closed: an unterminated string or
+// comment returns `u32::MAX`, which always exceeds the depth cap.
 fn json5_nesting_depth(source: &str) -> u32 {
     let mut depth: u32 = 0;
     let mut max_depth: u32 = 0;
@@ -450,15 +403,14 @@ pub fn discover(dir: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Error type returned from [`Flockfile::parse`]
+/// Error type returned from [`Flockfile::parse`].
 ///
-/// `#[non_exhaustive]`: shep-core is a library crate, so an out-of-tree
-/// consumer can match this exhaustively and a new variant would break them
-/// with no version bump to say so (IR-20). Growth is anticipated per
-/// backend, not per format: `.js` Flockfiles do NOT appear here, because
-/// shep-core never executes anything — the node bridge lives in shep-cli
-/// (`commands::lifecycle`) and feeds its output back through
-/// [`FlockFormat::Json`], which is what this module's own doc promises.
+/// `#[non_exhaustive]`: an out-of-tree consumer could otherwise match
+/// this exhaustively and a new variant would break them silently. Growth
+/// is anticipated per backend, not per format: `.js` Flockfiles never
+/// appear here, since shep-core never executes anything. The node bridge
+/// lives in shep-cli, which feeds its output back through
+/// [`FlockFormat::Json`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlockfileError {
@@ -591,12 +543,9 @@ args = ["job.py"]
         );
     }
 
-    /// fails if a `.js` name is ever added to the discovery order. The maintainer's
-    /// ruling, 2026-08-15: a `.js` Flockfile is read only when named
-    /// explicitly on the command line, because reading one runs node on it,
-    /// and `cd` into a cloned repo followed by `shep start` must not execute
-    /// a stranger's JavaScript. Discovery is the path with no operator in
-    /// the loop, so it is the path that must never reach node.
+    /// fails if a `.js` name is ever added to the discovery order. Reading
+    /// one runs node on it, and discovery is the path with no operator in
+    /// the loop, so it must never reach node.
     #[test]
     fn discovery_never_names_a_js_file_and_stays_ten_names() {
         assert_eq!(DISCOVERY_ORDER.len(), 10);
@@ -611,9 +560,8 @@ args = ["job.py"]
 
     #[test]
     fn yaml_deep_nesting_is_rejected_without_crashing() {
-        // Adversarial probe locked in as a regression test (json5 taught us
-        // to distrust backends here): 5000-deep flow-style nesting must
-        // return Err from serde-saphyr, never overflow the stack.
+        // 5000-deep flow-style nesting must return Err from serde-saphyr,
+        // never overflow the stack.
         let deep = "[".repeat(5000);
         let result = Flockfile::parse(&deep, FlockFormat::Yaml);
         assert!(matches!(result, Err(FlockfileError::Yaml(_))));
@@ -622,8 +570,8 @@ args = ["job.py"]
     #[test]
     fn yaml_alias_bomb_is_bounded() {
         // Billion-laughs shape: each level aliases the previous twice. The
-        // backend must reject or resolve it bounded — this test completing
-        // quickly (and the doc failing schema-wise) is the assertion.
+        // backend must reject it or resolve it bounded; completing
+        // quickly is the assertion.
         let mut bomb = String::from("a: &a [\"x\",\"x\"]\n");
         for i in 1..9 {
             bomb.push_str(&format!(
@@ -638,11 +586,9 @@ args = ["job.py"]
 
     #[test]
     fn json5_beyond_max_nesting_depth_is_rejected_without_crashing() {
-        // json5's backend parser stack-overflows (SIGABRT) around ~4500
-        // levels of nesting rather than returning an error — the depth
-        // guard must reject this before ever calling into it. 5000 unclosed
-        // `[` is nonsense JSON5, but the guard runs before any real parsing
-        // is attempted, so that's fine.
+        // json5 stack-overflows (SIGABRT) around ~4500 levels, so the depth
+        // guard must reject this before calling into it. 5000 unclosed `[`
+        // is nonsense JSON5, but the guard runs before any real parsing.
         let src = "[".repeat(5000);
         assert_eq!(
             Flockfile::parse(&src, FlockFormat::Json5).unwrap_err(),
@@ -665,8 +611,8 @@ args = ["job.py"]
     #[test]
     fn json5_legitimately_nested_doc_still_parses() {
         // A probe object nested inside an app object inside the app array
-        // inside the root object — depth 4, the deepest a real Flockfile
-        // schema allows, and well under the depth-64 guard.
+        // inside the root object: depth 4, the deepest a real Flockfile
+        // schema allows, well under the depth-64 guard.
         let src = r#"{
             app: [{
                 name: "web",
@@ -681,9 +627,8 @@ args = ["job.py"]
     #[test]
     fn json5_line_comment_apostrophe_does_not_hide_deep_nesting() {
         // Regression: a `'` inside a `//` comment must not flip the scanner
-        // into string mode and make it ignore every bracket that follows —
-        // that would let an over-deep document slip past the guard straight
-        // into json5's stack overflow.
+        // into string mode and make it ignore every bracket that follows,
+        // letting an over-deep document slip past the guard.
         let src = format!("// don't nest\n{}", "[".repeat(5000));
         assert_eq!(
             Flockfile::parse(&src, FlockFormat::Json5).unwrap_err(),
@@ -739,9 +684,9 @@ args = ["job.py"]
 
     /// fails whenever the Flockfile grammar changes and the committed schema
     /// does not. That includes a doc-comment edit: schemars reads `///` into
-    /// `description`, which is the point — those become hover text in the
-    /// operator's editor — so a docs-only change is a real schema change and
-    /// regenerating is the correct response, not a sign anything broke.
+    /// `description`, which becomes hover text in the operator's editor, so
+    /// a docs-only change is a real schema change, and regenerating is the
+    /// correct response, not a sign anything broke.
     #[cfg(feature = "schema")]
     #[test]
     fn the_committed_schema_is_current() {
@@ -754,7 +699,7 @@ args = ["job.py"]
         );
     }
 
-    /// fails if the artefact goes back to describing ONE APP. The document is
+    /// fails if the artefact goes back to describing one app. The document is
     /// `{"app": [ … ]}`; a schema whose own `required` names `name` and
     /// `script` is an AppConfig schema under a Flockfile filename, and every
     /// real Flockfile would fail against it.
@@ -800,7 +745,7 @@ args = ["job.py"]
     }
 
     /// fails if MemSize or UpDuration reverts to a derive and starts
-    /// describing its inner integer. Follows the `$ref` — the fields are
+    /// describing its inner integer. Follows the `$ref`: the fields are
     /// references into `$defs`, not inline schemas.
     #[cfg(feature = "schema")]
     #[test]
@@ -828,15 +773,12 @@ args = ["job.py"]
 
     /// fails if a Flockfile carrying a dog's own configuration is refused.
     ///
-    /// A dog with per-app configuration has nowhere else to put it: it belongs
-    /// beside the app's declaration, in the repository the dog deploys. Before
-    /// this, `deny_unknown_fields` refused the whole document, so an operator
-    /// following shep-deploy's own README could not `shep start` their app at
-    /// all. Measured 2026-08-28 against shep 0.1.8: "unknown field `build`,
-    /// expected `$schema` or `app`".
+    /// A dog with per-app configuration has nowhere else to put it: it
+    /// belongs beside the app's declaration, in the repository the dog
+    /// deploys.
     ///
-    /// The contents are deliberately not validated. shep does not know what a
-    /// dog's keys mean and refusing a document for not recognising another
+    /// The contents are not validated: shep does not know what a dog's
+    /// keys mean, and refusing a document for not recognising another
     /// program's config is a coupling neither side wants.
     #[test]
     fn a_dog_table_is_accepted_and_ignored() {
@@ -860,10 +802,9 @@ script = "./srv"
 
     /// fails if `dog` accepts something that is not a table.
     ///
-    /// Not reading what a dog wrote is deliberate. Not caring whether it wrote
-    /// a table at all is a different thing, and it would make this the one key
-    /// in the document where a typo does not fail loudly, which is the rule
-    /// the rest of the file is built on.
+    /// Not reading what a dog wrote does not mean not caring whether it
+    /// wrote a table: that would make this the one key where a typo does
+    /// not fail loudly.
     #[test]
     fn a_dog_that_is_not_a_table_is_refused() {
         for value in ["5", "\"nope\"", "[1, 2]", "true"] {
@@ -906,7 +847,7 @@ script = "./srv"
     }
 
     /// fails if the new field is implemented by relaxing
-    /// `deny_unknown_fields` instead of naming one more key — which would
+    /// `deny_unknown_fields` instead of naming one more key, which would
     /// silently accept every typo the document lock exists to catch.
     #[test]
     fn one_more_key_is_legal_and_no_others_are() {
@@ -931,10 +872,10 @@ script = "./srv"
     }
 
     /// fails if the declared key set is inferred from values rather than read
-    /// from the document. `autorestart = true` is also the DEFAULT, so a
+    /// from the document. `autorestart = true` is also the default, so a
     /// parser that reports "fields that differ from Default" would miss it,
     /// and a later file load would then overwrite an operator who had
-    /// deliberately turned it off.
+    /// turned it off.
     #[test]
     fn declared_reports_keys_the_document_wrote_even_at_their_default() {
         let text = r#"

@@ -1,34 +1,22 @@
 //! `overrides.json`: what an operator has changed since a Flockfile was
 //! loaded.
 //!
-//! A Flockfile arrives from an app's own repository, so a merged pull request
-//! must not be able to silently change a running flock's config out from
-//! under an operator who edited it live. This store is where that edit lives:
-//! one entry per sheep name, holding the fields an operator set that the
-//! Flockfile does not currently declare. A later file load merges the two:
-//! the Flockfile's declared keys win, everything else falls back to the
-//! override, then to the built-in default. The store's own shape carries
-//! no merge logic itself; it is the ledger the merge reads and writes.
+//! A Flockfile arrives from an app's own repository, so a merged pull
+//! request must not silently change a running flock's live config. This
+//! store holds the fields an operator set that the Flockfile does not
+//! declare. A load merges the two: declared keys win, then the override,
+//! then the built-in default.
 //!
-//! # Writing
-//!
-//! Same shape as [`crate::kv`]: a read-modify-rename under an exclusive
-//! advisory lock on a sibling `overrides.json.lock`, staged through a
-//! uniquely-named `0600` temp file, `fsync`ed and `rename`d over the
-//! original. Copied rather than shared because `KvLock` is private to its
-//! module: see that module's own doc for why the lock exists at all and why
-//! `snapshot::write_atomic`'s lock-free shape does not apply here: this store
-//! is written by the daemon today and will be written by CLI verbs later, so
-//! two independent OS processes can race on it exactly as `kv.json` can.
+//! Same on-disk shape as [`crate::kv`]: a read-modify-rename under an
+//! exclusive lock on a sibling `overrides.json.lock`, copied rather than
+//! shared since `KvLock` is private to its module.
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::Path;
-// `PathBuf` backs `lock_path` below, which both platform arms of
-// `OverridesLock` need (the unix one for `nix::fcntl::Flock`'s target, the
-// windows one for the `share_mode(0)` handle), so it is gated the same way
-// `lock_path` is, rather than to `cfg(unix)` alone.
+// `PathBuf` backs `lock_path` below, gated the same way for both platform
+// arms of `OverridesLock`.
 #[cfg(any(unix, windows))]
 use std::path::PathBuf;
 
@@ -36,23 +24,19 @@ use serde::{Deserialize, Serialize};
 
 /// The on-disk format's version.
 ///
-/// A store carrying a HIGHER version is refused rather than read or replaced
-/// ([`OverridesError::FutureVersion`]): the file holds an operator's live
-/// edits with no Flockfile copy to fall back to, and there is no undo for a
-/// downgrade that overwrites it. `kv.rs`'s `KV_VERSION` is the precedent.
+/// A store carrying a higher version is refused rather than read or
+/// replaced ([`OverridesError::FutureVersion`]): there is no undo for a
+/// downgrade that overwrites an operator's live edits.
 pub const OVERRIDES_VERSION: u32 = 1;
 
 /// One sheep's overrides: the fields an operator has set that its current
 /// Flockfile does not declare.
 ///
-/// `fields` is a flat JSON object rather than a typed `AppConfig` because a
-/// later shep version may accept fields this one does not know, and reading
-/// this store must not silently drop them (the same reasoning
-/// [`OverridesError::FutureVersion`] applies to the whole file, applied per
-/// field instead). `declared` and `declared_env` are not overrides
-/// themselves: they are the set of keys the *Flockfile* has established, kept
-/// here so a later merge can tell "the file used to declare this and no
-/// longer does" apart from "the file never mentioned it".
+/// `fields` is a flat JSON object rather than a typed `AppConfig`, since a
+/// newer shep may accept fields this one does not know, and reading must
+/// not silently drop them. `declared` and `declared_env` are not overrides
+/// themselves: they are the Flockfile's declared keys, kept so a merge can
+/// tell a key the Flockfile dropped apart from one it never mentioned.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppOverrides {
     /// Operator-set field values, keyed by the same names `AppConfig`'s
@@ -64,8 +48,8 @@ pub struct AppOverrides {
     pub declared_env: BTreeSet<String>,
 }
 
-/// Redacted: `fields` can hold an `env` map, and this store is the primary
-/// place an operator's secrets live (IR-41).
+/// Redacted: `fields` can hold an `env` map, and this store is where an
+/// operator's secrets live.
 impl fmt::Debug for AppOverrides {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppOverrides")
@@ -78,10 +62,8 @@ impl fmt::Debug for AppOverrides {
 
 /// The file's shape: a version and a flat map of sheep name to overrides.
 ///
-/// `BTreeMap`, not `HashMap`, so the file is written in key order and two
-/// writes of the same content produce byte-identical files, which makes the
-/// store diffable, greppable, and safe to keep in a dotfiles repository.
-/// Same argument `kv::KvFile` records.
+/// `BTreeMap`, not `HashMap`, so the file writes in key order: two writes
+/// of the same content produce byte-identical files.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct OverridesFile {
     version: u32,
@@ -90,15 +72,13 @@ struct OverridesFile {
 
 /// Error type returned by this module.
 ///
-/// `#[non_exhaustive]`: shep-core is a published library and this enum is
-/// reachable from it, so a further failure shape must not break an
-/// out-of-tree consumer's `match` (IR-20).
+/// `#[non_exhaustive]`: shep-core is published, so a new failure variant
+/// must not break an out-of-tree `match`.
 ///
 /// Wraps `io::Error`/`serde_json::Error` directly rather than stringifying
 /// them, matching [`crate::kv::KvError`], so callers keep the underlying
-/// diagnostic through [`core::error::Error::source`], at the cost,
-/// documented there too, of not deriving `Clone`/`PartialEq`/`Eq` (IR-19's
-/// exception for variants wrapping `io::Error`).
+/// diagnostic through [`core::error::Error::source`]; this type does not
+/// derive `Clone`/`PartialEq`/`Eq` as a result.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum OverridesError {
@@ -168,14 +148,11 @@ fn lock_path(path: &Path) -> PathBuf {
     path.parent().unwrap_or_else(|| Path::new(".")).join(name)
 }
 
-/// An exclusive advisory lock over one overrides store, held for as long as
-/// the value lives and released when it drops (including on an early `?`,
-/// and by the kernel if the process dies holding it).
+/// An exclusive advisory lock over one overrides store, released when it
+/// drops.
 ///
-/// Copied from `kv::KvLock`, which is private to its module: see that
-/// module's doc for the two-platform dance this mirrors, and for why the
-/// lock is on a **sibling** `overrides.json.lock`, never on the store
-/// itself.
+/// Mirrors `kv::KvLock`: a lock on a sibling `overrides.json.lock`, never
+/// on the store itself.
 struct OverridesLock {
     /// `flock(2)` is released by this handle's `Drop`. Named with a leading
     /// underscore because it is held, never read.
@@ -279,8 +256,8 @@ fn read_file(path: &Path) -> Result<OverridesFile, OverridesError> {
     Ok(file)
 }
 
-/// Rewrites `path` to hold exactly `file`, atomically: see this module's
-/// own doc for the staged-temp-file-then-rename shape.
+/// Rewrites `path` to hold exactly `file`, atomically: staged through a
+/// temp file, then renamed over the original.
 fn write_file(path: &Path, file: &OverridesFile) -> Result<(), OverridesError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = crate::atomic_file::create_staging_file(parent, "overrides", ".tmp")?;
@@ -296,8 +273,8 @@ fn write_file(path: &Path, file: &OverridesFile) -> Result<(), OverridesError> {
     tmp.persist(path)
         .map_err(|err| OverridesError::Io(err.error))?;
 
-    // The `sync_all` above made the CONTENTS durable; this makes the rename
-    // that published them durable. See `shep_core::atomic_file`.
+    // `sync_all` above made the contents durable; this makes the rename
+    // that published them durable too.
     crate::atomic_file::sync_dir(parent)?;
     Ok(())
 }
@@ -313,12 +290,9 @@ fn write_file(path: &Path, file: &OverridesFile) -> Result<(), OverridesError> {
 /// - [`OverridesError::FutureVersion`]: the file's `version` is newer than
 ///   [`OVERRIDES_VERSION`]. Nothing is read and nothing is written.
 pub fn all(path: &Path) -> Result<BTreeMap<String, AppOverrides>, OverridesError> {
-    // Taking the lock here too costs one extra `open` and removes the
-    // question of whether a lock-free reader could observe a half-`rename`d
-    // file entirely: harmless in practice, since the rename is atomic and
-    // the worst case is a whole old file, but not worth reasoning about
-    // twice. Do not "optimize" this away without re-deriving that. Same
-    // argument `kv::all` records.
+    // Taking the lock here too costs one extra `open`, avoiding the question
+    // of a lock-free reader observing a half-`rename`d file. Do not
+    // "optimize" this away without re-deriving that.
     let _lock = OverridesLock::acquire(path)?;
     Ok(read_file(path)?.apps)
 }
@@ -337,13 +311,11 @@ pub fn get(path: &Path, name: &str) -> Result<Option<AppOverrides>, OverridesErr
 ///
 /// # Errors
 ///
-/// - [`OverridesError::FutureVersion`]: the store on disk is newer than this
-///   build understands. **Nothing is written**; a downgrade that overwrote
-///   an operator's overrides has no undo.
+/// - [`OverridesError::FutureVersion`]: the store on disk is newer than
+///   this build understands. Nothing is written.
 /// - [`OverridesError::Decode`]: the existing file could not be parsed.
-///   Refused rather than replaced, for the same reason.
 /// - [`OverridesError::Io`]: the lock, the temp file, the `fsync` or the
-///   `rename` failed. Either the whole write landed or none of it did.
+///   `rename` failed.
 pub fn put(path: &Path, name: &str, value: &AppOverrides) -> Result<(), OverridesError> {
     let _lock = OverridesLock::acquire(path)?;
     let mut file = read_file(path)?;
@@ -370,24 +342,16 @@ pub fn remove(path: &Path, name: &str) -> Result<bool, OverridesError> {
 
 /// Applies several changes at once: `Some` stores, `None` removes.
 ///
-/// One lock acquisition and one rewrite for the whole batch, where the
-/// per-name [`put`] and [`remove`] take one each. The daemon merges a whole
-/// Flockfile in one pass, and doing that through the single-name calls made
-/// an eleven-app file 11 full rewrites of this store on the thread
-/// supervising the flock. It also makes the record of one load atomic: either
-/// every app the load established is written, or none is.
-///
-/// Names this batch does not mention are left exactly as they are, which is
-/// what makes this safe against a concurrent writer touching a different app:
-/// the read and the write both happen under the one lock, so this is a
-/// read-modify-write of the whole file rather than a blind overwrite of it.
-///
-/// An empty batch takes no lock and writes nothing.
+/// One lock and one rewrite for the whole batch, atomic: either every
+/// change lands or none does. Names the batch does not mention are left
+/// untouched, and the read and write happen under the same lock, so this
+/// is safe against a concurrent writer touching a different app. An empty
+/// batch takes no lock and writes nothing.
 ///
 /// # Errors
 ///
-/// The same set [`put`] returns: `FutureVersion`, `Decode`, `Io`. Nothing is
-/// written on any of them.
+/// The same set [`put`] returns: `FutureVersion`, `Decode`, `Io`. Nothing
+/// is written on any of them.
 pub fn update(
     path: &Path,
     changes: &BTreeMap<String, Option<AppOverrides>>,
@@ -415,10 +379,6 @@ pub fn update(
 mod tests {
     use super::*;
 
-    /// fails if a batch does not store and remove in one pass, or if it
-    /// touches a name it was not given. The daemon writes a whole Flockfile
-    /// through this, so a batch that clobbered an app the file never
-    /// mentioned would delete an operator's overrides for it.
     #[test]
     fn update_stores_removes_and_leaves_the_rest_alone() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -445,8 +405,6 @@ mod tests {
         assert_eq!(all.get("bystander"), Some(&record(3)));
     }
 
-    /// fails if an empty batch writes anything. A load whose every app
-    /// refused must not rewrite the store at all.
     #[test]
     fn an_empty_update_writes_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -455,7 +413,6 @@ mod tests {
         assert!(!path.exists(), "an empty batch created a store");
     }
 
-    /// fails if a written override does not come back.
     #[test]
     fn put_then_get_round_trips() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -471,16 +428,13 @@ mod tests {
         assert_eq!(get(&path, "web").unwrap().as_ref(), Some(&value));
     }
 
-    /// fails if a missing store is an error. A fresh $SHEP_HOME has no
-    /// overrides and that is the normal state, not a fault.
     #[test]
     fn a_missing_store_reads_as_empty() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(all(&dir.path().join("overrides.json")).unwrap().is_empty());
     }
 
-    /// fails if the store is readable by anyone but its owner. It holds env
-    /// values, which is what flock.json's own owner-only test exists for.
+    /// Holds env values, same reason `flock.json` has its own owner-only test.
     #[cfg(unix)]
     #[test]
     fn the_store_is_owner_only() {
@@ -492,8 +446,6 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
     }
 
-    /// fails if Debug prints an env value. This store is where an operator's
-    /// secrets will live (IR-41).
     #[test]
     fn debug_redacts_override_values() {
         let mut fields = serde_json::Map::new();
@@ -515,8 +467,6 @@ mod tests {
         );
     }
 
-    /// fails if a store written by a NEWER shep is silently rewritten by an
-    /// older one, which would drop every field this binary does not know.
     #[test]
     fn a_future_version_refuses_without_clobbering() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -532,11 +482,8 @@ mod tests {
         );
     }
 
-    /// fails if two concurrent writers lose each other's work. This is what
-    /// the lock is for; `kv.rs`'s own version of this test is the model.
-    ///
-    /// Bounded (IR-46): each join is under a timeout, so a lock that
-    /// deadlocks fails this test instead of hanging the suite.
+    /// Bounded: each join is under a timeout, so a lock that deadlocks fails
+    /// this test instead of hanging the suite.
     #[test]
     fn two_concurrent_writers_lose_nothing() {
         let dir = tempfile::TempDir::new().unwrap();

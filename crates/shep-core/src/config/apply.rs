@@ -1,24 +1,18 @@
 //! How each `AppConfig` field reaches a running sheep.
 //!
-//! Four answers, and the difference between them is where the daemon READS
+//! Four answers, and the difference between them is where the daemon reads
 //! the field, not what the field means. A value read fresh at each decision
-//! can be swapped under a running process with no disruption; one baked into
-//! the child at exec cannot change until that process is replaced.
-//!
-//! The four entries most likely to look wrong carry their reasoning at their
-//! own arm below. All four were measured against the read sites rather than
-//! inferred from the field's name.
+//! can be swapped under a running process with no disruption; one baked
+//! into the child at exec cannot change until that process is replaced.
 
 use serde::{Deserialize, Serialize};
 
 /// Where a field's new value takes effect.
 ///
 /// `#[non_exhaustive]`: a field could someday be applied by nudging the
-/// running child through the existing `shep reopen` (SIGUSR2) signal path
-/// rather than by a fresh read, a next spawn, or a full respawn -- a
-/// reopen-triggered fifth group distinct from all four below. shep-core is
-/// published, so an out-of-tree match on this enum needs a wildcard arm to
-/// survive that addition without a major version bump.
+/// running child through `shep reopen`'s SIGUSR2 path, a fifth group
+/// distinct from the four below. shep-core is published, so an
+/// out-of-tree match on this enum needs a wildcard arm to survive that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApplyGroup {
@@ -66,10 +60,9 @@ const FIELDS: &[(&str, ApplyGroup)] = &[
     // `supervisor.rs`'s `begin_action` (`config.action_timeout.as_duration()`),
     // not baked into the long-lived per-sheep task.
     ("action_timeout", ApplyGroup::Live),
-    // `kill_signal` is NOT Live, despite its two ladder-mates above. It is
-    // read inside `kill_process` from the `app: &AppConfig` parameter of the
-    // long-lived per-sheep task, whose `ResolvedApp` is moved in once at
-    // `spawn_sheep_task` and never refreshed.
+    // Unlike its two ladder-mates above, `kill_signal` is read from the
+    // per-sheep task's `ResolvedApp`, moved in once at `spawn_sheep_task`
+    // and never refreshed.
     ("kill_signal", ApplyGroup::NextSpawn),
     ("listen_timeout", ApplyGroup::NextSpawn),
     ("readiness_probe", ApplyGroup::NextSpawn),
@@ -124,30 +117,14 @@ pub fn is_classified(field: &str) -> bool {
 
 /// How much of a Flockfile load overwrites what the operator has set since.
 ///
-/// A mode touches what its name says, and the design spec
-/// (`2026-09-02-config-overrides-design.md` §3) states each variant against
-/// three columns rather than two: whether `env` is reset, whether a key the
-/// template declares is reset, and whether a key it does not declare is.
+/// Two independent axes: whether `env` is reset, and whether a key the
+/// template declares (or does not) is reset. Five of the six combinations
+/// are named here; each variant's own doc states its column values.
 ///
-/// **Not a two-by-two grid**, and an earlier version of this comment said it
-/// was. There are two independent choices, but the settings one has three
-/// settings rather than two -- untouched, declared only, or everything --
-/// which makes six combinations. These four are the ones worth having. One
-/// discarded combination resets nothing at all, so it is the additive
-/// default with extra typing. The other is `File` plus `Env`: reset `env`,
-/// and reset only what the template declares, sparing everything it does
-/// not. That one is coherent, not useless, and is left out only because
-/// nobody has asked for it.
-///
-/// `#[non_exhaustive]`: no fifth depth is anticipated, and the attribute buys
-/// SOURCE compatibility rather than wire compatibility. It forces a crate
-/// outside this one to carry a wildcard arm, so adding a variant does not
-/// break its build. It does nothing for serde, which is worth stating because
-/// an earlier version of this comment claimed otherwise: this enum carries no
-/// `#[serde(other)]`, so a build meeting a variant it predates fails to
-/// deserialize with `unknown variant`, measured rather than assumed. That is
-/// the whole reason renaming `Settings` to `Policy` moved `PROTOCOL_VERSION`
-/// to 3 instead of riding the additive precedent.
+/// `#[non_exhaustive]` buys source compatibility only, forcing an
+/// out-of-tree match to carry a wildcard arm. It does nothing for serde:
+/// this enum has no `#[serde(other)]`, so an older build fails to
+/// deserialize a variant it predates with `unknown variant`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -163,28 +140,23 @@ pub enum ResetDepth {
     /// Put back what the template declares, and nothing else.
     ///
     /// `env`: kept. A key the template declares: reset. A key it does not
-    /// declare: kept -- an app stocked to four instances against a file with
-    /// no `instances` line keeps its count, because the file never entered
-    /// that argument. This is the mode that fixes the footgun `Policy` below
-    /// reintroduces.
+    /// declare: kept, so an app stocked to four instances against a file
+    /// with no `instances` line keeps its count.
     File,
     /// Put non-`env` settings back to the template, `env` kept. Every
-    /// setting goes back, declared or not: a key the template is silent
-    /// about goes to the value a fresh start off that template would give
-    /// it. `env` is operator-supplied data while the rest is operator-tuned
-    /// policy: resetting policy is recoverable, resetting data takes the
-    /// app's database away.
+    /// setting goes back, declared or not, to the value a fresh start off
+    /// the template would give it: `env` is operator data, the rest is
+    /// operator-tuned policy, and resetting policy is recoverable while
+    /// resetting data is not.
     ///
     /// `env`: kept. A key the template declares: reset. A key it does not
     /// declare: reset too, to the template's own default.
     Policy,
     /// Reset `env` back to the template and leave everything else alone.
     ///
-    /// This mode touches data, not policy, so it has no opinion about any
-    /// setting: a restart budget the template happens to mention is not the
-    /// operator's to lose to a flag that says `env`. On the settings axis it
-    /// is therefore `None`, append included, because the flag widens a load
-    /// rather than narrowing one.
+    /// Touches data, not policy: on the settings axis this behaves like
+    /// `None`, append included, since it widens a load rather than
+    /// narrowing one.
     ///
     /// `env`: reset. A key the template declares: kept, save for the same
     /// append `None` does. A key it does not declare: kept.
@@ -218,12 +190,6 @@ mod tests {
         );
     }
 
-    /// fails if kill_signal is classified Live. It is read from the
-    /// per-sheep task's frozen ResolvedApp, moved in once at
-    /// spawn_sheep_task and never refreshed, so an edit reaches the next
-    /// spawn and not the next kill. Its ladder-mates kill_timeout and
-    /// graceful_timeout ARE read fresh, in claim_manual, which is why this
-    /// one looks like it belongs with them.
     #[test]
     fn kill_signal_reaches_the_next_spawn_not_the_next_kill() {
         assert_eq!(apply_group("kill_signal"), ApplyGroup::NextSpawn);
@@ -231,10 +197,6 @@ mod tests {
         assert_eq!(apply_group("graceful_timeout"), ApplyGroup::Live);
     }
 
-    /// fails if shutdown_with_message is classified anything but
-    /// NeedsRespawn. assemble() ORs it into whether fd 3 is opened for the
-    /// child, which is the child's own fd table and cannot change under a
-    /// running process.
     #[test]
     fn shutdown_with_message_is_baked_into_the_child() {
         assert_eq!(
