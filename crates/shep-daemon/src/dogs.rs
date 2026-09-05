@@ -321,12 +321,25 @@ pub async fn spawn_enabled_dogs(
     }
 }
 
-/// The `[<name>]` section of `path`, a `dogs.toml`, rendered back to TOML
-/// text.
+/// The `[<name>]` section of `path`, a `dogs.toml`, as the operator wrote
+/// it: the table's own text, without its header.
 ///
 /// Reads the file on every call rather than serving a copy cached at boot:
 /// one reader can never be stale, and it is what makes
 /// `shep disable X && shep enable X` re-read an edited section.
+///
+/// The span, not a re-render of the parsed table, and the pane is why.
+/// [`set_dog_section`] writes back the text its caller hands it, so
+/// whatever this drops is dropped for good the next time anyone saves.
+/// `toml::to_string` over a parsed table drops every comment inside the
+/// section, and `toml::map::Map` is a `BTreeMap` in this build, so it
+/// alphabetises the keys on the way out too. A hand-written `dogs.toml` is
+/// worth more than the simpler read.
+///
+/// A dog parses this and never reads it, so the comments cost it nothing:
+/// the text is valid TOML either way, and a section that is only comments
+/// still renders empty, which is the answer that sends a dog to its
+/// defaults.
 ///
 /// A missing file, or a file with no such section, is `Ok(String::new())` —
 /// a dog with no configuration is the ordinary case, not a fault. That
@@ -351,9 +364,20 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
     // the boot-time migration moved it.
     let config =
         DogsConfig::load(Some(&source)).map_err(|err| DogError::Config(err.to_string()))?;
-    match config.dog.get(name) {
-        None => Ok(String::new()),
-        Some(table) => toml::to_string(table).map_err(|err| DogError::Config(err.to_string())),
+    let Some(table) = config.dog.get(name) else {
+        return Ok(String::new());
+    };
+    // Cannot fail: the stricter parse above already read the same bytes.
+    let doc: toml_edit::DocumentMut = source
+        .parse()
+        .map_err(|err: toml_edit::TomlError| DogError::Config(err.to_string()))?;
+    match doc.get(name) {
+        Some(toml_edit::Item::Table(spanned)) => Ok(spanned.to_string()),
+        // An inline table — `bark = { poll = "60s" }` — is a valid entry
+        // whose span is `{ ... }`, which is not a section body and is not
+        // something the pane could write back. Rendered, as every section
+        // was before: there is no comment to lose inside one line.
+        _ => toml::to_string(table).map_err(|err| DogError::Config(err.to_string())),
     }
 }
 
@@ -367,7 +391,8 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
 /// out: every table other than `name`'s comes through byte for byte, and so
 /// does a comment outside it. A comment INSIDE the replaced table is the
 /// caller's to carry, because the caller is what decided the section's new
-/// text.
+/// text — and [`dog_section`] hands it the span rather than a re-render
+/// precisely so that it can.
 ///
 /// The rendered result is handed to [`DogsConfig::load`] before anything
 /// reaches disk, so a section this daemon could not serve back never lands.
@@ -1980,6 +2005,43 @@ mod tests {
         assert!(!text.contains("poll = \"60s\""), "{text}");
         let parsed = DogsConfig::load(Some(&text)).unwrap();
         assert_eq!(parsed.dog["bark"]["history_bytes"].as_integer(), Some(4096));
+    }
+
+    /// fails if the READ renders a parsed map back out instead of handing
+    /// back the text an operator wrote. The sibling test above pins a
+    /// comment OUTSIDE the edited table, which the write side preserves on
+    /// its own; a comment INSIDE it, and the order of the keys around it,
+    /// survive only if the section the pane was handed was the raw span.
+    /// `toml::map::Map` is a `BTreeMap` without `preserve_order`, so a
+    /// re-render alphabetises as well as stripping.
+    #[test]
+    fn a_pane_round_trip_keeps_a_comment_inside_the_table_and_the_key_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dogs.toml");
+        std::fs::write(
+            &path,
+            "[bark]\n# why bark polls slowly\npoll = \"60s\"\nzz_last = 1\naa_first = 2\n",
+        )
+        .unwrap();
+
+        let section = dog_section(&path, "bark").unwrap();
+        assert!(section.contains("# why bark polls slowly"), "{section}");
+        assert!(
+            section.find("zz_last") < section.find("aa_first"),
+            "the keys come back in the operator\'s order: {section}"
+        );
+
+        // What the pane does: write back what it was handed, one value
+        // changed.
+        set_dog_section(&path, "bark", &section.replace("60s", "30s")).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# why bark polls slowly"), "{text}");
+        assert!(text.contains("poll = \"30s\""), "{text}");
+        assert!(
+            text.find("zz_last") < text.find("aa_first"),
+            "the write keeps the order the read handed it: {text}"
+        );
     }
 
     /// fails if the writer needs a file to already be there. A home that has
