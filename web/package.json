@@ -12,11 +12,11 @@
     "astro": "astro"
   },
   "dependencies": {
-    "astro": "^7.2.2"
+    "astro": "^7.2.10"
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.10",
     "pagefind": "^1.5.2",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   }
 }
