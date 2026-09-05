@@ -57,6 +57,22 @@ pub(crate) fn visible_width(s: &str) -> usize {
 /// dropped.
 #[must_use]
 pub(crate) fn sanitize_cell(s: &str) -> String {
+    sanitize(s, true)
+}
+
+/// [`sanitize_cell`] for a surface that emits no colour of its own, where a
+/// well-formed ANSI escape is dropped rather than kept.
+///
+/// `bare` style colours nothing, so an escape reaching one of its cells came
+/// from an app name and has only the operator's terminal left to drive.
+#[must_use]
+pub(crate) fn sanitize_cell_without_ansi(s: &str) -> String {
+    sanitize(s, false)
+}
+
+/// The body both spellings share. `keep_ansi` decides the single
+/// difference: whether a well-formed CSI sequence is written out or dropped.
+fn sanitize(s: &str, keep_ansi: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -71,7 +87,7 @@ pub(crate) fn sanitize_cell(s: &str) -> String {
                         break;
                     }
                 }
-                if closed {
+                if closed && keep_ansi {
                     out.push_str(&seq);
                 }
             }
