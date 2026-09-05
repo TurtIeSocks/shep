@@ -1255,11 +1255,12 @@ it read and dropped are counted exactly; bytes below its 64 KiB window were
 never read at all, so those are reported in bytes, because nothing counted the
 lines in them and guessing would be worse than saying so.
 
-The last six frames are the settings screen, `s` from the dashboard. It owns
+The last seven frames are the settings screen, `s` from the dashboard. It owns
 the whole body between the title and the status bar rather than sharing it
 with the flock table, so a fresh $SHEP_HOME, some scalars declared, an armed
-confirm, the socket editor mid-type, the dogs table's own drift and the same
-screen at 45 columns each get a frame of their own.
+confirm, the socket editor mid-type, the dogs table's own drift, the same
+screen at 45 columns and the same screen too short to hold every row each get
+a frame of their own.
 ";
 
 #[cfg(test)]
