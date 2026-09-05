@@ -168,3 +168,18 @@ async fn a_run_of_requests_is_answered_without_the_receiver_being_read() {
     }
     assert_eq!(seen, 10, "and every envelope was still recorded");
 }
+
+/// `Duration::MAX` is a caller's to pass, and `Duration`'s `Add` panics
+/// on overflow rather than saturating.
+#[tokio::test]
+async fn a_deadline_at_the_duration_ceiling_errors_instead_of_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = shep_client::testing::control_address(dir.path());
+    let (client, _served) = fake_client_that_dies_mid_request(&path).await;
+    assert!(matches!(
+        client
+            .request_with_deadline(Request::Ping, Some(Duration::MAX))
+            .await,
+        Err(RequestError::Closed)
+    ));
+}
