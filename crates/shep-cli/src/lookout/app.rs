@@ -37,9 +37,10 @@ use shep_core::protocol::{
 };
 use shep_core::status::ProcStatus;
 
+use super::field::FieldSet;
 use super::theme::Palette;
 use super::viewport::Viewport;
-use crate::commands::settings::{SettingEdit, SettingField, SettingsSnapshot};
+use crate::commands::settings::{SettingEdit, SettingField, SettingsSnapshot, settings_field_set};
 use crate::style::{StyleLevel, StyleSource};
 use crate::vocabulary::Reported;
 
@@ -642,6 +643,11 @@ pub enum SettingsRow {
 #[derive(Debug, Clone)]
 pub struct Settings {
     snapshot: SettingsSnapshot,
+    /// The six scalars' shape: which they are, in what order, under which
+    /// section. The screen reads its rows, labels and section headers off
+    /// this rather than off a `match` per question, so a config pane and
+    /// this screen answer them the same way.
+    fields: FieldSet,
     /// The cursor and, once a terminal has said how tall the body is, the
     /// scroll offset. Clamped on every read rather than kept pre-clamped: a
     /// refresh can shrink the dog list out from under a cursor already
@@ -731,6 +737,7 @@ impl Settings {
     fn new(snapshot: SettingsSnapshot) -> Self {
         Self {
             snapshot,
+            fields: settings_field_set(),
             view: Viewport::new(),
             pending: None,
         }
@@ -889,16 +896,21 @@ impl Settings {
     /// order, then one row per candidate dog.
     #[must_use]
     pub fn rows(&self) -> Vec<SettingsRow> {
-        let mut rows = vec![
-            SettingsRow::Scalar(SettingField::LogLevel),
-            SettingsRow::Scalar(SettingField::LogJson),
-            SettingsRow::Scalar(SettingField::Socket),
-            SettingsRow::Scalar(SettingField::MaxCronSleep),
-            SettingsRow::Scalar(SettingField::AllowControl),
-            SettingsRow::Scalar(SettingField::StyleLevel),
-        ];
+        let mut rows: Vec<SettingsRow> = self
+            .fields
+            .fields()
+            .iter()
+            .filter_map(|f| SettingField::from_key(&f.key))
+            .map(SettingsRow::Scalar)
+            .collect();
         rows.extend((0..self.snapshot.dogs.len()).map(SettingsRow::Dog));
         rows
+    }
+
+    /// The field model behind the scalar rows.
+    #[must_use]
+    pub fn fields(&self) -> &FieldSet {
+        &self.fields
     }
 
     /// The row the cursor sits on. `None` only if [`Self::rows`] is somehow
@@ -950,7 +962,7 @@ impl Settings {
 
 /// `Off, Error, Warn, Info, Debug, Trace`, [`LogLevel`]'s own declared
 /// order, wrapping from `Trace` back to `Off`.
-const LOG_LEVEL_ORDER: [LogLevel; 6] = [
+pub(crate) const LOG_LEVEL_ORDER: [LogLevel; 6] = [
     LogLevel::Off,
     LogLevel::Error,
     LogLevel::Warn,
@@ -985,7 +997,8 @@ fn next_bool(current: &str) -> String {
 
 /// `Full, Plain, Bare`, [`StyleLevel`]'s own declared order, wrapping from
 /// `Bare` back to `Full`.
-const STYLE_LEVEL_ORDER: [StyleLevel; 3] = [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare];
+pub(crate) const STYLE_LEVEL_ORDER: [StyleLevel; 3] =
+    [StyleLevel::Full, StyleLevel::Plain, StyleLevel::Bare];
 
 /// One step along [`STYLE_LEVEL_ORDER`] from `current`, the same fallback
 /// [`next_log_level`] takes for an unparseable value.

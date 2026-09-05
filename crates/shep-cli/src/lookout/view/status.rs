@@ -113,7 +113,9 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // including the filter box, which it cannot coexist with anyway
         // because `/` cancels a confirm before it opens the box.
         (confirm_prompt(&action), palette.attention())
-    } else if let Some((field, buffer)) = app.settings().and_then(Settings::typing) {
+    } else if let Some((settings, (field, buffer))) =
+        app.settings().and_then(|s| s.typing().map(|t| (s, t)))
+    {
         // The settings screen's own free-text editor, checked ahead of the
         // dashboard's filter-box branch below: both share `InputMode::Text`
         // (task 8's editor reuses the filter box's keymap), but this one is
@@ -127,7 +129,7 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         (
             format!(
                 "editing {}  {buffer}\u{258f}   enter applies   esc cancels",
-                field_label(*field)
+                field_label(settings, *field)
             ),
             palette.attention(),
         )

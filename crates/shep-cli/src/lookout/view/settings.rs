@@ -321,15 +321,11 @@ fn scalar_view(snapshot: &SettingsSnapshot, field: SettingField) -> &ScalarView 
 /// `pub(super)`: `status::status_line`'s own editor-line branch names the
 /// field being typed with this same word, so the status bar and the body
 /// pane never disagree about what to call `socket` or `max_cron_sleep`.
-pub(super) const fn field_label(field: SettingField) -> &'static str {
-    match field {
-        SettingField::LogLevel => "log_level",
-        SettingField::LogJson => "log_json",
-        SettingField::Socket => "socket",
-        SettingField::MaxCronSleep => "max_cron_sleep",
-        SettingField::AllowControl => "allow_control",
-        SettingField::StyleLevel => "level",
-    }
+pub(super) fn field_label(settings: &Settings, field: SettingField) -> &str {
+    settings
+        .fields()
+        .by_key(field.key())
+        .map_or(field.key(), |f| f.key.as_str())
 }
 
 /// What applying this field costs, decision 6 of the design spec's own
@@ -486,9 +482,14 @@ fn scalar_widths(width: u16, columns: &[ScalarColumn]) -> (u16, u16) {
 }
 
 /// One scalar cell's text.
-fn scalar_cell(field: SettingField, view: &ScalarView, column: ScalarColumn) -> String {
+fn scalar_cell(
+    settings: &Settings,
+    field: SettingField,
+    view: &ScalarView,
+    column: ScalarColumn,
+) -> String {
     match column {
-        ScalarColumn::Name => field_label(field).to_string(),
+        ScalarColumn::Name => field_label(settings, field).to_owned(),
         ScalarColumn::Value => view.value.clone(),
         ScalarColumn::Source => view.source.to_string(),
         ScalarColumn::Cost => apply_cost(field, view.source).to_string(),
@@ -498,6 +499,7 @@ fn scalar_cell(field: SettingField, view: &ScalarView, column: ScalarColumn) -> 
 /// One scalar row: name, value, source, apply cost, as many of those as
 /// `width` (a BODY width) can pay for.
 fn scalar_line(
+    settings: &Settings,
     field: SettingField,
     view: &ScalarView,
     selected: bool,
@@ -516,21 +518,21 @@ fn scalar_line(
             ScalarColumn::Source => SCALAR_SOURCE_W,
             ScalarColumn::Cost => cost_width,
         };
-        text.push_str(&fit(&scalar_cell(field, view, *column), cell_width));
+        text.push_str(&fit(
+            &scalar_cell(settings, field, view, *column),
+            cell_width,
+        ));
     }
     Line::from(Span::raw(text))
 }
 
 /// Which `[section]` a scalar field's row lives under.
-const fn section_for(field: SettingField) -> &'static str {
-    match field {
-        SettingField::LogLevel
-        | SettingField::LogJson
-        | SettingField::Socket
-        | SettingField::MaxCronSleep => "[daemon]",
-        SettingField::AllowControl => "[whistle]",
-        SettingField::StyleLevel => "[style]",
-    }
+fn section_for(settings: &Settings, field: SettingField) -> &str {
+    settings
+        .fields()
+        .by_key(field.key())
+        .and_then(|f| f.group.as_deref())
+        .unwrap_or("")
 }
 
 /// Every line of the screen's body, top to bottom: `[daemon]`'s four rows,
@@ -563,7 +565,7 @@ fn content_lines(
     let total_rows = settings.rows().len();
 
     let mut lines = Vec::new();
-    let mut current_section: Option<&'static str> = None;
+    let mut current_section: Option<&str> = None;
     // A section's header (and the blank line ahead of it, for every
     // section after the first) held here rather than pushed straight away.
     // It is only pushed alongside the first row of its section that
@@ -586,7 +588,7 @@ fn content_lines(
         };
         let index = row_index;
         row_index += 1;
-        let section = section_for(field);
+        let section = section_for(settings, field);
         if current_section != Some(section) {
             let mut header = Vec::new();
             if current_section.is_some() {
@@ -605,6 +607,7 @@ fn content_lines(
         }
         lines.extend(pending_header.drain(..));
         lines.push(scalar_line(
+            settings,
             field,
             scalar_view(snapshot, field),
             cursor == Some(row),
@@ -711,7 +714,7 @@ fn content_lines(
                 fit(
                     &format!(
                         "editing {}: {buffer}\u{258f}   enter applies   esc cancels",
-                        field_label(*field)
+                        field_label(settings, *field)
                     ),
                     table_width,
                 )
