@@ -557,7 +557,7 @@ jobs:
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          cargo nextest run --profile ci --workspace --locked -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'
+          cargo nextest run --profile ci --workspace --locked --all-features -E 'not (test(::slow::) or test(two_concurrent_boots) or test(signal_ignored_then_kill_tree_reaps) or test(a_reload_costs_a))'
           cargo llvm-cov report --lcov --output-path lcov.info
       - uses: ./.github/actions/nextest-report
         if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
