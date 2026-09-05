@@ -72,7 +72,7 @@ pub enum SelectorSpec {
     /// By fold name
     Fold(String),
     // Both field names are part of the wire contract, and the byte shape is
-    // pinned by `request_wire_v3`, so renaming either breaks that snapshot
+    // pinned by `request_wire_v4`, so renaming either breaks that snapshot
     // rather than sliding through unnoticed.
     /// By app name and instance slot
     ///
@@ -2784,7 +2784,7 @@ mod tests {
                 },
             },
         ];
-        insta::assert_json_snapshot!("request_wire_v3", requests);
+        insta::assert_json_snapshot!("request_wire_v4", requests);
     }
 
     #[test]
@@ -3199,7 +3199,7 @@ mod tests {
                 }),
             },
         ];
-        insta::assert_json_snapshot!("reply_wire_v3", replies);
+        insta::assert_json_snapshot!("reply_wire_v4", replies);
     }
 
     /// fails if `applied` or `pending` ever carries a field's VALUE rather
@@ -3375,7 +3375,7 @@ mod tests {
             dog_name: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
-        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":3}"#);
+        assert_eq!(json, r#"{"client_version":"0.1.0","protocol":4}"#);
     }
 
     /// fails if a non-dog client's `Hello` grows a key. The CLI is the
@@ -3393,7 +3393,7 @@ mod tests {
         let json = serde_json::to_string(&dog).unwrap();
         assert_eq!(
             json,
-            r#"{"client_version":"0.1.0","protocol":3,"dog_name":"metrics"}"#
+            r#"{"client_version":"0.1.0","protocol":4,"dog_name":"metrics"}"#
         );
         assert_eq!(serde_json::from_str::<Hello>(&json).unwrap(), dog);
     }

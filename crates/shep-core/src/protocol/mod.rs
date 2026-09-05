@@ -1,4 +1,4 @@
-//! The client<->daemon wire protocol (version 3)
+//! The client<->daemon wire protocol (version 4)
 //!
 //! Typed request/response enums + bus events. Framing lives in [`wire`];
 //! every type here is snapshot-pinned — changing any serialized shape is a
@@ -25,8 +25,23 @@
 //! refusal at the handshake. Restart the shepherd after upgrading to this
 //! version, the same as the last bump asked.
 //!
+//! **What version 4 added:** the three config-pane requests --
+//! [`Request::SheepConfig`], [`Request::SetSheepEnv`] and
+//! [`Request::SetDogConfig`] -- with their three replies.
+//!
+//! Every one of them is an addition behind `#[non_exhaustive]`, so the
+//! evolution rule below would keep the version, and it moves anyway. The
+//! rule is about what an older peer can still DECODE, and these are
+//! requests an older daemon cannot: it fails on the envelope and ends the
+//! connection, so the operator gets a dead client rather than a sentence
+//! naming the skew. `Request::ApplyConfig` shipped additively for exactly
+//! this reason and produced exactly that failure, which is the precedent
+//! this bump declines to repeat. The cost of a bump is one `shep daemon
+//! reload` after an upgrade; the cost of not bumping is an operator
+//! debugging a socket.
+//!
 //! **Two sets of tests carry a version in their name and they assert
-//! opposite things.** The `*_wire_v3` snapshots pin the shape this crate
+//! opposite things.** The `*_wire_v4` snapshots pin the shape this crate
 //! serializes TODAY, so they follow [`PROTOCOL_VERSION`] and get renamed
 //! whenever it moves. The `v1_*_fixture_still_deserializes` tests pin a
 //! literal payload captured from a version 1 peer and assert it STILL
@@ -59,4 +74,4 @@ pub use wire::{MAX_FRAME_BYTES, WireError, codec, decode_frame, encode_frame};
 /// Removing, renaming, or retyping anything serialized bumps it, recorded in
 /// the CHANGELOG. Byte fixtures in each protocol module pin the deserialize
 /// direction.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
