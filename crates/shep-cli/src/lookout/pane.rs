@@ -13,8 +13,9 @@ use std::time::Instant;
 use serde_json::{Map, Value};
 use shep_core::config::{ApplyGroup, GROUP_ORDER, apply_group, flockfile_schema_json};
 use shep_core::protocol::{EnvValue, SheepConfigView};
+use shep_core::values::{MemSize, UpDuration};
 
-use super::field::{FieldKind, FieldSet};
+use super::field::{FieldKind, FieldSet, ValueKind};
 use super::viewport::Viewport;
 
 /// Which thing the pane is editing.
@@ -506,6 +507,8 @@ pub struct ConfigPane {
     view: Viewport,
     pending_edit: Option<PanePending>,
     env: Option<EnvPane>,
+    /// Whether `h` is showing the selected field's own help text.
+    help_open: bool,
     /// The dog's `[<name>]` table as TOML text, and [`None`] for a sheep.
     ///
     /// Kept beside the parsed `values` rather than instead of them, because
@@ -584,6 +587,7 @@ impl ConfigPane {
             view: Viewport::new(),
             pending_edit: None,
             env: None,
+            help_open: false,
             section: None,
         }
     }
@@ -652,6 +656,7 @@ impl ConfigPane {
             view: Viewport::new(),
             pending_edit: None,
             env: None,
+            help_open: false,
             section: Some(section),
         }
     }
@@ -717,6 +722,30 @@ impl ConfigPane {
     /// Closes it, leaving the field list up.
     pub(super) fn close_env(&mut self) {
         self.env = None;
+    }
+
+    /// Whether `h` is showing the selected field's own help text.
+    #[must_use]
+    pub fn help_open(&self) -> bool {
+        self.help_open
+    }
+
+    /// Flips it.
+    pub(super) fn toggle_help(&mut self) {
+        self.help_open = !self.help_open;
+    }
+
+    /// Dismisses it. A no-op when it is already closed, so `Escape` can
+    /// call this unconditionally.
+    pub(super) fn close_help(&mut self) {
+        self.help_open = false;
+    }
+
+    /// Carries a previous pane's help visibility across a rebuild, the
+    /// same reason [`Self::adopt_view`] carries the cursor: a re-read must
+    /// not dismiss a note the operator has not dismissed.
+    pub(super) fn set_help_open(&mut self, open: bool) {
+        self.help_open = open;
     }
 
     /// The key under the cursor, and why the pane will not edit it, when it
@@ -1003,7 +1032,7 @@ impl ConfigPane {
         let shown = match value.as_value() {
             Value::Null => "(unset)".to_owned(),
             _ if secret => "<set>".to_owned(),
-            Value::String(text) => text.clone(),
+            Value::String(text) => self.resolved_display(key, text),
             other => other.to_string(),
         };
         // `ApplyGroup` is `#[non_exhaustive]`, so the wildcard is required
@@ -1044,6 +1073,11 @@ impl ConfigPane {
     /// dog's schema is somebody else's, and one declaring a field named
     /// `env` reads its own section, not [`Self::env_keys`], which
     /// [`Self::dog`] always leaves empty.
+    ///
+    /// This is the parseable form: what [`Self::begin_typing`] seeds an
+    /// editor with. [`Self::display_value`] is the one a row draws, and the
+    /// two disagree exactly for a [`ValueKind`] field, where a seed has to
+    /// stay something the daemon's own grammar still accepts.
     #[must_use]
     pub fn value(&self, key: &str) -> String {
         if key == "env" && matches!(self.target, PaneTarget::Sheep { .. }) {
@@ -1058,6 +1092,42 @@ impl ConfigPane {
             Some(Value::Bool(flag)) => flag.to_string(),
             Some(Value::Number(number)) => number.to_string(),
             Some(other) => other.to_string(),
+        }
+    }
+
+    /// [`Self::value`], resolved through its own grammar for a
+    /// [`MemSize`]/[`UpDuration`] field: what a row draws instead of the
+    /// digits an operator would otherwise have to already know the
+    /// convention for.
+    #[must_use]
+    pub fn display_value(&self, key: &str) -> String {
+        self.resolved_display(key, &self.value(key))
+    }
+
+    /// `raw` resolved through `key`'s own grammar, when `key` is one of
+    /// shep-core's unit types. Display only: [`Self::value`] is what an
+    /// editor still seeds and sends, so a suffix minted here never travels
+    /// back out as part of a value.
+    ///
+    /// A `raw` that fails to parse, including whatever is mid-edit, comes
+    /// back unchanged: this has no business guessing at a string shep is
+    /// about to refuse on its own.
+    ///
+    /// Only a bare number is annotated. A value naming its own unit is the
+    /// operator's spelling and survives as written, so a `60s` on disk is
+    /// never redrawn as the `1m` its own `Display` would canonicalize it to.
+    fn resolved_display(&self, key: &str, raw: &str) -> String {
+        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return raw.to_owned();
+        }
+        match self.fields.by_key(key).and_then(|field| field.value_kind) {
+            Some(ValueKind::MemSize) => raw
+                .parse::<MemSize>()
+                .map_or_else(|_| raw.to_owned(), |_| format!("{raw} B")),
+            Some(ValueKind::UpDuration) => raw
+                .parse::<UpDuration>()
+                .map_or_else(|_| raw.to_owned(), |_| format!("{raw}ms")),
+            None => raw.to_owned(),
         }
     }
 
@@ -1446,6 +1516,115 @@ mod tests {
         assert!(
             !matches!(value.as_value(), serde_json::Value::String(_)),
             "an integer field must not travel as a string"
+        );
+    }
+
+    /// `kill_timeout` defaults to 1600ms, which `UpDuration::Display`
+    /// prints as the bare digits `"1600"`; `listen_timeout` defaults to
+    /// 3s, which it already prints with a unit. `value` stays the raw,
+    /// parseable form an editor would seed from.
+    #[test]
+    fn a_bare_up_duration_shows_its_resolved_unit_and_a_suffixed_one_is_unchanged() {
+        let pane = ConfigPane::sheep(web());
+        assert_eq!(pane.display_value("kill_timeout"), "1600ms");
+        assert_eq!(pane.value("kill_timeout"), "1600");
+        assert_eq!(pane.display_value("listen_timeout"), "3s");
+    }
+
+    /// A dog's values come from the section its operator wrote, so a
+    /// spelling that `UpDuration::Display` would canonicalize to `1m`
+    /// stays as `60s`. A sheep's arrive already canonicalized, `UpDuration`
+    /// serializing through its own `Display`, so this is the pane that can
+    /// tell the difference.
+    #[test]
+    fn a_dogs_own_spelling_of_a_duration_survives_the_pane() {
+        let schema = serde_json::json!({
+            "properties": {
+                "poll": { "type": "string", "$ref": "#/$defs/UpDuration" }
+            },
+            "$defs": { "UpDuration": { "type": "string" } }
+        });
+        let pane = ConfigPane::dog("bark".into(), None, schema, "poll = \"60s\"\n".into());
+        assert_eq!(pane.display_value("poll"), "60s");
+    }
+
+    /// 64 bytes is not a whole `K`/`M`/`G`, so `MemSize::Display` prints
+    /// the bare digits `"64"`; 512 mebibytes already prints with a unit.
+    #[test]
+    fn a_bare_mem_size_shows_its_resolved_unit_and_a_suffixed_one_is_unchanged() {
+        for (bytes, want) in [(64, "64 B"), (512 << 20, "512M")] {
+            let config = AppConfig {
+                name: "web".into(),
+                max_memory: Some(MemSize::from_bytes(bytes)),
+                ..AppConfig::default()
+            };
+            let pane = ConfigPane::sheep(SheepConfigView::new(config, Vec::new(), Vec::new()));
+            assert_eq!(pane.display_value("max_memory"), want, "{bytes} bytes");
+        }
+    }
+
+    /// A field with no `MemSize`/`UpDuration` grammar is untouched by
+    /// `display_value`, the same as `value`.
+    #[test]
+    fn a_field_with_no_unit_grammar_displays_the_same_either_way() {
+        let pane = ConfigPane::sheep(web());
+        assert_eq!(pane.display_value("cwd"), pane.value("cwd"));
+        assert_eq!(
+            pane.display_value("max_restarts"),
+            pane.value("max_restarts")
+        );
+    }
+
+    /// The confirm sentence quotes what a write would actually mean, not
+    /// the digits the operator typed: this is the moment the maintainer's
+    /// own report says nothing warned them.
+    #[test]
+    fn arming_a_bare_number_on_a_mem_size_field_confirms_the_resolved_value() {
+        let mut pane = ConfigPane::sheep(web());
+        pane.move_to_key("max_memory");
+        pane.begin_typing();
+        for c in "64".chars() {
+            pane.type_char(c);
+        }
+        pane.apply_typing(Instant::now());
+        let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
+            panic!("{:?}", pane.pending_edit());
+        };
+        assert!(text.contains("set max_memory = 64 B?"), "{text}");
+    }
+
+    /// A buffer that does not parse renders as typed rather than guessed
+    /// at or hidden: shep is the one that gets to refuse it.
+    #[test]
+    fn an_unparseable_buffer_on_a_unit_field_confirms_as_typed() {
+        let mut pane = ConfigPane::sheep(web());
+        pane.move_to_key("max_memory");
+        pane.begin_typing();
+        for c in "banana".chars() {
+            pane.type_char(c);
+        }
+        pane.apply_typing(Instant::now());
+        let Some(PanePending::Armed { text, .. }) = pane.pending_edit() else {
+            panic!("{:?}", pane.pending_edit());
+        };
+        assert!(text.contains("set max_memory = banana?"), "{text}");
+    }
+
+    #[test]
+    fn toggling_help_flips_it_and_closing_it_is_idempotent() {
+        let mut pane = ConfigPane::sheep(web());
+        assert!(!pane.help_open());
+        pane.toggle_help();
+        assert!(pane.help_open());
+        pane.toggle_help();
+        assert!(!pane.help_open());
+        pane.toggle_help();
+        pane.close_help();
+        assert!(!pane.help_open());
+        pane.close_help();
+        assert!(
+            !pane.help_open(),
+            "closing an already-closed help is a no-op"
         );
     }
 
