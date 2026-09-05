@@ -63,7 +63,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === errored  (120x30) ===
 One errored, one waiting to restart, one stopped, with the selection parked on the errored sheep. Each row's own STATUS cell is the only coloured cell in that row, and EXIT carries why each of the three stopped: a code for the two that crashed, a signal name for the one shep stopped itself.
@@ -97,7 +97,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === grouped  (120x30) ===
 Three instances of one app under a group header, with the cursor parked on the header. The header sums their restarts, CPU and memory and takes the SHORTEST of their uptimes, so a group reads as time since the app was last disturbed rather than as the age of its luckiest instance. The detail pane repeats that rollup and says lambs are per-instance; the feed will not guess which instance to tail.
@@ -131,7 +131,7 @@ bleats  web  follows one instance; select one to see its log
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === empty  (100x28) ===
 No sheep registered. Each of the three panes says why it is empty, and the three sentences are different because the three reasons are.
@@ -163,7 +163,7 @@ bleats  no sheep is selected
                                                                                                     
                                                                                                     
                                                                                                     
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                   read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit          read-only
 
 === narrow  (51x14) ===
 51 columns: FOLD, EXIT, RESTARTS, PID and MEM are gone, in that order. CPU and UPTIME survive because they explain WHY a RUNNING sheep is behaving badly, a question EXIT cannot even ask. The host strip fits; the detail pane and the feed do not, at 14 rows.
@@ -227,7 +227,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === frozen  (120x30) ===
 The ladder ran out. Last known values stay, the uptime clock has stopped, and so has the host strip — one line ticking over on a frozen screen is a contradiction on the same frame.
@@ -261,7 +261,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === refused  (120x30) ===
 `x` with actions gated off. The refusal is literal, nothing about damage gets charming, and the panes below carry on.
@@ -373,7 +373,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === table_only  (120x12) ===
 12 rows: no optional panes at all. This is 12a's frame, and the only thing that changed is the two-column gutter the marker sits in.
@@ -389,7 +389,7 @@ shep lookout   /home/ada/.shep                                                  
   1     web         online           48212    0         -          2.9%    178.0M    1h 26m    edge        -            
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === feed_gap  (120x30) ===
 The feed under a burst: 3.8 megabytes were never read and some hundreds of lines were read and dropped. The pane counts both, and counts them separately, because it knows the second exactly and cannot know how many lines are in the first.
@@ -423,7 +423,7 @@ out  GET /v1/orders/26 200 34ms
 out  GET /v1/orders/27 200 35ms                                                                                         
 out  GET /v1/orders/28 200 36ms                                                                                         
 out  GET /v1/orders/29 200 37ms                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === feed_missing  (120x30) ===
 The selected sheep has never written a log in this $SHEP_HOME. The feed names that cause rather than sitting blank.
@@ -457,7 +457,7 @@ this sheep has not written a log in this $SHEP_HOME
                                                                                                                         
                                                                                                                         
                                                                                                                         
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === cramped  (33x26) ===
 33 columns: the narrowest terminal that draws. 26 rows — a couple more than the 24-row floor for all three panes being up, so this frame has a little breathing room rather than sitting exactly on the edge. Everything truncates with an ellipsis; nothing overlaps.
@@ -521,7 +521,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === lambs  (120x30) ===
 The detail pane with a lamb list: how many descendants the shepherd's walk found, how old that reading is, and each lamb's pid and executable name. The stamp sits before the list so a narrow terminal truncates lambs rather than the caveat.
@@ -555,7 +555,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   / filter   x stop   R restart   L reload   s settings                              control enabled
+q quit   j/k select   / filter   x stop   R restart   L reload   s settings   e edit                     control enabled
 
 === lambs_unknown  (120x30) ===
 The same pane on a stopped sheep. The shepherd had no pid to walk from and left the field unset rather than empty, and the line says which of the two it is looking at rather than reporting none found.
@@ -589,7 +589,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms                                                                                           
 out  GET /v1/orders/8821 200 9ms                                                                                        
 out  connection pool: 14/50 in use                                                                                      
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only
 
 === confirm  (100x14) ===
 `R` pressed with the gate open. Nothing has been sent: the bar asks a question naming the verb and the exact sheep, and `api` is still online in the table behind it.

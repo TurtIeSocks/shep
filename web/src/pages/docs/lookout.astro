@@ -36,7 +36,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only`;
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only`;
 
 const narrow = `shep lookout   /home/ada/.shep       6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12…
@@ -76,7 +76,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only`;
+q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only`;
 
 const refused = `shep lookout   /home/ada/.shep                                                                            6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M   up 6d 3h
@@ -131,7 +131,7 @@ out  GET /v1/orders 200 44ms
 out  POST /v1/orders 201 88ms
 out  GET /v1/orders/8821 200 9ms
 out  connection pool: 14/50 in use
-q quit   j/k select   / filter   x stop   R restart   L reload   s settings                              control enabled`;
+q quit   j/k select   / filter   x stop   R restart   L reload   s settings   e edit                     control enabled`;
 
 const filterActive = `shep lookout   /home/ada/.shep                                                   2 of 6 in the flock
 host  load 2.31 4.10 3.88 / 10 cores   host mem 12.4G / 32.0G   flock cpu 14.7%   flock mem 716.0M …

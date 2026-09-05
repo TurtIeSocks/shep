@@ -63,7 +63,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === errored  (120x30) ===
@@ -98,7 +98,7 @@ sheep 2  api   [0m[38;5;166merrored[0m   pid -   restarts 14   uptime 1h 18m 
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === grouped  (120x30) ===
@@ -133,7 +133,7 @@ app web ×3  [0m[38;5;29monline[0m   restarts 3   uptime 15m   cpu 9.4%   mem
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === empty  (100x28) ===
@@ -166,7 +166,7 @@ shep lookout   /home/ada/.shep                                                  
                                                                                                     [0m
                                                                                                     [0m
                                                                                                     [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                   read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit          read-only[0m
 
 
 === narrow  (51x14) ===
@@ -233,7 +233,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === frozen  (120x30) ===
@@ -268,7 +268,7 @@ sheep 2  api   [0m[38;5;166merrored[0m   pid -   restarts 14   uptime 1h 18m 
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === refused  (120x30) ===
@@ -385,7 +385,7 @@ shep lookout   /home/ada/.shep                                                  
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === table_only  (120x12) ===
@@ -402,7 +402,7 @@ shep lookout   /home/ada/.shep                                                  
   1     web         [0m[38;5;29monline         [0m  48212    0         -          2.9%    178.0M    1h 26m    edge        -            [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === feed_gap  (120x30) ===
@@ -437,7 +437,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mGET /v1/orders/27 200 35ms                                                                                         [0m
 [0m[38;5;245mout  [0mGET /v1/orders/28 200 36ms                                                                                         [0m
 [0m[38;5;245mout  [0mGET /v1/orders/29 200 37ms                                                                                         [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === feed_missing  (120x30) ===
@@ -472,7 +472,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
                                                                                                                         [0m
                                                                                                                         [0m
                                                                                                                         [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === cramped  (33x26) ===
@@ -538,7 +538,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === lambs  (120x30) ===
@@ -573,7 +573,7 @@ sheep 2  api   [0m[38;5;29monline[0m   pid 48219   restarts 1   uptime 1h 28m
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   / filter   x stop   R restart   L reload   s settings                              control enabled[0m
+[0m[38;5;245mq quit   j/k select   / filter   x stop   R restart   L reload   s settings   e edit                     control enabled[0m
 
 
 === lambs_unknown  (120x30) ===
@@ -608,7 +608,7 @@ sheep 4  cron   [0m[38;5;245mstopped[0m   pid -   restarts 0   uptime 1h 21m 
 [0m[38;5;245mout  [0mPOST /v1/orders 201 88ms                                                                                           [0m
 [0m[38;5;245mout  [0mGET /v1/orders/8821 200 9ms                                                                                        [0m
 [0m[38;5;245mout  [0mconnection pool: 14/50 in use                                                                                      [0m
-[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings                                       read-only[0m
+[0m[38;5;245mq quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit                              read-only[0m
 
 
 === confirm  (100x14) ===

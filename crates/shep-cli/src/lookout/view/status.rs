@@ -299,6 +299,12 @@ const PANE_HINT: &str = "esc/e close   j/k select   g/G first/last   r refresh  
 /// read-only one is a prefix of the control one, and the two edit keys are
 /// appended rather than inserted.
 ///
+/// `e edit` is appended after `s settings` under that same rule, and is two
+/// characters shorter than `e config` deliberately: at 84 the control form
+/// still renders whole at 100 columns, and at 86 it would need 102, so an
+/// operator on a 100-column terminal with the gate open would lose the tail
+/// of the one word that says the key exists.
+///
 /// The settings screen takes `control` for the same reason the dashboard
 /// does, which it did not until a whole-branch review caught it: the
 /// argument was taken and then thrown away on the `settings_open` branch,
@@ -320,12 +326,12 @@ fn hint_for(control: Control, settings_open: bool) -> String {
     }
     match control {
         Control::ReadOnly => {
-            "q quit   j/k select   g/G first/last   r refresh   / filter   s settings"
+            "q quit   j/k select   g/G first/last   r refresh   / filter   s settings   e edit"
         }
         // `g/G` and `r` drop out to make room. They are the two an operator
         // rediscovers by pressing them; an action key is not.
         Control::Allowed => {
-            "q quit   j/k select   / filter   x stop   R restart   L reload   s settings"
+            "q quit   j/k select   / filter   x stop   R restart   L reload   s settings   e edit"
         }
     }
     .to_string()
