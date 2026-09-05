@@ -403,9 +403,8 @@ async fn read_response<S: AsyncRead + Unpin>(
             });
         }
         filled += read;
-        // The second cap check: `expected` is already bounded by `limit`
-        // and `body`'s fixed size prevents `filled` exceeding it, so this
-        // guards a future change to the loop rather than a reachable path.
+        // Unreachable in practice: `body` is sized to `expected`, which
+        // `limit` already bounds, so `filled` cannot pass it here.
         if filled > limit {
             return Err(FetchError::TooLarge { limit });
         }

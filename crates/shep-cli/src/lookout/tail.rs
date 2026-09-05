@@ -4,8 +4,8 @@
 //! and a count of what the two left out: [`Tail::missed_lines`] for what the
 //! reader saw and discarded, off by at most one at a boundary, plus
 //! [`Tail::missed_bytes`] for what it never read, exact. One refresh costs
-//! one seek and one [`FEED_WINDOW_BYTES`] read per file whatever the sheep
-//! writes, so the reader is bounded by itself and not by the writer.
+//! at most one seek and one [`FEED_WINDOW_BYTES`] read per file whatever
+//! the sheep writes, so the reader is bounded by itself and not by the writer.
 //! [`read`] is pure over the filesystem, which is what lets its tests drive
 //! it with a [`std::collections::BTreeMap`] and a `tempdir`.
 

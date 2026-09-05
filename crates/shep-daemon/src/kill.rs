@@ -25,10 +25,10 @@ use crate::runner::{ExitOutcome, RunningProcess, StopSignal};
 /// stop, the longer `graceful_timeout` for a reload's drain. Delivery
 /// failures are logged and never panic, so the caller always gets a terminal
 /// [`ExitOutcome`].
-// `kill_tree` is not redundant: the first rung's signal is catchable,
-// `shutdown_with_message` sends none, and a fork born after it never saw
-// it. A lamb outliving the sheep also skips this rung: `proc.wait()`
-// already resolved on the leader's exit, so `kill_tree` is never called.
+// `kill_tree` is not redundant: the first rung's signal is catchable, the
+// message branch sends no signal, and a fork born after it never saw it.
+// A lamb outliving the sheep also skips this rung: `proc.wait()` already
+// resolved on the leader's exit, so `kill_tree` is never called.
 pub async fn kill_process<P: RunningProcess>(
     proc: &mut P,
     app: &AppConfig,

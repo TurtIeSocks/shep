@@ -3,8 +3,8 @@
 //! Always present, regardless of `[whistle] allow_control`; only the four
 //! control tools are gated. `list_flock`, `describe_sheep`, `get_metrics`
 //! and `tail_bleats` each send a request frame the shepherd answers;
-//! `tail_bleats` also reads two log files by path, and `list_barks` reads
-//! its file with no shepherd contact at all.
+//! `tail_bleats` also reads up to two log files by path, and `list_barks`
+//! reads its file with no shepherd contact at all.
 
 use std::io;
 use std::path::Path;

@@ -148,10 +148,10 @@ impl ProcScript {
         }
     }
 
-    /// Accepts every stdin write and answers none of them.
-    ///
-    /// Models an app that stopped reading fd 0: the write is delivered and
-    /// recorded, but the `done` acknowledgement is withheld.
+    /// With [`SpawnSpec::stdin`] enabled, accepts every stdin write and
+    /// answers none of them: models an app that stopped reading fd 0. The
+    /// write is delivered and recorded, but the `done` acknowledgement is
+    /// withheld. With `stdin` disabled the runner closes the writer instead.
     #[must_use]
     pub fn never_reads_its_stdin() -> Self {
         Self {

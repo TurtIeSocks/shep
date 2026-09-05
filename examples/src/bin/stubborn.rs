@@ -40,10 +40,9 @@ mod unix {
     /// is alive, not merely silent.
     const HEARTBEAT: Duration = Duration::from_secs(2);
 
-    /// Blocks `SIGTERM` on the whole process. A mask set before any
-    /// other thread spawns is inherited by every later thread. Starts
-    /// the heartbeat, then loops forever printing a line each time
-    /// `sigwait` returns, never exiting.
+    /// Blocks `SIGTERM` in the calling thread; threads it spawns inherit
+    /// the mask. Starts the heartbeat, then loops forever printing a line
+    /// each time `sigwait` returns, never exiting.
     ///
     /// Blocking (`thread_block`), not installing a handler
     /// (`sigaction`), keeps this file free of `unsafe`.

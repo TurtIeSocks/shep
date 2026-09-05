@@ -99,8 +99,7 @@ const SECRET: &str = "secret";
 /// - a union, which has no serde representation to build a schema from;
 /// - `#[shep]` with no option in parentheses;
 /// - `#[shep(secret = ...)]`, since `secret` is a flag and takes no value;
-/// - any option other than `secret`, which is the misspelling this crate is
-///   here to catch.
+/// - any option other than `secret`, rejected as a likely misspelling of it.
 ///
 /// A struct or variant with no fields, an unmarked tuple, and a
 /// unit-variant enum are accepted and carry no marks. A dog whose config

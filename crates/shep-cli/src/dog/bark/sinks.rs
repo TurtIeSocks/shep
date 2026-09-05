@@ -105,8 +105,8 @@ impl Sink {
 /// surface, so no downstream match needs protecting from a new variant.
 #[derive(Debug)]
 pub enum SinkConfigError {
-    /// Sink `name` is a [`Sink::Discord`] or [`Sink::Slack`] (`kind`)
-    /// configured with `http://`.
+    /// Sink `name` is a [`Sink::Discord`] or [`Sink::Slack`] (`kind`) not
+    /// configured with `https://`.
     InsecureScheme {
         /// The sink's config key under `[dog.bark.sinks]`, never the url.
         name: String,
