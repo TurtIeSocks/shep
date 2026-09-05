@@ -9149,6 +9149,15 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
 #[cfg(unix)]
 const DIAL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// `ExitCode::DaemonUnreachable`, the one failing exit `shep ping` has: it
+/// renders "shepherd offline" on stdout and exits with this, whatever the
+/// reason. Any other failing exit is a usage error or a refusal, which no
+/// handover produces, and the prober in
+/// [`the_control_socket_accepts_throughout_a_handover`] refuses it rather
+/// than counting it as the one drop the exec is allowed.
+#[cfg(unix)]
+const PING_OFFLINE: i32 = 5;
+
 /// The control socket answers throughout a handover.
 ///
 /// The successor inherits the listening descriptor rather than binding the
@@ -9256,7 +9265,21 @@ fn the_control_socket_accepts_throughout_a_handover() {
         let mut announced = false;
         while Instant::now() < deadline {
             pings += 1;
-            let served = shep(&home).arg("ping").output().unwrap().status.success();
+            let out = shep(&home).arg("ping").output().unwrap();
+            let served = out.status.success();
+            if !served {
+                // The failure has to be the one shape a handover can cause.
+                // Its reason cannot be read (see the case's doc), but its
+                // exit can: anything but `DaemonUnreachable` is a different
+                // defect wearing the tolerated drop's clothes.
+                assert_eq!(
+                    out.status.code(),
+                    Some(PING_OFFLINE),
+                    "ping {pings} failed for a reason no handover produces: {}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
             if !announced {
                 // The reload waits for a ping the predecessor ANSWERED. A
                 // failure before that has no exec to blame, since none has
