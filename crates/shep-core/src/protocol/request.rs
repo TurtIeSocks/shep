@@ -348,6 +348,60 @@ pub enum Request {
         /// the new name.
         reset: ResetDepth,
     },
+    /// One sheep's effective config, for a pane that is about to edit it.
+    ///
+    /// `env` comes back emptied and its key names ride separately, so a
+    /// value never crosses the wire (decision 12 of the overrides design).
+    /// Read-only: nothing about the sheep changes.
+    ///
+    /// Answers [`Response::SheepConfig`], or
+    /// [`RpcErrorCode::NotFound`] when no sheep has that name.
+    SheepConfig {
+        /// The sheep's name, not a selector: a pane edits one sheep, for
+        /// the reason [`Self::Scale`] states at length.
+        name: String,
+    },
+    /// Sets, replaces, or with `None` removes one env key on one sheep,
+    /// recorded as an operator override. Never reads it back.
+    ///
+    /// Its own request rather than a [`Self::ApplyConfig`] depth, because
+    /// no depth does this: `ResetDepth::None` appends only, `File` and
+    /// `Policy` leave env alone, and `Env`/`All` replace the whole map with
+    /// the template's. A pane cannot send the whole map, since it is never
+    /// told the values it would have to send back.
+    ///
+    /// The running child holds the env it was spawned from, so the change
+    /// parks for the next spawn exactly as `ApplyConfig` parks a
+    /// respawn-only field, and `shep reload`/`shep restart` promote it.
+    ///
+    /// Answers [`Response::SheepEnvSet`], or
+    /// [`RpcErrorCode::NotFound`] when no sheep has that name.
+    SetSheepEnv {
+        /// The sheep's name, not a selector, for [`Self::SheepConfig`]'s
+        /// reason.
+        name: String,
+        /// The env key.
+        key: String,
+        /// The value, or `None` to remove the key.
+        value: Option<String>,
+    },
+    /// Replaces one dog's `[<name>]` section in `dogs.toml` and publishes
+    /// `config.dog.<name>` so a running dog re-reads it.
+    ///
+    /// The writing twin of [`Self::DogConfig`], which reads the same
+    /// section.
+    ///
+    /// Answers [`Response::DogConfigSet`].
+    SetDogConfig {
+        /// The dog's name, the config key.
+        name: String,
+        /// The whole section, as TOML text.
+        ///
+        /// [`DogSectionToml`], not a bare `String`, for the reason that
+        /// type's own doc gives: a section can hold a dog's credentials and
+        /// this is what keeps them out of a `{:?}` (IR-41).
+        toml: DogSectionToml,
+    },
     /// Stop matching sheep (stay registered)
     Stop {
         /// Which sheep
@@ -1487,6 +1541,78 @@ impl SheepApplied {
     }
 }
 
+/// One sheep's effective config as a pane sees it: every field but env's
+/// values, plus which fields an operator has overridden and which are
+/// waiting on a respawn.
+///
+/// The answer to [`Request::SheepConfig`], and the one reply in this module
+/// that carries a whole [`AppConfig`]. [`SheepApplied`] deliberately carries
+/// field NAMES alone, and the difference is what each is for: that one is
+/// printed at an operator who already has the file, this one feeds a pane
+/// that is about to edit fields it has to be able to show first.
+// wire format: changing field names is a breaking change
+//
+// `#[non_exhaustive]`: shep-core is a published library and a sixth field
+// would otherwise break an out-of-tree consumer's construction of this with
+// no version bump to say so (IR-20). [`SheepConfigView::new`] is how the
+// daemon builds one, and it is what enforces the emptied `env`.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheepConfigView {
+    /// The sheep's name.
+    pub name: String,
+    /// The effective config with `env` cleared. Every remaining field is
+    /// operator-supplied policy the pane is about to let them edit, so
+    /// withholding a value would make the pane unusable while protecting
+    /// nothing.
+    pub config: AppConfig,
+    /// The env keys, so the pane can list them. Never the values.
+    pub env_keys: Vec<String>,
+    /// Field names an operator has set that the Flockfile does not declare.
+    pub overridden: Vec<String>,
+    /// Field names parked until the next respawn.
+    pub pending: Vec<String>,
+}
+
+impl SheepConfigView {
+    /// Builds one, clearing `env` and recording its keys.
+    ///
+    /// The clearing happens HERE rather than at the one call site, so a
+    /// second caller cannot forget it: this constructor is the only way to
+    /// build the type outside this crate, since `#[non_exhaustive]` blocks
+    /// a literal.
+    #[must_use]
+    pub fn new(mut config: AppConfig, overridden: Vec<String>, pending: Vec<String>) -> Self {
+        let env_keys = config.env.keys().cloned().collect();
+        config.env.clear();
+        Self {
+            name: config.name.clone(),
+            config,
+            env_keys,
+            overridden,
+            pending,
+        }
+    }
+}
+
+/// Redacted (IR-41): `config` carries `args` and `cwd`, which routinely hold
+/// a token or a home directory, and this type is what a `{:?}` on a
+/// [`Response`] would print. The three lists are counted rather than named
+/// for the same reason -- `env_keys` is a key set, which is itself worth
+/// keeping out of a log.
+impl fmt::Debug for SheepConfigView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SheepConfigView {{ name: {:?}, env_keys: {}, overridden: {}, pending: {} }}",
+            self.name,
+            self.env_keys.len(),
+            self.overridden.len(),
+            self.pending.len()
+        )
+    }
+}
+
 /// One RPC response (pairs with [`Request`] variants)
 ///
 /// Ten variants carry a bare `Vec<ProcessInfo>` (`Flock`, `Described`,
@@ -1545,6 +1671,27 @@ pub enum Response {
     /// these", and an app missing from that answer is indistinguishable from
     /// an app the daemon silently dropped.
     Applied(Vec<SheepApplied>),
+    /// Answer to `SheepConfig`: one sheep's config with `env` emptied and
+    /// its keys listed beside it.
+    SheepConfig(SheepConfigView),
+    /// Answer to `SetSheepEnv`: the key that was set or removed.
+    ///
+    /// Never the value, and never the resulting env map. This reply exists
+    /// to confirm which key moved, and echoing what was just written back
+    /// down a socket would undo the whole point of `SheepConfig` withholding
+    /// it (IR-41).
+    SheepEnvSet {
+        /// The sheep.
+        name: String,
+        /// The key.
+        key: String,
+    },
+    /// Answer to `SetDogConfig`: the section was written and the topic
+    /// published.
+    DogConfigSet {
+        /// The dog.
+        name: String,
+    },
     /// Answer to `Stop`
     Stopped(Vec<ProcessInfo>),
     /// Answer to `Restart`
@@ -2265,6 +2412,38 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }
 
+    /// fails if a config pane's answer can carry an env VALUE. The pane
+    /// edits everything else about a sheep, so the config itself has to
+    /// travel; `env` is the one map in it that holds secrets, and decision
+    /// 12 of the overrides design is that the keys travel and the values
+    /// never do (IR-41).
+    #[test]
+    fn a_sheep_config_view_never_carries_an_env_value() {
+        let mut config = AppConfig::minimal("web", "./srv");
+        config
+            .env
+            .insert("DB_PASS".to_string(), "hunter2".to_string());
+        let view = SheepConfigView::new(config, Vec::new(), Vec::new());
+        assert!(view.config.env.is_empty());
+        assert_eq!(view.env_keys, ["DB_PASS"]);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
+    }
+
+    /// fails if this type's `Debug` ever prints the config it carries. A
+    /// `{:?}` on a `Response` reaches it, and `config` holds `args` and
+    /// `cwd` as well as the env keys (IR-41).
+    #[test]
+    fn a_sheep_config_views_debug_is_the_exact_redacted_string() {
+        let mut config = AppConfig::minimal("web", "./srv");
+        config.env.insert("A".to_string(), "1".to_string());
+        let view = SheepConfigView::new(config, vec!["max_restarts".to_string()], Vec::new());
+        assert_eq!(
+            format!("{view:?}"),
+            r#"SheepConfigView { name: "web", env_keys: 1, overridden: 1, pending: 0 }"#
+        );
+    }
+
     #[test]
     fn request_wire_snapshots() {
         let requests = vec![
@@ -2564,6 +2743,44 @@ mod tests {
                 deadline_ms: None,
                 body: Request::Add {
                     apps: vec![AppConfig::minimal("web", "./srv")],
+                },
+            },
+            // The three config-pane requests. `SheepConfig` takes a name
+            // rather than a selector, like `Scale` and `SetSmit` above and
+            // for their reason: a pane edits one sheep.
+            Envelope {
+                id: 28,
+                deadline_ms: None,
+                body: Request::SheepConfig {
+                    name: "web".to_string(),
+                },
+            },
+            // `value` is pinned as `Some`, because the `None` spelling is
+            // what REMOVES the key and a reader that guessed the two apart
+            // wrongly would delete an operator's env instead of setting it.
+            // The value is a placeholder, not a secret: this is the one
+            // request in the enum that carries an env value at all, and it
+            // travels in one direction only -- nothing ever reads it back
+            // (decision 12 of the overrides design).
+            Envelope {
+                id: 29,
+                deadline_ms: None,
+                body: Request::SetSheepEnv {
+                    name: "web".to_string(),
+                    key: "DATABASE_URL".to_string(),
+                    value: Some("postgres://localhost/app".to_string()),
+                },
+            },
+            // The second request carrying a `DogSectionToml`, and pinned
+            // beside its reader: `DogConfig` asks for a section and this
+            // writes one back, so the two have to agree about the shape a
+            // section takes on the wire.
+            Envelope {
+                id: 30,
+                deadline_ms: None,
+                body: Request::SetDogConfig {
+                    name: "bark".to_string(),
+                    toml: "debounce = \"30s\"\n".to_string().into(),
                 },
             },
         ];
@@ -2945,6 +3162,41 @@ mod tests {
             Reply {
                 id: 33,
                 result: Ok(Response::Added(vec![])),
+            },
+            // The config pane's answer, and the row that proves its whole
+            // security property: `env` serializes as an empty object while
+            // `env_keys` names the key beside it, so an out-of-tree reader
+            // learns here that a value never travels (IR-41).
+            Reply {
+                id: 34,
+                result: Ok(Response::SheepConfig(SheepConfigView::new(
+                    {
+                        let mut config = AppConfig::minimal("web", "./srv");
+                        config
+                            .env
+                            .insert("DATABASE_URL".to_string(), "postgres://x".to_string());
+                        config
+                    },
+                    vec!["max_restarts".to_string()],
+                    vec!["env".to_string()],
+                ))),
+            },
+            // The two acknowledgements. Neither echoes what was written:
+            // `SheepEnvSet` names the key and not its value, for the reason
+            // the row above pins, and `DogConfigSet` names the dog and not
+            // the section.
+            Reply {
+                id: 35,
+                result: Ok(Response::SheepEnvSet {
+                    name: "web".to_string(),
+                    key: "DATABASE_URL".to_string(),
+                }),
+            },
+            Reply {
+                id: 36,
+                result: Ok(Response::DogConfigSet {
+                    name: "bark".to_string(),
+                }),
             },
         ];
         insta::assert_json_snapshot!("reply_wire_v3", replies);

@@ -652,6 +652,43 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 Err(err) => reply(Err(rpc_error(&err))),
             },
         },
+        // The two config-pane reads and writes. Neither takes a selector:
+        // a pane edits one sheep, so an unknown name is `NotFound` here
+        // rather than an empty match.
+        Request::SheepConfig { name } => match ctx.supervisor.sheep_config(name.clone()).await {
+            Ok(Some(view)) => reply(Ok(Response::SheepConfig(view))),
+            Ok(None) => reply(Err(RpcError {
+                code: RpcErrorCode::NotFound,
+                message: format!("no sheep named {name}"),
+                daemon_version: None,
+            })),
+            Err(err) => reply(Err(rpc_error(&err))),
+        },
+        Request::SetSheepEnv { name, key, value } => {
+            match ctx
+                .supervisor
+                .set_sheep_env(name.clone(), key.clone(), value)
+                .await
+            {
+                Ok(true) => reply(Ok(Response::SheepEnvSet { name, key })),
+                Ok(false) => reply(Err(RpcError {
+                    code: RpcErrorCode::NotFound,
+                    message: format!("no sheep named {name}"),
+                    daemon_version: None,
+                })),
+                Err(err) => reply(Err(rpc_error(&err))),
+            }
+        }
+        // A real arm rather than the wildcard below, deliberately, and the
+        // difference is not cosmetic: the wildcard's message says this
+        // daemon is too old for the request, which would send an operator
+        // to upgrade a daemon that is already current. The handler lands in
+        // task 8 of the config-panes plan.
+        Request::SetDogConfig { name, .. } => reply(Err(RpcError {
+            code: RpcErrorCode::Internal,
+            message: format!("SetDogConfig for {name} lands in task 8"),
+            daemon_version: None,
+        })),
         // `Request` is #[non_exhaustive]: a verb from a newer client that this
         // daemon has never heard of is an error, not a panic.
         _ => reply(Err(RpcError {
@@ -995,6 +1032,28 @@ fn rpc_error(err: &SupervisorError) -> RpcError {
         SupervisorError::InvalidScale(msg) => RpcError {
             code: RpcErrorCode::InvalidConfig,
             message: msg.clone(),
+            daemon_version: None,
+        },
+        // `InvalidConfig`, like `InvalidScale` above and for its reason:
+        // this is something the caller asked for that it can ask
+        // differently, and telling an operator "unexpected daemon-side
+        // failure" about their own env key would send them to the wrong
+        // place entirely. The bare payload is `normalize`'s own refusal,
+        // which already names the key.
+        SupervisorError::InvalidEnv(msg) => RpcError {
+            code: RpcErrorCode::InvalidConfig,
+            message: msg.clone(),
+            daemon_version: None,
+        },
+        // `Internal`, on the same rule the log-maintenance pair above
+        // states: an override store that cannot be read or written is an
+        // unexpected daemon-side failure, and there is no code for it that
+        // a client predating this build could decode. `err.to_string()`
+        // rather than the bare payload, so the reader is told the store was
+        // the thing that failed and not the request.
+        SupervisorError::Overrides(_) => RpcError {
+            code: RpcErrorCode::Internal,
+            message: err.to_string(),
             daemon_version: None,
         },
         SupervisorError::EngineStopped => RpcError {
@@ -2587,6 +2646,230 @@ mod tests {
             panic!("expected DogStarted, got {:?}", reply.result)
         };
         info
+    }
+
+    /// Starts one sheep named `web` carrying a secret env value, which is
+    /// the fixture the config-pane cases below all want.
+    async fn start_web_with_a_secret(ctx: &RpcContext) {
+        let mut config = AppConfig::minimal("web", "./srv");
+        config
+            .env
+            .insert("DB_PASS".to_string(), "hunter2".to_string());
+        let started =
+            reply_of(dispatch(envelope(1, Request::Start { apps: vec![config] }), ctx).await);
+        assert!(started.result.is_ok(), "{:?}", started.result);
+    }
+
+    /// fails if a config pane's answer carries an env VALUE, and fails if
+    /// it stops listing the keys. Both halves are the point: a pane that
+    /// cannot name the keys cannot offer to edit them, and one that is
+    /// handed the values has put a secret on a socket for nothing
+    /// (decision 12 of the overrides design, IR-41).
+    #[tokio::test(start_paused = true)]
+    async fn sheep_config_answers_with_env_emptied_and_its_keys_listed() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SheepConfig {
+                        name: "web".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::SheepConfig(view)) = reply.result else {
+            panic!("expected SheepConfig")
+        };
+        assert_eq!(view.name, "web");
+        assert!(view.config.env.is_empty());
+        assert_eq!(view.env_keys, ["DB_PASS"]);
+    }
+
+    /// fails if an unknown name reads as a daemon fault. A pane asking
+    /// about a sheep that was deleted under it is a normal thing to have
+    /// happen, and `Internal` would send its operator looking for a bug in
+    /// the shepherd.
+    #[tokio::test(start_paused = true)]
+    async fn sheep_config_for_an_unknown_name_is_not_found_not_internal() {
+        let h = harness(vec![]);
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    1,
+                    Request::SheepConfig {
+                        name: "ghost".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Err(err) = reply.result else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(err.code, RpcErrorCode::NotFound);
+    }
+
+    /// fails if a set env key does not reach the store, and fails if it
+    /// reaches the running child instead of parking. The running process
+    /// was handed its environment at spawn and cannot be handed another,
+    /// so an edit reported as applied would be an edit the operator
+    /// believes is in force and is not.
+    #[tokio::test(start_paused = true)]
+    async fn set_sheep_env_writes_the_store_and_parks_env_until_a_respawn() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    2,
+                    Request::SetSheepEnv {
+                        name: "web".to_string(),
+                        key: "NEW".to_string(),
+                        value: Some("1".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        assert!(
+            matches!(reply.result, Ok(Response::SheepEnvSet { .. })),
+            "{:?}",
+            reply.result
+        );
+
+        let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.fields["env"]["NEW"], "1");
+
+        let described = reply_of(
+            dispatch(
+                envelope(
+                    3,
+                    Request::Describe {
+                        selector: SelectorSpec::Name("web".to_string()),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::Described(infos)) = described.result else {
+            panic!("expected Described")
+        };
+        assert_eq!(
+            infos[0].pending.as_deref(),
+            Some(["env".to_string()].as_slice())
+        );
+    }
+
+    /// fails if a removal leaves the sheep marked as overridden. The CFG
+    /// column reads `ProcessEntry::overridden`, so an `env` key left in the
+    /// store's field set after the last value under it is gone marks a
+    /// sheep that no longer differs from its Flockfile.
+    #[tokio::test(start_paused = true)]
+    async fn removing_the_last_env_override_stops_marking_the_sheep() {
+        let h = harness(vec![ProcScript::never_exits()]);
+        start_web_with_a_secret(&h.ctx).await;
+
+        for (id, value) in [(2, Some("1".to_string())), (3, None)] {
+            let reply = reply_of(
+                dispatch(
+                    envelope(
+                        id,
+                        Request::SetSheepEnv {
+                            name: "web".to_string(),
+                            key: "NEW".to_string(),
+                            value,
+                        },
+                    ),
+                    &h.ctx,
+                )
+                .await,
+            );
+            assert!(reply.result.is_ok(), "{:?}", reply.result);
+        }
+
+        let stored = shep_core::overrides::get(&h.ctx.paths.overrides, "web")
+            .unwrap()
+            .unwrap();
+        assert!(!stored.fields.contains_key("env"), "{stored:?}");
+
+        let reply = reply_of(
+            dispatch(
+                envelope(
+                    4,
+                    Request::SheepConfig {
+                        name: "web".to_string(),
+                    },
+                ),
+                &h.ctx,
+            )
+            .await,
+        );
+        let Ok(Response::SheepConfig(view)) = reply.result else {
+            panic!("expected SheepConfig")
+        };
+        assert!(view.overridden.is_empty(), "{view:?}");
+    }
+
+    /// fails if a variant added to `Request` never gets a dispatch arm.
+    ///
+    /// The one test here that cannot be replaced by reading the code.
+    /// `Request` is `#[non_exhaustive]` and this module's dispatch ends in
+    /// a wildcard, so a variant with NO arm compiles, passes every other
+    /// test in this file, and answers "this daemon does not implement that
+    /// request" at runtime -- a message that sends an operator to upgrade a
+    /// daemon that is already current. The wire snapshots cannot catch it
+    /// either: they are hand-written literals with no completeness check.
+    ///
+    /// Every request below names something that does not exist, so a real
+    /// arm refuses each of them and nothing is asserted about the refusal
+    /// but which one it is.
+    #[tokio::test(start_paused = true)]
+    async fn every_new_variant_reaches_an_arm_and_not_the_wildcard() {
+        let h = harness(vec![]);
+        let requests = [
+            Request::SheepConfig {
+                name: "ghost".to_string(),
+            },
+            Request::SetSheepEnv {
+                name: "ghost".to_string(),
+                key: "K".to_string(),
+                value: None,
+            },
+            Request::SetDogConfig {
+                name: "ghost".to_string(),
+                toml: String::new().into(),
+            },
+        ];
+        for (id, request) in requests.into_iter().enumerate() {
+            let reply = reply_of(
+                dispatch(
+                    envelope(
+                        u64::try_from(id).expect("three requests fit a u64"),
+                        request,
+                    ),
+                    &h.ctx,
+                )
+                .await,
+            );
+            let Err(err) = reply.result else {
+                continue;
+            };
+            assert_ne!(
+                err.message, "this daemon does not implement that request",
+                "a config-pane variant fell through to the wildcard"
+            );
+        }
     }
 
     /// fails if `DisableDog` is wired to anything but a real deregistration

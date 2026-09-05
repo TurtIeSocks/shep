@@ -232,11 +232,14 @@ pub fn spawn_cron_worker(
                         | SupervisorError::FlushFailed(_)
                         | SupervisorError::ReloadInFlight(_)
                         | SupervisorError::InvalidScale(_)
-                        | SupervisorError::CannotStart(_)),
+                        | SupervisorError::CannotStart(_)
+                        | SupervisorError::InvalidEnv(_)
+                        | SupervisorError::Overrides(_)),
                     ) => {
                         // A restart touches no log files, starts no reload,
-                        // scales nothing and registers no batch, so none of
-                        // the five can arrive.
+                        // scales nothing and registers no batch, and it never
+                        // reads or writes the override store, so none of
+                        // the seven can arrive.
                         // Named rather than swept into a catch-all, so a
                         // variant this path CAN produce still fails to
                         // compile here.
