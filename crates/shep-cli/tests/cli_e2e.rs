@@ -4707,6 +4707,35 @@ fn available_dogs_reports_a_server_error_naming_the_url() {
     assert!(stderr.contains("500"), "stderr: {stderr}");
 }
 
+/// The one url `available_dogs` does not name. `SHEP_DOG_INDEX` is an
+/// operator's own string, so a password can reach it, and this message is
+/// built outside `fetch` and outside `IndexError` where neither refusal
+/// covers it.
+#[test]
+fn available_dogs_names_no_url_that_carries_credentials() {
+    let home = TempDir::new().unwrap();
+
+    let output = shep(home.path())
+        .env("SHEP_DOG_INDEX", "ftp://user:hunter2@example.com/dogs.json")
+        .arg("dogs")
+        .arg("--available")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an unfetchable url must not exit success: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("hunter2"),
+        "stderr printed the password: {stderr}"
+    );
+    assert!(
+        stderr.contains("a url carrying credentials"),
+        "stderr must say why it withheld the url: {stderr}"
+    );
+}
+
 #[test]
 fn available_dogs_reports_a_truncated_body_naming_the_url() {
     let home = TempDir::new().unwrap();

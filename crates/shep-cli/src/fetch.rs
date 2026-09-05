@@ -187,20 +187,21 @@ pub const CREDENTIALS_REFUSAL: &str = concat!(
 ///
 /// The rule [`parse_url`] refuses on, separated out so a caller holding a
 /// URL it has not parsed yet can refuse the same shape at config-load time
-/// rather than at first use. A `url` naming neither scheme answers
-/// `false`: it has no authority to look in, and [`parse_url`] refuses it
-/// on the scheme instead.
+/// rather than at first use.
+///
+/// Deliberately blind to the scheme, and to whether there is one at all.
+/// Keying this on `http://`/`https://` would have answered `false` for
+/// `ftp://user:pass@host/` and for `HTTPS://user:pass@host/`, which
+/// [`parse_url`] then refuses on the SCHEME instead, in a message that
+/// quotes the whole url and hands the password back. A url this cannot
+/// parse is exactly the one whose refusal must not echo it.
+///
+/// The cost is that `mailto:someone@example.com` reads as credentials.
+/// It is refused either way, and a wrong reason on a url nothing here can
+/// fetch is cheaper than a right one that prints a password.
 pub fn url_carries_credentials(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
-        return false;
-    };
-    let authority = match rest.find('/') {
-        Some(i) => &rest[..i],
-        None => rest,
-    };
+    let rest = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
     authority.contains('@')
 }
 
@@ -752,6 +753,11 @@ mod tests {
             "https://user:hunter2@example.com:8443/webhook",
             "https://user:hunter2@example.com/webhook",
             "http://hunter2@example.com/webhook",
+            // Schemes this module cannot fetch at all. Each used to be
+            // refused on the scheme, in a message quoting the whole url.
+            "ftp://user:hunter2@example.com/webhook",
+            "HTTPS://user:hunter2@example.com/webhook",
+            "user:hunter2@example.com/webhook",
         ] {
             let err = parse_url(url).unwrap_err();
             assert!(matches!(err, FetchError::Url(_)), "{url}: {err:?}");
