@@ -821,7 +821,8 @@ impl ProcessRunner for ScriptedRunner {
                 crate::handover::CarriedFds,
             )> = None;
             // Every unanswered report, kept alive rather than dropped: a
-            // deaf pump never releases a caller waiting on it.
+            // deaf pump answers no caller while it lives. When it ends the
+            // senders drop and each waiter gets an acknowledgement error.
             #[cfg(unix)]
             let mut held_reports: Vec<
                 tokio::sync::oneshot::Sender<crate::handover::CarriedFds>,
@@ -930,8 +931,8 @@ impl ProcessRunner for ScriptedRunner {
                 let mut withheld = Vec::new();
                 while let Some(StdinWrite { line, done }) = rx.recv().await {
                     // Recorded either way: `never_reads_its_stdin` withholds
-                    // the acknowledgement, not the delivery, so the write
-                    // still reaches the app, modelling a pipe that fills.
+                    // the acknowledgement, not the record, so the line is
+                    // kept while the caller stays pending.
                     lines.lock().unwrap().push(line);
                     if reads_stdin {
                         let _ = done.send(Ok(()));
