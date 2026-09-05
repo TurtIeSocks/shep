@@ -1731,7 +1731,23 @@ pub enum Response {
     Applied(Vec<SheepApplied>),
     /// Answer to `SheepConfig`: one sheep's config with `env` emptied and
     /// its keys listed beside it.
-    SheepConfig(SheepConfigView),
+    ///
+    /// Boxed, and the only variant here that is. This one carries a whole
+    /// [`AppConfig`], which is several times the size of anything else in
+    /// the enum, and a `Response` is inside a `Reply` which is inside a
+    /// [`ServerFrame`](crate::protocol::ServerFrame) -- so without the box
+    /// every frame the daemon sends costs the largest config's worth of
+    /// stack for a variant almost none of them use.
+    ///
+    /// The enum-level `#[allow(clippy::large_enum_variant)]` below does not
+    /// cover it, and the difference is the point of that allow's own
+    /// argument: boxing `DogStarted` would be a source break for every
+    /// `Response::DogStarted(info)` in and out of this workspace, where
+    /// this variant has never shipped and so breaks nobody.
+    ///
+    /// `Box<T>` serializes exactly as `T`, so the wire bytes and the pinned
+    /// fixtures are untouched.
+    SheepConfig(Box<SheepConfigView>),
     /// Answer to `SetSheepEnv`: the key that was set or removed.
     ///
     /// Never the value, and never the resulting env map. This reply exists
@@ -3251,7 +3267,7 @@ mod tests {
             // learns here that a value never travels (IR-41).
             Reply {
                 id: 34,
-                result: Ok(Response::SheepConfig(SheepConfigView::new(
+                result: Ok(Response::SheepConfig(Box::new(SheepConfigView::new(
                     {
                         let mut config = AppConfig::minimal("web", "./srv");
                         config
@@ -3261,7 +3277,7 @@ mod tests {
                     },
                     vec!["max_restarts".to_string()],
                     vec!["env".to_string()],
-                ))),
+                )))),
             },
             // The two acknowledgements. Neither echoes what was written:
             // `SheepEnvSet` names the key and not its value, for the reason

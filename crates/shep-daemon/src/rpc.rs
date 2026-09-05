@@ -656,7 +656,7 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
         // a pane edits one sheep, so an unknown name is `NotFound` here
         // rather than an empty match.
         Request::SheepConfig { name } => match ctx.supervisor.sheep_config(name.clone()).await {
-            Ok(Some(view)) => reply(Ok(Response::SheepConfig(view))),
+            Ok(Some(view)) => reply(Ok(Response::SheepConfig(Box::new(view)))),
             Ok(None) => reply(Err(RpcError {
                 code: RpcErrorCode::NotFound,
                 message: format!("no sheep named {name}"),
@@ -2789,7 +2789,7 @@ mod tests {
             .await,
         );
         match reply.result {
-            Ok(Response::SheepConfig(view)) => view,
+            Ok(Response::SheepConfig(view)) => *view,
             other => panic!("expected SheepConfig, got {other:?}"),
         }
     }

@@ -878,8 +878,9 @@ pub enum SupervisorError {
     InvalidEnv(String),
     /// The override store at `$SHEP_HOME/overrides.json` could not be read
     /// or written, so an operator's edit was not recorded. Carries
-    /// [`OverridesError`]'s own message, which names which of the three
-    /// (I/O, a parse, a future version) it was.
+    /// [`OverridesError`](shep_core::overrides::OverridesError)'s own
+    /// message, which names which of the three (I/O, a parse, a future
+    /// version) it was.
     ///
     /// Its own variant rather than [`Self::SpawnFailed`] or an `Internal`
     /// string, because it is the one failure here that leaves the flock
