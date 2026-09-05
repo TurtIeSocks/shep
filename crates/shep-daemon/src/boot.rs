@@ -737,13 +737,13 @@ pub struct BootOptions {
     /// of, and for the same reason: shep-daemon never reads `shep.toml`
     /// itself.
     ///
-    /// A SUPERSET of [`Self::dogs`], and the difference is the whole point
+    /// A superset of [`Self::dogs`], and the difference is the whole point
     /// of carrying both. That one is the spawn list, so it holds only the
     /// dogs an operator has switched on; this one holds the dogs that
-    /// EXIST. `Request::SetDogConfig` is guarded on this one, because the
+    /// exist. `Request::SetDogConfig` is guarded on this one, because the
     /// dog most in need of configuring is the one that is disabled or has
-    /// never started (the dog-config design, decision 4) and a guard on
-    /// the running set refuses exactly that dog.
+    /// never started, and a guard on the running set refuses exactly that
+    /// dog.
     pub known_dogs: Vec<String>,
     /// Wipe the in-memory flock registry before [`RunningDaemon::run`]'s
     /// teardown writes the final muster roll, so that roll describes an empty

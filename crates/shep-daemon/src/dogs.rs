@@ -243,7 +243,7 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
 /// it deliberately not a locked shep-owned store), so this reads, modifies
 /// and writes the document it read rather than rendering a parsed map back
 /// out: every table other than `name`'s comes through byte for byte, and so
-/// does a comment outside it. A comment INSIDE the replaced table is the
+/// does a comment outside it. A comment inside the replaced table is the
 /// caller's to carry, because the caller is what decided the section's new
 /// text, and [`dog_section`] hands it the span rather than a re-render
 /// precisely so that it can. The header's own decor, a comment line above
@@ -264,7 +264,7 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
 /// path), `fsync`ed, then `rename`d over `path` so a crash leaves the whole
 /// file or none of it.
 ///
-/// Whether `name` is a dog at all is the CALLER's question, not this
+/// Whether `name` is a dog at all is the caller's question, not this
 /// function's: the answer lives in the supervisor, and `rpc::dispatch` asks
 /// it before calling here.
 ///
@@ -305,12 +305,12 @@ pub fn set_dog_section(path: &Path, name: &str, section: &str) -> Result<(), Dog
     // dog's table with it. A document's root table is implicit, and an
     // implicit table with no keys of its own renders no header at all. A
     // section that still holds a key renders `[name]` either way, so this
-    // line shows up only in the emptied case -- which is where an operator
+    // line shows up only in the emptied case, which is where an operator
     // arrives by deleting the last key in the pane.
     let mut table = incoming.as_table().clone();
     table.set_implicit(false);
     // A comment above `[name]`, and anything trailing the header itself,
-    // are decor on the TABLE rather than text inside it -- `dog_section`
+    // are decor on the table rather than text inside it: `dog_section`
     // hands the caller the body and cannot carry them, and replacing the
     // item wholesale would drop both. Copied across so an operator's note
     // about what a dog is for survives a pane write, as the notes between
@@ -332,7 +332,7 @@ pub fn set_dog_section(path: &Path, name: &str, section: &str) -> Result<(), Dog
     // inside the error and its `Drop` removes it, so a failed replace
     // leaves nothing behind in `$SHEP_HOME`.
     tmp.persist(path).map_err(|err| DogError::Io(err.error))?;
-    // `sync_all` made the CONTENTS durable; this makes the rename that
+    // `sync_all` made the contents durable; this makes the rename that
     // published them durable. A no-op on Windows.
     shep_core::atomic_file::sync_dir(parent).map_err(DogError::Io)?;
     Ok(())
@@ -1453,10 +1453,10 @@ mod tests {
         assert_eq!(dog_section(&path, "metrics").expect("section"), "");
     }
 
-    /// fails if the write regenerates the file from a parsed map instead of
-    /// editing it in place: a comment above another dog's table, or that
-    /// dog's own keys, would not survive. `dogs.toml` is hand-editable on
-    /// purpose, so an operator's file coming back rewritten is the bug.
+    /// A comment above another dog's table, or that dog's own keys, would
+    /// not survive a regenerate-from-map write. `dogs.toml` is
+    /// hand-editable on purpose, so an operator's file coming back
+    /// rewritten would be the bug.
     #[test]
     fn set_dog_section_replaces_one_table_and_leaves_the_rest_untouched() {
         let dir = tempfile::tempdir().unwrap();
@@ -1478,15 +1478,13 @@ mod tests {
         assert_eq!(parsed.dog["bark"]["history_bytes"].as_integer(), Some(4096));
     }
 
-    /// fails if the READ renders a parsed map back out instead of handing
-    /// back the text an operator wrote. The sibling test above pins a
-    /// comment OUTSIDE the edited table, which the write side preserves on
-    /// its own; a comment INSIDE it, and the order of the keys around it,
-    /// survive only if the section the pane was handed was the raw span.
-    /// `toml::map::Map` is a `BTreeMap` without `preserve_order`, so a
-    /// re-render alphabetises as well as stripping. The comment ABOVE the
-    /// header is the third case, decor on the table itself, which only the
-    /// write side can carry.
+    /// The sibling test above pins a comment outside the edited table,
+    /// which the write side preserves on its own; a comment inside it, and
+    /// the order of the keys around it, survive only if the section the
+    /// pane was handed was the raw span. `toml::map::Map` is a `BTreeMap`
+    /// without `preserve_order`, so a re-render alphabetises as well as
+    /// stripping. A comment above the header is the third case, decor on
+    /// the table itself, which only the write side can carry.
     #[test]
     fn a_pane_round_trip_keeps_the_comments_and_the_key_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -1521,9 +1519,8 @@ mod tests {
         );
     }
 
-    /// fails if the writer needs a file to already be there. A home that has
-    /// never had a dog configured has no `dogs.toml` at all, which is the
-    /// ordinary case for the first section anyone writes.
+    /// A home that has never had a dog configured has no `dogs.toml` at
+    /// all, the ordinary case for the first section anyone writes.
     #[test]
     fn set_dog_section_creates_the_file_when_there_is_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -1535,9 +1532,8 @@ mod tests {
         assert!(parsed.dog.contains_key("bark"));
     }
 
-    /// fails if the validation runs after the write, or not at all. A
-    /// section this daemon cannot read back must never reach disk: the file
-    /// it would land in is the one every dog is served from, so one bad
+    /// A section this daemon cannot read back must never reach disk: the
+    /// file it lands in is the one every dog is served from, so one bad
     /// section would take the rest of the kennel down with it.
     #[test]
     fn set_dog_section_refuses_text_that_is_not_a_table_and_writes_nothing() {
@@ -1554,12 +1550,11 @@ mod tests {
         );
     }
 
-    /// fails if the only gate is the parse of the incoming text. This
-    /// section parses fine on its own and the spliced document is valid
-    /// TOML; what it is not is a valid `DogsConfig`, because the file it
-    /// lands in has a top-level scalar in it. The daemon serves every dog
+    /// This section parses fine on its own and the spliced document is
+    /// valid TOML; what it is not is a valid `DogsConfig`, since the file
+    /// it lands in has a top-level scalar. The daemon serves every dog
     /// from one `DogsConfig::load` of this file, so a write that leaves it
-    /// unloadable takes the whole kennel down and not just this dog.
+    /// unloadable takes the whole kennel down, not just this dog.
     #[test]
     fn set_dog_section_refuses_a_result_the_daemon_could_not_read_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -1575,11 +1570,10 @@ mod tests {
         );
     }
 
-    /// fails if the dog's table vanishes when its last key is deleted. A
-    /// root table is implicit, and an implicit table with no keys of its
+    /// A root table is implicit, and an implicit table with no keys of its
     /// own renders no header at all, so an operator who cleared a section
-    /// in the pane would find `[bark]` gone from a file they are invited to
-    /// hand-edit -- and `shep describe` with it.
+    /// in the pane would find `[bark]` gone from a file they are invited
+    /// to hand-edit, and `shep describe` with it.
     #[test]
     fn set_dog_section_leaves_the_table_behind_when_the_section_is_emptied() {
         let dir = tempfile::tempdir().unwrap();
@@ -1594,10 +1588,9 @@ mod tests {
         assert!(parsed.dog["bark"].is_empty(), "{text}");
     }
 
-    /// fails if the file is created at the ambient umask. This is where
-    /// `docs/dogs.md` tells an operator to paste a webhook URL, which is a
-    /// bearer token in a path; the CLI's own writer creates it `0600` and a
-    /// second writer at `0644` would be the downgrade.
+    /// `docs/dogs.md` tells an operator to paste a webhook URL here, a
+    /// bearer token in a path. The CLI's own writer creates the file
+    /// `0600`; a second writer at `0644` would be the downgrade.
     #[cfg(unix)]
     #[test]
     fn set_dog_section_writes_owner_only() {

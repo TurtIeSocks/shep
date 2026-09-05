@@ -661,8 +661,8 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 // `Scale`'s arm gives: the muster roll is written from the
                 // registry (`snapshot::muster`) and nothing on the restore
                 // path reads the override store, so an env edit that
-                // skipped this would survive a `shep daemon reload` -- the
-                // handover blob carries `pending` -- and vanish on a cold
+                // skipped this would survive a `shep daemon reload` (the
+                // handover blob carries `pending`) and vanish on a cold
                 // restart. The same field class behaving differently
                 // depending on which request set it is the bug.
                 Ok(Some(app)) => {
@@ -705,31 +705,25 @@ async fn run(id: u64, conn: ConnId, request: Request, ctx: &RpcContext) -> Outco
                 Err(err) => reply(Err(rpc_error(&err))),
             }
         }
-        // The inverse of every other config door's guard, and deliberately
-        // so: `dogs.toml` holds dogs' sections and nothing else, so what
-        // this one refuses is a SHEEP, and a name that is no dog of this
-        // shepherd's. Asked before the file is opened, so a mistyped name
-        // cannot leave a table behind for a dog that will never exist.
+        // The inverse of every other config door's guard: `dogs.toml`
+        // holds dogs' sections and nothing else, so what this one refuses
+        // is a sheep's name, not merely a dog no one has heard of. Asked
+        // before the file is opened, so a mistyped name leaves no stray
+        // table behind for a dog that will never exist.
         //
-        // Asked of [`RpcContext::known_dogs`] and NOT of the running
-        // flock. A guard on `supervisor.list()` compiles, passes a test
-        // that enables a dog first, and refuses the one dog this feature
-        // exists for: the dog-config design's decision 4 is that the dog
-        // most in need of configuring is the one that is disabled or has
-        // never started, so an operator who adopts a dog and opens its
-        // pane to set a webhook before switching it on would be told
-        // there is no such dog. The running set is still consulted, as a
-        // widening: a dog adopted and enabled since this shepherd booted
-        // is not in the list the CLI handed over at boot, and refusing
-        // that one would be the same bug in its second shape.
+        // Guarded on `known_dogs`, not on the running flock: a guard on
+        // `supervisor.list()` would refuse the dog most in need of
+        // configuring, one that is disabled or has never started. The
+        // running flock is still consulted too, as a widening, because a
+        // dog adopted and enabled since this shepherd booted is not yet
+        // in the list the CLI handed over at boot.
         //
         // Written here rather than through the supervisor: `dogs.toml` is
-        // not supervisor state the way the override store is, and the two
-        // things this needs -- the file's path and the bus -- are both
-        // already in scope. The daemon and not the client writes it because
-        // the daemon is the only publisher of `config.dog.<name>`, and a
-        // section written with nothing publishing that topic leaves a
-        // running dog reading the old one.
+        // not supervisor state, and the file's path and the bus are both
+        // already in scope here. The daemon, not the client, writes it
+        // because the daemon is the only publisher of `config.dog.<name>`,
+        // and a section written with nothing publishing that topic leaves
+        // a running dog reading the old one.
         Request::SetDogConfig { name, toml } => {
             let running_dog = || async {
                 ctx.supervisor
@@ -2499,16 +2493,12 @@ mod tests {
         assert!(started.result.is_ok(), "{:?}", started.result);
     }
 
-    /// fails if a dog can be handed a sheep's env override. A dog runs at
-    /// the daemon's own trust level and its binary is what `shep adopt`
-    /// vetted, so a `PATH`, an `LD_PRELOAD` or a `DYLD_INSERT_LIBRARIES`
-    /// parked for its next respawn is arbitrary code at that level. Nothing
-    /// in the tree sends this yet; the socket is live, which is the whole
-    /// reason it is refused at the daemon rather than at a caller.
-    ///
-    /// Asserts the store and the entry as well as the code: a refusal that
-    /// answered `InvalidConfig` after writing would be the same hole with a
-    /// better error message.
+    /// A dog runs at the daemon's own trust level and its binary is what
+    /// `shep adopt` vetted, so a parked `PATH`, `LD_PRELOAD` or
+    /// `DYLD_INSERT_LIBRARIES` for its next respawn would run arbitrary
+    /// code at that level. Refused at the daemon, not at a caller, because
+    /// the socket is already live. Asserts the store as well as the code:
+    /// a refusal that still wrote would be the same hole.
     #[tokio::test(start_paused = true)]
     async fn a_dog_is_refused_an_env_override_rather_than_given_one() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2559,11 +2549,9 @@ mod tests {
         assert_eq!(infos[0].pending, None, "the refusal still parked a config");
     }
 
-    /// fails if a dog's whole `AppConfig` can be read through the sheep
-    /// config pane. No other request hands a client a config at all, so this
-    /// would be a read surface that exists for dogs and nothing else, and a
-    /// dog's config is what `shep adopt` vetted rather than anything an
-    /// operator is meant to edit here.
+    /// No other request hands a client a config at all, so this would be a
+    /// read surface that exists for dogs and nothing else. A dog's config
+    /// is what `shep adopt` vetted, not something an operator edits here.
     #[tokio::test(start_paused = true)]
     async fn a_dogs_config_is_not_readable_through_the_sheep_config_pane() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2612,11 +2600,9 @@ mod tests {
         }
     }
 
-    /// fails if a config pane's answer carries an env VALUE, and fails if
-    /// it stops listing the keys. Both halves are the point: a pane that
-    /// cannot name the keys cannot offer to edit them, and one that is
-    /// handed the values has put a secret on a socket for nothing
-    /// (decision 12 of the overrides design, IR-41).
+    /// Both halves matter: a pane that cannot name the keys cannot offer
+    /// to edit them, and one handed the values has put a secret on a
+    /// socket for nothing (IR-41).
     #[tokio::test(start_paused = true)]
     async fn sheep_config_answers_with_env_emptied_and_its_keys_listed() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2642,10 +2628,9 @@ mod tests {
         assert_eq!(view.env_keys, ["DB_PASS"]);
     }
 
-    /// fails if an unknown name reads as a daemon fault. A pane asking
-    /// about a sheep that was deleted under it is a normal thing to have
-    /// happen, and `Internal` would send its operator looking for a bug in
-    /// the shepherd.
+    /// A pane asking about a sheep deleted out from under it is normal,
+    /// not a daemon fault. `Internal` would send an operator looking for
+    /// a bug in the shepherd.
     #[tokio::test(start_paused = true)]
     async fn sheep_config_for_an_unknown_name_is_not_found_not_internal() {
         let h = harness(vec![]);
@@ -2667,11 +2652,9 @@ mod tests {
         assert_eq!(err.code, RpcErrorCode::NotFound);
     }
 
-    /// fails if a set env key does not reach the store, and fails if it
-    /// reaches the running child instead of parking. The running process
-    /// was handed its environment at spawn and cannot be handed another,
-    /// so an edit reported as applied would be an edit the operator
-    /// believes is in force and is not.
+    /// The running process was handed its environment at spawn and cannot
+    /// be handed another, so an edit reported as applied would be one the
+    /// operator believes is in force when it is not.
     #[tokio::test(start_paused = true)]
     async fn set_sheep_env_writes_the_store_and_parks_env_until_a_respawn() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2723,9 +2706,8 @@ mod tests {
         );
     }
 
-    /// fails if a removal leaves the sheep marked as overridden. The CFG
-    /// column reads `ProcessEntry::overridden`, so an `env` key left in the
-    /// store's field set after the last value under it is gone marks a
+    /// The CFG column reads `ProcessEntry::overridden`, so an `env` key
+    /// left in the store's field set after its last value is gone marks a
     /// sheep that no longer differs from its Flockfile.
     #[tokio::test(start_paused = true)]
     async fn removing_the_last_env_override_stops_marking_the_sheep() {
@@ -2773,15 +2755,12 @@ mod tests {
         assert!(view.overridden.is_empty(), "{view:?}");
     }
 
-    /// fails if an env edit survives a `shep daemon reload` and is lost by
-    /// a cold restart, which is the shape this bug took. The muster roll is
-    /// written from the `FlockRegistry` and nothing on the restore path
-    /// reads the override store, so a handler that parks a config without
-    /// recording it looks correct in every live test and forgets the edit
-    /// the next time the machine comes up.
-    ///
-    /// Asserts the roll rather than the registry's own accessor: the roll
-    /// is what `shep muster` actually restores from.
+    /// The muster roll is written from the `FlockRegistry`, and nothing on
+    /// the restore path reads the override store, so a handler that parks
+    /// a config without recording it looks correct in every live test and
+    /// forgets the edit on the next cold start. Asserts the roll rather
+    /// than the registry's own accessor, since the roll is what `shep
+    /// muster` actually restores from.
     #[tokio::test(start_paused = true)]
     async fn a_set_env_reaches_the_roll_a_cold_restart_would_come_back_on() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2813,15 +2792,10 @@ mod tests {
         assert_eq!(web.app.env.get("NEW").map(String::as_str), Some("1"));
     }
 
-    /// fails if removing an env key the operator never overrode records
-    /// nothing. `map.remove` is a no-op for a key that was supplied by the
-    /// app's own config, so without a tombstone the store comes back empty,
-    /// the CFG column marks nothing, and the removal lives only in
-    /// `ProcessEntry::pending` -- for a change the operator just made.
-    ///
-    /// `removing_the_last_env_override_stops_marking_the_sheep` cannot
-    /// reach this: it removes a key it set itself, which is the one case
-    /// that must NOT leave a tombstone.
+    /// `map.remove` is a no-op for a key the app's own config supplied, so
+    /// without a tombstone the store comes back empty and the removal
+    /// lives only in `ProcessEntry::pending`, a change the operator just
+    /// made.
     #[tokio::test(start_paused = true)]
     async fn removing_a_key_the_operator_never_set_is_still_recorded() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2857,27 +2831,13 @@ mod tests {
         assert!(!view.env_keys.contains(&"DB_PASS".to_string()));
     }
 
-    /// fails if a removal stops being REPORTED once the Flockfile that
-    /// declares the key is loaded again.
-    ///
-    /// Two things have to compose and neither is pinned by the tombstone
-    /// test above, which stops before any load. `merge_declared`'s env loop
-    /// must skip a key held in `overridden_env`, which counts a null like
-    /// any other entry, so the file's value does not come back. And
-    /// `establish_env`, which runs after that loop, must NOT spend the
-    /// tombstone the way it spends an override carrying a value, or the
-    /// store comes back empty and `overridden` stops naming `env` while the
-    /// sheep genuinely still differs from its file.
-    ///
-    /// The second is the operator-visible half: `overridden` is the only
-    /// signal a sheep diverges from its Flockfile, and the `CFG` column in
-    /// `shep flock` and `shep lookout` reads it. A removal is the one edit
-    /// that can make it claim identical when it is not.
-    ///
-    /// Loaded TWICE on purpose. The second load only skips the key because
-    /// the first one preserved the record, so a single load would pass
-    /// against a build that spent the tombstone and leaned on
-    /// `declared_env` alone.
+    /// Two things must compose: `merge_declared`'s env loop must skip a
+    /// key held in `overridden_env` so the file's value does not come
+    /// back, and `establish_env`, which runs after, must not spend the
+    /// tombstone the way it spends a valued override, or `overridden`
+    /// stops naming `env` while the sheep still differs from its file.
+    /// Loaded twice on purpose: a single load would pass against a build
+    /// that spent the tombstone and leaned on `declared_env` alone.
     #[tokio::test(start_paused = true)]
     async fn a_removed_key_stays_removed_and_stays_reported_across_reloads() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2953,12 +2913,11 @@ mod tests {
         }
     }
 
-    /// fails if `SetSheepEnv` writes the store before it validates. Two
-    /// halves, and the second is the one a refactor breaks: `SHEP_NAME` is
-    /// injected per instance and refused in a hand-written env, so this is
-    /// a real refusal an operator can meet from a free-text pane, and a
-    /// handler that wrote first would leave a stored override for a config
-    /// the daemon will not accept.
+    /// Two halves, and the second is the one a refactor breaks:
+    /// `SHEP_NAME` is injected per instance and refused in a hand-written
+    /// env, so this is a real refusal an operator can meet from a
+    /// free-text pane, and a handler that wrote first would leave a
+    /// stored override for a config the daemon will not accept.
     #[tokio::test(start_paused = true)]
     async fn an_env_key_normalize_refuses_is_invalid_config_and_writes_nothing() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -2990,10 +2949,8 @@ mod tests {
         );
     }
 
-    /// fails if an unreadable override store is reported as anything but a
-    /// daemon-side fault. It is the one failure here that is neither the
-    /// caller's request nor a refusal they can act on by asking
-    /// differently, which is the whole reason it has a variant of its own
+    /// Neither the caller's request nor a refusal they can act on by
+    /// asking differently, which is why it gets a variant of its own
     /// rather than sharing `InvalidEnv`'s.
     #[tokio::test(start_paused = true)]
     async fn an_unreadable_override_store_is_internal_not_a_bad_request() {
@@ -3051,16 +3008,13 @@ mod tests {
         .result
     }
 
-    /// fails if a pane edit stops being visible as an operator override.
-    ///
-    /// **This is the whole reason `SetSheepField` exists.** The same edit
-    /// through `ApplyConfig` at `ResetDepth::File` moved the field and then
-    /// spent the override for it in `merge_declared`, so the key was gone
-    /// from `overridden`, `shep flock`'s CFG column counted nothing, and
-    /// the pane's `*` marker never appeared for a value the operator had
-    /// just set. Asserted end to end -- through `SheepConfig`, which the
-    /// pane reads, and `ListFlock`, which the CFG column reads -- because
-    /// the request in isolation was correct the whole time it was wrong.
+    /// The same edit through `ApplyConfig` at `ResetDepth::File` moves the
+    /// field and spends the override in `merge_declared`, so the key drops
+    /// from `overridden` and the pane's `*` marker never appears for a
+    /// value the operator just set. Asserted through both `SheepConfig`,
+    /// which the pane reads, and `ListFlock`, which the CFG column reads,
+    /// because the request alone can be correct while both derived views
+    /// are wrong.
     #[tokio::test(start_paused = true)]
     async fn a_field_edit_is_reported_as_an_operator_override() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3108,9 +3062,9 @@ mod tests {
         );
     }
 
-    /// fails if the four-way apply classification stops governing this
-    /// door. A `Live` field is in force now, a `NeedsRespawn` field parks
-    /// and says so, and the pane's cost column promises exactly this.
+    /// The four-way apply classification governs this door: a `Live`
+    /// field is in force now, a `NeedsRespawn` field parks and says so,
+    /// and the pane's cost column promises exactly this.
     #[tokio::test(start_paused = true)]
     async fn a_live_field_applies_now_and_a_respawn_field_parks() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3148,19 +3102,11 @@ mod tests {
         );
     }
 
-    /// fails if a `Live` field that cannot reach the running child stops
-    /// saying so.
-    ///
-    /// **One of the two cases that make `pending` worth carrying at all.**
-    /// The other three answers this reply gives -- `max_restarts` in force,
-    /// `script` parked -- a client could have derived from `apply_group`
-    /// without asking. This one it cannot: `reached_spec` builds a SUBSET
-    /// of the config, running plus the one field that reaches, and
-    /// `normalize` checks fields against each other. `watch` needs a `cwd`,
-    /// and a `cwd` that is itself still parked is not on the running spec
-    /// for the subset to find, so a `Live` field parks. If this ever stops
-    /// being reachable, `pending` is a restatement of `apply_group` and
-    /// should be deleted.
+    /// One of two cases where `pending` carries information `apply_group`
+    /// alone cannot: `reached_spec` builds a subset of the config, running
+    /// plus the one field that reaches, and `normalize` checks fields
+    /// against each other. `watch` needs a `cwd`, and a `cwd` still parked
+    /// is not on that subset, so a `Live` field parks anyway.
     #[tokio::test(start_paused = true)]
     async fn a_live_field_whose_subset_will_not_normalize_parks_instead() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3179,7 +3125,7 @@ mod tests {
         );
         assert!(started.result.is_ok(), "{:?}", started.result);
 
-        // `cwd` is NeedsRespawn, so this parks and the RUNNING spec still
+        // `cwd` is NeedsRespawn, so this parks and the running spec still
         // has none.
         let reply = set_field(&h.ctx, 2, "web", "cwd", serde_json::json!("/srv")).await;
         let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
@@ -3188,7 +3134,7 @@ mod tests {
         assert!(pending, "cwd needs a respawn");
 
         // `watch` is Live, so `apply_group` alone predicts "in force now".
-        // The merge is valid -- it carries the parked `cwd` -- but the
+        // The merge is valid (it carries the parked `cwd`) but the
         // subset is `running + watch`, which is a watch with no directory.
         let reply = set_field(&h.ctx, 3, "web", "watch", serde_json::json!(true)).await;
         let Ok(Response::SheepFieldSet { pending, .. }) = reply else {
@@ -3214,16 +3160,12 @@ mod tests {
         );
     }
 
-    /// fails if `autostart` stops reporting as in force.
-    ///
-    /// **The second case that makes `pending` worth carrying.** It is
-    /// `ApplyGroup::NextSpawn`, so `apply_group` predicts an operator must
-    /// restart for it, and that would be telling them to do nothing useful:
-    /// `snapshot::restorable` reads it at muster or boot rather than at a
-    /// spawn, so it is in force the moment it lands on the stored spec.
-    /// `kill_signal` is its group-mate and really is read at a spawn, and
-    /// is asserted beside it so this pins the carve-out rather than the
-    /// whole group.
+    /// `autostart` is `ApplyGroup::NextSpawn`, so `apply_group` predicts a
+    /// respawn is needed, but `snapshot::restorable` reads it at muster or
+    /// boot rather than at spawn, so it is in force the moment it lands on
+    /// the stored spec. `kill_signal` is its group-mate and is genuinely
+    /// read at spawn, asserted alongside it to pin the carve-out rather
+    /// than the whole group.
     #[tokio::test(start_paused = true)]
     async fn autostart_reports_in_force_and_its_group_mate_reports_pending() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3253,14 +3195,11 @@ mod tests {
         assert!(pending, "kill_signal really is read at a spawn");
     }
 
-    /// fails if a dog can be handed a config field. The same hole
-    /// `a_dog_is_refused_an_env_override_rather_than_given_one` closes for
-    /// `env`, and sharper: this door reaches `script` and `args` directly,
-    /// and a dog runs at the daemon's own trust level.
-    ///
-    /// Asserts the store as well as the code: a refusal that answered
-    /// `InvalidConfig` after writing would be the same hole with a better
-    /// error message.
+    /// The same hole `a_dog_is_refused_an_env_override_rather_than_given_one`
+    /// closes for `env`, sharper here since this door reaches `script` and
+    /// `args` directly and a dog runs at the daemon's own trust level.
+    /// Asserts the store as well as the code: a refusal that still wrote
+    /// would be the same hole with a better error.
     #[tokio::test(start_paused = true)]
     async fn a_dog_is_refused_a_config_field_rather_than_given_one() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3281,11 +3220,9 @@ mod tests {
         drop(dog);
     }
 
-    /// fails if the three keys this door does not own stop being refused.
-    ///
-    /// `env` would be replaced wholesale by a request that carries one
-    /// value, wiping every other key; `instances` and `name` are
-    /// Structural, and the count moves through `shep stock`.
+    /// `env` would be replaced wholesale by a request carrying one value,
+    /// wiping every other key; `instances` and `name` are Structural, and
+    /// the count moves through `shep stock`.
     #[tokio::test(start_paused = true)]
     async fn env_and_the_structural_fields_are_refused_by_this_door() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3311,9 +3248,6 @@ mod tests {
         );
     }
 
-    /// fails if `SetSheepField` writes the store before it validates, or
-    /// reports a caller's own bad key or value as a daemon fault.
-    ///
     /// Three shapes, and each is the caller's: a key `AppConfig` has no
     /// field for, a value that will not deserialize into the field it
     /// names, and a value that deserializes and then fails `normalize`.
@@ -3345,9 +3279,6 @@ mod tests {
         }
     }
 
-    /// fails if a store fault is reported as the caller's mistake. The
-    /// ordering twin of the test above, and the pair is what
-    /// `SetSheepEnv`'s own two pin for its door.
     #[tokio::test(start_paused = true)]
     async fn an_unreadable_store_is_internal_for_a_field_edit_too() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3366,11 +3297,10 @@ mod tests {
         );
     }
 
-    /// fails if a field edit stops reaching the muster roll, which is the
-    /// registry record `rpc.rs` writes rather than anything the supervisor
-    /// does. Nothing on the restore path reads the override store, so an
-    /// edit that skipped it would survive a `shep daemon reload` and vanish
-    /// on a cold restart.
+    /// The muster roll is a registry record `rpc.rs` writes, not
+    /// something the supervisor does. Nothing on the restore path reads
+    /// the override store, so an edit that skipped it would survive a
+    /// `shep daemon reload` and vanish on a cold restart.
     #[tokio::test(start_paused = true)]
     async fn a_field_edit_reaches_the_muster_roll() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3389,25 +3319,11 @@ mod tests {
         assert_eq!(web.app.max_restarts, 40);
     }
 
-    /// fails if a variant added to `Request` never gets a dispatch arm.
-    ///
-    /// The one test here that cannot be replaced by reading the code.
-    /// `Request` is `#[non_exhaustive]` and this module's dispatch ends in
-    /// a wildcard, so a variant with NO arm compiles, passes every other
-    /// test in this file, and answers "this daemon does not implement that
-    /// request" at runtime -- a message that sends an operator to upgrade a
-    /// daemon that is already current. The wire snapshots cannot catch it
-    /// either: they are hand-written literals with no completeness check.
-    ///
-    /// Every request below names something that does not exist, so a real
-    /// arm refuses each of them and nothing is asserted about the refusal
-    /// but which one it is.
-    ///
-    /// **The list is hand-written and nothing makes it exhaustive.** There
-    /// is no way to enumerate a `#[non_exhaustive]` enum's variants at
-    /// runtime, so a fourth variant added to `Request` is covered by this
-    /// test only if its author adds it here. If you are adding one, add it
-    /// here.
+    /// `Request` is `#[non_exhaustive]` with dispatch ending in a
+    /// wildcard, so a variant missing its arm compiles and passes every
+    /// other test, silently refused at runtime instead. The list below is
+    /// hand-written and nothing makes it exhaustive: a new variant is
+    /// covered only if its author adds it here.
     #[tokio::test(start_paused = true)]
     async fn every_new_variant_reaches_an_arm_and_not_the_wildcard() {
         let h = harness(vec![]);
@@ -3500,13 +3416,12 @@ mod tests {
         assert!(toml.as_str().contains("30s"));
     }
 
-    /// fails if the section is written without the topic going out, which
-    /// is the whole difference between this door and a CLI writing the file
-    /// itself: a running dog subscribed to `config.dog.<name>` is the only
-    /// reader that finds out a section moved. Asserted on a SUBSCRIBER
-    /// rather than on the publish call, the way the dog contract's own
-    /// `bark_subscribes_to_its_own_config_topic` does -- a test that the
-    /// publisher ran proves nothing about what a dog hears.
+    /// This door differs from a CLI writing the file directly because it
+    /// publishes: a running dog subscribed to `config.dog.<name>` is the
+    /// only reader that finds out a section moved. Asserted on a
+    /// subscriber rather than the publish call, the way the dog
+    /// contract's own `bark_subscribes_to_its_own_config_topic` does,
+    /// since a publisher that ran proves nothing about what a dog hears.
     #[tokio::test(start_paused = true)]
     async fn set_dog_config_writes_the_file_and_a_subscriber_hears_about_it() {
         let h = harness(vec![ProcScript::never_exits()]);
@@ -3554,12 +3469,10 @@ mod tests {
         );
     }
 
-    /// fails if the write door is guarded on the RUNNING set. The dog most
-    /// in need of configuring is the one that is switched off: an operator
-    /// adopts a dog, sets its webhook, and only then enables it, which is
-    /// the sequence the dog-config design's decision 4 argues for by name.
-    /// A guard on `supervisor.list()` refuses exactly that dog, and this
-    /// one has never been started at all.
+    /// The dog most in need of configuring is the one that is switched
+    /// off: an operator adopts a dog, sets its webhook, and only then
+    /// enables it. A guard on `supervisor.list()` would refuse exactly
+    /// that dog, and this one has never been started at all.
     #[tokio::test(start_paused = true)]
     async fn a_dog_that_is_adopted_and_never_started_can_still_be_configured() {
         let mut h = harness(vec![]);
@@ -3589,10 +3502,9 @@ mod tests {
         assert!(text.contains("4317"), "{text}");
     }
 
-    /// fails for the same reason as the case above, one step further along:
-    /// a built-in dog an operator has enabled but that is not up right now
-    /// -- crashed, stopped, or simply not spawned on this boot -- is still
-    /// a dog whose section this shepherd holds. The harness starts nothing,
+    /// A dog an operator has enabled but that is not up right now
+    /// (crashed, stopped, or simply not spawned on this boot) is still a
+    /// dog whose section this shepherd holds. The harness starts nothing,
     /// so `bark` is known and absent from the flock.
     #[tokio::test(start_paused = true)]
     async fn a_dog_that_is_enabled_but_not_running_can_still_be_configured() {
@@ -3621,11 +3533,10 @@ mod tests {
         );
     }
 
-    /// fails if the boot-time list is the ONLY thing consulted. A dog
-    /// adopted and enabled since this shepherd started is not in the list
-    /// the CLI handed over at boot -- that list is refreshed by a `shep
-    /// daemon reload` and by nothing else -- so a guard that stopped there
-    /// would refuse a dog that is up and answering right now.
+    /// A dog adopted and enabled since this shepherd started is not in
+    /// the list the CLI handed over at boot (refreshed only by a `shep
+    /// daemon reload`), so a guard that stopped there would refuse a dog
+    /// that is up and answering right now.
     #[tokio::test(start_paused = true)]
     async fn a_dog_adopted_since_boot_is_reached_through_the_running_flock() {
         let mut h = harness(vec![ProcScript::never_exits()]);
@@ -3654,8 +3565,6 @@ mod tests {
         );
     }
 
-    /// fails if the known set goes stale the moment a dog stops running.
-    ///
     /// The boot-time list is a snapshot, so a dog adopted against a running
     /// shepherd is in neither half of the old guard once it is off the
     /// flock, and both of these were refused:
@@ -3715,12 +3624,11 @@ mod tests {
         );
     }
 
-    /// fails if the guard is the one every other config door carries. This
-    /// is the inverse: `dogs.toml` holds dogs' sections and nothing else,
-    /// so a SHEEP's name is what has to be refused here, and a name nobody
-    /// registered with it. Refused before the file is opened, so a
-    /// mistyped name cannot leave a stray table behind for a dog that will
-    /// never exist.
+    /// This is the inverse of the guard every other config door carries:
+    /// `dogs.toml` holds dogs' sections and nothing else, so it has to
+    /// refuse a sheep's name, one nobody registered with it. Refused
+    /// before the file opens, so a mistyped name leaves no stray table
+    /// behind for a dog that will never exist.
     #[tokio::test(start_paused = true)]
     async fn setting_a_dogs_config_over_a_sheeps_name_is_refused_and_writes_nothing() {
         let h = harness(vec![ProcScript::never_exits()]);
