@@ -2266,8 +2266,6 @@ impl App {
             }
             // Unreachable from here, named so a new variant cannot fall
             // silently into an arm that ignores it.
-            // Unreachable from here, named so a new variant cannot fall
-            // silently into an arm that ignores it.
             KeyPress::Action(_)
             | KeyPress::FilterStart
             | KeyPress::TextChar(_)
