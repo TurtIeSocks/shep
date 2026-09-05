@@ -373,7 +373,7 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
         .map_err(|err: toml_edit::TomlError| DogError::Config(err.to_string()))?;
     match doc.get(name) {
         Some(toml_edit::Item::Table(spanned)) => Ok(spanned.to_string()),
-        // An inline table — `bark = { poll = "60s" }` — is a valid entry
+        // An inline table, `bark = { poll = "60s" }`, is a valid entry
         // whose span is `{ ... }`, which is not a section body and is not
         // something the pane could write back. Rendered, as every section
         // was before: there is no comment to lose inside one line.
@@ -391,7 +391,7 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
 /// out: every table other than `name`'s comes through byte for byte, and so
 /// does a comment outside it. A comment INSIDE the replaced table is the
 /// caller's to carry, because the caller is what decided the section's new
-/// text — and [`dog_section`] hands it the span rather than a re-render
+/// text, and [`dog_section`] hands it the span rather than a re-render
 /// precisely so that it can. The header's own decor, a comment line above
 /// `[name]` and anything trailing the header, is carried across here
 /// instead: it sits neither inside the section nor outside the table, so
