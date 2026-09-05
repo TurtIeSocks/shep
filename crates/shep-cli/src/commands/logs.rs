@@ -1,23 +1,12 @@
-//! Log-plane verbs: the ones that act on a sheep's log FILES.
+//! Log-plane verbs: the ones that act on a sheep's log files.
 //!
-//! Reading a sheep's log output is `bleats` and lives in
-//! `commands::bleats` — which is what `shep logs` aliases, despite this
-//! module's name. This module is the other half: the files themselves.
-//! `reopen` hands them to an external rotator that has renamed them;
-//! `flush` empties them in place.
+//! Reading a sheep's output is `commands::bleats`, which is what `shep logs`
+//! aliases despite this module's name. Here, `reopen` hands the files to an
+//! external rotator that has renamed them and `flush` empties them in place.
 //!
-//! Like every other verb module, these receive an already-connected
-//! [`Client`]; `main` connects, and nothing here autostarts a daemon.
-//!
-//! # Why acting on a sheep's log files is cheap
-//!
-//! The child never sees its log file. It is spawned with `Stdio::piped()`
-//! and the daemon does the file I/O on the far side of that pipe, so
-//! swapping the daemon's handle — or emptying the file under it — is
-//! invisible across the process boundary: no signal to the child, no fd
-//! surgery, no restart, and no gap in the pipe. Nothing child-side is
-//! needed to rotate or clear a sheep's logs, so nothing here asks anything
-//! of the child.
+//! The child never sees its log file: it is spawned with `Stdio::piped()`
+//! and the daemon does the file I/O, so nothing here asks anything of the
+//! child.
 
 use std::time::Duration;
 
@@ -37,17 +26,9 @@ use crate::output::{
 /// renders whatever the daemon answers through [`emit`], and maps every way
 /// that can go wrong to its exit code.
 ///
-/// `extract` pulls the verb's own payload out of `Response`; `Response` is
-/// `#[non_exhaustive]` (Global Constraints), so an answer `extract` does not
-/// recognise — a variant this client predates, or simply the wrong one for
-/// this verb — maps to [`ExitCode::Internal`] rather than being guessed at.
-///
-/// The third per-module copy of this helper, after `commands::lifecycle`'s
-/// and `commands::query`'s. They are one refactor rather than three: this
-/// one and `lifecycle`'s are now identical, and `query`'s differs only by
-/// the deadline parameter it has no verb to use. Kept a copy here because
-/// pulling all three into a shared home rewrites two modules this change
-/// otherwise does not touch.
+/// `extract` pulls the verb's own payload out of `Response`, which is
+/// `#[non_exhaustive]`: an answer it does not recognise maps to
+/// [`ExitCode::Internal`] rather than being guessed at.
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -84,30 +65,15 @@ where
 /// Reopens the log files of the sheep matching `args.selector`, for an
 /// external rotator that has renamed them.
 ///
-/// A zero exit means every matched sheep's log pump holds a handle on the
-/// recreated path, so a `postrotate` stanza that waits for this command
-/// knows no live pump is still filling the archive it just renamed. That
-/// holds because the daemon reaches every writer to a path it is rotating,
-/// not only the sheep named here — several instances can share one file, and
-/// one of them left unasked would go on filling the archive. A matched sheep
-/// that is not running has no pump and nothing to reopen; it is reported
-/// alongside the rest rather than as a failure.
+/// A zero exit means every matched sheep's pump holds a handle on the
+/// recreated path, so a `postrotate` stanza waiting on this command knows no
+/// live pump is still filling the archive. The daemon reaches every writer to
+/// a path it rotates, not only the sheep named: several instances can share
+/// one file. A sheep that is not running has no pump and is reported like the
+/// rest; a pump that cannot open its path again fails the command.
 ///
-/// A pump that could not open a path again fails the command instead, with
-/// the sheep and the path on stderr. The rename is still safe to act on —
-/// the old handle was closed either way — but that sheep is writing a
-/// stream nowhere until the path can be opened, and exiting 0 there would
-/// be the silent failure this verb exists to end.
-///
-/// Renders the matched sheep as [`FlockRows`], the same table `stop` and
-/// `restart` answer with — the useful thing to show is which sheep the
-/// selector reached.
-///
-/// Sent with [`LOG_PLANE_DEADLINE`] rather than the client's default, the way
-/// `lifecycle::start` sends its own: the daemon visits matched sheep one at
-/// a time with no per-sheep bound, so on a slow log directory the 5s default
-/// would hand a `postrotate` stanza a `DeadlineExceeded` for a reopen that
-/// was still running.
+/// Sent with [`LOG_PLANE_DEADLINE`]: the daemon visits matched sheep serially
+/// with no per-sheep bound, so the client's 5s default would time out.
 pub async fn reopen(client: &Client, streams: &mut Streams<'_>, args: &ReopenArgs) -> ExitCode {
     let selector = match parse_selector(streams, &args.selector) {
         Ok(selector) => SelectorSpec::from(&selector),
@@ -128,73 +94,19 @@ pub async fn reopen(client: &Client, streams: &mut Streams<'_>, args: &ReopenArg
 }
 
 /// Empties the log files of the sheep matching `args.selector`: the daemon
-/// flushes what every pump writing to one of those files still owes it, then
-/// truncates the paths those sheep were registered with.
+/// flushes what every pump owes those files, then truncates the paths the
+/// sheep were registered with, running or not.
 ///
-/// # What gets emptied
+/// Those paths are ordinary config values, never checked against the log
+/// directory, so an `out_file` naming something that is not a log is emptied
+/// too, with the shepherd's privileges. Several sheep can share a path: it is
+/// truncated once, and a sharing sheep the selector skipped is emptied too.
 ///
-/// Exactly the paths the Flockfile names — `out_file` and `err_file` as the
-/// daemon resolved them — for every registered sheep the selector matches,
-/// whether or not it has ever run. Those are ordinary config values, taken
-/// verbatim and never checked against the log directory, so an app pointing
-/// `out_file` at something that is not a log file makes this verb empty that
-/// file too, with the shepherd's privileges.
-///
-/// # Why the selector is required
-///
-/// This destroys log data, so it follows `stop`/`restart`/`delete` in
-/// demanding a target — where `bleats` and `reopen` default to `all` because
-/// neither destroys anything. `shep flush` with no argument is a usage error,
-/// not "empty every log in the flock": that is the one command here whose
-/// slip of the finger cannot be undone, and `shep flush all` is a short thing
-/// to type when it is meant. [`FlushArgs`] carries the selector as an
-/// `Option` only because `--daemon` names a target that is not a selection at
-/// all; clap still refuses a `flush` that names neither.
-///
-/// # A stopped sheep is emptied too
-///
-/// The daemon truncates recorded paths, not open handles, so a matched sheep
-/// with no running process is emptied like any other. That is the useful
-/// behaviour rather than an accident of the implementation: a stopped sheep's
-/// logs are still readable with `shep bleats --no-follow`, so they are still
-/// worth being able to clear.
-///
-/// # What this does NOT touch
-///
-/// The shepherd's own `shepd.out.log`/`shepd.err.log`. Those are opened by
-/// the CLI's launcher before the daemon exists, and the daemon inherits them
-/// as plain fds 1 and 2. It holds no handle it could flush and no recorded
-/// path it could truncate, so no selector can reach them and none ever will:
-/// they are [`flush_daemon`]'s, reached only by naming `--daemon`.
-///
-/// Renders the matched sheep as [`FlushedRows`] — one row per SHEEP, and the
-/// two paths that sheep contributed. Not [`FlockRows`], which every other
-/// flock-shaped verb answers with: those keep `out_file`/`err_file` out of the
-/// table for being too wide, and here they are the answer. A verb that empties
-/// files an operator may have mistyped, and then reports lifecycle columns it
-/// did not touch, has told them nothing about what it destroyed. The JSON is
-/// unchanged either way — the paths were always in it.
-///
-/// Several sheep can share one log path (`merge_logs`, or an explicit
-/// `out_file` on a multi-instance app) and the daemon truncates each distinct
-/// path once, so the same path can appear in two rows. A sharing sheep the
-/// selector skipped has that file emptied under it all the same, with its pump
-/// flushed first so none of its pending lines lands in the file afterwards —
-/// it is not a row here, because it is not a sheep the operator named, and
-/// that is the one thing this table cannot show.
-///
-/// Sent with [`LOG_PLANE_DEADLINE`] for the reason [`reopen`] gives: the
-/// daemon walks the matched flock file by file with no per-sheep bound.
-///
-/// # A selector-less call
-///
-/// `main` routes `--daemon` to [`flush_daemon`] before reaching here, and
-/// clap's `required_unless_present` covers everything else, so no real
-/// invocation arrives without a selector. The `None` arm below answers with
-/// the usage error clap itself would rather than an `expect`: a panicking
-/// convenience would abort the process over a bug in the dispatch above, and
-/// buy an operator nothing that one branch does not.
+/// The shepherd's own two logs are out of reach of any selector and are
+/// [`flush_daemon`]'s. Sent with [`LOG_PLANE_DEADLINE`], as [`reopen`] is.
 pub async fn flush(client: &Client, streams: &mut Streams<'_>, args: &FlushArgs) -> ExitCode {
+    // `main` routes `--daemon` away and clap requires a selector otherwise,
+    // so this arm is a guard against a dispatch bug.
     let Some(raw) = args.selector.as_deref() else {
         return streams.fail(
             ExitCode::Usage,
@@ -221,48 +133,15 @@ pub async fn flush(client: &Client, streams: &mut Streams<'_>, args: &FlushArgs)
 
 /// Empties the shepherd's own two log files: `shep flush --daemon`.
 ///
-/// # Why the CLI does this and not the daemon
+/// The CLI owns these files: `launch::launch_command` creates them before the
+/// daemon exists and hands them over as fds 1 and 2, so the daemon knows no
+/// path for them. This is the one flush that works with the shepherd down.
 ///
-/// It is the CLI that owns these files. `launch::launch_command` creates them
-/// before the daemon exists and hands them over as fds 1 and 2; the daemon
-/// never learns their paths, holds no `LogFile` for them, and has nothing to
-/// answer a `Request::Flush` about. Truncating them here needs no new wire
-/// variant, and — the useful consequence — needs no daemon either: this is
-/// the one flush that works while the shepherd is down, which is when an
-/// operator most often wants it.
-///
-/// # Why there is no flush barrier
-///
-/// The flock half exists in two phases because a pump's `write_all` returns
-/// with the real `write(2)` still queued on the blocking pool, so a truncate
-/// can outrun a line already dispatched. Nothing here is queued: the daemon's
-/// records go through its `tracing` subscriber straight to fd 2, synchronously
-/// on the thread that emitted them. There is no in-flight write to wait for,
-/// and no channel to wait on it with.
-///
-/// # Where the next line lands
-///
-/// At offset 0 — not because of how this function truncates, but because of
-/// what the daemon writes with. [`launch::launch_command`] opens both files
-/// `O_APPEND` (see `launch`'s own `emptied_appending`), and an `O_APPEND`
-/// handle always writes at the file's current end, recomputed on every
-/// write; that is what lands the daemon's next line at 0 once this function
-/// has truncated the file to nothing, and it would hold just as true had
-/// this used `File::create` in place of `open().truncate(true)`. What
-/// `File::create` would actually change is the case below: it creates a
-/// file where one is missing, rather than leaving room for `absent`. A
-/// daemon launched by an older `shep` binary, or run in the foreground with
-/// the operator's own shell redirection, keeps whatever descriptor it was
-/// given: this verb still empties the file and still frees the disk blocks,
-/// but that daemon's next line lands at its own remembered offset.
-///
-/// # A missing file is a success
-///
-/// The same rule the flock half applies to a sheep that has never run: a log
-/// file that is not there is already empty. It is reported as `absent` rather
-/// than created, so an operator can tell "emptied 4 MB" from "there was
-/// nothing here" — and a `shep flush --daemon` against a cold `$SHEP_HOME`
-/// exits 0 rather than complaining about a daemon that has never started.
+/// No flush barrier, unlike the flock half: the daemon's records reach fd 2
+/// synchronously. The next line lands at offset 0 because
+/// [`launch::launch_command`] opens both files `O_APPEND`; a daemon holding
+/// a descriptor from elsewhere keeps writing at the offset it remembers. A
+/// missing file is reported `absent` rather than created.
 pub fn flush_daemon(streams: &mut Streams<'_>, paths: &ShepPaths) -> ExitCode {
     let mut emptied = Vec::new();
     let mut failures = Vec::new();
@@ -323,12 +202,6 @@ mod tests {
         }
     }
 
-    /// Fails if `reopen` sends the raw selector string, another verb's
-    /// request kind, or a selector it did not parse: the whole `sent.body`
-    /// is asserted, not just the selector inside it. A `reopen` wired to
-    /// `Request::Restart` would restart the flock on every rotation — the
-    /// most expensive way this verb can be wrong, and invisible to a test
-    /// that only checked the selector.
     #[tokio::test]
     async fn every_selector_form_reaches_the_wire_inside_a_reopen_request() {
         let dir = tempfile::tempdir().unwrap();
@@ -360,25 +233,8 @@ mod tests {
         }
     }
 
-    /// Fails if `reopen` leaves the deadline to the client's default. The
-    /// daemon visits matched sheep serially with no per-sheep bound, so on a
-    /// slow or NFS-backed log directory a 5s budget expires while the reopen
-    /// is still running — and the one caller the docs invite to wait for
-    /// this, a logrotate `postrotate` stanza, gets both a non-zero exit and
-    /// pumps still holding the inodes it renamed.
-    ///
-    /// Asserted on the wire rather than on the constant: `deadline_ms` is
-    /// what the daemon actually budgets from, and `request_with_deadline`
-    /// never leaves it unset — `None` would travel as
-    /// `DEFAULT_DEADLINE`'s 5s, which is exactly the regression.
-    ///
-    /// The literal `30_000` is here and only here. Comparing against
-    /// [`LOG_PLANE_DEADLINE`] alone is the assert-X-equals-X shape: it holds
-    /// whatever the constant says, so the constant could be cut back to the
-    /// 5s this verb is meant to escape and every deadline assertion in this
-    /// module would still pass. One test names the number so that change has
-    /// to be deliberate; the flush case below keeps comparing against the
-    /// constant, which is what pins the two verbs to the same budget.
+    /// The literal `30_000` is here and only here: comparing against
+    /// [`LOG_PLANE_DEADLINE`] alone would hold whatever the constant says.
     #[tokio::test]
     async fn a_reopen_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -408,9 +264,7 @@ mod tests {
         );
     }
 
-    /// `"/[/"` is one of the only three inputs the selector grammar
-    /// rejects. Fails if `reopen` skips the client-side parse: the daemon
-    /// would answer `NotFound` after a round trip instead.
+    /// `"/[/"` is one of only three inputs the selector grammar rejects.
     #[tokio::test]
     async fn a_malformed_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -434,9 +288,6 @@ mod tests {
         );
     }
 
-    /// Fails if the verb swallows a daemon-side refusal and exits 0. The
-    /// selector matching nothing is the one refusal `reopen` can provoke on
-    /// its own, since no other input reaches the daemon.
     #[tokio::test]
     async fn a_not_found_reply_exits_not_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -455,17 +306,6 @@ mod tests {
         assert_eq!(code, ExitCode::NotFound);
     }
 
-    /// The flush counterpart of
-    /// [`every_selector_form_reaches_the_wire_inside_a_reopen_request`], and
-    /// the whole `sent.body` is asserted for the same reason.
-    ///
-    /// Fails if `flush` sends the raw selector string, a selector it did not
-    /// parse, or another verb's request kind. `Request::Reopen` is the
-    /// dangerous mis-wiring here — the two verbs are neighbours in this
-    /// module, take the same shaped payload and answer with the same shaped
-    /// table, so a `flush` that sent a `Reopen` would swap every log handle
-    /// in the flock, empty nothing at all, and print a table that looks
-    /// exactly right while doing it.
     #[tokio::test]
     async fn every_selector_form_reaches_the_wire_inside_a_flush_request() {
         let dir = tempfile::tempdir().unwrap();
@@ -497,16 +337,6 @@ mod tests {
         }
     }
 
-    /// Fails if `flush` leaves the deadline to the client's default, for the
-    /// reason [`a_reopen_asks_for_the_longer_deadline`] gives about its own
-    /// verb: the daemon walks the matched flock file by file with no
-    /// per-sheep bound, so a 5s budget expires mid-flush on a slow log
-    /// directory. Asserted on the wire, where `deadline_ms` is what the
-    /// daemon actually budgets from.
-    ///
-    /// The failure here is worse than a reopen's. A `flush` that timed out
-    /// exits non-zero having ALREADY emptied some of the matched files, so
-    /// the operator is told it failed about work that is not coming back.
     #[tokio::test]
     async fn a_flush_asks_for_the_longer_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -530,16 +360,8 @@ mod tests {
         );
     }
 
-    /// Fails if `flush` skips the client-side parse. `"/[/"` is one of the
-    /// only three inputs the selector grammar rejects; without the local
-    /// parse the daemon answers `NotFound` after a round trip, so the
-    /// operator gets "no sheep matched" for what is really a typo.
-    ///
-    /// The bare `try_recv` needs no bounded wait to be sound: `flush` above
-    /// has already returned, and it returns only after a full round trip, so
-    /// a version of it that sent would have had its envelope captured before
-    /// this line runs. There is no window here for the channel to be
-    /// legitimately empty-but-about-to-fill.
+    /// The bare `try_recv` needs no bounded wait: `flush` returns only after
+    /// a full round trip, so a send would already have been captured.
     #[tokio::test]
     async fn a_malformed_flush_selector_exits_usage_without_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -563,22 +385,7 @@ mod tests {
         );
     }
 
-    /// Fails if the verb swallows a daemon-side refusal and exits 0.
-    ///
-    /// A zero exit over a refusal is the silent failure in its purest form:
-    /// an operator who ran `shep flush` and saw 0 believes those files are
-    /// empty. The refusal driven here is `NotFound`, which is what the daemon
-    /// answers a selector that matched nothing — the one refusal this tier
-    /// can produce, since a fake client answers whatever it is armed with and
-    /// no real path is ever truncated behind it.
-    ///
-    /// The refusal that costs the most, a path the daemon could not truncate,
-    /// answers `Internal` and exits 9. Nothing here can provoke it, so it is
-    /// pinned where it can be: `rpc::tests`'s
-    /// `a_log_plane_failure_is_internal_and_says_which_half_failed` for the
-    /// code and the message, and `cli_e2e`'s
-    /// `a_reopen_that_cannot_open_a_path_again_exits_internal` for the exit
-    /// status an operator's shell actually sees.
+    /// `NotFound` is the only refusal a fake client can produce here.
     #[tokio::test]
     async fn a_refused_flush_never_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -611,14 +418,6 @@ mod tests {
         paths
     }
 
-    /// Fails if `--daemon` stops emptying both of the shepherd's files, or
-    /// stops naming them.
-    ///
-    /// The naming half is not decoration. The whole reason this verb reports
-    /// paths at all is that an operator cannot otherwise tell WHAT a flush
-    /// emptied, and for `--daemon` the two files are the entire answer — a
-    /// table that said only "ok" would be indistinguishable from one that
-    /// truncated the wrong `$SHEP_HOME`.
     #[test]
     fn a_daemon_flush_empties_both_shepherd_logs_and_names_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -638,14 +437,8 @@ mod tests {
         for name in [launch::DAEMON_STDOUT_LOG, launch::DAEMON_STDERR_LOG] {
             let path = paths.logs.join(name);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "{name}");
-            // Searched for as JSON-ENCODED text, not as the raw path. The
-            // answer here is a `--format json` envelope, and on Windows a
-            // path's `\` separators are escaped to `\` inside it — so a
-            // raw `path.display()` needle matches on unix and never on
-            // Windows, for a payload that is perfectly correct on both.
-            // Encoding the needle the same way the payload encoded it is
-            // what makes this assert about the CONTENT rather than about
-            // the platform's separator.
+            // JSON-encoded, not raw: on Windows a path's separators are
+            // escaped inside the envelope.
             let needle = serde_json::to_string(&path.display().to_string()).unwrap();
             let needle = needle.trim_matches('"');
             assert!(
@@ -656,15 +449,6 @@ mod tests {
         }
     }
 
-    /// Fails if a missing shepherd log becomes an error, or is created to
-    /// make the row look tidy.
-    ///
-    /// A cold `$SHEP_HOME` has never had a daemon in it, so neither file
-    /// exists — and a `shep flush --daemon` that exited non-zero there would
-    /// be complaining that there was nothing to do. `absent` rather than
-    /// `emptied` because the two are different facts: an operator chasing a
-    /// full disk needs to know which files this actually truncated. The same
-    /// rule the flock half applies to a sheep that has never run.
     #[test]
     fn a_daemon_flush_reports_a_missing_log_as_absent_and_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -701,15 +485,8 @@ mod tests {
         );
     }
 
-    /// Fails if a file that could not be truncated is reported as emptied —
-    /// the silent failure `a_refused_flush_never_exits_zero` pins for the
-    /// flock half, in the half that never touches the socket. An operator who
-    /// ran this to reclaim a full disk and saw 0 believes the space is back.
-    ///
-    /// A directory in the log's place is the failure with no permission games
-    /// in it: `open(2)` for writing on a directory fails for every uid, root
-    /// included, so this cannot pass for the wrong reason on a privileged
-    /// runner.
+    /// A directory in the log's place fails `open(2)` for writing for every
+    /// uid, root included.
     #[test]
     fn a_daemon_flush_that_could_not_empty_a_file_never_exits_zero() {
         let dir = tempfile::tempdir().unwrap();

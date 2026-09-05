@@ -5,7 +5,7 @@ description: Use when writing, reviewing, or refactoring ANY Rust code in the sh
 
 # shep Idiomatic Rust
 
-**REQUIRED READING before writing code: [docs/idiomatic-rust.md](../../../docs/idiomatic-rust.md)** — 46 numbered rules (IR-1..IR-46) distilled from rand 0.10.2, the project's quality bar. Cite rules by number in reviews. Full evidence: `docs/idiomatic-rust/lenses/`.
+**REQUIRED READING before writing code: [docs/idiomatic-rust.md](../../../docs/idiomatic-rust.md)** — 47 numbered rules (IR-1..IR-47) distilled from rand 0.10.2, the project's quality bar. Cite rules by number in reviews. Full evidence: `docs/idiomatic-rust/lenses/`.
 
 ## Baseline-failure checklist
 
@@ -25,6 +25,7 @@ These are the rules agents violate when writing "good" Rust from instinct. Check
 | New dep: `default-features = false`; new feature: additive + `# Option:` comment | IR-2, IR-3 |
 | `#[must_use]` only where discarding is a plausible bug | IR-17 |
 | Don't widen accepted input formats beyond the spec (no bonus unit spellings, no lenient whitespace) without a map.md/goals.md basis | spec fidelity |
+| Comments say only what the code cannot: no history, no rejected alternatives, no paraphrase; `//` under four lines, `///` under twelve | IR-47 |
 
 ## Sheep terminology
 

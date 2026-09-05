@@ -1,74 +1,33 @@
 # release-plz owns the changelog, the version bump, the tag, the GitHub
 # release and the upload. Merging the release pull request is the whole
-# release, and since 2026-08-27 even that merge is automatic.
+# release, and that merge is automatic.
 #
-# ## This was rewritten on 2026-08-27 to match zendriver-rs
+# `release_always` is left unset (the default, true) rather than false: false
+# refuses to publish once a manifest names a version bumped outside a release
+# PR, which can strand it with no path forward. What stops an untested commit
+# from publishing instead is the `main` branch ruleset, which requires lint,
+# docs, typos, the test matrix, features, musl and minimal-versions before
+# anything can reach main at all.
 #
-# The maintainer's call: zendriver-rs's setup is the one to copy. What that changed here,
-# and why each change is not just cosmetic:
+# Changelogs are generated from conventional commits (release-plz-changelog.toml):
+# it skips docs, test, ci, chore and style commits and emits Keep a Changelog
+# form, so a generated section stays short and matches its hand-written
+# neighbours. Two commits survive those skips: release-plz's own
+# `chore: update Cargo.toml dependencies`, grouped under Internal so a
+# lockstep bump is not a silent empty section, and anything marked breaking,
+# which `protect_breaking_commits` keeps regardless of which parser matched
+# it. `typos` is a required check on main, so a commit subject that would
+# poison a changelog blocks its own release PR instead of landing.
 #
-#   changelog_update    false -> true. See the section below; this is the one
-#                       with real consequences for the files in this repo.
-#   release_always      false -> unset (release-plz's default, true). This is
-#                       what stranded 0.1.7: main was bumped by hand, so
-#                       release-plz had nothing left to put in a release PR
-#                       and opened none, and `release_always = false` then
-#                       refused to publish because no release-PR commit
-#                       existed. Version bumped, crates.io behind, no path
-#                       forward without editing the workflow. The default
-#                       publishes whenever a manifest names an unpublished
-#                       version, which cannot deadlock that way.
-#   semver_check        unset -> true. cargo-semver-checks against the
-#                       published version, so an accidental breaking change
-#                       fails the release PR rather than shipping in a patch.
-#   git_release_enable  unset -> true. Was already the default; stated so it
-#                       survives a future default change.
-#   changelog_config    new. release-plz-changelog.toml, copied from
-#                       zendriver-rs.
-#   publish_no_verify   new, false. Also the default. Stated because the
-#                       opposite skips the pre-upload build, and an upload
-#                       cannot be undone.
+# Not handled automatically: each crate's `## [Unreleased]` section.
+# release-plz inserts its generated section near the top, which leaves that
+# hand-written block sitting below a released version while still claiming
+# to be unreleased. Roll it into the new version's section by hand.
 #
-# `release_always = false` is gone, so read what replaced it: nothing in this
-# file. What stops an untested commit publishing is the `main` ruleset, which
-# requires lint, docs, typos, the test matrix, features, musl and
-# minimal-versions before anything can reach main at all. The old
-# `workflow_run` gate in .github/workflows/release-plz.yml did that job before
-# the ruleset existed. Deleting the ruleset without restoring that gate would
-# leave crates.io publishing whatever lands on main.
-#
-# ## The changelogs are generated now, and they were not before
-#
-# This was `changelog_update = false` for good reasons, recorded here so
-# nobody re-derives them: generation inserted 576 lines across shep and
-# shep-daemon in a second style next to hand-written entries covering the same
-# work, and it copies commit subjects verbatim, so 551f3ce's misspelling of
-# "organization" became a tracked typo that failed the `typos` job.
-#
-# Both are handled rather than accepted. release-plz-changelog.toml skips
-# docs, test, ci, chore and style commits and emits Keep a Changelog form,
-# which is the form these files already use, so a generated section is short
-# and matches its neighbours. Two commits survive those skips on purpose:
-# release-plz's own `chore: update Cargo.toml dependencies`, which is parsed
-# before the generic chore skip and grouped under Internal so a lockstep bump
-# is not a silent empty section; and anything marked breaking, which
-# `protect_breaking_commits` keeps whichever parser matched it. And `typos` is a required check on main, so a
-# commit subject that would poison a changelog now blocks its own release PR
-# from merging instead of landing.
-#
-# What is NOT handled automatically: the `## [Unreleased]` sections these four
-# changelogs are carrying right now. release-plz inserts its generated section
-# near the top, which leaves that hand-written block sitting below a released
-# version while still claiming to be unreleased. Roll those into a `## [0.1.7]`
-# section by hand before the next release.
-#
-# ## On pre-releases
-#
-# release-plz publishes a pre-release fine and marks it as one via
-# `git_release_type` below. It does not manage the progression: there is no
-# automated path from `-alpha.1` to `-alpha.2` to `-beta.0` to stable. The
-# maintainer said so in discussion #2443. While this workspace is on an alpha,
-# the version in `[workspace.package]` is set by hand.
+# release-plz publishes a pre-release and marks it via `git_release_type`
+# below, but does not manage the progression between pre-release stages
+# (`-alpha.1` to `-alpha.2` to `-beta.0` to stable): the version in
+# `[workspace.package]` is set by hand while on one.
 
 [workspace]
 # Marks a GitHub release as a pre-release when the version carries a SemVer
@@ -78,25 +37,18 @@ git_release_type = "auto"
 git_release_enable = true
 
 # Read by .coderabbit.yaml, whose `auto_review.labels: ["!release"]` skips a
-# pull request carrying this label. A release pull request has nothing to
-# review -- the commits in it were each reviewed on their own pull request,
-# and this one auto-merges without a human in front of it.
-#
-# A label rather than the title keyword that was there first: release-plz
-# force-pushes this branch on every push to main, and each force-push starts
-# an incremental review that the title gate did not stop. The label is
-# re-checked on every one of them.
-#
-# The label has to EXIST in the repository first. release-plz opens the pull
-# request and then calls GitHub's label endpoint, so a name nothing has
-# defined can leave the pull request opened and unlabelled with the job
-# failing around it. `release` was created for this on 2026-08-28. Renaming or
-# deleting it silently un-skips every release pull request, because
-# .coderabbit.yaml matches the name and nothing checks the two still agree.
+# pull request carrying this label, since every commit in it was already
+# reviewed on its own pull request. A label rather than the title, since
+# release-plz force-pushes this branch on every push to main and the label is
+# re-checked on each force-push. The label must already exist in the
+# repository: release-plz opens the pull request, then calls GitHub's label
+# endpoint separately, so an undefined name leaves the pull request opened
+# and unlabelled with the job failing around it. Renaming or deleting the
+# label silently un-skips every release pull request, since .coderabbit.yaml
+# matches it by name.
 pr_labels = ["release"]
 
 # Generated from conventional commits through release-plz-changelog.toml.
-# See the header for what this used to be and what changed to make it safe.
 changelog_update = true
 changelog_config = "release-plz-changelog.toml"
 
@@ -132,11 +84,8 @@ version_group = "shep"
 name = "shep"
 version_group = "shep"
 
-# The placeholder holding the `shep-cli` name on crates.io. It has no code, so
-# no commit will ever imply a version bump for it, and a changelog entry for
-# an empty crate is noise. Left out of release-plz entirely; if it ever needs
-# republishing, that is a deliberate act rather than a consequence of merging
-# a release PR.
+# The placeholder holding the `shep-cli` name on crates.io. Has no code, so
+# no commit will ever imply a version bump; excluded from the release flow.
 [[package]]
 name = "shep-cli"
 release = false

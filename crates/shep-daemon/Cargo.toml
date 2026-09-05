@@ -11,13 +11,11 @@ documentation = "https://docs.rs/shep-daemon"
 keywords = ["shep", "process-manager", "supervisor", "daemon", "restart"]
 categories = ["os", "os::unix-apis", "asynchronous"]
 
-# No `[package.metadata.docs.rs]` here, deliberately: `test-fakes` is this
-# crate's only feature, and its own comment below says what it is — test
-# scaffolding for other crates' tests, not public API. There is nothing else
-# behind it worth unlocking for docs.rs, unlike shep-core's `schema`.
+# No `[package.metadata.docs.rs]`: `test-fakes` is this crate's only
+# feature, and it is test scaffolding, not public API worth unlocking.
 [features]
 # Option: expose the scripted fake runner (`fake::ScriptedRunner`) to other
-# crates' tests. Off by default — it is test scaffolding, not public API.
+# crates' tests. Off by default, since it is test scaffolding, not public API.
 test-fakes = []
 
 [dependencies]
@@ -40,7 +38,7 @@ tempfile.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# Rendering one `[dog.<name>]` table back to TOML text (dogs.rs) — the reply
+# Rendering one `[dog.<name>]` table back to TOML text (dogs.rs): the reply
 # a dog parses is the section as text, not a shep type. `parse` comes with
 # the workspace entry because shep-core needs it to produce the table in the
 # first place; this crate only writes one back out.
@@ -48,7 +46,7 @@ toml.workspace = true
 # DateTime<Utc> for the Clock seam (cron.rs): cron means wall time, which is
 # not the same clock as tokio::time's paused Instant.
 chrono.workspace = true
-# Process-table RSS sampling for the MemorySampler seam (limits/sample.rs) —
+# Process-table RSS sampling for the MemorySampler seam (limits/sample.rs):
 # resident memory across a sheep's whole process tree.
 sysinfo.workspace = true
 # The OS seam for watch-restart (watch/source.rs): bridges notify's debounced
@@ -56,13 +54,11 @@ sysinfo.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
 
-# nix is #![cfg(unix)] internally and command-fds does unconditional unix-only fd
-# plumbing, so both would fail to compile on a Windows CI leg. The maintainer's Windows ruling:
-# the pure tier (this crate's types/traits/fake) compiles everywhere; the OS tier
-# (signal delivery, fd-passing) is unix-only for now. tokio_runner.rs/kill.rs use
-# the workspace-default nix features (signal, process, user); sys.rs's readiness-pipe
-# adoption additionally needs "fs" for `nix::fcntl::fcntl`/`FcntlArg::F_GETFD`, the
-# safe probe that lets `adopt_fd` refuse a closed descriptor instead of adopting it.
+# nix is #![cfg(unix)] internally and command-fds does unconditional
+# unix-only fd plumbing. The pure tier (types/traits/fake) compiles
+# everywhere; the OS tier (signal delivery, fd-passing) is unix-only. `fs`
+# is for sys.rs's readiness-pipe adoption: `nix::fcntl::fcntl`/
+# `FcntlArg::F_GETFD` lets `adopt_fd` refuse a closed descriptor.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }
 command-fds.workspace = true
@@ -74,43 +70,34 @@ command-fds.workspace = true
 windows-sys.workspace = true
 getrandom.workspace = true
 
-# `cfg(any())` never matches any target, so nothing here is ever compiled into any real
-# build — but Cargo's resolver still walks these entries when computing the dependency
-# graph, including under `-Z minimal-versions`. Used to force a floor pin for a transitive
-# dep whose own Cargo.toml under-declares its true minimum (see root Cargo.toml comment
-# for the per-crate reasoning). Safe to drop once `tracing` corrects its own declared
-# `tracing-core` floor.
+# `cfg(any())` never matches, so nothing here compiles into a real build, but
+# Cargo's resolver still walks these entries under `-Z minimal-versions`.
+# Forces a floor pin for tracing's under-declared tracing-core floor (see
+# root Cargo.toml). Safe to drop once tracing corrects it.
 [target.'cfg(any())'.dependencies]
 tracing-core.workspace = true
-# Same mechanism, for notify's under-declared fsevent-sys floor (root
-# Cargo.toml's comment on the `fsevent-sys` entry has the exact API). macOS
-# only in principle, but this crate has no `cfg(target_os = "macos")`
-# dependency section of its own, so `cfg(any())` is the opt-in that puts it
-# in the graph everywhere the rehearsal needs to see it.
+# Same mechanism, for notify's under-declared fsevent-sys floor (see root
+# Cargo.toml). macOS only in principle, but this crate has no
+# `cfg(target_os = "macos")` section of its own to hold it.
 fsevent-sys.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
 # `tests/real_runner_windows.rs` walks the real process table to prove a
-# sheep's lamb does not outlive `kill_tree`. Already a normal dependency of
-# this crate (`limits::sample`), so this adds no crate to the tree — an
-# integration test is its own crate and cannot reach the lib's own deps.
+# sheep's lamb does not outlive `kill_tree`. Adds no crate: an integration
+# test is its own crate and cannot reach the lib's own deps.
 sysinfo.workspace = true
 proptest.workspace = true
 # The scoped, per-test subscriber `testing::capture_logs` installs, so a
-# warn-and-continue arm's record is something a test can assert on instead of
-# something that vanishes at the macro. Dev-only: the daemon library installs
-# no subscriber of its own — `shep-cli`'s `daemon` subcommand owns the one
-# global install.
+# warn-and-continue arm's record is something a test can assert on. Dev-only:
+# the daemon library installs no subscriber of its own; `shep-cli`'s
+# `daemon` subcommand owns the one global install.
 tracing-subscriber.workspace = true
 
-# Only for `examples/reuse_port_sheep.rs`, the fixture server behind the reload
-# measurement in `tests/daemon_e2e.rs`: `socket` is what sets `SO_REUSEPORT`
-# before a bind, which is the mechanism a reload's overlap rests on and the one
-# thing `std` cannot express; `net` is where nix keeps `SockaddrIn`, so a bind
-# has an address to name. Dev-only, and in its own `cfg(unix)` table for the
-# reason the dependency table above gives — nix does not build on Windows, and
-# that leg of the matrix compiles this crate's examples too.
+# Only for `examples/reuse_port_sheep.rs`, the fixture behind the reload
+# tests in `tests/daemon_e2e.rs`: `socket` sets `SO_REUSEPORT` before a bind,
+# the one thing `std` cannot express; `net` is where nix keeps `SockaddrIn`.
+# Own `cfg(unix)` table: nix does not build on Windows.
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["socket", "net"] }
 

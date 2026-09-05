@@ -1,11 +1,10 @@
 //! A plain HTTP server: binds a port, answers every request `200 OK`.
 //!
-//! The baseline every probe example in `examples/Flockfile.toml` points at —
-//! a `readiness_probe`/`liveness_probe` with `kind = "http"` needs something
-//! real to poll. It needs no request parsing to demonstrate that: reading
-//! whatever the client sent (best-effort, so a slow or silent client cannot
-//! hang a worker thread) is enough to let the response go out and the
-//! connection close cleanly.
+//! The baseline every probe example in `examples/Flockfile.toml`
+//! points at. A `readiness_probe`/`liveness_probe` with
+//! `kind = "http"` needs something real to poll. Reading whatever
+//! the client sent is best-effort, so a silent client cannot hang a
+//! worker thread.
 //!
 //! # Usage
 //!
@@ -19,10 +18,10 @@ use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-/// How long a connection's read is allowed to block before this program gives
-/// up on seeing a full request and answers anyway. A probe or `curl` writes
-/// its request in one flush, so this only guards against a client that
-/// connects and then sends nothing.
+/// How long a connection's read blocks before this program gives up
+/// and answers anyway. A probe or `curl` writes its request in one
+/// flush. This only guards against a client that connects and sends
+/// nothing.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 
 fn main() {
@@ -44,8 +43,8 @@ fn main() {
     }
 }
 
-/// Reads whatever is available (ignoring the result — a client that never
-/// sends anything just times out) and writes a fixed `200 OK` response.
+/// Reads whatever is available, ignoring the result, and writes a
+/// fixed `200 OK` response.
 fn respond(mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let mut buf = [0_u8; 1024];
@@ -60,9 +59,9 @@ fn respond(mut stream: TcpStream) {
     let _ = stream.flush();
 }
 
-/// Parses the port argument, or dies naming what was wrong with it — a
-/// silently-defaulted port would leave a probe polling the wrong place with
-/// no error anywhere.
+/// Parses the port argument, or dies naming what was wrong with it. A
+/// silently defaulted port would leave a probe polling the wrong
+/// place with no error anywhere.
 ///
 /// # Panics
 ///

@@ -1,9 +1,7 @@
-//! `shep runtime`: resolves a Flockfile, then either hands off to
-//! `commands::foreground`'s engine with `tidy_up: false` — decision 12's own
-//! table: a container going away has no reason to pay for a delete on the
-//! way out, and leaves the muster roll exactly as `runtime` found it — or,
-//! at PID 1, splits into `commands::reap`'s init loop first. Read decision
-//! 14 in Phase 15's plan before touching the split itself.
+//! `shep runtime`: resolves a Flockfile, then hands off to
+//! `commands::foreground`'s engine with `tidy_up: false`, which leaves the
+//! muster roll exactly as `runtime` found it. At PID 1 it splits into
+//! `commands::reap`'s init loop first.
 
 use std::path::PathBuf;
 
@@ -18,25 +16,19 @@ use crate::commands::reap;
 use crate::exit::ExitCode;
 use crate::output::Streams;
 
-/// The ten filenames [`discover`] looks for, in the order it looks. Named
-/// here rather than imported: `shep_core::config::flockfile::DISCOVERY_ORDER`
-/// is private, and this is the one caller that needs to name the list, in an
-/// error message printed when discovery finds nothing.
+/// The ten filenames [`discover`] looks for, in the order it looks
+///
+/// Spelled out because `shep_core::config::flockfile::DISCOVERY_ORDER` is
+/// private.
 const DISCOVERY_NAMES: &str = "Flockfile.toml, Flockfile.yaml, Flockfile.yml, Flockfile.json, \
      Flockfile.json5, flockfile.toml, flockfile.yaml, flockfile.yml, flockfile.json, \
      flockfile.json5";
 
-/// Runs `shep runtime`.
+/// Runs `shep runtime`
 ///
-/// `args.target`, when given, resolves through the same
-/// [`resolve_target`] `start` uses — a script or a Flockfile, by extension.
-/// With no target, [`discover`] looks in the current directory for one of
-/// the ten conventional names; finding none is [`ExitCode::Usage`] (2)
-/// naming them, same as an unresolvable `start` target.
-///
-/// Always dispatches with `tidy_up: false` — see this module's own doc.
-/// `quiet` is `cli::GlobalArgs::quiet`, threaded straight through to the
-/// engine's own `bleats` narration, same as every other verb that follows.
+/// `args.target` resolves through the same [`resolve_target`] `start` uses.
+/// With no target, [`discover`] looks in the current directory; finding
+/// nothing is [`ExitCode::Usage`] naming the ten names.
 pub async fn runtime(
     streams: &mut Streams<'_>,
     quiet: bool,
@@ -65,15 +57,9 @@ pub async fn runtime(
         tidy_up: false,
     };
 
-    // Read once, right here, and nowhere else in the crate: it exists only
-    // to make the PID-1 split reachable from a test harness, following the
-    // panic probe's shape in `lib.rs`'s `run_argv`. See decision 14.
-    // The PID-1 split is a unix-only concern, and skipping it on Windows is
-    // correct rather than a shortcut. It exists because a unix init process
-    // inherits every orphan on the machine and must `waitpid` them or leak
-    // zombies; Windows has no zombie state and no reparent-to-init rule, so
-    // a Windows container entrypoint has nothing to reap and goes straight
-    // to supervising its flock.
+    // `SHEP_FORCE_INIT` is read here and nowhere else: it exists to make the
+    // split reachable from a test harness. Unix only, because Windows has no
+    // zombie state and no reparent-to-init rule, so there is nothing to reap.
     #[cfg(windows)]
     return foreground::run(streams, quiet, options).await;
 
@@ -83,9 +69,8 @@ pub async fn runtime(
     if !reap::should_split(std::process::id(), args.supervise, forced) {
         return foreground::run(streams, quiet, options).await;
     }
-    // `Infallible` is an ordinary uninhabited enum, not the never type `!`,
-    // so it does not coerce to `ExitCode` as a bare tail expression — the
-    // empty match is what performs that coercion. `run_init` never returns.
+    // `Infallible` does not coerce to `ExitCode` as a bare tail expression,
+    // so the empty match performs it. `run_init` never returns.
     #[cfg(unix)]
     match reap::run_init().await {}
 }
@@ -93,9 +78,8 @@ pub async fn runtime(
 /// Discovers a Flockfile in the current directory, or reports
 /// [`ExitCode::Usage`] naming the ten filenames [`discover`] looked for.
 ///
-/// `pub(crate)`: `commands::dev` shares this rather than repeating it —
-/// `shep dev ./` and `shep runtime ./` cannot disagree about what "no
-/// target" discovers.
+/// Shared with `commands::dev`, so `shep dev ./` and `shep runtime ./`
+/// cannot disagree about what "no target" discovers.
 pub(crate) fn discovered_target(streams: &mut Streams<'_>) -> Result<String, ExitCode> {
     let cwd = get_cwd(streams)?;
     match discover(&cwd) {

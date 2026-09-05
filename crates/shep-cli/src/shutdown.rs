@@ -1,34 +1,15 @@
-//! One "the OS asked us to stop" signal, on both platforms
+//! One "the OS asked us to stop" signal, on both platforms.
 //!
-//! Three long-running things in this crate — the `lookout` dashboard, the
-//! bark dog and the metrics dog — each installed a `SIGTERM` listener of
-//! their own and selected on it. That is exactly right on unix and does not
-//! compile on Windows, where there are no signals and the equivalent request
-//! arrives as one of five distinct console control events.
+//! [`Terminate`] is where the platform difference is spent, so callers
+//! keep one shape: install once, `recv().await` in a `select!`.
 //!
-//! [`Terminate`] is the one place that difference is spent, so the three
-//! call sites keep the shape they had: install once, `recv().await` in a
-//! `select!`.
+//! Unix listens for `SIGTERM` alone. Windows merges all five console
+//! control events, since `CTRL_CLOSE_EVENT`, `CTRL_SHUTDOWN_EVENT` and
+//! `CTRL_LOGOFF_EVENT` arrive on a closing console or a machine going
+//! down, and a stop request must cover those too.
 //!
-//! # What "terminate" means per platform
-//!
-//! Unix listens for `SIGTERM` alone, unchanged — `SIGINT` is the terminal's
-//! own Ctrl-C and these three already handle a key press or a closed stdin
-//! separately.
-//!
-//! Windows merges all five console control events, and that is a wider net
-//! than `SIGTERM` on purpose: `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` are what
-//! an operator sends by hand, while `CTRL_CLOSE_EVENT`,
-//! `CTRL_SHUTDOWN_EVENT` and `CTRL_LOGOFF_EVENT` are what arrive when the
-//! console window closes or the machine goes down. Treating only the first
-//! two as a stop request would leave a dog running through a reboot with no
-//! chance to flush.
-//!
-//! **The three close events carry a hard OS deadline** — Windows terminates
-//! the process a few seconds after the handler returns, and nothing in the
-//! process can extend it. So a shutdown path that must finish work should
-//! not assume it has long. `shep_daemon::boot`'s own signal installer
-//! carries the same caveat for the shepherd itself.
+//! Windows terminates the process a few seconds after the handler
+//! returns, so a shutdown path here should not assume it has long.
 
 use std::io;
 
@@ -83,19 +64,14 @@ impl Terminate {
 
     /// Resolves when the OS asks this process to stop.
     ///
-    /// `Option<()>` rather than `()` so the unix arm can pass through
-    /// `Signal::recv`'s own `None` (the stream closed) unchanged, keeping
-    /// the three call sites' `while ... .is_some()` and `select!` arms
-    /// exactly as they were.
+    /// `Option<()>` rather than `()`, so the unix arm passes through
+    /// `Signal::recv`'s own `None` unchanged, keeping every call site's
+    /// `while ... .is_some()` unchanged too.
     ///
     /// # Cancellation safety
-    ///
-    /// Safe on both platforms, which every call site depends on — all three
-    /// poll this inside a `select!` against other work, so a cancelled
-    /// branch must not drop a pending signal. Each underlying stream is
-    /// documented cancel-safe, and the Windows arm's `select!` over five of
-    /// them inherits that: a cancellation drops the outer future without
-    /// consuming any inner one's notification.
+    /// Safe on both platforms: each underlying stream is documented
+    /// cancel-safe, and the Windows arm's `select!` over five of them
+    /// inherits that.
     pub(crate) async fn recv(&mut self) -> Option<()> {
         #[cfg(unix)]
         {
@@ -118,28 +94,18 @@ impl Terminate {
 mod tests {
     use super::*;
 
-    /// fails if the listener cannot be installed on this platform.
-    ///
-    /// Deliberately does not try to DELIVER a signal: raising a real
-    /// `SIGTERM`, or generating a real console control event, would take the
-    /// test harness's own process down with it. Installation is the half
-    /// that differs per platform and the half that can break silently; that
-    /// a delivered signal wakes the stream is tokio's contract, not this
-    /// module's.
+    /// fails if the listener cannot be installed on this platform. Does
+    /// not try to deliver a signal: raising a real `SIGTERM` would take
+    /// the test harness down with it.
     #[tokio::test]
     async fn a_terminate_listener_installs_on_this_platform() {
         let listener = Terminate::install().expect("installing a terminate listener must work");
-        // Also pins that `Debug` renders without needing the inner types to,
-        // which is the reason it is hand-written.
         assert!(format!("{listener:?}").contains("Terminate"));
     }
 
-    /// fails if the listener resolves without anything having been sent.
-    ///
-    /// The Windows arm is a `select!` over five streams, and a `select!`
-    /// whose branches were mis-wired (a `recv()` that returns immediately,
-    /// say) would make every long-running verb exit the instant it started.
-    /// That is a silent, total failure, so it earns a test.
+    /// fails if the listener resolves without anything having been sent:
+    /// a mis-wired `select!` branch would make every long-running verb
+    /// exit the instant it started.
     #[tokio::test]
     async fn an_uninvoked_listener_does_not_resolve() {
         let mut listener = Terminate::install().unwrap();

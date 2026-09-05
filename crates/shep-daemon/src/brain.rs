@@ -1,7 +1,6 @@
-//! Restart decision logic: pure function that classifies an exit and determines whether to restart.
+//! Restart decision logic.
 //!
-//! Core rule: **signal exits (code=None) NEVER match stop_exit_codes**, even if
-//! stop_exit_codes is configured. Only exits with a code (Some) are tested.
+//! A signal exit (`code: None`) never matches `stop_exit_codes`; only `Some(code)` is tested.
 
 use core::time::Duration;
 
@@ -25,13 +24,8 @@ pub enum Decision {
     Errored,
 }
 
-/// Decide whether to restart based on an exit outcome.
-///
-/// Rule order (first match wins):
-/// 1. Manual stop → CleanStop
-/// 2. Exit code matches stop_exit_codes (ONLY if code.is_some()) → CleanStop
-/// 3. !autorestart → CleanStop
-/// 4. Otherwise: note_exit → if exhausted → Errored; else → Restart with delay
+/// Decides whether to restart, checking in order: manual stop, a
+/// `stop_exit_codes` match, `autorestart`, then the restart budget.
 pub fn decide_on_exit(
     app: &AppConfig,
     budget: &mut RestartBudget,
@@ -39,24 +33,20 @@ pub fn decide_on_exit(
     exit: ExitOutcome,
     manual_stop: bool,
 ) -> Decision {
-    // Rule 1: manual stop wins
     if manual_stop {
         return Decision::CleanStop;
     }
 
-    // Rule 2: exit code matched against stop_exit_codes (ONLY if code.is_some())
     if let Some(code) = exit.code
         && app.stop_exit_codes.contains(&code)
     {
         return Decision::CleanStop;
     }
 
-    // Rule 3: autorestart is off
     if !app.autorestart {
         return Decision::CleanStop;
     }
 
-    // Rule 4: classify stability and check budget
     let _stability = budget.note_exit(uptime, app.min_uptime.as_duration());
     if budget.exhausted(app.max_restarts) {
         return Decision::Errored;
@@ -100,13 +90,11 @@ mod tests {
         let mut app = AppConfig::minimal("test", "./test");
         app.stop_exit_codes = vec![0];
         let mut budget = RestartBudget::default();
-        // Signal 15 (SIGTERM) with code=None
         let exit = ExitOutcome {
             code: None,
             signal: Some(15),
         };
         let d = decide_on_exit(&app, &mut budget, Duration::from_millis(100), exit, false);
-        // Should restart, NOT CleanStop
         assert!(matches!(d, Decision::Restart { .. }));
     }
 
@@ -127,18 +115,15 @@ mod tests {
     fn budget_exhausted_returns_errored() {
         let mut app = AppConfig::minimal("test", "./test");
         app.min_uptime = "1000".parse().unwrap(); // 1000 ms
-        // max_restarts uses the real shipped default (16, spec §4) — no
-        // override needed now that `exhausted` uses `>=`.
+        // max_restarts is the real default (16); exhausted uses >=.
         let mut budget = RestartBudget::default();
 
-        // Make 16 consecutive unstable exits to exhaust the budget
         for _ in 0..16 {
             let exit = ExitOutcome {
                 code: Some(1),
                 signal: None,
             };
             let d = decide_on_exit(&app, &mut budget, Duration::from_millis(100), exit, false);
-            // After the 16th decision, it should be Errored
             if budget.unstable_count() >= 16 {
                 assert!(matches!(d, Decision::Errored));
                 return;
@@ -166,10 +151,7 @@ mod tests {
         fn budget_errors_exactly_at_max_restarts(
             exits in proptest::collection::vec(0u64..500, 16..64)
         ) {
-            // Every uptime < min_uptime(1000ms): the 16th decision must be
-            // Errored, none before it. max_restarts uses the real shipped
-            // default (16, spec §4) — no override needed now that
-            // `exhausted` uses `>=`.
+            // ms range stays under the default min_uptime (1000ms), so every exit is unstable.
             let app = AppConfig::minimal("p", "./p");
             let mut budget = RestartBudget::default();
             for (i, ms) in exits.iter().enumerate() {

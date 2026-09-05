@@ -1,53 +1,23 @@
-//! One sanitiser for every string an untrusted host can put in front of an
-//! operator — [`sanitise`].
+//! One sanitiser for every string an untrusted host can put in front of
+//! an operator: [`sanitise`].
 //!
-//! ## Why this is its own module
+//! Lives here, at a leaf both `crate::fetch` and `dog_index` can reach,
+//! rather than in either: a module cycle is the wrong way to share it.
 //!
-//! Every string an untrusted host can put in front of an operator must go
-//! through this — response bodies AND headers. A hostile `Location:` on a
-//! redirect reaches the terminal raw otherwise — screen cleared, window
-//! title rewritten — because [`crate::fetch::FetchError::Redirect`]
-//! captures the header verbatim and `emit_error`'s table arm is a bare
-//! `writeln!`.
+//! Strips rather than escapes: a stripped sequence's printable tail
+//! survives as inert text (`\u{1b}[2J` prints as `[2J`), which is
+//! simpler to get right than rendering it literally.
 //!
-//! [`crate::fetch`], the transport layer, sits below `dog_index` and needs
-//! this too; a module cycle (`fetch` -> `dog_index` -> `fetch`) is the wrong
-//! way to share it, so the sanitiser lives here, at a leaf both can reach.
-//!
-//! Every security-relevant line for untrusted-host strings stays in this
-//! one file, small enough for a reviewer to hold in their head.
-//!
-//! ## The rule
-//!
-//! Strip every character that is invisible, that moves the cursor, or that
-//! reorders what follows it, then collapse the whitespace that stripping
-//! leaves behind. **Non-ASCII prose is not the threat and survives
-//! untouched**: a German or Japanese description is ordinary text, and a
-//! sanitiser that strips it is a broken sanitiser.
-//!
-//! Stripping rather than escaping. Rendering `^[[2J` literally is arguably
-//! more honest, but strip is simpler to get right and nothing anybody wants
-//! to read is lost. The cost is that the printable tail of a sequence
-//! survives as inert text: `\u{1b}[2J` prints as `[2J`. That is a broken
-//! sequence, not a working one.
-//!
-//! **Not to be confused with [`crate::output::width::sanitize_cell`]**,
-//! which the table renderer runs over every cell. That one deliberately
-//! *keeps* a well-formed CSI sequence, because shep's own colouring is
-//! made of them — so it is a layout guard, not a defence against a string
-//! somebody else wrote. This one is the defence, and it runs first.
+//! Not [`crate::output::width::sanitize_cell`], which keeps a
+//! well-formed CSI sequence since shep's own colouring is made of them.
 
-/// Strips everything that could drive a terminal out of `field`, returning
-/// the cleaned text and whether anything was removed.
+/// Strips everything that could drive a terminal out of `field`,
+/// returning the cleaned text and whether anything was removed. See
+/// [`is_unprintable`] for the exact set.
 ///
-/// See this module's own doc for the rule, and [`is_unprintable`] for the
-/// exact set.
-///
-/// **A string with nothing to strip is returned byte for byte**, and
-/// reports `false`. That matters twice over: non-ASCII prose is ordinary
-/// text and must survive untouched, and the reported flag drives an
-/// operator-facing count that has to mean "this entry carried control
-/// characters" rather than "this entry had two spaces in a row".
+/// A string with nothing to strip is returned byte for byte, and reports
+/// `false`: the flag must mean "carried control characters", not "had
+/// two spaces in a row".
 pub fn sanitise(field: &str) -> (String, bool) {
     if !field.chars().any(is_unprintable) {
         return (field.to_owned(), false);
@@ -72,59 +42,16 @@ pub fn sanitise(field: &str) -> (String, bool) {
 
 /// Whether `ch` must never reach a terminal.
 ///
-/// Two groups, and it is worth naming why each is here:
+/// Two groups: `char::is_control` (Unicode `Cc`, including `\u{1b}` and
+/// `\u{9b}`, the single-character CSI introducer), and a fixed list of
+/// invisible or reordering format characters that are not control
+/// characters: zero-width spaces and joiners, bidi overrides (`U+202E`
+/// can make `exe.gnp` read as `png.exe`), variation selectors, and tags
+/// (`U+E0000..=U+E007F` maps onto ASCII, so it can carry a hidden string).
 ///
-/// - **`char::is_control`**, which is the Unicode `Cc` category: `U+0000`
-///   through `U+001F` and `U+007F` through `U+009F`. That covers `\u{1b}`
-///   (the escape that opens `[2J`, `]0;` and every colour sequence),
-///   `\r`, `\n`, `\t`, `\u{0}`, `\u{7}` — and `\u{9b}`, the
-///   single-character CSI introducer, which is *not* `\u{1b}` and is easy
-///   to forget precisely because it does not look like an escape.
-/// - **Invisible and reordering format characters**, which are not control
-///   characters and so survive the first test: zero-width spaces and
-///   joiners, the bidi embeddings and overrides (`U+202E` can make
-///   `exe.gnp` read as `png.exe`), the bidi isolates, the word joiner and
-///   the invisible maths operators, the BOM, and the interlinear annotation
-///   marks. `U+2028`/`U+2029` are in the list as line and paragraph
-///   separators: newlines under another name.
-///
-/// Everything else survives, and that is the point. Accented Latin, kana,
-/// Han, emoji and combining marks are ordinary prose in an ordinary
-/// description, and a sanitiser that eats them is a broken sanitiser.
-///
-/// ## The second group grew, and here is the tell that it had to
-///
-/// The list below started with the characters an author thinks of first,
-/// and review found twelve survivors of exactly the same classes. The
-/// clearest was `U+061C` ARABIC LETTER MARK: a bidi control indistinguishable
-/// in kind from `U+200E`/`U+200F`, which were already stripped. An
-/// inconsistency inside one class is the tell that the class was
-/// enumerated from memory rather than from its definition, so each range
-/// below now names a *class* and takes all of it:
-///
-/// - **Invisible by design.** `U+00AD` soft hyphen, `U+034F` combining
-///   grapheme joiner, the Mongolian free variation selectors and vowel
-///   separator (`U+180B`..`U+180F`), the variation selectors
-///   (`U+FE00`..`U+FE0F` and the supplement `U+E0100`..`U+E01EF`), and the
-///   musical beam/slur/phrase marks (`U+1D173`..`U+1D17A`).
-/// - **Blank but not whitespace.** The Hangul fillers `U+115F`, `U+1160`,
-///   `U+3164` and `U+FFA0` render as nothing at all, so two entries can be
-///   made to look identical while comparing unequal.
-/// - **Tags** (`U+E0000`..`U+E007F`). `U+E0041` is an invisible `A`: the
-///   block can carry an entire hidden ASCII string through any check that
-///   reads what it can see.
-/// - **The rest of the `U+2060` block.** `U+2060`..`U+2064` and
-///   `U+2066`..`U+2069` were listed with the gap between them left in.
-///   `U+206A`..`U+206F` are the deprecated format characters (symmetric
-///   swapping, Arabic form shaping, national digit shapes) — same class,
-///   same invisibility — so the range is now the contiguous
-///   `U+2060`..`U+206F` rather than two halves and a reason to wonder about
-///   the middle.
-///
-/// One deliberate cost: stripping `U+FE0F` drops an emoji's *presentation*
-/// selector, so `❤️` prints as `❤`. The character survives, the entry
-/// survives, and a variation selector is otherwise a free channel for
-/// hiding bytes in a string a human is being asked to trust.
+/// Everything else survives: accented Latin, kana, Han, emoji and
+/// combining marks are ordinary prose. Stripping `U+FE0F` costs an
+/// emoji's presentation form, so `❤️` prints as `❤`.
 fn is_unprintable(ch: char) -> bool {
     ch.is_control()
         || matches!(ch,
@@ -262,13 +189,9 @@ mod tests {
         assert!(changed);
     }
 
-    /// fails if any of the twelve survivors review found still reaches a
-    /// terminal. Each is invisible or reordering, and each is the same
-    /// *class* as something the list already stripped -- which is exactly
-    /// why they were missed: the class was enumerated from memory rather
-    /// than from its definition. `\u{61c}` is the clearest case, a bidi
-    /// control sitting beside `\u{200e}`/`\u{200f}`, which were stripped
-    /// all along.
+    /// fails if any of these still reaches a terminal. Each is invisible
+    /// or reordering, and each is the same class as one [`is_unprintable`]
+    /// already names.
     #[test]
     fn the_invisible_classes_are_taken_whole_not_as_a_remembered_subset() {
         let hostile = [

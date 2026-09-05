@@ -1,13 +1,10 @@
-//! `ReadinessSource` and `await_ready` — the gate between `starting` and
+//! `ReadinessSource` and `await_ready`: the gate between `starting` and
 //! `online` (spec §7).
 //!
-//! A sheep whose app configures `wait_ready` or `readiness_probe` does not
-//! reach `online` the instant it spawns: the supervisor holds it at
-//! `starting` until [`await_ready`] resolves — the shepherd channel says
-//! `{"kind":"ready"}`, or a probe first passes. [`ReadinessSource::
-//! Heuristic`] exists and is fully implemented here, but is reachable only
-//! from reload's `AwaitReady` state, not from `start` — see the supervisor's
-//! own gating logic for why (spec §7 gates reload, not every plain start).
+//! A sheep whose app configures `wait_ready` or `readiness_probe` holds at
+//! `starting` until [`await_ready`] resolves. `ReadinessSource::Heuristic`
+//! is fully implemented here but reachable only from reload's `AwaitReady`
+//! state, not from `start`.
 //!
 //! ## Reference
 //!
@@ -38,22 +35,14 @@ impl ReadinessSource {
     /// Derives the source from an app's configuration.
     ///
     /// `wait_ready` wins over `readiness_probe` when both are set: the
-    /// channel is the app telling us directly, and a probe is an outside
-    /// guess at the same fact.
+    /// channel is the app telling us directly.
     ///
     /// # Errors
     ///
     /// Whatever [`ProbeTarget::parse`] returns for the app's
-    /// `readiness_probe` target — [`ProbeTargetError::Empty`],
-    /// [`HttpsUnsupported`](ProbeTargetError::HttpsUnsupported),
-    /// [`NotHttpUrl`](ProbeTargetError::NotHttpUrl),
-    /// [`MissingHost`](ProbeTargetError::MissingHost),
-    /// [`InvalidHost`](ProbeTargetError::InvalidHost),
-    /// [`InvalidPath`](ProbeTargetError::InvalidPath),
-    /// [`MissingPort`](ProbeTargetError::MissingPort) or
-    /// [`BadPort`](ProbeTargetError::BadPort). In practice `normalize` has
-    /// already rejected every one of them, so an `Err` here means the caller
-    /// adopted an app that never went through `normalize`.
+    /// `readiness_probe` target. `normalize` already rejects every case in
+    /// practice, so an `Err` here means the caller adopted an app that
+    /// never went through it.
     pub fn of(config: &AppConfig) -> Result<Self, ProbeTargetError> {
         if config.wait_ready {
             return Ok(Self::Channel);
@@ -86,17 +75,14 @@ pub async fn await_ready(
     channel: oneshot::Receiver<()>,
     prober: Arc<dyn Prober>,
 ) -> Readiness {
-    // No `_` arm: three sources, three arms, and a fourth source added later
-    // fails `cargo check` right here instead of silently taking a default
-    // this function never chose (Global Constraints rule 6).
+    // No `_` arm: a fourth source added later fails `cargo check` right
+    // here instead of silently taking a default this function never chose.
     match source {
         ReadinessSource::Channel => {
-            // A dropped sender (the sheep exited before ever signalling)
-            // must not resolve this wait early — that is the exit path's
-            // job, and deciding here would race it. So a closed channel
+            // A dropped sender must not resolve this wait early, since
+            // deciding here would race the exit path. A closed channel
             // switches to a future that never resolves, leaving the outer
-            // `timeout` below as the only thing that can end the wait, at
-            // the deadline it was always going to end at.
+            // `timeout` as the only thing that ends the wait.
             let wait_for_signal = async {
                 if channel.await.is_err() {
                     core::future::pending::<()>().await;
@@ -108,24 +94,15 @@ pub async fn await_ready(
             }
         }
         ReadinessSource::Probe(config, target) => {
-            // Deliberately NOT floored at `MIN_PROBE_INTERVAL` the way
-            // `spawn_liveness_task` floors its own interval, and the
-            // difference is not an oversight. That floor exists because a
-            // liveness loop runs forever, so a zero interval there is an
-            // unbounded hot spin; this loop is bounded by `deadline` (an
-            // app's `listen_timeout`), which ends it either way. And the
-            // cost of flooring runs the wrong direction here: a second is a
-            // long time to hold a sheep at `starting` after it is already
-            // answering, which is exactly what a one-second floor would add
-            // to a fast app configured to poll faster.
+            // Not floored at `MIN_PROBE_INTERVAL` like `spawn_liveness_task`:
+            // this loop is bounded by `deadline`, not infinite, and
+            // flooring it would hold a fast, already-answering app at
+            // `starting` for a needless second.
             let interval = config.interval.as_duration();
             let timeout = config.timeout.as_duration();
-            // Probe first, sleep after: the first probe must land at t=0,
-            // not after one `interval` — an interval-first loop would add a
-            // full interval to every gated start. `failure_threshold` is
-            // deliberately never read here: it is a liveness concept, and
-            // giving up after N failures would turn this wait into a
-            // second, smaller deadline nested inside the real one.
+            // Probe first, sleep after, so the first probe lands at t=0.
+            // `failure_threshold` is never read here: it is a liveness
+            // concept, not a readiness one.
             let poll = async {
                 loop {
                     if prober.probe(target, timeout).await.is_ok() {
@@ -140,9 +117,9 @@ pub async fn await_ready(
             }
         }
         ReadinessSource::Heuristic => {
-            // The elapse IS the signal here — the one branch that returns
-            // `Ready` from a deadline racing nothing, rather than from an
-            // event beating one.
+            // The elapse is the signal here: the one branch that returns
+            // `Ready` from a deadline racing nothing, not an event beating
+            // one.
             tokio::time::sleep(deadline).await;
             Readiness::Ready
         }
@@ -163,9 +140,9 @@ mod tests {
     use shep_core::config::ProbeKind;
     use shep_core::values::UpDuration;
 
-    /// A prober `Channel`/`Heuristic` waits never call — an empty script
-    /// would panic on the first `probe()` call, so using it here proves
-    /// those two arms never reach the prober at all.
+    /// A prober `Channel`/`Heuristic` waits never call: an empty script
+    /// would panic on the first `probe()` call, proving those arms never
+    /// reach the prober.
     fn unused_prober() -> Arc<dyn Prober> {
         Arc::new(ScriptedProber::new(vec![]))
     }
@@ -179,8 +156,6 @@ mod tests {
         ReadinessSource::Probe(config, target)
     }
 
-    // fails if a wait ignores the channel signal and always runs the full
-    // deadline
     #[tokio::test(start_paused = true)]
     async fn channel_ready_before_the_deadline_resolves_at_signal_time() {
         let (tx, rx) = oneshot::channel();
@@ -205,7 +180,6 @@ mod tests {
         );
     }
 
-    // fails if a wait never gives up, which would hang a start forever
     #[tokio::test(start_paused = true)]
     async fn channel_with_no_signal_times_out_at_exactly_the_deadline() {
         let (_tx, rx) = oneshot::channel(); // held: never signals, never drops
@@ -218,9 +192,6 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - start, deadline);
     }
 
-    // fails if a closed channel is treated as a decision instead of the exit
-    // path's own signal: a sheep that died is handled elsewhere, and
-    // resolving early here would race it
     #[tokio::test(start_paused = true)]
     async fn channel_dropped_without_signalling_times_out_at_the_deadline_not_immediately() {
         let (tx, rx) = oneshot::channel();
@@ -234,8 +205,6 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - start, deadline);
     }
 
-    // fails if failure_threshold — a liveness concept — is applied here,
-    // giving up after three failures instead of riding out the deadline
     #[tokio::test(start_paused = true)]
     async fn probe_becomes_ready_two_failures_then_a_pass_at_two_intervals() {
         let source = tcp_source(1_000);
@@ -253,8 +222,6 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(2));
     }
 
-    // fails if the loop sleeps one interval before its first probe — an
-    // interval-first loop adds a full interval to every gated start
     #[tokio::test(start_paused = true)]
     async fn probe_ready_immediately_when_the_first_probe_passes() {
         let source = tcp_source(1_000);
@@ -272,7 +239,6 @@ mod tests {
         );
     }
 
-    // fails if a probe wait has no deadline of its own
     #[tokio::test(start_paused = true)]
     async fn probe_that_always_fails_times_out_at_the_deadline() {
         let source = tcp_source(1_000);
@@ -287,9 +253,6 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - start, deadline);
     }
 
-    // fails if this returns TimedOut instead of Ready — the heuristic's own
-    // elapse IS the readiness signal, and the two verdicts drive different
-    // log lines at the call site
     #[tokio::test(start_paused = true)]
     async fn heuristic_becomes_ready_when_its_deadline_elapses() {
         let (_tx, rx) = oneshot::channel();
@@ -305,9 +268,6 @@ mod tests {
 
     // --- ReadinessSource::of ---
 
-    // fails if readiness_probe is consulted before wait_ready, so an app
-    // configuring both would probe instead of waiting on its own explicit
-    // signal
     #[test]
     fn wait_ready_wins_over_a_configured_probe() {
         let mut app = AppConfig::minimal("web", "./srv");
@@ -317,7 +277,6 @@ mod tests {
         assert_eq!(ReadinessSource::of(&app), Ok(ReadinessSource::Channel));
     }
 
-    // fails if a configured probe is ignored when wait_ready is unset
     #[test]
     fn a_configured_probe_is_used_when_wait_ready_is_unset() {
         let mut app = AppConfig::minimal("web", "./srv");
@@ -333,15 +292,12 @@ mod tests {
         );
     }
 
-    // fails if an app configuring neither is treated as gated
     #[test]
     fn neither_configured_is_heuristic() {
         let app = AppConfig::minimal("web", "./srv");
         assert_eq!(ReadinessSource::of(&app), Ok(ReadinessSource::Heuristic));
     }
 
-    // fails if a malformed readiness_probe target is silently accepted here
-    // instead of surfacing ProbeTarget::parse's own rejection
     #[test]
     fn a_malformed_probe_target_is_rejected() {
         let mut app = AppConfig::minimal("web", "./srv");

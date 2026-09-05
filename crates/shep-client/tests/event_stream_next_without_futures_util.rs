@@ -1,11 +1,8 @@
-//! Simulates the position of a consumer who depends on `shep-client` alone
-//! and never added `futures-util` to their own manifest: this file has no
-//! `use futures_util::...` anywhere in it, and none of its other imports
-//! bring `StreamExt` into scope either. `stream.next()` below resolves only
-//! because [`shep_client::EventStream::next`] is an inherent method — if
-//! that method were ever removed, this file would fail to compile (`next`
-//! not found) rather than silently keep passing, since nothing here has a
-//! trait in scope to fall back to.
+//! Has no `futures_util` import, and nothing else brings `StreamExt`
+//! into scope. `stream.next()` resolves only because
+//! [`shep_client::EventStream::next`] is an inherent method. If that
+//! method were removed, this fails to compile instead of silently
+//! passing.
 
 use std::time::Duration;
 

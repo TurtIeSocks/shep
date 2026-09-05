@@ -1,18 +1,15 @@
-//! `shep startup`/`unstartup`: installing and removing the init unit that
-//! starts the shepherd at boot. [`mod@unit`] renders a systemd unit or a
-//! launchd plist from a [`unit::UnitSpec`] — pure `format!`, no filesystem
-//! or process access. This module resolves a real `UnitSpec`, decides
-//! whether this process may install it, and writes, enables, disables or
-//! removes it.
+//! `shep startup`/`unstartup`: installs and removes the init unit that
+//! starts the shepherd at boot. [`mod@unit`] renders a unit from a
+//! [`unit::UnitSpec`] with no filesystem or process access; this module
+//! resolves a real `UnitSpec`, decides whether this process may install
+//! it, and writes, enables, disables or removes it.
 //!
 //! # Privilege
 //!
-//! shep never escalates. There is no `sudo`, no setuid, and no re-exec
-//! through a helper: [`startup`] reads `geteuid()` once and hands the answer
-//! down as a [`Privilege`] value, and an [`install`] or [`remove`] that is
-//! given [`Privilege::Unprivileged`] prints the exact command an operator
-//! can paste and exits non-zero — non-zero so a script notices rather than
-//! believing a unit was installed.
+//! shep never escalates: no `sudo`, no setuid, no re-exec through a
+//! helper. [`startup`] reads `geteuid()` once as a [`Privilege`] value; an
+//! [`install`] or [`remove`] given [`Privilege::Unprivileged`] prints the
+//! command an operator can paste and exits non-zero.
 
 pub(crate) mod unit;
 
@@ -34,10 +31,8 @@ const DEFAULT_HOME_DIR: &str = ".shep";
 
 /// The mode a generated unit is created with.
 ///
-/// A systemd unit and a launchd plist are **read** by their init system:
-/// 0644. An openrc script and a BSD rc.d script are **executed**: 0755.
-/// Shipping an openrc script at 0644 fails at the next reboot, which is the
-/// worst possible time to find out.
+/// systemd and launchd units are read, not executed: 0644. openrc and BSD
+/// rc.d scripts are executed: 0755.
 pub(crate) const fn unit_mode(init: Init) -> u32 {
     match init {
         Init::Systemd | Init::Launchd => 0o644,
@@ -47,12 +42,10 @@ pub(crate) const fn unit_mode(init: Init) -> u32 {
 
 /// Where a generated unit for `init` is written, for `user`.
 ///
-/// Systemd and launchd keep calling their own existing formatters —
-/// `unit::systemd_unit_path`/`unit::launchd_plist_path` — rather than
-/// restating their format strings here. The other three name a file
-/// `unstartup` has to be able to find under any init an operator names with
-/// `--init`, which is why this is a function of `Init` alone rather than
-/// something `plan` only ever calls for the detected one.
+/// Systemd and launchd delegate to `unit::systemd_unit_path`/
+/// `unit::launchd_plist_path`. Takes `Init` explicitly, not just the
+/// detected one, so `unstartup` can find the file under whatever `--init`
+/// names.
 pub(crate) fn unit_path_for(init: Init, user: &str) -> PathBuf {
     match init {
         Init::Systemd => unit::systemd_unit_path(user),
@@ -65,15 +58,12 @@ pub(crate) fn unit_path_for(init: Init, user: &str) -> PathBuf {
 
 /// Whether `user` can appear in a BSD rc script's variable names.
 ///
-/// `rcvar` and `rcctl` turn the service name into **shell variable names**
-/// (`shep_<user>_enable`, `shep_<user>_flags`). A username containing `-` or
-/// `.` — `web-app` and `deploy.svc` are both legal on both systems —
-/// produces `shep_web-app_enable`, which is not a valid `sh` variable, and
-/// the script then fails at `load_rc_config` with a syntax error naming a
-/// line number rather than a user.
+/// `rcvar` and `rcctl` turn the service name into shell variable names
+/// (`shep_<user>_enable`, `shep_<user>_flags`). A `-` or `.` in `user`
+/// produces an invalid `sh` identifier, and the script then fails at
+/// `load_rc_config` with a syntax error naming a line number, not a user.
 ///
-/// systemd and openrc name *files*, not variables, and are unaffected. Do
-/// not add this check there.
+/// systemd and openrc name files, not variables, and are unaffected.
 pub(crate) fn is_rc_safe_user(user: &str) -> bool {
     let mut chars = user.chars();
     chars
@@ -115,20 +105,17 @@ pub(crate) struct StartupPlan {
     pub unit_path: PathBuf,
     /// The launchd label, unused on systemd.
     pub label: String,
-    /// `$SUDO_USER`, resolved once in [`plan`] the same way [`Privilege`]
-    /// is: a value [`install`] reads rather than an environment lookup of
-    /// its own, so a test can drive the sanitised-`PATH` warning below
-    /// without `std::env::set_var` — `unsafe` in edition 2024, and this
-    /// crate is `#![forbid(unsafe_code)]`.
+    /// `$SUDO_USER`, resolved once in [`plan`]: a value [`install`] reads
+    /// rather than an env lookup of its own, so a test can drive the
+    /// sanitised-`PATH` warning without `std::env::set_var`, which is
+    /// `unsafe` under `#![forbid(unsafe_code)]`.
     pub sudo_user: Option<String>,
     /// The layout to create before installing: `<passwd home>/.shep` of the
-    /// very user running shep, and only with no `--home`/`$SHEP_HOME`. A
-    /// named home is never created (`ensure_home_at`'s rule in `lib.rs`),
-    /// and another user's default is not this process's to make: under
-    /// `sudo` that process is root, a directory root makes in the target
-    /// user's home is root's at 0700, and the daemon started as that user
-    /// could not open it. [`install`] refuses a missing one instead.
-    /// [`remove`] never reads this.
+    /// user running shep, and only with no `--home`/`$SHEP_HOME`. A named
+    /// home is never created, and another user's default is not this
+    /// process's to make: under `sudo` root would own it at 0700 and the
+    /// daemon started as that user could not open it. [`install`] refuses
+    /// a missing one; [`remove`] never reads this.
     pub own_default_home: Option<ShepPaths>,
 }
 
@@ -144,11 +131,10 @@ struct Refusal {
 ///
 /// `explicit_home` is `--home`/`$SHEP_HOME` as clap already folded it, and
 /// `run` has already refused one that is not there. When it names nothing
-/// the unit carries the **target user's** own `<passwd home>/.shep`, never
-/// this process's `$HOME` — under `sudo` that is root's, and a unit built
+/// the unit carries the target user's own `<passwd home>/.shep`, never
+/// this process's `$HOME`: under `sudo` that is root's, and a unit built
 /// from it restores nothing after a reboot. A default that is this
-/// process's own is created first, first-run scaffold included; see
-/// [`StartupPlan::own_default_home`].
+/// process's own is created first; see [`StartupPlan::own_default_home`].
 pub fn startup(
     streams: &mut Streams<'_>,
     explicit_home: Option<&Path>,
@@ -181,10 +167,9 @@ pub fn unstartup(streams: &mut Streams<'_>, args: &StartupArgs) -> ExitCode {
 /// The user a generated unit runs the daemon as: `--user` when given, else
 /// `$SUDO_USER`, else the invoking user.
 ///
-/// `$SUDO_USER` beats the invoking user rather than the other way round
-/// because under `sudo shep startup` the invoking user IS root: a unit
-/// resolved from it would supervise root's flock while the operator's stayed
-/// down, and would look correct doing it.
+/// Under `sudo shep startup` the invoking user is root, so `$SUDO_USER`
+/// beats it: otherwise the unit would supervise root's flock while the
+/// operator's stayed down.
 pub(crate) fn target_user(
     explicit: Option<&str>,
     sudo_user: Option<&str>,
@@ -197,9 +182,8 @@ pub(crate) fn target_user(
 /// when given, else the target user's own `<passwd home>/.shep`.
 ///
 /// `user_home` is the target user's passwd home, never this process's
-/// `$HOME`: `sudo` resets that to root's, so a unit built from it would carry
-/// `/root/.shep` and restore nothing after a reboot — silently, and months
-/// later.
+/// `$HOME`: `sudo` resets that to root's, so a unit built from it would
+/// carry `/root/.shep` and restore nothing after a reboot.
 pub(crate) fn target_home(explicit: Option<&Path>, user_home: &Path) -> PathBuf {
     explicit.map_or_else(|| user_home.join(DEFAULT_HOME_DIR), Path::to_path_buf)
 }
@@ -214,39 +198,16 @@ pub(crate) fn default_home_is_own(explicit: Option<&Path>, target: &str, invokin
 
 /// Writes and enables the unit, or prints the command that would.
 ///
-/// Every refusal is decided before anything is written or run, and in this
-/// order:
+/// Refused, in order, before anything is written: a `$SHEP_HOME` that is
+/// not a directory ([`ExitCode::Usage`]); a unit that already exists
+/// ([`ExitCode::Usage`], naming `unstartup`, since rewriting a loaded
+/// unit's file would leave it disagreeing with the running service); then
+/// [`Privilege::Unprivileged`], which prints the resolved `sudo` command
+/// and exits [`ExitCode::Failure`].
 ///
-/// 1. A `$SHEP_HOME` that is not a directory is [`ExitCode::Usage`], naming
-///    the path, the user whose default it is, and `--home`. By the time
-///    this runs, `run` has refused a named home that is missing and
-///    [`startup`] has created this process's own default, so what reaches
-///    it is another user's default under `sudo`: the trap [`target_home`]
-///    describes, and a unit pointing at a home that is not there is a
-///    reboot that restores nothing.
-/// 2. A unit that already exists is [`ExitCode::Usage`] too, naming the path
-///    and `unstartup`. An operator who edited the unit in place has to be
-///    told rather than have the edits replaced — and on both init systems
-///    rewriting the file does not change the service already loaded, so an
-///    overwrite would leave the file and the running unit disagreeing.
-///    `unstartup` then `startup` closes that gap; a `--force` flag would not.
-/// 3. [`Privilege::Unprivileged`] prints the fully resolved
-///    `sudo <exec> startup --user <user> --home <home>` and exits
-///    [`ExitCode::Failure`] — non-zero so a script notices. shep never
-///    escalates on its own.
-///
-/// Past that point the unit is going to be written, and if [`plan`] saw
-/// `$SUDO_USER` set, [`secure_path_warning`] prints a notice naming the
-/// `PATH` about to go into it — `sudo` on most distributions replaces
-/// `PATH` with its own `secure_path` before shep ever runs, and that
-/// substitution happens before shep is exec'd, so this is a "may have"
-/// rather than a refusal: shep has no login `PATH` left to compare against,
-/// only the operator does.
-///
-/// The privilege is a parameter rather than a `geteuid()` call in here for
-/// the reason [`Privilege`]'s own doc gives, and `plan.unit_path` is a field
-/// rather than a call to `unit::systemd_unit_path` for the matching one: a
-/// test points it into a temporary directory.
+/// If [`plan`] saw `$SUDO_USER` set, [`secure_path_warning`] also warns:
+/// `sudo` typically replaces `PATH` with its own `secure_path`, and shep
+/// has no login `PATH` left to compare against.
 pub(crate) fn install(
     streams: &mut Streams<'_>,
     plan: &StartupPlan,
@@ -327,16 +288,12 @@ pub(crate) fn install(
 
 /// The notice [`install`] prints when `$SUDO_USER` was set: `None` if it
 /// was not, else a message naming `sudo_user` and showing `spec.path` in
-/// full, so the operator can check it against that user's login `PATH`
-/// without a second lookup.
+/// full, so the operator can check it against that user's login `PATH`.
 ///
-/// A pure function of the two values rather than an environment read of its
-/// own, matching [`target_user`]/[`target_home`]'s own shape: this crate is
-/// `#![forbid(unsafe_code)]` (`cli.rs`), so nothing in its test suite can
-/// call the `unsafe`-in-edition-2024 `std::env::set_var` to establish an
-/// ambient `$SUDO_USER` and watch [`plan`] read it. Driving this function
-/// directly with a resolved `sudo_user` is the next best thing, and the
-/// thing that actually matters: the text the operator reads.
+/// A pure function of the two values, not an environment read of its own:
+/// this crate is `#![forbid(unsafe_code)]`, so a test cannot call
+/// `std::env::set_var` to establish an ambient `$SUDO_USER` for [`plan`]
+/// to read.
 fn secure_path_warning(sudo_user: Option<&str>, spec: &UnitSpec) -> Option<String> {
     let sudo_user = sudo_user?;
     Some(format!(
@@ -351,14 +308,12 @@ fn secure_path_warning(sudo_user: Option<&str>, spec: &UnitSpec) -> Option<Strin
 
 /// Disables and removes the unit, or prints the command that would.
 ///
-/// A unit that is not there is a success carrying one `absent` row, matching
-/// `flush --daemon`'s treatment of a log file that is not there — and that
-/// check runs BEFORE the privilege gate, so `shep unstartup` on a machine
-/// that never ran `startup` answers plainly instead of demanding root to
-/// discover there is nothing to do. Everything past it needs root, and
-/// without it this prints `sudo <exec> unstartup --user <user>` and exits
-/// [`ExitCode::Failure`]; the printed command carries no `--home`, since a
-/// removal is addressed by the unit's path and label alone.
+/// A missing unit is a success carrying one `absent` row; that check runs
+/// before the privilege gate, so `shep unstartup` on a host that never ran
+/// `startup` answers without demanding root. Otherwise this needs root:
+/// without it, prints `sudo <exec> unstartup --user <user>` (no `--home`,
+/// since removal is addressed by path and label alone) and exits
+/// [`ExitCode::Failure`].
 pub(crate) fn remove(
     streams: &mut Streams<'_>,
     plan: &StartupPlan,
@@ -431,11 +386,9 @@ pub(crate) fn remove(
 
 /// Renders the unit and writes it at [`unit_mode`], as one step.
 ///
-/// The mode is requested at `open` time rather than set afterwards, matching
-/// `launch::launch_command`'s own discipline: a create-then-chmod sequence
-/// leaves the file readable at whatever the ambient umask allowed until the
-/// chmod lands, and this one is being written into a directory every user on
-/// the machine can reach.
+/// Mode set at `open` time, not via a later chmod: a create-then-chmod
+/// sequence would leave the file readable at the ambient umask until the
+/// chmod lands, and this file lands in a directory every user can reach.
 fn write_unit(plan: &StartupPlan) -> StartupStep {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -456,13 +409,9 @@ fn write_unit(plan: &StartupPlan) -> StartupStep {
         .open(&plan.unit_path)
         .and_then(|mut file| {
             file.write_all(rendered.as_bytes())?;
-            // `open`'s mode is still masked by the caller's umask, and a
-            // root shell with `umask 077` would leave a unit only root can
-            // read — `systemctl cat shep-<user>`, run by the operator the
-            // unit is FOR, could not. Setting it afterwards makes the
-            // shipped mode deterministic; it acts on the open descriptor,
-            // so there is no path to race, and it only ever widens from a
-            // mode that was already no wider than this one.
+            // `open`'s mode is masked by the umask; this chmod makes it
+            // deterministic. Acts on the open fd, so there is no race, and
+            // it only ever widens a mode already no wider than this one.
             file.set_permissions(std::fs::Permissions::from_mode(mode))
         });
     StartupStep {
@@ -509,9 +458,9 @@ fn run_step(program: &str, args: &[&str]) -> StartupStep {
     }
 }
 
-/// `shep-<user>.service`, read back off the path the plan already resolved
-/// rather than formatted a second time — `systemctl enable` wants the unit's
-/// name, and two spellings of it could drift apart.
+/// `shep-<user>.service`, read back off the path the plan already
+/// resolved rather than formatted a second time: `systemctl enable` wants
+/// the unit's name, and two spellings could drift apart.
 fn unit_file_name(plan: &StartupPlan) -> String {
     plan.unit_path
         .file_name()
@@ -542,15 +491,12 @@ fn report(streams: &mut Streams<'_>, command: &str, steps: Vec<StartupStep>) -> 
 /// Quotes one word of a printed command so the line can be pasted rather
 /// than read and repaired.
 ///
-/// A `$SHEP_HOME` with a space in it is a legal path, and an unquoted one
-/// would become two arguments — the operator would paste a command that
-/// installs a unit carrying half the path they meant.
+/// A `$SHEP_HOME` with a space is a legal path; unquoted, it would become
+/// two arguments and paste a command carrying half the path.
 ///
-/// `pub(crate)` rather than private: [`unit::freebsd_rc_script`] and
-/// [`unit::openbsd_rc_script`] reuse it as the single-quote former their own
-/// doc comments describe, for a value that will be re-evaluated by a nested
-/// shell — a different job from `unit`'s own double-quote escaper, and the
-/// two compose there.
+/// `pub(crate)`: [`unit::freebsd_rc_script`] and [`unit::openbsd_rc_script`]
+/// reuse it as the single-quote former for a value re-evaluated by a
+/// nested shell, distinct from `unit`'s own double-quote escaper.
 pub(crate) fn shell_quote(word: &str) -> String {
     let safe = |b: &u8| b.is_ascii_alphanumeric() || b"_./:@%+=-".contains(b);
     if !word.is_empty() && word.as_bytes().iter().all(safe) {
@@ -589,16 +535,12 @@ fn refuse(streams: &mut Streams<'_>, code: ExitCode, message: &str) -> ExitCode 
 
 /// Which init a Linux host running these two probes is on.
 ///
-/// A pure function so the ORDER is testable on a machine that is not Linux.
-/// systemd wins a tie: `/run/systemd/system` is exactly what `sd_booted(3)`
-/// checks and is the only probe here with an upstream contract behind it,
-/// and a host with both present is a host running systemd with openrc
-/// leftovers rather than the other way round.
+/// A pure function so the order is testable off Linux. systemd wins a
+/// tie: `/run/systemd/system` is what `sd_booted(3)` checks, so both
+/// present means openrc leftovers on a systemd host, not the reverse.
 ///
-/// [`current_init`]'s Linux arm is the only non-test caller, and that arm is
-/// `#[cfg]`-ed away on every other target — narrowed the same way the old
-/// `Init` variants were before this task moved them, rather than
-/// blanket-allowed.
+/// [`current_init`]'s Linux arm is the only non-test caller; `#[cfg]`-ed
+/// away on every other target rather than blanket-`#[allow(dead_code)]`ed.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const fn linux_init(systemd: bool, openrc: bool) -> Option<Init> {
     if systemd {
@@ -613,21 +555,13 @@ const fn linux_init(systemd: bool, openrc: bool) -> Option<Init> {
 /// The init system this host is actually running, or `None` when it is one
 /// shep has no renderer for.
 ///
-/// Linux is a **runtime** probe: systemd and openrc share one target triple,
-/// so `target_os` cannot tell them apart, and until this existed a Linux host
-/// running openrc was silently written a systemd unit whose failure surfaced
-/// only when `systemctl` turned out not to exist. The ordering lives in
-/// [`linux_init`], which is compiled and tested everywhere; this function is
-/// the two filesystem reads that feed it.
+/// Linux is a runtime probe: `target_os` cannot tell systemd and openrc
+/// apart. The ordering lives in [`linux_init`]; this function is the two
+/// filesystem reads that feed it. Every other target is a compile-time
+/// fact.
 ///
-/// Every other target is a compile-time fact: there is nothing else macOS,
-/// FreeBSD or OpenBSD could be.
-///
-/// **This is stricter than what it replaces.** A Linux container with no
-/// `/run/systemd/system` used to get a systemd unit written into it and now
-/// gets a refusal. That is the right answer — a unit with no init to read it
-/// does nothing — but it is a case that worked before, so `--init` exists to
-/// override this entirely.
+/// A Linux container with no `/run/systemd/system` and no openrc is
+/// refused rather than guessed at; `--init` overrides this entirely.
 fn current_init() -> Option<Init> {
     #[cfg(target_os = "linux")]
     {
@@ -707,11 +641,9 @@ fn plan(explicit_home: Option<&Path>, args: &StartupArgs) -> Result<StartupPlan,
             user,
             exec,
             home: target_home(explicit_home, &passwd_home),
-            // Captured from THIS invocation, which is what makes an
-            // interpreter installed under `~/.bun` or `~/.cargo` findable
-            // after a reboot. An empty one is left empty rather than
-            // guessed at: a unit carrying a PATH shep invented would fail
-            // somewhere else entirely.
+            // Captured from this invocation so an interpreter under
+            // `~/.bun` or `~/.cargo` stays findable after reboot. Left
+            // empty rather than guessed at if unset.
             path: std::env::var_os("PATH").unwrap_or_default(),
             working_dir: passwd_home,
         },
@@ -737,7 +669,7 @@ fn invoking_user() -> Result<String, Refusal> {
     }
 }
 
-/// The target user's passwd home — the unit's working directory, and the
+/// The target user's passwd home: the unit's working directory, and the
 /// root its `$SHEP_HOME` defaults under.
 fn passwd_home(name: &str) -> Result<PathBuf, Refusal> {
     match nix::unistd::User::from_name(name) {
@@ -785,10 +717,8 @@ mod tests {
         }
     }
 
-    /// fails if `$SUDO_USER` stops winning over the invoking user. Under
-    /// `sudo shep startup` the invoking user IS root, so a resolution that
-    /// ignored SUDO_USER would install a unit supervising root's flock
-    /// while the operator's stayed down — and the unit would look correct.
+    /// Under `sudo`, the invoking user is root; ignoring `$SUDO_USER` would
+    /// install a unit supervising root's flock instead of the operator's.
     #[test]
     fn the_target_user_prefers_an_explicit_name_then_sudo_user() {
         assert_eq!(target_user(Some("deploy"), Some("ada"), "root"), "deploy");
@@ -796,10 +726,8 @@ mod tests {
         assert_eq!(target_user(None, None, "ada"), "ada");
     }
 
-    /// fails if the home falls back to this process's `$HOME`. `sudo` resets
-    /// HOME to root's, so a unit built from it carries /root/.shep and
-    /// restores nothing after a reboot — the failure the whole gate exists
-    /// to prevent, and one that surfaces months later.
+    /// `sudo` resets `$HOME` to root's; falling back to it would carry
+    /// `/root/.shep` and restore nothing after a reboot.
     #[test]
     fn the_target_home_comes_from_the_target_user_not_the_invoker() {
         assert_eq!(
@@ -812,12 +740,6 @@ mod tests {
         );
     }
 
-    /// fails if a default home is created for anyone but the user running
-    /// shep. Under `sudo shep startup` that user is root, and a directory
-    /// root makes inside the target user's home is root's, mode 0700: the
-    /// daemon this unit starts as that user could not open it. A named home
-    /// is never created by anyone; that is `ensure_home_at`'s rule in
-    /// `lib.rs`, and this one must not undercut it.
     #[test]
     fn a_default_home_is_created_only_for_the_user_running_shep() {
         assert!(default_home_is_own(None, "ada", "ada"));
@@ -828,9 +750,6 @@ mod tests {
         );
     }
 
-    /// fails if the home `target_home` puts in the unit and the layout
-    /// `plan` hands `run` to create ever spell `.shep` differently: the
-    /// unit would then point beside the directory that was made for it.
     #[test]
     fn the_default_home_and_the_layout_created_for_it_agree() {
         let passwd_home = Path::new("/home/ada");
@@ -840,11 +759,6 @@ mod tests {
         );
     }
 
-    /// fails if the warning fires without `$SUDO_USER`, or if it fires with
-    /// one and drops the name or the exact `PATH` about to be written. The
-    /// first would warn an operator who never touched `sudo`; the second
-    /// would leave the one who did with nothing to check the captured
-    /// `PATH` against.
     #[test]
     fn secure_path_warning_names_the_sudo_user_and_the_full_path_only_under_sudo() {
         let spec = UnitSpec {
@@ -873,10 +787,8 @@ mod tests {
         );
     }
 
-    /// fails if an unprivileged startup exits 0, or prints a command the
-    /// operator cannot paste. Exit 0 makes a script believe a unit was
-    /// installed; a command missing --home re-runs the sudo trap the gate
-    /// above exists to close.
+    /// Exit 0 would make a script believe a unit was installed; a command
+    /// missing `--home` re-runs the sudo trap [`target_home`] describes.
     #[test]
     fn an_unprivileged_startup_prints_the_command_and_exits_non_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -904,10 +816,9 @@ mod tests {
         );
     }
 
-    /// fails if the secure-`PATH` warning is checked before the privilege
-    /// gate rather than after it. Nothing is written on this path — there
-    /// is no `PATH` yet to show — so a plan carrying `$SUDO_USER` must stay
-    /// as silent about it as the plain refusal above.
+    /// The secure-`PATH` warning is checked after the privilege gate, not
+    /// before: nothing is written on this path, so it must stay as silent
+    /// as the plain refusal above.
     #[test]
     fn an_unprivileged_startup_under_sudo_still_prints_no_secure_path_warning() {
         let dir = tempfile::tempdir().unwrap();
@@ -932,9 +843,8 @@ mod tests {
         assert!(!printed.contains("secure_path"), "{printed}");
     }
 
-    /// fails if a `$SHEP_HOME` that does not exist is accepted. That is what
-    /// the sudo trap produces when nobody notices it, and the unit it yields
-    /// is one that boots cleanly and restores an empty flock.
+    /// Accepting a missing `$SHEP_HOME` would yield a unit that boots
+    /// cleanly and restores an empty flock.
     #[test]
     fn a_shep_home_that_does_not_exist_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -948,9 +858,8 @@ mod tests {
                 style: crate::style::Presentation::BARE,
                 fmt: Format::Table,
             };
-            // Root, deliberately: an unprivileged run would refuse for the
-            // other reason and this case would pass without ever exercising
-            // the home check.
+            // Root: an unprivileged run would refuse for the other reason
+            // first, never exercising the home check.
             install(&mut streams, &plan_for_test(&missing), Privilege::Root)
         };
         assert_eq!(code, ExitCode::Usage);
@@ -962,15 +871,11 @@ mod tests {
         );
     }
 
-    /// fails if an existing unit is overwritten. An operator who edited the
-    /// unit in place has to be told, not have the edits replaced — and on
-    /// both init systems a rewritten file does not change the service that
-    /// is already loaded, so an overwrite would leave the file and the
-    /// running unit disagreeing.
+    /// Rewriting an existing unit's file would not change the service
+    /// already loaded, leaving the file and the running unit disagreeing.
     ///
-    /// `Privilege::Root`, for `a_shep_home_that_does_not_exist_is_refused`'s
-    /// reason: unprivileged would refuse for the other reason and this case
-    /// would never reach the check.
+    /// `Privilege::Root`: unprivileged would refuse for the other reason
+    /// first, never reaching this check.
     #[test]
     fn an_existing_unit_is_refused_rather_than_overwritten() {
         let dir = tempfile::tempdir().unwrap();
@@ -1012,14 +917,9 @@ mod tests {
         );
     }
 
-    /// fails if `unstartup` on a machine that never ran `startup` reports a
-    /// failure instead of an `absent` row — the same treatment
-    /// `flush --daemon` gives a log file that is not there.
-    ///
-    /// `Privilege::Unprivileged` deliberately: the absence check runs before
-    /// the privilege gate, so this passes only while that order holds, and
-    /// a `Privilege::Root` plan here would reach a real `systemctl` the
-    /// moment somebody swapped the two.
+    /// `Privilege::Unprivileged`: the absence check runs before the
+    /// privilege gate, so a `Privilege::Root` plan here would reach a real
+    /// `systemctl`.
     #[test]
     fn an_absent_unit_is_an_absent_row_and_a_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -1040,9 +940,7 @@ mod tests {
         assert!(printed.contains(ABSENT), "{printed}");
     }
 
-    /// fails if an unprivileged unstartup exits 0, prints a command the
-    /// operator cannot paste, or removes the unit anyway. The last is the
-    /// one that matters: this verb's whole job is destructive.
+    /// The removal check matters most: this verb's whole job is destructive.
     #[test]
     fn an_unprivileged_unstartup_prints_the_command_and_removes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1071,13 +969,9 @@ mod tests {
         );
     }
 
-    /// fails if the unit is written with the wrong bytes or a mode other
-    /// than 0644. A unit an init system cannot read is a boot that restores
-    /// nothing; a world-writable one under `/etc` is worse than that.
-    ///
-    /// Drives `write_unit` and `remove_unit` directly rather than `install`:
-    /// `install`'s privileged path runs `systemctl`, which no test in this
-    /// phase may reach.
+    /// Drives `write_unit` and `remove_unit` directly rather than
+    /// `install`: `install`'s privileged path runs `systemctl`, which no
+    /// test here may reach.
     #[test]
     fn the_unit_is_written_at_0644_and_removed_again() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1096,10 +990,9 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        // A literal, deliberately, not `unit_mode(Init::Systemd)`: a test
-        // comparing the function's own return value against itself passes
-        // for whatever that value is changed to, and a mutation to 0o666
-        // went uncaught by exactly that until this line stopped naming it.
+        // A literal, not `unit_mode(Init::Systemd)`: comparing the
+        // function's own return value to itself would pass no matter what
+        // it returned.
         assert_eq!(mode & 0o777, 0o644, "mode was {:o}", mode & 0o777);
 
         assert_eq!(remove_unit(&plan).result, OK);
@@ -1111,15 +1004,9 @@ mod tests {
         );
     }
 
-    /// fails if a failed step stops failing the verb, or if a failure
-    /// truncates the report. Both halves are the rule [`report`] exists for:
-    /// a half-installed unit is worse than a fully-attempted one, so every
-    /// step still runs and still prints, and the operator needs a non-zero
-    /// exit to know which half they are holding.
-    ///
     /// Drives `report` with hand-built rows rather than a real `install`:
-    /// producing a genuinely failing step would mean running a real
-    /// `systemctl`, which no test in this crate may.
+    /// producing a genuinely failing step would need a real `systemctl`,
+    /// which no test in this crate may run.
     #[test]
     fn a_failed_step_fails_the_verb_and_still_prints_every_row() {
         let step = |action, target: &str, result: &str| StartupStep {
@@ -1162,10 +1049,8 @@ mod tests {
         }
     }
 
-    /// fails if a printed command stops being paste-able. A `$SHEP_HOME`
-    /// with a space in it is legal and would otherwise become two arguments
-    /// — the operator would paste a command that installs a unit carrying
-    /// half the path they meant.
+    /// A `$SHEP_HOME` with a space is legal; unquoted it would split into
+    /// two arguments.
     #[test]
     fn a_printed_command_quotes_what_a_shell_would_split() {
         assert_eq!(shell_quote("/home/ada/.shep"), "/home/ada/.shep");
@@ -1174,10 +1059,7 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
-    /// fails if a failed step reports something other than the first line
-    /// its command complained with. systemd answers a refusal in several
-    /// lines of its own advice and a row is one line; a step reporting an
-    /// empty string would say a command failed and not say how.
+    /// systemd answers a refusal in several lines; a row is one line.
     #[test]
     fn a_failed_step_reports_one_line_and_never_an_empty_one() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -1200,11 +1082,6 @@ mod tests {
         );
     }
 
-    /// fails if a systemd unit or launchd plist stops being read-only, or an
-    /// openrc/rc.d script stops being executable. A unit an init system
-    /// cannot read is a boot that restores nothing; a script that is not
-    /// executable fails at the next reboot, the worst possible time to
-    /// find out.
     #[test]
     fn the_mode_is_read_only_for_units_and_executable_for_scripts() {
         assert_eq!(unit_mode(Init::Systemd), 0o644);
@@ -1214,11 +1091,8 @@ mod tests {
         assert_eq!(unit_mode(Init::OpenbsdRc), 0o755);
     }
 
-    /// fails if the probe order ever flips. systemd wins a tie because
-    /// `/run/systemd/system` is the check `sd_booted(3)` makes; a host with
-    /// both is a systemd host with openrc leftovers. Untestable as a
-    /// filesystem probe on this machine — which is the whole reason the
-    /// ordering is a pure function.
+    /// systemd wins a tie: `/run/systemd/system` is what `sd_booted(3)`
+    /// checks, so both present means openrc leftovers on a systemd host.
     #[test]
     fn systemd_wins_when_both_linux_probes_are_true() {
         assert_eq!(linux_init(true, true), Some(Init::Systemd));
@@ -1227,9 +1101,8 @@ mod tests {
         assert_eq!(linux_init(false, false), None);
     }
 
-    /// fails if `--init` stops overriding detection — the escape hatch for a
-    /// container with no /run/systemd/system, and the only way a macOS
-    /// machine renders a systemd unit at all.
+    /// The escape hatch for a container with no `/run/systemd/system`, and
+    /// the only way a macOS host renders a systemd unit.
     #[test]
     fn an_explicit_init_beats_detection() {
         use clap::Parser as _;
@@ -1243,12 +1116,9 @@ mod tests {
         }
     }
 
-    /// fails if `--init` stops choosing the unit PATH — which is the half
-    /// that matters for `unstartup`. A unit installed under one init has to
-    /// be removable after the host has changed to another, and that is a
-    /// claim about which file gets removed, not about which struct the two
-    /// verbs share. (`Startup` and `Unstartup` both take `StartupArgs`, so a
-    /// test that only checked that both parse `--init` could barely fail.)
+    /// A unit installed under one init must be removable after the host
+    /// changes to another, so this is about which file gets removed, not
+    /// which struct the two verbs share.
     #[test]
     fn each_init_names_its_own_unit_path() {
         assert_eq!(
@@ -1274,11 +1144,9 @@ mod tests {
         );
     }
 
-    /// fails if a username `rcvar`/`rcctl` cannot turn into a shell variable
-    /// stops being refused, or if a safe one is refused by mistake. `web-app`
-    /// and `deploy.svc` are both legal usernames and both illegal shell
+    /// `web-app` and `deploy.svc` are legal usernames and illegal shell
     /// variable fragments; a script built from one fails at
-    /// `load_rc_config` naming a line number rather than the user.
+    /// `load_rc_config` naming a line number, not the user.
     #[test]
     fn a_user_name_that_cannot_be_a_shell_variable_is_refused() {
         for ok in ["deploy", "www", "_shep", "app2"] {

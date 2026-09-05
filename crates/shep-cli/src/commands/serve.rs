@@ -1,20 +1,14 @@
-//! `shep serve`: registers a static file server as a managed sheep, or —
-//! with `--foreground` — runs the worker directly in this terminal.
+//! `shep serve`: registers a static file server as a managed sheep, or,
+//! with `--foreground`, runs the worker directly in this terminal.
 //!
-//! **One function does both halves** ([`serve`]), and does every refusal and
-//! every notice before either one: `--foreground` and the registered sheep
-//! must never disagree about what is valid, and the registered sheep is
-//! itself this same binary re-invoked with `--foreground` appended
-//! ([`sheep_args`]) — so the shepherd's own spawn of it runs straight back
-//! through this function, re-deriving the same refusals and the same
-//! notices against its own stderr, which is where `shep bleats` reads them
-//! from (Phase 15 decision 8's own two-audience split).
+//! [`serve`] does both halves, and every refusal and notice before either:
+//! the registered sheep is this same binary re-invoked with `--foreground`
+//! ([`sheep_args`]), so the shepherd's spawn of it runs back through here
+//! and re-derives them against its own stderr, where `shep bleats` reads.
 //!
-//! Dispatched from `lib.rs` before the shared `$SHEP_HOME`-gated, locked
-//! block — the same early-dispatch spot `lookout` and `bleats` use, and for
-//! the same reason: `--foreground` runs until signalled, and a `StdoutLock`
-//! held for a process lifetime wedges the first off-thread write elsewhere
-//! in the binary.
+//! Dispatched from `lib.rs` ahead of the shared `$SHEP_HOME`-gated, locked
+//! block: `--foreground` runs until signalled, and a `StdoutLock` held for
+//! a process lifetime wedges the first off-thread write elsewhere.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -31,22 +25,18 @@ use crate::output::{FlockRows, Render, Streams, emit, write_outcome};
 use crate::serve::auth::{self, AuthError, Credentials};
 use crate::serve::worker::{self, ServeConfig};
 
-/// Why the shared refusals (Phase 15 decision, Step 7.3) stopped a
-/// `shep serve` invocation before either half — registering or
-/// `--foreground` — ever ran. Module-scoped per IR-18.
+/// Why the shared refusals stopped an invocation before either half ran.
 #[derive(Debug)]
 enum ServeRefusal {
     /// `root` does not exist, or a component along the way is not itself a
-    /// directory. Carries `std::fs::canonicalize`'s own error rather than
-    /// re-deriving which case happened.
+    /// directory. Carries `std::fs::canonicalize`'s own error.
     RootUnresolvable {
         /// The path as the operator wrote it.
         root: PathBuf,
         /// The underlying IO failure.
         source: std::io::Error,
     },
-    /// `root` resolved to a real path, but that path is not a directory —
-    /// a file, say.
+    /// `root` resolved to a real path that is not a directory.
     RootNotADirectory {
         /// The resolved, canonical path.
         root: PathBuf,
@@ -54,8 +44,7 @@ enum ServeRefusal {
     /// `--auth` named a file [`auth::load`] refused, or that could not be
     /// canonicalized after loading fine.
     Auth(AuthError),
-    /// `--spa` was given but `root` holds no `index.html` — a would-be 404
-    /// this flag is supposed to answer with would have nothing to answer it
+    /// `--spa` was given but `root` holds no `index.html` to answer a 404
     /// with.
     MissingSpaIndex {
         /// The resolved, canonical docroot.
@@ -94,9 +83,8 @@ impl From<AuthError> for ServeRefusal {
     }
 }
 
-/// The exit code a [`ServeRefusal`] reports — decision (Step 7.3): a bad
-/// `root` is a usage error, a bad `--auth` file or a missing SPA index is a
-/// config error.
+/// The exit code a [`ServeRefusal`] reports: a bad `root` is a usage error,
+/// a bad `--auth` file or a missing SPA index a config error.
 fn refusal_exit_code(refusal: &ServeRefusal) -> ExitCode {
     match refusal {
         ServeRefusal::RootUnresolvable { .. } | ServeRefusal::RootNotADirectory { .. } => {
@@ -113,7 +101,7 @@ fn fail(streams: &mut Streams<'_>, refusal: &ServeRefusal) -> ExitCode {
 }
 
 /// Resolves and canonicalizes `root`, refusing it if it is missing or not a
-/// directory (Phase 15 decision 11).
+/// directory.
 fn validate_root(root: &Path) -> Result<PathBuf, ServeRefusal> {
     let canonical =
         std::fs::canonicalize(root).map_err(|source| ServeRefusal::RootUnresolvable {
@@ -129,12 +117,9 @@ fn validate_root(root: &Path) -> Result<PathBuf, ServeRefusal> {
 
 /// Loads and canonicalizes `path` as `--auth`'s creds file, if given.
 ///
-/// Canonicalizing here — not deferred to [`sheep_args`]'s caller — is what
-/// [`sheep_args`]'s own doc comment calls out: the registering half must
-/// hand a relative `--auth` no further than this point, because a relative
-/// path baked into the registered sheep's command line resolves against the
-/// shepherd's cwd, not the operator's, and produces a sheep that validates
-/// clean at registration and crash-loops on its first restart.
+/// Canonicalizing here, not in [`sheep_args`]: a relative `--auth` baked
+/// into the registered command line resolves against the shepherd's cwd,
+/// giving a sheep that registers clean and crash-loops on its first spawn.
 ///
 /// # Errors
 /// [`ServeRefusal::Auth`] if the file cannot be loaded or, having loaded,
@@ -151,10 +136,10 @@ fn validate_auth(path: &Path) -> Result<(PathBuf, Credentials), ServeRefusal> {
 }
 
 /// The compensating control for allowing `--bind` wider than loopback
-/// (Phase 15 decision 8). `None` when `bind` is loopback; otherwise a
-/// stderr notice naming the address and the docroot it is about to expose,
-/// and — only when no `--auth` was set — spelling out that its files will
-/// be readable by anything that can reach the port.
+///
+/// `None` when `bind` is loopback; otherwise a stderr notice naming the
+/// address and the docroot, and, when no `--auth` was set, saying its files
+/// are readable by anything that can reach the port.
 fn exposure_notice(bind: IpAddr, auth: bool, root: &Path) -> Option<String> {
     if bind.is_loopback() {
         return None;
@@ -173,12 +158,11 @@ fn exposure_notice(bind: IpAddr, auth: bool, root: &Path) -> Option<String> {
     })
 }
 
-/// The second, independent compensating control (Phase 15 decision 8's
-/// addendum): a stderr notice naming the check-then-open race
-/// `--follow-symlinks` reopens. `None` when the flag is off. Independent of
-/// [`exposure_notice`] on purpose — a fully loopback serve with the flag on
-/// must still get this notice, and a wide bind without the flag says
-/// nothing about symlinks.
+/// A stderr notice naming the check-then-open race `--follow-symlinks`
+/// reopens, or `None` when the flag is off
+///
+/// Independent of [`exposure_notice`]: a loopback serve with the flag on
+/// still needs this one.
 fn follow_symlinks_notice(follow_symlinks: bool) -> Option<String> {
     if !follow_symlinks {
         return None;
@@ -192,37 +176,14 @@ fn follow_symlinks_notice(follow_symlinks: bool) -> Option<String> {
 }
 
 /// The sheep's own command line, rebuilt from the flags rather than from
-/// `std::env::args`.
+/// `std::env::args`
 ///
-/// Rebuilt, not forwarded: the operator's `shep serve ./dist` carries a
-/// relative path that resolves against *their* cwd, and the shepherd spawns
-/// from its own. The canonical root goes in, and every flag is written in
-/// one canonical order, so `shep describe` shows the same line for the same
-/// server however it was typed.
-///
-/// **`root` and `auth` both arrive already canonical — the caller
-/// canonicalizes both**, in [`validate_root`] and [`validate_auth`], before
-/// building this line. `shep serve ./dist --auth ./creds` validates the
-/// file successfully in the registering half — so the operator sees no
-/// error at all — and then, if `--auth` were forwarded uncanonicalized,
-/// would register a sheep that resolves `./creds` against the shepherd's
-/// cwd, does not find it, and crash-loops. A relative docroot produces a
-/// 404; a relative creds path produces a server that never starts, after a
-/// green registration. This function only ever emits the paths it is
-/// handed.
-///
-/// **`--name` and `--fold` are deliberately NOT in the output.** They are
-/// registration-time facts — which sheep this is and which fold it joins —
-/// and mean nothing to the foreground worker that receives this line.
-///
-/// **`--follow-symlinks`, by contrast, is a worker-time fact and IS in the
-/// output when set**, the same as `--spa`, `--listing` and `--hidden`: the
-/// foreground process is the one that calls `fs::contain`, so it is the one
-/// that has to know. A sheep registered with the flag on and restarted by
-/// the shepherd must come back up still following symlinks — dropping it
-/// here would be the same silent downgrade `--bind`'s round-trip test
-/// already guards against, on a security-relevant flag instead of a
-/// networking one.
+/// The operator's cwd is not the shepherd's, and one canonical flag order
+/// makes `shep describe` show the same line however it was typed. `root`
+/// and `auth` must both arrive canonical; this only emits what it is
+/// handed. `--name` and `--fold` are registration-time facts and stay out.
+/// Every worker-time flag goes in, `--follow-symlinks` included: a restart
+/// that dropped it would silently change what the worker serves.
 fn sheep_args(root: &Path, auth: Option<&Path>, args: &ServeArgs) -> Vec<String> {
     let mut out = vec!["serve".to_string(), root.display().to_string()];
     out.push("--port".to_string());
@@ -258,14 +219,11 @@ fn default_name(root: &Path) -> String {
         .unwrap_or_else(|| "serve".to_string())
 }
 
-/// `shep serve`'s entry point, reached from `lib.rs`'s early dispatch —
-/// before the shared `$SHEP_HOME`-gated, locked block, the same spot
-/// `lookout` and `bleats` are, and for the same reason: `--foreground` runs
-/// until signalled.
+/// `shep serve`'s entry point, reached from `lib.rs`'s early dispatch
 ///
 /// Does every refusal and every notice once, for both halves, so
-/// `--foreground` and the registered sheep can never disagree about what is
-/// valid — see this module's own doc.
+/// `--foreground` and the registered sheep cannot disagree about what is
+/// valid.
 pub async fn serve(streams: &mut Streams<'_>, paths: &ShepPaths, args: &ServeArgs) -> ExitCode {
     let root = match validate_root(&args.root) {
         Ok(root) => root,
@@ -316,9 +274,8 @@ pub async fn serve(streams: &mut Streams<'_>, paths: &ShepPaths, args: &ServeArg
 }
 
 /// Registers `root` as a sheep whose command line runs this same binary
-/// again with `--foreground` appended ([`sheep_args`]), through the same
-/// path `shep start` uses — `connect_or_spawn_client`, because starting a
-/// sheep against a dead shepherd means bringing one up first.
+/// again with `--foreground` appended ([`sheep_args`]), through the
+/// `connect_or_spawn_client` path `shep start` uses.
 async fn register(
     streams: &mut Streams<'_>,
     paths: &ShepPaths,
@@ -339,10 +296,8 @@ async fn register(
     app.args = sheep_args(root, auth, args);
     app.fold.clone_from(&args.fold);
 
-    // Names the guard rather than being threaded one from `run`'s dispatch:
-    // `serve` is not one of `crate::RECOVERY_VERBS` and cannot become one —
-    // it registers a sheep, which is the opposite of a way out of a version
-    // skew — so there is no value here but `Enforce` to pass down.
+    // `serve` registers a sheep, so it is not one of
+    // `crate::RECOVERY_VERBS` and there is no value but `Enforce` here.
     let client =
         match crate::connect_or_spawn_client(streams, paths, crate::VersionGuard::Enforce).await {
             Ok(client) => client,
@@ -366,10 +321,8 @@ async fn register(
 /// Sends `body`, renders whatever the daemon answers through [`emit`], and
 /// maps every way that can go wrong to its exit code.
 ///
-/// A copy of `commands::lifecycle`'s own helper of the same name and shape
-/// (also duplicated in `commands::logs`/`commands::query`) rather than a
-/// shared one — this project's own precedent for a small, single-purpose
-/// helper with more than one call site across `commands/`.
+/// A copy of `commands::lifecycle`'s helper of the same name and shape,
+/// also duplicated in `commands::logs` and `commands::query`.
 async fn request_and_render<T, F>(
     client: &Client,
     streams: &mut Streams<'_>,
@@ -423,12 +376,8 @@ mod tests {
         }
     }
 
-    /// fails if the registered command line loses a flag, or carries the
-    /// operator's relative path instead of the canonical one.
-    ///
-    /// Every field of `ServeArgs` is set to a non-default value here, so a
-    /// flag `sheep_args` forgets shows up as an absence rather than as a
-    /// default that happens to match.
+    /// Every field of `ServeArgs` is non-default here, so a forgotten flag
+    /// shows up as an absence rather than a matching default.
     #[test]
     fn the_registered_command_line_is_absolute_and_carries_every_flag() {
         let args = full_args();
@@ -462,14 +411,9 @@ mod tests {
         );
     }
 
-    /// fails if the rebuilt line does not parse back to the same flags — the
-    /// half a string-equality test cannot see.
-    ///
     /// Whole-struct equality, not field by field: a field added to
-    /// `ServeArgs` without a matching arm in `sheep_args` fails this test by
-    /// construction, which is the property the earlier field-by-field
-    /// version claimed and did not have — it asserted four of ten fields
-    /// and let `--bind` and `--auth` through silently.
+    /// `ServeArgs` with no matching arm in `sheep_args` then fails by
+    /// construction.
     #[test]
     fn the_registered_command_line_parses_back_to_the_same_arguments() {
         use crate::cli::{Cli, Commands};
@@ -493,7 +437,7 @@ mod tests {
                 root: PathBuf::from("/srv/www"),
                 auth: Some(PathBuf::from("/srv/creds")),
                 foreground: true,
-                // registration-time only, and absent from the line by design
+                // registration-time only
                 name: None,
                 fold: None,
                 ..original
@@ -501,8 +445,7 @@ mod tests {
         );
     }
 
-    /// fails if widening the bind stops being loud. The notice is the entire
-    /// compensating control for allowing `--bind 0.0.0.0` (decision 8).
+    /// The notice is the whole compensating control for `--bind 0.0.0.0`.
     #[test]
     fn a_non_loopback_bind_produces_a_notice_that_names_the_address() {
         use std::net::{IpAddr, Ipv4Addr};
@@ -527,10 +470,6 @@ mod tests {
         assert!(!with_auth.contains("readable"), "{with_auth}");
     }
 
-    /// fails if turning symlink-following on stops being loud, or if the
-    /// notice reads as free rather than as a reopened race. Independent of
-    /// `exposure_notice` on purpose (decision 8's addendum): a fully
-    /// loopback serve with the flag on must still get this notice.
     #[test]
     fn follow_symlinks_produces_a_notice_that_names_the_race() {
         assert!(follow_symlinks_notice(false).is_none());

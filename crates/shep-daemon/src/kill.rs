@@ -1,11 +1,9 @@
 //! The kill ladder: graceful stop escalating to `SIGKILL`
 //!
-//! [`kill_process`] runs inside the sheep task that owns the live [`RunningProcess`]
-//! (Task 9's per-sheep task). It is generic over [`RunningProcess`] so the same
-//! ladder drives both `crate::fake::FakeProc` in engine tests and the real
-//! `tokio_runner` child in production — this module itself stays portable
-//! (no `cfg(unix)`) since it only touches the portable [`StopSignal`] enum and
-//! the [`RunningProcess`] trait, never OS signal APIs directly.
+//! [`kill_process`] runs inside the sheep task that owns the live
+//! [`RunningProcess`], and is generic over that trait so one ladder drives
+//! both the engine tests' fake and the real child. Portable: it touches only
+//! [`StopSignal`] and the trait, never an OS signal API.
 
 use core::time::Duration;
 
@@ -18,46 +16,19 @@ use crate::runner::{ExitOutcome, RunningProcess, StopSignal};
 
 /// Runs the stop ladder against one live process and returns its exit outcome.
 ///
-/// 1. If `app.shutdown_with_message` is set and `to_child` is present, sends
-///    [`ShepherdMessage::Shutdown`] over the shepherd channel; otherwise sends
-///    the app's configured [`StopSignal`] (resolved by the private
-///    `stop_signal` parser from `app.kill_signal`) to the sheep's whole
-///    process group — lambs included, see [`RunningProcess::signal`].
-/// 2. Waits up to `grace` for the process to exit.
-/// 3. On timeout, `SIGKILL`s that SAME process group and waits for that to
-///    land — not the whole process tree, which is what the block comment
-///    below spends a paragraph explaining this rung cannot reach. On
-///    Windows it is the sheep's whole job, which nothing escapes; see
-///    `RunningProcess::kill_tree`'s two arms.
+/// `app.shutdown_with_message` with a `to_child` present sends
+/// [`ShepherdMessage::Shutdown`]; otherwise the app's [`StopSignal`] goes to
+/// the sheep's whole process group, lambs included. After `grace`,
+/// [`RunningProcess::kill_tree`] sweeps that same group again.
 ///
-/// `grace` is the caller's, not the app's, because an app configures two of
-/// them for two different asks: `kill_timeout` for an ordinary stop, and
-/// `graceful_timeout` — longer by default — for the one stop that expects the
-/// instance to finish the work in hand first, a reload's drain. Step 1 is
-/// identical in both cases, including which of the two messages goes out:
-/// `shutdown_with_message` keys that, and a drain wanting more patience is not
-/// a reason to tell the child something different.
-///
-/// Delivery failures (message send, signal, `kill_tree`) are logged and never
-/// panic: the caller always gets a terminal [`ExitOutcome`], even if every
-/// delivery step failed and the timeout simply ran out the clock.
-// Step 3 is not made redundant by step 1 reaching the same process group:
-//
-// - Every signal step 1 can send is catchable. `SIGTERM`/`INT`/`QUIT`/`USR2`
-//   can all be trapped or ignored (`tests/real_runner.rs` runs a `trap ""
-//   TERM` sheep that does exactly that); `SIGKILL` cannot. Escalating from
-//   the polite signal to the unblockable one IS the ladder.
-// - Under `shutdown_with_message`, step 1 sends no signal at all — a child
-//   that never acts on the message has only this rung left.
-// - Group membership is a snapshot taken at delivery: anything forked after
-//   step 1's signal landed never saw it, and only step 3 re-sweeps the group.
-//
-// The rung it still cannot cover: `proc.wait()` resolves on the LEADER's
-// exit, so a lamb that survives its own graceful signal and outlives the
-// sheep ends the ladder at step 2 without ever reaching step 3. Waiting for
-// the whole group to empty has no portable syscall, and the daemon never
-// learns lamb pids (spec §7's shepherd channel does not report them), so
-// nothing here can detect that case today.
+/// `grace` is the caller's, not the app's: `kill_timeout` for an ordinary
+/// stop, the longer `graceful_timeout` for a reload's drain. Delivery
+/// failures are logged and never panic, so the caller always gets a terminal
+/// [`ExitOutcome`].
+// `kill_tree` is not redundant: the first rung's signal is catchable, the
+// message branch sends no signal, and a fork born after it never saw it.
+// A lamb outliving the sheep also skips this rung: `proc.wait()` already
+// resolved on the leader's exit, so `kill_tree` is never called.
 pub async fn kill_process<P: RunningProcess>(
     proc: &mut P,
     app: &AppConfig,
@@ -87,18 +58,10 @@ pub async fn kill_process<P: RunningProcess>(
 
 /// Maps `app.kill_signal` onto a [`StopSignal`]; unset defaults to `SIGTERM`.
 ///
-/// Total over [`KillSignal`], with no fallback branch, because the grammar
-/// and the rejection both live in shep-core now: a config that reached the
-/// daemon at all came through `normalize`, which refuses any name this cannot
-/// map. The `_ => Term` clamp this replaced is the whole of config.md #2 — it
-/// turned a typo into SIGTERM for the life of the process and said so only in
-/// a log line no detached daemon has a reader for.
-///
-/// The one branch that is still defensive is the unparseable name below. It
-/// is unreachable through `normalize`, and it is an `error!` rather than a
-/// `warn!` for that reason: reaching it means a config bypassed validation,
-/// which is a bug in the daemon's own wiring and not something an operator
-/// can fix by editing a file.
+/// Total over [`KillSignal`]: a config that reached the daemon came through
+/// `normalize`, which refuses any name this cannot map. The unparseable
+/// branch below is therefore a wiring bug in the daemon rather than anything
+/// an operator can fix, and logs at `error!` for that reason.
 fn stop_signal(app: &AppConfig) -> StopSignal {
     let Some(name) = app.kill_signal.as_deref() else {
         return StopSignal::Term;
@@ -132,8 +95,7 @@ mod tests {
     use crate::runner::{ProcessRunner, SpawnSpec};
     use crate::testing::capture_logs;
 
-    /// The cap an ordinary stop passes — the app's own `kill_timeout`, which
-    /// is what every caller outside a reload's drain hands `kill_process`.
+    /// The cap an ordinary stop passes: the app's own `kill_timeout`.
     fn stop_grace(app: &AppConfig) -> Duration {
         app.kill_timeout.as_duration()
     }
@@ -183,10 +145,8 @@ mod tests {
         assert_eq!(outcome.signal, Some(9));
     }
 
-    // fails if the ladder ignores the cap its caller passed and reads
-    // `kill_timeout` off the app again — a drain would then SIGKILL the
-    // instance at 1600ms, five seconds before the deadline it was promised,
-    // and the whole point of draining is the time to finish work in hand.
+    // fails if the ladder reads `kill_timeout` off the app instead of the cap
+    // its caller passed, SIGKILLing a drain five seconds early
     #[tokio::test(start_paused = true)]
     async fn a_drain_waits_the_caps_it_was_given_not_the_apps_kill_timeout() {
         let runner = ScriptedRunner::new(vec![ProcScript::ignores_signals()]);
@@ -214,8 +174,8 @@ mod tests {
 
         let outcome = kill_process(&mut proc, &app, Some(&io.to_child), stop_grace(&app)).await;
 
-        // The fake resolves an obeys_signal wait to Term (15) on a Shutdown
-        // message too (Task 3 rule) — but it's never recorded as a signal() call.
+        // The fake resolves an `obeys_signal` wait to Term (15) on a
+        // `Shutdown` message too, but records no `signal()` call.
         assert_eq!(outcome.signal, Some(15));
         assert!(runner.signals(0).is_empty());
 
@@ -261,11 +221,6 @@ mod tests {
         }
     }
 
-    // fails if an unparseable `kill_signal` reaching the stop ladder (a state
-    // `normalize` should have refused before the daemon ever saw it) stops
-    // logging loudly. This branch is unreachable through a validated config;
-    // it exists only for a wiring bug, and an `error!` line is the one signal
-    // an operator staring at a detached daemon's logs would actually have.
     #[test]
     fn an_unvalidated_kill_signal_reaching_the_ladder_falls_back_to_term_and_logs_loudly() {
         let mut app = AppConfig::minimal("web", "./srv");

@@ -1,21 +1,15 @@
-//! Hand-rolled test doubles shared across this phase's tasks (and, via the
-//! `test-support` feature, shep-cli's own tests) — the ONE home for every
-//! scripted daemon/client double: no other module grows a second
-//! `fake_daemon`, and no other crate defines its own.
+//! Test doubles for a scripted daemon peer, shared with shep-cli via the
+//! `test-support` feature. The only module that defines a `fake_daemon`.
 //!
-//! Every helper takes the socket path as `&Path` — this module carries no
-//! dev-dependencies (it compiles into an ordinary build under
-//! `test-support`, so `missing_docs` and `missing_debug_implementations`
-//! apply to it exactly like any other public module), so the caller owns
-//! the `TempDir`.
+//! Every helper takes the socket path as `&Path`; the caller owns the
+//! `TempDir`. No dev-dependencies, so `missing_docs` and
+//! `missing_debug_implementations` apply here like any other public module.
 //!
-//! [`fake_daemon`], [`sample_ack`], and [`sample_info`] are the
-//! handshake-only primitives. [`FakeDaemon`] and the `fake_client_*`
-//! helpers below it connect a real [`Client`] against a scripted peer,
-//! for testing the connection actor's request/reply routing and beyond.
-//! [`fast_opts`], [`start_fake_daemon_answering_on`] and
-//! [`child_exiting_with`] serve the autostart tests, where the peer has to
-//! be brought into existence from a synchronous launcher closure.
+//! [`fake_daemon`], [`sample_ack`] and [`sample_info`] are handshake-only
+//! primitives; [`FakeDaemon`] and the `fake_client_*` helpers connect a
+//! real [`Client`] against a scripted peer; [`fast_opts`],
+//! [`start_fake_daemon_answering_on`] and [`child_exiting_with`] serve the
+//! autostart tests.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -41,26 +35,11 @@ use crate::{Client, ReconnectingClient};
 /// A control address valid on the platform running the test, unique to
 /// `dir`.
 ///
-/// Every fake in this module takes an address as `&Path`. That works
-/// directly on unix (`dir.path().join("s.sock")`), but cannot on Windows,
-/// where the control transport is a named pipe: `\\.\pipe\...` is a name in
-/// a machine-global kernel namespace, not a path under a directory, so a
-/// tempdir path names nothing a pipe can be created on.
-///
-/// The uniqueness argument is the reason this takes a `dir` it does not
-/// otherwise need on Windows. The pipe namespace is shared by every process
-/// on the machine, so two tests that picked one fixed name would contend for
-/// real — passing individually and failing under `cargo test`'s default
-/// parallelism, which is the worst way for this to show up. A `TempDir`'s
-/// path is already unique per test, so folding it into the pipe name inherits
-/// that uniqueness instead of inventing a second scheme. This is the same
-/// derivation [`ShepPaths::pipe_name`](shep_core::paths::ShepPaths::pipe_name)
-/// performs for a real `$SHEP_HOME`, which is why the two agree by
-/// construction rather than by being kept in step.
-///
-/// The process id is folded in as well, because `cargo test` runs each
-/// integration binary as its own process and two of them can hold
-/// same-named tempdirs on some platforms.
+/// Unix uses `dir` directly. Windows names a pipe in a machine-global
+/// namespace instead of a path under `dir`, matching
+/// [`ShepPaths::pipe_name`](shep_core::paths::ShepPaths::pipe_name)'s own
+/// derivation; the pid is folded in too, since each `cargo test` binary is
+/// its own process and could otherwise collide on a shared `TempDir` name.
 #[must_use]
 pub fn control_address(dir: &Path) -> PathBuf {
     #[cfg(unix)]
@@ -84,28 +63,20 @@ pub fn control_address(dir: &Path) -> PathBuf {
 
 /// The framed transport a fake daemon holds for one accepted client.
 ///
-/// Deliberately NOT [`crate::connection::Frames`], which is the *client's*
-/// side. The two are the same type on unix, where a socket's two ends are
-/// indistinguishable, and different types on Windows, where a named pipe's
-/// server end is its own type. Every fake in this module is a server, so it
-/// frames a [`ServerStream`]; reusing the client alias compiled on unix and
-/// would not on Windows, which is precisely the bug this separate name
-/// exists to make impossible.
+/// Not [`crate::connection::Frames`], the client's side: the two coincide
+/// on unix but differ on Windows, where a named pipe's server end is its
+/// own type.
 type Frames = Framed<ServerStream, tokio_util::codec::LengthDelimitedCodec>;
 use crate::spawn::SpawnOptions;
 
-/// Serves exactly one connection, replying to the `Hello` with `reply`,
-/// then closing. The returned handle yields the `Hello` the client
-/// actually sent, so a test can assert on the announcement as well as on
-/// the answer.
+/// Serves exactly one connection, replying to the `Hello` with `reply` and
+/// closing. Returns the `Hello` the client actually sent.
 ///
-/// Binds before returning, so a caller that awaits it can `connect`
-/// immediately without a sleep.
+/// Binds before returning, so a caller can `connect` immediately without a
+/// sleep.
 ///
-/// Panics if `path` cannot be bound, or if the served connection fails to
-/// accept, read the `Hello` frame, decode it, or send `reply` back — this
-/// is test scaffolding, meant to fail the test loudly rather than surface
-/// a `Result` nobody would check.
+/// Panics if `path` cannot be bound or the connection fails partway
+/// through the handshake.
 pub async fn fake_daemon(path: &Path, reply: HelloReply) -> JoinHandle<Hello> {
     let mut listener = Listener::bind(path).unwrap();
     tokio::spawn(async move {
@@ -119,20 +90,13 @@ pub async fn fake_daemon(path: &Path, reply: HelloReply) -> JoinHandle<Hello> {
 }
 
 /// Binds `path`, accepts one connection, handshakes with `ack`, answers the
-/// first request it receives with `response`, and returns the envelope it
-/// received.
+/// first request with `response`, and returns the received envelope.
 ///
-/// Unlike [`fake_client_on`] and its siblings below, this does not connect a
-/// [`Client`] of its own — it only listens, so the caller's OWN connect is
-/// the first and only thing that ever dials it. That is the shape
-/// `shep-cli`'s `DogRuntime::start` needs to be tested against: it performs
-/// its own `Client::connect`, so a fixture that already holds a connected
-/// `Client` (every `fake_client_*` helper below) cannot stand in for the
-/// peer on the other end of it.
+/// Unlike [`fake_client_on`] and its siblings, this does not connect its own
+/// [`Client`]: it only listens, for a caller (`shep-cli`'s `DogRuntime::start`)
+/// that performs its own `Client::connect`.
 ///
-/// Panics on any accept/handshake/decode/encode failure, same as
-/// [`fake_daemon`] — test scaffolding, meant to fail the test loudly rather
-/// than surface a `Result` nobody would check.
+/// Panics on any accept, handshake, decode or encode failure.
 pub async fn serve_one_request(
     path: &Path,
     ack: HelloAck,
@@ -149,25 +113,15 @@ pub async fn serve_one_request(
     })
 }
 
-/// Binds `path` and answers EVERY connection — one handshake and one request
-/// each — with `reply`, until the returned handle is aborted.
+/// Binds `path` and answers every connection, one handshake and one request
+/// each, with `reply`, until the returned handle is aborted.
 ///
-/// Every other fake in this module accepts exactly one connection
-/// (`serve_scripted` opens with a bare `accept` and then loops over frames),
-/// which is right for a caller handed an already-connected [`Client`]. `shep
-/// whistle` is the first caller in this workspace that opens a fresh
-/// connection per request — see `shep-cli/src/whistle/shepherd.rs` for why —
-/// so it needs a listener that outlives the first call.
+/// The `served` counter is returned separately from the task: the accept
+/// loop never ends on its own, so a `JoinHandle<u32>` could never be read
+/// (`abort()` gives `JoinError::Cancelled`, an await waits forever). The
+/// `AtomicU32` can be read while the fake is still running.
 ///
-/// The returned `served` counter is shared, not the task's return value: the
-/// accept loop never ends on its own, so a `JoinHandle<u32>` would carry a
-/// number no caller could ever read (a caller that `abort()`s gets
-/// `JoinError::Cancelled`, and a caller that awaits waits forever). An
-/// `AtomicU32` the test reads WHILE the fake is still running is what lets a
-/// test assert that a request was made exactly once rather than retried.
-///
-/// Panics if `path` cannot be bound — test scaffolding, the same failure mode
-/// [`fake_daemon`] documents.
+/// Panics if `path` cannot be bound.
 pub fn fake_daemon_accepting_repeatedly(
     path: &Path,
     reply: Response,
@@ -176,12 +130,10 @@ pub fn fake_daemon_accepting_repeatedly(
 }
 
 /// As [`fake_daemon_accepting_repeatedly`], but with a caller-chosen
-/// [`HelloAck`] — for a caller whose own version-skew guard would otherwise
-/// refuse [`sample_ack`]'s fixed `"9.9.9"` on every one of these repeated
-/// connections.
+/// [`HelloAck`], for a caller whose version-skew guard would otherwise
+/// refuse [`sample_ack`]'s fixed `"9.9.9"`.
 ///
-/// Panics if `path` cannot be bound — test scaffolding, the same failure mode
-/// [`fake_daemon`] documents.
+/// Panics if `path` cannot be bound.
 pub fn fake_daemon_accepting_repeatedly_with_ack(
     path: &Path,
     ack: HelloAck,
@@ -195,9 +147,7 @@ pub fn fake_daemon_accepting_repeatedly_with_ack(
             let mut frames = Framed::new(stream, codec());
             let _hello = handshake(&mut frames, ack.clone()).await;
             let envelope = read_envelope(&mut frames).await;
-            // `write_reply` wraps the value in `Ok` itself — its signature is
-            // `(&mut Frames, u64, Response)`, testing.rs:155 — so passing an
-            // `Ok(...)` here is a type error, not a courtesy.
+            // `write_reply` already wraps the response in `Ok`.
             write_reply(&mut frames, envelope.id, reply.clone()).await;
             counter.fetch_add(1, Ordering::SeqCst);
         }
@@ -206,43 +156,32 @@ pub fn fake_daemon_accepting_repeatedly_with_ack(
 }
 
 /// What one generation of [`fake_daemon_across_handovers`] does with the
-/// `Hello` a client sends it.
-///
-/// The three shapes a reconnecting client has to survive, and no others:
-/// a daemon that answers, one that refuses on version skew, and one that is
-/// bound but not yet able to answer at all.
+/// `Hello` a client sends it: the three shapes a reconnecting client has
+/// to survive, and no others.
 #[derive(Debug, Clone)]
 pub enum Handshake {
     /// Answer the `Hello` with this ack, then serve requests until the
     /// connection is cut.
     Accept(HelloAck),
-    /// Refuse the `Hello` with this error and close — the successor a dog
-    /// compiled against an older protocol meets.
+    /// Refuse the `Hello` with this error and close, as a successor
+    /// compiled against an older protocol would.
     Refuse(RpcError),
-    /// Close without answering the `Hello` at all — a successor that is
-    /// accepting but has not finished coming up.
+    /// Close without answering the `Hello`, as a successor still coming up
+    /// would.
     Drop,
 }
 
-/// A fake shepherd that survives a handover: ONE listener, one accepted
+/// A fake shepherd that survives a handover: one listener, one accepted
 /// connection at a time, and a [`Self::cut`] that drops the accepted
-/// connection out from under the client.
-///
-/// That asymmetry is the whole fixture. A real daemon handover passes the
-/// LISTENING socket across its `execve` and cannot pass an accepted one, so
-/// the address never stops being connectable while every established
-/// connection dies — which is precisely why a carried dog ends up a live
-/// process holding a dead socket. A fake that dropped its listener too
-/// would exercise "the daemon went away", a different situation with a
-/// different answer.
+/// connection out from under the client while the listener stays bound,
+/// matching a real daemon's `execve`, which carries the listening socket
+/// across but cannot carry an accepted connection.
 ///
 /// Each connection is served by the next [`Handshake`] in the list; once
-/// they run out the last one repeats, so a test sizes the list to what it
-/// means to assert and not to how many attempts the client makes.
+/// they run out, the last one repeats.
 ///
-/// Panics if `path` cannot be bound, and on any accept/decode/encode
-/// failure — test scaffolding, the same failure mode [`fake_daemon`]
-/// documents.
+/// Panics if `path` cannot be bound, or on any accept, decode or encode
+/// failure.
 #[derive(Debug)]
 pub struct Handovers {
     cut: mpsc::Sender<()>,
@@ -256,64 +195,56 @@ pub struct Handovers {
 }
 
 impl Handovers {
-    /// Drops the currently accepted connection, leaving the listener bound.
-    ///
-    /// The handover, compressed: what the client sees is exactly what an
-    /// `execve` in the daemon produces for it.
+    /// Drops the currently accepted connection, leaving the listener bound,
+    /// matching what a real `execve` produces for the client.
     pub async fn cut(&self) {
         let _ = self.cut.send(()).await;
     }
 
-    /// Arms the current connection to read its next request envelope and
-    /// then die WITHOUT answering it — a request the daemon may or may not
-    /// have acted on before the image swapped.
+    /// Arms the current connection to read its next request envelope, then
+    /// die without answering it.
     ///
-    /// Synchronous rather than `async`, so a test can arm it on the line
-    /// before the request it means to lose (an `await` here would give the
-    /// serving task a chance to run first).
+    /// Synchronous, not `async`: an `await` here would give the serving
+    /// task a chance to run before the test arms it.
     pub fn cut_on_next_request(&self) {
         self.cut_on_next_request.store(true, Ordering::SeqCst);
     }
 
     /// How many connections this fake has accepted so far, across every
-    /// generation. The number that says whether a client retried, gave up,
-    /// or spun.
+    /// generation.
     #[must_use]
     pub fn accepted(&self) -> u32 {
         self.accepted.load(Ordering::SeqCst)
     }
 
-    /// Every `Hello` this fake has read, in the order its generations read
-    /// them — including the ones it went on to REFUSE, which is the only
-    /// path where a real daemon can learn which dog it just turned away.
+    /// Every `Hello` this fake has read, in order, including ones it went
+    /// on to refuse: the only path where a real daemon learns which dog it
+    /// just turned away.
     #[must_use]
     pub fn hellos(&self) -> Vec<Hello> {
         self.hellos.lock().unwrap().clone()
     }
 
-    /// Every request envelope received so far, each paired with the 1-based
-    /// generation that received it — so a test can ask what the SUCCESSOR
-    /// saw rather than only what the fake saw in total.
+    /// Every request envelope received so far, paired with the 1-based
+    /// generation that received it.
     #[must_use]
     pub fn envelopes(&self) -> Vec<(u32, Envelope)> {
         self.envelopes.lock().unwrap().clone()
     }
 
     /// Arms the answer every generation gives to `Request::ListFlock`.
-    /// Unlike [`FakeDaemon::reply_to_list`] this is not consumed, because a
-    /// test that reloads under a dog asks the same question of both
-    /// generations.
+    /// Unlike [`FakeDaemon::reply_to_list`], not consumed: a reload test
+    /// asks both generations the same question.
     pub fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
         *self.armed_list.lock().unwrap() = flock;
     }
 
     /// Arms the `[<name>]` section every generation answers
-    /// `Request::DogConfig` with. Empty until a test says otherwise, which
-    /// is what a home with no dog configured really answers.
+    /// `Request::DogConfig` with. Empty until set, matching a home with no
+    /// dog configured.
     ///
-    /// Not consumed, for the same reason [`Self::reply_to_list`] is not: a
-    /// dog asks its own section again after a handover, and again whenever
-    /// a `config.dog.<name>` frame tells it to.
+    /// Not consumed, like [`Self::reply_to_list`]: a dog asks again after a
+    /// handover.
     pub fn reply_to_dog_config(&self, section: &str) {
         *self.armed_dog_section.lock().unwrap() = section.to_owned();
     }
@@ -326,11 +257,9 @@ impl Drop for Handovers {
 }
 
 /// Binds `path` and serves one connection per entry in `handshakes`, in
-/// order. See [`Handovers`] for what this fixture models and why the
-/// listener outlives every connection.
+/// order. See [`Handovers`] for what this fixture models.
 ///
-/// Panics if `path` cannot be bound — test scaffolding, the same failure
-/// mode [`fake_daemon`] documents.
+/// Panics if `path` cannot be bound.
 #[must_use]
 pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> Handovers {
     assert!(
@@ -367,12 +296,8 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
                 match script {
                     Handshake::Drop => continue,
                     Handshake::Refuse(err) => {
-                        // The client's `Hello` is read first so the refusal
-                        // is an answer rather than a race with its own write.
-                        // Recorded before the refusal, not after: a real
-                        // daemon has to read the name off a `Hello` it is
-                        // about to refuse, and that is the only path where
-                        // it can learn which dog it just refused.
+                        // Recorded before the refusal: the only path where
+                        // a real daemon learns which dog it just refused.
                         if let Some(Ok(first)) = frames.next().await {
                             hellos.lock().unwrap().push(decode_frame(&first).unwrap());
                         }
@@ -401,11 +326,8 @@ pub fn fake_daemon_across_handovers(path: &Path, handshakes: Vec<Handshake>) -> 
                                     Response::Flock(armed_list.lock().unwrap().clone())
                                 }
                                 Request::Subscribe { .. } => Response::Subscribed,
-                                // A real answer rather than the `Pong`
-                                // below, because a dog refuses to run on a
-                                // reply it cannot parse: this is the first
-                                // request every dog makes, and a fixture
-                                // that fumbles it never sees the second.
+                                // A dog refuses to run on a reply it can't
+                                // parse, and this is its first request.
                                 Request::DogConfig { .. } => Response::DogSection {
                                     toml: armed_dog_section.lock().unwrap().clone().into(),
                                 },
@@ -443,8 +365,8 @@ pub fn sample_ack() -> HelloAck {
     }
 }
 
-/// One fully-populated [`ProcessInfo`] — every `Option` is `Some`, so a
-/// payload type's anti-drift test sees every serialized field.
+/// One fully-populated [`ProcessInfo`]: every `Option` is `Some`, so an
+/// anti-drift test sees every serialized field.
 #[must_use]
 pub fn sample_info() -> ProcessInfo {
     ProcessInfo::builder(1, "web", ProcStatus::Online)
@@ -458,33 +380,27 @@ pub fn sample_info() -> ProcessInfo {
         .memory_bytes(Some(48 * 1024 * 1024))
         .dog(Some(DogSource::BuiltIn))
         .lambs(Some(vec![Lamb::new(4243, "node")]))
-        // `restarts: 3` above already says this sheep has exited before;
-        // giving it a real outcome here rather than `None` keeps that
-        // consistent, and keeps this fixture exercising `last_exit`'s own
-        // JSON shape the same way it exercises every other field's.
+        // `restarts: 3` already implies an exit; give it a real outcome
+        // rather than `None` so `last_exit`'s JSON shape gets exercised too.
         .last_exit(Some(ExitInfo {
             code: Some(1),
             signal: None,
         }))
-        // The reference smit a deploy dog paints, non-ASCII and all: this
-        // fixture's job is that every `Option` is `Some`, and a mark shep
-        // does not understand is exactly what this field carries in life.
+        // Non-ASCII, like a real deploy dog's mark: every `Option` here
+        // must be `Some`.
         .smit(Some("\u{25b2} main@a1b2c3".to_string()))
         .build()
 }
 
 /// Depth of a [`FakeDaemon`]'s script channel and of
-/// [`fake_client_capturing_envelopes`]'s capture channel — generous test
-/// scaffolding, never tuned, same rationale as `shep-daemon`'s own fake
-/// (`fake.rs`'s `CHANNEL_CAPACITY`).
+/// [`fake_client_capturing_envelopes`]'s capture channel: generous and
+/// untuned, like `shep-daemon`'s own `CHANNEL_CAPACITY`.
 const SCRIPT_CHANNEL_CAPACITY: usize = 8;
 
-/// Completes the handshake side of the protocol: reads the client's
-/// `Hello`, answers with `ack`, and hands the `Hello` back for a caller
-/// that wants to assert on it.
+/// Completes the handshake: reads the client's `Hello`, answers with
+/// `ack`, and returns the `Hello`.
 ///
-/// Panics on any accept/read/decode/write failure — test scaffolding, see
-/// [`fake_daemon`]'s own doc for why that is the right failure mode here.
+/// Panics on any accept, read, decode or write failure.
 async fn handshake(frames: &mut Frames, ack: HelloAck) -> Hello {
     let first = frames.next().await.unwrap().unwrap();
     let hello: Hello = decode_frame(&first).unwrap();
@@ -494,14 +410,13 @@ async fn handshake(frames: &mut Frames, ack: HelloAck) -> Hello {
 }
 
 /// Reads and decodes the next envelope. Panics on failure or a closed
-/// connection — test scaffolding, see [`fake_daemon`]'s own doc.
+/// connection.
 async fn read_envelope(frames: &mut Frames) -> Envelope {
     let frame = frames.next().await.unwrap().unwrap();
     decode_frame(&frame).unwrap()
 }
 
-/// Encodes and sends one successful [`Reply`] for `id`. Panics on failure —
-/// test scaffolding, see [`fake_daemon`]'s own doc.
+/// Encodes and sends one successful [`Reply`] for `id`. Panics on failure.
 async fn write_reply(frames: &mut Frames, id: u64, response: Response) {
     let reply = Reply {
         id,
@@ -510,8 +425,7 @@ async fn write_reply(frames: &mut Frames, id: u64, response: Response) {
     frames.send(encode_frame(&reply).unwrap()).await.unwrap();
 }
 
-/// Encodes and sends one error [`Reply`] for `id`. Panics on failure —
-/// test scaffolding, see [`fake_daemon`]'s own doc.
+/// Encodes and sends one error [`Reply`] for `id`. Panics on failure.
 async fn write_err(frames: &mut Frames, id: u64, code: RpcErrorCode, message: String) {
     let reply = Reply {
         id,
@@ -524,18 +438,15 @@ async fn write_err(frames: &mut Frames, id: u64, code: RpcErrorCode, message: St
     frames.send(encode_frame(&reply).unwrap()).await.unwrap();
 }
 
-/// Encodes and sends one [`BusEvent`] frame directly — not wrapped in a
-/// [`Reply`], the shape a real subscriber actually receives. Panics on
-/// failure — test scaffolding, see [`fake_daemon`]'s own doc.
+/// Encodes and sends one [`BusEvent`] frame directly, not wrapped in a
+/// [`Reply`]: the shape a real subscriber receives. Panics on failure.
 async fn write_event(frames: &mut Frames, event: BusEvent) {
     frames.send(encode_frame(&event).unwrap()).await.unwrap();
 }
 
-/// Sends a `BusEvent::Process` built from [`sample_info`] — the daemon's
-/// own documented ordering (`shep-daemon/tests/daemon_e2e.rs:161-174`): a
-/// sheep's bus event can legitimately arrive ahead of the reply for the
-/// request that caused it. Panics on failure — test scaffolding, see
-/// [`fake_daemon`]'s own doc.
+/// Sends a `BusEvent::Process` built from [`sample_info`]: a sheep's bus
+/// event can legitimately arrive ahead of the reply for the request that
+/// caused it. Panics on failure.
 async fn send_sample_event(frames: &mut Frames) {
     write_event(
         frames,
@@ -552,39 +463,31 @@ async fn send_sample_event(frames: &mut Frames) {
 /// One scripted step sent to a [`FakeDaemon`]'s background task.
 ///
 /// [`FakeDaemon::reply_to_list`] and [`FakeDaemon::queue_reply_then_event`]
-/// do NOT go through this channel — both are synchronous (a `Mutex`-backed
-/// flag), because every plan call site invokes them without `.await`. This
-/// enum carries the remaining scripted behaviors, each armed at most once,
-/// by the `fake_client_*` constructor or `FakeDaemon` method that needs it.
+/// go through a `Mutex`-backed flag instead, since every call site invokes
+/// them without `.await`. This enum carries the rest, each armed at most
+/// once.
 enum ScriptCommand {
-    /// Arms the next request (of any kind) to receive an [`RpcError`] with
-    /// this `code` and `message` instead of a normal response.
+    /// Arms the next request to receive an [`RpcError`] with this `code`
+    /// and `message` instead of a normal response.
     ReplyErr(RpcErrorCode, String),
     /// Arms the next request to receive a [`sample_info`]-based
-    /// `BusEvent::Process` BEFORE its `Pong` reply.
+    /// `BusEvent::Process` before its `Pong` reply.
     EventThenReply,
     /// Buffers the next two requests, then answers the `ListFlock` one
-    /// first (`Response::Flock(vec![])`) and the other second
-    /// (`Response::Pong`) — regardless of which one arrived first, proof
-    /// that a `Client` routes replies by id rather than by send order.
+    /// first and the other second, regardless of arrival order.
     ArmOutOfOrder,
-    /// Queues one [`BusEvent`] for this connection's subscriber. Buffered
-    /// until the connection has observed and answered a `Request::Subscribe`
-    /// — see [`FakeDaemon::push`] for why — then written straight to the
-    /// wire for as long as the subscription stays live.
+    /// Queues one [`BusEvent`] for this connection's subscriber, buffered
+    /// until the connection has answered a `Request::Subscribe`.
     ///
-    /// Boxed: `BusEvent::Process` carries a `ProcessInfo`, which
-    /// grew past clippy's `large_enum_variant` threshold the moment
-    /// `last_exit` landed on it. Every other variant here is a handful of
-    /// bytes, so boxing this one rather than allowing the lint keeps the
-    /// enum's stack footprint tied to its smallest common case, not its
-    /// largest.
+    /// Boxed: `BusEvent::Process` carries a `ProcessInfo`, which is past
+    /// clippy's `large_enum_variant` threshold; every other variant here is
+    /// a few bytes.
     PushEvent(Box<BusEvent>),
     /// Ends the script: stop serving and let the task return.
     Close,
-    /// Ends the script the moment this connection has answered its next
-    /// `Request::Subscribe` and flushed anything already queued via
-    /// [`FakeDaemon::push`] — see [`FakeDaemon::close_after_subscribe`].
+    /// Ends the script once this connection has answered its next
+    /// `Request::Subscribe` and flushed anything queued via
+    /// [`FakeDaemon::push`].
     CloseAfterSubscribe,
 }
 
@@ -600,39 +503,13 @@ enum OutOfOrder {
     Buffered(Envelope),
 }
 
-/// A scripted daemon over one accepted connection.
+/// A scripted daemon over one accepted connection. Every request not
+/// covered by an armed method answers `Response::Pong`.
 ///
-/// [`Self::reply_to_list`] arms the answer to the next `Request::ListFlock`;
-/// [`Self::reply_to_describe`] arms the answer to the next
-/// `Request::Describe { .. }` (the shape both `describe` and `fold` send);
-/// [`Self::list_flock_count`] reports how many `ListFlock` requests this
-/// connection has answered, so a test can prove a client cached rather than
-/// re-asked; [`Self::close`] ends the script and drops the connection;
-/// [`Self::close_after_subscribe`] does the same but only once this
-/// connection's next `Request::Subscribe` has actually been answered,
-/// which is what a test needs when the script has to queue `close`
-/// *before* the client under test has connected at all.
-/// [`Self::reply_shutting_down_then_unlink_after`] arms the next request to
-/// be answered `Response::ShuttingDown` and, after a delay, unlinks this
-/// connection's socket file — the real teardown sequence, compressed;
-/// [`Self::reply_shutting_down_and_never_unlink`] answers the same way but
-/// leaves the socket file in place, the branch a kill-teardown timeout
-/// exists to observe.
-/// Every other request this fake receives is answered with
-/// `Response::Pong` — good enough for a test that only cares about
-/// `ListFlock`/`Describe` behavior, or about a request getting *some*
-/// prompt reply.
-/// [`Self::push`], [`Self::overrun_by`] and [`Self::queue_reply_then_event`]
-/// drive this connection's event side: a real `Request::Subscribe` is
-/// always answered with `Response::Subscribed` and switches the connection
-/// into forwarding pushed events straight to the wire.
-///
-/// A handful of `fake_client_*` constructors below
-/// ([`fake_client_replying_err`], [`fake_client_out_of_order`],
-/// [`fake_client_event_then_reply`]) also arm a one-shot error reply, an
-/// out-of-order two-request response, or an event-before-reply, via a
-/// private `ScriptCommand` — internal to this module, since nothing
-/// outside it needs to arm those behaviors directly.
+/// A few `fake_client_*` constructors below arm a one-shot error, an
+/// out-of-order reply, or an event-before-reply via a private
+/// `ScriptCommand`, since nothing outside this module needs to arm those
+/// directly.
 #[derive(Debug)]
 pub struct FakeDaemon {
     script: mpsc::Sender<ScriptCommand>,
@@ -650,40 +527,26 @@ impl FakeDaemon {
     /// Arms the answer to the next `Request::ListFlock` this connection
     /// receives.
     ///
-    /// Synchronous, not `async`: every call site invokes this without
-    /// `.await`, which would trip `unused_must_use` under `-D warnings`
-    /// against an `async fn`. A `Mutex`-backed flag lets this stay a plain
-    /// fn instead.
+    /// Synchronous: an `async fn` here would trip `unused_must_use` since
+    /// every call site invokes it without `.await`.
     pub fn reply_to_list(&self, flock: Vec<ProcessInfo>) {
         *self.armed_list.lock().unwrap() = Some(flock);
     }
 
     /// Arms a whole sequence of `Request::ListFlock` answers at once: the
     /// first call gets `responses[0]`, the second `responses[1]`, and so on.
+    /// Once the queue empties, [`Self::reply_to_list`]'s single-slot arming
+    /// takes back over.
     ///
-    /// For a test proving a caller re-asks on every scrape rather than
-    /// caching the first reading — the shep-cli metrics dog's own
-    /// `every_scrape_asks_the_shepherd_again` test. [`Self::reply_to_list`]
-    /// only arms ONE answer at a time (consumed on the next `ListFlock`), so
-    /// a test with two scrapes that must see two DIFFERENT listings would
-    /// otherwise need to re-arm between them with no hook to do it from —
-    /// the caller does not control when its own second request lands on the
-    /// wire. Once this queue empties, [`Self::reply_to_list`]'s own
-    /// single-slot arming (or the `Flock(vec![])` default) takes back over.
-    ///
-    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
-    /// call site invokes it without `.await`.
+    /// Synchronous, like [`Self::reply_to_list`].
     pub fn reply_to_list_sequence(&self, responses: Vec<Vec<ProcessInfo>>) {
         *self.armed_list_sequence.lock().unwrap() = responses.into();
     }
 
     /// Arms the answer to the next `Request::Describe { .. }` this
-    /// connection receives, regardless of the selector inside it —
-    /// `describe` and `fold` both send this request shape, and this fake
-    /// scripts the reply the same way for either.
+    /// connection receives, regardless of the selector inside it.
     ///
-    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
-    /// call site invokes it without `.await`.
+    /// Synchronous, like [`Self::reply_to_list`].
     pub fn reply_to_describe(&self, procs: Vec<ProcessInfo>) {
         *self.armed_describe.lock().unwrap() = Some(procs);
     }
@@ -695,53 +558,40 @@ impl FakeDaemon {
         self.list_flock_count.load(Ordering::SeqCst)
     }
 
-    /// Arms the reply this connection sends for the very next request it
-    /// receives (of any kind) as `reply`, then immediately follows it with
-    /// `event` written directly to the wire — the ordering
-    /// `shep-daemon/src/server.rs:357` actually produces: the `Subscribed`
-    /// reply ahead of any event, by queue order, once a subscriber is
-    /// installed.
+    /// Arms the reply this connection sends for its next request, then
+    /// immediately follows it with `event` written directly to the wire:
+    /// matches the ordering a real subscribe produces, reply ahead of any
+    /// event.
     ///
-    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
-    /// call site invokes it without `.await`.
+    /// Synchronous, like [`Self::reply_to_list`].
     pub fn queue_reply_then_event(&self, reply: Response, event: BusEvent) {
         *self.armed_reply_then_event.lock().unwrap() = Some((reply, event));
     }
 
-    /// Arms the next request to be answered `Response::ShuttingDown`, after
-    /// which this connection waits `after` and then unlinks its socket file
-    /// — the real teardown sequence, compressed.
+    /// Arms the next request to be answered `Response::ShuttingDown`; this
+    /// connection then waits `after` and unlinks its socket file.
     ///
-    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
-    /// call site invokes it without `.await`.
+    /// Synchronous, like [`Self::reply_to_list`].
     pub fn reply_shutting_down_then_unlink_after(&self, after: Duration) {
         *self.armed_shutdown_then_unlink.lock().unwrap() = Some(after);
     }
 
-    /// Arms the next request to be answered `Response::ShuttingDown` and then
-    /// nothing: the socket file stays. The branch `kill`'s timeout exists
-    /// for.
+    /// Arms the next request to be answered `Response::ShuttingDown` and
+    /// then nothing: the socket file stays.
     ///
-    /// Synchronous for the same reason [`Self::reply_to_list`] is: every
-    /// call site invokes it without `.await`.
+    /// Synchronous, like [`Self::reply_to_list`].
     pub fn reply_shutting_down_and_never_unlink(&self) {
         *self.armed_shutdown_never_unlink.lock().unwrap() = Some(());
     }
 
     /// Queues `event` for this connection's subscriber.
     ///
-    /// Before this connection has observed a `Request::Subscribe` and
-    /// answered it, `event` is buffered in arrival order rather than
-    /// written straight through — nothing is listening for it yet, since
-    /// the `broadcast::Receiver` a real `Client::subscribe` call installs
-    /// does not exist until that call returns, and a `broadcast::Receiver`
-    /// never sees a value sent before it existed. Once the subscription is
-    /// live, `push` writes straight to the wire.
+    /// Buffered in arrival order until the connection has answered a
+    /// `Request::Subscribe`, since a `broadcast::Receiver` never sees a
+    /// value sent before it existed. Written straight to the wire once
+    /// subscribed.
     ///
-    /// Silently does nothing if the background task has already ended —
-    /// the same tolerance [`Self::close`] applies to its own script send —
-    /// so a `push` racing the connection closing simply vanishes rather
-    /// than panicking.
+    /// Silently does nothing if the background task has already ended.
     pub async fn push(&self, event: BusEvent) {
         let _ = self
             .script
@@ -750,10 +600,8 @@ impl FakeDaemon {
     }
 
     /// Pushes `EVENT_CHANNEL_CAPACITY + n` [`BusEvent::LogOut`] events in
-    /// one go — enough, once a subscriber falls that far behind, to force a
-    /// local lag notice rather than an ordinary delivery. `EVENT_CHANNEL_CAPACITY`
-    /// is the actor's own broadcast channel capacity
-    /// (`crate::actor::EVENT_CHANNEL_CAPACITY`).
+    /// one go, enough to force a local lag notice instead of ordinary
+    /// delivery.
     pub async fn overrun_by(&self, n: usize) {
         for i in 0..(crate::actor::EVENT_CHANNEL_CAPACITY + n) {
             self.push(BusEvent::LogOut {
@@ -767,36 +615,23 @@ impl FakeDaemon {
     /// Ends the script and drops the connection: drains anything still
     /// queued, then lets the background task finish.
     ///
-    /// Panics if the background task is gone or panicked — test
-    /// scaffolding, see [`fake_daemon`]'s own doc.
+    /// Panics if the background task is gone or panicked.
     pub async fn close(self) {
         let _ = self.script.send(ScriptCommand::Close).await;
         self.task.await.unwrap();
     }
 
-    /// Arms this connection to close itself the moment it has answered its
-    /// next `Request::Subscribe` and flushed anything [`Self::push`] queued
-    /// beforehand — deterministically, unlike calling [`Self::close`]
-    /// *before* a test's client has even issued its first real request.
+    /// Arms this connection to close itself once it has answered its next
+    /// `Request::Subscribe` and flushed anything [`Self::push`] queued
+    /// beforehand, unlike calling [`Self::close`] before the subscription
+    /// exists.
     ///
-    /// [`Self::close`] ends the script as soon as the background task
-    /// observes it, with no regard for whether a real protocol exchange
-    /// (`ListFlock`, `Subscribe`, ...) is still ahead of it — calling it
-    /// before the client under test has connected races the whole
-    /// arrange/act split instead of the one thing a test means to exercise.
-    /// This method instead waits for the *real* milestone a "the daemon
-    /// goes away mid-follow" test actually needs: the subscription this
-    /// connection's caller asked for has been served, in full, before the
-    /// connection ends.
+    /// Goes through the script channel rather than a `Mutex` flag: it arms
+    /// behavior on the same background task that drains [`Self::push`]'s
+    /// queue.
     ///
-    /// Synchronous is not an option here (unlike [`Self::reply_to_list`]):
-    /// this arms behavior on the same background task that also drains
-    /// [`Self::push`]'s queue, so it has to go through the same script
-    /// channel those do.
-    ///
-    /// Does not consume `self`, unlike [`Self::close`]: a caller that also
-    /// wants [`Self::list_flock_count`] after the connection ends needs to
-    /// keep this handle alive to ask for it.
+    /// Does not consume `self`, unlike [`Self::close`]: a caller may still
+    /// want [`Self::list_flock_count`] afterward.
     pub async fn close_after_subscribe(&self) {
         let _ = self.script.send(ScriptCommand::CloseAfterSubscribe).await;
     }
@@ -806,34 +641,14 @@ impl FakeDaemon {
 /// with `ack`, then answers requests until [`ScriptCommand::Close`] arrives
 /// or the connection ends.
 ///
-/// Per request, in priority order: a request buffered by
-/// [`OutOfOrder::Buffered`] is answered together with the one that just
-/// arrived; else an armed `armed_reply_then_event` or
-/// [`ScriptCommand::ReplyErr`] or [`ScriptCommand::EventThenReply`] is
-/// consumed and answers this one request; else
-/// [`FakeDaemon::reply_shutting_down_then_unlink_after`] or
-/// [`FakeDaemon::reply_shutting_down_and_never_unlink`], if armed, answers
-/// `Response::ShuttingDown` and then unlinks `socket_path` (after a delay)
-/// or leaves it in place, respectively; else a `Request::Subscribe`
-/// is answered with `Response::Subscribed`, flips this connection into the
-/// subscribed state, and flushes anything [`ScriptCommand::PushEvent`]
-/// queued before now; else `ListFlock` is answered per
-/// [`FakeDaemon::reply_to_list_sequence`]'s queue first (one entry consumed
-/// per call), falling back to [`FakeDaemon::reply_to_list`] (or
-/// `Flock(vec![])` if nothing is armed) once the queue is empty;
-/// else `Describe { .. }` is answered per [`FakeDaemon::reply_to_describe`]
-/// (or `Described(vec![])` if nothing is armed); else `Response::Pong`.
+/// Checked in priority order per request: a buffered out-of-order request,
+/// then an armed error, event or shutdown script, then `Subscribe`, then
+/// `ListFlock`/`Describe`, falling back to `Response::Pong`.
 ///
-/// A [`ScriptCommand::PushEvent`] arriving outside a request turn is
-/// written straight to the wire once subscribed, or buffered until then —
-/// see [`FakeDaemon::push`].
-///
-/// Eleven parameters: `listener`, `socket_path` and `ack` set up the one served
-/// connection, `script` carries every command a `FakeDaemon` handle can send
-/// after that, and the rest are one `Arc<Mutex<..>>` slot per independently
-/// armable behavior, cloned straight from [`FakeDaemon`]'s own fields —
-/// bundling them into a struct would move the coupling around, not reduce
-/// it, for this private, one-caller function.
+/// One `Arc<Mutex<..>>` slot per independently armed behavior, cloned from
+/// [`FakeDaemon`]'s own fields. Eleven parameters: bundling them into a
+/// struct would move the coupling around, not reduce it, for this
+/// private, one-caller function.
 #[allow(clippy::too_many_arguments)]
 async fn serve_scripted(
     mut listener: Listener,
@@ -855,10 +670,8 @@ async fn serve_scripted(
     let mut armed_err: Option<(RpcErrorCode, String)> = None;
     let mut armed_event_then_reply = false;
     let mut out_of_order = OutOfOrder::Idle;
-    // Once a `Request::Subscribe` has been answered, a pushed event is
-    // written the moment it arrives. Before that, nothing is listening on
-    // the client side yet (its `broadcast::Receiver` is created inside
-    // `Client::subscribe`, which has not returned), so events queue here.
+    // Before `Subscribe` is answered, a pushed event queues here: the
+    // client's `broadcast::Receiver` does not exist yet.
     let mut subscribed = false;
     let mut pending_events: Vec<BusEvent> = Vec::new();
     let mut close_after_subscribe = false;
@@ -879,14 +692,9 @@ async fn serve_scripted(
                     }
                     Some(ScriptCommand::CloseAfterSubscribe) => {
                         close_after_subscribe = true;
-                        // If the `Subscribe` frame was already handled by
-                        // this same `select!` before this script command
-                        // was dequeued (both arms are unbiased here), the
-                        // flag above arms too late and the connection stays
-                        // open — a latent race that surfaces as a 5s test
-                        // timeout rather than a clean close. Re-check the
-                        // milestone this command is arming against and act
-                        // on it immediately if it already happened.
+                        // `select!`'s arms are unbiased: `Subscribe` may
+                        // already be handled, so re-check and close now if
+                        // it already happened.
                         if subscribed {
                             break;
                         }
@@ -912,11 +720,9 @@ async fn serve_scripted(
                         write_reply(&mut frames, other_env.id, Response::Pong).await;
                     }
                     OutOfOrder::Idle => {
-                        // Taken into owned locals before any `.await` below:
-                        // the `MutexGuard`s `.lock()` produces are not
-                        // `Send`, and holding one across an await point would
-                        // make this whole future not `Send` (tokio::spawn
-                        // requires `Send`).
+                        // Taken into owned locals before any `.await`:
+                        // `MutexGuard` is not `Send`, and `tokio::spawn`
+                        // requires the future to be.
                         let reply_then_event = armed_reply_then_event.lock().unwrap().take();
                         let shutdown_then_unlink =
                             armed_shutdown_then_unlink.lock().unwrap().take();
@@ -934,19 +740,15 @@ async fn serve_scripted(
                             write_reply(&mut frames, envelope.id, Response::Pong).await;
                         } else if let Some(after) = shutdown_then_unlink {
                             write_reply(&mut frames, envelope.id, Response::ShuttingDown).await;
-                            // Run inline, in this same request arm, rather
-                            // than deferred to a later `select!` turn: `kill`
-                            // drops the `Client` right after reading this
-                            // reply, which closes the connection — the next
-                            // `frames.next()` yields `None` and the loop
-                            // breaks before a deferred unlink would ever get
-                            // a turn to run.
+                            // Run inline: `kill` drops the `Client` right
+                            // after this reply, closing the connection
+                            // before a deferred unlink would get a turn.
                             tokio::time::sleep(after).await;
                             let _ = std::fs::remove_file(&socket_path);
                         } else if shutdown_never_unlink.is_some() {
                             write_reply(&mut frames, envelope.id, Response::ShuttingDown).await;
-                            // Deliberately never unlinks — the branch a
-                            // kill-teardown timeout exists to observe.
+                            // Never unlinks: the branch a kill-teardown
+                            // timeout exists to observe.
                         } else if matches!(envelope.body, Request::Subscribe { .. }) {
                             write_reply(&mut frames, envelope.id, Response::Subscribed).await;
                             subscribed = true;
@@ -959,14 +761,9 @@ async fn serve_scripted(
                         } else {
                             let response = if matches!(envelope.body, Request::ListFlock) {
                                 list_flock_count.fetch_add(1, Ordering::SeqCst);
-                                // The sequence queue (`reply_to_list_sequence`)
-                                // takes priority: a test scripting a whole
-                                // sequence at once still means it, even if
-                                // `reply_to_list`'s single slot happens to be
-                                // armed too (it should never be armed
-                                // alongside the sequence in practice, but the
-                                // queue winning is the least surprising order
-                                // either way).
+                                // The sequence queue takes priority over a
+                                // single `reply_to_list` slot armed at the
+                                // same time.
                                 let next = armed_list_sequence.lock().unwrap().pop_front();
                                 Response::Flock(next.unwrap_or_else(|| {
                                     armed_list.lock().unwrap().take().unwrap_or_default()
@@ -988,13 +785,13 @@ async fn serve_scripted(
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], and hands back a connected
-/// [`Client`] alongside the still-live [`FakeDaemon`] script — for a test
-/// that only needs a client past the handshake and nothing daemon-specific.
+/// [`Client`] alongside the still-live [`FakeDaemon`] script, for a test
+/// that needs nothing daemon-specific.
 pub async fn fake_client_on(path: &Path) -> (Client, FakeDaemon) {
     fake_client_with_ack(path, sample_ack()).await
 }
 
-/// As [`fake_client_on`], but with a caller-chosen [`HelloAck`] — for a
+/// As [`fake_client_on`], but with a caller-chosen [`HelloAck`], for a
 /// test asserting on the ack a `Client` receives.
 pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDaemon) {
     let daemon = fake_daemon_scripted_on(path, ack);
@@ -1002,30 +799,26 @@ pub async fn fake_client_with_ack(path: &Path, ack: HelloAck) -> (Client, FakeDa
     (client, daemon)
 }
 
-/// As [`fake_client_on`], but hands back a [`ReconnectingClient`] — the
-/// supervised wrapper a dog uses — instead of a bare [`Client`].
+/// As [`fake_client_on`], but hands back a [`ReconnectingClient`], the
+/// supervised wrapper a dog uses, instead of a bare [`Client`].
 ///
-/// The [`FakeDaemon`] behind it still serves exactly ONE connection, so a
-/// test that cuts this connection leaves the supervisor retrying against a
-/// listener that is gone. That is the right fixture for a test about what
-/// the dog does over a live connection, and the wrong one for a test about
-/// the reconnect itself — use [`fake_daemon_across_handovers`] for that.
+/// The [`FakeDaemon`] behind it still serves exactly one connection, so a
+/// test that cuts it leaves the supervisor retrying against a gone
+/// listener. Use [`fake_daemon_across_handovers`] to test the reconnect
+/// itself.
 pub async fn fake_reconnecting_client_on(path: &Path) -> (ReconnectingClient, FakeDaemon) {
     let daemon = fake_daemon_scripted_on(path, sample_ack());
     let client = ReconnectingClient::connect(path).await.unwrap();
     (client, daemon)
 }
 
-/// Binds `path` and starts the scripted fake WITHOUT connecting a client of
-/// its own, for a caller that performs its own connect — which is what
-/// separates a [`Client`] fixture from a [`ReconnectingClient`] one.
+/// Binds `path` and starts the scripted fake without connecting a client
+/// of its own, for a caller that performs its own connect.
 ///
-/// Synchronous: binding and spawning are both immediate, and the listener is
-/// bound before this returns, so a caller can connect straight away without
-/// a sleep.
+/// Synchronous: the listener is bound before this returns, so a caller can
+/// connect straight away without a sleep.
 ///
-/// Panics if `path` cannot be bound — test scaffolding, the same failure
-/// mode [`fake_daemon`] documents.
+/// Panics if `path` cannot be bound.
 #[must_use]
 pub fn fake_daemon_scripted_on(path: &Path, ack: HelloAck) -> FakeDaemon {
     let listener = Listener::bind(path).unwrap();
@@ -1063,33 +856,25 @@ pub fn fake_daemon_scripted_on(path: &Path, ack: HelloAck) -> FakeDaemon {
     }
 }
 
-/// Binds `path`, handshakes with [`sample_ack`], and hands back a connected
-/// [`Client`] alongside the still-live [`FakeDaemon`] script — identical to
-/// [`fake_client_on`], named separately for tests whose whole point is
-/// [`FakeDaemon::push`], [`FakeDaemon::overrun_by`] or
-/// [`FakeDaemon::queue_reply_then_event`], so the call site reads as "a
-/// daemon I'm about to push events through" rather than "a daemon with
-/// nothing daemon-specific armed".
+/// Identical to [`fake_client_on`], named separately for tests whose whole
+/// point is [`FakeDaemon::push`], [`FakeDaemon::overrun_by`] or
+/// [`FakeDaemon::queue_reply_then_event`].
 pub async fn fake_client_with_push(path: &Path) -> (Client, FakeDaemon) {
     fake_client_on(path).await
 }
 
-/// Binds `path` and serves EVERY connection made to it, handshaking with
+/// Binds `path` and serves every connection made to it, handshaking with
 /// `ack`, answering each request through `answer`, and forwarding each
 /// decoded [`Envelope`] onto the returned channel.
 ///
-/// The multi-connection sibling of [`fake_client_answering`], and the
-/// difference is the whole reason it exists. That helper accepts exactly one
-/// connection, which is right for a test that drives the [`Client`] it hands
-/// back; a test that instead drives a whole CLI verb has the verb open its
-/// own connections, and a second connect against a one-shot fake sits in the
-/// kernel's backlog until the client's own deadline expires. `ack` is a
-/// parameter for the same reason: the verb under test reads
-/// [`HelloAck::daemon_version`] and decides what to do from it, so a fixed
-/// [`sample_ack`] would pin the test to one branch.
+/// Unlike [`fake_client_answering`], which accepts exactly one connection:
+/// a test driving a whole CLI verb has the verb open its own connections,
+/// and a second connect against a one-shot fake would sit in the kernel's
+/// backlog. `ack` is a parameter so a test can vary
+/// [`HelloAck::daemon_version`] rather than being pinned to [`sample_ack`].
 ///
-/// The task is detached and runs until the listener errors, which happens
-/// when the caller's `TempDir` goes away.
+/// The task is detached and runs until the listener errors, when the
+/// caller's `TempDir` goes away.
 pub async fn fake_daemon_answering_with_ack(
     path: &Path,
     ack: HelloAck,
@@ -1122,40 +907,18 @@ pub async fn fake_daemon_answering_with_ack(
     rx
 }
 
-/// As [`fake_client_capturing_envelopes`], but the caller decides what each
-/// request is answered with — for a test asserting on what a MULTI-REQUEST
-/// caller puts on the wire.
-///
-/// The two existing shapes each cover one half and neither covers this.
-/// [`fake_client_capturing_envelopes`] shows the wire but answers everything
-/// `Response::Pong`, so a caller that reads its own reply and decides what to
-/// send next stalls at the first request. [`FakeDaemon`] answers a `ListFlock`
-/// or a `Describe` properly but keeps every envelope to itself, so the
-/// requests that followed cannot be asserted on at all. `shep start <name>`
-/// needs both at once: it lists the flock, decides from the listing which
-/// sheep to respawn, and the whole question is which respawns it then sends.
-/// Two bugs reached an operator's terminal in that gap, both of them a
-/// widened selector no test could see (`shep-cli`'s `resume_all`).
-///
+/// As [`fake_client_capturing_envelopes`], but `answer` decides each reply,
+/// for a test asserting on what a multi-request caller puts on the wire.
 /// `answer` is called with each decoded [`Request`] in arrival order and may
-/// close over a counter to answer the second call differently from the first.
-/// The envelope reaches the channel BEFORE the reply is written, matching
-/// [`fake_client_capturing_envelopes`], so a test that awaits its own request
-/// future finds the envelope already queued.
+/// close over a counter to vary its reply. The envelope reaches the channel
+/// before the reply is written, matching [`fake_client_capturing_envelopes`].
 ///
-/// UNBOUNDED, unlike every other channel in this module, and that is the
-/// difference a multi-request caller makes. A test reads these envelopes after
-/// the call it is testing has returned, so nothing drains the channel while
-/// the exchange is in flight: on a bounded channel of this module's `SCRIPT_CHANNEL_CAPACITY`
-/// the send blocks once the caller's ninth request arrives, the reply to it is
-/// never written, and the test hangs rather than failing. One `shep start` over
-/// a ten-instance app is thirteen requests. Unbounded also keeps the observer
-/// off the reply path entirely, since the send no longer awaits anything.
+/// Unbounded, unlike every other channel in this module: a test reads these
+/// envelopes only after the call under test returns, so a bounded channel
+/// would block once `SCRIPT_CHANNEL_CAPACITY` requests are in flight.
 ///
-/// The read loop ends on a closed or unreadable connection instead of
-/// panicking there. A test drops its `Client` while this task is parked on the
-/// next frame, which is an ordinary end rather than a fault, and
-/// `read_envelope`'s `unwrap` would report it as a panic in a detached task.
+/// The read loop ends on a closed or unreadable connection rather than
+/// panicking, since a dropped `Client` here is an ordinary end, not a fault.
 pub async fn fake_client_answering(
     path: &Path,
     answer: impl Fn(&Request) -> Response + Send + 'static,
@@ -1184,9 +947,8 @@ pub async fn fake_client_answering(
 
 /// Binds `path`, handshakes with [`sample_ack`], and answers every request
 /// with `Response::Pong` while forwarding each decoded [`Envelope`] onto
-/// the returned channel — for a test asserting on what a `Client` actually
-/// puts on the wire (its deadline, in particular) rather than on how the
-/// daemon answers.
+/// the returned channel, for asserting on what a `Client` puts on the wire
+/// rather than on how the daemon answers.
 pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Receiver<Envelope>) {
     let mut listener = Listener::bind(path).unwrap();
     let (tx, rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
@@ -1197,9 +959,8 @@ pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Rece
         loop {
             let envelope = read_envelope(&mut frames).await;
             let id = envelope.id;
-            // Forwarded before the reply is sent, so a test that awaits the
-            // `Client::request` future first is guaranteed to find its
-            // envelope already sitting in the channel.
+            // Forwarded before the reply is sent, so an awaited
+            // `Client::request` future finds its envelope already queued.
             if tx.send(envelope).await.is_err() {
                 break;
             }
@@ -1211,15 +972,10 @@ pub async fn fake_client_capturing_envelopes(path: &Path) -> (Client, mpsc::Rece
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], and answers the one
-/// request that arrives with an [`RpcError`] carrying `code` and `message`
-/// instead of a normal response — for testing that a daemon-side error reply surfaces
-/// through `Client::request` as `RequestError::Rpc`.
+/// request that arrives with an [`RpcError`] carrying `code` and `message`.
 ///
-/// Backed by a [`FakeDaemon`] (armed with a private `ScriptCommand::ReplyErr`)
-/// so the connection keeps serving afterward, like any other `fake_client_*`
-/// helper that hands one back — a bespoke one-shot task here would die
-/// after the one scripted reply, which is wrong for a later test that
-/// issues a second request against the same connection.
+/// Backed by a [`FakeDaemon`] so the connection keeps serving afterward,
+/// unlike a bespoke one-shot task that would die after the scripted reply.
 pub async fn fake_client_replying_err(
     path: &Path,
     code: RpcErrorCode,
@@ -1235,13 +991,11 @@ pub async fn fake_client_replying_err(
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], reads exactly two
-/// envelopes, then answers them in REVERSE arrival order — the `ListFlock`
-/// one first, with `Response::Flock(vec![])`, then the `Ping` one, with
-/// `Response::Pong` — proof that a `Client` routes replies by id rather
-/// than by the order it sent the requests in.
+/// envelopes, then answers the `ListFlock` one first and the `Ping` one
+/// second, regardless of arrival order: proof that a `Client` routes
+/// replies by id.
 ///
-/// Backed by a [`FakeDaemon`] (armed with a private `ScriptCommand::ArmOutOfOrder`);
-/// see [`fake_client_replying_err`]'s own doc for why that matters.
+/// Backed by a [`FakeDaemon`], like [`fake_client_replying_err`].
 pub async fn fake_client_out_of_order(path: &Path) -> (Client, FakeDaemon) {
     let (client, daemon) = fake_client_on(path).await;
     daemon
@@ -1253,13 +1007,11 @@ pub async fn fake_client_out_of_order(path: &Path) -> (Client, FakeDaemon) {
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], reads one envelope, and
-/// sends a `BusEvent::Process` event BEFORE answering it — the daemon's own
-/// documented ordering (`shep-daemon/tests/daemon_e2e.rs:161-174`): a
-/// sheep's bus event can legitimately arrive ahead of the reply for the
-/// very request that caused it.
+/// sends a `BusEvent::Process` event before answering it: a sheep's bus
+/// event can legitimately arrive ahead of the reply for the request that
+/// caused it.
 ///
-/// Backed by a [`FakeDaemon`] (armed with a private `ScriptCommand::EventThenReply`);
-/// see [`fake_client_replying_err`]'s own doc for why that matters.
+/// Backed by a [`FakeDaemon`], like [`fake_client_replying_err`].
 pub async fn fake_client_event_then_reply(path: &Path) -> (Client, FakeDaemon) {
     let (client, daemon) = fake_client_on(path).await;
     daemon
@@ -1271,28 +1023,26 @@ pub async fn fake_client_event_then_reply(path: &Path) -> (Client, FakeDaemon) {
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], then immediately drops the
-/// connection — for testing that a `Client` fails every pending request
-/// with `RequestError::Closed` rather than hanging.
+/// connection, for testing that a `Client` fails every pending request with
+/// `RequestError::Closed` rather than hanging.
 pub async fn fake_client_that_closes_after_handshake(path: &Path) -> (Client, JoinHandle<()>) {
     let mut listener = Listener::bind(path).unwrap();
     let task = tokio::spawn(async move {
         let stream = listener.accept().await.unwrap();
         let mut frames = Framed::new(stream, codec());
         let _hello = handshake(&mut frames, sample_ack()).await;
-        // Dropping `frames` (and the `UnixStream` it owns) here closes the
-        // connection from this side.
+        // Dropping `frames` here closes the connection from this side.
     });
     let client = Client::connect(path).await.unwrap();
     (client, task)
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], reads exactly one
-/// envelope, then drops the connection WITHOUT replying — for testing that
-/// a request already accepted by the connection actor (and thus already
-/// sitting in its `pending` map) fails with `RequestError::Closed` when the
-/// connection dies mid-flight, rather than only covering the case where the
-/// connection was already gone before the request was ever sent (that's
-/// [`fake_client_that_closes_after_handshake`]).
+/// envelope, then drops the connection without replying: for testing that
+/// a request already accepted into the connection actor's `pending` map
+/// fails with `RequestError::Closed` when the connection dies mid-flight.
+/// Unlike [`fake_client_that_closes_after_handshake`], which never accepts
+/// the request at all.
 pub async fn fake_client_that_dies_mid_request(path: &Path) -> (Client, JoinHandle<()>) {
     let mut listener = Listener::bind(path).unwrap();
     let task = tokio::spawn(async move {
@@ -1300,25 +1050,21 @@ pub async fn fake_client_that_dies_mid_request(path: &Path) -> (Client, JoinHand
         let mut frames = Framed::new(stream, codec());
         let _hello = handshake(&mut frames, sample_ack()).await;
         let _envelope = read_envelope(&mut frames).await;
-        // Dropping `frames` here — after reading, not before — closes the
-        // connection only once the actor has already written the request
-        // and recorded it as pending.
+        // Dropping `frames` here, after reading, closes the connection
+        // only once the actor has recorded the request as pending.
     });
     let client = Client::connect(path).await.unwrap();
     (client, task)
 }
 
 /// Binds `path`, handshakes with [`sample_ack`], then reads nothing and
-/// replies to nothing, ever — for testing a `Client`'s own client-side
+/// replies to nothing, ever: for testing a `Client`'s own client-side
 /// deadline against a daemon that accepted the connection but stopped
 /// answering.
 ///
 /// Returns `(Client, JoinHandle<()>)`, not `(Client, FakeDaemon)`:
-/// `FakeDaemon`'s `serve_scripted` loop always answers SOME request
-/// promptly (`ListFlock` per the armed script, everything else with
-/// `Pong`) — there is no script command that means "never answer," so a
-/// `FakeDaemon`-backed version of this helper could not do what its name
-/// promises.
+/// `FakeDaemon`'s `serve_scripted` loop always answers some request
+/// promptly, and no `ScriptCommand` means never answering.
 pub async fn fake_client_that_never_replies(path: &Path) -> (Client, JoinHandle<()>) {
     let mut listener = Listener::bind(path).unwrap();
     let task = tokio::spawn(async move {
@@ -1331,16 +1077,11 @@ pub async fn fake_client_that_never_replies(path: &Path) -> (Client, JoinHandle<
     (client, task)
 }
 
-/// [`SpawnOptions`] tuned so `spawn.rs`'s tests finish in well under a
-/// second on a real clock, rather than the production 30s/100ms/5s/5s
-/// figures. Every test built against a real socket and (in most cases) a
-/// real child process, so none of them may pause tokio's clock to fake this
-/// speed — shrinking the values themselves is the only option.
+/// [`SpawnOptions`] tuned so `spawn.rs`'s tests finish in under a second on
+/// a real clock, since none of them may pause tokio's clock.
 ///
-/// The one exception, `a_child_that_dies_fails_fast_instead_of_waiting_out_the_deadline`,
-/// deliberately runs on the production defaults instead: it is an assertion
-/// *about* the 30s deadline, so using this would delete the thing under
-/// test.
+/// `a_child_that_dies_fails_fast_instead_of_waiting_out_the_deadline` uses
+/// the production defaults instead: it asserts on the 30s deadline itself.
 #[must_use]
 pub fn fast_opts() -> SpawnOptions {
     SpawnOptions {
@@ -1351,25 +1092,17 @@ pub fn fast_opts() -> SpawnOptions {
     }
 }
 
-/// Binds `path`, accepts one connection, and answers its handshake with
-/// [`sample_ack`], then parks — for a launcher closure that needs to bring a
-/// working daemon into existence synchronously (a real launcher spawns a
-/// child, this stands in for the daemon that child would eventually become).
+/// Binds `path`, accepts one connection, answers its handshake with
+/// [`sample_ack`], then parks, standing in for a daemon a launcher closure
+/// needs to bring into existence synchronously.
 ///
-/// Synchronous, not `async`: a `connect_or_spawn` launcher is a plain
-/// `FnOnce() -> io::Result<Child>`, so anything it calls to make a daemon
-/// "appear" has to be callable from a synchronous context too. This spawns
-/// its own background task via [`tokio::spawn`], which works even though the
-/// caller isn't `async`: `connect_or_spawn_with` runs the launcher on
-/// `tokio::task::spawn_blocking`'s pool, and that pool's threads carry the
-/// owning runtime's context for exactly this reason.
+/// Synchronous: a `connect_or_spawn` launcher is a plain
+/// `FnOnce() -> io::Result<Child>`. Its `tokio::spawn` call still gets a
+/// runtime context, since `connect_or_spawn_with` runs the launcher on
+/// `spawn_blocking`'s pool. The returned task is detached and outlives
+/// this call.
 ///
-/// The returned task is detached deliberately: it outlives this function
-/// call and keeps running for as long as the test's runtime does, which is
-/// long enough for `connect_or_spawn_with`'s later probes to reach it.
-///
-/// Panics if `path` cannot be bound — test scaffolding, see [`fake_daemon`]'s
-/// own doc for why that is the right failure mode here.
+/// Panics if `path` cannot be bound.
 pub fn start_fake_daemon_answering_on(path: &Path) {
     let mut listener = Listener::bind(path).unwrap();
     tokio::spawn(async move {
@@ -1381,19 +1114,12 @@ pub fn start_fake_daemon_answering_on(path: &Path) {
 }
 
 /// A launcher-ready child that is already exiting with `code`: spawns
-/// `sh -c "exit <code>"` and hands the `Child` back immediately.
-///
-/// For a launcher whose test cares only about `connect_or_spawn`'s reaction
-/// to a child that is dead (or dying) with a known status, not about a
-/// process that behaves like a daemon in any other way.
+/// `sh -c "exit <code>"` and returns the `Child` immediately.
 ///
 /// # Errors
 ///
-/// Whatever `std::process::Command::spawn` itself can return — `sh` failing
-/// to exec, principally. Propagated rather than unwrapped so a caller using
-/// this directly as a launcher (`connect_or_spawn`'s `L` bound is
-/// `FnOnce() -> io::Result<Child>`) gets the same signature every other
-/// launcher does.
+/// Whatever `std::process::Command::spawn` can return, propagated rather
+/// than unwrapped so this fits `connect_or_spawn`'s launcher signature.
 pub fn child_exiting_with(code: i32) -> std::io::Result<std::process::Child> {
     std::process::Command::new("sh")
         .args(["-c", &format!("exit {code}")])
