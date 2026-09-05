@@ -392,7 +392,10 @@ pub fn dog_section(path: &Path, name: &str) -> Result<String, DogError> {
 /// does a comment outside it. A comment INSIDE the replaced table is the
 /// caller's to carry, because the caller is what decided the section's new
 /// text — and [`dog_section`] hands it the span rather than a re-render
-/// precisely so that it can.
+/// precisely so that it can. The header's own decor, a comment line above
+/// `[name]` and anything trailing the header, is carried across here
+/// instead: it sits neither inside the section nor outside the table, so
+/// neither half would otherwise keep it.
 ///
 /// The rendered result is handed to [`DogsConfig::load`] before anything
 /// reaches disk, so a section this daemon could not serve back never lands.
@@ -452,6 +455,15 @@ pub fn set_dog_section(path: &Path, name: &str, section: &str) -> Result<(), Dog
     // arrives by deleting the last key in the pane.
     let mut table = incoming.as_table().clone();
     table.set_implicit(false);
+    // A comment above `[name]`, and anything trailing the header itself,
+    // are decor on the TABLE rather than text inside it -- `dog_section`
+    // hands the caller the body and cannot carry them, and replacing the
+    // item wholesale would drop both. Copied across so an operator's note
+    // about what a dog is for survives a pane write, as the notes between
+    // its keys already do.
+    if let Some(Item::Table(existing)) = doc.get(name) {
+        *table.decor_mut() = existing.decor().clone();
+    }
     doc[name] = Item::Table(table);
 
     let rendered = doc.to_string();
@@ -2013,14 +2025,16 @@ mod tests {
     /// its own; a comment INSIDE it, and the order of the keys around it,
     /// survive only if the section the pane was handed was the raw span.
     /// `toml::map::Map` is a `BTreeMap` without `preserve_order`, so a
-    /// re-render alphabetises as well as stripping.
+    /// re-render alphabetises as well as stripping. The comment ABOVE the
+    /// header is the third case, decor on the table itself, which only the
+    /// write side can carry.
     #[test]
-    fn a_pane_round_trip_keeps_a_comment_inside_the_table_and_the_key_order() {
+    fn a_pane_round_trip_keeps_the_comments_and_the_key_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dogs.toml");
         std::fs::write(
             &path,
-            "[bark]\n# why bark polls slowly\npoll = \"60s\"\nzz_last = 1\naa_first = 2\n",
+            "# what bark is for\n[bark]\n# why bark polls slowly\npoll = \"60s\"\nzz_last = 1\naa_first = 2\n",
         )
         .unwrap();
 
@@ -2037,6 +2051,10 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# why bark polls slowly"), "{text}");
+        assert!(
+            text.contains("# what bark is for"),
+            "the header's own comment lives on the table, not inside it: {text}"
+        );
         assert!(text.contains("poll = \"30s\""), "{text}");
         assert!(
             text.find("zz_last") < text.find("aa_first"),
