@@ -271,9 +271,17 @@ fn in_flight_text(action: &ActionState<'_>) -> String {
     }
 }
 
+/// The config pane's own key hint. One form, not two: the pane is read-only
+/// so far, so [`Control`] has nothing to change about it, and `esc/e close`
+/// names both keys that close it.
+const PANE_HINT: &str = "esc/e close   j/k select   g/G first/last   r refresh   q quit";
+
 /// The key hint.
 ///
-/// Three forms now: the settings screen's own, and the dashboard's two.
+/// Three forms now: the settings screen's own, and the dashboard's two. The
+/// config pane's is [`PANE_HINT`] above and is not one of these -- it is a
+/// constant rather than a branch here, because that screen has one form and
+/// `hint_for`'s whole subject is choosing between several.
 /// `settings_open` picks between them, and wins outright, because the
 /// dashboard's `x`/`R`/`L`/`r`/`/` mean nothing while the screen owns the
 /// keyboard. This file's standing rule: a hint that needs a footnote to be
@@ -297,14 +305,6 @@ fn in_flight_text(action: &ActionState<'_>) -> String {
 /// so a read-only lookout was told `space cycle` about a key that refuses.
 /// That is exactly the asterisk the rule above forbids, and the dashboard
 /// omits `x`, `R` and `L` for the same reason.
-/// The config pane's own key hint. One form, not two: the pane is read-only,
-/// so [`Control`] has nothing to change about it.
-///
-/// `esc/e close` names both keys that close it, the same way the settings
-/// screen's own form names both of its own -- on this screen `e` is the
-/// close key, not the open one.
-const PANE_HINT: &str = "esc/e close   j/k select   g/G first/last   r refresh   q quit";
-
 fn hint_for(control: Control, settings_open: bool) -> String {
     if settings_open {
         // `esc/s close` names both keys that close the screen, which is how
