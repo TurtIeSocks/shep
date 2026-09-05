@@ -1,22 +1,16 @@
 //! A cursor that knows what is on screen.
 //!
-//! lookout's screens used to hold a bare `cursor: usize` and draw the first
-//! `height` lines, which works while every screen fits a terminal. A config
-//! pane does not: a sheep has 39 fields under four headers, and a 30-line
-//! terminal shows a quarter of them. This is the offset and the
-//! scroll-into-view that a bare index never had.
+//! A config pane has 39 fields under four headers; a 30-line terminal
+//! shows a quarter of them. This holds the offset and scroll-into-view a
+//! bare `cursor: usize` cannot.
 //!
-//! A viewport that does not know its height (`rows == 0`) never scrolls,
-//! so a screen built in a test with no terminal behaves exactly as it did
-//! before this existed. The gallery no longer leans on that: `frames::scene`
-//! hands it the real height, the same call `run_ui` makes before each draw.
-//! Seven settings frames spent a phase rendering at `rows == 0`, which meant
-//! every scrolling guard behind them sat on a branch nothing exercised.
+//! A viewport that does not know its height (`rows == 0`) never scrolls.
+//! `frames::scene` hands it the real height before each draw.
 //!
-//! This counts ROWS. A screen whose chrome costs lines -- a section header,
-//! a caption, a column header -- cannot ask it how much is off screen and
-//! get an answer about its own body, which is why it no longer offers one:
-//! `view::settings` counts what it drew instead.
+//! This counts rows, not lines: a screen whose chrome costs lines (a
+//! section header, a caption, a column header) cannot ask it how much is
+//! off screen and get an answer about its own body. `view::settings`
+//! counts what it drew instead.
 
 /// A cursor, an offset, and the number of rows the terminal shows.
 ///
@@ -84,12 +78,11 @@ impl Viewport {
     }
 
     /// Pulls the offset back to whatever keeps the cursor visible, and caps
-    /// it to `len - rows` -- every entry point above routes through here
-    /// with its own `len`, so a list that shrank between two calls (a
-    /// `move_by` after keys were removed from underneath, with no `clamp`
-    /// in between) cannot leave a stale offset past the end of the new,
-    /// shorter list, the same way `move_by` and `move_to`'s own cursor
-    /// clamp already cannot leave a stale cursor.
+    /// it to `len - rows`. Every entry point above routes through here
+    /// with its own `len`, so a list that shrinks between two calls (a
+    /// `move_by` with no `clamp` in between) cannot leave a stale offset
+    /// past the end of the shorter list, the same way `move_by` and
+    /// `move_to` already cannot leave a stale cursor.
     fn ensure_visible(&mut self, len: usize) {
         if self.rows == 0 {
             return;
@@ -173,10 +166,9 @@ mod tests {
         assert_eq!(v.offset(), 16, "the cursor is still the last visible row");
     }
 
-    /// A list that shrinks between two `move_by` calls with no `clamp` in
-    /// between -- the shape `content_lines`' env sub-screen exercises once
-    /// it can remove a key out from under the cursor. `move_by` must catch
-    /// the stale offset on its own; nothing here ever calls `clamp`.
+    /// The shape `content_lines`' env sub-screen exercises once it can
+    /// remove a key out from under the cursor. `move_by` must catch the
+    /// stale offset on its own; nothing here ever calls `clamp`.
     #[test]
     fn a_move_after_the_list_shrinks_catches_the_stale_offset_without_a_clamp() {
         let mut v = Viewport::new();

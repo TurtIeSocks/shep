@@ -279,10 +279,10 @@ pub enum Effect {
     ///
     /// A dog's schema is not persisted anywhere, so the pane asks at open:
     /// `shep adopt` uses the answer for the vet and records only the path.
-    /// A built-in dog IS this binary, so it is asked in-process
+    /// A built-in dog is this binary, so it is asked in-process
     /// (`crate::dog::builtin_schema`); an adopted one is spawned with the
     /// schema flag, which is why `super::run_ui` runs this on
-    /// `spawn_blocking` -- it costs up to `VERSION_BUDGET` of somebody
+    /// `spawn_blocking`: it costs up to `VERSION_BUDGET` of somebody
     /// else's binary starting up, and the redraw task cannot wait for that.
     ///
     /// No [`WriteAuthority`]: this reads. The pane it opens is gated on
@@ -420,7 +420,7 @@ pub enum Sent {
     /// rather than a one-key `Request::ApplyConfig` for the reason that
     /// variant's own doc gives: an `ApplyConfig` at `ResetDepth::File`
     /// moves the field and then spends the operator's override for it,
-    /// because that merge is a template load. This pane's value IS the
+    /// because that merge is a template load. This pane's value is the
     /// operator's, so the sheep still differs from its file and the `*`
     /// marker has to keep saying so.
     ///
@@ -447,9 +447,9 @@ pub enum Sent {
     /// the pane's schema probe has answered, and again by `r` from inside an
     /// open dog pane and after a landed write.
     ///
-    /// The SCHEMA is not asked for here and never travels the wire: it comes
+    /// The schema is not asked for here and never travels the wire: it comes
     /// off the dog's own binary ([`Effect::LoadDogPane`]), because nothing
-    /// records one -- `shep adopt` uses it for the vet and writes down only
+    /// records one. `shep adopt` uses it for the vet and writes down only
     /// the path.
     DogSection {
         /// Which dog was asked about.
@@ -462,8 +462,8 @@ pub enum Sent {
     /// applies the edit through `toml_edit`, so the operator's comments and
     /// key order survive a write shep did not author.
     ///
-    /// NOT a `Request::ApplyConfig`, and not for [`Self::ApplyField`]'s
-    /// reason either -- a dog has no override store and no Flockfile. Its
+    /// Not a `Request::ApplyConfig`, and not for [`Self::ApplyField`]'s
+    /// reason either: a dog has no override store and no Flockfile. Its
     /// section is the operator's outright, and `dogs.toml` is the one copy
     /// of it.
     ///
@@ -537,7 +537,7 @@ impl Sent {
                 ..
             } => Request::DisableDog { name: name.clone() },
             Self::SheepConfig { name } => Request::SheepConfig { name: name.clone() },
-            // One field, recorded as an operator override. NOT an
+            // One field, recorded as an operator override, not an
             // `ApplyConfig`: see this variant's own doc for the marker that
             // route silently spent.
             Self::ApplyField {
@@ -583,7 +583,7 @@ pub struct DogEdit {
 /// is open, so a refresh re-reads the section without respawning the dog.
 ///
 /// `Debug` is derived rather than redacted (IR-41): a name, a binary's path
-/// and a JSON Schema. A schema describes values without carrying any -- the
+/// and a JSON Schema. A schema describes values without carrying any, the
 /// same argument `super::field::Field`'s own derived `Debug` makes, and a
 /// dog's defaults come from its binary describing itself rather than from
 /// this flock.
@@ -1165,7 +1165,7 @@ pub struct App {
     /// opens the box; the reducer, not the keymap, owns this state.
     mode: InputMode,
     /// The next config-write ticket. Monotonic and never reused, so a reply
-    /// can only settle the write it belongs to -- see [`PanePending::Sent`].
+    /// can only settle the write it belongs to. See [`PanePending::Sent`].
     next_write_ticket: u64,
     link: Link,
     notice: Option<Notice>,
@@ -1324,12 +1324,10 @@ impl App {
                         settings.pending = None;
                     }
                 }
-                // The pane's own expiry, and it sits OUTSIDE the link guard
-                // for a different reason than the settings screen's: the
-                // question describes the shepherd, which a lost link froze,
-                // but an armed edit that can never be sent is not a
-                // question worth leaving on screen either. `now` rather
-                // than `self.now`, which that guard stops advancing.
+                // The pane's own expiry sits outside the link guard: an
+                // armed edit that can never be sent is not worth leaving
+                // on screen either, even with a live link. `now`, not
+                // `self.now`, which that guard stops advancing.
                 if let Some(pane) = self.config_pane.as_mut()
                     && pane
                         .armed_at()
@@ -1741,25 +1739,19 @@ impl App {
     /// swallowed, and a refresh that fails does not blank a pane that was
     /// showing something real.
     fn on_sheep_config(&mut self, name: &str, result: Result<Response, RequestError>) -> Effect {
-        // A reply nobody is waiting for any more: two `e` presses against a
-        // slow shepherd, then `Esc`, and the second answer used to re-open
-        // the pane over a dashboard the operator had gone back to. Dropped
-        // in silence, because nothing went wrong and the operator asked for
-        // nothing that is still outstanding.
+        // A reply nobody is waiting for any more is dropped in silence:
+        // nothing went wrong, and the operator asked for nothing that is
+        // still outstanding.
         if self.config_target.as_deref() != Some(name) {
             return Effect::None;
         }
         match result {
             Ok(Response::SheepConfig(view)) => {
                 let carried = self.config_pane.as_ref().map(|pane| pane.view().clone());
-                // The env sub-screen is carried too, and it has to be: a
-                // set re-reads the whole config, so without this the
-                // sub-screen would close on the operator's own keystroke --
-                // on the one screen where that keystroke ADDS a row.
-                // The cursor's KEY rides across, not its index: a removal
-                // shortens the list, so the same index names the NEIGHBOUR
-                // afterwards and a reflexive second `Enter` would arm a
-                // write against a key nobody chose. See `EnvPane::adopt_view`.
+                // The env sub-screen is carried too: a set re-reads the
+                // whole config, and without this it would close on the
+                // very keystroke that just added a row. Its cursor rides
+                // by key, not index, since a removal would rename it.
                 let carried_env = self
                     .config_pane
                     .as_ref()
@@ -1767,7 +1759,7 @@ impl App {
                     .map(|env| (env.view().clone(), env.cursor_key().map(str::to_owned)));
                 // A question the operator has not answered, or a write
                 // still out, survives the rebuild. Only `Typing` is
-                // dropped -- see `ConfigPane::adopt_pending_edit`.
+                // dropped. See `ConfigPane::adopt_pending_edit`.
                 let carried_edit = self
                     .config_pane
                     .as_ref()
@@ -1793,27 +1785,11 @@ impl App {
                     grave: true,
                 });
             }
-            // Prefixed, like every other reply handler in this file, and
-            // NOT stripped on the theory that the shepherd's refusals name
-            // their own subject. Two of the three do -- `no sheep named
-            // {name}` and the `IsADog` sentence -- and the third,
-            // `EngineStopped`, renders as `the supervisor engine has
-            // stopped`, which names neither the sheep nor the screen it
-            // came from. Stripping unconditionally traded a doubled name in
-            // two cases for an unattributable notice in the third.
-            //
-            // The doubling that motivated the strip is fixed in the right
-            // place instead: `Self::ask_for_config` refuses a dog off the
-            // local row and never sends, so `IsADog` no longer reaches this
-            // arm by the door an operator actually uses. It is not
-            // structurally unreachable -- that guard reads a flock snapshot
-            // up to two seconds old, and `r` from inside the pane re-sends
-            // by name without re-checking -- so a sheep deleted and a dog
-            // adopted under the same name in between would still land here
-            // and read `web: web is a dog, ...`. That is a cosmetic double
-            // in a case needing a name collision across a delete; the
-            // alternative was silence about which sheep every time the
-            // engine stops.
+            // Prefixed, like every other reply handler in this file: the
+            // shepherd's refusals mostly name their own subject, but
+            // `EngineStopped` renders as `the supervisor engine has
+            // stopped`, naming neither the sheep nor the screen it came
+            // from.
             Err(RequestError::Rpc(err)) => {
                 self.notice = Some(Notice {
                     text: format!("{name}: {}", err.message),
@@ -1918,7 +1894,7 @@ impl App {
                 }
                 self.config_pane = Some(pane);
                 // The settings screen is what a dog pane opens over, and it
-                // closes only now -- once there is something to look at.
+                // closes only now, once there is something to look at.
                 self.settings = None;
                 self.release_text_mode_if_unowned();
             }
@@ -1948,15 +1924,15 @@ impl App {
 
     /// One `Request::SetDogConfig` reply.
     ///
-    /// The pane settles either way, and a success re-reads the section --
-    /// the same shape [`Self::on_field_applied`] has, for the same reason:
-    /// the screen shows what the shepherd now holds rather than what the
-    /// operator asked for.
+    /// The pane settles either way, and a success re-reads the section,
+    /// the same shape [`Self::on_field_applied`] has: the screen shows
+    /// what the shepherd now holds rather than what the operator asked
+    /// for.
     ///
-    /// The sentence says the change was published and stops there. Whether
-    /// the dog acted on it is the dog's own answer, which this reply does
-    /// not carry and shep cannot predict -- the same fact the pane's footer
-    /// states (decision 4).
+    /// The sentence says the change was published and stops there.
+    /// Whether the dog acted on it is the dog's own answer, which this
+    /// reply does not carry and shep cannot predict. The pane's footer
+    /// states the same fact.
     fn on_dog_section_set(
         &mut self,
         name: &str,
@@ -2004,17 +1980,13 @@ impl App {
 
     /// One `Request::SetSheepField` reply.
     ///
-    /// The pane settles either way -- a question that has been answered is
-    /// not still in flight -- and a success re-reads the config so the
-    /// screen shows what the shepherd now holds rather than what the
-    /// operator asked for. `Effect::Send` rather than a second effect kind,
-    /// so the re-read gets `Msg::Unsent` handling for free like every other
-    /// request this reducer raises.
+    /// The pane settles either way: a question that has been answered is
+    /// not still in flight. A success re-reads the config so the screen
+    /// shows what the shepherd now holds, using `Effect::Send` so the
+    /// re-read gets `Msg::Unsent` handling for free.
     ///
-    /// `pending` is the shepherd's answer and not this pane's guess: the
-    /// cost column reads `apply_group`, which is right about the field and
-    /// cannot know that `autostart` is in force the moment it lands or that
-    /// a config subset failed to normalize on its own.
+    /// `pending` is the shepherd's answer, not this pane's guess: it knows
+    /// about fields like `autostart` that `apply_group` cannot derive.
     fn on_field_applied(
         &mut self,
         name: &str,
@@ -2293,17 +2265,13 @@ impl App {
     /// `e` on the settings screen: probe the dog under the cursor for its
     /// schema.
     ///
-    /// Nothing at all on a scalar row -- the six of them are the settings
-    /// screen's own subject, and `space` and `Enter` already edit them.
-    /// Silent rather than refused, the same rule `confirm_field` states: a
-    /// refusal about a row that was never going to act trains an operator
-    /// to ignore the status bar.
+    /// Silent on a scalar row, not refused: `space` and `Enter` already
+    /// edit those, and a refusal that was never going to act trains an
+    /// operator to ignore the status bar.
     ///
-    /// The dogs this can reach are exactly the rows the screen is already
-    /// showing -- `BUILT_IN_DOGS` plus every `adopted_dogs` key -- so no
-    /// listing request is needed to tell a name the daemon knows from one
-    /// it does not. An adopted-but-disabled dog is in that list on purpose:
-    /// configure-then-enable is the ordinary order.
+    /// The dogs this can reach are exactly the rows already shown, so no
+    /// listing request is needed. An adopted-but-disabled dog stays in
+    /// that list: configure-then-enable is the ordinary order.
     fn probe_dog_schema(&mut self) -> Effect {
         let Some(settings) = self.settings.as_ref() else {
             return Effect::None;
@@ -2322,24 +2290,13 @@ impl App {
 
     /// `e`'s own handler: refuse a dog here, else ask the shepherd.
     ///
-    /// The dog check is local because the answer is better local. The
-    /// daemon refuses this request for a dog with a sentence that already
-    /// names it, and this reducer prefixes a refusal with the name it asked
-    /// about, so the round trip produced `log-rotate: log-rotate is a dog,
-    /// and ...`. It also refuses for the wrong reason for this door: the
-    /// daemon is talking about where a dog's config comes from, and what an
-    /// operator pressing `e` needs to know is which screen edits a dog.
+    /// The daemon's refusal for a dog names where its config comes from,
+    /// not which screen edits it, so this reducer checks locally and
+    /// answers that question instead: `s` then `e` on the dog's own row.
     ///
-    /// It is a screen, not a refusal: this sentence said the config pane is
-    /// for a sheep, which stopped being true when the dog pane shipped, and
-    /// left an operator with no next keystroke. `s` then `e` on the dog's
-    /// own row is the path, and it is the one the settings screen's own
-    /// `Edit` arm takes.
-    ///
-    /// [`Self::selected_row`] rather than [`Self::selected_name`] for the
-    /// check, and both are right: a dog runs one process, so it is never a
-    /// group row, and a group row is exactly the case `selected_row`
-    /// answers `None` for and `e` still has to work on.
+    /// [`Self::selected_row`] rather than [`Self::selected_name`]: a dog
+    /// runs one process and is never a group row, but a group row must
+    /// still work with `e`.
     fn ask_for_config(&mut self) -> Effect {
         if let Some(row) = self.selected_row()
             && row.info.dog.is_some()
@@ -2365,7 +2322,7 @@ impl App {
     ///
     /// [`InputMode::Text`] is remembered on `App` while the buffer it
     /// belongs to lives on the pane, so anything that drops or replaces the
-    /// pane can leave the two disagreeing -- and a lookout in `Text` mode
+    /// pane can leave the two disagreeing, and a lookout in `Text` mode
     /// with nothing to type into eats every keystroke until `Esc`. A
     /// re-read rebuilds the whole `ConfigPane`, which is exactly that, and
     /// a landed write asks for one.
@@ -2391,23 +2348,14 @@ impl App {
     /// The config pane's own keymap, in force for as long as
     /// [`Self::config_pane`] is `Some`.
     ///
-    /// The movement keys walk the field list, `r` re-reads the same config,
-    /// `space` arms a cycle, `Enter` opens an editor or sends what is
-    /// armed, and `e` or `Escape` closes. Everything else is ignored, named
-    /// rather than wildcarded so a future variant does not fall silently
-    /// into an arm that ignores it -- an action key in particular must
-    /// never be mistaken for one this pane answers.
+    /// Movement walks fields, `r` re-reads, `space` arms a cycle, `Enter`
+    /// edits or sends, and `e` or `Escape` closes. Everything else is
+    /// named rather than wildcarded, so a stray variant cannot fall
+    /// silently into an arm that ignores it.
     ///
-    /// The env sub-screen owns the keyboard ahead of all of it while it is
-    /// open ([`Self::on_env_key`]), the same nesting the pane itself has
-    /// over the dashboard.
-    ///
-    /// An armed edit eats the FIRST movement key, `Escape`, `e` and `r`
-    /// rather than also doing their ordinary job -- the same
-    /// cancel-before-act rule the dashboard and the settings screen already
-    /// follow, and for the same reason: otherwise the operator sees the
-    /// question vanish and the cursor move on one keypress, and the next
-    /// reflexive `Enter` applies an edit to a row they have lost track of.
+    /// An armed edit eats the first movement key, `Escape`, `e` and `r`
+    /// instead of doing their ordinary job, so a reflexive `Enter` never
+    /// lands on a row the operator has lost track of.
     fn on_pane_key(&mut self, key: KeyPress) -> Effect {
         self.notice = None;
         if self
@@ -2420,12 +2368,10 @@ impl App {
         if key == KeyPress::Quit {
             return Effect::Quit;
         }
-        // Checked before the dispatch below and CONSUMED, save for the two
-        // keys the question is actually waiting for: `Enter` answers it,
-        // and `space` walks it one step further along its own cycle -- the
-        // same carve-out `on_settings_key` makes, and for the same reason.
-        // Without it a bool could be flipped once and a choice could never
-        // reach its third value without a cancel in between.
+        // Checked before the dispatch below and consumed, except `Enter`
+        // and `space`: the same carve-out `on_settings_key` makes, so a
+        // choice can still reach its third value instead of needing a
+        // cancel in between.
         if self.config_pane.as_ref().is_some_and(ConfigPane::is_armed)
             && !matches!(key, KeyPress::Confirm | KeyPress::Cycle)
         {
@@ -2473,7 +2419,7 @@ impl App {
     /// `r` from inside a pane: ask for the same target again, by whichever
     /// of the two doors it came in.
     ///
-    /// A dog's SCHEMA is not re-probed. It came from the dog's binary at
+    /// A dog's schema is not re-probed. It came from the dog's binary at
     /// open and is parked on [`Self::dog_target`]; re-probing would respawn
     /// somebody else's binary on a keystroke whose job is to re-read a file.
     fn reread_pane(&mut self) -> Effect {
@@ -2490,7 +2436,7 @@ impl App {
     /// Drops the open pane and everything a reply for it would re-open.
     ///
     /// Both targets are cleared, always, and not only the one the pane
-    /// happens to hold: a read for the OTHER kind can be in flight when this
+    /// happens to hold: a read for the other kind can be in flight when this
     /// runs (`e` on a dog, then the settings screen closes and `e` opens a
     /// sheep), and a stale one left set is exactly the re-open behind the
     /// operator's back `config_target` exists to prevent.
@@ -2503,18 +2449,13 @@ impl App {
 
     /// The refusal a locked row gets, in that row's own words.
     ///
-    /// Two sentences for two facts, and never one for both: shep refusing a
+    /// Two sentences for two facts, never one for both: shep refusing a
     /// config write is not the same as this pane having no widget for a
-    /// shape a Flockfile writes perfectly well. A generic third sentence
-    /// would put the pane back where it was before [`Lock`] existed.
+    /// shape a Flockfile writes perfectly well.
     ///
-    /// A refused row names the verb that DOES move it (decision 5), which
-    /// only the two Structural fields have. The daemon's own refusal for
-    /// the same write already named `shep stock`; this pane refuses
-    /// locally, so its weaker sentence was the only one an operator saw.
-    /// The wildcard keeps that sentence for a Structural field this binary
-    /// has not been taught a remedy for, which is the honest answer rather
-    /// than a guessed verb.
+    /// A refused Structural field names the verb that moves it instead.
+    /// The wildcard keeps a generic sentence for a Structural field this
+    /// binary has no remedy for, rather than guessing a verb.
     fn lock_refusal(key: &str, lock: Lock) -> String {
         match lock {
             Lock::Refused => match key {
@@ -2542,13 +2483,10 @@ impl App {
     /// running flock's config needs the fat-finger catch a keystroke that
     /// stops a sheep has.
     fn cycle_field(&mut self) -> Effect {
-        // The lock is checked AHEAD of the control gate, the same order
-        // `confirm_field` takes. The two disagreed once, on the same row:
-        // `space` on `instances` without `--allow-control` said read-only
-        // while `Enter` said the field is not something a config write
-        // changes. The lock wins because it is the more specific fact --
-        // `--allow-control` would not help -- and a screen that answers one
-        // question two ways teaches an operator to believe neither.
+        // The lock is checked ahead of the control gate, the same order
+        // `confirm_field` takes: it is the more specific fact, and
+        // `--allow-control` would not change it. A screen that answers
+        // one question two ways teaches an operator to believe neither.
         if let Some((key, lock)) = self
             .config_pane
             .as_ref()
@@ -2578,7 +2516,7 @@ impl App {
     /// ([`ConfigPane::pending_edit`]) and only its destination differs. A
     /// sheep's field edit leaves as a `Request::SetSheepField` and its env
     /// edit as a `Request::SetSheepEnv`, both recording an operator
-    /// override for one key. A DOG leaves by a third door, before either:
+    /// override for one key. A dog leaves by a third door, before either:
     /// `Request::SetDogConfig` carries the whole `dogs.toml` section rather
     /// than a key, so the target is read first and the [`PaneEdit`] variant
     /// only decides the other two.
@@ -2638,14 +2576,10 @@ impl App {
                 value,
                 authority,
             }),
-            // No client-side validation of the value, deliberately. The
-            // daemon deserializes it into the field it names and
-            // re-normalizes the result -- peer input is untrusted, so it
-            // must -- and a second, weaker copy of that check here would
-            // refuse some shapes the daemon accepts and would drift the
-            // moment `AppConfig` grows a field. An empty buffer on a field
-            // that is not nullable arms `null` and comes back as a named
-            // `InvalidConfig` refusal on the status bar.
+            // No client-side validation, deliberately: the daemon already
+            // re-normalizes untrusted input, so a weaker copy here would
+            // drift the moment `AppConfig` grows a field. An empty buffer
+            // on a non-nullable field arms `null`, refused as `InvalidConfig`.
             PaneEdit::Set { key, value } => Effect::Send(Sent::ApplyField {
                 name,
                 ticket,
@@ -2665,11 +2599,9 @@ impl App {
     ///   [`InputMode::Text`] on.
     ///
     /// All three go through [`Self::authorize_write`], the editor included,
-    /// for the reason [`Self::confirm_setting`]'s own doc gives: an editor
-    /// a read-only operator can type a whole path into before being told no
-    /// is a worse refusal than one that arrives on the keypress that asked.
-    /// The env sub-screen is gated too -- it exists only to write, since
-    /// the shepherd never sends a value back for it to show.
+    /// for the reason [`Self::confirm_setting`]'s own doc gives. The env
+    /// sub-screen is gated too: it exists only to write, since the
+    /// shepherd never sends a value back for it to show.
     fn confirm_field(&mut self) -> Effect {
         let Some(pane) = self.config_pane.as_ref() else {
             return Effect::None;
@@ -2682,17 +2614,16 @@ impl App {
         };
         let locked = pane.cursor_lock().map(|(key, lock)| (key.to_owned(), lock));
         let opens = matches!(kind, FieldKind::Map | FieldKind::Text | FieldKind::Integer);
-        // A row `Enter` was never going to open raises nothing at all --
-        // `confirm_setting`'s own third case, for its reason: a refusal
-        // about a key that was never going to act trains an operator to
-        // ignore the status bar. A bool and a choice are `space`'s job, and
-        // `space` works.
+        // A row `Enter` was never going to open raises nothing at all: a
+        // refusal about a key that was never going to act trains an
+        // operator to ignore the status bar. A bool and a choice are
+        // `space`'s job, and `space` works.
         if !opens && locked.is_none() {
             return Effect::None;
         }
-        // The lock is checked AHEAD of the control gate, and it is the more
-        // specific of the two answers: `--allow-control` would not help.
-        // Each lock says its own thing -- see [`Self::lock_refusal`].
+        // The lock is checked ahead of the control gate: it is the more
+        // specific of the two answers, and `--allow-control` would not
+        // help. Each lock says its own thing; see [`Self::lock_refusal`].
         if let Some((key, lock)) = locked {
             self.notice = Some(Notice {
                 text: Self::lock_refusal(&key, lock),
@@ -2718,27 +2649,16 @@ impl App {
     /// The env sub-screen's own keymap, in force for as long as the pane
     /// holds one.
     ///
-    /// `Escape` closes the sub-screen and NOT the pane: the cascade backs
-    /// out of the innermost thing first, the same rule
-    /// [`KeyPress::Escape`]'s own doc states. `e` closes the whole pane,
-    /// because that is the key that opened it.
+    /// `Escape` closes the sub-screen, not the pane, backing out of the
+    /// innermost thing first; `e` closes the whole pane. `Enter` opens the
+    /// editor on the row under the cursor, or sends whatever is armed.
     ///
-    /// `Enter` opens the editor on the row under the cursor, and sends
-    /// whatever is armed -- the same two-keystroke shape every other write
-    /// in lookout has.
+    /// Both a set and a removal arm before sending: `handle_set_sheep_env`
+    /// writes the override store on the same call, so the previous value
+    /// is gone the moment the reply lands, and this write-only screen
+    /// cannot read it back to restore it.
     ///
-    /// It did not, briefly, on the argument that an env change parks until
-    /// the next spawn, so nothing irreversible happens on the keypress.
-    /// That argument is about when the change takes EFFECT and says nothing
-    /// about when the old value is LOST: `handle_set_sheep_env` writes the
-    /// override store on the same call, so the previous value is gone the
-    /// moment the reply lands, reload or no reload. This screen is
-    /// write-only, so nothing here can read it back to put it there again,
-    /// which makes an overwrite exactly as total a loss as a removal. Both
-    /// arm.
-    ///
-    /// An armed edit eats the first stray key, the cancel-before-act rule
-    /// the field list already follows, with `Enter` exempt because it is
+    /// An armed edit eats the first stray key, `Enter` exempt since it is
     /// the key the question is waiting for.
     fn on_env_key(&mut self, key: KeyPress) -> Effect {
         if key == KeyPress::Quit {
@@ -2805,10 +2725,8 @@ impl App {
     /// [`Self::on_settings_text_key`]'s own doc gives: this repository does
     /// not widen an accepted input grammar without a basis in the spec.
     ///
-    /// Both editors ARM on `TextApply`: the operator's next `Enter`, on the
-    /// now-closed editor, is what sends it. This doc said an env edit
-    /// SENDS, which it did until [`Self::on_env_key`] made that screen stop
-    /// being the one exception -- see its own doc for the argument.
+    /// Both editors arm on `TextApply`: the operator's next `Enter`, on
+    /// the now-closed editor, is what sends it.
     fn on_pane_text_key(&mut self, key: KeyPress) -> Effect {
         if key == KeyPress::Quit {
             return Effect::Quit;
@@ -2847,9 +2765,8 @@ impl App {
 
     /// The env sub-screen's own text keymap.
     ///
-    /// `TextApply` ARMS, exactly as the field editor's does. See
-    /// [`Self::on_env_key`] for why this screen stopped being the one
-    /// exception to that.
+    /// `TextApply` arms, exactly as the field editor's does. See
+    /// [`Self::on_env_key`] for why an env write arms before it sends.
     fn on_env_text_key(&mut self, key: KeyPress) -> Effect {
         let now = self.now;
         let Some(pane) = self.config_pane.as_mut() else {
@@ -6030,7 +5947,7 @@ mod tests {
     }
 
     /// The file half lands first, so `DogView.enabled` is stale by the time
-    /// this reply arrives while RUNNING keeps updating off the poll. Without
+    /// this reply arrives while running keeps updating off the poll. Without
     /// the re-read a landed `enable metrics` reads `metrics | no | online`.
     #[test]
     fn a_landed_toggle_re_reads_the_file_in_both_directions() {
@@ -6118,10 +6035,7 @@ mod tests {
         assert!(said.contains(&RequestError::Closed.to_string()));
     }
 
-    /// fails if `e` stops asking the shepherd for the selected sheep's
-    /// config, or if the reply stops opening a pane over the dashboard.
-    ///
-    /// `e` raises the READ, not the open: the pane shows the shepherd's own
+    /// `e` raises the read, not the open: the pane shows the shepherd's own
     /// answer or it shows nothing, the same rule `s` and `Msg::Settings`
     /// already follow for the settings screen.
     #[test]
@@ -6150,8 +6064,6 @@ mod tests {
         assert_eq!(pane.fields().len(), 39);
     }
 
-    /// fails if `e` on an empty flock starts sending a request for a sheep
-    /// that is not there.
     #[test]
     fn e_with_nothing_selected_asks_for_nothing() {
         let mut app = fixtures::app_with(Vec::new(), fixtures::plain());
@@ -6159,10 +6071,9 @@ mod tests {
         assert!(app.config_pane().is_none());
     }
 
-    /// fails if `e` stops reaching a group row. A group has no single sheep,
-    /// which is why `selected_row` answers `None` for one -- but every
-    /// instance behind it shares one stored spec, and the group row is what
-    /// a multi-instance app shows by default.
+    /// A group has no single sheep, so `selected_row` answers `None` for
+    /// one. Every instance behind it shares one stored spec, and the group
+    /// row is what a multi-instance app shows by default.
     #[test]
     fn e_on_a_group_row_asks_by_the_apps_name() {
         let mut app = fixtures::app_with(
@@ -6189,9 +6100,6 @@ mod tests {
         );
     }
 
-    /// fails if either key stops closing the pane, or if closing starts
-    /// cascading into the dashboard's own `Escape` (which quits, or clears
-    /// a filter).
     #[test]
     fn e_and_escape_both_close_the_pane_and_neither_quits() {
         for key in [KeyPress::Edit, KeyPress::Escape] {
@@ -6201,8 +6109,6 @@ mod tests {
         }
     }
 
-    /// fails if the pane stops owning the keyboard while it is open. `x` in
-    /// particular: an action key must never arm from in here.
     #[test]
     fn the_pane_owns_the_keyboard_while_it_is_open() {
         let mut app = fixtures::app_in_sheep_pane();
@@ -6222,7 +6128,6 @@ mod tests {
         assert!(app.config_pane().is_some());
     }
 
-    /// fails if the movement keys stop walking the field list.
     #[test]
     fn the_movement_keys_walk_the_fields() {
         let mut app = fixtures::app_in_sheep_pane();
@@ -6235,8 +6140,6 @@ mod tests {
         assert_eq!(app.config_pane().unwrap().view().cursor(), 0);
     }
 
-    /// fails if `r` from inside the pane stops re-reading, or if the reply
-    /// throws the operator back to the first field.
     #[test]
     fn r_re_reads_the_same_sheep_and_the_cursor_survives_it() {
         let mut app = fixtures::app_in_sheep_pane();
@@ -6257,8 +6160,6 @@ mod tests {
         assert_eq!(app.config_pane().unwrap().view().cursor(), 38);
     }
 
-    /// fails if a refusal is swallowed, or if a failed refresh blanks a pane
-    /// that was showing something real.
     #[test]
     fn a_refused_config_read_says_why_and_leaves_the_pane_alone() {
         let mut app = fixtures::app_in_sheep_pane();
@@ -6278,8 +6179,7 @@ mod tests {
         assert!(app.config_pane().is_some(), "the pane stays as it was");
     }
 
-    /// fails if a config read the channel dropped goes unreported. Silence
-    /// looks exactly like a key that is not bound.
+    /// Silence looks exactly like a key that is not bound.
     #[test]
     fn a_config_read_that_was_never_sent_says_so() {
         let mut app =
@@ -6294,9 +6194,8 @@ mod tests {
         assert!(app.notice().unwrap().is_grave());
     }
 
-    /// fails if the pane stops getting one row fewer than the settings
-    /// screen. It spends its first line on a title naming the sheep, so a
-    /// viewport told the full body height would scroll one row late.
+    /// It spends its first line on a title naming the sheep, so a viewport
+    /// told the full body height would scroll one row late.
     #[test]
     fn the_pane_gets_the_body_height_minus_its_own_title() {
         let mut app = fixtures::app_in_sheep_pane();
@@ -6354,24 +6253,10 @@ mod tests {
         }
     }
 
-    /// fails if a single-field write stops going out as a
-    /// `Request::SetSheepField`, or starts naming a key other than the one
-    /// the operator edited.
-    ///
-    /// **The route is the whole point.** The same edit went out as a
-    /// one-app `Request::ApplyConfig` at `ResetDepth::File` until
-    /// 2026-09-05. That moved exactly this field and nothing else, and then
-    /// the merge spent the operator's override for it, because a merge is a
-    /// template load and a key put back to the template is not a key an
-    /// operator is holding a value for. The edit therefore landed and
-    /// vanished from `overridden` on the same round trip, so the `*` this
-    /// pane draws never appeared and `shep flock`'s CFG column counted
-    /// nothing. `rpc.rs`'s
-    /// `a_field_edit_is_reported_as_an_operator_override` is the other half
-    /// of this claim, asserted where the marker is actually built.
-    ///
-    /// One field from each of the groups the pane draws, because the
-    /// classification the daemon routes on is per field.
+    /// One field from each of the groups the pane draws, since the
+    /// daemon's routing classification is per field. `rpc.rs`'s
+    /// `a_field_edit_is_reported_as_an_operator_override` asserts the
+    /// other half, where the marker is actually built.
     #[test]
     fn one_edit_reaches_the_wire_as_a_single_field_override() {
         for (key, presses) in [
@@ -6404,10 +6289,8 @@ mod tests {
         }
     }
 
-    /// fails if a typed field stops reaching the wire as the value that was
-    /// typed, in the JSON shape that field's own kind wants. `cwd` and
-    /// `max_restarts` between them cover text and integer, which arm
-    /// differently, and an integer sent as a string is refused by the
+    /// `cwd` and `max_restarts` between them cover text and integer, which
+    /// arm differently, and an integer sent as a string is refused by the
     /// daemon rather than set.
     #[test]
     fn a_typed_field_reaches_the_wire_as_the_value_that_was_typed() {
@@ -6439,13 +6322,8 @@ mod tests {
         }
     }
 
-    /// fails if the env sub-screen stops sending one key at a time, or
-    /// starts routing env through `ApplyConfig`, where no `ResetDepth`
-    /// expresses one key.
-    ///
-    /// Also fails if either write stops ARMING first. The daemon writes the
-    /// override store on the same call, so a set destroys the old value as
-    /// surely as a removal does, and this screen cannot read either back.
+    /// Routing through `ApplyConfig` would not work: no `ResetDepth`
+    /// names a single key.
     #[test]
     fn the_env_sub_screen_arms_then_sets_one_key_and_removes_another() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6509,8 +6387,6 @@ mod tests {
         );
     }
 
-    /// fails if an armed env write stops being cancellable by a stray key,
-    /// which is what makes it a question rather than an announcement.
     #[test]
     fn a_stray_key_cancels_an_armed_env_write() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6530,11 +6406,9 @@ mod tests {
         );
     }
 
-    /// fails if the env cursor stops naming the same KEY across a refresh.
-    ///
-    /// A removal shortens the list, so a cursor carried by INDEX names the
-    /// next key down afterwards, and a reflexive second `Enter` arms a
-    /// write against a neighbour nobody chose. A key that is gone lands on
+    /// A removal shortens the list, so a cursor carried by index would name
+    /// the next key down, and a reflexive second `Enter` would arm a write
+    /// against a neighbour nobody chose. A key that is gone lands on
     /// `+ new`, the one row where `Enter` destroys nothing.
     #[test]
     fn the_env_cursor_is_carried_by_key_and_not_by_index_across_a_refresh() {
@@ -6553,7 +6427,7 @@ mod tests {
             app.config_pane().unwrap().env().unwrap().cursor_key(),
             Some("LOG_LEVEL")
         );
-        // A refresh that removed the key ABOVE it keeps it on its own key,
+        // A refresh that removed the key above it keeps it on its own key,
         // which is now row 0. Carrying the index would have moved it to
         // `+ new`; carrying nothing would have moved it to `DB_HOST`.
         refresh_config(&mut app, &["LOG_LEVEL"]);
@@ -6561,19 +6435,14 @@ mod tests {
             app.config_pane().unwrap().env().unwrap().cursor_key(),
             Some("LOG_LEVEL")
         );
-        // A refresh that removed the cursor's OWN key lands on `+ new`,
+        // A refresh that removed the cursor's own key lands on `+ new`,
         // never on whatever took its place.
         refresh_config(&mut app, &["OTHER"]);
         assert_eq!(app.config_pane().unwrap().env().unwrap().cursor_key(), None);
     }
 
-    /// fails if a reply landing while an editor is open throws the buffer
-    /// away, or strands the keyboard in `InputMode::Text`.
-    ///
-    /// The buffer was discarded with no notice and every later keystroke
-    /// was dead until `Esc`, because `settle` cleared every variant rather
-    /// than only the one that is in flight. On the env screen the
-    /// discarded buffer is a secret the operator cannot read back.
+    /// `settle` clears only the write that is in flight. On the env screen
+    /// the discarded buffer is a secret the operator cannot read back.
     #[test]
     fn a_reply_landing_mid_edit_leaves_the_buffer_and_the_keyboard_alone() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6599,9 +6468,8 @@ mod tests {
         assert!(buffer.ends_with("/srv"), "{buffer}");
     }
 
-    /// fails if the pane is left in `InputMode::Text` with no editor to
-    /// type into. A landed write asks for a re-read, and the re-read
-    /// rebuilds the whole `ConfigPane`, editor included.
+    /// A landed write asks for a re-read, and the re-read rebuilds the
+    /// whole `ConfigPane`, editor included.
     #[test]
     fn a_refresh_that_drops_an_open_editor_puts_the_keyboard_back() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6613,13 +6481,9 @@ mod tests {
         assert!(app.config_pane().unwrap().pending_edit().is_none());
     }
 
-    /// fails if one write's reply clears a DIFFERENT write's in-flight
-    /// line while that one is still outstanding.
-    ///
     /// Only the line was ever at risk: each request names exactly its own
-    /// key, so neither can carry the other's value and the config itself
-    /// cannot be crossed. `PanePending::Sent` had no key to match against,
-    /// so any reply settled whatever was pending.
+    /// key, so neither can carry the other's value, and the config itself
+    /// cannot be crossed.
     #[test]
     fn an_arriving_reply_leaves_the_in_flight_line_of_another_write() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6661,13 +6525,10 @@ mod tests {
         assert!(app.config_pane().unwrap().pending_edit().is_none());
     }
 
-    /// fails if either kind of locked row starts arming an edit, or if the
-    /// two stop refusing for their own reasons.
-    ///
-    /// `instances` is `Lock::Refused` -- shep takes no config write for it
-    /// at all -- and `args` is `Lock::NoWidget`, which is only this pane
-    /// having no editor for the shape. A single sentence for both is what
-    /// `Lock` exists to stop.
+    /// `instances` is `Lock::Refused`, since shep takes no config write for
+    /// it at all. `args` is `Lock::NoWidget`, since this pane simply has no
+    /// editor for the shape. `Lock` exists so one sentence never covers
+    /// both.
     #[test]
     fn a_refused_field_and_one_with_no_widget_refuse_for_different_reasons() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6693,10 +6554,6 @@ mod tests {
         assert_ne!(refused, no_widget, "two facts, two sentences");
     }
 
-    /// fails if the pane refuses a Structural field without naming the
-    /// verb that does move it (decision 5). The daemon's own refusal for
-    /// the same field names `shep stock`; the pane refuses locally, so its
-    /// weaker sentence was the only one an operator ever saw.
     #[test]
     fn a_refused_field_names_the_verb_that_owns_it() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6706,15 +6563,8 @@ mod tests {
         assert!(said.contains("`shep stock`"), "{said}");
     }
 
-    /// fails if `space` and `Enter` answer the same locked row two
-    /// different ways.
-    ///
-    /// They did: `cycle_field` read the control gate first and
-    /// `confirm_field` read the lock first, so on `instances` without
-    /// `--allow-control` one key said read-only and the other said the
-    /// field is not something a config write changes. Both are true and
-    /// only one can be the answer; the lock wins, because
-    /// `--allow-control` would not have helped.
+    /// The lock wins over the control gate: `--allow-control` does not
+    /// unlock a Structural field.
     #[test]
     fn space_and_enter_refuse_a_locked_row_with_the_same_sentence() {
         for control in [Control::ReadOnly, Control::Allowed] {
@@ -6740,10 +6590,6 @@ mod tests {
         }
     }
 
-    /// fails if a read-only lookout can arm or send a config write, or open
-    /// either editor. The gate is the same fat-finger catch `x` gets: an
-    /// editor a read-only operator can type a whole path into before being
-    /// told no is a worse refusal than one that arrives on the keypress.
     #[test]
     fn a_read_only_pane_refuses_every_door_that_writes() {
         // One pair per door: `space` arms a cycle, `Enter` opens the text
@@ -6767,9 +6613,6 @@ mod tests {
         }
     }
 
-    /// fails if an armed edit survives a stray key, or if that key also
-    /// does its ordinary job -- the cancel-before-act rule the dashboard
-    /// and the settings screen already follow.
     #[test]
     fn a_stray_key_cancels_an_armed_pane_edit_and_does_nothing_else() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6786,8 +6629,6 @@ mod tests {
         );
     }
 
-    /// fails if an armed pane edit stops expiring, which would leave a
-    /// question about the shepherd on screen indefinitely.
     #[test]
     fn an_armed_pane_edit_expires_with_the_confirm_budget() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6800,13 +6641,9 @@ mod tests {
         assert!(!app.config_pane().unwrap().is_armed());
     }
 
-    /// fails if a landed write stops re-reading the config, if it stops
-    /// saying whether the running child has the value, or if a refusal is
-    /// swallowed.
-    ///
-    /// `pending` is the shepherd's answer and the pane reports it verbatim
-    /// rather than re-deriving it from `apply_group`: the two disagree on
-    /// `autostart`, and on a field whose config subset would not normalize.
+    /// `pending` is the shepherd's answer, reported verbatim rather than
+    /// re-derived from `apply_group`: the two disagree on `autostart`, and
+    /// on a field whose config subset would not normalize.
     #[test]
     fn a_landed_write_re_reads_the_config_and_reports_what_the_shepherd_said() {
         for (pending, wanted) in [(false, "is set"), (true, "shep reload")] {
@@ -6838,11 +6675,9 @@ mod tests {
         }
     }
 
-    /// fails if the shepherd's refusal is swallowed. Every refusal this
-    /// door can meet is an `Err` now rather than a field in a success
-    /// reply, which is `Response::SheepFieldSet`'s own argument for
-    /// carrying no `refused`: two ways to say no is one a client forgets to
-    /// check.
+    /// Every refusal this door can meet is an `Err`, which is why
+    /// `Response::SheepFieldSet` carries no `refused` field: two ways to
+    /// say no is one a client forgets to check.
     #[test]
     fn a_refused_write_is_reported_and_does_not_re_read() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6869,18 +6704,8 @@ mod tests {
         );
     }
 
-    /// fails if the value a write carries reaches a `{:?}` (IR-41).
-    ///
-    /// The leak this closes was one hop outside the boundary drawn when
-    /// `PaneEdit` got a hand-written redaction: the same value travelled on
-    /// into `Sent::ApplyField`, which derives `Debug`, and printed
-    /// `value: String("/home/ada/secret-project")` in the clear. Asserted
-    /// on the whole `Effect`, which is what a diagnostic would print, and
-    /// not on the value alone -- the point is that no wrapper between here
-    /// and there unwraps it.
-    ///
-    /// `Sent::SetEnv` is here for the same reason and was never leaking:
-    /// `EnvValue` has redacted itself since Task 4.
+    /// Asserted on the whole `Effect`, since that is what a diagnostic
+    /// would print. Nothing between here and the wire unwraps the value.
     #[test]
     fn a_write_effects_debug_names_no_value() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6916,13 +6741,8 @@ mod tests {
         );
     }
 
-    /// fails if two writes to the SAME field settle on the first reply.
-    ///
-    /// The narrower half of the two-writes hole. Matching a reply against
-    /// the `Sent` variant's KEY closed it for two different fields and left
-    /// it open for one field twice, which is what a ticket closes: the
-    /// counter is monotonic and never reused, so no two writes can be
-    /// confused whatever they name.
+    /// A ticket is what closes it: the counter is monotonic and never
+    /// reused, so no two writes can be confused whatever field they name.
     #[test]
     fn two_writes_to_one_field_settle_on_their_own_replies() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6963,15 +6783,8 @@ mod tests {
         assert!(app.config_pane().unwrap().pending_edit().is_none());
     }
 
-    /// fails if a refresh silently drops a question the operator has not
-    /// answered, or a write they are still waiting on.
-    ///
-    /// Held by reachability before this: a refresh rebuilds the whole
-    /// `ConfigPane` and the arm went with it, and nothing on today's
-    /// keyboard could land one while armed. That is an invariant nobody
-    /// can see, and the `Sent` half IS reachable -- two writes out, the
-    /// first lands, and its own re-read arrives while the second is still
-    /// outstanding.
+    /// The `Sent` half is reachable: two writes out, the first lands, and
+    /// its own re-read arrives while the second is still outstanding.
     #[test]
     fn a_refresh_keeps_an_armed_edit_and_an_outstanding_one() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -6997,12 +6810,9 @@ mod tests {
         );
     }
 
-    /// fails if `e` on a dog row asks the shepherd for a config it will
-    /// refuse, or if the refusal names the dog twice.
-    ///
-    /// The round trip produced `log-rotate: log-rotate is a dog, and ...`,
-    /// because the shepherd's own refusal is a whole sentence that already
-    /// names its subject.
+    /// The shepherd's own refusal for a dog already names it. Asking
+    /// anyway would double the name: `log-rotate: log-rotate is a dog,
+    /// and ...`.
     #[test]
     fn e_on_a_dog_row_refuses_locally_and_names_the_dog_once() {
         let mut app = fixtures::with_selection(
@@ -7025,10 +6835,6 @@ mod tests {
         assert!(app.config_pane().is_none());
     }
 
-    /// fails if `e` on a dog row withholds the path that does work. The
-    /// old sentence said the config pane is for a sheep, which stopped
-    /// being true when the dog pane shipped, and left the operator with a
-    /// refusal and no next keystroke.
     #[test]
     fn e_on_a_dog_row_names_the_screen_that_does_edit_a_dog() {
         let mut app = fixtures::with_selection(
@@ -7042,14 +6848,10 @@ mod tests {
         assert!(!said.contains("the config pane is for a sheep"), "{said}");
     }
 
-    /// fails if a refusal that names nothing reaches an operator naming
-    /// nothing.
-    ///
-    /// `EngineStopped` is the one of this request's three refusals that
-    /// carries no subject of its own: `rpc_error` renders it as `the
-    /// supervisor engine has stopped`, full stop. A notice saying only that
-    /// identifies neither the sheep nor the screen it came from, which is
-    /// what stripping the prefix unconditionally produced.
+    /// `EngineStopped` is the one of this request's three refusals with no
+    /// subject of its own: `rpc_error` renders it as `the supervisor
+    /// engine has stopped`, full stop, naming neither the sheep nor the
+    /// screen it came from.
     #[test]
     fn a_refusal_that_names_nothing_still_reaches_the_operator_named() {
         let mut app = fixtures::app_in_sheep_pane();
@@ -7068,11 +6870,6 @@ mod tests {
         assert!(app.notice().unwrap().is_grave());
     }
 
-    /// fails if a config reply re-opens a pane the operator has closed.
-    ///
-    /// Two `e` presses against a slow shepherd, then `Esc`: the second
-    /// answer used to land on a dashboard the operator had gone back to and
-    /// put the pane straight back up.
     #[test]
     fn a_config_reply_for_a_pane_nobody_wants_is_dropped() {
         let mut app =
@@ -7101,9 +6898,8 @@ mod tests {
         assert!(app.notice().is_none(), "silently: nothing went wrong");
     }
 
-    /// fails if closing the pane stops making a later `e` work again. The
-    /// drop above is keyed on a target, and a target left set or left stale
-    /// would either re-open on a stray reply or refuse the next open.
+    /// Closing must clear the target it is keyed on: left stale, it would
+    /// either re-open on a stray reply or refuse the next open.
     #[test]
     fn e_still_opens_a_pane_after_one_was_closed() {
         let mut app = fixtures::app_in_sheep_pane();
@@ -7119,10 +6915,8 @@ mod tests {
         });
         assert!(app.config_pane().is_some());
     }
-    /// fails if `e` on the settings screen's dog row stops probing, or
-    /// starts probing something other than the row under the cursor. The
-    /// path is what carries a probe to an ADOPTED dog's own binary; a
-    /// built-in answers in-process and has none.
+    /// The path is what carries a probe to an adopted dog's own binary; a
+    /// built-in dog answers in-process and has none.
     #[test]
     fn e_on_a_settings_dog_row_probes_that_dogs_own_binary() {
         let mut app = fixtures::app_in_settings_on_dog("otel");
@@ -7143,7 +6937,6 @@ mod tests {
         );
     }
 
-    /// fails if `e` on one of the six scalar rows starts doing something.
     /// Those rows are the settings screen's own subject, and `space` and
     /// `Enter` already edit them.
     #[test]
@@ -7154,9 +6947,6 @@ mod tests {
         assert!(app.notice().is_none(), "and says nothing about it");
     }
 
-    /// fails if a dog that publishes no schema gets a pane anyway, or if
-    /// the refusal stops naming the file an operator edits instead
-    /// (decision 10).
     #[test]
     fn a_dog_with_no_schema_gets_no_pane_and_is_told_where_to_edit() {
         let mut app = fixtures::app_in_settings_on_dog("otel");
@@ -7179,9 +6969,9 @@ mod tests {
         assert!(notice.contains("$EDITOR"), "{notice}");
     }
 
-    /// fails if the schema stops being the first of two halves: the pane
-    /// cannot be drawn until the shepherd has answered with the section,
-    /// which is the half this binary has no copy of.
+    /// The schema is the first of two halves. The pane cannot be drawn
+    /// until the shepherd answers with the section, the half this binary
+    /// has no copy of.
     #[test]
     fn a_schema_asks_for_the_section_and_the_section_opens_the_pane() {
         let mut app = fixtures::app_in_settings_on_dog("metrics");
@@ -7214,9 +7004,7 @@ mod tests {
         );
     }
 
-    /// fails if a section arriving for a dog the operator has already left
-    /// re-opens a pane over the screen they went back to -- the same
-    /// property `config_target` buys for a sheep.
+    /// The same property `config_target` buys for a sheep.
     #[test]
     fn a_section_for_a_dog_nobody_is_waiting_for_is_dropped() {
         let mut app = fixtures::app_in_dog_pane();
@@ -7233,10 +7021,9 @@ mod tests {
         assert!(app.config_pane().is_none(), "a late reply re-opens nothing");
     }
 
-    /// fails if a section for the WRONG dog replaces the pane. Its twin
-    /// above proves the pane is dropped once nobody is waiting; this one
-    /// proves the name is checked while somebody still is, which is the
-    /// half a cleared target cannot cover.
+    /// Its twin above proves the pane drops once nobody is waiting; this
+    /// one proves the name is checked while somebody still is, the half a
+    /// cleared target cannot cover.
     #[test]
     fn a_section_for_a_different_dog_does_not_replace_the_pane() {
         let mut app = fixtures::app_in_dog_pane();
@@ -7257,9 +7044,9 @@ mod tests {
         );
     }
 
-    /// fails if a dog's write stops carrying the WHOLE section, or if it
-    /// stops going out through `SetDogConfig` -- a dog has no override
-    /// store and no Flockfile, so `ApplyConfig` has nothing to mean here.
+    /// A dog has no override store and no Flockfile, so `ApplyConfig` has
+    /// nothing to mean here: the write goes out through `SetDogConfig`
+    /// instead.
     #[test]
     fn a_dog_pane_write_carries_the_whole_edited_section() {
         let mut app = fixtures::app_in_dog_pane();
@@ -7301,9 +7088,6 @@ mod tests {
         );
     }
 
-    /// fails if a landed write stops re-reading the section, or if the
-    /// sentence starts promising the dog acted on it. Only the dog knows
-    /// that, which is the same fact the pane's own footer states.
     #[test]
     fn a_landed_dog_write_re_reads_the_section_and_promises_nothing_more() {
         let mut app = fixtures::app_in_dog_pane();
@@ -7340,9 +7124,8 @@ mod tests {
         assert!(notice.contains("bark is told"), "{notice}");
     }
 
-    /// fails if `r` in a dog pane starts re-probing the dog's binary. The
-    /// schema was read at open and is parked on the app; a keystroke whose
-    /// job is to re-read a file must not respawn somebody else's process.
+    /// The schema was read at open and is parked on the app: a keystroke
+    /// that re-reads a file must not respawn somebody else's process.
     #[test]
     fn r_in_a_dog_pane_re_reads_the_section_and_never_re_probes() {
         let mut app = fixtures::app_in_dog_pane();
@@ -7354,9 +7137,9 @@ mod tests {
         );
     }
 
-    /// fails if a dog's map field starts offering the sheep env sub-screen,
-    /// which writes through `Request::SetSheepEnv` and would name a sheep
-    /// that does not exist. It refuses with `Lock::NoWidget`'s own sentence.
+    /// The env sub-screen writes through `Request::SetSheepEnv`, which
+    /// would name a sheep that does not exist. It refuses with
+    /// `Lock::NoWidget`'s own sentence instead.
     #[test]
     fn enter_on_a_dogs_map_field_refuses_rather_than_opening_the_env_screen() {
         let mut app = fixtures::app_in_dog_pane();

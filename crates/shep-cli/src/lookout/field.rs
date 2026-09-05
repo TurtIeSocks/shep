@@ -29,7 +29,7 @@ pub enum FieldKind {
 /// One field of a form.
 ///
 /// `Debug` is derived rather than redacted (IR-41): this is a schema, and a
-/// schema describes a value without carrying one. A secret's SHAPE is not a
+/// schema describes a value without carrying one. A secret's shape is not a
 /// secret.
 ///
 /// `default` is the one field that could weaken that, since it is a value
@@ -37,7 +37,7 @@ pub enum FieldKind {
 /// comes from a static constant, either the committed
 /// `crates/shep-core/assets/flockfile.schema.json` or a dog's own
 /// `--schema` answer, which is its binary describing itself. Neither has
-/// ever seen this flock. A LIVE value reaches the pane through
+/// ever seen this flock. A live value reaches the pane through
 /// `ConfigPane`'s own values map instead, which is why that type's `Debug`
 /// is redacted by hand while this one is derived.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,13 +100,9 @@ impl FieldSet {
     #[must_use]
     pub fn from_fields(mut fields: Vec<Field>, group_order: &[&str]) -> Self {
         // Every group `group_order` does not name, in the order it first
-        // appears. Without this, all of them ranked `(1, 0)` alike, so two
-        // distinct unknown groups stayed interleaved wherever the caller
-        // had interleaved them -- and a renderer pushes a header whenever
-        // the group changes, so each one would have drawn its name twice.
-        // Unreachable for the Flockfile schema, where `GROUP_ORDER` names
-        // all four; reachable the moment a dog's own `--schema` answer
-        // names a group this binary has never heard of.
+        // appears. Without this, all of them ranked `(1, 0)` alike, and
+        // two distinct unknown groups stayed interleaved, so a renderer
+        // pushing a header on every group change drew each name twice.
         let mut unknown: Vec<String> = Vec::new();
         for field in &fields {
             if let Some(group) = field.group.as_deref()
@@ -132,7 +128,7 @@ impl FieldSet {
             }
         };
         // Stable, so within-group order is whatever the caller gave. The
-        // sort is also what makes every group CONTIGUOUS, which every
+        // sort is also what makes every group contiguous, which every
         // renderer relies on.
         fields.sort_by_key(|f| rank(f.group.as_deref()));
         Self { fields }
@@ -391,12 +387,10 @@ mod tests {
         assert_eq!(set.by_key("c").unwrap().help, "c");
     }
 
-    /// fails if two groups `group_order` does not name stay interleaved.
-    ///
-    /// They all ranked equal, so a stable sort left them exactly where the
-    /// caller had them, and a renderer pushing a header on every group
-    /// change would have drawn each of these twice. `GROUP_ORDER` names all
-    /// four Flockfile groups, so only a dog's own `--schema` answer reaches
+    /// They all rank equal, so a stable sort leaves them exactly where the
+    /// caller put them, and a renderer that pushes a header on every group
+    /// change would draw each of these twice. `GROUP_ORDER` names all four
+    /// Flockfile groups, so only a dog's own `--schema` answer reaches
     /// this.
     #[test]
     fn two_groups_the_order_does_not_name_still_come_out_contiguous() {

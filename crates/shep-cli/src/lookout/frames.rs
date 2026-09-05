@@ -907,11 +907,9 @@ fn scene_with(which: Scene, age: Duration) -> Buffer {
     }
 
     let (width, height) = which.size();
-    // The same call `run_ui` makes before every draw. Without it a gallery
-    // frame renders with `Viewport::rows` still zero, which means unlimited
-    // -- so every guard on a scrolled screen sat on a branch no snapshot
-    // here exercised, and the settings screen shipped drawing its cursor
-    // off the bottom of a short terminal with seven green frames behind it.
+    // The same call `run_ui` makes before every draw. Without it
+    // `Viewport::rows` stays zero, which means unlimited, so a guard on a
+    // scrolled screen never triggers.
     app.note_body_rows(body_rows(Rect::new(0, 0, width, height)));
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| draw(&app, frame)).unwrap();
@@ -1811,7 +1809,7 @@ mod tests {
         // "The same screen at 14 rows, which is fewer than it has to draw.
         //  The cursor is on the last dog, so the view has scrolled to reach
         //  it and `... 5 above` says how much is off the top. The scroll is
-        //  counted in LINES rather than in rows: a section header and the
+        //  counted in lines rather than in rows: a section header and the
         //  dogs caption cost the same height a row does."
         let short = render_text(&scene(Scene::SettingsShort).1);
         assert!(

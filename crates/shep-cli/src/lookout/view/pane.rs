@@ -2,18 +2,15 @@
 //! groups as section headers, one row per field, and a cost column saying
 //! what changing that field would cost.
 //!
-//! The layout is [`super::settings`]'s, and deliberately so: both screens
-//! own the whole body between the title line and the status bar, both have
-//! more rows than a terminal has lines, and both pay for chrome the
-//! viewport cannot see. The scroll walk itself is shared
-//! ([`super::scroll::to_cursor`]); the layout below is this pane's own,
-//! because a uniform field list under four headers and a settings screen
-//! with a caption, a column header and a dogs table have almost no lines in
-//! common.
+//! The layout is [`super::settings`]'s: both screens own the whole body
+//! between the title and the status bar, both have more rows than a
+//! terminal has lines, and both pay for chrome the viewport cannot see.
+//! The scroll walk is shared ([`super::scroll::to_cursor`]); the layout
+//! below is this pane's own, since a field list under four headers and a
+//! settings screen with a dogs table share almost no lines.
 //!
 //! A sheep pane is 39 rows plus a title, four headers and three blank
-//! separators, so the chrome runs to eight lines before a marker is paid
-//! for. Every one of them is counted here.
+//! separators: eight lines of chrome before a marker is paid for.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -62,33 +59,13 @@ const fn body_width(width: u16) -> u16 {
 
 /// What a change to a field in `group` costs, in an operator's words.
 ///
-/// **A prediction from the field's CLASS, not a promise about a particular
-/// write, and the pane no longer claims otherwise anywhere else.**
-/// `apply_group` is a fact about the field; whether a given write reaches
-/// the running child is a fact about the flock, and only the shepherd has
-/// it. Two rows drawn here are routinely wrong about their own write:
-/// `watch` says `now` and parks whenever the config subset it would reach
-/// cannot normalize alone, and `autostart` says `next start` and is in
-/// force the moment it lands, because the daemon reads it at muster.
+/// A prediction from the field's class, not the outcome of a specific
+/// write: `watch` says `now` but can park, and `autostart` says `next
+/// start` but takes effect at muster. The status bar reports what
+/// actually happened; the row's `!` flag is the durable answer.
 ///
-/// It is left as a prediction rather than corrected from the reply. A reply
-/// arrives for one row of thirty-nine, so correcting it would leave a
-/// column that is a fact on the rows an operator happened to edit and a
-/// prediction on the rest, with nothing on screen saying which is which.
-/// The question this column answers is hypothetical anyway -- it is read
-/// BEFORE a write, to decide whether to make one. The other two things that
-/// speak are not predictions: the status bar reports what the shepherd
-/// actually did, and the row's own `!` flag is the durable answer, read off
-/// the shepherd's parked-field list on every refresh.
-/// `the_cost_column_predicts_and_the_status_bar_reports` pins both
-/// directions.
-///
-/// [`ApplyGroup`] is `#[non_exhaustive]`, so the wildcard is required rather
-/// than chosen. It answers `respawn`, the most conservative of the four and
-/// the same fallback [`apply_group`](shep_core::config::apply_group) gives a
-/// field name its own table has not been taught about: a group this pane has
-/// not been taught about promises a restart rather than a silent claim that
-/// the change applied.
+/// [`ApplyGroup`] is `#[non_exhaustive]`, so an untaught field falls back
+/// to `respawn`, the most conservative of the four.
 const fn cost_label(group: ApplyGroup) -> &'static str {
     match group {
         ApplyGroup::Live => "now",
@@ -127,16 +104,11 @@ fn section_header(label: &str, palette: Palette) -> Line<'static> {
 
 /// The pane's own title: which sheep or dog is being edited.
 ///
-/// The dashboard's title line above this one names `$SHEP_HOME` and nothing
-/// else, so without this the operator would be reading 39 fields with
-/// nothing on screen saying whose they are.
+/// The dashboard's title line above this one names `$SHEP_HOME` and
+/// nothing else, so this names whose 39 fields are on screen.
 ///
-/// It used to say `read-only` too, and that stopped being true the moment
-/// `space` and `Enter` started writing. It is NOT replaced by a
-/// control-dependent word here: what the keys do belongs in the key hint,
-/// which reads the gate already (`view::status::pane_hint`), and a title
-/// that needed a footnote about `--allow-control` is exactly the asterisk
-/// that file's standing rule forbids.
+/// Carries no control-dependent word: what the keys do belongs in the key
+/// hint (`view::status::pane_hint`), which already reads the gate.
 fn title_line(pane: &ConfigPane, palette: Palette, width: u16) -> Line<'static> {
     let kind = match pane.target() {
         PaneTarget::Sheep { .. } => "sheep config",
@@ -157,22 +129,14 @@ fn title_line(pane: &ConfigPane, palette: Palette, width: u16) -> Line<'static> 
 /// One field's row: the selection mark, a lock glyph, a flag, the key, the
 /// value and what changing it costs.
 ///
-/// The flag is the same pair `shep flock`'s own CFG column prints: `!` for a
-/// field parked until a respawn, `*` for one an operator has overridden.
-/// Pending wins when a field is both, because it is the sharper fact -- the
-/// value on screen is not the value the running child holds.
+/// The flag matches `shep flock`'s CFG column: `!` for a field parked
+/// until a respawn, `*` for one an operator has overridden. Pending wins
+/// when both apply, since the value on screen is not what the running
+/// child holds.
 ///
-/// The lock glyph sits in the column between the selection mark and the
-/// flag, which every row already spent on a space, so it costs nothing and
-/// cannot be truncated. It is a glyph rather than a style because a style
-/// says nothing at all in `plain`. It is in that column rather than in the
-/// cost cell because the cost cell is the first thing [`widths`] drops, and
-/// it is dropped at `MIN_TERM_WIDTH` -- `body_width(33)` is 31, under
-/// [`FULL_WIDTH`] -- while being the only other place either fact appears.
-/// The KEY and VALUE cells do both still render there (31 clears
-/// [`VALUE_WIDTH`]); VALUE carries the field's value and has no room for a
-/// second subject, and a suffix inside KEY would be the first thing `fit`
-/// truncated on the long names this pane already abbreviates. See [`Lock`].
+/// The lock is a glyph, not a style, since a style says nothing in
+/// `plain`. It sits between the mark and the flag rather than in the cost
+/// cell, since cost is the first column [`widths`] drops. See [`Lock`].
 fn field_line(
     pane: &ConfigPane,
     index: usize,
@@ -193,11 +157,10 @@ fn field_line(
     // Flockfile schema marks nothing secret today; a dog's own schema can,
     // and this pane draws both.
     let raw = pane.value(&field.key);
-    // An editor open on THIS field replaces the cell with what is being
-    // typed, cursor included. The same `\u{258f}` every other text box in
-    // lookout draws, and a character rather than a reversed cell for the
-    // reason `view::status` gives: the ANSI gallery renders foregrounds
-    // only.
+    // An editor open on this field replaces the cell with what is being
+    // typed, cursor included. The same `\u{258f}` every text box in
+    // lookout draws; a character rather than a reversed cell because the
+    // ANSI gallery renders foregrounds only.
     let typing = match pane.pending_edit() {
         Some(PanePending::Typing { key, buffer }) if *key == field.key => Some(buffer),
         _ => None,
@@ -227,13 +190,9 @@ fn field_line(
         let cost = pane.cost(&field.key).map_or("", cost_label);
         text.push_str(&fit(cost, cost_w));
     }
-    // Muting reinforces the glyph and never carries a fact on its own. It
-    // used to be the whole signal, and it said "read-only" about six fields
-    // shep writes happily -- `args`, `ignore_watch`, `liveness_probe`,
-    // `readiness_probe`, `stop_exit_codes` and `watch_options`, every one of
-    // them merely a shape this pane has no widget for. A `plain` palette
-    // renders muted as nothing, so a style could not have told those six
-    // apart from `name` and `instances` even in principle.
+    // Muting reinforces the glyph but carries no fact alone: a `plain`
+    // palette renders muted as nothing, so style could not tell a locked
+    // row from an editable one on its own.
     if field.editable {
         Line::from(Span::raw(text))
     } else {
@@ -242,7 +201,7 @@ fn field_line(
 }
 
 /// The question an armed edit reads as, or the one already sent. [`None`]
-/// while nothing is in flight and while an editor is open -- an editor
+/// while nothing is in flight and while an editor is open, since an editor
 /// draws in its own field's row instead ([`field_line`]).
 fn confirm_text(pane: &ConfigPane) -> Option<&str> {
     match pane.pending_edit()? {
@@ -253,19 +212,13 @@ fn confirm_text(pane: &ConfigPane) -> Option<&str> {
 
 /// The env sub-screen: the sheep's env key names, and a row to add one on.
 ///
-/// Values are never drawn, because they never arrive: `Request::SheepConfig`
-/// answers with the keys alone (decision 12 of the overrides design), so
-/// every key reads `<set>` and the pane could not say otherwise if it
-/// wanted to. That is a property of the wire, not a truncation, and the
-/// title says so rather than leaving an operator to wonder which of their
-/// keys the pane failed to read.
+/// Values are never drawn: `Request::SheepConfig` answers with keys alone,
+/// so every key reads `<set>` regardless of what the pane knows. That is a
+/// property of the wire, not a truncation, and the title says so.
 ///
 /// Laid out through [`super::scroll::to_cursor`], the same walk the field
-/// list uses, so the cursor is drawn at every height this pane claims to
-/// support. The layout is simpler -- one uniform row, no group headers --
-/// but the invariants are identical: nothing is pushed uncounted, both
-/// markers are reserved before a row is admitted, and the last resort draws
-/// the cursor's row alone.
+/// list uses (one uniform row, no group headers), so the cursor is drawn
+/// at every height this pane claims to support.
 fn env_lines(
     pane: &ConfigPane,
     env: &EnvPane,
@@ -400,10 +353,10 @@ fn env_body_from(
 /// Every line of the pane, top to bottom, laid out for a terminal `height`
 /// rows tall.
 ///
-/// `height` counts LINES and no more than that ever come back. Zero means
+/// `height` counts lines, and no more than that ever come back. Zero means
 /// unlimited, which is what a test with no terminal behind it gets. See
-/// [`super::scroll`] for why the viewport's own offset is a starting point
-/// here rather than an answer.
+/// [`super::scroll`] for why the viewport's offset is a starting point
+/// here, not an answer.
 #[must_use]
 pub fn pane_lines(
     pane: &ConfigPane,
@@ -424,16 +377,14 @@ pub fn pane_lines(
     }
     let mut lines = vec![title_line(pane, palette, width)];
     // The title is unconditional, so the body is laid out against what is
-    // left after it. An empty form -- unreachable for a sheep, whose schema
+    // left after it. An empty form (unreachable for a sheep, whose schema
     // is a committed file with 39 properties, but a dog answers `--schema`
-    // for itself -- leaves the title as the whole pane.
+    // for itself) leaves the title as the whole pane.
     let mut body_budget = budget - 1;
-    // The confirm echoed under the title, exactly the redundancy the
-    // settings screen has: `view::status` draws the same sentence on a
-    // fixed row the layout never cuts, and this is the belt, not a second
-    // source of truth -- both read `ConfigPane::pending_edit`. It costs a
-    // body line, so it is subtracted rather than appended, for the reason
-    // `body_from`'s own doc gives about markers.
+    // The confirm echoed under the title, the same redundancy the settings
+    // screen has: `view::status` draws the same sentence on a fixed row,
+    // and both read `ConfigPane::pending_edit`. Subtracted from the
+    // budget rather than appended, per `body_from`'s own doc on markers.
     if let Some(text) = confirm_text(pane)
         && body_budget > 0
     {
@@ -443,12 +394,11 @@ pub fn pane_lines(
         )));
         body_budget -= 1;
     }
-    // The one line a dog pane has that a sheep pane does not, and decision 4
-    // is why: shep does not know what a dog's field costs, so every row's
-    // COST cell is empty. Said once here rather than guessed thirty times up
-    // there. Reserved out of the body budget before the rows are laid out,
-    // for the same reason the confirm echo is -- a footer appended
-    // afterwards is a line nothing counted.
+    // The one line a dog pane has that a sheep pane does not: shep does not
+    // know what a dog's field costs, so every row's COST cell is empty.
+    // Reserved out of the budget before rows are laid out, for the same
+    // reason the confirm echo is: a footer appended afterwards is a line
+    // nothing counted.
     let footer = match pane.target() {
         PaneTarget::Sheep { .. } => None,
         PaneTarget::Dog { name, .. } => (body_budget > 0)
@@ -478,11 +428,10 @@ pub fn pane_lines(
 
 /// Lays the body out from field `offset`, spending at most `budget` lines.
 ///
-/// Every line pushed is counted, including the section headers, the blank
+/// Every line pushed is counted, including section headers, blank
 /// separators between them and both markers. The two markers are reserved
-/// BEFORE a row is admitted rather than appended afterwards, so a height
-/// that binds cuts a row instead of cutting the sentence that says a row was
-/// cut.
+/// before a row is admitted rather than appended afterwards, so a height
+/// that binds cuts a row instead of the sentence saying a row was cut.
 fn body_from(
     pane: &ConfigPane,
     palette: Palette,
@@ -673,8 +622,6 @@ mod tests {
         insta::assert_snapshot!("sheep_pane_wide", text_of(&lines).join("\n"));
     }
 
-    /// fails if the pane stops naming the section a scrolled window opened
-    /// in, or stops saying how many rows it hid above.
     #[test]
     fn a_sheep_pane_scrolled_to_the_cron_section_labels_it() {
         let mut pane = web_pane();
@@ -690,11 +637,8 @@ mod tests {
         assert!(!text.iter().any(|line| line.contains("below")), "{text:?}");
     }
 
-    /// fails if any line of the pane renders wider than the terminal it was
-    /// drawn for. `Buffer::set_line` clips in silence, so an overrun is a
-    /// truncated cost cell with nothing saying it was cut -- the same claim
-    /// `settings::every_settings_line_fits_the_terminal_it_was_drawn_for`
-    /// makes for the screen this one borrowed its layout from.
+    /// `Buffer::set_line` clips in silence, so an overrun renders as a
+    /// truncated cost cell with nothing saying it was cut.
     #[test]
     fn every_pane_line_fits_the_width_it_was_drawn_for() {
         let pane = web_pane();
@@ -709,13 +653,8 @@ mod tests {
         }
     }
 
-    /// fails if the cost column stops saying why a Structural field cannot
-    /// be edited, or if either kind of locked row stops being drawn muted.
-    ///
-    /// Muting reinforces the glyph on both kinds and carries no fact of its
-    /// own, so `args` -- which shep writes happily -- is checked here too,
-    /// against a cost cell that must keep saying `respawn` rather than
-    /// `read-only`.
+    /// Checks `args` too, since shep writes it happily: muting must mark
+    /// both reasons a row can be locked, not just the structural one.
     #[test]
     fn a_structural_field_renders_muted_and_the_cost_column_says_why() {
         let pane = web_pane();
@@ -752,7 +691,7 @@ mod tests {
 
     /// A field row split into its four fixed leading parts: the selection
     /// mark, the lock glyph, the flag and the key. Positional rather than a
-    /// `starts_with`, which only ever matched UNSELECTED rows and so could
+    /// `starts_with`, which only ever matched unselected rows and so could
     /// not see a glyph on the one row the cursor was on.
     fn parts(line: &str) -> Option<(char, char, char, String)> {
         let mut chars = line.chars();
@@ -778,8 +717,6 @@ mod tests {
             .collect()
     }
 
-    /// fails if the two flags stop marking the fields the shepherd reported,
-    /// or start marking any others.
     #[test]
     fn the_flags_mark_exactly_the_overridden_and_pending_fields() {
         let text = text_of(&pane_lines(&web_pane(), fixtures::plain(), 120, 0));
@@ -795,14 +732,10 @@ mod tests {
         assert_eq!(rows_of(&text).len(), 39, "every field is drawn at 120");
     }
 
-    /// fails if the pane goes back to saying one thing about two different
-    /// facts.
-    ///
-    /// `=` is shep refusing a config write to the field at all. `~` is only
-    /// this pane having no widget for the shape, which is true of six fields
-    /// `shep start <Flockfile>` writes happily -- and the cost cell beside
-    /// each of them says `respawn` or `now`, not `read-only`, so a row
-    /// carrying `=` there would be the pane contradicting itself.
+    /// `=` is shep refusing the write outright; `~` is only this pane
+    /// having no widget for the shape. Six fields shep writes happily
+    /// carry `~`, so their cost cell must say `respawn` or `now`, never
+    /// `read-only`.
     #[test]
     fn a_refused_field_and_one_the_pane_has_no_widget_for_get_different_glyphs() {
         let text = text_of(&pane_lines(&web_pane(), fixtures::plain(), 120, 0));
@@ -828,14 +761,9 @@ mod tests {
         assert_eq!(glyphed(' ').len(), 39 - 2 - 6);
     }
 
-    /// fails if the distinction above survives only at a comfortable width
-    /// or only in colour.
-    ///
-    /// `MIN_TERM_WIDTH` drops the cost cell, which is the only other place
-    /// either fact is written, and `plain` renders muted as nothing at all.
-    /// So the glyph is the whole signal in exactly the case an operator is
-    /// most likely to be in, and this is the test that says it survives
-    /// there.
+    /// `MIN_TERM_WIDTH` drops the cost cell and `plain` renders muted as
+    /// nothing, so the glyph is the whole signal in exactly the case an
+    /// operator is most likely to be in.
     #[test]
     fn the_two_glyphs_survive_the_narrowest_width_and_a_palette_with_no_colour() {
         let mut pane = web_pane();
@@ -872,14 +800,11 @@ mod tests {
         text.lines().filter(|line| line.starts_with('>')).count()
     }
 
-    /// fails if any single step of a walk to the bottom and back loses the
-    /// cursor, at any height this pane says it can draw.
-    ///
-    /// The class this pane's layout was copied to avoid: chrome eats the
-    /// budget, the selected row is never drawn, and every static frame
-    /// still looks right. Six is `view::MIN_HEIGHT`, which leaves three
-    /// lines of body under the pane's own title -- less than a group's
-    /// first row costs in place, so those steps go through `cursor_only`.
+    /// Guards against the class of bug where chrome eats the budget and
+    /// the selected row is never drawn, while every static frame still
+    /// looks right. Six is `view::MIN_HEIGHT`; three lines of body under
+    /// the title is less than a group's first row costs, so those steps
+    /// go through `cursor_only`.
     #[test]
     fn the_cursor_survives_every_step_of_a_walk_down_and_back_up() {
         for height in [6u16, 7, 8, 10, 14, 20, 45] {
@@ -898,8 +823,8 @@ mod tests {
         }
     }
 
-    /// fails if the body outgrows the height it was given, which is how the
-    /// marker that says rows were cut becomes the row that gets cut.
+    /// The marker that says rows were cut would itself become the row
+    /// that gets cut.
     #[test]
     fn the_body_never_outgrows_the_height_it_was_given() {
         let mut pane = web_pane();
@@ -917,12 +842,8 @@ mod tests {
         }
     }
 
-    /// fails if an armed edit stops being echoed under the title, or if a
-    /// sent one stops being echoed while it is in flight.
-    ///
-    /// `view::status` draws the same sentence on a fixed row the layout
-    /// never cuts; this is the belt beside that brace, and both read
-    /// `ConfigPane::pending_edit` rather than one reading the other.
+    /// `view::status` draws the same sentence on a fixed row; this is the
+    /// belt beside that brace, and both read `ConfigPane::pending_edit`.
     #[test]
     fn an_armed_edit_is_echoed_under_the_title() {
         let mut pane = web_pane();
@@ -955,23 +876,11 @@ mod tests {
         }
     }
 
-    /// fails if the COST column stops being a prediction, or if the status
-    /// bar stops being the thing that reports what actually happened.
-    ///
-    /// **Both directions, because the column is wrong in both.** `watch` is
-    /// `Live` and draws `now`, and parks whenever the config subset it
-    /// would reach cannot normalize alone. `autostart` is `NextSpawn` and
-    /// draws `next start`, and is in force the moment it lands, because the
-    /// daemon reads it at muster. The column is read off `apply_group`,
-    /// which is a fact about the FIELD; whether a given write reaches the
-    /// running child is a fact about the flock, and only the shepherd has
-    /// it.
-    ///
-    /// The column is deliberately not corrected after a reply. A reply
-    /// arrives for one row of thirty-nine, so correcting it would leave a
-    /// column that is a fact on two rows and a prediction on the other
-    /// thirty-seven, with nothing on screen saying which. It stays a
-    /// prediction everywhere and is labelled as one; the bar reports the
+    /// Both directions: `watch` is `Live`, draws `now`, and can still
+    /// park. `autostart` is `NextSpawn`, draws `next start`, and takes
+    /// effect at muster, not at the next spawn. The column is never
+    /// corrected after a reply, since a reply covers one row of
+    /// thirty-nine; it stays a prediction everywhere, the bar reports the
     /// outcome, and the row's `!` flag carries it afterwards.
     #[test]
     fn the_cost_column_predicts_and_the_status_bar_reports() {
@@ -1016,9 +925,8 @@ mod tests {
         }
     }
 
-    /// fails if an open editor stops drawing what is being typed in the
-    /// field's own row, which is the only place on screen that says which
-    /// field the buffer belongs to.
+    /// The only place on screen that says which field the buffer belongs
+    /// to.
     #[test]
     fn an_open_editor_draws_its_buffer_in_the_fields_own_row() {
         let mut pane = web_pane();
@@ -1053,12 +961,12 @@ mod tests {
 
     /// The whole dog pane at a comfortable width. The snapshot is the
     /// assertion: the title says `dog config`, the rows are flat with no
-    /// section headers (decision 3), every COST cell is empty, and the foot
-    /// says once that the dog decides (decision 4).
+    /// section headers, every COST cell is empty, and the foot says once
+    /// that the dog decides.
     ///
-    /// The three assertions ahead of it are the ones worth failing loudly
-    /// rather than as a snapshot diff: a webhook URL on screen is the leak
-    /// the whole secret contract exists to prevent.
+    /// The three assertions ahead of it fail loudly rather than as a
+    /// snapshot diff: a webhook URL on screen is the leak the whole secret
+    /// contract exists to prevent.
     #[test]
     fn a_dog_pane_at_a_comfortable_width() {
         let text = text_of(&pane_lines(&bark_pane(), fixtures::plain(), 120, 0));
@@ -1075,8 +983,6 @@ mod tests {
         insta::assert_snapshot!("dog_pane_wide", text.join("\n"));
     }
 
-    /// fails if the footer stops being counted, which is how the line that
-    /// says a row was cut becomes the line that overruns the terminal.
     #[test]
     fn a_dog_panes_footer_is_paid_for_out_of_the_height_it_was_given() {
         let mut pane = bark_pane();
@@ -1094,8 +1000,7 @@ mod tests {
         }
     }
 
-    /// fails if any line of a dog pane renders wider than the terminal it
-    /// was drawn for -- the footer is the newest line and the longest, and
+    /// The footer is the newest line and the longest, and
     /// `Buffer::set_line` clips in silence.
     #[test]
     fn every_dog_pane_line_fits_the_width_it_was_drawn_for() {
@@ -1122,8 +1027,6 @@ mod tests {
         insta::assert_snapshot!("env_sub_screen", text_of(&lines).join("\n"));
     }
 
-    /// fails if an armed env write stops being echoed on the sub-screen,
-    /// or if the echo ever quotes the value.
     #[test]
     fn an_armed_env_write_is_echoed_and_never_quotes_the_value() {
         let mut pane = web_pane();
@@ -1139,8 +1042,7 @@ mod tests {
         assert!(!text.join("\n").contains("hunter2"), "{text:?}");
     }
 
-    /// fails if the sub-screen ever renders a value. The shepherd sends the
-    /// keys and no values at all (decision 12), so a value on this screen
+    /// The shepherd sends keys with no values at all, so a rendered value
     /// could only have been invented.
     #[test]
     fn the_env_sub_screen_never_renders_a_value() {
@@ -1161,10 +1063,6 @@ mod tests {
         assert!(text.contains("<set>"), "{text}");
     }
 
-    /// fails if any single step of a walk down the env sub-screen and back
-    /// loses the cursor, at any height this pane says it can draw -- the
-    /// same claim the field list makes, made for the second layout that
-    /// rides `super::scroll::to_cursor`.
     #[test]
     fn the_env_cursor_survives_every_step_of_a_walk_down_and_back_up() {
         let mut pane = ConfigPane::sheep({
@@ -1214,9 +1112,6 @@ mod tests {
         }
     }
 
-    /// fails if any line of the env sub-screen renders wider than the
-    /// terminal it was drawn for -- `Buffer::set_line` clips in silence,
-    /// the same reason the field list pins this.
     #[test]
     fn every_env_line_fits_the_width_it_was_drawn_for() {
         let mut pane = web_pane();
@@ -1236,10 +1131,6 @@ mod tests {
         }
     }
 
-    /// fails if the title stops naming the sheep the pane is about, or
-    /// goes back to calling the pane read-only. The dashboard's own title
-    /// line above it names `$SHEP_HOME` and nothing else, and `space` and
-    /// `Enter` write from here now.
     #[test]
     fn the_title_names_the_target_and_no_longer_calls_it_read_only() {
         let text = text_of(&pane_lines(&web_pane(), fixtures::plain(), 120, 0));

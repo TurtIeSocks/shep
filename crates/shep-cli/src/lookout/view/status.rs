@@ -85,13 +85,10 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         };
         (text, palette.attention())
     } else if let Some(prompt) = app.config_pane().and_then(pane_prompt) {
-        // Slot 1b. The config pane's own armed edit or in-flight sentence.
-        // Beside the settings screen's rather than under it for the reason
-        // that one gives: this is a fixed row the layout never cuts, and
-        // an operator who armed a config write must never be able to press
-        // Enter into a change nothing showed them was coming. The two
-        // cannot compete on one frame -- the pane and the settings screen
-        // cannot both be open.
+        // Slot 1b. The config pane's own armed edit or in-flight sentence,
+        // on the fixed row the layout never cuts, so an operator can never
+        // press Enter into a change nothing showed them. The pane and the
+        // settings screen cannot both be open, so they never compete for it.
         let text = if prompt.sent {
             format!("{}  sent, waiting for the shepherd", prompt.text)
         } else {
@@ -100,11 +97,9 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         (text, palette.attention())
     } else if let Some((label, buffer)) = app.config_pane().and_then(pane_editor) {
         // The pane's own free-text editor, and the env sub-screen's, ahead
-        // of the filter branch below for exactly the reason the settings
-        // editor's own slot is: all of them share `InputMode::Text`, and a
+        // of the filter branch: all three share `InputMode::Text`, and a
         // bar that fell through would render the dashboard's untouched
-        // query under the label `filter` while the pane draws something
-        // else entirely on the same frame.
+        // query under the label `filter` instead.
         (
             format!("{label}  {buffer}\u{258f}   enter applies   esc cancels"),
             palette.attention(),
@@ -158,14 +153,10 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // beats a full border for a pane somebody reads at 3am.
         (text, palette.attention())
     } else if let Some(pane) = app.config_pane() {
-        // The pane owns the keyboard, so neither the filter line nor either
-        // dashboard hint is true while it is up. Its own form, for the
-        // reason this file's standing rule gives: a dashboard hint naming
-        // `x stop` beside a pane where `x` does nothing is exactly the
-        // asterisk that rule forbids. Four forms now rather than one: the
-        // pane writes, so `space` and `enter` are named only where the gate
-        // actually lets them act, and the env sub-screen's own keys are a
-        // different set again.
+        // The pane owns the keyboard, so neither the filter line nor
+        // either dashboard hint is true while it is up. Its own form: a
+        // hint naming `x stop` beside a pane where `x` does nothing is
+        // the asterisk this file's standing rule forbids.
         (
             pane_hint(app.control(), pane.env().is_some()).to_string(),
             palette.muted(),
@@ -247,7 +238,7 @@ fn in_flight_text(action: &ActionState<'_>) -> String {
 ///
 /// Reuses [`SettingsPrompt`] rather than declaring a second two-field
 /// struct that says the same thing: the bar asks one question of both
-/// screens -- what is the sentence, and has it gone out.
+/// screens, what is the sentence and has it gone out.
 fn pane_prompt(pane: &ConfigPane) -> Option<SettingsPrompt<'_>> {
     match pane.pending_edit()? {
         PanePending::Armed { text, .. } => Some(SettingsPrompt { text, sent: false }),
@@ -276,25 +267,18 @@ fn pane_editor(pane: &ConfigPane) -> Option<(String, &str)> {
 
 /// The config pane's own key hint.
 ///
-/// Four forms, not one, and for this file's standing rule rather than for
-/// completeness: a hint that needs a footnote to be true is an asterisk.
-/// `space cycle` and `enter edit` are named only under
-/// [`Control::Allowed`], because under [`Control::ReadOnly`] both keys
-/// refuse -- the same reason `hint_for` omits `x`, `R` and `L` from the
-/// dashboard's read-only form.
+/// Four forms, not one: a hint that needs a footnote to be true is an
+/// asterisk. `space cycle` and `enter edit` are named only under
+/// [`Control::Allowed`], since under [`Control::ReadOnly`] both refuse.
 ///
-/// The env sub-screen gets its own pair because two of its keys mean
-/// something else there: `esc` backs out to the field list rather than
-/// closing the pane, so `e close` is named separately, and `enter` sets a
-/// value rather than opening a field editor. Everything the sub-screen
-/// shares with the field list is named in both, `g/G` and `r` included --
-/// they are bound on both screens, in both control states, and a form that
-/// quietly dropped them would be the same asterisk in the other direction.
-/// This doc used to claim they HAD been dropped to make room, and the claim
-/// was false in three of the four forms.
+/// The env sub-screen gets its own pair since two keys mean something
+/// else there: `esc` backs out to the field list rather than closing the
+/// pane, and `enter` sets a value rather than opening a field editor.
+/// `g`/`G` and `r` are named in both, since they are bound on both
+/// screens in both control states.
 ///
-/// The read-only field-list form is byte-identical to what shipped before
-/// the pane could write, so nothing that measured it has moved.
+/// The read-only field-list form must stay byte-identical, so nothing
+/// that measured it moves.
 const fn pane_hint(control: Control, env_open: bool) -> &'static str {
     match (control, env_open) {
         (Control::ReadOnly, false) => {
@@ -677,10 +661,6 @@ mod tests {
         }
     }
 
-    /// fails if the pane advertises its edit keys behind a closed gate, the
-    /// same rule the settings screen already carries. The pane used to be
-    /// read-only, so its hint had one form; `space` and `enter` refuse
-    /// under `--allow-control`'s absence and must not be named there.
     #[test]
     fn the_panes_edit_keys_are_advertised_only_when_the_gate_is_open() {
         let closed = rendered(&status_line(
@@ -708,8 +688,6 @@ mod tests {
         }
     }
 
-    /// fails if the env sub-screen keeps the field list's own hint, whose
-    /// `esc/e close` is wrong there: `esc` backs out to the field list.
     #[test]
     fn the_env_sub_screen_says_esc_backs_out_rather_than_closes() {
         let mut app = super::super::fixtures::app_in_sheep_pane_with_control();
@@ -722,13 +700,9 @@ mod tests {
         assert!(bar.contains("enter set"), "got {bar:?}");
     }
 
-    /// fails if any of the four pane forms hides a key that screen binds.
-    ///
-    /// `g`/`G` and `r` are bound on the field list and on the env
-    /// sub-screen, in both control states, and three of the four forms used
-    /// to name neither while the doc claimed they had been dropped to make
-    /// room. A hint that needs a footnote is an asterisk in both
-    /// directions.
+    /// `g`/`G` and `r` are bound on the field list and the env sub-screen,
+    /// in both control states. A hint that needs a footnote is an
+    /// asterisk in both directions.
     #[test]
     fn every_pane_hint_names_the_movement_and_refresh_keys_it_binds() {
         for env_open in [false, true] {
@@ -741,8 +715,8 @@ mod tests {
         }
     }
 
-    /// fails if the env sub-screen's own keys stop working, which is what
-    /// would make the hint above a lie rather than merely a gap.
+    /// Guards against the hint naming a key that does not actually work,
+    /// a lie rather than merely a gap.
     #[test]
     fn the_env_sub_screens_movement_and_refresh_keys_do_what_the_hint_says() {
         let mut app = super::super::fixtures::app_in_sheep_pane_with_control();
@@ -758,10 +732,6 @@ mod tests {
         ));
     }
 
-    /// fails if an armed config write stops reaching the one row the layout
-    /// never cuts. The settings screen's own confirm moved here for exactly
-    /// this reason: an operator must never press Enter into a change
-    /// nothing on screen showed them was coming.
     #[test]
     fn an_armed_pane_edit_reaches_the_status_bar_and_says_so_once_sent() {
         let mut app = super::super::fixtures::app_in_sheep_pane_with_control();
@@ -780,10 +750,6 @@ mod tests {
         );
     }
 
-    /// fails if either of the pane's two editors falls through to the
-    /// filter box's own line, which would render the dashboard's untouched
-    /// query under the label `filter` while the pane draws something else
-    /// on the same frame.
     #[test]
     fn the_panes_editors_get_their_own_status_line_rather_than_the_filters() {
         let mut app = super::super::fixtures::app_in_sheep_pane_with_control();
@@ -805,10 +771,6 @@ mod tests {
         assert!(!env.contains("filter"), "got {env:?}");
     }
 
-    /// fails if the status bar keeps offering the dashboard's own keys
-    /// while the config pane owns the keyboard. `x stop` in particular: it
-    /// does nothing from in there, and this file's standing rule is that a
-    /// hint needing a footnote is an asterisk rather than a hint.
     #[test]
     fn the_config_pane_gets_its_own_key_hint() {
         let app = super::super::fixtures::app_in_sheep_pane();

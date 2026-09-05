@@ -511,13 +511,11 @@ fn content_lines(
 /// that row's section costs.
 ///
 /// The last resort, reached only when every offset down to the cursor's own
-/// left it undrawn. `MIN_HEIGHT` is six rows, which is four of body, and a
-/// dog row needs the blank line, the `[dogs]` header, the caption and the
-/// column header above it before it may be drawn at all -- six lines for
-/// one row. The screen used to answer that by drawing two markers and two
-/// blank lines: honest about how much was hidden, and silent about the one
-/// row the operator had selected. A screen that declares a minimum height
-/// should draw something at it, and the selected row is the something.
+/// left it undrawn. `MIN_HEIGHT` is six rows, four of body, and a dog row
+/// needs the blank line, the `[dogs]` header, the caption and the column
+/// header above it before it may be drawn at all: six lines for one row.
+/// A screen that declares a minimum height should draw something at it,
+/// and the selected row is the something.
 ///
 /// Markers are added around it while they fit, the cursor's row first: it
 /// is the one line this function exists to guarantee.
@@ -600,13 +598,10 @@ fn body_from(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_section: Option<&str> = None;
-    // A section's header (and the blank line ahead of it, for every
-    // section after the first) held here rather than pushed straight away.
-    // It is only pushed alongside the first row of its section that
-    // survives the offset skip below -- which is what rule 3 means by "the
-    // header labels a scrolled view": a section can start well above the
-    // offset and still need its name on screen the moment the view enters
-    // it.
+    // A section's header, and the blank line ahead of it for every
+    // section after the first, held here rather than pushed straight
+    // away: pushed alongside the first row of its section that survives
+    // the offset skip, so the view still names a section it opens in.
     let mut pending_header: Vec<Line<'static>> = Vec::new();
     let mut drawn = 0usize;
     let mut row_index = 0usize;
@@ -903,10 +898,6 @@ mod tests {
             .collect()
     }
 
-    /// fails if a terminal shorter than the settings screen either loses
-    /// the cursor off the bottom of the drawn window, or draws past
-    /// `note_body_rows`' own count without saying anything was cut.
-    ///
     /// `Viewport` scrolls in data rows while the height it is handed counts
     /// lines, so the section headers, blank separators, `[dogs]` caption
     /// and dog column header all have to be counted here too.
@@ -959,9 +950,6 @@ mod tests {
         text.lines().filter(|line| line.starts_with('>')).count()
     }
 
-    /// fails if any single step of a walk to the bottom and back loses the
-    /// cursor, at any height this screen says it can draw.
-    ///
     /// Six is `view::MIN_HEIGHT`: four lines of body, where a dog row
     /// costs six lines to draw in place and falls back to drawing alone.
     #[test]
@@ -982,9 +970,6 @@ mod tests {
         }
     }
 
-    /// fails if a window opening in the middle of a section stops naming
-    /// the section it opened in.
-    ///
     /// `settings_short` exercises this only in its mild form: it opens at
     /// `[style]`, whose one row is the section, so the header sits where it
     /// would anyway. This opens inside `[daemon]`, three rows past that
@@ -1009,8 +994,8 @@ mod tests {
         );
     }
 
-    /// fails if the marker that says rows were cut is itself the row that
-    /// gets cut: it is pushed last, so a clip drops it first.
+    /// The marker is pushed last, so a clip drops it first before it can
+    /// say anything was cut.
     #[test]
     fn the_below_marker_survives_the_height_that_made_it_necessary() {
         let mut app = fixtures::app_in_settings();
