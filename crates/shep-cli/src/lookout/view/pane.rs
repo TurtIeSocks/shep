@@ -254,7 +254,7 @@ fn env_lines(
         return lines;
     }
     let rows = env.rows();
-    let cursor_row = env.view().cursor().min(rows.len() - 1);
+    let cursor_row = env.view().cursor().min(rows.len().saturating_sub(1));
     lines.extend(super::scroll::to_cursor(
         cursor_row,
         env.view().offset(),
