@@ -2,18 +2,16 @@
 //!
 //! The pane is a [`FieldSet`] over one target, plus the values that target
 //! currently holds and a [`Viewport`] over the rows. It writes too: a
-//! [`PaneEdit`] arms as a [`PanePending`], and [`ConfigPane::declared_app`]
-//! turns it into the one-app [`DeclaredApp`] a `Request::ApplyConfig`
-//! carries. `env` is the one field that does NOT travel that way -- see
-//! [`EnvPane`].
+//! [`PaneEdit`] arms as a [`PanePending`], and leaves as a
+//! `Request::SetSheepField` or, for `env`, a `Request::SetSheepEnv`. Both
+//! write an operator override for one key; neither pretends to be a
+//! template. See [`PaneEdit`] for why the `ApplyConfig` route this pane
+//! shipped with was wrong.
 
-use std::collections::BTreeSet;
 use std::time::Instant;
 
 use serde_json::{Map, Value};
-use shep_core::config::{
-    AppConfig, ApplyGroup, DeclaredApp, GROUP_ORDER, apply_group, flockfile_schema_json,
-};
+use shep_core::config::{ApplyGroup, GROUP_ORDER, apply_group, flockfile_schema_json};
 use shep_core::protocol::{EnvValue, SheepConfigView};
 
 use super::field::{FieldKind, FieldSet};
@@ -84,10 +82,17 @@ pub enum PaneRow {
 
 /// One edit, ready to send.
 ///
-/// Two variants, and they leave by different doors: a [`Self::Set`] goes out
-/// as a one-app `Request::ApplyConfig` at `ResetDepth::File`, and a
-/// [`Self::SetEnv`] as a `Request::SetSheepEnv`, because no reset depth
-/// expresses one env key.
+/// Two variants, and they leave by their own doors: a [`Self::Set`] as a
+/// `Request::SetSheepField` and a [`Self::SetEnv`] as a
+/// `Request::SetSheepEnv`. Both record an operator override for one key.
+///
+/// A [`Self::Set`] went out as a one-app `Request::ApplyConfig` at
+/// `ResetDepth::File` until 2026-09-05, which moved the field correctly and
+/// then SPENT the override for it: that merge is a template load, and a key
+/// put back to the template is rightly not a key an operator is still
+/// holding a value for. A pane's value is the operator's, so the edit
+/// vanished from `overridden` the moment it landed and the `*` this pane
+/// draws never appeared for it.
 ///
 /// `Debug` is MANUAL and redacted (IR-41), exact-string-tested below. It
 /// prints the field name and never the value. `value` on a [`Self::Set`] is
@@ -181,13 +186,19 @@ pub enum PanePending {
     },
     /// Gone out, awaiting the shepherd's reply.
     ///
-    /// `key` is what a landing reply is matched against
+    /// `ticket` is what a landing reply is matched against
     /// ([`ConfigPane::settle`]). Without it any reply settled whatever was
     /// pending, so a second write's "sent, waiting" line vanished the
     /// moment the FIRST write's reply landed, while the second was still
-    /// outstanding.
+    /// outstanding. It is a ticket rather than the KEY, which was the
+    /// first fix and left the same hole one step narrower: two writes to
+    /// the same field, in flight at once, still settled on the first reply.
     Sent {
-        /// Which field or env key is in flight.
+        /// The write this is waiting on. Minted by `App` per send, so no
+        /// two are ever equal.
+        ticket: u64,
+        /// Which field or env key is in flight. Not what a reply is
+        /// matched against -- see `ticket` -- but what a `{:?}` names.
         key: String,
         /// The rendered question, so the prompt line does not change
         /// wording between the question and its own answer.
@@ -207,7 +218,9 @@ impl core::fmt::Debug for PanePending {
                 buffer.chars().count()
             ),
             Self::Armed { edit, .. } => write!(f, "PanePending::Armed {{ edit: {edit:?} }}"),
-            Self::Sent { key, .. } => write!(f, "PanePending::Sent {{ key: {key:?} }}"),
+            Self::Sent { ticket, key, .. } => {
+                write!(f, "PanePending::Sent {{ ticket: {ticket}, key: {key:?} }}")
+            }
         }
     }
 }
@@ -740,12 +753,17 @@ impl ConfigPane {
         }
     }
 
-    /// Takes the armed edit out and marks it sent. [`None`] when nothing is
-    /// armed, and the pane is left exactly as it was.
-    pub fn take_armed(&mut self) -> Option<PaneEdit> {
+    /// Takes the armed edit out and marks it sent under `ticket`. [`None`]
+    /// when nothing is armed, and the pane is left exactly as it was.
+    ///
+    /// The ticket is the caller's, because the caller is what mints one per
+    /// send and puts the same value on the request. See
+    /// [`PanePending::Sent`].
+    pub fn take_armed(&mut self, ticket: u64) -> Option<PaneEdit> {
         match self.pending_edit.take() {
             Some(PanePending::Armed { edit, text, .. }) => {
                 self.pending_edit = Some(PanePending::Sent {
+                    ticket,
                     key: edit.key().to_owned(),
                     text,
                 });
@@ -758,8 +776,8 @@ impl ConfigPane {
         }
     }
 
-    /// Clears the in-flight line for `key`, once the shepherd has answered
-    /// about `key` and not about anything else.
+    /// Clears the in-flight line for `ticket`, once the shepherd has
+    /// answered that write and not another.
     ///
     /// Guarded twice, and both guards were bugs before they were guards.
     ///
@@ -770,14 +788,17 @@ impl ConfigPane {
     /// every subsequent keystroke dead until `Esc`. On the env screen that
     /// discarded buffer is a secret the operator cannot read back.
     ///
-    /// It only clears a `Sent` whose own key matches. Two writes can be in
-    /// flight at once (send one, arm another, send that), and without the
-    /// match the FIRST reply cleared the SECOND's "sent, waiting" line
+    /// It only clears a `Sent` whose own ticket matches. Two writes can be
+    /// in flight at once (send one, arm another, send that), and without
+    /// the match the FIRST reply cleared the SECOND's "sent, waiting" line
     /// while the second was still outstanding. The requests themselves
-    /// never confused each other -- each declares exactly its own key, so
+    /// never confused each other -- each names exactly its own key, so
     /// neither can carry the other's value -- but the line on screen did.
-    pub fn settle(&mut self, key: &str) {
-        if matches!(&self.pending_edit, Some(PanePending::Sent { key: sent, .. }) if sent == key) {
+    /// Matching on the KEY was the first fix and left the same hole one
+    /// step narrower, for two writes to the SAME field.
+    pub fn settle(&mut self, ticket: u64) {
+        if matches!(&self.pending_edit, Some(PanePending::Sent { ticket: sent, .. }) if *sent == ticket)
+        {
             self.pending_edit = None;
         }
     }
@@ -845,41 +866,6 @@ impl ConfigPane {
             Some(_) => format!("set {key} = {shown}? {name} is respawned to pick it up"),
             None => format!("set {key} = {shown}? {name} is told, and decides what to reload"),
         }
-    }
-
-    /// The one-app [`DeclaredApp`] a sheep edit sends.
-    ///
-    /// `declared` is EXACTLY the edited key, and that is the whole write
-    /// path: `Request::ApplyConfig` is sent at `ResetDepth::File`, under
-    /// which a key the template declares is reset and a key it does not
-    /// declare is kept. One name in `declared` is therefore one field
-    /// moved, and a second name would be a second field moved in silence.
-    /// At the default `ResetDepth::None` the same request would be ignored
-    /// for every key an operator has ever touched.
-    ///
-    /// [`None`] when the edited value does not deserialize into an
-    /// [`AppConfig`] -- an integer field set to `null`, say -- rather than
-    /// sending a config the daemon would refuse.
-    #[must_use]
-    pub fn declared_app(&self, edit: &PaneEdit) -> Option<DeclaredApp> {
-        // An env edit has no `DeclaredApp` and must not acquire one by
-        // accident: no `ResetDepth` expresses a single env key, and this
-        // pane is never told a value it could put back into a whole map.
-        let PaneEdit::Set { key, value } = edit else {
-            return None;
-        };
-        let mut values = self.values.clone();
-        values.insert(key.clone(), value.clone());
-        // `env` is absent from `values` in all but name: the shepherd
-        // strips it on the way out (decision 12), so what round-trips here
-        // is the empty map, and the pane could not put a value back even if
-        // it wanted to. `declared_env` is empty for the same reason.
-        let config: AppConfig = serde_json::from_value(Value::Object(values)).ok()?;
-        Some(DeclaredApp {
-            config,
-            declared: core::iter::once(key.clone()).collect(),
-            declared_env: BTreeSet::new(),
-        })
     }
 
     /// What is being edited.
@@ -996,6 +982,22 @@ impl ConfigPane {
     pub(super) fn move_to_last(&mut self) {
         let len = self.rows().len();
         self.view.move_to(len.saturating_sub(1), len);
+    }
+
+    /// Adopts a previous pane's in-flight edit, so a refresh does not
+    /// silently drop a question the operator has not answered or a write
+    /// they are still waiting on.
+    ///
+    /// [`PanePending::Typing`] is deliberately NOT carried: its buffer was
+    /// seeded from a value this refresh may have just changed, so keeping
+    /// it would put the operator halfway through editing something that is
+    /// no longer there. `App::release_text_mode_if_unowned` is what puts
+    /// the keyboard back when that happens.
+    pub(super) fn adopt_pending_edit(&mut self, previous: Option<PanePending>) {
+        self.pending_edit = match previous {
+            Some(carried @ (PanePending::Armed { .. } | PanePending::Sent { .. })) => Some(carried),
+            Some(PanePending::Typing { .. }) | None => None,
+        };
     }
 
     /// Adopts a previous pane's cursor and offset, clamped to this one's
@@ -1228,28 +1230,29 @@ mod tests {
         assert_eq!(*value, serde_json::json!(40));
     }
 
-    /// fails if one edit ever declares more than the key it edited. The
-    /// whole write path rides on this: under `ResetDepth::File` a declared
-    /// key is reset and an undeclared one is kept, so a second name in
-    /// `declared` is a second field silently moved.
+    /// fails if a typed edit stops carrying the value the field's kind
+    /// wants. The request names one key and one JSON value, and the daemon
+    /// deserializes that value into the field it names, so an integer field
+    /// handed `"40"` is refused rather than set.
     #[test]
-    fn a_declared_app_for_one_edit_declares_only_that_key() {
-        let pane = ConfigPane::sheep(web());
-        let edit = PaneEdit::Set {
-            key: "max_restarts".into(),
-            value: serde_json::json!(40),
+    fn an_edit_carries_the_key_and_the_typed_value_and_nothing_else() {
+        let mut pane = ConfigPane::sheep(web());
+        pane.move_to_key("max_restarts");
+        pane.begin_typing();
+        pane.type_backspace();
+        pane.type_backspace();
+        for c in "40".chars() {
+            pane.type_char(c);
+        }
+        pane.apply_typing(Instant::now());
+        let Some(PaneEdit::Set { key, value }) = pane.take_armed(7) else {
+            panic!("{:?}", pane.pending_edit());
         };
-        let app = pane.declared_app(&edit).unwrap();
-        assert_eq!(app.config.max_restarts, 40);
-        assert_eq!(app.config.name, "web");
-        assert_eq!(
-            app.declared,
-            ["max_restarts".to_owned()].into_iter().collect()
-        );
-        assert!(app.declared_env.is_empty());
+        assert_eq!(key, "max_restarts");
+        assert_eq!(value, serde_json::json!(40));
         assert!(
-            app.config.env.is_empty(),
-            "env is never round-tripped through a pane"
+            !matches!(value, serde_json::Value::String(_)),
+            "an integer field must not travel as a string"
         );
     }
 
@@ -1329,10 +1332,14 @@ mod tests {
             r#"PanePending::Armed { edit: PaneEdit::Set { key: "cwd" } }"#
         );
         let sent = PanePending::Sent {
+            ticket: 7,
             key: "cwd".into(),
             text: "set cwd = /home/ada/secret-project? web takes it now".into(),
         };
-        assert_eq!(format!("{sent:?}"), r#"PanePending::Sent { key: "cwd" }"#);
+        assert_eq!(
+            format!("{sent:?}"),
+            r#"PanePending::Sent { ticket: 7, key: "cwd" }"#
+        );
     }
 
     /// fails if [`EnvPane`] starts printing a key name or the buffer

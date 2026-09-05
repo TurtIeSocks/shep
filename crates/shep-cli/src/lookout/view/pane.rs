@@ -891,7 +891,7 @@ mod tests {
         assert!(text[1].contains("set autorestart = false"), "{:?}", text[1]);
         assert!(text[1].contains("web"), "{:?}", text[1]);
 
-        pane.take_armed();
+        pane.take_armed(0);
         let sent = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
         assert_eq!(
             sent[1], text[1],

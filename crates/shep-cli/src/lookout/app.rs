@@ -31,10 +31,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use shep_client::RequestError;
-use shep_core::config::{DeclaredApp, LogLevel, ResetDepth};
+use shep_core::config::LogLevel;
 use shep_core::protocol::{
     BusEvent, DogSource, EnvValue, Lamb, ProcessEventKind, ProcessInfo, Request, Response,
-    SelectorSpec, SheepApplied,
+    SelectorSpec,
 };
 use shep_core::status::ProcStatus;
 
@@ -522,15 +522,13 @@ pub enum Sent {
     },
     /// One field of one sheep's config, off the config pane's own `Enter`.
     ///
-    /// Carries the [`DeclaredApp`] built at confirm time rather than the
-    /// pane's edit, so the request cannot disagree with the pane the
-    /// operator answered: the cursor, and what is armed, can both move
-    /// while the write is in flight. `key` rides along for the report,
-    /// which is the one thing the reply does not name.
-    ///
-    /// Boxed for the reason `Response::SheepConfig`'s own doc gives: an
-    /// [`AppConfig`](shep_core::config::AppConfig) is several hundred bytes
-    /// and every other variant of this enum is a name or two.
+    /// [`Self::SetEnv`]'s twin, and it is a `Request::SetSheepField`
+    /// rather than a one-key `Request::ApplyConfig` for the reason that
+    /// variant's own doc gives: an `ApplyConfig` at `ResetDepth::File`
+    /// moves the field and then spends the operator's override for it,
+    /// because that merge is a template load. This pane's value IS the
+    /// operator's, so the sheep still differs from its file and the `*`
+    /// marker has to keep saying so.
     ///
     /// The [`WriteAuthority`] is not decoration, for exactly the reason
     /// [`Effect::WriteSetting`]'s own doc gives: this variant cannot be
@@ -539,23 +537,28 @@ pub enum Sent {
     ApplyField {
         /// The sheep.
         name: String,
-        /// The field that moves. Exactly the one name in
-        /// [`DeclaredApp::declared`].
+        /// Which write this is, so a reply settles its own in-flight line
+        /// and no other. See [`PanePending::Sent`].
+        ticket: u64,
+        /// The field that moves.
         key: String,
-        /// The one-app merge, ready to send.
-        app: Box<DeclaredApp>,
+        /// Its new value, in the shape that field serializes as.
+        value: serde_json::Value,
         /// Proof the control gate was open.
         authority: WriteAuthority,
     },
     /// One env key of one sheep, off the env sub-screen's own `Enter`.
     ///
-    /// Its own variant rather than a [`Self::ApplyField`] value, because
-    /// env does not travel through `ApplyConfig` at all: no
-    /// [`ResetDepth`] expresses "one key", and a pane that is never told a
-    /// value could not send the whole map back even if one did.
+    /// Its own variant beside [`Self::ApplyField`] rather than a value of
+    /// it, because the two are different requests: a whole env map is
+    /// never sent (a pane is not told the values), so `SetSheepField`
+    /// refuses the `env` key outright and `SetSheepEnv` takes one key at a
+    /// time.
     SetEnv {
         /// The sheep.
         name: String,
+        /// Which write this is, for [`Self::ApplyField`]'s reason.
+        ticket: u64,
         /// The env key.
         key: String,
         /// The value, or `None` to remove the key. [`EnvValue`] rather than
@@ -599,15 +602,15 @@ impl Sent {
                 ..
             } => Request::DisableDog { name: name.clone() },
             Self::SheepConfig { name } => Request::SheepConfig { name: name.clone() },
-            // `ResetDepth::File`, and the whole write path rides on it: a
-            // key the declaration names is reset, a key it does not name is
-            // kept, and `declared` holds exactly the edited key. At the
-            // default `ResetDepth::None` this same request would be ignored
-            // for every key an operator has ever touched, so the pane would
-            // look like it worked and change nothing.
-            Self::ApplyField { app, .. } => Request::ApplyConfig {
-                apps: vec![(**app).clone()],
-                reset: ResetDepth::File,
+            // One field, recorded as an operator override. NOT an
+            // `ApplyConfig`: see this variant's own doc for the marker that
+            // route silently spent.
+            Self::ApplyField {
+                name, key, value, ..
+            } => Request::SetSheepField {
+                name: name.clone(),
+                key: key.clone(),
+                value: value.clone(),
             },
             Self::SetEnv {
                 name, key, value, ..
@@ -1344,6 +1347,9 @@ pub struct App {
     /// Which keymap [`super::input::map_key`] is called with. Normal until
     /// `/` opens the box; the reducer, not the keymap, owns this state.
     mode: InputMode,
+    /// The next config-write ticket. Monotonic and never reused, so a reply
+    /// can only settle the write it belongs to -- see [`PanePending::Sent`].
+    next_write_ticket: u64,
     link: Link,
     notice: Option<Notice>,
     palette: Palette,
@@ -1419,6 +1425,7 @@ impl App {
             selected: None,
             filter: String::new(),
             mode: InputMode::Normal,
+            next_write_ticket: 0,
             link: Link::Live,
             notice: None,
             palette,
@@ -1578,10 +1585,16 @@ impl App {
                 }
                 Sent::Dog { name, enable, .. } => self.on_dog_reply(name, enable, result),
                 Sent::SheepConfig { name } => self.on_sheep_config(&name, result),
-                Sent::ApplyField { name, key, .. } => self.on_field_applied(&name, &key, result),
+                Sent::ApplyField {
+                    name, ticket, key, ..
+                } => self.on_field_applied(&name, ticket, &key, result),
                 Sent::SetEnv {
-                    name, key, value, ..
-                } => self.on_env_set(&name, &key, value.is_some(), result),
+                    name,
+                    ticket,
+                    key,
+                    value,
+                    ..
+                } => self.on_env_set(&name, ticket, &key, value.is_some(), result),
             },
             Msg::Unsent { sent } => match sent {
                 Sent::Action { verb, target, name } => {
@@ -1620,9 +1633,11 @@ impl App {
                 // same shape `Sent::Action`'s arm above uses: a bar still
                 // saying "sent, waiting for the shepherd" about a request
                 // nobody has is the failure `Msg::Unsent` exists for.
-                Sent::ApplyField { name, key, .. } => {
+                Sent::ApplyField {
+                    name, ticket, key, ..
+                } => {
                     if let Some(pane) = self.config_pane.as_mut() {
-                        pane.settle(&key);
+                        pane.settle(ticket);
                     }
                     self.notice = Some(Notice {
                         text: format!("{name}: {key} was not sent"),
@@ -1630,9 +1645,11 @@ impl App {
                     });
                     Effect::None
                 }
-                Sent::SetEnv { name, key, .. } => {
+                Sent::SetEnv {
+                    name, ticket, key, ..
+                } => {
                     if let Some(pane) = self.config_pane.as_mut() {
-                        pane.settle(&key);
+                        pane.settle(ticket);
                     }
                     self.notice = Some(Notice {
                         text: format!("{name}: env {key} was not sent"),
@@ -2028,7 +2045,15 @@ impl App {
                     .as_ref()
                     .and_then(ConfigPane::env)
                     .map(|env| (env.view().clone(), env.cursor_key().map(str::to_owned)));
+                // A question the operator has not answered, or a write
+                // still out, survives the rebuild. Only `Typing` is
+                // dropped -- see `ConfigPane::adopt_pending_edit`.
+                let carried_edit = self
+                    .config_pane
+                    .as_ref()
+                    .and_then(|pane| pane.pending_edit().cloned());
                 let mut pane = ConfigPane::sheep(*view);
+                pane.adopt_pending_edit(carried_edit);
                 if let Some(carried) = carried {
                     pane.adopt_view(carried);
                 }
@@ -2155,7 +2180,7 @@ impl App {
         }
     }
 
-    /// One `Request::ApplyConfig` reply for one edited field.
+    /// One `Request::SetSheepField` reply.
     ///
     /// The pane settles either way -- a question that has been answered is
     /// not still in flight -- and a success re-reads the config so the
@@ -2164,26 +2189,30 @@ impl App {
     /// so the re-read gets `Msg::Unsent` handling for free like every other
     /// request this reducer raises.
     ///
-    /// [`SheepApplied::refused`] is reported rather than swallowed: it is
-    /// the one field that says a request the daemon accepted did not
-    /// wholly land, and it arrives beside lists that carry whatever did.
+    /// `pending` is the shepherd's answer and not this pane's guess: the
+    /// cost column reads `apply_group`, which is right about the field and
+    /// cannot know that `autostart` is in force the moment it lands or that
+    /// a config subset failed to normalize on its own.
     fn on_field_applied(
         &mut self,
         name: &str,
+        ticket: u64,
         key: &str,
         result: Result<Response, RequestError>,
     ) -> Effect {
         if let Some(pane) = self.config_pane.as_mut() {
-            pane.settle(key);
+            pane.settle(ticket);
         }
         match result {
-            Ok(Response::Applied(reports)) => {
-                let report = reports.into_iter().next();
-                let (text, grave) = Self::applied_notice(name, key, report.as_ref());
-                self.notice = Some(Notice { text, grave });
-                if grave {
-                    return Effect::None;
-                }
+            Ok(Response::SheepFieldSet { pending, .. }) => {
+                self.notice = Some(Notice {
+                    text: if pending {
+                        format!("{name}: {key} is set, and waits for `shep reload {name}`")
+                    } else {
+                        format!("{name}: {key} is set")
+                    },
+                    grave: false,
+                });
                 Effect::Send(Sent::SheepConfig {
                     name: name.to_owned(),
                 })
@@ -2214,39 +2243,6 @@ impl App {
         }
     }
 
-    /// What one field's report reads as, and whether it is grave.
-    ///
-    /// Four answers, and the fourth is not a failure: `ResetDepth::File`
-    /// resets a declared key to the value the request carried, so an edit
-    /// that proposes what is already in force lands with both lists empty
-    /// and nothing refused. Saying "set" about that would be a claim the
-    /// screen cannot back up.
-    fn applied_notice(name: &str, key: &str, report: Option<&SheepApplied>) -> (String, bool) {
-        let Some(report) = report else {
-            return (
-                format!("{name}: the shepherd reported nothing about {key}"),
-                true,
-            );
-        };
-        if let Some(refused) = &report.refused {
-            return (format!("{name}: {refused}"), true);
-        }
-        let named = |list: &[String]| list.iter().any(|field| field == key);
-        if named(&report.applied) {
-            (format!("{name}: {key} is set"), false)
-        } else if named(&report.pending) {
-            (
-                format!("{name}: {key} is set, and waits for `shep reload {name}`"),
-                false,
-            )
-        } else {
-            (
-                format!("{name}: {key} was already what you asked for"),
-                false,
-            )
-        }
-    }
-
     /// One `Request::SetSheepEnv` reply.
     ///
     /// `was_set` comes off the request rather than the reply: the answer
@@ -2259,12 +2255,13 @@ impl App {
     fn on_env_set(
         &mut self,
         name: &str,
+        ticket: u64,
         key: &str,
         was_set: bool,
         result: Result<Response, RequestError>,
     ) -> Effect {
         if let Some(pane) = self.config_pane.as_mut() {
-            pane.settle(key);
+            pane.settle(ticket);
         }
         match result {
             Ok(Response::SheepEnvSet { .. }) => {
@@ -2743,49 +2740,49 @@ impl App {
     ///
     /// One function for both, because the arm is one field
     /// ([`ConfigPane::pending_edit`]) and only the [`PaneEdit`] variant
-    /// inside it differs: a field edit leaves as a one-app
-    /// `Request::ApplyConfig`, an env edit as a `Request::SetSheepEnv`.
+    /// inside it differs: a field edit leaves as a
+    /// `Request::SetSheepField`, an env edit as a `Request::SetSheepEnv`.
+    /// Both record an operator override for one key.
     fn send_armed(&mut self) -> Effect {
         let Some(authority) = self.authorize_write() else {
             return Effect::None;
         };
+        // Read before the borrow below, and spent only once the pane really
+        // had something armed: a ticket burned on a no-op would still be
+        // unique, but the counter is easier to reason about when every
+        // value on it names a request that went out.
+        let ticket = self.next_write_ticket;
         let Some(pane) = self.config_pane.as_mut() else {
             return Effect::None;
         };
-        let Some(edit) = pane.take_armed() else {
+        let Some(edit) = pane.take_armed(ticket) else {
             return Effect::None;
         };
+        self.next_write_ticket += 1;
         let PaneTarget::Sheep { name } = pane.target().clone();
         match edit {
             PaneEdit::SetEnv { key, value } => Effect::Send(Sent::SetEnv {
                 name,
+                ticket,
                 key,
                 value,
                 authority,
             }),
-            PaneEdit::Set { .. } => {
-                let key = edit.key().to_owned();
-                let Some(app) = pane.declared_app(&edit) else {
-                    // The one shape a typed edit can take that `AppConfig`
-                    // refuses: an empty buffer on a field that is not
-                    // nullable arms `null`. `take_armed` has already moved
-                    // the pane to `Sent`, so this settles it back by the
-                    // same key rather than leaving a line on screen about a
-                    // request that never existed.
-                    pane.settle(&key);
-                    self.notice = Some(Notice {
-                        text: format!("{name}: {key} cannot take that value"),
-                        grave: true,
-                    });
-                    return Effect::None;
-                };
-                Effect::Send(Sent::ApplyField {
-                    name,
-                    key,
-                    app: Box::new(app),
-                    authority,
-                })
-            }
+            // No client-side validation of the value, deliberately. The
+            // daemon deserializes it into the field it names and
+            // re-normalizes the result -- peer input is untrusted, so it
+            // must -- and a second, weaker copy of that check here would
+            // refuse some shapes the daemon accepts and would drift the
+            // moment `AppConfig` grows a field. An empty buffer on a field
+            // that is not nullable arms `null` and comes back as a named
+            // `InvalidConfig` refusal on the status bar.
+            PaneEdit::Set { key, value } => Effect::Send(Sent::ApplyField {
+                name,
+                ticket,
+                key,
+                value,
+                authority,
+            }),
         }
     }
 
@@ -7159,20 +7156,26 @@ mod tests {
         }
     }
 
-    /// fails if a single-field write stops going out at `ResetDepth::File`,
-    /// or stops declaring exactly the key that was edited.
+    /// fails if a single-field write stops going out as a
+    /// `Request::SetSheepField`, or starts naming a key other than the one
+    /// the operator edited.
     ///
-    /// **The whole write path rides on this pair.** Under `File` a declared
-    /// key is reset and an undeclared key is kept, so one name in
-    /// `declared` is one field moved. At the default `ResetDepth::None` the
-    /// same request is ignored for every key an operator has ever touched,
-    /// which is the failure that makes the pane look like it works and
-    /// change nothing.
+    /// **The route is the whole point.** The same edit went out as a
+    /// one-app `Request::ApplyConfig` at `ResetDepth::File` until
+    /// 2026-09-05. That moved exactly this field and nothing else, and then
+    /// the merge spent the operator's override for it, because a merge is a
+    /// template load and a key put back to the template is not a key an
+    /// operator is holding a value for. The edit therefore landed and
+    /// vanished from `overridden` on the same round trip, so the `*` this
+    /// pane draws never appeared and `shep flock`'s CFG column counted
+    /// nothing. `rpc.rs`'s
+    /// `a_field_edit_is_reported_as_an_operator_override` is the other half
+    /// of this claim, asserted where the marker is actually built.
     ///
-    /// One field from each of the four groups the pane draws, because the
+    /// One field from each of the groups the pane draws, because the
     /// classification the daemon routes on is per field.
     #[test]
-    fn one_edit_reaches_the_wire_as_a_file_reset_declaring_only_that_key() {
+    fn one_edit_reaches_the_wire_as_a_single_field_override() {
         for (key, presses) in [
             ("autorestart", 1usize), // control
             ("watch", 1),            // process
@@ -7189,27 +7192,31 @@ mod tests {
                 "{key}: space must arm before Enter means anything"
             );
             let request = wire(app.update(Msg::Key(KeyPress::Confirm)));
-            let Request::ApplyConfig { apps, reset } = request else {
-                panic!("{key}: expected ApplyConfig, got {request:?}");
+            let Request::SetSheepField {
+                name,
+                key: sent,
+                value,
+            } = request
+            else {
+                panic!("{key}: expected SetSheepField, got {request:?}");
             };
-            assert_eq!(reset, ResetDepth::File, "{key}");
-            assert_eq!(apps.len(), 1, "{key}");
-            assert_eq!(
-                apps[0].declared,
-                [key.to_owned()].into_iter().collect(),
-                "{key}"
-            );
-            assert!(apps[0].declared_env.is_empty(), "{key}");
-            assert_eq!(apps[0].config.name, "web", "{key}");
+            assert_eq!(name, "web", "{key}");
+            assert_eq!(sent, key, "{key}");
+            assert!(value.is_boolean(), "{key}: {value}");
         }
     }
 
     /// fails if a typed field stops reaching the wire as the value that was
-    /// typed, or stops declaring only itself. `cwd` and `max_restarts`
-    /// between them cover both text and integer, which arm differently.
+    /// typed, in the JSON shape that field's own kind wants. `cwd` and
+    /// `max_restarts` between them cover text and integer, which arm
+    /// differently, and an integer sent as a string is refused by the
+    /// daemon rather than set.
     #[test]
     fn a_typed_field_reaches_the_wire_as_the_value_that_was_typed() {
-        for (key, typed, check) in [("cwd", "/srv/web", 0u32), ("max_restarts", "40", 40)] {
+        for (key, typed, want) in [
+            ("cwd", "/srv/web", serde_json::json!("/srv/web")),
+            ("max_restarts", "40", serde_json::json!(40)),
+        ] {
             let mut app = fixtures::app_in_sheep_pane_with_control();
             pane_to(&mut app, key);
             let _ = app.update(Msg::Key(KeyPress::Confirm));
@@ -7223,20 +7230,14 @@ mod tests {
             let _ = app.update(Msg::Key(KeyPress::TextApply));
             assert_eq!(app.mode(), InputMode::Normal, "{key}: the editor closes");
             let request = wire(app.update(Msg::Key(KeyPress::Confirm)));
-            let Request::ApplyConfig { apps, reset } = request else {
-                panic!("{key}: expected ApplyConfig, got {request:?}");
+            let Request::SetSheepField {
+                key: sent, value, ..
+            } = request
+            else {
+                panic!("{key}: expected SetSheepField, got {request:?}");
             };
-            assert_eq!(reset, ResetDepth::File, "{key}");
-            assert_eq!(
-                apps[0].declared,
-                [key.to_owned()].into_iter().collect(),
-                "{key}"
-            );
-            if key == "cwd" {
-                assert_eq!(apps[0].config.cwd.as_deref(), Some("/srv/web"));
-            } else {
-                assert_eq!(apps[0].config.max_restarts, check);
-            }
+            assert_eq!(sent, key, "{key}");
+            assert_eq!(value, want, "{key}");
         }
     }
 
@@ -7417,10 +7418,10 @@ mod tests {
     /// fails if one write's reply clears a DIFFERENT write's in-flight
     /// line while that one is still outstanding.
     ///
-    /// Only the line was ever at risk: each request declares exactly its
-    /// own key, so neither can carry the other's value and the config
-    /// itself cannot be crossed. `PanePending::Sent` had no key to match
-    /// against, so any reply settled whatever was pending.
+    /// Only the line was ever at risk: each request names exactly its own
+    /// key, so neither can carry the other's value and the config itself
+    /// cannot be crossed. `PanePending::Sent` had no key to match against,
+    /// so any reply settled whatever was pending.
     #[test]
     fn one_replys_arrival_does_not_clear_another_writes_in_flight_line() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
@@ -7440,12 +7441,11 @@ mod tests {
         ));
         let _ = app.update(Msg::Replied {
             sent: first,
-            result: Ok(Response::Applied(vec![SheepApplied::new(
-                "web",
-                vec!["autorestart".to_owned()],
-                Vec::new(),
-                None,
-            )])),
+            result: Ok(Response::SheepFieldSet {
+                name: "web".to_owned(),
+                key: "autorestart".to_owned(),
+                pending: false,
+            }),
         });
         let pending = app.config_pane().unwrap().pending_edit();
         assert!(
@@ -7454,12 +7454,11 @@ mod tests {
         );
         let _ = app.update(Msg::Replied {
             sent: second,
-            result: Ok(Response::Applied(vec![SheepApplied::new(
-                "web",
-                vec!["watch".to_owned()],
-                Vec::new(),
-                None,
-            )])),
+            result: Ok(Response::SheepFieldSet {
+                name: "web".to_owned(),
+                key: "watch".to_owned(),
+                pending: false,
+            }),
         });
         assert!(app.config_pane().unwrap().pending_edit().is_none());
     }
@@ -7590,10 +7589,51 @@ mod tests {
         assert!(!app.config_pane().unwrap().is_armed());
     }
 
-    /// fails if a landed write stops re-reading the config, or if the
-    /// shepherd's own `refused` is swallowed.
+    /// fails if a landed write stops re-reading the config, if it stops
+    /// saying whether the running child has the value, or if a refusal is
+    /// swallowed.
+    ///
+    /// `pending` is the shepherd's answer and the pane reports it verbatim
+    /// rather than re-deriving it from `apply_group`: the two disagree on
+    /// `autostart`, and on a field whose config subset would not normalize.
     #[test]
-    fn a_landed_write_re_reads_the_config_and_a_refusal_is_reported() {
+    fn a_landed_write_re_reads_the_config_and_reports_what_the_shepherd_said() {
+        for (pending, wanted) in [(false, "is set"), (true, "shep reload")] {
+            let mut app = fixtures::app_in_sheep_pane_with_control();
+            pane_to(&mut app, "autorestart");
+            let _ = app.update(Msg::Key(KeyPress::Cycle));
+            let Effect::Send(sent) = app.update(Msg::Key(KeyPress::Confirm)) else {
+                panic!("the confirm sends");
+            };
+            let effect = app.update(Msg::Replied {
+                sent,
+                result: Ok(Response::SheepFieldSet {
+                    name: "web".to_owned(),
+                    key: "autorestart".to_owned(),
+                    pending,
+                }),
+            });
+            assert_eq!(
+                effect,
+                Effect::Send(Sent::SheepConfig {
+                    name: "web".to_owned()
+                }),
+                "a landed write re-reads what the shepherd now holds"
+            );
+            assert!(app.config_pane().unwrap().pending_edit().is_none());
+            let notice = app.notice().expect("the outcome is reported");
+            assert!(!notice.is_grave(), "{notice:?}");
+            assert!(notice.to_string().contains(wanted), "{notice:?}");
+        }
+    }
+
+    /// fails if the shepherd's refusal is swallowed. Every refusal this
+    /// door can meet is an `Err` now rather than a field in a success
+    /// reply, which is `Response::SheepFieldSet`'s own argument for
+    /// carrying no `refused`: two ways to say no is one a client forgets to
+    /// check.
+    #[test]
+    fn a_refused_write_is_reported_and_does_not_re_read() {
         let mut app = fixtures::app_in_sheep_pane_with_control();
         pane_to(&mut app, "autorestart");
         let _ = app.update(Msg::Key(KeyPress::Cycle));
@@ -7601,38 +7641,101 @@ mod tests {
             panic!("the confirm sends");
         };
         let effect = app.update(Msg::Replied {
-            sent: sent.clone(),
-            result: Ok(Response::Applied(vec![SheepApplied::new(
-                "web",
-                vec!["autorestart".to_owned()],
-                Vec::new(),
-                None,
-            )])),
-        });
-        assert_eq!(
-            effect,
-            Effect::Send(Sent::SheepConfig {
-                name: "web".to_owned()
-            }),
-            "a landed write re-reads what the shepherd now holds"
-        );
-        assert!(app.config_pane().unwrap().pending_edit().is_none());
-
-        let effect = app.update(Msg::Replied {
             sent,
-            result: Ok(Response::Applied(vec![SheepApplied::new(
-                "web",
-                Vec::new(),
-                Vec::new(),
-                Some("the store is locked by another shep".to_owned()),
-            )])),
+            result: Err(RequestError::Rpc(shep_core::protocol::RpcError {
+                code: shep_core::protocol::RpcErrorCode::InvalidConfig,
+                message: "the store is locked by another shep".to_owned(),
+                daemon_version: None,
+            })),
         });
         assert_eq!(effect, Effect::None, "a refusal does not re-read");
+        assert!(app.config_pane().unwrap().pending_edit().is_none());
         let notice = app.notice().expect("the refusal is reported");
         assert!(notice.is_grave());
         assert!(
             notice.to_string().contains("the store is locked"),
             "{notice:?}"
+        );
+    }
+
+    /// fails if two writes to the SAME field settle on the first reply.
+    ///
+    /// The narrower half of the two-writes hole. Matching a reply against
+    /// the `Sent` variant's KEY closed it for two different fields and left
+    /// it open for one field twice, which is what a ticket closes: the
+    /// counter is monotonic and never reused, so no two writes can be
+    /// confused whatever they name.
+    #[test]
+    fn two_writes_to_one_field_settle_on_their_own_replies() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "autorestart");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::Send(first) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("the first confirm sends");
+        };
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let Effect::Send(second) = app.update(Msg::Key(KeyPress::Confirm)) else {
+            panic!("the second confirm sends");
+        };
+        assert_ne!(first, second, "two sends are two different tickets");
+
+        let _ = app.update(Msg::Replied {
+            sent: first,
+            result: Ok(Response::SheepFieldSet {
+                name: "web".to_owned(),
+                key: "autorestart".to_owned(),
+                pending: false,
+            }),
+        });
+        assert!(
+            matches!(
+                app.config_pane().unwrap().pending_edit(),
+                Some(PanePending::Sent { .. })
+            ),
+            "the second write to the same field is still outstanding"
+        );
+        let _ = app.update(Msg::Replied {
+            sent: second,
+            result: Ok(Response::SheepFieldSet {
+                name: "web".to_owned(),
+                key: "autorestart".to_owned(),
+                pending: false,
+            }),
+        });
+        assert!(app.config_pane().unwrap().pending_edit().is_none());
+    }
+
+    /// fails if a refresh silently drops a question the operator has not
+    /// answered, or a write they are still waiting on.
+    ///
+    /// Held by reachability before this: a refresh rebuilds the whole
+    /// `ConfigPane` and the arm went with it, and nothing on today's
+    /// keyboard could land one while armed. That is an invariant nobody
+    /// can see, and the `Sent` half IS reachable -- two writes out, the
+    /// first lands, and its own re-read arrives while the second is still
+    /// outstanding.
+    #[test]
+    fn a_refresh_keeps_an_armed_edit_and_an_outstanding_one() {
+        let mut app = fixtures::app_in_sheep_pane_with_control();
+        pane_to(&mut app, "autorestart");
+        let _ = app.update(Msg::Key(KeyPress::Cycle));
+        let armed = app.config_pane().unwrap().pending_edit().cloned();
+        assert!(matches!(armed, Some(PanePending::Armed { .. })));
+        refresh_config(&mut app, &[]);
+        assert_eq!(
+            app.config_pane().unwrap().pending_edit().cloned(),
+            armed,
+            "the question survives the rebuild, word for word"
+        );
+
+        let _ = app.update(Msg::Key(KeyPress::Confirm));
+        let sent = app.config_pane().unwrap().pending_edit().cloned();
+        assert!(matches!(sent, Some(PanePending::Sent { .. })));
+        refresh_config(&mut app, &[]);
+        assert_eq!(
+            app.config_pane().unwrap().pending_edit().cloned(),
+            sent,
+            "the in-flight line survives the landed write's own re-read"
         );
     }
 
