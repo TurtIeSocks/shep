@@ -55,6 +55,27 @@ def dev_dep_tables(manifest: dict) -> list[tuple[str, dict]]:
     return tables
 
 
+def resolved_package(entry, dep: str, workspace_deps: dict) -> str:
+    """The real package name behind a dependency key.
+
+    Cargo lets the key alias a package through `package`, and the alias can sit
+    on the entry itself or on the root table it inherits from. Membership has to
+    be checked against the package rather than the key, or
+
+        client_for_tests = { package = "shep-client", version = "0.2.2" }
+
+    walks straight past a table keyed by real names.
+    """
+    if isinstance(entry, dict):
+        if isinstance(named := entry.get("package"), str):
+            return named
+        if entry.get("workspace") is True:
+            inherited = workspace_deps.get(dep)
+            if isinstance(inherited, dict) and isinstance(named := inherited.get("package"), str):
+                return named
+    return dep
+
+
 def carries_a_version(entry, name: str, workspace_deps: dict) -> str | None:
     """The version this entry would publish with, or None if it publishes clean.
 
@@ -96,18 +117,22 @@ def main() -> int:
     for name, (member, manifest) in sorted(members.items()):
         for table_name, table in dev_dep_tables(manifest):
             for dep, entry in table.items():
-                if dep not in members:
+                # The root table stays keyed by `dep`, since that is how cargo
+                # resolves `workspace = true`. Only membership moves.
+                package = resolved_package(entry, dep, workspace_deps)
+                if package not in members:
                     continue
                 version = carries_a_version(entry, dep, workspace_deps)
                 if version is not None:
-                    offenders.append((member, table_name, name, dep, version))
+                    shown = package if package == dep else f"{package} (as {dep})"
+                    offenders.append((member, table_name, name, shown, version))
 
     # To stderr, like the explanation below it: stdout is block-buffered when a
     # CI runner captures it and stderr is not, so splitting the two reorders the
     # offender list after the paragraph explaining it.
-    for member, table, name, dep, version in offenders:
+    for member, table, name, shown, version in offenders:
         print(
-            f"  {member}  [{table}]  {name} dev-depends on {dep} = \"{version}\"",
+            f"  {member}  [{table}]  {name} dev-depends on {shown} = \"{version}\"",
             file=sys.stderr,
         )
 
