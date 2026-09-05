@@ -26,9 +26,11 @@ command -v typos >/dev/null 2>&1 || exit 0
 # names under docs/shep-design/: fed through `printf '%s\n' | xargs`, each
 # one arrived at typos as several fragments, every fragment was "not
 # found", and the commit was refused for a typo that did not exist.
-if ! git diff --cached -z --name-only --diff-filter=ACMR | grep -qz .; then
-    exit 0
-fi
+# No grep in the emptiness test. Stock macOS grep accepts `-z` (measured on
+# macOS 25), but a hook whose first decision depends on which grep is first
+# on PATH is one that exits 0 without running typos on the wrong machine,
+# and a hook that silently does nothing is worse than no hook.
+[ -n "$(git diff --cached --name-only --diff-filter=ACMR)" ] || exit 0
 staged=$(mktemp -d) || exit 0
 trap 'rm -rf "$staged"' EXIT
 git diff --cached -z --name-only --diff-filter=ACMR \
