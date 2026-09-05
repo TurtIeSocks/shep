@@ -1,70 +1,15 @@
-//! [`ReconnectingClient`]: a connection that re-establishes itself when the
-//! daemon on the other end is replaced.
+//! [`ReconnectingClient`]: a connection that re-establishes itself when the daemon on the other end is replaced.
 //!
-//! # Why this is a separate type and not a mode on [`Client`]
-//!
-//! A daemon handover carries the listening socket across an `execve` but
-//! cannot carry an accepted one, so every connection to the shepherd dies
-//! at a reload. A dog's *process* survives that for free — it is a child of
-//! a daemon whose pid does not change — so what a carried dog becomes is a
-//! live process holding a dead socket. Measured over six real reloads: the
-//! metrics dog kept its pid, reported zero restarts, stayed `online`, wrote
-//! nothing to stderr, and answered HTTP 503 to every scrape for 6m 22s.
-//!
-//! The CLI has the opposite requirement. `shep stop` is one-shot: a request
-//! that dropped mid-flight must fail, because a silently re-issued `Stop`
-//! could stop a sheep twice — the second time after an operator's own
-//! `start` put it back. So the reconnect could not go on [`Client`] itself,
-//! nor behind a flag on it: a type whose retry behaviour depends on how it
-//! was built is a type every CLI call site has to be read carefully to
-//! trust. Making it a *distinct type* means the CLI is unaffected by
-//! construction rather than by convention — it never names
-//! `ReconnectingClient`, so no `shep` verb can acquire this behaviour by
-//! accident or by a later edit to a shared constructor.
-//!
-//! # What it does and does not retry
-//!
-//! **In-flight requests fail, never retry.** A request already handed to
-//! the connection when it died comes back [`RequestError::Closed`], exactly
-//! as it does on a bare [`Client`]. The client cannot tell a request the
-//! daemon never received from one it received and acted on before the image
-//! swapped, so retrying would be a guess about a side effect. What
-//! reconnects is the *connection*, so the caller's NEXT request is served.
-//!
-//! # Why the reconnect is supervised rather than lazy
-//!
-//! A background task waits on the current connection's death and
-//! re-establishes it immediately, rather than the cheaper design of
-//! reconnecting on the next use. Two reasons, both about the daemon's side
-//! of the reload:
-//!
-//! - A dog nobody is talking to still has to re-handshake. A metrics dog
-//!   scraped once a minute would otherwise spend that minute unreconnected,
-//!   and a refusal the daemon needs to act on (the design's G8) would not
-//!   surface until something happened to ask.
-//! - `daemon reload` reports dog staleness *after* the dogs have
-//!   reconnected (G13), which is only immediate if the reconnect is driven
-//!   by the disconnection rather than by the next request.
-//!
-//! A request issued during the reconnect window still fails with
-//! [`RequestError::Closed`]: the window is one connect plus one handshake
-//! on a local socket, and waiting inside `request` would turn a fast
-//! failure into a long hang for no correctness gain.
-//!
-//! # A refused reconnect stops
-//!
-//! A successor that refuses the handshake on protocol skew has said
-//! something a retry cannot change: this dog's running image speaks a
-//! protocol this daemon does not. The supervisor stops, and
-//! [`ReconnectingClient::link`] reports [`LinkState::Refused`]. Restarting
-//! that dog from disk is the daemon's job, not this client's — retrying
-//! here would be the spin the design's G8 exists to forbid.
-//!
-//! The daemon can only do that job if it knows WHICH dog it refused, and a
-//! refused handshake never reaches a request. So a dog connects with
-//! [`ReconnectingClient::connect_as_dog`], which carries the name the
-//! daemon spawned it under in the `Hello` itself — on the first connection
-//! and on every reconnect after it.
+//! A handover carries the listening socket across `execve` but not an accepted
+//! one, so a dog's own process survives holding a dead socket. [`Client`] has
+//! no such mode: the CLI's one-shot verbs must never see a request silently
+//! retried, so in-flight requests here fail too, and only the connection
+//! re-establishes. A background task reconnects as soon as the connection
+//! dies rather than on the next request, so an idle dog still re-handshakes
+//! before `shep daemon reload` polls dog staleness, and a refusing successor
+//! stops the supervisor ([`LinkState::Refused`]) rather than retrying.
+//! [`ReconnectingClient::connect_as_dog`] names the dog on every handshake so
+//! a refusal is actionable.
 
 use core::fmt;
 use std::path::{Path, PathBuf};
@@ -82,27 +27,25 @@ use crate::events::EventStream;
 /// How long the supervisor waits after its FIRST failed reconnect attempt
 /// before trying again.
 ///
-/// The first attempt carries no delay at all, which is the case that
-/// matters: across a handover the listening socket never stops being bound,
-/// so `connect(2)` succeeds into the backlog and only the handshake waits
-/// for the successor to start accepting. 50ms is the pause before a second
-/// attempt, short enough that a successor a few milliseconds late costs one
-/// of these rather than a visible outage (IR-26: named, with the reason).
+/// The first attempt carries no delay: across a handover the listening
+/// socket stays bound, so `connect(2)` succeeds into the backlog and only
+/// the handshake waits for the successor to start accepting. 50ms is the
+/// pause before a second attempt, short enough that a successor a few
+/// milliseconds late costs one of these rather than a visible outage.
 pub const RECONNECT_MIN_DELAY: Duration = Duration::from_millis(50);
 
 /// The ceiling [`RECONNECT_MIN_DELAY`] doubles up to.
 ///
-/// Same order as [`HANDSHAKE_TIMEOUT`] deliberately: once a daemon has been
-/// unreachable long enough to reach this ceiling, one further attempt costs
-/// about as much as the wait between attempts, so the loop is bounded noise
-/// rather than a spin. A dog whose daemon is genuinely gone sits here
-/// indefinitely, which is correct — the daemon that would have reaped it is
-/// the one that vanished.
+/// Same order as [`HANDSHAKE_TIMEOUT`]: past this point one further attempt
+/// costs about as much as the wait between attempts, so the loop is
+/// bounded noise rather than a spin. A dog whose daemon is genuinely gone
+/// sits here indefinitely: the daemon that would have reaped it is the one
+/// that vanished.
 pub const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 /// What a [`ReconnectingClient`]'s supervisor is currently doing.
 ///
-/// Growth is expected — library-crate public type (IR-20).
+/// Non-exhaustive: expect more variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LinkState {
@@ -113,9 +56,9 @@ pub enum LinkState {
     /// queued and not retried.
     Reconnecting,
     /// A successor refused the handshake on protocol-version skew. The
-    /// supervisor has stopped and every later request fails with
-    /// [`RequestError::Closed`] — a refusal is not something a retry can
-    /// fix, and the daemon that refused is the party that can.
+    /// supervisor has stopped, and every later request fails with
+    /// [`RequestError::Closed`]: the daemon that refused is the party
+    /// that can fix it, not a retry.
     Refused {
         /// The daemon's own crate version, when it named one. `None` from a
         /// daemon built before the refusal carried it.
@@ -130,9 +73,8 @@ pub enum LinkState {
 ///
 /// Built for dogs, which outlive the shepherd they connected to: a dog's
 /// process crosses a daemon handover as an ordinary child, so it is still
-/// running when its socket dies. The CLI deliberately uses a bare
-/// [`Client`] instead — see this module's own docs for why that is a
-/// separate type rather than a flag.
+/// running when its socket dies. The CLI uses a bare [`Client`] instead;
+/// see this module's own docs for why.
 ///
 /// # Example
 ///
@@ -155,14 +97,11 @@ pub struct ReconnectingClient {
     supervisor: JoinHandle<()>,
 }
 
-/// Manual, not derived (IR-41). The socket path and the [`HelloAck`] are
-/// both already printed by [`Client`]'s own `Debug`, and neither carries a
-/// secret — a control-socket path is an operator-visible filename, and an
-/// ack is a version, a protocol number and a pid. [`LinkState`] is printed
-/// in full for the same reason: its one payload is the daemon's own
-/// refusal sentence. Manual only because [`RwLock`] and [`JoinHandle`]
-/// derive into noise, and because a derived impl would print the *inner*
-/// [`Client`] on every line where the link state is the useful fact.
+/// Manual, not derived: the socket path and the [`HelloAck`] carry no
+/// secret, and neither does [`LinkState`], whose one payload is the
+/// daemon's own refusal sentence. Manual because [`RwLock`] and
+/// [`JoinHandle`] derive into noise, and a derived impl would print the
+/// inner [`Client`] where the link state is the useful fact.
 impl fmt::Debug for ReconnectingClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReconnectingClient")
@@ -180,7 +119,7 @@ struct Shared {
     socket: PathBuf,
     handshake_timeout: Duration,
     /// The name this client announces itself as a dog under, re-sent on
-    /// every reconnect — see [`ReconnectingClient::connect_as_dog`].
+    /// every reconnect. See [`ReconnectingClient::connect_as_dog`].
     dog_name: Option<String>,
     state: RwLock<State>,
 }
@@ -195,10 +134,9 @@ struct State {
 impl Shared {
     /// A read guard, treating a poisoned lock as ordinary data.
     ///
-    /// Nothing inside a critical section here can panic — every one is a
-    /// clone or an assignment of a plain struct — so poisoning cannot
-    /// signal a torn value, and `unwrap()` would turn an impossible
-    /// condition into a panic in a library.
+    /// Nothing inside a critical section here can panic: every one is a
+    /// clone or an assignment of a plain struct, so poisoning cannot
+    /// signal a torn value.
     fn read(&self) -> RwLockReadGuard<'_, State> {
         self.state.read().unwrap_or_else(PoisonError::into_inner)
     }
@@ -209,7 +147,7 @@ impl Shared {
     }
 
     /// The current generation, cloned out so the guard is dropped before
-    /// any caller awaits on it — no lock is ever held across an `await`.
+    /// any caller awaits on it: no lock is ever held across an `await`.
     fn client(&self) -> Arc<Client> {
         Arc::clone(&self.read().client)
     }
@@ -237,8 +175,7 @@ impl ReconnectingClient {
     ///
     /// # Errors
     ///
-    /// See [`Self::connect_with_timeout`] — every error variant it can
-    /// return, this returns unchanged.
+    /// See [`Self::connect_with_timeout`].
     pub async fn connect(socket: &Path) -> Result<Self, ConnectError> {
         Self::connect_with_timeout(socket, HANDSHAKE_TIMEOUT).await
     }
@@ -248,17 +185,12 @@ impl ReconnectingClient {
     ///
     /// # Errors
     ///
-    /// - [`ConnectError::Connect`] — `connect(2)` failed; nothing is
-    ///   listening at `socket`.
-    /// - [`ConnectError::Wire`] — the `Hello` failed to encode, or the
-    ///   reply frame failed to decode.
-    /// - [`ConnectError::Io`] — a framed read or write failed after connect.
-    /// - [`ConnectError::HandshakeClosed`] — the peer closed the connection
-    ///   before sending a `HelloReply`.
-    /// - [`ConnectError::HandshakeTimeout`] — connect succeeded but no
-    ///   `HelloReply` (or close) arrived within `timeout`.
-    /// - [`ConnectError::ProtocolMismatch`] — the daemon refused the
-    ///   handshake on protocol-version skew.
+    /// - [`ConnectError::Connect`]: nothing is listening at `socket`.
+    /// - [`ConnectError::Wire`]: `Hello` failed to encode, or the reply failed to decode.
+    /// - [`ConnectError::Io`]: a framed read or write failed after connect.
+    /// - [`ConnectError::HandshakeClosed`]: the peer closed before a `HelloReply`.
+    /// - [`ConnectError::HandshakeTimeout`]: no `HelloReply` arrived within `timeout`.
+    /// - [`ConnectError::ProtocolMismatch`]: the daemon refused on protocol-version skew.
     pub async fn connect_with_timeout(
         socket: &Path,
         timeout: Duration,
@@ -267,22 +199,17 @@ impl ReconnectingClient {
     }
 
     /// As [`Self::connect`], but announcing this client as the dog
-    /// registered under `name` — the value the daemon put in
+    /// registered under `name`, the value the daemon put in
     /// `$SHEP_DOG_NAME` when it spawned this process.
     ///
-    /// **A dog should use this rather than [`Self::connect`].** The name is
-    /// what makes a refused handshake actionable: it never reaches a
-    /// request, so `Request::DogConfig`'s name is unreachable on exactly
-    /// the path where the daemon needs to know which dog to restart (the
-    /// handover design's G8). A dog that connects without it still
-    /// reconnects across a handover, and still stops rather than spinning
-    /// when a successor refuses it — but the daemon is left unable to say
-    /// which dog went stale, or to restart it from disk.
+    /// A dog should use this rather than [`Self::connect`]: the name makes
+    /// a refused handshake actionable, since a refusal never reaches a
+    /// request. Without it, the daemon still stops rather than spins on a
+    /// refusal, but cannot say which dog went stale or restart it.
     ///
     /// # Errors
     ///
-    /// See [`Self::connect_with_timeout`] — every error variant it can
-    /// return, this returns unchanged.
+    /// See [`Self::connect_with_timeout`].
     pub async fn connect_as_dog(socket: &Path, name: &str) -> Result<Self, ConnectError> {
         Self::connect_as_dog_with_timeout(socket, HANDSHAKE_TIMEOUT, name).await
     }
@@ -293,8 +220,7 @@ impl ReconnectingClient {
     ///
     /// # Errors
     ///
-    /// See [`Self::connect_with_timeout`] — every error variant it can
-    /// return, this returns unchanged.
+    /// See [`Self::connect_with_timeout`].
     pub async fn connect_as_dog_with_timeout(
         socket: &Path,
         timeout: Duration,
@@ -330,15 +256,13 @@ impl ReconnectingClient {
     }
 
     /// The handshake acknowledgement of the daemon this client is talking
-    /// to **right now**.
+    /// to right now.
     ///
     /// Owned rather than borrowed, unlike [`Client::daemon`]: the ack
-    /// belongs to a generation that a reconnect can replace at any moment,
-    /// so handing out a reference would either pin a stale one or need a
-    /// guard in the caller's hands. Reading it through the current
-    /// generation is also the only correct answer — a cached ack would
-    /// describe the predecessor, which is exactly what a dog publishing
-    /// `daemon_version` must not do.
+    /// belongs to a generation a reconnect can replace at any moment, so a
+    /// reference would either pin a stale one or need a guard in the
+    /// caller's hands. A cached ack would describe the predecessor, which
+    /// a dog publishing `daemon_version` must not do.
     #[must_use]
     pub fn daemon(&self) -> HelloAck {
         self.shared.read().client.daemon().clone()
@@ -366,22 +290,18 @@ impl ReconnectingClient {
         self.request_with_deadline(body, None).await
     }
 
-    /// Sends `body` with `deadline` on the current generation of the
-    /// connection.
+    /// Sends `body` with `deadline` on the current generation.
     ///
-    /// **Never retried.** A request that was on the wire when the daemon
-    /// was replaced fails, and a request issued while the supervisor is
-    /// still reconnecting fails too. Only the connection is re-established;
-    /// the caller decides what to do about the request, because only the
-    /// caller knows whether sending it twice is safe.
+    /// Never retried: a request on the wire when the daemon was replaced
+    /// fails, and so does one issued while reconnecting. Only the
+    /// connection re-establishes; the caller decides whether resending is safe.
     ///
     /// # Errors
     ///
-    /// - [`RequestError::Rpc`] — the daemon answered with a structured error.
-    /// - [`RequestError::Timeout`] — no reply within the request's budget.
-    /// - [`RequestError::Closed`] — the connection closed before a reply
-    ///   arrived, or had already closed when this was issued.
-    /// - [`RequestError::Wire`] — `body` failed to encode.
+    /// - [`RequestError::Rpc`]: the daemon answered with a structured error.
+    /// - [`RequestError::Timeout`]: no reply within the request's budget.
+    /// - [`RequestError::Closed`]: the connection closed before a reply arrived, or already had.
+    /// - [`RequestError::Wire`]: `body` failed to encode.
     pub async fn request_with_deadline(
         &self,
         body: Request,
@@ -395,18 +315,15 @@ impl ReconnectingClient {
 
     /// Subscribes the current generation of the connection to `topics`.
     ///
-    /// **The returned stream belongs to one generation and is not re-armed
-    /// across a reconnect**: it ends when that connection dies, the same as
+    /// The returned stream belongs to one generation and is not re-armed
+    /// across a reconnect: it ends when that connection dies, like
     /// [`Client::subscribe`]'s would. A consumer that wants events past a
-    /// handover subscribes again after the stream ends. Re-arming it inside
-    /// this type would silently swallow the gap between the connection
-    /// dying and the successor accepting a new `Subscribe`, and an event
-    /// stream that hides a gap is worse than one that ends.
+    /// handover subscribes again; re-arming here would silently swallow
+    /// the gap between the old connection dying and a new `Subscribe`.
     ///
     /// # Errors
     ///
-    /// Same as [`Self::request`]: a daemon-side error, a client-side
-    /// timeout, a closed connection, or a wire encode failure.
+    /// Same as [`Self::request`].
     pub async fn subscribe(&self, topics: Vec<String>) -> Result<EventStream, RequestError> {
         self.shared.client().subscribe(topics).await
     }
@@ -433,9 +350,8 @@ impl Drop for ReconnectingClient {
 /// handle is dropped and this task is aborted.
 async fn supervise(shared: Arc<Shared>) {
     loop {
-        // Held only for the await on this generation's death — dropped
-        // before the reconnect, so the dead client's socket goes away as
-        // soon as `install` replaces it rather than being pinned here.
+        // held only for the death await, dropped before reconnecting so the
+        // dead socket goes away as soon as `install` replaces it
         let generation = shared.client();
         generation.closed().await;
         drop(generation);
@@ -487,22 +403,19 @@ mod tests {
     use super::*;
     use crate::testing::{Handovers, Handshake, control_address, fake_daemon_across_handovers};
 
-    /// Every bounded wait in this module uses one budget. Generous against
-    /// a loaded CI runner, and small enough that a genuinely stuck test
-    /// fails rather than hanging the suite (IR-46: every `await` here has a
-    /// forcing mechanism, and this is it).
+    /// Every bounded wait in this module uses one budget: generous against
+    /// a loaded CI runner, small enough that a genuinely stuck test fails
+    /// rather than hanging the suite.
     const BOUND: Duration = Duration::from_secs(5);
 
-    /// The window a test watches for something that must NOT happen.
+    /// The window a test watches for something that must not happen.
     ///
-    /// Eight times [`RECONNECT_MIN_DELAY`], so a supervisor that were still
-    /// looping would have made several further attempts inside it — the
-    /// first of them after 50ms. A negative assertion is only as good as
-    /// its window, so this is stated against the delay it has to outrun
-    /// rather than picked as a round number.
+    /// Eight times [`RECONNECT_MIN_DELAY`], so a supervisor still looping
+    /// would have made several further attempts inside it, the first after
+    /// 50ms. Stated against the delay it has to outrun, not a round number.
     const NEGATIVE_WINDOW: Duration = Duration::from_millis(400);
 
-    /// An ack distinguishable per generation, so a test can tell WHICH
+    /// An ack distinguishable per generation, so a test can tell which
     /// daemon answered rather than only that one did.
     fn ack_from(pid: u32) -> HelloAck {
         HelloAck {
@@ -512,25 +425,17 @@ mod tests {
         }
     }
 
-    /// Waits until the fake has accepted `accepts` connections AND the
+    /// Waits until the fake has accepted `accepts` connections and the
     /// client has installed the newest of them, or fails inside [`BOUND`].
-    /// The reconnect is driven by a background task, so there is no handle
-    /// to await; polling against a real condition with a hard ceiling is
-    /// the forcing mechanism.
     ///
-    /// Both halves are needed and neither alone would do. The accept count
-    /// alone rises before the handshake completes, so a request issued on
-    /// it could still meet the dead generation; the link alone still reads
-    /// `Connected` in the instant after a cut, before the supervisor has
-    /// noticed. Together they are unambiguous, because the supervisor sets
-    /// `Reconnecting` BEFORE it dials — so an accept count that has moved
-    /// and a link back at `Connected` can only mean the fresh generation is
-    /// installed.
+    /// Both halves are needed: the accept count alone rises before the
+    /// handshake completes, and the link alone still reads `Connected` in
+    /// the instant after a cut. The supervisor sets `Reconnecting` before
+    /// it dials, so together they are unambiguous.
     ///
-    /// Deliberately does NOT observe [`ReconnectingClient::daemon`]: the
-    /// ack is what one of these tests is asserting about, and a helper that
-    /// waited on it would make every other test fail for that test's
-    /// reason.
+    /// Does not observe [`ReconnectingClient::daemon`]: some tests assert
+    /// on the ack, and a helper that waited on it would make those fail
+    /// for an unrelated reason.
     async fn await_reconnect(client: &ReconnectingClient, shepherds: &Handovers, accepts: u32) {
         let seen = tokio::time::timeout(BOUND, async {
             loop {
@@ -566,10 +471,8 @@ mod tests {
     }
 
     /// fails if a dog is left holding a dead socket after its daemon is
-    /// replaced. This is the measured defect: over six real reloads the
-    /// metrics dog kept its pid, reported zero restarts and answered 503 to
-    /// every scrape, because only the LISTENING socket crosses the exec and
-    /// an accepted one dies with the image.
+    /// replaced: only the listening socket crosses the exec, and an
+    /// accepted one dies with the image.
     #[tokio::test]
     async fn a_dropped_connection_is_re_established_and_the_next_request_is_served() {
         let dir = tempfile::tempdir().unwrap();
@@ -603,9 +506,8 @@ mod tests {
     }
 
     /// fails if the ack keeps describing the predecessor after a
-    /// reconnect. A dog publishing `daemon_version` from a cached ack —
-    /// which the metrics dog does — would report a daemon that is no longer
-    /// running.
+    /// reconnect, which would make a dog publish `daemon_version` for a
+    /// daemon no longer running.
     #[tokio::test]
     async fn the_ack_follows_the_successor_rather_than_the_predecessor() {
         let dir = tempfile::tempdir().unwrap();
@@ -698,14 +600,12 @@ mod tests {
     }
 
     /// fails if a request that was in flight when the daemon was replaced
-    /// is re-sent to the successor. A re-issued `Stop` stops a sheep twice,
-    /// and the client cannot tell a request the daemon never saw from one
-    /// it received and acted on before the image swapped — so the rule is
-    /// the whole of the design's H2: in-flight requests fail, never retry.
+    /// is re-sent to the successor: a re-issued `Stop` could stop a sheep
+    /// twice, and the client cannot tell a request the daemon never saw
+    /// from one it already acted on.
     ///
-    /// The proof is positional rather than a count: the successor's FIRST
-    /// envelope must be the request issued after the reconnect. A retry
-    /// would put the abandoned `Ping` there instead.
+    /// The proof is positional: the successor's first envelope must be the
+    /// request issued after the reconnect, not the abandoned `Ping`.
     #[tokio::test]
     async fn an_in_flight_request_fails_and_is_never_re_sent_to_the_successor() {
         let dir = tempfile::tempdir().unwrap();
@@ -719,8 +619,7 @@ mod tests {
         );
         let client = ReconnectingClient::connect(&path).await.unwrap();
 
-        // The predecessor reads this envelope and dies without answering
-        // it — a request the daemon may or may not have acted on.
+        // the predecessor reads this envelope and dies without answering it
         shepherds.cut_on_next_request();
         let lost = tokio::time::timeout(BOUND, client.request(Request::Ping))
             .await
@@ -840,12 +739,10 @@ mod tests {
     }
 
     /// fails if dropping the handle leaves the supervisor reconnecting
-    /// forever. A dog that exits, or a test that finishes, must not leave a
-    /// task dialling an address nobody will answer and pinning the last
-    /// generation's socket open with it.
+    /// forever against an address nobody will answer.
     ///
-    /// Asserts a NEGATIVE, so the bound is the assertion: the accept count
-    /// must NOT grow within it.
+    /// Asserts a negative: the bound is the assertion, and the accept
+    /// count must stay flat within it.
     #[tokio::test]
     async fn dropping_the_handle_stops_the_supervisor() {
         let dir = tempfile::tempdir().unwrap();
