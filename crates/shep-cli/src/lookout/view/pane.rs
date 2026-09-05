@@ -62,6 +62,27 @@ const fn body_width(width: u16) -> u16 {
 
 /// What a change to a field in `group` costs, in an operator's words.
 ///
+/// **A prediction from the field's CLASS, not a promise about a particular
+/// write, and the pane no longer claims otherwise anywhere else.**
+/// `apply_group` is a fact about the field; whether a given write reaches
+/// the running child is a fact about the flock, and only the shepherd has
+/// it. Two rows drawn here are routinely wrong about their own write:
+/// `watch` says `now` and parks whenever the config subset it would reach
+/// cannot normalize alone, and `autostart` says `next start` and is in
+/// force the moment it lands, because the daemon reads it at muster.
+///
+/// It is left as a prediction rather than corrected from the reply. A reply
+/// arrives for one row of thirty-nine, so correcting it would leave a
+/// column that is a fact on the rows an operator happened to edit and a
+/// prediction on the rest, with nothing on screen saying which is which.
+/// The question this column answers is hypothetical anyway -- it is read
+/// BEFORE a write, to decide whether to make one. The other two things that
+/// speak are not predictions: the status bar reports what the shepherd
+/// actually did, and the row's own `!` flag is the durable answer, read off
+/// the shepherd's parked-field list on every refresh.
+/// `the_cost_column_predicts_and_the_status_bar_reports` pins both
+/// directions.
+///
 /// [`ApplyGroup`] is `#[non_exhaustive]`, so the wildcard is required rather
 /// than chosen. It answers `respawn`, the most conservative of the four and
 /// the same fallback [`apply_group`](shep_core::config::apply_group) gives a
@@ -600,7 +621,7 @@ mod tests {
 
     use super::super::fixtures;
     use super::*;
-    use crate::lookout::app::{KeyPress, Msg};
+    use crate::lookout::app::{Effect, KeyPress, Msg};
     use crate::lookout::frames::render_text;
     use crate::output::width::visible_width;
 
@@ -889,7 +910,6 @@ mod tests {
         pane.cycle(Instant::now());
         let text = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
         assert!(text[1].contains("set autorestart = false"), "{:?}", text[1]);
-        assert!(text[1].contains("web"), "{:?}", text[1]);
 
         pane.take_armed(0);
         let sent = text_of(&pane_lines(&pane, fixtures::plain(), 120, 0));
@@ -897,6 +917,83 @@ mod tests {
             sent[1], text[1],
             "the wording must not change between the question and its answer"
         );
+    }
+
+    /// The pane's cursor, walked onto `key` the way an operator walks it.
+    fn pane_to(app: &mut crate::lookout::app::App, key: &str) {
+        let index = app
+            .config_pane()
+            .expect("the pane is open")
+            .fields()
+            .fields()
+            .iter()
+            .position(|field| field.key == key)
+            .unwrap_or_else(|| panic!("no field named {key}"));
+        app.update(Msg::Key(KeyPress::SelectFirst));
+        for _ in 0..index {
+            app.update(Msg::Key(KeyPress::SelectDown));
+        }
+    }
+
+    /// fails if the COST column stops being a prediction, or if the status
+    /// bar stops being the thing that reports what actually happened.
+    ///
+    /// **Both directions, because the column is wrong in both.** `watch` is
+    /// `Live` and draws `now`, and parks whenever the config subset it
+    /// would reach cannot normalize alone. `autostart` is `NextSpawn` and
+    /// draws `next start`, and is in force the moment it lands, because the
+    /// daemon reads it at muster. The column is read off `apply_group`,
+    /// which is a fact about the FIELD; whether a given write reaches the
+    /// running child is a fact about the flock, and only the shepherd has
+    /// it.
+    ///
+    /// The column is deliberately not corrected after a reply. A reply
+    /// arrives for one row of thirty-nine, so correcting it would leave a
+    /// column that is a fact on two rows and a prediction on the other
+    /// thirty-seven, with nothing on screen saying which. It stays a
+    /// prediction everywhere and is labelled as one; the bar reports the
+    /// outcome, and the row's `!` flag carries it afterwards.
+    #[test]
+    fn the_cost_column_predicts_and_the_status_bar_reports() {
+        for (key, column, pending, sentence) in [
+            ("watch", "now", true, "waits for `shep reload web`"),
+            ("autostart", "next start", false, "is set"),
+        ] {
+            let mut app = fixtures::app_in_sheep_pane_with_control();
+            pane_to(&mut app, key);
+
+            let text = text_of(&pane_lines(
+                app.config_pane().unwrap(),
+                fixtures::plain(),
+                120,
+                0,
+            ));
+            let row = text
+                .iter()
+                .find(|line| {
+                    line.split_whitespace().next() == Some(key)
+                        || line
+                            .get(3..)
+                            .is_some_and(|rest| rest.split_whitespace().next() == Some(key))
+                })
+                .unwrap_or_else(|| panic!("{key} is drawn at 120 columns: {text:?}"));
+            assert!(row.contains(column), "{key}: {row:?}");
+
+            app.update(Msg::Key(KeyPress::Cycle));
+            let Effect::Send(sent) = app.update(Msg::Key(KeyPress::Confirm)) else {
+                panic!("{key}: the confirm sends");
+            };
+            app.update(Msg::Replied {
+                sent,
+                result: Ok(shep_core::protocol::Response::SheepFieldSet {
+                    name: "web".to_string(),
+                    key: key.to_string(),
+                    pending,
+                }),
+            });
+            let bar = crate::lookout::view::status::status_line(&app, 200).to_string();
+            assert!(bar.contains(sentence), "{key}: {bar:?}");
+        }
     }
 
     /// fails if an open editor stops drawing what is being typed in the

@@ -608,7 +608,10 @@ esc/s close   j/k select   g/G fir… read-only`;
       <code>plain</code> style has no colour to read, so a greyed-out row
       would be the only signal left in the case where it says least.
     </p>
-    <p>The last column is what a change would cost:</p>
+    <p>
+      The last column is the field's class, which is what a change to it
+      usually costs:
+    </p>
     <ul>
       <li><code>now</code> the shepherd re-reads it at the next decision</li>
       <li>
@@ -624,6 +627,16 @@ esc/s close   j/k select   g/G fir… read-only`;
         moves with <code>shep stock</code>, not from here.
       </li>
     </ul>
+    <p class="fine">
+      Read it before you write, not after. It says what kind of field this
+      is, and a particular write can land differently: <code>watch</code>
+      says <code>now</code> and waits for a reload if the
+      <code>cwd</code> it needs is itself still parked, and
+      <code>autostart</code> says <code>next start</code> and takes effect
+      immediately, because shep reads it at muster. The status bar after the
+      write is the one that reports what actually happened, and the
+      <code>!</code> flag on the row carries it afterwards.
+    </p>
     <p>Keys, local to the pane while it's open:</p>
     <ul>
       <li><code>e</code> opens the pane, and closes it again</li>
