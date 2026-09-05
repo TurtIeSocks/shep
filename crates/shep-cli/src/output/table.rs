@@ -2,7 +2,7 @@
 //! two pieces of `--format table` independent of any payload type.
 
 use super::Render;
-use super::width::visible_width;
+use super::width::{sanitize_cell_without_ansi, visible_width};
 
 /// Renders any payload as the padded table, returned rather than printed so
 /// a test can read it. [`emit`](super::emit) calls this for `Format::Table`.
@@ -10,7 +10,8 @@ use super::width::visible_width;
 /// Column widths come from the widest cell in each column, header included,
 /// measured in display columns via [`visible_width`] so a CJK or emoji cell
 /// pads correctly. Cells are separated by two spaces with no box-drawing
-/// characters. An empty payload still prints the header row.
+/// characters. An empty payload still prints the header row. Every cell goes
+/// through [`sanitize_cell_without_ansi`] first.
 ///
 /// # Panics
 /// If any row `T::rows()` returns has a different number of cells than
@@ -19,7 +20,19 @@ use super::width::visible_width;
 #[track_caller]
 pub fn render_table<T: Render>(data: &T) -> String {
     let headers = T::headers();
-    let rows = data.rows();
+    // Sanitised once, ahead of the width pass, so measuring and printing see
+    // the same bytes. This surface never colours, so a well-formed CSI
+    // sequence drops here where the boxed renderer keeps its own.
+    let rows: Vec<Vec<String>> = data
+        .rows()
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(String::as_str)
+                .map(sanitize_cell_without_ansi)
+                .collect()
+        })
+        .collect();
 
     for row in &rows {
         assert_eq!(
@@ -448,6 +461,16 @@ mod tests {
     fn info_with_name(name: &str) -> shep_core::protocol::ProcessInfo {
         shep_core::protocol::ProcessInfo::builder(1, name, shep_core::status::ProcStatus::Online)
             .build()
+    }
+
+    /// fails if a forged colour reaches the bare table. `shep-core`'s
+    /// `normalize()` rejects only `/`, `\`, `.` and `..` in a name, so an
+    /// escape gets this far from an app an operator started.
+    #[test]
+    fn a_name_carrying_an_escape_leaves_no_escape_in_the_table() {
+        let out = render_table(&FlockRows(vec![info_with_name("web\u{1b}[31mworker")]));
+        assert!(!out.contains('\u{1b}'), "escape survived: {out:?}");
+        assert!(out.contains("webworker"), "the printable text stays: {out}");
     }
 
     /// `MemSize`'s own Display only names a unit that divides the value
