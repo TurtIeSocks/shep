@@ -9355,9 +9355,12 @@ fn roll_recording(roll: &Path, want: usize) -> Vec<u8> {
 /// The pid check at the end is what keeps this from passing vacuously.
 /// SIGHUP has exactly two outcomes and no third: this image execs into a
 /// successor, or it cannot and stops gracefully instead. On the second, the
-/// polling below finds no shepherd and spawns a fresh one, which is a NEW
-/// pid and a boot that does restore the roll. So a shepherd still answering
-/// on the original pid is a successor and nothing else.
+/// polling below meets no shepherd at all and fails on its own
+/// `assert_success`, since `shep flock` connects and never spawns; the case
+/// is red before the pid check is reached. So a shepherd still answering on
+/// the original pid is a successor and nothing else, and the pid check is
+/// what says the exec happened rather than a stop the polling was too
+/// tolerant to notice.
 ///
 /// The final wait is on the WRONG outcome deliberately. A restore that is
 /// going to happen happens inside the successor's own boot, and nothing in
