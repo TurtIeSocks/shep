@@ -554,7 +554,17 @@ mod tests {
                 "level"
             ]
         );
-        assert_eq!(set.groups(), ["[daemon]", "[whistle]", "[style]"]);
+        let mut groups: Vec<&str> = Vec::new();
+        for field in set.fields() {
+            let group = field
+                .group
+                .as_deref()
+                .expect("every scalar names a section");
+            if groups.last() != Some(&group) {
+                groups.push(group);
+            }
+        }
+        assert_eq!(groups, ["[daemon]", "[whistle]", "[style]"]);
     }
 
     #[test]

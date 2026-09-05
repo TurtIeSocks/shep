@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use ratatui::text::Line;
 use shep_client::RequestError;
-use shep_core::protocol::{BusEvent, DogSource, Lamb, ProcessInfo, Response};
+use shep_core::config::AppConfig;
+use shep_core::protocol::{BusEvent, DogSource, Lamb, ProcessInfo, Response, SheepConfigView};
 use shep_core::status::ProcStatus;
 
 use super::super::app::{
@@ -632,4 +633,47 @@ pub fn app_in_settings_on_dog(name: &str) -> App {
 /// what the test is asserting on without checking the dogs list.
 pub fn app_in_settings_on_enabled_dog(name: &str) -> App {
     app_in_settings_on_dog(name)
+}
+
+/// One sheep's config as the shepherd would answer it: `web`, with two
+/// fields an operator has overridden, one parked until a respawn, and two
+/// env keys whose values the view never carries.
+pub fn sheep_config_view() -> SheepConfigView {
+    let mut config = AppConfig {
+        name: "web".to_string(),
+        script: "./srv".to_string(),
+        args: vec!["--port".to_string(), "8080".to_string()],
+        max_restarts: 32,
+        instances: 3,
+        ..AppConfig::default()
+    };
+    config
+        .env
+        .insert("DB_HOST".to_string(), "db.internal".to_string());
+    config
+        .env
+        .insert("LOG_LEVEL".to_string(), "debug".to_string());
+    SheepConfigView::new(
+        config,
+        vec!["max_restarts".to_string(), "instances".to_string()],
+        vec!["kill_signal".to_string()],
+    )
+}
+
+/// A dashboard with `web` selected and its config pane open, opened the way
+/// the event loop opens it: `e`, then the shepherd's own reply.
+pub fn app_in_sheep_pane() -> App {
+    let mut app = with_selection(
+        ProcessInfo::builder(9, "web", ProcStatus::Online)
+            .pid(Some(48_000))
+            .build(),
+    );
+    app.update(Msg::Key(KeyPress::Edit));
+    app.update(Msg::Replied {
+        sent: Sent::SheepConfig {
+            name: "web".to_string(),
+        },
+        result: Ok(Response::SheepConfig(Box::new(sheep_config_view()))),
+    });
+    app
 }

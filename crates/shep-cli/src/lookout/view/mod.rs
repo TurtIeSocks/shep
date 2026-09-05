@@ -10,6 +10,7 @@ pub mod bleats;
 pub mod detail;
 pub mod flock;
 pub mod host;
+pub mod pane;
 pub mod scroll;
 pub mod settings;
 pub mod status;
@@ -223,6 +224,21 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
     // the host strip, the flock table and the two bottom panes all belong
     // to the dashboard body this branch replaces, so none of them draw
     // while the screen is open.
+    // The config pane owns the same body the settings screen does, and is
+    // checked first for the same reason `App::on_key` checks it first: it
+    // opens over the dashboard, and while it is open it is the screen.
+    if let Some(pane) = app.config_pane() {
+        let body = Rect {
+            x: area.x,
+            y,
+            width,
+            height: body_rows(area),
+        };
+        pane::draw_pane(app, pane, body, buffer);
+        buffer.set_line(area.x, bottom, &status::status_line(app, width), width);
+        return;
+    }
+
     if let Some(settings) = app.settings() {
         let body = Rect {
             x: area.x,

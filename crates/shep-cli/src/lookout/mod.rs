@@ -43,6 +43,7 @@ pub mod field;
 pub mod frames;
 pub mod input;
 pub mod link;
+pub mod pane;
 pub mod source;
 pub mod tail;
 pub mod term;

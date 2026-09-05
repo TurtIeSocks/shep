@@ -183,6 +183,15 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         // overlay anywhere in this module, and one rule under the header
         // beats a full border for a pane somebody reads at 3am.
         (text, palette.attention())
+    } else if app.config_pane().is_some() {
+        // The pane owns the keyboard, so neither the filter line nor either
+        // dashboard hint is true while it is up. Its own form, for the
+        // reason this file's standing rule gives: a dashboard hint naming
+        // `x stop` beside a pane where `x` does nothing is exactly the
+        // asterisk that rule forbids. Read-only in both `Control` states --
+        // this pane does not write yet, so there is nothing for the gate to
+        // permit and no second form to hand out.
+        (PANE_HINT.to_string(), palette.muted())
     } else if app.settings().is_none() && !app.filter().is_empty() {
         // Gated on the screen being closed: the filter survives the swap
         // into settings (`App::on_settings_key` never touches it), but `/`
@@ -288,6 +297,14 @@ fn in_flight_text(action: &ActionState<'_>) -> String {
 /// so a read-only lookout was told `space cycle` about a key that refuses.
 /// That is exactly the asterisk the rule above forbids, and the dashboard
 /// omits `x`, `R` and `L` for the same reason.
+/// The config pane's own key hint. One form, not two: the pane is read-only,
+/// so [`Control`] has nothing to change about it.
+///
+/// `esc/e close` names both keys that close it, the same way the settings
+/// screen's own form names both of its own -- on this screen `e` is the
+/// close key, not the open one.
+const PANE_HINT: &str = "esc/e close   j/k select   g/G first/last   r refresh   q quit";
+
 fn hint_for(control: Control, settings_open: bool) -> String {
     if settings_open {
         // `esc/s close` names both keys that close the screen, which is how
@@ -698,5 +715,19 @@ mod tests {
         for hint in [&closed, &open] {
             assert!(hint.contains("q quit"), "got {hint:?}");
         }
+    }
+
+    /// fails if the status bar keeps offering the dashboard's own keys
+    /// while the config pane owns the keyboard. `x stop` in particular: it
+    /// does nothing from in there, and this file's standing rule is that a
+    /// hint needing a footnote is an asterisk rather than a hint.
+    #[test]
+    fn the_config_pane_gets_its_own_key_hint() {
+        let app = super::super::fixtures::app_in_sheep_pane();
+        let bar = status_line(&app, 120).to_string();
+        assert!(bar.contains("esc/e close"), "got {bar:?}");
+        assert!(bar.contains("r refresh"), "got {bar:?}");
+        assert!(!bar.contains("x stop"), "got {bar:?}");
+        assert!(!bar.contains("s settings"), "got {bar:?}");
     }
 }

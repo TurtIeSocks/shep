@@ -38,6 +38,7 @@ use shep_core::protocol::{
 use shep_core::status::ProcStatus;
 
 use super::field::FieldSet;
+use super::pane::ConfigPane;
 use super::theme::Palette;
 use super::viewport::Viewport;
 use crate::commands::settings::{SettingEdit, SettingField, SettingsSnapshot, settings_field_set};
@@ -128,6 +129,10 @@ pub enum KeyPress {
     /// Meaningless from the dashboard; refuses the same way an action key
     /// does when the control gate is closed.
     Cycle,
+    /// `e`: open the config pane for the selected sheep on the dashboard,
+    /// and close it again from inside it. The reducer decides which, the
+    /// same division [`Self::Settings`]'s own doc argues for.
+    Edit,
 }
 
 /// Everything that can change the dashboard.
@@ -503,6 +508,17 @@ pub enum Sent {
         /// answered.
         source: DogSource,
     },
+    /// One sheep's effective config, for the config pane. Raised by `e` on
+    /// the dashboard and by `r` from inside an open pane.
+    ///
+    /// A name rather than a [`RowKey`], because [`Request::SheepConfig`]
+    /// takes one: the pane is about an app's stored spec, which every
+    /// instance of a multi-instance app shares, so an id would name a
+    /// narrower thing than the config it would come back with.
+    SheepConfig {
+        /// Which sheep was asked about.
+        name: String,
+    },
 }
 
 impl Sent {
@@ -537,6 +553,7 @@ impl Sent {
                 enable: false,
                 ..
             } => Request::DisableDog { name: name.clone() },
+            Self::SheepConfig { name } => Request::SheepConfig { name: name.clone() },
         }
     }
 }
@@ -1303,6 +1320,14 @@ pub struct App {
     /// The settings screen's own state. `None` is the dashboard; `Some` is
     /// the screen, open over it.
     settings: Option<Settings>,
+    /// The open config pane, or `None`. Opened by `e` on a selected sheep,
+    /// and closed by `e` or `Escape` from inside it.
+    ///
+    /// A sibling of [`Self::settings`] rather than a field on it: the two
+    /// screens open from different places and neither is reachable from the
+    /// other. `on_key` checks this one first, so a pane opened over the
+    /// dashboard owns the keyboard for as long as it is up.
+    config_pane: Option<ConfigPane>,
     /// The resolved style level and which layer chose it, from
     /// `run_argv`'s own `resolve_style`. `App::new` defaults it to
     /// `(StyleLevel::Full, StyleSource::Default)`; `run_argv`'s `lookout`
@@ -1334,6 +1359,7 @@ impl App {
             lambs: None,
             action: None,
             settings: None,
+            config_pane: None,
             style: (StyleLevel::Full, StyleSource::Default),
         }
     }
@@ -1465,6 +1491,7 @@ impl App {
                     self.on_action_reply(verb, target, &name, result)
                 }
                 Sent::Dog { name, enable, .. } => self.on_dog_reply(name, enable, result),
+                Sent::SheepConfig { name } => self.on_sheep_config(&name, result),
             },
             Msg::Unsent { sent } => match sent {
                 Sent::Action { verb, target, name } => {
@@ -1486,6 +1513,19 @@ impl App {
                 // is what the pane says. Nothing to report and nothing to
                 // clear.
                 Sent::Lambs { .. } => Effect::None,
+                // A config read nobody took. Same shape as `Sent::Lambs`
+                // above rather than as `Sent::Action`: nothing was armed and
+                // nothing is in flight to clear, so the notice is the whole
+                // report. Said out loud rather than swallowed, because `e`
+                // dropped in silence looks exactly like a key that is not
+                // bound.
+                Sent::SheepConfig { name } => {
+                    self.notice = Some(Notice {
+                        text: format!("{name}: its config was not asked for"),
+                        grave: true,
+                    });
+                    Effect::None
+                }
                 // Same shape as `Sent::Action`'s own arm above, aimed at the
                 // settings screen's own pending line instead of the sheep
                 // confirm.
@@ -1835,6 +1875,54 @@ impl App {
         Effect::LoadSettings
     }
 
+    /// One `Request::SheepConfig` reply. Opens the pane, or refreshes an
+    /// open one in place.
+    ///
+    /// The cursor and offset are carried across a refresh rather than reset
+    /// to the first field, the same rule `Msg::Settings` follows and for the
+    /// same reason: `r` from inside the pane, and every later re-read, must
+    /// not throw an operator who was reading `cron_restart` back to `name`.
+    /// [`ConfigPane::adopt_view`] clamps what it adopts, so a field list
+    /// that came back shorter cannot leave the cursor past its end.
+    ///
+    /// A failed read leaves whatever is on screen exactly as it was and
+    /// raises a grave notice, so a refusal is reported rather than
+    /// swallowed, and a refresh that fails does not blank a pane that was
+    /// showing something real.
+    fn on_sheep_config(&mut self, name: &str, result: Result<Response, RequestError>) -> Effect {
+        match result {
+            Ok(Response::SheepConfig(view)) => {
+                let carried = self.config_pane.as_ref().map(|pane| pane.view().clone());
+                let mut pane = ConfigPane::sheep(*view);
+                if let Some(carried) = carried {
+                    pane.adopt_view(carried);
+                }
+                self.config_pane = Some(pane);
+            }
+            Ok(_unrecognised) => {
+                self.notice = Some(Notice {
+                    text: format!(
+                        "{name}: the shepherd answered something this lookout does not understand"
+                    ),
+                    grave: true,
+                });
+            }
+            Err(RequestError::Rpc(err)) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {}", err.message),
+                    grave: true,
+                });
+            }
+            Err(other) => {
+                self.notice = Some(Notice {
+                    text: format!("{name}: {other}"),
+                    grave: true,
+                });
+            }
+        }
+        Effect::None
+    }
+
     fn on_event(&mut self, event: BusEvent) -> Effect {
         match event {
             BusEvent::Process { event, info, .. } => {
@@ -1912,6 +2000,15 @@ impl App {
         // this branch is what keeps them off the query. See `on_text_key`.
         if self.mode == InputMode::Text {
             return self.on_text_key(key);
+        }
+        // The config pane owns the keyboard while it is open, ahead of the
+        // settings screen and ahead of the armed-confirm check below. The
+        // two screens cannot coexist -- `e` reaches the dashboard only from
+        // the dashboard, and `s` only from there too -- so the ordering
+        // between these first two branches is a documentation choice rather
+        // than a correctness one, the same as the next one down.
+        if self.config_pane.is_some() {
+            return self.on_pane_key(key);
         }
         // The settings screen owns its own keymap while it is open, ahead of
         // the armed-confirm check below: no sheep action can be armed from
@@ -2011,6 +2108,19 @@ impl App {
             // The read, not the open: the screen opens only once
             // `Msg::Settings` lands. See that arm's own doc for why.
             KeyPress::Settings => Effect::LoadSettings,
+            // Also the read, not the open, and for the same reason: the
+            // pane shows the shepherd's answer or it shows nothing.
+            //
+            // `selected_row` is `None` for a group row as well as for an
+            // empty flock. A group has no single sheep, but every instance
+            // behind it shares one stored spec, so the group's own name is
+            // exactly what `Request::SheepConfig` wants -- and refusing
+            // there would make `e` do nothing on the one row a
+            // multi-instance app shows by default.
+            KeyPress::Edit => match self.selected_name() {
+                Some(name) => Effect::Send(Sent::SheepConfig { name }),
+                None => Effect::None,
+            },
             // Meaningless from the dashboard; the settings screen is the
             // only thing `space` does anything for, and this branch is only
             // reached when that screen is not open.
@@ -2101,6 +2211,59 @@ impl App {
             // ignores it: an action key in particular must never be
             // mistaken for one this screen answers.
             KeyPress::Action(_)
+            | KeyPress::Edit
+            | KeyPress::FilterStart
+            | KeyPress::TextChar(_)
+            | KeyPress::TextBackspace
+            | KeyPress::TextApply
+            | KeyPress::TextAbandon => {}
+        }
+        Effect::None
+    }
+
+    /// The config pane's own keymap, in force for as long as
+    /// [`Self::config_pane`] is `Some`.
+    ///
+    /// Read-only: nothing here writes, and nothing here arms. The movement
+    /// keys walk the field list, `r` re-reads the same config, and `e` or
+    /// `Escape` closes. Everything else is ignored, named rather than
+    /// wildcarded so a future variant does not fall silently into an arm
+    /// that ignores it -- an action key in particular must never be
+    /// mistaken for one this pane answers.
+    fn on_pane_key(&mut self, key: KeyPress) -> Effect {
+        self.notice = None;
+        match key {
+            KeyPress::Quit => return Effect::Quit,
+            // Both close. `Escape` closes rather than cascading to a filter
+            // clear or a quit, exactly as it does on the settings screen.
+            KeyPress::Edit | KeyPress::Escape => self.config_pane = None,
+            KeyPress::SelectUp
+            | KeyPress::SelectDown
+            | KeyPress::SelectFirst
+            | KeyPress::SelectLast => {
+                if let Some(pane) = self.config_pane.as_mut() {
+                    match key {
+                        KeyPress::SelectUp => pane.move_by(-1),
+                        KeyPress::SelectDown => pane.move_by(1),
+                        KeyPress::SelectFirst => pane.move_to_first(),
+                        KeyPress::SelectLast => pane.move_to_last(),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            // Re-reads the same sheep, so an override applied from another
+            // window shows up. The cursor survives it: see
+            // `Self::on_sheep_config`.
+            KeyPress::Refresh => {
+                if let Some(pane) = self.config_pane.as_ref() {
+                    let name = pane.target().name().to_owned();
+                    return Effect::Send(Sent::SheepConfig { name });
+                }
+            }
+            KeyPress::Action(_)
+            | KeyPress::Confirm
+            | KeyPress::Cycle
+            | KeyPress::Settings
             | KeyPress::FilterStart
             | KeyPress::TextChar(_)
             | KeyPress::TextBackspace
@@ -2799,6 +2962,22 @@ impl App {
         }
     }
 
+    /// The selected row's app name: a sheep's own, or a group row's.
+    ///
+    /// Unlike [`Self::selected_row`] this answers for a group too. The two
+    /// callers differ in what they need: the detail pane and the feed
+    /// describe ONE process and have nothing to show for a group, while a
+    /// config pane is about the stored spec every instance of an app
+    /// shares, which a group row names exactly.
+    #[must_use]
+    pub fn selected_name(&self) -> Option<String> {
+        match &self.selected {
+            Some(RowKey::Group(name)) => Some(name.clone()),
+            Some(RowKey::Sheep(id)) => self.flock.get(id).map(|row| row.info.name.clone()),
+            None => None,
+        }
+    }
+
     /// One sheep by id, whatever the filter hides -- the lookup a
     /// [`RowKey::Sheep`] row's own rendering needs.
     #[must_use]
@@ -3026,6 +3205,18 @@ impl App {
         if let Some(settings) = self.settings.as_mut() {
             settings.set_rows(usize::from(rows));
         }
+        if let Some(pane) = self.config_pane.as_mut() {
+            // One less than the settings screen gets: the pane spends its
+            // first line on a title naming the sheep, which
+            // `view::pane::pane_lines` draws before any row.
+            pane.set_rows(usize::from(rows.saturating_sub(1)));
+        }
+    }
+
+    /// The open config pane, or `None` while nothing is being edited.
+    #[must_use]
+    pub fn config_pane(&self) -> Option<&ConfigPane> {
+        self.config_pane.as_ref()
     }
 
     /// The resolved style level and which layer chose it. What
@@ -5970,5 +6161,192 @@ mod tests {
         let said = app.notice().map(ToString::to_string).unwrap_or_default();
         assert!(said.starts_with("enable metrics: "), "got {said:?}");
         assert!(said.contains(&RequestError::Closed.to_string()));
+    }
+
+    /// fails if `e` stops asking the shepherd for the selected sheep's
+    /// config, or if the reply stops opening a pane over the dashboard.
+    ///
+    /// `e` raises the READ, not the open: the pane shows the shepherd's own
+    /// answer or it shows nothing, the same rule `s` and `Msg::Settings`
+    /// already follow for the settings screen.
+    #[test]
+    fn e_asks_for_the_selected_sheeps_config_and_the_reply_opens_the_pane() {
+        let mut app =
+            fixtures::with_selection(ProcessInfo::builder(9, "web", ProcStatus::Online).build());
+        let effect = app.update(Msg::Key(KeyPress::Edit));
+        assert_eq!(
+            effect,
+            Effect::Send(Sent::SheepConfig {
+                name: "web".to_string()
+            })
+        );
+        assert!(app.config_pane().is_none(), "nothing opens on the keypress");
+
+        app.update(Msg::Replied {
+            sent: Sent::SheepConfig {
+                name: "web".to_string(),
+            },
+            result: Ok(Response::SheepConfig(Box::new(
+                fixtures::sheep_config_view(),
+            ))),
+        });
+        let pane = app.config_pane().expect("the reply opens the pane");
+        assert_eq!(pane.target().name(), "web");
+        assert_eq!(pane.fields().len(), 39);
+    }
+
+    /// fails if `e` on an empty flock starts sending a request for a sheep
+    /// that is not there.
+    #[test]
+    fn e_with_nothing_selected_asks_for_nothing() {
+        let mut app = fixtures::app_with(Vec::new(), fixtures::plain());
+        assert_eq!(app.update(Msg::Key(KeyPress::Edit)), Effect::None);
+        assert!(app.config_pane().is_none());
+    }
+
+    /// fails if `e` stops reaching a group row. A group has no single sheep,
+    /// which is why `selected_row` answers `None` for one -- but every
+    /// instance behind it shares one stored spec, and the group row is what
+    /// a multi-instance app shows by default.
+    #[test]
+    fn e_on_a_group_row_asks_by_the_apps_name() {
+        let mut app = fixtures::app_with(
+            vec![
+                ProcessInfo::builder(1, "web", ProcStatus::Online)
+                    .instance(Some(0))
+                    .build(),
+                ProcessInfo::builder(2, "web", ProcStatus::Online)
+                    .instance(Some(1))
+                    .build(),
+            ],
+            fixtures::plain(),
+        );
+        app.update(Msg::Key(KeyPress::SelectFirst));
+        assert!(
+            app.selected_row().is_none(),
+            "the selection is the group row, not one instance"
+        );
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Edit)),
+            Effect::Send(Sent::SheepConfig {
+                name: "web".to_string()
+            })
+        );
+    }
+
+    /// fails if either key stops closing the pane, or if closing starts
+    /// cascading into the dashboard's own `Escape` (which quits, or clears
+    /// a filter).
+    #[test]
+    fn e_and_escape_both_close_the_pane_and_neither_quits() {
+        for key in [KeyPress::Edit, KeyPress::Escape] {
+            let mut app = fixtures::app_in_sheep_pane();
+            assert_eq!(app.update(Msg::Key(key)), Effect::None);
+            assert!(app.config_pane().is_none(), "{key:?}");
+        }
+    }
+
+    /// fails if the pane stops owning the keyboard while it is open. `x` in
+    /// particular: an action key must never arm from in here.
+    #[test]
+    fn the_pane_owns_the_keyboard_while_it_is_open() {
+        let mut app = fixtures::app_in_sheep_pane();
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Action(ActionVerb::Stop))),
+            Effect::None
+        );
+        assert!(
+            app.action().is_none(),
+            "no action arms from inside the pane"
+        );
+        assert_eq!(app.update(Msg::Key(KeyPress::Settings)), Effect::None);
+        assert!(
+            app.settings().is_none(),
+            "`s` does not open a second screen"
+        );
+        assert!(app.config_pane().is_some());
+    }
+
+    /// fails if the movement keys stop walking the field list.
+    #[test]
+    fn the_movement_keys_walk_the_fields() {
+        let mut app = fixtures::app_in_sheep_pane();
+        app.update(Msg::Key(KeyPress::SelectDown));
+        app.update(Msg::Key(KeyPress::SelectDown));
+        assert_eq!(app.config_pane().unwrap().view().cursor(), 2);
+        app.update(Msg::Key(KeyPress::SelectLast));
+        assert_eq!(app.config_pane().unwrap().view().cursor(), 38);
+        app.update(Msg::Key(KeyPress::SelectFirst));
+        assert_eq!(app.config_pane().unwrap().view().cursor(), 0);
+    }
+
+    /// fails if `r` from inside the pane stops re-reading, or if the reply
+    /// throws the operator back to the first field.
+    #[test]
+    fn r_re_reads_the_same_sheep_and_the_cursor_survives_it() {
+        let mut app = fixtures::app_in_sheep_pane();
+        app.update(Msg::Key(KeyPress::SelectLast));
+        let sent = Sent::SheepConfig {
+            name: "web".to_string(),
+        };
+        assert_eq!(
+            app.update(Msg::Key(KeyPress::Refresh)),
+            Effect::Send(sent.clone())
+        );
+        app.update(Msg::Replied {
+            sent,
+            result: Ok(Response::SheepConfig(Box::new(
+                fixtures::sheep_config_view(),
+            ))),
+        });
+        assert_eq!(app.config_pane().unwrap().view().cursor(), 38);
+    }
+
+    /// fails if a refusal is swallowed, or if a failed refresh blanks a pane
+    /// that was showing something real.
+    #[test]
+    fn a_refused_config_read_says_why_and_leaves_the_pane_alone() {
+        let mut app = fixtures::app_in_sheep_pane();
+        app.update(Msg::Replied {
+            sent: Sent::SheepConfig {
+                name: "web".to_string(),
+            },
+            result: Err(RequestError::Rpc(RpcError {
+                code: RpcErrorCode::NotFound,
+                message: "no sheep named web".to_string(),
+                daemon_version: None,
+            })),
+        });
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert!(said.contains("no sheep named web"), "got {said:?}");
+        assert!(app.notice().unwrap().is_grave());
+        assert!(app.config_pane().is_some(), "the pane stays as it was");
+    }
+
+    /// fails if a config read the channel dropped goes unreported. Silence
+    /// looks exactly like a key that is not bound.
+    #[test]
+    fn a_config_read_that_was_never_sent_says_so() {
+        let mut app =
+            fixtures::with_selection(ProcessInfo::builder(9, "web", ProcStatus::Online).build());
+        app.update(Msg::Unsent {
+            sent: Sent::SheepConfig {
+                name: "web".to_string(),
+            },
+        });
+        let said = app.notice().map(ToString::to_string).unwrap_or_default();
+        assert!(said.contains("web"), "got {said:?}");
+        assert!(app.notice().unwrap().is_grave());
+    }
+
+    /// fails if the pane stops getting one row fewer than the settings
+    /// screen. It spends its first line on a title naming the sheep, so a
+    /// viewport told the full body height would scroll one row late.
+    #[test]
+    fn the_pane_gets_the_body_height_minus_its_own_title() {
+        let mut app = fixtures::app_in_sheep_pane();
+        app.note_body_rows(20);
+        app.update(Msg::Key(KeyPress::SelectLast));
+        assert_eq!(app.config_pane().unwrap().view().offset(), 39 - 19);
     }
 }

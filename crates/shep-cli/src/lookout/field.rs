@@ -1,7 +1,3 @@
-// The settings screen reads `section_for` off this; the config panes in
-// task 5 are what reach the rest. The allow leaves with them.
-#![allow(dead_code)]
-
 //! A form's shape, read off a JSON Schema.
 //!
 //! Every config pane in lookout renders one of these. A JSON Schema is
@@ -57,10 +53,15 @@ pub struct Field {
 }
 
 /// An ordered set of fields, grouped.
+///
+/// The groups themselves are not stored. A renderer reads each field's own
+/// [`Field::group`] as it walks the list, which is what a scrolled window
+/// needs anyway: a pane whose top row is the middle of `control` has to
+/// draw that header from the row, not from a list of every group the set
+/// has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSet {
     fields: Vec<Field>,
-    groups: Vec<String>,
 }
 
 impl FieldSet {
@@ -98,29 +99,18 @@ impl FieldSet {
                 },
             }
         };
-        // Stable, so within-group order is whatever the caller gave.
+        // Stable, so within-group order is whatever the caller gave. The
+        // sort is also what makes a group CONTIGUOUS, which every renderer
+        // relies on: a header is pushed when the group changes, so a group
+        // split in two would have its name drawn twice.
         fields.sort_by_key(|f| rank(f.group.as_deref()));
-        let mut groups: Vec<String> = Vec::new();
-        for field in &fields {
-            if let Some(g) = &field.group
-                && !groups.contains(g)
-            {
-                groups.push(g.clone());
-            }
-        }
-        Self { fields, groups }
+        Self { fields }
     }
 
     /// Every field, in display order.
     #[must_use]
     pub fn fields(&self) -> &[Field] {
         &self.fields
-    }
-
-    /// The groups present, in display order. Empty for an ungrouped schema.
-    #[must_use]
-    pub fn groups(&self) -> &[String] {
-        &self.groups
     }
 
     /// The field named `key`.
@@ -261,6 +251,21 @@ mod tests {
         v.as_object().unwrap().clone()
     }
 
+    /// The groups the set's fields carry, in the order they first appear.
+    /// A group that appeared twice would show up twice, which is the
+    /// contiguity a renderer's one-header-per-group rule depends on.
+    fn groups_of(set: &FieldSet) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for field in set.fields() {
+            if let Some(group) = &field.group
+                && seen.last() != Some(group)
+            {
+                seen.push(group.clone());
+            }
+        }
+        seen
+    }
+
     #[test]
     fn a_bool_an_integer_and_a_string_get_their_kinds() {
         let p = props(json!({
@@ -368,7 +373,11 @@ mod tests {
             FieldSet::from_properties(&p, &Default::default(), &["process", "inputs", "control"]);
         let keys: Vec<&str> = set.fields().iter().map(|f| f.key.as_str()).collect();
         assert_eq!(keys, ["alpha", "beta", "zeta", "odd", "nogroup"]);
-        assert_eq!(set.groups(), ["process", "control", "unknown"]);
+        assert_eq!(
+            groups_of(&set),
+            ["process", "control", "unknown"],
+            "and each group is contiguous, so a renderer draws its header once"
+        );
     }
 
     #[test]
@@ -404,7 +413,7 @@ mod tests {
         let props = defs["AppConfig"]["properties"].as_object().unwrap();
         let set = FieldSet::from_properties(props, defs, shep_core::config::GROUP_ORDER);
         assert_eq!(set.len(), 39);
-        assert_eq!(set.groups(), ["process", "inputs", "control", "cron"]);
+        assert_eq!(groups_of(&set), ["process", "inputs", "control", "cron"]);
         assert!(
             set.fields().iter().all(|f| f.group.is_some()),
             "every field carries a group"
