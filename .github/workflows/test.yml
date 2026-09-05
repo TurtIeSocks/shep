@@ -8,11 +8,9 @@ name: test
 # performance budget, at roughly three times the last green runtime with a
 # floor of ten minutes. GitHub's default when absent is 360.
 #
-# Every `uses:` is pinned by commit, with its version in a comment, and
-# .github/dependabot.yml moves the pins. This file holds no secrets and
-# still decides what a pull request may claim: a moved tag could rewrite
-# the cache every job restores, or the filter that decides whether the
-# matrix runs at all.
+# Every `uses:` is pinned by commit, and .github/dependabot.yml moves the
+# pins. No secrets here, but a moved tag could rewrite the cache every job
+# restores or the filter that decides whether the matrix runs at all.
 on:
   push:
     branches: [main]
@@ -20,14 +18,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-# One run per ref at a time. On a pull request a newer push cancels the run
-# it supersedes, because the old head's verdict is no longer the question:
-# measured over every run to 2026-09-04, 565 of them, 17 were cancelled by
-# hand for exactly that reason and the rest of the superseded ones ran to
-# the end for nothing. A push to main cancels nothing, and never queues behind a
-# pull request, since the group carries the ref: main's runs are the record
-# the release workflows and the ruleset read, and a cancelled one there is
-# a gap in it.
+# One run per ref. A newer push cancels a pull request's run, since the old
+# head's verdict is no longer the question. A push to main cancels nothing:
+# main's runs are the record the release workflows and the ruleset read.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -211,10 +204,8 @@ jobs:
       # or they stop running on this platform. 14 of them, 6.8s warm.
       - run: 'cargo +${{ matrix.toolchain }} test --workspace --locked --all-features --doc'
         if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch' }}
-      # `!cancelled()` on purpose, and only here: this step must run after
-      # a FAILED test step, since that is when the junit is worth reading,
-      # and it is harmless after a failed toolchain install, because the
-      # report finds no file and says so.
+      # `!cancelled()`: this runs after a failed test step, when the junit is
+      # worth reading; after a failed toolchain install it finds no file.
       - uses: ./.github/actions/nextest-report
         if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
         with:
@@ -316,7 +307,6 @@ jobs:
       # This job runs nextest twice under the one `ci` profile, and both
       # runs write the same junit path, so the second overwrites the first
       # before anything reads it. One report per run, named for its tier.
-      # Review of this file found the first junit was being lost.
       - uses: ./.github/actions/nextest-report
         if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}
         with:
@@ -396,10 +386,8 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
-        # Block style on purpose. In a flow mapping the comma is YAML's own
-        # separator, so `{ tool: cargo-llvm-cov,nextest }` installs llvm-cov
-        # and hands the action a stray `nextest` key: measured as
-        # `error: no such command: nextest` on the first run of this pin.
+        # Block style: in a flow mapping the comma is YAML's separator, so
+        # `{ tool: a,b }` installs `a` and passes a stray `b` key.
         with:
           tool: cargo-llvm-cov,nextest
       - run: |
@@ -415,13 +403,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: coverage, path: lcov.info }
   # cargo-deny against deny.toml: RustSec advisories, licences, duplicate
-  # versions and sources. The advisory half is the one nothing else here
-  # does; `cargo audit` was installed on one machine and run by nobody. It
-  # runs on the `rust` filter, which includes Cargo.lock and deny.toml, so a
-  # lockfile-only pull request (a Dependabot bump, say) gets it too.
-  #
-  # Ten minutes is a ceiling: the whole check is under a minute, and most
-  # of that is fetching the advisory database.
+  # versions and sources. On the `rust` filter, which includes Cargo.lock
+  # and deny.toml, so a Dependabot bump gets it too. Ten minutes is a
+  # ceiling; the check runs in under one.
   deny:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.outputs.rust == 'true' || needs.changes.result != 'success' || github.event_name == 'workflow_dispatch') }}

@@ -227,12 +227,9 @@ async fn kill_tree_reaches_a_grandchild_and_not_just_the_sheep() {
     // comes from the process table, since `cmd` cannot report one.
     wait_for_log(&spec.out_file, "LAMB-STARTED").await;
     let sheep = proc.pid();
-    // Both pings, not whichever is up first. `LAMB-STARTED` is echoed
-    // between the background ping and the foreground one, so a snapshot
-    // taken on the echo can land while `cmd` is still starting the second,
-    // and a case that then tested containment on one of two would prove
-    // half of what it says. Bounded by [`SETTLE`], like every other wait
-    // in this file.
+    // Both pings, not whichever is up first: `LAMB-STARTED` is echoed
+    // between the background ping and the foreground one, so a snapshot on
+    // the echo can miss the second. Bounded by [`SETTLE`].
     let discovery = tokio::time::Instant::now() + SETTLE;
     let lambs = loop {
         let pings = pings_under(sheep);

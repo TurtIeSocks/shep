@@ -1029,23 +1029,13 @@ fn poll_flock_data(
     poll_flock_until(home, deadline, false, done)
 }
 
-/// [`poll_flock_data`], for a case that signals a handover itself and then
-/// polls the shepherd being replaced.
+/// [`poll_flock_data`] for the one case that signals a handover itself and
+/// then polls the shepherd being replaced.
 ///
-/// The attempt whose reply is in flight at the successor's `execve` fails
-/// with [`DROPPED_REPLY`], so asserting on it turns a documented, tolerated
-/// event into a panic. That is the whole of a flake CI met three times on
-/// 2026-09-04, on Linux every time, never on macOS and never on a rerun,
-/// always as `expected success, got ExitStatus(unix_wait_status(1280))` with
-/// the `daemon_unreachable` envelope carrying that sentence.
-/// [`the_control_socket_accepts_throughout_a_handover`] tolerates the same
-/// drop for the same reason.
-///
-/// ONE drop, and a second is still fatal. This poll is serial and the exec
-/// happens once, so at most one accepted connection can be open when the
-/// image is replaced. A shepherd dropping every reply is a defect rather
-/// than a handover, and a wait that spun its deadline out over one would
-/// report the caller's own assertion against a value it never read.
+/// The attempt whose reply is in flight at the `execve` fails with
+/// [`DROPPED_REPLY`]; asserting on it turns a tolerated event into a panic.
+/// One drop, and a second is still fatal: the poll is serial and the exec
+/// happens once, so at most one accepted connection is open at the swap.
 #[cfg(unix)]
 fn poll_flock_data_across_a_handover(
     home: &Path,
@@ -1055,20 +1045,13 @@ fn poll_flock_data_across_a_handover(
     poll_flock_until(home, deadline, true, done)
 }
 
-/// The loop the two above share. `tolerate_one_drop` says whether a single
-/// attempt may fail with a connection the shepherd closed after accepting it
-/// (see [`DROPPED_REPLY`]) before the next one is asserted on like any
-/// other.
+/// The loop the two above share. `tolerate_one_drop` lets one attempt fail
+/// with a connection the shepherd closed after accepting it.
 ///
-/// A tolerated attempt costs a retry and nothing else: it does not consult
-/// `done`, and it does not extend `deadline` for the observations that
-/// follow. It does not check the deadline either, and that is wanted rather
-/// than an oversight. There is no observation to return from a dropped
-/// reply, and a drop at the deadline's edge that ended the poll instead
-/// would be the flake this exists to close, one window narrower. The one
-/// retry it buys can land after `deadline` by at most one poll interval and
-/// one command, and it cannot spin: the tolerance is spent the first time
-/// it is used.
+/// A tolerated attempt costs a retry and nothing else: it consults neither
+/// `done` nor `deadline`. The retry can land after `deadline` by one poll
+/// interval and one command, and that is wanted: a drop at the edge that
+/// ended the poll would be the flake this closes, one window narrower.
 fn poll_flock_until(
     home: &Path,
     deadline: Duration,
@@ -1100,12 +1083,9 @@ fn poll_flock_until(
     }
 }
 
-/// Whether `output` is a client whose connection was the one the shepherd
-/// had accepted when it replaced its own image.
-///
-/// The two sentences and nothing else, so a shepherd that is gone, that
-/// refuses the handshake on version skew, or that answers with a refusal
-/// still fails the caller on the attempt that met it.
+/// Whether `output` is a client whose connection the shepherd had accepted
+/// when it replaced its own image. The two sentences and nothing else, so a
+/// shepherd that is gone or refusing still fails the caller.
 fn closed_by_a_handover(output: &Output) -> bool {
     let stderr = String::from_utf8_lossy(&output.stderr);
     stderr.contains(DROPPED_REPLY) || stderr.contains(DROPPED_HANDSHAKE)
@@ -7301,22 +7281,16 @@ fn a_flock_of_every_carried_kind_survives_a_daemon_reload() {
 }
 
 /// Gap between the dials [`the_control_socket_accepts_throughout_a_handover`]
-/// makes at the control address.
-///
-/// A dial is a `connect(2)` and an immediate close, microseconds of work on
-/// each side, so this interval decides how narrow an outage the case can see
-/// rather than what the case costs. 5ms resolves one far shorter than the
-/// shortest real one: every way this address can actually go away spans a
-/// daemon teardown or a fresh bind, hundreds of milliseconds in the
-/// stop-and-start fallback that is the closest thing to a near miss.
+/// makes at the control address. A dial is a `connect(2)` and a close, so
+/// this decides how narrow an outage the case can see, not what it costs:
+/// every real way the address goes away spans a daemon teardown or a fresh
+/// bind, hundreds of milliseconds.
 #[cfg(unix)]
 const DIAL_INTERVAL: Duration = Duration::from_millis(5);
 
-/// `ExitCode::DaemonUnreachable`, the one failing exit `shep ping` has: it
-/// renders "shepherd offline" on stdout and exits with this, whatever the
-/// reason. Any other failing exit is a usage error or a refusal, which no
-/// handover produces, and the prober in
-/// [`the_control_socket_accepts_throughout_a_handover`] refuses it rather
+/// `ExitCode::DaemonUnreachable`, the one failing exit `shep ping` has,
+/// whatever the reason. Any other failing exit is a usage error or a
+/// refusal, which no handover produces, and the prober refuses it rather
 /// than counting it as the one drop the exec is allowed.
 #[cfg(unix)]
 const PING_OFFLINE: i32 = 5;
@@ -7355,11 +7329,9 @@ fn the_control_socket_accepts_throughout_a_handover() {
     // window.
     let deadline = Instant::now() + Duration::from_secs(8);
     let socket = dir.path().join("run").join("shep.sock");
-    // The file's identity, taken before anything happens to it. A successor
-    // that binds a fresh listener instead of adopting the carried one has to
-    // unlink this file and create it again, which gives it a new inode, and
-    // that is a microsecond of work no poller can be relied on to land in.
-    // The dialer below measures an outage; this measures a rebind.
+    // The file's identity before anything happens to it. A successor that
+    // binds fresh instead of adopting must unlink and recreate the file,
+    // which changes the inode; that takes a microsecond no poller can see.
     let inode_before = std::fs::metadata(&socket)
         .expect("the control socket must exist before the handover")
         .ino();
@@ -7369,13 +7341,9 @@ fn the_control_socket_accepts_throughout_a_handover() {
         let mut dials = 0_usize;
         while Instant::now() < deadline {
             dials += 1;
-            // The stream this opens is dropped where the `if let` ends, so
-            // the daemon's accept loop meets an EOF rather than a handshake
-            // it has to wait out, and reports it at `debug!` and nothing
-            // else (`shep-daemon/src/server.rs`, "connection ended"). The
-            // answer wanted here is the syscall's: asking for more of the
-            // exchange would put it back in the same bucket as everything
-            // else that can go wrong, which is the whole bug being fixed.
+            // Dropped where the `if let` ends: the daemon's accept loop meets
+            // an EOF and logs it at `debug!`. The answer wanted is the
+            // syscall's; anything more would be the bucket this case fixes.
             if let Err(err) = std::os::unix::net::UnixStream::connect(&dial_socket) {
                 refused.push(format!("dial {dials}: {:?}: {err}", err.kind()));
             }
@@ -7440,24 +7408,19 @@ fn the_control_socket_accepts_throughout_a_handover() {
         .output()
         .unwrap();
     assert_success(&reloaded);
-    // The premise, checked rather than assumed. A reload that fell back to
-    // stopping and starting really did unbind the address, legitimately, and
-    // the dialer below would report that as the defect: one misclassified
-    // failure traded for another. Both fallback arms say so on stderr before
-    // they take it (`commands/daemon.rs`'s two `aside("reload", ...)` calls),
-    // so the case can name what happened instead of blaming the daemon for
-    // doing what it said it would.
+    // The premise, checked. A reload that fell back to stopping and starting
+    // really did unbind the address, and the dialer would report that as
+    // the defect. Both fallback arms say so on stderr (`commands/daemon.rs`'s
+    // two `aside("reload", ...)` calls).
     let reload_aside = String::from_utf8_lossy(&reloaded.stderr);
     assert!(
         !reload_aside.contains("starting one instead")
             && !reload_aside.contains("stopping and starting instead"),
         "this case is about the handover arm and the reload took the other one: {reload_aside}"
     );
-    // Same file, same inode: the successor adopted the carried listener.
-    // Review of this case found that a rebind at the same path (drop the
-    // inherited listener, unlink, bind fresh) passed the dialer 10 of 10,
-    // because the gap it opens is far narrower than `DIAL_INTERVAL`. The
-    // inode is the deterministic reading of the same property.
+    // Same file, same inode: the successor adopted the carried listener. A
+    // rebind at the same path passed the dialer 10 of 10; the inode is the
+    // deterministic reading of the same property.
     let inode_after = std::fs::metadata(&socket)
         .expect("the control socket must still exist after the handover")
         .ino();
@@ -7518,13 +7481,12 @@ fn roll_recording(roll: &Path, want: usize) -> Vec<u8> {
 /// A boot either installs the flock it was handed or restores the roll, and
 /// what decides is whether it was handed a flock at all, not how large.
 ///
-/// SIGHUP directly, not `shep daemon reload`, which would start `ghost` through
-/// `shep muster` whatever the boot decided. SIGHUP can also fail to exec, after
-/// which the poll meets no shepherd and fails on its own `assert_success`, so
-/// the pid check says a successor answered. The final wait is for a sheep to
-/// appear, so asserting none did cannot pass by looking too early. It is
-/// [`poll_flock_data_across_a_handover`]: the raw signal means the first
-/// attempt can be the request the exec drops.
+/// SIGHUP directly, not `shep daemon reload`, which would start `ghost`
+/// through `shep muster` whatever the boot decided. A failed exec leaves no
+/// shepherd, so the poll fails on its own `assert_success` and the pid check
+/// says a successor answered. The wait is for a sheep to appear, so asserting
+/// none did cannot pass by looking too early; it goes through
+/// [`poll_flock_data_across_a_handover`] since the raw signal can drop one reply.
 #[cfg(unix)]
 #[test]
 fn a_successor_inheriting_an_empty_flock_does_not_restore_the_roll() {

@@ -1,35 +1,15 @@
 #!/bin/sh
-# Runs `typos` over what is about to be committed, when it is installed.
+# Runs `typos` over the staged files when it is installed; skipped when it
+# is not, since the `typos` job in test.yml is the gate.
 #
-# The `typos` job in .github/workflows/test.yml is the gate; this is the
-# same check a few minutes earlier. Measured over the 19 days to 2026-09-04,
-# 12 of 99 red CI runs were that job, every one a real misspelling in prose
-# or a comment that a local run would have caught before the push.
-#
-# Same install as the commit-msg hook beside this file:
-#     git config core.hooksPath .githooks
-# `typos` itself: `brew install typos-cli` or `cargo install typos-cli`.
-# Missing, it is skipped rather than failed, so a clone without it commits
-# as before and CI still has the last word.
+# Install: git config core.hooksPath .githooks
 
 command -v typos >/dev/null 2>&1 || exit 0
 
-# What is staged, not what is in the working tree. The two differ exactly
-# when it matters: an unstaged correction would let a staged misspelling
-# through, and an unstaged misspelling would refuse a clean staged change.
-# `checkout-index` writes the index's own blobs under a temporary prefix
-# and typos reads those, from inside it, so the paths it reports are the
-# repository's own.
-#
-# NUL-delimited end to end. A plain `xargs` splits on every kind of
-# whitespace, and this repository tracks three files with spaces in their
-# names under docs/shep-design/: fed through `printf '%s\n' | xargs`, each
-# one arrived at typos as several fragments, every fragment was "not
-# found", and the commit was refused for a typo that did not exist.
-# No grep in the emptiness test. Stock macOS grep accepts `-z` (measured on
-# macOS 25), but a hook whose first decision depends on which grep is first
-# on PATH is one that exits 0 without running typos on the wrong machine,
-# and a hook that silently does nothing is worse than no hook.
+# The index, not the working tree: `checkout-index` writes the staged blobs
+# under a temporary prefix and typos reads those. NUL-delimited, since three
+# tracked filenames carry spaces. No grep: the emptiness test must not
+# depend on which grep is first on PATH.
 [ -n "$(git diff --cached --name-only --diff-filter=ACMR)" ] || exit 0
 staged=$(mktemp -d) || exit 0
 trap 'rm -rf "$staged"' EXIT

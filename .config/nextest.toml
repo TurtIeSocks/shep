@@ -12,12 +12,9 @@
 # and both of the 2026-09-04 failures would have been hidden by one: a
 # missing precondition in a test, and the log pump dropping a child's last
 # line 39 times in 64 at the seam. Read a retried failure before shrugging at
-# it. Every CI profile below writes junit, and
-# .github/actions/nextest-report reads it after each leg: a test that passed
-# only on retry becomes a warning on the run and a row in the job summary,
-# so the retries are countable rather than invisible. Until 2026-09-04 this
-# comment claimed `--junit` was on while no profile named a path, so nothing
-# was written and nothing could have been counted.
+# it. Every CI profile below writes junit, and .github/actions/nextest-report
+# reads it after each leg, so a test that passed only on retry is a warning
+# on the run and a row in the job summary rather than nothing.
 
 [profile.ci]
 # Report every failure in one run. A matrix leg is expensive to re-trigger

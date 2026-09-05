@@ -1,12 +1,6 @@
 # cargo-deny: RustSec advisories, licences, duplicate versions and sources.
-# Run by the `deny` job in .github/workflows/test.yml on every pull request
-# that touches Rust or a lockfile, and by hand with `cargo deny check`.
-#
-# Why this exists. Until 2026-09-04 nothing in any gate read the RustSec
-# database, and nothing checked which licence a new transitive dependency
-# arrived under. `cargo audit` was installed on one machine and run by
-# nobody, which is the shape a check takes right before it matters. A job
-# that runs on every pull request is the version that fires.
+# Run by the `deny` job in .github/workflows/test.yml and by hand with
+# `cargo deny check`.
 
 [graph]
 # The task gate's feature set, so the tree checked here is the tree that is
@@ -25,10 +19,8 @@ ignore = []
 
 [licenses]
 version = 2
-# Every licence in the tree as of 2026-09-04, each read once before it was
-# added. The workspace is MIT OR Apache-2.0; the rest are what the
-# dependencies arrive under. A licence not on this list fails the job, and
-# that is the point: it should be read before it is allowed, not after.
+# Every licence in the tree, each read before it was added. A licence not
+# on this list fails the job until somebody reads it, which is the point.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -46,13 +38,10 @@ allow = [
 # the `windows-*` family moves on its own schedule and is the usual
 # offender. Reported, not refused.
 multiple-versions = "warn"
-# A `*` requirement resolves to whatever is newest on the day, which is the
-# opposite of a reproducible build. A path dependency with no version is
-# also a `*` to Cargo, and one of those is deliberate: shep-macros'
-# dev-dependency on shep-client names only a path so that `cargo publish`
-# drops it, which is what broke the release deadlock of 2026-09-04 (the
-# comment on that dependency has the measurement). Path-only is allowed
-# here for exactly that shape and nothing else.
+# A `*` requirement resolves to whatever is newest that day. A path
+# dependency with no version is also a `*` to Cargo, and one is deliberate:
+# shep-macros' dev-dependency on shep-client names only a path so that
+# `cargo publish` drops it. Path-only is allowed for that shape and no other.
 wildcards = "deny"
 allow-wildcard-paths = true
 

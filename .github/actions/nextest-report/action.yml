@@ -2,21 +2,10 @@ name: nextest report
 description: >-
   Reads the junit nextest wrote for one profile, annotates every test that
   passed only on retry, and keeps the file as an artifact.
-# Why a composite action rather than two steps pasted into six jobs: the
-# steps are identical everywhere except the profile and the artifact name,
-# and a fix to how a retry is reported should land in one place.
-#
-# Retries are configured in .config/nextest.toml for the integration tier
-# only. A test that failed and then passed is a green job with a defect in
-# it, and nothing in nextest's own output makes that hard to miss on a run
-# nobody is watching. This turns each one into a warning annotation on the
-# run and a row in the job summary, so a retried test is something a person
-# reads rather than something a retry absorbed. The note above `retries` in
-# .config/nextest.toml says what a retry does and does not excuse.
-#
-# `shell: python` rather than `bash` calling `python3`: every hosted runner
-# puts a `python` on PATH, while `python3` on windows-latest depends on
-# which shim wins, and this has to run on all three.
+# One composite action rather than the same two steps in six jobs. A test
+# that passed only on retry is a green job with a defect in it; this makes
+# it a warning on the run and a row in the summary. `shell: python`: every
+# hosted runner has `python` on PATH, and windows-latest's `python3` is a shim.
 inputs:
   profile:
     description: The nextest profile whose junit to read.
@@ -31,12 +20,9 @@ runs:
       env:
         JUNIT: target/nextest/${{ inputs.profile }}/junit.xml
       run: |
-        # nextest marks a test that failed and then passed with a
-        # <flakyFailure> or <flakyError> child, and one that failed every
-        # retry with <rerunFailure> / <rerunError> beside its <failure>. The
-        # second kind already failed the job. The first is the one this is
-        # for: a green run carrying a defect. Always exits 0; the test step
-        # already gave the verdict, this is the report.
+        # nextest marks a pass-after-retry with <flakyFailure>/<flakyError>
+        # and a fail-every-retry with <rerunFailure>/<rerunError>. Always
+        # exits 0: the test step gave the verdict, this is the report.
         import os
         import sys
         import xml.etree.ElementTree as ET

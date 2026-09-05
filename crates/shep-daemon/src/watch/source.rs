@@ -450,12 +450,9 @@ mod tests {
 
             // Prove the watch is live first, so a failure below can't be
             // confused with "this watch never worked in the first place".
-            // On the write itself, not on whichever batch arrives first: on
-            // FSEvents that can be the arm-time event for the root alone
-            // (see `a_file_created_under_the_root_produces_a_batch_containing_it`),
-            // and taking it as proof would drop the source while
-            // `first.txt`'s own batch is still on its way, which then reads
-            // as a leak that never happened.
+            // On the write itself, not the first batch: on FSEvents that can
+            // be the arm-time root event, and dropping the source on it would
+            // read `first.txt`'s own late batch as a leak.
             let first = root.join("first.txt");
             std::fs::write(&first, b"hello").unwrap();
             batches_until(&mut rx, SMOKE_DEADLINE, &format!("{first:?}"), |batch| {
@@ -574,9 +571,7 @@ mod tests {
             let (_source, mut rx) = watch_tree(&link, TEST_DELAY).unwrap();
             crate::testing::touch(&link, "through-the-link.txt").unwrap();
 
-            // Every batch up to the one naming the file, not the first one
-            // alone (the arm-time root event can arrive on its own, as the
-            // root-level write case above records), and the literal-form
+            // Every batch up to the one naming the file, and the literal-form
             // check runs over all of them: a root-only batch spelled through
             // the link would be the same trap one batch earlier.
             let resolved_file = resolved_target.join("through-the-link.txt");
