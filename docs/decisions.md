@@ -1751,6 +1751,18 @@ The entry above was right about `ApplyConfig` itself: the variant is additive, a
 
 `verified crates/shep-core/src/protocol/mod.rs (PROTOCOL_VERSION = 3) and the request_wire snapshot renamed from v2 to v3`
 
+### PROTOCOL_VERSION moved to 4 for three additive variants, against the rule the entry above set
+
+`Request` gained `SheepConfig`, `SetSheepEnv` and `SetDogConfig`, and `Response` gained their three answers. All six are additive, with no rename and no retype anywhere in the payload. By the reasoning directly above, that is the shape that does NOT bump: an older daemon was never going to receive them, old traffic keeps working, and only a brand-new capability is unreachable until a restart. It bumped anyway.
+
+**Why:** The precedent was tested by `ApplyConfig` and it failed the operator. A newer CLI against a not-yet-restarted daemon passed the handshake, sent the variant, and had the connection dropped on an envelope the daemon could not decode, so `shep start <Flockfile>` failed on a dead client with no diagnosis. The remedy was correct and undiscoverable, which is why `getting-started.astro` had to grow a paragraph telling operators to restart after upgrading. That paragraph is the cost of not bumping, paid once per additive variant forever.
+
+A bump turns the same skew into a `protocol_mismatch` refusal, exit 6, naming both numbers and the remedy, at the handshake rather than mid-request. The price is that every older client is refused every verb until the shepherd restarts, which the last two releases already asked for.
+
+So the rule the entry above states is narrowed rather than overturned: additivity is what decides whether OLD traffic still decodes, and it does here. It is not what decides whether an operator can understand the failure when they skip the restart. When a new variant is one a running CLI will send on an ordinary path, the second question is the one that matters, and these three are exactly that: a config pane opens on a keypress against whatever daemon is running.
+
+`verified crates/shep-core/src/protocol/mod.rs (PROTOCOL_VERSION = 4), the three *_wire_v3 snapshots renamed to _v4, and the two tests that pin the numeral rather than reading the constant (request.rs hello_handshake_shape and a_dogs_hello_names_the_dog_and_nothing_elses_does). The older-daemon skew fixtures in shep-client/src/reconnect.rs and shep-cli/src/commands/{daemon,dogs}.rs still hardcode 1, 2 and 3 deliberately and were not touched.`
+
 ### The two "reload does not re-read config" entries are about shep reload <sheep>, not shep daemon reload
 
 `shep daemon reload` re-reads `shep.toml`, and always has. The superseded entries under Reload above are about `shep reload <sheep>` and a Flockfile, which are different files read by a different verb.
